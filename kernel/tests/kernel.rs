@@ -97,13 +97,15 @@ fn request<'a>(
 /// check that each submitted request was answered exactly once.
 struct Run {
     sup: Supervisor,
-    root: Option<PathBuf>,
+    /// Declared after `sup` on purpose: the fields are dropped in declaration order, so the root is removed only
+    /// after the Supervisor has stopped its inspector and removed its per-start directory.
+    root: Option<TestDir>,
     submitted: Vec<ReqId>,
     got: Vec<(ReqId, Verdict)>,
 }
 
 impl Run {
-    fn new(cfg: Config, root: Option<PathBuf>) -> Run {
+    fn new(cfg: Config, root: Option<TestDir>) -> Run {
         Run {
             sup: Supervisor::new(cfg)
                 .unwrap_or_else(|e| panic!("the test configuration is refused: {e:?}")),
@@ -178,12 +180,12 @@ impl Run {
         ids.dedup();
         assert_eq!(ids.len(), want.len(), "a result was delivered twice");
         if let Some(root) = &self.root {
-            let left: Vec<_> = fs::read_dir(root)
+            let left: Vec<_> = fs::read_dir(root.path())
                 .expect("the test root is readable")
                 .map(|e| e.map(|e| e.file_name()))
                 .collect();
             assert!(left.is_empty(), "the test root is not empty: {left:?}");
-            fs::remove_dir(root).expect("the empty test root is removed");
+            fs::remove_dir(root.path()).expect("the empty test root is removed");
         }
         (self.sup.status(), sd.bye)
     }
@@ -841,16 +843,34 @@ fn parse_sha256(s: &str) -> [u8; 32] {
     out
 }
 
+/// A fresh 0700 directory, removed with everything in it when dropped.
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A new 0700 root for one test, under `TUKUYOMI_TEST_TMP`. Its name has the process id and the test name, so
-/// parallel tests and earlier runs do not meet. `Run::finish` removes it, and fails if it is not empty.
-fn make_root(test: &str) -> PathBuf {
+/// parallel tests and earlier runs do not meet. The guard removes it when it is dropped, also when the test
+/// fails; `Run::finish` fails if it is not empty, and removes it.
+fn make_root(test: &str) -> TestDir {
     let root =
         PathBuf::from(var("TUKUYOMI_TEST_TMP")).join(format!("{test}-{}", std::process::id()));
     DirBuilder::new()
         .mode(0o700)
         .create(&root)
         .unwrap_or_else(|e| panic!("cannot create the test root {root:?}: {e}"));
-    let mode = fs::symlink_metadata(&root)
+    // The directory is the guard's from here on, so a failed check below does not leave it behind.
+    let root = TestDir(root);
+    let mode = fs::symlink_metadata(root.path())
         .expect("the test root exists")
         .permissions()
         .mode();
@@ -878,7 +898,7 @@ fn real_config_without_inspector(root: &Path) -> Config {
 fn real_run(test: &str) -> Run {
     let sha = parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256"));
     let root = make_root(test);
-    Run::new(real_config(&root, sha), Some(root))
+    Run::new(real_config(root.path(), sha), Some(root))
 }
 
 /// The end of a test that ran a live inspector: a BYE answered the DRAIN and the exit was a normal one.
@@ -1147,7 +1167,7 @@ fn a_different_rules_hash_fails_at_hello_without_restart() {
     let mut sha = parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256"));
     sha[31] ^= 1;
     let root = make_root("wrong_sha");
-    let mut run = Run::new(real_config(&root, sha), Some(root));
+    let mut run = Run::new(real_config(root.path(), sha), Some(root));
     let hs = [header(b"Host", b"example.test")];
     let id = run.submit(&request(b"GET", b"/", &hs, b""));
     run.wait_for("the failure at HELLO", |r| {
@@ -1167,9 +1187,9 @@ fn a_different_rules_hash_fails_at_hello_without_restart() {
 fn a_failed_start_ends_the_supervisor_when_no_restart_is_allowed() {
     // The inspector does not exist: the one start fails at spawn, before any process exists.
     let root = make_root("no_restart");
-    let mut cfg = real_config_without_inspector(&root);
-    cfg.inspector = root.join("absent-inspector");
-    cfg.rules = root.join("absent-rules.conf");
+    let mut cfg = real_config_without_inspector(root.path());
+    cfg.inspector = root.path().join("absent-inspector");
+    cfg.rules = root.path().join("absent-rules.conf");
     cfg.restarts = 0;
     let mut run = Run::new(cfg, Some(root));
     let hs = [header(b"Host", b"example.test")];
@@ -1193,9 +1213,9 @@ fn a_full_restart_window_waits_and_the_supervisor_does_not_fail() {
     // The inspector does not exist, so every start fails at spawn. One restart is allowed in a window of 300 ms.
     let window = 300 * MS;
     let root = make_root("window");
-    let mut cfg = real_config_without_inspector(&root);
-    cfg.inspector = root.join("absent-inspector");
-    cfg.rules = root.join("absent-rules.conf");
+    let mut cfg = real_config_without_inspector(root.path());
+    cfg.inspector = root.path().join("absent-inspector");
+    cfg.rules = root.path().join("absent-rules.conf");
     (cfg.restarts, cfg.restart_window, cfg.wait_deadline) = (1, window, 400 * MS);
     let mut run = Run::new(cfg, Some(root));
     let hs = [header(b"Host", b"example.test")];

@@ -106,16 +106,34 @@ fn parse_sha256(s: &str) -> String {
     s.to_ascii_lowercase()
 }
 
+/// A fresh 0700 directory, removed with everything in it when dropped.
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A new 0700 root for one test, under `TUKUYOMI_TEST_TMP`. Its name has the process id and the test name, so
 /// earlier runs do not meet. The end of a test removes it, and fails if it holds anything but the configuration.
-fn make_root(test: &str) -> PathBuf {
+/// A test that fails leaves nothing in `TUKUYOMI_TEST_TMP`: the guard removes the root with what it holds.
+fn make_root(test: &str) -> TestDir {
     let root =
         PathBuf::from(var("TUKUYOMI_TEST_TMP")).join(format!("{test}-{}", std::process::id()));
     DirBuilder::new()
         .mode(0o700)
         .create(&root)
         .unwrap_or_else(|e| panic!("cannot create the test root {root:?}: {e}"));
-    let mode = fs::symlink_metadata(&root)
+    // The guard owns the root from here on, also when the check below fails.
+    let root = TestDir(root);
+    let mode = fs::symlink_metadata(root.path())
         .expect("the test root exists")
         .permissions()
         .mode();
@@ -965,7 +983,6 @@ impl StopCounts {
 }
 
 struct Proxy {
-    root: PathBuf,
     port: u16,
     pid: u32,
     exit: Receiver<io::Result<ExitStatus>>,
@@ -978,6 +995,9 @@ struct Proxy {
     /// When the process was started.
     started: Instant,
     done: bool,
+    /// The last field: the fields are dropped in order, after `Proxy::drop` has stopped the processes, so the
+    /// root is removed after everything else of the proxy is gone.
+    root: TestDir,
 }
 
 impl Proxy {
@@ -997,11 +1017,14 @@ impl Proxy {
         let upstream = Upstream::start();
         let port = free_port();
         let listen = SocketAddr::from(([127, 0, 0, 1], port));
-        let config = root.join("config.json");
-        fs::write(&config, config_json(&knobs, listen, upstream.addr, &root))
-            .expect("write the configuration");
+        let config = root.path().join("config.json");
+        fs::write(
+            &config,
+            config_json(&knobs, listen, upstream.addr, root.path()),
+        )
+        .expect("write the configuration");
         if knobs.stand_in {
-            fs::write(root.join(STAND_IN), "exec /bin/sleep 120\n")
+            fs::write(root.path().join(STAND_IN), "exec /bin/sleep 120\n")
                 .expect("write the stand-in for the inspector");
         }
         let started = Instant::now();
@@ -1035,7 +1058,6 @@ impl Proxy {
             let _ = tx.send(child.wait());
         });
         Proxy {
-            root,
             port,
             pid,
             exit,
@@ -1046,6 +1068,7 @@ impl Proxy {
             knobs,
             started,
             done: false,
+            root,
         }
     }
 
@@ -1134,7 +1157,7 @@ impl Proxy {
     /// Checks that the root holds the files the test put there and nothing else (the kernel removed its own
     /// directory), and removes them and the root.
     fn clear_root(&self, files: &[&str]) {
-        let mut left: Vec<String> = fs::read_dir(&self.root)
+        let mut left: Vec<String> = fs::read_dir(self.root.path())
             .expect("the test root is readable")
             .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
             .collect::<Result<_, _>>()
@@ -1144,9 +1167,9 @@ impl Proxy {
         want.sort_unstable();
         assert_eq!(left, want, "the test root holds other files");
         for file in files {
-            fs::remove_file(self.root.join(file)).expect("remove a file of the test root");
+            fs::remove_file(self.root.path().join(file)).expect("remove a file of the test root");
         }
-        fs::remove_dir(&self.root).expect("the empty test root is removed");
+        fs::remove_dir(self.root.path()).expect("the empty test root is removed");
     }
 
     /// Ends the test: SIGTERM, a clean exit within `stop_wait`, and then every check of what must be left (or
@@ -1254,6 +1277,9 @@ impl Drop for Proxy {
                     .status();
             }
         }
+        // The guard removes the root after this, so the proxy must be gone first: a killed process may need a
+        // moment to exit, and must not make anything in the root while it is removed. The wait ends at the exit.
+        let _ = self.exit.recv_timeout(MARGIN);
     }
 }
 
