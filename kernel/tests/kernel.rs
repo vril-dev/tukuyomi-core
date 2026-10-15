@@ -815,7 +815,8 @@ fn uri_rule_blocks_in_phase_1() {
         run.verdict(blocked),
         Verdict::Block {
             phase: 1,
-            rule_id: 9201
+            rule_id: 9201,
+            status: 403
         }
     );
     assert_eq!(run.verdict(passed), Verdict::Allow);
@@ -842,7 +843,8 @@ fn urlencoded_body_rule_blocks_in_phase_2() {
         run.verdict(blocked),
         Verdict::Block {
             phase: 2,
-            rule_id: 9202
+            rule_id: 9202,
+            status: 403
         }
     );
     assert_eq!(run.verdict(passed), Verdict::Allow);
@@ -876,6 +878,7 @@ fn urlencoded_content_type_forms_the_submit_accepts_are_parsed() {
     let blocked = Verdict::Block {
         phase: 2,
         rule_id: 9202,
+        status: 403,
     };
     assert_eq!(run.verdict(with_charset), blocked);
     assert_eq!(run.verdict(leading_space), blocked);

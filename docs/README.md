@@ -2,7 +2,7 @@
 
 tukuyomi-core の設計文書を置くディレクトリ。tukuyomi-core は、tukuyomi（tukuyomi WAF）から派生し、WAF 機能に特化したシステムを目指す。
 
-現時点で実装しているのは、初回の検査核だけである。Rust のライブラリ [`kernel/`](../kernel/) と Go の検査プロセス [`inspector/`](../inspector/) のソースがあり、HTTP の受付・転送、管理UI、配布物はまだない。ここにある文書は初期草案で、目標・前提・候補・未決事項を記録している。実装済みの範囲は [システム概要](detailed-design/00_overview/system-overview.md) の「現在の状態」に書く。
+現時点で実装しているのは、初回の検査核と、HTTP/1.1 の最小の受付・転送だけである。Rust のライブラリ [`kernel/`](../kernel/)、Go の検査プロセス [`inspector/`](../inspector/)、HTTP の実行体 [`proxy/`](../proxy/) のソースがあり、管理UI、配布物はまだない。ここにある文書は初期草案で、目標・前提・候補・未決事項を記録している。実装済みの範囲は [システム概要](detailed-design/00_overview/system-overview.md) の「現在の状態」に書く。
 
 ## 作成済みの文書
 

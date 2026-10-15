@@ -1,0 +1,995 @@
+#![forbid(unsafe_code)]
+//! The proxy process: start-up, the wait for the kernel, the accept loop and the stop.
+//!
+//! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration
+//! file), the host checks, the configuration, the runtime and the signal handlers, the driver thread, the wait
+//! for the kernel to be ready, bind, accept. Handlers exist for SIGTERM, SIGINT and SIGHUP only and are installed
+//! before the kernel starts its child process; SIGCHLD is never handled. The listener is bound only after the
+//! kernel is ready, and a connection permit is taken before every accept.
+//!
+//! The first cause of a stop (a signal, or a failure of start-up or of the driver) fixes the time `t0`. The stop
+//! closes the listener, tells the driver to finish inspecting by `t0 + stop_inspect`, waits for the connections
+//! until `t0 + stop_wait` and aborts what is left, then waits for the driver's end until
+//! `t0 + stop_wait + kill_grace`. The exit code is 0 only when the stop was not caused by a failure and the driver
+//! reports a stopped kernel whose child exit and per-start directory removal are confirmed; 1 for any other end;
+//! 2 for a wrong argument or a refused configuration. The log is flushed for at most 200 ms at the end.
+
+use std::future::{Future, poll_fn};
+use std::io::{self, Write};
+use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
+use std::panic::{self, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::mpsc::SyncSender;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use tokio::net::{TcpListener, TcpStream};
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::task::{JoinError, JoinSet};
+use tokio::time::{Instant, Sleep, sleep, timeout_at};
+use tukuyomi_kernel::{Failure, Phase};
+use tukuyomi_proxy::config::{self, Loaded, ProxyConfig};
+use tukuyomi_proxy::driver::{self, Driver, End, Msg};
+use tukuyomi_proxy::front::{self, Ctx};
+use tukuyomi_proxy::host;
+use tukuyomi_proxy::log::{self, Log};
+
+const EXIT_OK: u8 = 0;
+const EXIT_FAILED: u8 = 1;
+const EXIT_USAGE: u8 = 2;
+/// The longest the end of the process waits for the logger.
+const FLUSH_WAIT: Duration = Duration::from_millis(200);
+/// The pause of the accept loop after the system ran out of a resource.
+const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+/// Linux errno values (the same on x86_64 and aarch64).
+const ENOMEM: i32 = 12;
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+const ENOBUFS: i32 = 105;
+
+fn main() -> ExitCode {
+    let log = match log::start_logger() {
+        Ok(log) => log,
+        Err(text) => {
+            let _ = writeln!(io::stderr(), "{text}");
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
+    log::install_panic_hook(log.clone());
+    // A panic on this thread is reported through the log and ends the process with the failure code.
+    let code = panic::catch_unwind(AssertUnwindSafe(|| start(&log))).unwrap_or(EXIT_FAILED);
+    log.flush(FLUSH_WAIT);
+    ExitCode::from(code)
+}
+
+/// Everything before the runtime runs, then the runtime. Returns the exit code.
+fn start(log: &Log) -> u8 {
+    let mut args = std::env::args_os().skip(1);
+    let path = match (args.next(), args.next()) {
+        (Some(path), None) if clean_abs(Path::new(&path)) => PathBuf::from(path),
+        _ => {
+            log.line(
+                "start: expected one argument, the absolute clean path of the configuration file",
+            );
+            return EXIT_USAGE;
+        }
+    };
+    if let Err(text) = host::check() {
+        log.line(&format!("start: host check refused: {text}"));
+        return EXIT_FAILED;
+    }
+    let loaded = match config::load(&path) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            log.line(&format!("start: configuration refused: {}", e.0));
+            return EXIT_USAGE;
+        }
+    };
+    log.line("start: configuration accepted");
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            log.line("start: cannot build the runtime");
+            return EXIT_FAILED;
+        }
+    };
+    runtime.block_on(run(loaded, log.clone()))
+}
+
+/// A path argument must be absolute and already clean: no empty, `.` or `..` component, no trailing slash, no
+/// NUL, and shorter than the Linux `PATH_MAX`.
+fn clean_abs(p: &Path) -> bool {
+    let b = p.as_os_str().as_bytes();
+    b.len() > 1
+        && b.len() < 4096
+        && b[0] == b'/'
+        && !b.contains(&0)
+        && b[1..]
+            .split(|&c| c == b'/')
+            .all(|s| !s.is_empty() && s != b"." && s != b"..")
+}
+
+/// The runtime part: handlers, driver, the wait for ready, serving, and the stop.
+async fn run(loaded: Loaded, log: Log) -> u8 {
+    let Loaded { proxy, kernel } = loaded;
+    let signals = match Signals::install() {
+        Ok(signals) => signals,
+        Err(_) => {
+            log.line("start: cannot install the signal handlers");
+            return EXIT_FAILED;
+        }
+    };
+    let wait_queue = kernel.wait_queue;
+    let kill_grace = kernel.kill_grace;
+    let driver = match driver::start(kernel, proxy.drive_slice, log.clone()) {
+        Ok(driver) => driver,
+        Err(text) => {
+            log.line(&format!("start: cannot start the driver: {text}"));
+            return EXIT_FAILED;
+        }
+    };
+    let Driver {
+        ingress,
+        ready,
+        failed,
+        end,
+    } = driver;
+    let mut waits = Waits::new(signals, ready, failed, end);
+    let cause = until_stop(&mut waits, &proxy, wait_queue, &ingress, &log).await;
+    stop(waits, cause, ingress, &proxy, kill_grace, &log).await
+}
+
+/// Waits for the kernel, binds, and accepts until something asks for a stop. Returns that cause.
+async fn until_stop(
+    waits: &mut Waits,
+    proxy: &ProxyConfig,
+    wait_queue: usize,
+    ingress: &SyncSender<Msg>,
+    log: &Log,
+) -> Cause {
+    let Some(ready_by) = Instant::now().checked_add(proxy.ready_wait) else {
+        return Cause::Late;
+    };
+    loop {
+        match waits.wait(Some(ready_by)).await {
+            Event::Ready(Ok(())) => break,
+            event => {
+                if let Some(cause) = Cause::of(event) {
+                    return cause;
+                }
+            }
+        }
+    }
+    log.line("start: the kernel is ready");
+
+    let listener = match TcpListener::bind(proxy.listen).await {
+        Ok(listener) => listener,
+        Err(_) => return Cause::Bind,
+    };
+    let ctx = Arc::new(Ctx {
+        cfg: proxy.clone(),
+        budget: Arc::new(Semaphore::new(proxy.max_buffered_bytes)),
+        inspect: Arc::new(Semaphore::new(wait_queue)),
+        log: log.clone(),
+    });
+    let permits = Arc::new(Semaphore::new(proxy.max_conns));
+    waits.accept = Some(Acceptor::new(listener, permits));
+    log.line("start: listening");
+
+    loop {
+        match waits.wait(None).await {
+            Event::Conn(sock, peer, permit) => {
+                spawn_connection(&mut waits.conns, sock, peer, permit, &ctx, ingress, log);
+            }
+            Event::AcceptErr(Some(errno)) => log.line(&format!("accept: failed, errno {errno}")),
+            Event::AcceptErr(None) => log.line("accept: failed"),
+            Event::Joined(done) => note_joined(done, log),
+            event => {
+                if let Some(cause) = Cause::of(event) {
+                    return cause;
+                }
+            }
+        }
+    }
+}
+
+/// Starts one connection. The permit lives as long as the connection and goes back when it ends or is aborted.
+fn spawn_connection(
+    conns: &mut JoinSet<()>,
+    sock: TcpStream,
+    peer: SocketAddr,
+    permit: OwnedSemaphorePermit,
+    ctx: &Arc<Ctx>,
+    ingress: &SyncSender<Msg>,
+    log: &Log,
+) {
+    let local = match (sock.set_nodelay(true), sock.local_addr()) {
+        (Ok(()), Ok(local)) => local,
+        _ => {
+            log.line("accept: the connection is not usable");
+            return;
+        }
+    };
+    let ctx = ctx.clone();
+    let ingress = ingress.clone();
+    conns.spawn(async move {
+        let _permit = permit;
+        front::serve(sock, peer, local, ctx, ingress).await;
+    });
+}
+
+fn note_joined(done: Result<(), JoinError>, log: &Log) {
+    if let Err(e) = done
+        && e.is_panic()
+    {
+        log.line("connection: a connection panicked");
+    }
+}
+
+/// Whether the accept error means the system is out of descriptors, memory or buffers.
+fn is_resource_error(errno: i32) -> bool {
+    matches!(errno, ENOMEM | ENFILE | EMFILE | ENOBUFS)
+}
+
+/// The driver's end counts as clean only for a stopped kernel whose child exit and directory removal are
+/// confirmed.
+fn clean_shutdown(end: &End) -> bool {
+    matches!(end, End::Done(done)
+        if done.phase == Phase::Stopped && done.exit_confirmed && done.dir_removed)
+}
+
+/// Why the process stops.
+enum Cause {
+    Signal(&'static str),
+    /// The kernel failed (before ready, or after).
+    Failed(Failure),
+    /// The driver ended without being told to.
+    Ended(End),
+    /// A channel closed without an answer.
+    Lost(Source),
+    /// The kernel was not ready within `ready_wait`.
+    Late,
+    Bind,
+}
+
+impl Cause {
+    /// The cause that an event stands for, or none if the event only keeps the process going.
+    fn of(event: Event) -> Option<Cause> {
+        match event {
+            Event::Signal(name) => Some(Cause::Signal(name)),
+            Event::Ready(Err(failure)) | Event::Failed(failure) => Some(Cause::Failed(failure)),
+            Event::Ended(end) => Some(Cause::Ended(end)),
+            Event::Lost(source) => Some(Cause::Lost(source)),
+            Event::Late => Some(Cause::Late),
+            Event::Ready(Ok(())) | Event::Conn(..) | Event::AcceptErr(_) | Event::Joined(_) => None,
+        }
+    }
+}
+
+/// What the stop learned while it ran.
+struct Stop {
+    /// The stop was caused by a failure: the exit code is 1 whatever the driver reports.
+    fault: bool,
+    ended: Option<End>,
+    end_lost: bool,
+}
+
+impl Stop {
+    fn begin(cause: Cause, log: &Log) -> Stop {
+        let mut stop = Stop {
+            fault: true,
+            ended: None,
+            end_lost: false,
+        };
+        match cause {
+            Cause::Signal(name) => {
+                stop.fault = false;
+                log.line(&format!("stop: {name}"));
+            }
+            Cause::Failed(failure) => log.line(&format!("stop: the kernel failed: {failure:?}")),
+            Cause::Ended(end) => {
+                log.line("stop: the driver ended before it was told to stop");
+                stop.ended = Some(end);
+            }
+            Cause::Lost(source) => {
+                log.line(&format!(
+                    "stop: the {} channel closed without an answer",
+                    source.name()
+                ));
+                stop.end_lost = source == Source::End;
+            }
+            Cause::Late => log.line("stop: the kernel was not ready in time"),
+            Cause::Bind => log.line("stop: the listen address cannot be bound"),
+        }
+        stop
+    }
+
+    /// Takes in an event that arrives while the stop runs. Later signals are only logged.
+    fn note(&mut self, event: Event, log: &Log) {
+        match event {
+            Event::Ended(end) => self.ended = Some(end),
+            Event::Lost(Source::End) => self.end_lost = true,
+            Event::Signal(name) => log.line(&format!("stop: {name} again")),
+            Event::Failed(failure) => {
+                log.line(&format!("stop: the kernel failed: {failure:?}"));
+            }
+            Event::Joined(done) => note_joined(done, log),
+            Event::Lost(_)
+            | Event::Ready(_)
+            | Event::Late
+            | Event::Conn(..)
+            | Event::AcceptErr(_) => {}
+        }
+    }
+
+    fn answered(&self) -> bool {
+        self.ended.is_some() || self.end_lost
+    }
+}
+
+/// The stop procedure. `t0` is taken here, at the first cause.
+async fn stop(
+    mut waits: Waits,
+    cause: Cause,
+    ingress: SyncSender<Msg>,
+    proxy: &ProxyConfig,
+    kill_grace: Duration,
+    log: &Log,
+) -> u8 {
+    let t0 = Instant::now();
+    let after = |d: Duration| t0.checked_add(d).unwrap_or(t0);
+    let mut stop = Stop::begin(cause, log);
+
+    // The listener is closed here; a connection that was not accepted yet is never accepted.
+    waits.accept = None;
+
+    // The driver finishes what it holds by `inspect_by`. The channel has room for this message by construction;
+    // if it does not take it, the driver ends when the last connection is gone.
+    let inspect_by = after(proxy.stop_inspect).into_std();
+    if ingress.try_send(Msg::Stop { inspect_by }).is_err() {
+        log.line("stop: the driver did not take the stop message");
+    }
+    drop(ingress);
+
+    // The connections get until `t0 + stop_wait`; what is left is aborted.
+    let abort_at = after(proxy.stop_wait);
+    while !waits.conns.is_empty() {
+        let event = waits.wait(Some(abort_at)).await;
+        if matches!(event, Event::Late) {
+            log.line("stop: the remaining connections are aborted");
+            waits.conns.abort_all();
+            break;
+        }
+        stop.note(event, log);
+    }
+    // Aborted connections are dropped when the runtime next runs them; a connection that does not end by then
+    // is left to the process exit.
+    let end_by = abort_at.checked_add(kill_grace).unwrap_or(abort_at);
+    while let Ok(Some(done)) = timeout_at(end_by, waits.conns.join_next()).await {
+        note_joined(done, log);
+    }
+
+    // The driver's end.
+    while !stop.answered() {
+        let event = waits.wait(Some(end_by)).await;
+        if matches!(event, Event::Late) {
+            log.line("stop: the driver did not answer in time");
+            break;
+        }
+        stop.note(event, log);
+    }
+
+    match &stop.ended {
+        Some(End::Done(done)) => log.line(&format!(
+            "stop: kernel {:?}, bye {}, exit_confirmed {}, dir_removed {}, held_left {}, waiting_left {}, results {}",
+            done.phase,
+            done.bye,
+            done.exit_confirmed,
+            done.dir_removed,
+            done.held_left,
+            done.waiting_left,
+            done.results.len()
+        )),
+        Some(End::Fatal(text)) => log.line(&format!("stop: the driver stopped: {text}")),
+        None => log.line("stop: the driver gave no end"),
+    }
+    let clean = stop.ended.as_ref().is_some_and(clean_shutdown);
+    if !stop.fault && clean {
+        EXIT_OK
+    } else {
+        EXIT_FAILED
+    }
+}
+
+/// The three signal streams. They are created before the driver starts.
+struct Signals {
+    term: Signal,
+    int: Signal,
+    hup: Signal,
+}
+
+impl Signals {
+    fn install() -> io::Result<Signals> {
+        Ok(Signals {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+            hup: signal(SignalKind::hangup())?,
+        })
+    }
+}
+
+/// The channel an answer did not come through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    Ready,
+    Failed,
+    End,
+    Permits,
+}
+
+impl Source {
+    fn name(self) -> &'static str {
+        match self {
+            Source::Ready => "ready",
+            Source::Failed => "failed",
+            Source::End => "end",
+            Source::Permits => "connection permit",
+        }
+    }
+}
+
+/// What ended one wait.
+enum Event {
+    Ready(Result<(), Failure>),
+    Signal(&'static str),
+    Failed(Failure),
+    Ended(End),
+    Lost(Source),
+    /// The deadline of the wait passed.
+    Late,
+    Conn(TcpStream, SocketAddr, OwnedSemaphorePermit),
+    AcceptErr(Option<i32>),
+    Joined(Result<(), JoinError>),
+}
+
+type Acquire = Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, AcquireError>>>>;
+
+/// The accept side: one connection permit first, then the accept it is for.
+struct Acceptor {
+    listener: TcpListener,
+    permits: Arc<Semaphore>,
+    acquire: Option<Acquire>,
+    permit: Option<OwnedSemaphorePermit>,
+    pause: Option<Pin<Box<Sleep>>>,
+}
+
+impl Acceptor {
+    fn new(listener: TcpListener, permits: Arc<Semaphore>) -> Acceptor {
+        Acceptor {
+            listener,
+            permits,
+            acquire: None,
+            permit: None,
+            pause: None,
+        }
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
+        if let Some(pause) = self.pause.as_mut() {
+            if pause.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.pause = None;
+        }
+        let permit = match self.permit.take() {
+            Some(permit) => permit,
+            None => {
+                let permits = &self.permits;
+                let acquire = self
+                    .acquire
+                    .get_or_insert_with(|| Box::pin(permits.clone().acquire_owned()));
+                match acquire.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(permit)) => {
+                        self.acquire = None;
+                        permit
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(Event::Lost(Source::Permits)),
+                }
+            }
+        };
+        match self.listener.poll_accept(cx) {
+            Poll::Pending => {
+                self.permit = Some(permit);
+                Poll::Pending
+            }
+            Poll::Ready(Ok((sock, peer))) => Poll::Ready(Event::Conn(sock, peer, permit)),
+            Poll::Ready(Err(e)) => {
+                self.permit = Some(permit);
+                let errno = e.raw_os_error();
+                if errno.is_some_and(is_resource_error) {
+                    self.pause = Some(Box::pin(sleep(ACCEPT_PAUSE)));
+                }
+                Poll::Ready(Event::AcceptErr(errno))
+            }
+        }
+    }
+}
+
+/// Everything main waits for, behind one poll. The order of the polls is the order of precedence: the driver's
+/// answers and the signals before the connections that ended, those before the next accept.
+struct Waits {
+    term: Signal,
+    int: Signal,
+    hup: Signal,
+    ready: Option<oneshot::Receiver<Result<(), Failure>>>,
+    failed: Option<oneshot::Receiver<Failure>>,
+    end: Option<oneshot::Receiver<End>>,
+    accept: Option<Acceptor>,
+    conns: JoinSet<()>,
+}
+
+impl Waits {
+    fn new(
+        signals: Signals,
+        ready: oneshot::Receiver<Result<(), Failure>>,
+        failed: oneshot::Receiver<Failure>,
+        end: oneshot::Receiver<End>,
+    ) -> Waits {
+        Waits {
+            term: signals.term,
+            int: signals.int,
+            hup: signals.hup,
+            ready: Some(ready),
+            failed: Some(failed),
+            end: Some(end),
+            accept: None,
+            conns: JoinSet::new(),
+        }
+    }
+
+    /// The next event, or `Event::Late` at `by`. A channel that answered or closed is not polled again.
+    async fn wait(&mut self, by: Option<Instant>) -> Event {
+        let next = poll_fn(|cx| self.poll(cx));
+        match by {
+            Some(by) => timeout_at(by, next).await.unwrap_or(Event::Late),
+            None => next.await,
+        }
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
+        if let Some(ready) = self.ready.as_mut()
+            && let Poll::Ready(answer) = Pin::new(ready).poll(cx)
+        {
+            self.ready = None;
+            return Poll::Ready(answer.map_or(Event::Lost(Source::Ready), Event::Ready));
+        }
+        for (name, stream) in [
+            ("SIGTERM", &mut self.term),
+            ("SIGINT", &mut self.int),
+            ("SIGHUP", &mut self.hup),
+        ] {
+            if stream.poll_recv(cx).is_ready() {
+                return Poll::Ready(Event::Signal(name));
+            }
+        }
+        if let Some(failed) = self.failed.as_mut()
+            && let Poll::Ready(answer) = Pin::new(failed).poll(cx)
+        {
+            self.failed = None;
+            return Poll::Ready(answer.map_or(Event::Lost(Source::Failed), Event::Failed));
+        }
+        if let Some(end) = self.end.as_mut()
+            && let Poll::Ready(answer) = Pin::new(end).poll(cx)
+        {
+            self.end = None;
+            return Poll::Ready(answer.map_or(Event::Lost(Source::End), Event::Ended));
+        }
+        if let Poll::Ready(Some(done)) = self.conns.poll_join_next(cx) {
+            return Poll::Ready(Event::Joined(done));
+        }
+        match self.accept.as_mut() {
+            Some(accept) => accept.poll(cx),
+            None => Poll::Pending,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::sync_channel;
+    use std::thread;
+    use tokio::runtime::{Builder, Runtime};
+    use tukuyomi_kernel::Shutdown;
+
+    fn runtime() -> Runtime {
+        Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    struct Fixture {
+        waits: Waits,
+        ready: oneshot::Sender<Result<(), Failure>>,
+        failed: oneshot::Sender<Failure>,
+        end: oneshot::Sender<End>,
+    }
+
+    /// Needs a runtime to be entered.
+    fn fixture() -> Fixture {
+        let (ready, ready_rx) = oneshot::channel();
+        let (failed, failed_rx) = oneshot::channel();
+        let (end, end_rx) = oneshot::channel();
+        Fixture {
+            waits: Waits::new(Signals::install().unwrap(), ready_rx, failed_rx, end_rx),
+            ready,
+            failed,
+            end,
+        }
+    }
+
+    fn after(ms: u64) -> Option<Instant> {
+        Some(Instant::now() + Duration::from_millis(ms))
+    }
+
+    fn shutdown(phase: Phase, confirmed: bool, removed: bool) -> End {
+        End::Done(Shutdown {
+            results: Vec::new(),
+            phase,
+            bye: true,
+            exit_confirmed: confirmed,
+            dir_removed: removed,
+            held_left: 0,
+            waiting_left: 0,
+        })
+    }
+
+    #[test]
+    fn only_a_stopped_confirmed_removed_kernel_is_a_clean_end() {
+        assert!(clean_shutdown(&shutdown(Phase::Stopped, true, true)));
+        assert!(!clean_shutdown(&shutdown(Phase::Stopped, false, true)));
+        assert!(!clean_shutdown(&shutdown(Phase::Stopped, true, false)));
+        assert!(!clean_shutdown(&shutdown(Phase::Ready, true, true)));
+        assert!(!clean_shutdown(&shutdown(Phase::Stopping, true, true)));
+        assert!(!clean_shutdown(&shutdown(
+            Phase::Failed(Failure::ReapUnknown),
+            true,
+            true
+        )));
+        assert!(!clean_shutdown(&End::Fatal(
+            "result for an unknown request"
+        )));
+    }
+
+    #[test]
+    fn the_configuration_argument_is_an_absolute_clean_path() {
+        for good in ["/c", "/etc/proxy/config.json", "/a.b/c-d", "/..c"] {
+            assert!(clean_abs(Path::new(good)), "{good:?}");
+        }
+        for bad in [
+            "", "/", "c", "c.json", "/c/", "/c//d", "/c/./d", "/c/../d", "/c\0d", "//c",
+        ] {
+            assert!(!clean_abs(Path::new(bad)), "{bad:?}");
+        }
+        assert!(clean_abs(Path::new(&format!("/{}", "a".repeat(4094)))));
+        assert!(!clean_abs(Path::new(&format!("/{}", "a".repeat(4095)))));
+    }
+
+    #[test]
+    fn only_running_out_of_a_resource_pauses_the_accept_loop() {
+        for errno in [12, 23, 24, 105] {
+            assert!(is_resource_error(errno), "{errno}");
+        }
+        // EAGAIN, EINTR, ECONNABORTED, EPROTO, EINVAL, EBADF
+        for errno in [11, 4, 103, 71, 22, 9, 0, 104, 106] {
+            assert!(!is_resource_error(errno), "{errno}");
+        }
+    }
+
+    #[test]
+    fn a_wait_returns_what_the_driver_answered_once() {
+        runtime().block_on(async {
+            let mut f = fixture();
+            f.ready.send(Ok(())).unwrap();
+            assert!(matches!(
+                f.waits.wait(after(2000)).await,
+                Event::Ready(Ok(()))
+            ));
+            // The answered channel is not polled again: the next wait runs to its deadline.
+            assert!(matches!(f.waits.wait(after(30)).await, Event::Late));
+
+            let mut f = fixture();
+            f.ready.send(Err(Failure::BudgetExhausted)).unwrap();
+            assert!(matches!(
+                f.waits.wait(after(2000)).await,
+                Event::Ready(Err(Failure::BudgetExhausted))
+            ));
+
+            let mut f = fixture();
+            drop(f.ready);
+            assert!(matches!(
+                f.waits.wait(after(2000)).await,
+                Event::Lost(Source::Ready)
+            ));
+
+            let mut f = fixture();
+            f.failed.send(Failure::ReapUnknown).unwrap();
+            assert!(matches!(
+                f.waits.wait(after(2000)).await,
+                Event::Failed(Failure::ReapUnknown)
+            ));
+            assert!(matches!(f.waits.wait(after(30)).await, Event::Late));
+
+            let mut f = fixture();
+            f.end.send(End::Fatal("x")).unwrap();
+            assert!(matches!(
+                f.waits.wait(after(2000)).await,
+                Event::Ended(End::Fatal("x"))
+            ));
+            drop(f.failed);
+            assert!(matches!(
+                f.waits.wait(after(2000)).await,
+                Event::Lost(Source::Failed)
+            ));
+        });
+    }
+
+    #[test]
+    fn a_wait_ends_late_at_its_deadline_and_not_before() {
+        runtime().block_on(async {
+            let mut f = fixture();
+            let start = Instant::now();
+            assert!(matches!(f.waits.wait(after(80)).await, Event::Late));
+            let spent = start.elapsed();
+            assert!(spent >= Duration::from_millis(80) && spent < Duration::from_secs(5));
+            // A deadline that has passed still returns an answer that is already there.
+            f.ready.send(Ok(())).unwrap();
+            let passed = Instant::now().checked_sub(Duration::from_millis(5));
+            assert!(matches!(f.waits.wait(passed).await, Event::Ready(Ok(()))));
+        });
+    }
+
+    #[test]
+    fn a_connection_permit_is_taken_before_accept() {
+        runtime().block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let permits = Arc::new(Semaphore::new(1));
+            let mut f = fixture();
+            f.waits.accept = Some(Acceptor::new(listener, permits.clone()));
+            let _first = TcpStream::connect(addr).await.unwrap();
+            let _second = TcpStream::connect(addr).await.unwrap();
+
+            let Event::Conn(_, _, permit) = f.waits.wait(after(5000)).await else {
+                panic!("the first connection was not accepted");
+            };
+            assert_eq!(permits.available_permits(), 0);
+            // The second connection waits in the backlog: no permit, no accept.
+            assert!(matches!(f.waits.wait(after(150)).await, Event::Late));
+            drop(permit);
+            assert!(matches!(f.waits.wait(after(5000)).await, Event::Conn(..)));
+        });
+    }
+
+    #[test]
+    fn a_stop_cause_comes_before_a_waiting_connection() {
+        runtime().block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut f = fixture();
+            f.waits.accept = Some(Acceptor::new(listener, Arc::new(Semaphore::new(4))));
+            let _client = TcpStream::connect(addr).await.unwrap();
+            f.failed.send(Failure::BudgetExhausted).unwrap();
+            assert!(matches!(f.waits.wait(after(5000)).await, Event::Failed(_)));
+            assert!(matches!(f.waits.wait(after(5000)).await, Event::Conn(..)));
+        });
+    }
+
+    fn proxy_config(stop_inspect_ms: u64, stop_wait_ms: u64) -> ProxyConfig {
+        let loaded = config_for_tests();
+        ProxyConfig {
+            stop_inspect: Duration::from_millis(stop_inspect_ms),
+            stop_wait: Duration::from_millis(stop_wait_ms),
+            ..loaded
+        }
+    }
+
+    fn config_for_tests() -> ProxyConfig {
+        let any: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let ms = Duration::from_millis;
+        ProxyConfig {
+            listen: any,
+            upstream: any,
+            max_conns: 1,
+            max_head_bytes: 1024,
+            max_body: 0,
+            max_body_wire: 0,
+            max_buffered_bytes: 0,
+            upstream_max_headers: 1,
+            upstream_max_head_bytes: 8192,
+            upstream_head_wire: 16384,
+            drive_slice: ms(1),
+            ready_wait: ms(1),
+            head_read: ms(1),
+            body_read: ms(1),
+            inspect_wait: ms(1),
+            upstream_connect: ms(1),
+            upstream_header: ms(1),
+            request_total: ms(1),
+            response_idle: ms(1),
+            conn_total: ms(1),
+            stop_inspect: ms(1),
+            stop_wait: ms(1),
+        }
+    }
+
+    /// A stand-in driver thread: takes the stop message, then ends as `end` says.
+    fn driver_thread(
+        end: Option<End>,
+        end_tx: oneshot::Sender<End>,
+    ) -> (
+        SyncSender<Msg>,
+        thread::JoinHandle<Option<std::time::Instant>>,
+    ) {
+        let (tx, rx) = sync_channel::<Msg>(2);
+        let handle = thread::spawn(move || {
+            let inspect_by = match rx.recv() {
+                Ok(Msg::Stop { inspect_by }) => Some(inspect_by),
+                _ => None,
+            };
+            if let Some(end) = end {
+                let _ = end_tx.send(end);
+            }
+            inspect_by
+        });
+        (tx, handle)
+    }
+
+    #[test]
+    fn the_stop_gives_the_driver_its_deadline_and_exits_zero_after_a_clean_end() {
+        let log = log::start_logger().unwrap();
+        runtime().block_on(async {
+            let f = fixture();
+            let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
+            let before = std::time::Instant::now();
+            let code = stop(
+                f.waits,
+                Cause::Signal("SIGTERM"),
+                tx,
+                &proxy_config(700, 2000),
+                Duration::from_millis(500),
+                &log,
+            )
+            .await;
+            assert_eq!(code, EXIT_OK);
+            let inspect_by = driver.join().unwrap().expect("the stop message");
+            assert!(inspect_by >= before + Duration::from_millis(700));
+            assert!(inspect_by <= std::time::Instant::now() + Duration::from_millis(700));
+        });
+    }
+
+    #[test]
+    fn the_stop_exits_one_unless_the_end_is_clean_and_the_cause_is_not_a_failure() {
+        let log = log::start_logger().unwrap();
+        let cfg = proxy_config(10, 100);
+        let grace = Duration::from_millis(50);
+        runtime().block_on(async {
+            // A kernel that did not stop cleanly.
+            for end in [
+                shutdown(Phase::Failed(Failure::CleanupUnknown), true, true),
+                shutdown(Phase::Stopped, false, true),
+                shutdown(Phase::Stopped, true, false),
+                End::Fatal("result for an unknown request"),
+            ] {
+                let f = fixture();
+                let (tx, driver) = driver_thread(Some(end), f.end);
+                assert_eq!(
+                    stop(f.waits, Cause::Signal("SIGINT"), tx, &cfg, grace, &log).await,
+                    EXIT_FAILED
+                );
+                driver.join().unwrap();
+            }
+            // A failure as the cause, although the driver ends cleanly.
+            for cause in [
+                Cause::Failed(Failure::BudgetExhausted),
+                Cause::Late,
+                Cause::Bind,
+                Cause::Lost(Source::Ready),
+            ] {
+                let f = fixture();
+                let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
+                assert_eq!(
+                    stop(f.waits, cause, tx, &cfg, grace, &log).await,
+                    EXIT_FAILED
+                );
+                driver.join().unwrap();
+            }
+            // The driver gone without an end.
+            let f = fixture();
+            let (tx, driver) = driver_thread(None, f.end);
+            assert_eq!(
+                stop(f.waits, Cause::Signal("SIGHUP"), tx, &cfg, grace, &log).await,
+                EXIT_FAILED
+            );
+            driver.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn the_stop_gives_up_on_a_driver_that_never_answers_after_the_grace() {
+        let log = log::start_logger().unwrap();
+        runtime().block_on(async {
+            let f = fixture();
+            let (tx, _rx) = sync_channel::<Msg>(2);
+            let start = Instant::now();
+            let code = stop(
+                f.waits,
+                Cause::Signal("SIGTERM"),
+                tx,
+                &proxy_config(10, 100),
+                Duration::from_millis(100),
+                &log,
+            )
+            .await;
+            let spent = start.elapsed();
+            assert_eq!(code, EXIT_FAILED);
+            assert!(spent >= Duration::from_millis(200) && spent < Duration::from_secs(5));
+            drop(f.end);
+        });
+    }
+
+    #[test]
+    fn the_stop_aborts_connections_that_outlive_it() {
+        let log = log::start_logger().unwrap();
+        runtime().block_on(async {
+            let mut f = fixture();
+            f.waits.conns.spawn(std::future::pending());
+            let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
+            let start = Instant::now();
+            let code = stop(
+                f.waits,
+                Cause::Signal("SIGTERM"),
+                tx,
+                &proxy_config(10, 150),
+                Duration::from_millis(100),
+                &log,
+            )
+            .await;
+            let spent = start.elapsed();
+            assert_eq!(code, EXIT_OK);
+            assert!(spent >= Duration::from_millis(150) && spent < Duration::from_secs(5));
+            driver.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn the_stop_waits_for_connections_that_end_by_themselves() {
+        let log = log::start_logger().unwrap();
+        runtime().block_on(async {
+            let mut f = fixture();
+            f.waits.conns.spawn(sleep(Duration::from_millis(100)));
+            let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
+            let start = Instant::now();
+            let code = stop(
+                f.waits,
+                Cause::Signal("SIGTERM"),
+                tx,
+                &proxy_config(10, 3000),
+                Duration::from_millis(100),
+                &log,
+            )
+            .await;
+            let spent = start.elapsed();
+            assert_eq!(code, EXIT_OK);
+            assert!(spent >= Duration::from_millis(100) && spent < Duration::from_millis(2500));
+            driver.join().unwrap();
+        });
+    }
+}

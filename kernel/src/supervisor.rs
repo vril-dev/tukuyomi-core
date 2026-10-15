@@ -38,7 +38,9 @@ const POLL: Duration = Duration::from_millis(5);
 /// A request number: from 0, one at a time, never used again by the same `Supervisor`.
 pub type ReqId = u64;
 
-/// One request to inspect, exactly as it will be forwarded. Allow is a verdict on these bytes only.
+/// One request to inspect. Allow is a verdict on these bytes only; the host forwards these bytes and nothing
+/// else, except the changes its own contract lists (removed hop-by-hop fields, added forwarding fields, the framing
+/// it writes).
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
     pub client_addr: &'a [u8],
@@ -59,7 +61,12 @@ pub struct Request<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Allow,
-    Block { phase: u8, rule_id: i64 },
+    Block {
+        phase: u8,
+        rule_id: i64,
+        /// The value the inspector sent, as it is. The host checks it as an HTTP status.
+        status: u16,
+    },
     Uninspectable(Reason),
 }
 
@@ -213,6 +220,16 @@ enum StopTag {
 /// confirmed and the supervisor stops as failed), and does not reap the child of this supervisor by a signal handler,
 /// `wait`, `waitpid`, `waitid` (a wait for any child, such as `waitpid(-1)`, can reap it) or any other mechanism
 /// of its own; waiting by pid for its own unrelated children is fine.
+///
+/// What the caller can rely on, and what it cannot: `poll(until)` with an `until` that has already passed writes
+/// at most one frame but reads none (the wait for the first byte is over before it begins), so a caller must not
+/// repeat only `poll` calls whose `until` is not after the current time: nothing is read from the inspector that way;
+/// `cancel` does not change a result that is already decided and not yet delivered (`Allow` included), which comes
+/// out once as it is; `shutdown` returns every result not delivered before in its `Shutdown.results`;
+/// `Phase::Stopping` does not tell a stop for a restart from the stop of a `shutdown`; the stage of a request from
+/// the continue of phase 1 until the writer takes BODY_END has no verdict deadline (`verdict_wait` counts from the
+/// take of TX_BEGIN and from the take of BODY_END, and every frame write is cut at `frame_io`, but the stage as a
+/// whole has no deadline), so the host keeps the limit for the whole stage and calls `cancel` when it has passed.
 pub struct Supervisor {
     cfg: Config,
     engine: Engine,
@@ -247,8 +264,12 @@ fn verdict_of(d: Decision) -> Verdict {
         Decision::Block {
             phase,
             rule_id,
-            status: _,
-        } => Verdict::Block { phase, rule_id },
+            status,
+        } => Verdict::Block {
+            phase,
+            rule_id,
+            status,
+        },
         Decision::ClientDisconnect => Verdict::Uninspectable(Reason::Cancelled),
         Decision::Uninspectable(why) => Verdict::Uninspectable(match why {
             Why::Invalid => Reason::Invalid,
@@ -1161,10 +1182,11 @@ mod tests {
             }),
             Verdict::Block {
                 phase: 2,
-                rule_id: 9202
+                rule_id: 9202,
+                status: 403
             }
         );
-        // the status of the block is dropped
+        // the status is passed on as it is, a value that is no HTTP status too
         assert_eq!(
             verdict_of(Decision::Block {
                 phase: 1,
@@ -1173,7 +1195,8 @@ mod tests {
             }),
             Verdict::Block {
                 phase: 1,
-                rule_id: -1
+                rule_id: -1,
+                status: 0
             }
         );
         assert_eq!(
