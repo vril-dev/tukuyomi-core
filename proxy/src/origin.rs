@@ -261,8 +261,10 @@ fn single<'a>(
 }
 
 /// Checks the head of the final response and takes out what belongs to the connection with the upstream.
-/// `head_request` is true when the request was a HEAD request. The checked `Content-Length` stays for a HEAD
-/// request and for 304 only; otherwise it goes, and hyper sets it from the body it sends.
+/// `head_request` is true when the request was a HEAD request. The checked `Content-Length` of the upstream stays
+/// in the head for a HEAD request and for a 304 only; otherwise it goes, and hyper sets the length from the body it
+/// sends. hyper's server writes a kept length only in the answer to a HEAD request: a 304 to any other request goes
+/// out without one.
 fn check_head(parts: &mut Parts, head_request: bool) -> Result<(), OriginError> {
     if !(200..=599).contains(&parts.status.as_u16()) {
         return Err(OriginError::Invalid);
@@ -1364,8 +1366,10 @@ mod tests {
         assert_eq!(kept(404, false), 0);
     }
 
+    /// Reads the bytes of an upstream through `forward` and checks the head and the body that it returns, not what
+    /// a client reads: `hyper_writes_the_kept_length_only_in_an_answer_to_head` serves such a response.
     #[test]
-    fn content_length_stays_for_head_and_304_and_goes_otherwise_on_the_wire() {
+    fn forward_keeps_the_upstream_length_in_the_head_it_returns_only_for_head_and_304() {
         run(async {
             let cases: [LengthCase; 4] = [
                 (
@@ -1440,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn hyper_serves_head_and_304_answers_that_keep_their_length() {
+    fn hyper_writes_the_kept_length_only_in_an_answer_to_head() {
         run(async {
             // hyper's server writes the length that a HEAD answer carries, whatever its status, and for a 200 answer
             // the length of the body it is given. For a 204 or 304 answer to any other request it writes none.

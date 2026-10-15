@@ -565,7 +565,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::fs::{self, DirBuilder};
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     use tokio::sync::Semaphore;
@@ -1582,14 +1582,31 @@ mod tests {
         }
     }
 
+    /// A fresh 0700 directory, removed with everything in it when dropped.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A new 0700 directory `parent/name-<process id>`.
-    fn scratch(parent: &Path, name: &str) -> PathBuf {
+    fn scratch(parent: &Path, name: &str) -> TestDir {
         let dir = parent.join(format!("{name}-{}", std::process::id()));
         DirBuilder::new()
             .mode(0o700)
             .create(&dir)
             .unwrap_or_else(|e| panic!("cannot create {dir:?}: {e}"));
-        dir
+        // A umask can only remove bits; make the mode exactly 0700.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        TestDir(dir)
     }
 
     #[test]
@@ -1656,11 +1673,11 @@ mod tests {
     #[test]
     fn start_returns_before_the_kernel_is_ready_and_a_stop_ends_a_start_that_never_said_hello() {
         let base = scratch(&std::env::temp_dir(), "driver-silent");
-        let root = base.join("root");
+        let root = base.path().join("root");
         DirBuilder::new().mode(0o700).create(&root).unwrap();
         // An inspector that is started and never speaks: the shell becomes `sleep`, so the kernel's own
         // kill ends it.
-        let script = base.join("silent.sh");
+        let script = base.path().join("silent.sh");
         fs::write(&script, "exec /bin/sleep 120\n").unwrap();
         let mut cfg = config(&root);
         cfg.inspector = PathBuf::from("/bin/sh");
@@ -1687,18 +1704,17 @@ mod tests {
             End::Fatal(why) => panic!("fatal: {why}"),
         }
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
-        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
     fn the_core_follows_the_incarnations_of_a_kernel_that_restarts_every_window() {
         let base = scratch(&std::env::temp_dir(), "driver-restart");
-        let root = base.join("root");
+        let root = base.path().join("root");
         DirBuilder::new().mode(0o700).create(&root).unwrap();
         // Every start fails, for the inspector is not there. One restart is allowed in a window of 50 ms, so the
         // kernel waits for the window and never fails.
         let mut cfg = config(&root);
-        cfg.inspector = base.join("missing");
+        cfg.inspector = base.path().join("missing");
         (cfg.restarts, cfg.restart_window) = (1, 50 * MS);
         let (tx, rx) = sync_channel(2);
         let mut core = Core::new(
@@ -1735,7 +1751,6 @@ mod tests {
         assert_eq!(done.phase, Phase::Stopped);
         assert!(done.exit_confirmed && done.dir_removed);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
-        fs::remove_dir_all(&base).unwrap();
     }
 
     // ---- with a built inspector ----
@@ -1763,7 +1778,7 @@ mod tests {
     #[ignore = "needs a built inspector"]
     fn a_real_inspector_allows_a_plain_get_blocks_the_uri_rule_and_stops_cleanly() {
         let root = scratch(Path::new(&var("TUKUYOMI_TEST_TMP")), "driver-real");
-        let mut cfg = config(&root);
+        let mut cfg = config(root.path());
         cfg.inspector = PathBuf::from(var("TUKUYOMI_TEST_INSPECTOR"));
         cfg.rules = PathBuf::from(var("TUKUYOMI_TEST_RULES"));
         cfg.rules_sha256 = sha256_from_hex(&var("TUKUYOMI_TEST_RULES_SHA256"));
@@ -1806,7 +1821,6 @@ mod tests {
         eventually("failed closes without an answer", || {
             matches!(d.failed.try_recv(), Err(SlotError::Closed))
         });
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
-        fs::remove_dir(&root).unwrap();
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
 }

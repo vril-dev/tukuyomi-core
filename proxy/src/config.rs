@@ -434,6 +434,7 @@ fn build(p: RawProxy, k: RawKernel) -> Result<Loaded, ConfigError> {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","upstream":"127.0.0.1:9000","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":30000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000},"kernel":{"inspector":"/opt/tukuyomi/inspector","rules":"/etc/tukuyomi/rules.conf","rules_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000}}"#;
@@ -1078,21 +1079,38 @@ mod tests {
         assert_eq!(inspect_floor(&huge, slice), None);
     }
 
-    fn scratch() -> PathBuf {
+    /// A fresh 0700 directory under the temp directory (`TMPDIR`), removed with everything in it when dropped.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch() -> TestDir {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
             "tukuyomi-proxy-config-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&dir).unwrap();
-        dir
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        // A umask can only remove bits; make the mode exactly 0700.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        TestDir(dir)
     }
 
     #[test]
     fn load_reads_a_regular_file_of_at_most_64_kib() {
         let dir = scratch();
-        let file = dir.join("config.json");
+        let file = dir.path().join("config.json");
         fs::write(&file, BASE).unwrap();
         assert!(load(&file).is_ok());
 
@@ -1105,13 +1123,12 @@ mod tests {
         );
 
         assert_eq!(
-            load(&dir.join("absent.json")).err(),
+            load(&dir.path().join("absent.json")).err(),
             Some(ConfigError("configuration file cannot be read"))
         );
         assert_eq!(
-            load(&dir).err(),
+            load(dir.path()).err(),
             Some(ConfigError("configuration file is not a regular file"))
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 }
