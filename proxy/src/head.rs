@@ -18,10 +18,13 @@
 //! 6. `Expect` is absent or one line that is exactly `100-continue`.
 //! 7. `Connection` lines are comma separated lists of tokens (no empty element) that do not name `host`,
 //!    `content-length`, `content-type` or `content-encoding`.
-//! 8. `Content-Encoding` is refused. A body that is not empty needs exactly one `Content-Type` that is
-//!    `application/x-www-form-urlencoded`, `multipart/form-data`, `application/json` or `application/<name>+json`
-//!    (the name is described at `inspectable_essence`); for a chunked body the caller applies the same rule once
-//!    the body has been read.
+//! 8. `Content-Encoding` is absent, or one line that is exactly `gzip` (ASCII case ignored); any other value, a
+//!    list and a repeated line are refused with 415. A gzip body that is empty on its face (`Content-Length: 0`,
+//!    or no body framing at all) is refused with 400, for it is not a gzip stream; for a chunked body the caller
+//!    applies that rule once the body has been read. A body that is not empty needs exactly one `Content-Type` that
+//!    is `application/x-www-form-urlencoded`, `multipart/form-data`, `application/json` or
+//!    `application/<name>+json` (the name is described at `inspectable_essence`); for a chunked body the caller
+//!    applies the same rule once the body has been read.
 //!
 //! A refusal is a fixed answer with no body that closes the connection.
 
@@ -127,6 +130,7 @@ pub struct Head {
     fields: Vec<(Range<usize>, Range<usize>)>,
     content_length: Option<u64>,
     chunked: bool,
+    gzip: bool,
     inspectable_type: bool,
 }
 
@@ -154,6 +158,12 @@ impl Head {
     /// The body is chunked (`Transfer-Encoding` is exactly `chunked`).
     pub fn chunked(&self) -> bool {
         self.chunked
+    }
+
+    /// The body is gzip coded (`Content-Encoding` is exactly `gzip`). The caller decodes it before the
+    /// inspection and the forwarding, so the body that is inspected is the decoded one.
+    pub fn gzip(&self) -> bool {
+        self.gzip
     }
 
     /// There is exactly one `Content-Type` and its type is one that the inspection reads (urlencoded,
@@ -457,8 +467,15 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         return Err(Reject::BadRequest);
     }
     // Rule 8.
-    if named(b"content-encoding").next().is_some() {
-        return Err(Reject::UnsupportedMedia);
+    let codings: Vec<&[u8]> = named(b"content-encoding").collect();
+    let gzip = match codings.as_slice() {
+        [] => false,
+        [value] if value.eq_ignore_ascii_case(b"gzip") => true,
+        _ => return Err(Reject::UnsupportedMedia),
+    };
+    // A chunked body is not known to be empty before it has been read; every other body is.
+    if gzip && !chunked && content_length.is_none_or(|n| n == 0) {
+        return Err(Reject::BadRequest);
     }
     let types: Vec<&[u8]> = named(b"content-type").collect();
     let inspectable_type = matches!(types.as_slice(), [value] if inspectable_essence(value));
@@ -474,6 +491,7 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         fields,
         content_length,
         chunked,
+        gzip,
         inspectable_type,
     }))
 }
@@ -981,24 +999,151 @@ mod tests {
     }
 
     #[test]
-    fn content_encoding_is_not_supported() {
-        assert_eq!(
-            refused(&head_with(&["Content-Encoding: gzip"])),
-            Reject::UnsupportedMedia
+    fn content_encoding_is_absent_or_one_line_that_is_gzip() {
+        // Absent: the body is not gzip, whatever else the head says.
+        assert!(!ok(&head_with(&[])).gzip());
+        assert!(!ok(&head_with(&["Content-Length: 1", FORM])).gzip());
+        assert!(!ok(&head_with(&["Transfer-Encoding: chunked", FORM])).gzip());
+        assert!(!ok(&head_with(&["Content-Language: en"])).gzip());
+        // Exactly `gzip`, ASCII case ignored, the blanks around the value dropped; with a length and chunked.
+        for line in [
+            "Content-Encoding: gzip",
+            "content-encoding: GZIP",
+            "CONTENT-ENCODING: GzIp",
+            "Content-Encoding:  gzip \t",
+            "Content-Encoding:\tgzip",
+        ] {
+            let sized = ok(&head_with(&["Content-Length: 1", FORM, line]));
+            assert!(sized.gzip() && !sized.chunked(), "line {line:?}");
+            assert_eq!(sized.content_length(), Some(1), "line {line:?}");
+            let chunked = ok(&head_with(&["Transfer-Encoding: chunked", FORM, line]));
+            assert!(chunked.gzip() && chunked.chunked(), "line {line:?}");
+        }
+        // Any other value is 415: another coding, a list of any length, an empty value, a near miss. The value
+        // decides before the body (or the lack of one) is looked at.
+        for line in [
+            "Content-Encoding: x-gzip",
+            "Content-Encoding: X-GZIP",
+            "Content-Encoding: deflate",
+            "Content-Encoding: br",
+            "Content-Encoding: zstd",
+            "Content-Encoding: identity",
+            "Content-Encoding: compress",
+            "Content-Encoding: x-compress",
+            "Content-Encoding: gzip, gzip",
+            "Content-Encoding: gzip,gzip",
+            "Content-Encoding: gzip, identity",
+            "Content-Encoding: identity, gzip",
+            "Content-Encoding: gzip, br",
+            "Content-Encoding: br, gzip",
+            "Content-Encoding: gzip,",
+            "Content-Encoding: ,gzip",
+            "Content-Encoding:",
+            "Content-Encoding:  \t",
+            "Content-Encoding: gzip;q=1",
+            "Content-Encoding: gzipx",
+            "Content-Encoding: xgzip",
+            "Content-Encoding: gzi",
+            "Content-Encoding: g zip",
+            "Content-Encoding: gzip gzip",
+            "Content-Encoding: \"gzip\"",
+        ] {
+            let sized = head_with(&["Content-Length: 1", FORM, line]);
+            assert_eq!(refused(&sized), Reject::UnsupportedMedia, "line {line:?}");
+            let chunked = head_with(&["Transfer-Encoding: chunked", FORM, line]);
+            assert_eq!(refused(&chunked), Reject::UnsupportedMedia, "line {line:?}");
+            let empty = head_with(&["Content-Length: 0", line]);
+            assert_eq!(refused(&empty), Reject::UnsupportedMedia, "line {line:?}");
+            assert_eq!(
+                refused(&head_with(&[line])),
+                Reject::UnsupportedMedia,
+                "line {line:?}"
+            );
+        }
+        // Two lines are refused whatever they say, in any case of the name.
+        for lines in [
+            &["Content-Encoding: gzip", "Content-Encoding: gzip"],
+            &["Content-Encoding: gzip", "content-encoding: GZIP"],
+            &["Content-Encoding: gzip", "Content-Encoding: identity"],
+            &["Content-Encoding: identity", "Content-Encoding: gzip"],
+            &["Content-Encoding: br", "Content-Encoding: br"],
+        ] {
+            let mut all = vec!["Content-Length: 1", FORM];
+            all.extend_from_slice(lines);
+            assert_eq!(
+                refused(&head_with(&all)),
+                Reject::UnsupportedMedia,
+                "lines {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gzip_body_that_is_empty_on_its_face_is_400() {
+        // No bytes by length or by the lack of any framing: not a gzip stream.
+        for lines in [
+            &["Content-Encoding: gzip", "Content-Length: 0"][..],
+            &["Content-Encoding: gzip", "Content-Length: 0", FORM],
+            &["content-encoding:  GZIP ", "content-length: 000"],
+            &["Content-Encoding: gzip"],
+            &["Content-Encoding: gzip", FORM],
+        ] {
+            assert_eq!(
+                refused(&head_with(lines)),
+                Reject::BadRequest,
+                "lines {lines:?}"
+            );
+        }
+        // One byte is enough to pass the rule, and a chunked body is not known to be empty yet.
+        let sized = ok(&head_with(&[
+            "Content-Encoding: gzip",
+            "Content-Length: 1",
+            FORM,
+        ]));
+        assert!(sized.gzip());
+        let chunked = ok(&head_with(&[
+            "Content-Encoding: gzip",
+            "Transfer-Encoding: chunked",
+            FORM,
+        ]));
+        assert!(chunked.gzip() && chunked.chunked());
+        // The same bodies without the coding are not refused for it.
+        assert!(
+            !ok(&head_with(&["Content-Length: 0"])).gzip() && !ok(&head_with(&[])).gzip(),
+            "an empty body is fine without gzip"
         );
+        // The type rule is the one of a body with a length: a gzip body needs the type of the decoded body.
         assert_eq!(
-            refused(&head_with(&["content-encoding: identity"])),
+            refused(&head_with(&["Content-Encoding: gzip", "Content-Length: 1"])),
             Reject::UnsupportedMedia
         );
         assert_eq!(
             refused(&head_with(&[
                 "Content-Encoding: gzip",
                 "Content-Length: 1",
-                FORM
+                "Content-Type: text/plain"
             ])),
             Reject::UnsupportedMedia
         );
-        ok(&head_with(&["Content-Language: en"]));
+        for essence in [
+            JSON,
+            SUFFIXED,
+            "Content-Type: multipart/form-data; boundary=x",
+        ] {
+            let head = ok(&head_with(&[
+                "Content-Encoding: gzip",
+                "Content-Length: 1",
+                essence,
+            ]));
+            assert!(head.gzip() && head.inspectable_type(), "type {essence:?}");
+        }
+        // A chunked gzip body of another type passes the head and is checked by the caller.
+        let chunked = ok(&head_with(&[
+            "Content-Encoding: gzip",
+            "Transfer-Encoding: chunked",
+            "Content-Type: text/plain",
+        ]));
+        assert!(chunked.gzip() && chunked.chunked() && !chunked.inspectable_type());
     }
 
     #[test]
@@ -1143,9 +1288,14 @@ mod tests {
             "Connection: host",
         ]);
         assert_eq!(refused(&raw), Reject::ContentTooLarge);
-        let raw = head_with(&["Expect: nope", "Connection: host", "Content-Encoding: gzip"]);
+        let raw = head_with(&["Expect: nope", "Connection: host", "Content-Encoding: br"]);
         assert_eq!(refused(&raw), Reject::ExpectationFailed);
-        let raw = head_with(&["Connection: host", "Content-Encoding: gzip"]);
+        let raw = head_with(&["Connection: host", "Content-Encoding: br"]);
+        assert_eq!(refused(&raw), Reject::BadRequest);
+        // Within rule 8 the coding is decided first, then the body that has no bytes, then the body type.
+        let raw = head_with(&["Content-Encoding: br", "Content-Length: 0"]);
+        assert_eq!(refused(&raw), Reject::UnsupportedMedia);
+        let raw = head_with(&["Content-Encoding: gzip", "Content-Length: 0"]);
         assert_eq!(refused(&raw), Reject::BadRequest);
     }
 

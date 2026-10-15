@@ -1,4 +1,4 @@
-//! The single owner of the engine, of the current start and of the restart count.
+//! The single owner of the engine, of the current start and of the times of the restarts.
 //!
 //! One thread drives everything. `poll` and `shutdown` repeat `step`: the engine's clock and halt are looked at
 //! first, then at most one frame is written (the engine's frames, and DRAIN through the same writer), then at most
@@ -8,6 +8,11 @@
 //! the wait of a request from its `submit` (also across a restart), the wait for BYE from DRAIN. A sum that does
 //! not fit in an `Instant` is a deadline that has passed. Once `shutdown` was called, every wait a step creates
 //! (a send, a read, the wait for the exit) is cut at its deadline.
+//!
+//! Restarts are counted in a sliding window (`Config::restarts` within `Config::restart_window`). When the window
+//! is full the next start waits, without a process and without failing, until the oldest restart is a whole window
+//! old; the requests meanwhile wait for their own deadlines. With `restarts` 0 nothing is restarted: the first
+//! start that ends, unless `shutdown` ended it, fails the supervisor.
 //!
 //! Trusted connection generation: the run number and the incarnation of the `Start` that owns the stream. A frame
 //! with another run or incarnation is a fault of the whole connection and never reaches the engine; the old
@@ -19,6 +24,7 @@
 //! (state.rs).
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::mem;
 use std::ops::ControlFlow::{self, Break, Continue};
@@ -98,6 +104,7 @@ pub enum Failure {
     TmpDir(&'static str),
     Hello(&'static str),
     Exit(i32),
+    /// A start ended or could not be made, and `restarts` is 0: no restart is allowed.
     BudgetExhausted,
     ReapUnknown,
     CleanupUnknown,
@@ -118,6 +125,8 @@ pub enum Phase {
 pub struct Status {
     pub phase: Phase,
     pub inc: u32,
+    /// The restarts made in all (saturating): the first start is not counted, a try to start that failed is. Not
+    /// the number within the window, and not one that is still waiting for the window.
     pub restarts: u32,
     pub waiting: usize,
     pub held: usize,
@@ -200,6 +209,15 @@ enum Next {
     Fail(Failure),
 }
 
+/// What the restart window says to a restart that is wanted.
+#[derive(Debug, PartialEq, Eq)]
+enum Slot {
+    /// There is room: the time was recorded and the start may go ahead.
+    Now,
+    /// The window is full: no start before this time.
+    Wait(Instant),
+}
+
 /// The three ways a stop can end, for `apply_stop`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StopTag {
@@ -209,7 +227,7 @@ enum StopTag {
 }
 
 /// Starts, feeds and stops one inspector process, and owns what that takes: the engine, the current start and
-/// the restart count.
+/// the times of the restarts.
 ///
 /// What the caller must hold to: one thread uses it; it moves only while `poll` or `shutdown` runs, so a deadline
 /// that passes between two calls is found, as expired and never as a permission, by the next call; call
@@ -236,8 +254,12 @@ pub struct Supervisor {
     /// The run number, chosen once before the first start.
     run_id: Option<u64>,
     run: Run,
-    /// Restarts used; the first start is not counted, a failed retry is.
+    /// Restarts made in all (what `Status` reports); the first start is not counted, a failed retry is.
     restarts: u32,
+    /// The times of the restarts that can still be inside the window, oldest first: at most `cfg.restarts`.
+    restart_times: VecDeque<Instant>,
+    /// Set while the window is full: `Down` starts nothing before this time.
+    not_before: Option<Instant>,
     /// `None` until the first `shutdown`; then that call's deadline.
     shutdown_by: Option<Instant>,
 }
@@ -246,6 +268,26 @@ pub struct Supervisor {
 fn bounded(t: Instant, d: Duration, cap: Option<Instant>) -> Instant {
     let x = t.checked_add(d).unwrap_or(t);
     cap.map_or(x, |c| x.min(c))
+}
+
+/// The restart window for a restart wanted at `now`. A record that is a whole `window` old is dropped (a sum that
+/// does not fit in an `Instant` has passed, as in `bounded`). With fewer than `limit` records left, `now` is
+/// recorded and the restart may go ahead. Otherwise it must wait until the oldest record is a whole `window` old;
+/// that time is after `now`, because a record that is that old has been dropped. `times` is oldest first because
+/// `now` never goes back. With a `limit` of 0 nothing is ever recorded and the wait is a whole window from `now`,
+/// again and again: `next` never asks for a restart then.
+fn restart_slot(times: &mut VecDeque<Instant>, now: Instant, limit: u32, window: Duration) -> Slot {
+    while times
+        .front()
+        .is_some_and(|&t| bounded(t, window, None) <= now)
+    {
+        times.pop_front();
+    }
+    if u32::try_from(times.len()).is_ok_and(|n| n < limit) {
+        times.push_back(now);
+        return Slot::Now;
+    }
+    Slot::Wait(bounded(times.front().copied().unwrap_or(now), window, None))
 }
 
 fn wire_kind(k: OutKind) -> u8 {
@@ -307,8 +349,9 @@ fn apply_stop(engine: &mut Engine, now: Instant, inc: u32, tag: StopTag) -> Opti
 }
 
 /// What follows a stop whose exit was seen (rows in order, the first that applies; `exit` is `None` when no process
-/// was started).
-fn next(end: End, exit: Option<Exit>, halted: Option<Halt>, used: u32, budget: u32) -> Next {
+/// was started). `_used`, the restarts made in all, decides nothing: only `budget == 0` ends the supervisor, and a
+/// full restart window makes the next start wait.
+fn next(end: End, exit: Option<Exit>, halted: Option<Halt>, _used: u32, budget: u32) -> Next {
     // A status with a code (not killed by a signal) of 10, 11 or 14 is a deterministic refusal of the inspector.
     if let Some(code @ (10 | 11 | 14)) = exit.and_then(|x| x.status.code()) {
         return Next::Fail(Failure::Exit(code));
@@ -326,7 +369,7 @@ fn next(end: End, exit: Option<Exit>, halted: Option<Halt>, used: u32, budget: u
         }
         Some(Halt::NoRestart) | None => {}
     }
-    if used >= budget {
+    if budget == 0 {
         return Next::Fail(Failure::BudgetExhausted);
     }
     Next::Restart
@@ -380,12 +423,17 @@ impl Supervisor {
             1,
             1,
         );
+        // At most `restarts` entries (`check` caps it), so the queue never grows.
+        let restart_times =
+            VecDeque::with_capacity(usize::try_from(cfg.restarts).unwrap_or_default());
         Ok(Supervisor {
             cfg,
             engine,
             run_id: None,
             run: Run::Down,
             restarts: 0,
+            restart_times,
+            not_before: None,
             shutdown_by: None,
         })
     }
@@ -624,14 +672,15 @@ impl Supervisor {
         }
     }
 
-    /// One turn. Down: one try to start. Stopping: one try to see the exit. Stopped and Failed: wait. With a
-    /// stream: the shutdown deadline, the engine's clock and halt, DRAIN once the intake has ended and nothing is
-    /// held, at most one frame written, at most one frame read (a tick long when nothing arrives). `until` cuts the
-    /// wait for the first byte; the frame that has begun is read to its end.
+    /// One turn. Down: wait while the restart window is full, else one try to start. Stopping: one try to see the
+    /// exit. Stopped and Failed: wait. With a stream: the shutdown deadline, the engine's clock and halt, DRAIN
+    /// once the intake has ended and nothing is held, at most one frame written, at most one frame read (a tick
+    /// long when nothing arrives). `until` cuts the wait for the first byte; the frame that has begun is read to
+    /// its end.
     fn step(&mut self, until: Instant) {
         let now = Instant::now();
         match self.run {
-            Run::Down => return self.launch(now),
+            Run::Down => return self.down(now, until),
             Run::Stopping { .. } => return self.reap(now, until),
             Run::Stopped | Run::Failed { .. } => return self.nap(now, until, None),
             Run::Hello { .. } | Run::Ready { .. } | Run::Draining { .. } => {}
@@ -931,8 +980,43 @@ impl Supervisor {
         }
     }
 
-    /// Down: one try to start. Nothing is started after the intake ended or the numbers ran out. A try that fails
-    /// has no process, so the incarnation is used up and never used again.
+    /// Down: while the restart window is full, nothing is started; the engine's clock still runs, so the waiting
+    /// requests keep their deadlines. When the time has come the window decides again and, with room, the start is
+    /// made.
+    fn down(&mut self, now: Instant, until: Instant) {
+        if let Some(due) = self.not_before {
+            let _ = self.engine.tick(now);
+            if now < due {
+                return self.nap(now, until, Some(due));
+            }
+            self.not_before = self.restart_wait(now);
+            // Still full: wait for the time it names.
+            if self.not_before.is_some() {
+                return;
+            }
+        }
+        self.launch(now);
+    }
+
+    /// A restart is wanted at `now`: `None` when the window has room (the time is recorded and counted), else the
+    /// time before which it must not start.
+    fn restart_wait(&mut self, now: Instant) -> Option<Instant> {
+        match restart_slot(
+            &mut self.restart_times,
+            now,
+            self.cfg.restarts,
+            self.cfg.restart_window,
+        ) {
+            Slot::Now => {
+                self.restarts = self.restarts.saturating_add(1);
+                None
+            }
+            Slot::Wait(t) => Some(t),
+        }
+    }
+
+    /// One try to start. Nothing is started after the intake ended or the numbers ran out. A try that fails has
+    /// no process, so the incarnation is used up and never used again.
     fn launch(&mut self, now: Instant) {
         match self.engine.halted() {
             None => {}
@@ -1034,8 +1118,8 @@ impl Supervisor {
     fn proceed(&mut self, now: Instant, n: Next) {
         match n {
             Next::Restart => {
-                // `next` chose this only with `restarts < budget`, so the sum fits.
-                self.restarts = self.restarts.saturating_add(1);
+                // `next` chose this only with `restarts` above 0. A full window keeps `Down` waiting.
+                self.not_before = self.restart_wait(now);
                 self.run = Run::Down;
             }
             Next::Stopped => self.run = Run::Stopped,
@@ -1134,6 +1218,7 @@ mod tests {
             exit_wait: secs(3),
             kill_grace: secs(1),
             restarts: 1,
+            restart_window: secs(60),
         }
     }
 
@@ -1335,6 +1420,10 @@ mod tests {
         assert_eq!(next(End::Bye, Some(killed_0), None, 0, 1), Next::Restart);
         assert_eq!(next(End::Bye, Some(code(1)), None, 0, 1), Next::Restart);
         assert_eq!(
+            next(End::Bye, Some(code(1)), None, 0, 0),
+            Next::Fail(Failure::BudgetExhausted)
+        );
+        assert_eq!(
             next(End::Bye, Some(code(1)), Some(Halt::Drain), 0, 0),
             Next::Stopped
         );
@@ -1373,15 +1462,37 @@ mod tests {
                 );
             }
         }
-        // 6. the budget is spent: `used >= budget`
-        for (used, budget) in [(0, 0), (1, 1), (2, 1), (u32::MAX, u32::MAX)] {
+        // 6. no restart at all (`budget == 0`): the end of the supervisor, whatever was made so far
+        for used in [0, 1, 9, u32::MAX] {
+            for exit in [None, Some(code(0)), Some(code(12)), Some(signal(9, true))] {
+                for halted in [None, Some(Halt::NoRestart)] {
+                    assert_eq!(
+                        next(restart(), exit, halted, used, 0),
+                        Next::Fail(Failure::BudgetExhausted),
+                        "{used}"
+                    );
+                }
+            }
+        }
+        // 7. otherwise a restart, whatever was made so far: a full window waits, it does not fail
+        for (used, budget) in [
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (u32::MAX, 1),
+            (0, 2),
+            (999, 1000),
+            (1000, 1000),
+            (u32::MAX - 1, u32::MAX),
+            (u32::MAX, u32::MAX),
+        ] {
             assert_eq!(
                 next(restart(), Some(code(12)), None, used, budget),
-                Next::Fail(Failure::BudgetExhausted),
+                Next::Restart,
                 "{used} {budget}"
             );
         }
-        // 7. otherwise a restart: any exit, also none (a try to start that failed)
+        // any exit, also none (a try to start that failed)
         for exit in [
             None,
             Some(code(0)),
@@ -1402,6 +1513,181 @@ mod tests {
             next(restart(), None, None, u32::MAX - 1, u32::MAX),
             Next::Restart
         );
+    }
+
+    // ---- the restart window ----
+
+    #[test]
+    fn the_restart_window_has_room_until_the_limit_and_then_names_the_time() {
+        let (t0, w) = (Instant::now(), secs(10));
+        let mut times = VecDeque::new();
+        // empty and below the limit: recorded
+        assert_eq!(restart_slot(&mut times, t0, 3, w), Slot::Now);
+        assert_eq!(restart_slot(&mut times, t0 + secs(1), 3, w), Slot::Now);
+        assert_eq!(restart_slot(&mut times, t0 + secs(2), 3, w), Slot::Now);
+        assert_eq!(times, [t0, t0 + secs(1), t0 + secs(2)]);
+        // full: the oldest plus a window, nothing recorded, the same answer however often it is asked
+        for ask in [3, 4, 9] {
+            assert_eq!(
+                restart_slot(&mut times, t0 + secs(ask), 3, w),
+                Slot::Wait(t0 + w)
+            );
+        }
+        assert_eq!(times, [t0, t0 + secs(1), t0 + secs(2)]);
+        // a limit of 1 is full after one
+        let mut one = VecDeque::new();
+        assert_eq!(restart_slot(&mut one, t0, 1, w), Slot::Now);
+        assert_eq!(restart_slot(&mut one, t0, 1, w), Slot::Wait(t0 + w));
+        // a limit of 0 has no oldest record: nothing is recorded, and the wait is a whole window from now
+        let mut none = VecDeque::new();
+        assert_eq!(restart_slot(&mut none, t0, 0, w), Slot::Wait(t0 + w));
+        assert_eq!(
+            restart_slot(&mut none, t0 + w, 0, w),
+            Slot::Wait(t0 + w + w)
+        );
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn the_restart_window_drops_a_record_that_is_a_whole_window_old() {
+        let (t0, w, ns) = (Instant::now(), secs(10), Duration::from_nanos(1));
+        // one nanosecond short of a whole window: the record stays, so the window is full
+        let mut times = VecDeque::from([t0]);
+        assert_eq!(
+            restart_slot(&mut times, t0 + w - ns, 1, w),
+            Slot::Wait(t0 + w)
+        );
+        assert_eq!(times, [t0]);
+        // a whole window: it is dropped and the new time is recorded (the time that was named is a time that works)
+        assert_eq!(restart_slot(&mut times, t0 + w, 1, w), Slot::Now);
+        assert_eq!(times, [t0 + w]);
+        // only the records that are old go, all of them if all are
+        let all = [t0, t0 + secs(1), t0 + secs(2)];
+        let mut times = VecDeque::from(all);
+        assert_eq!(restart_slot(&mut times, t0 + secs(10), 3, w), Slot::Now);
+        assert_eq!(times, [t0 + secs(1), t0 + secs(2), t0 + secs(10)]);
+        let mut times = VecDeque::from(all);
+        assert_eq!(
+            restart_slot(&mut times, t0 + secs(10), 2, w),
+            Slot::Wait(t0 + secs(11))
+        );
+        assert_eq!(times, [t0 + secs(1), t0 + secs(2)]);
+        let mut times = VecDeque::from(all);
+        assert_eq!(restart_slot(&mut times, t0 + secs(12), 3, w), Slot::Now);
+        assert_eq!(times, [t0 + secs(12)]);
+    }
+
+    #[test]
+    fn the_restart_window_treats_a_sum_that_does_not_fit_as_passed() {
+        let t0 = Instant::now();
+        // a window so long that its end does not fit in an `Instant`: the record has passed, so it is dropped and
+        // the window has room, however full it was
+        let mut times = VecDeque::from([t0]);
+        assert_eq!(restart_slot(&mut times, t0, 1, Duration::MAX), Slot::Now);
+        assert_eq!(times, [t0]);
+        // a window whose end fits still keeps the record
+        let mut times = VecDeque::from([t0]);
+        assert_eq!(
+            restart_slot(&mut times, t0, 1, secs(1)),
+            Slot::Wait(t0 + secs(1))
+        );
+    }
+
+    #[test]
+    fn the_restart_window_allows_no_more_than_its_limit_in_any_window() {
+        let (t0, w, limit) = (Instant::now(), secs(10), 3);
+        let mut times = VecDeque::new();
+        let mut made = Vec::new();
+        for i in 0..100 {
+            let now = t0 + secs(i);
+            if restart_slot(&mut times, now, limit, w) == Slot::Now {
+                made.push(now);
+            }
+            assert!(times.len() <= 3);
+        }
+        // three at once and three more as soon as the oldest leaves the window, ten times
+        assert_eq!(made.len(), 30);
+        for &m in &made {
+            let inside = made.iter().filter(|&&x| x <= m && m < x + w).count();
+            assert!(
+                inside <= 3,
+                "{inside} restarts in the window that ends at {m:?}"
+            );
+        }
+        assert_eq!(made[3], t0 + w);
+    }
+
+    /// A supervisor whose window is full: the restart wanted at `t0` found room, the second one did not.
+    fn window_full(window: Duration) -> (Supervisor, Instant) {
+        let mut c = cfg();
+        (c.tick, c.wait_deadline, c.restarts, c.restart_window) = (MS, 50 * MS, 1, window);
+        let mut s = Supervisor::new(c).unwrap();
+        let t0 = Instant::now();
+        s.proceed(t0, Next::Restart);
+        assert!(matches!(s.run, Run::Down));
+        assert_eq!((s.status().restarts, s.not_before), (1, None));
+        s.proceed(t0, Next::Restart);
+        (s, t0)
+    }
+
+    #[test]
+    fn a_full_window_keeps_down_and_the_requests_keep_their_deadlines() {
+        let (mut s, t0) = window_full(secs(30));
+        let a = s.submit(&get(b"/a")).unwrap();
+        // the second restart is not made: not counted, and the time before which nothing starts is held
+        assert!(matches!(s.run, Run::Down));
+        assert_eq!(
+            (s.status().restarts, s.not_before),
+            (1, Some(t0 + secs(30)))
+        );
+        assert_eq!(s.status().phase, Phase::Starting);
+        // a step starts nothing; the clock runs, so the request ends at its own deadline, not at the window
+        thread::sleep(60 * MS);
+        s.step(Instant::now());
+        assert!(matches!(s.run, Run::Down) && s.run_id.is_none());
+        assert_eq!(
+            s.poll(Instant::now()),
+            vec![(a, Verdict::Uninspectable(Reason::WaitDeadline))]
+        );
+        assert_eq!(
+            (s.status().restarts, s.not_before),
+            (1, Some(t0 + secs(30)))
+        );
+        // a request that comes now waits as well, and a shutdown stops the wait at once: it starts nothing and
+        // the restart that was waiting is not counted
+        let b = s.submit(&get(b"/b")).unwrap();
+        let sd = s.shutdown(Instant::now());
+        assert_eq!(sd.results, vec![(b, unavailable())]);
+        assert_eq!(sd.phase, Phase::Stopped);
+        assert!(!sd.bye && sd.exit_confirmed && sd.dir_removed);
+        assert_eq!((sd.held_left, sd.waiting_left), (0, 0));
+        assert!(s.run_id.is_none());
+        let st = s.status();
+        assert_eq!((st.phase, st.inc, st.restarts), (Phase::Stopped, 1, 1));
+    }
+
+    #[test]
+    fn a_restart_that_is_due_is_recorded_counted_and_started() {
+        let (mut s, t0) = window_full(40 * MS);
+        let due = s.not_before.unwrap();
+        assert_eq!(due, t0 + 40 * MS);
+        assert_eq!((s.status().restarts, s.not_before), (1, Some(due)));
+        // from the time: the oldest record is a whole window old, so the window has room again; the try is
+        // made (`cfg()` names a tmp root that is not there, so it ends at once, before anything is made)
+        thread::sleep(50 * MS);
+        assert!(Instant::now() >= due);
+        s.step(Instant::now());
+        let st = s.status();
+        assert!(
+            matches!(st.phase, Phase::Failed(Failure::TmpDir(_))),
+            "{st:?}"
+        );
+        assert_eq!((st.restarts, st.inc), (2, 2));
+        assert_eq!(s.not_before, None);
+        assert_eq!(s.restart_times.len(), 1);
+        assert!(s.restart_times[0] >= due);
+        let sd = s.shutdown(Instant::now());
+        assert!(sd.exit_confirmed && sd.dir_removed);
     }
 
     /// An engine after HELLO with one slot and room for one waiting request.
@@ -2036,6 +2322,31 @@ mod tests {
         assert_eq!(root.entries(), 0);
         let sd = finish(s, &root);
         assert_eq!(sd.phase, Phase::Failed(Failure::BudgetExhausted));
+        // With a restart in the window the same stop is only a restart: the next start is made and inspects.
+        let mut s = Supervisor::new(real(root.path(), 1)).unwrap();
+        let a = s.submit(&get(b"/")).unwrap();
+        s.step(soon());
+        let Run::Hello { start, until } = &mut s.run else {
+            panic!("not waiting for HELLO");
+        };
+        *until = start.started.checked_sub(Duration::from_nanos(1)).unwrap();
+        s.step(soon());
+        assert!(
+            matches!(&s.run, Run::Stopping { end: End::Restart(why), .. } if *why == "hello wait")
+        );
+        until_ready(&mut s);
+        let st = s.status();
+        assert_eq!((st.phase, st.inc, st.restarts), (Phase::Ready, 2, 1));
+        let guard = within(30);
+        let mut got = Vec::new();
+        while got.is_empty() {
+            assert!(Instant::now() < guard, "no result: {:?}", s.status());
+            got = s.poll(soon());
+        }
+        assert_eq!(got, vec![(a, Verdict::Allow)]);
+        let sd = finish(s, &root);
+        assert!(sd.bye);
+        assert_eq!(sd.phase, Phase::Stopped);
     }
 
     #[test]
@@ -2250,9 +2561,9 @@ mod tests {
 
     #[test]
     #[ignore = "needs a built inspector"]
-    fn a_start_that_cannot_run_uses_up_the_budget_and_leaves_nothing() {
+    fn a_start_that_cannot_run_ends_the_supervisor_when_it_may_not_restart() {
         let root = real_root();
-        let mut c = real(root.path(), 1);
+        let mut c = real(root.path(), 0);
         c.inspector = root.path().join("missing");
         let mut s = Supervisor::new(c).unwrap();
         let a = s.submit(&get(b"/")).unwrap();
@@ -2263,11 +2574,67 @@ mod tests {
         }
         let st = s.status();
         assert_eq!(st.phase, Phase::Failed(Failure::BudgetExhausted));
-        // two tries, each used up its incarnation; only the second was a restart
-        assert_eq!((st.inc, st.restarts), (3, 1));
+        // the one try used up its incarnation, and it was not a restart
+        assert_eq!((st.inc, st.restarts), (2, 0));
         assert_eq!(s.poll(Instant::now()), vec![(a, unavailable())]);
         assert_eq!(root.entries(), 0);
         finish(s, &root);
+    }
+
+    /// Every start of this supervisor fails (`inspector`). One restart is allowed in a window of 300 ms. It runs
+    /// through two whole windows and must never fail, never restart faster than once a window (the number of
+    /// restarts is at most one more than the windows that have passed), keep its incarnations in step with the
+    /// restarts, and leave a request that waits to its own deadline. A shutdown ends the wait and decides the
+    /// request that waits then.
+    fn fails_every_start_but_waits_for_the_window(root: &TempRoot, inspector: PathBuf) {
+        let mut c = real(root.path(), 1);
+        c.inspector = inspector;
+        (c.restart_window, c.wait_deadline) = (300 * MS, 400 * MS);
+        let window = c.restart_window;
+        let mut s = Supervisor::new(c).unwrap();
+        let started = Instant::now();
+        let a = s.submit(&get(b"/")).unwrap();
+        let guard = within(30);
+        let mut got = Vec::new();
+        while s.status().restarts < 3 {
+            assert!(Instant::now() < guard, "{:?}", s.status());
+            got.extend(s.poll(soon()));
+            let st = s.status();
+            assert!(
+                matches!(st.phase, Phase::Starting | Phase::Stopping),
+                "{st:?}"
+            );
+            assert!(
+                u128::from(st.restarts) <= 1 + started.elapsed().as_nanos() / window.as_nanos(),
+                "{st:?}"
+            );
+            assert!(
+                (st.restarts + 1..=st.restarts + 2).contains(&st.inc),
+                "{st:?}"
+            );
+        }
+        assert!(started.elapsed() >= 2 * window);
+        assert_eq!(got, vec![(a, Verdict::Uninspectable(Reason::WaitDeadline))]);
+        let b = s.submit(&get(b"/")).unwrap();
+        let sd = finish(s, root);
+        assert_eq!(sd.results, vec![(b, unavailable())]);
+        assert_eq!(sd.phase, Phase::Stopped);
+        assert!(!sd.bye);
+    }
+
+    #[test]
+    #[ignore = "needs a built inspector"]
+    fn a_start_that_cannot_run_is_tried_again_once_a_window_and_never_fails() {
+        let root = real_root();
+        fails_every_start_but_waits_for_the_window(&root, root.path().join("missing"));
+    }
+
+    #[test]
+    #[ignore = "needs a built inspector"]
+    fn a_start_that_ends_before_hello_is_tried_again_once_a_window_and_never_fails() {
+        let root = real_root();
+        // exits at once, whatever it is given: the connection ends before any HELLO
+        fails_every_start_but_waits_for_the_window(&root, PathBuf::from("/bin/true"));
     }
 
     #[test]
@@ -2283,9 +2650,9 @@ mod tests {
 
     #[test]
     #[ignore = "needs a built inspector"]
-    fn a_start_that_ends_before_hello_is_a_counted_restart() {
+    fn a_start_that_ends_before_hello_ends_the_supervisor_when_it_may_not_restart() {
         let root = real_root();
-        let mut c = real(root.path(), 1);
+        let mut c = real(root.path(), 0);
         // exits at once, whatever it is given: the connection ends before any HELLO
         c.inspector = PathBuf::from("/bin/true");
         let mut s = Supervisor::new(c).unwrap();
@@ -2297,7 +2664,7 @@ mod tests {
         }
         let st = s.status();
         assert_eq!(st.phase, Phase::Failed(Failure::BudgetExhausted));
-        assert_eq!((st.inc, st.restarts), (3, 1));
+        assert_eq!((st.inc, st.restarts), (2, 0));
         assert_eq!(s.poll(Instant::now()), vec![(a, unavailable())]);
         assert_eq!(root.entries(), 0);
         finish(s, &root);

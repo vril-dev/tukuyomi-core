@@ -127,6 +127,7 @@ struct RawKernel {
     exit_wait_ms: u64,
     kill_grace_ms: u64,
     restarts: u32,
+    restart_window_ms: u64,
 }
 
 /// Accepts only a JSON object. A derived struct alone would also take an array of its values in field order,
@@ -339,6 +340,7 @@ fn build(p: RawProxy, k: RawKernel) -> Result<Loaded, ConfigError> {
         exit_wait: Duration::from_millis(k.exit_wait_ms),
         kill_grace: Duration::from_millis(k.kill_grace_ms),
         restarts: k.restarts,
+        restart_window: Duration::from_millis(k.restart_window_ms),
     };
     kernel.check().map_err(|e| ConfigError(e.0))?;
 
@@ -434,7 +436,7 @@ mod tests {
     use serde_json::Value;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","upstream":"127.0.0.1:9000","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":30000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000},"kernel":{"inspector":"/opt/tukuyomi/inspector","rules":"/etc/tukuyomi/rules.conf","rules_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3}}"#;
+    const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","upstream":"127.0.0.1:9000","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":30000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000},"kernel":{"inspector":"/opt/tukuyomi/inspector","rules":"/etc/tukuyomi/rules.conf","rules_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000}}"#;
 
     /// Marks a value that must never appear in an error sentence.
     const MARK: &str = "qqmark";
@@ -509,6 +511,7 @@ mod tests {
         assert_eq!(kernel.tick, Duration::from_millis(100));
         assert_eq!(kernel.kill_grace, Duration::from_millis(1000));
         assert_eq!((kernel.discard_limit, kernel.restarts), (4, 3));
+        assert_eq!(kernel.restart_window, Duration::from_millis(60_000));
     }
 
     #[test]
@@ -929,6 +932,39 @@ mod tests {
         refuse(
             &[k("tick_ms", 1001), p("drive_slice_ms", 2000)],
             "tick is above the longest tick",
+        );
+    }
+
+    #[test]
+    fn the_restart_window_and_the_restart_count_are_checked_by_the_kernel() {
+        let mut value = base();
+        value["kernel"]
+            .as_object_mut()
+            .unwrap()
+            .remove("restart_window_ms");
+        refuse_text(&value.to_string(), "configuration has a missing key");
+
+        let key = "restart_window_ms";
+        let out = "restart_window is out of range";
+        refuse(&[k(key, 0)], out);
+        // The lowest window needs the lowest tick, and the slice of the proxy is held to the tick.
+        pass(&[k(key, 1), k("tick_ms", 1), p("drive_slice_ms", 1)]);
+        pass(&[k(key, 3_600_000)]);
+        refuse(&[k(key, 3_600_001)], out);
+        refuse(&[k(key, u64::MAX)], out);
+        refuse(&[k(key, -1)], "configuration has a value of the wrong type");
+        // tick (100 ms) <= restart_window
+        refuse(&[k(key, 99)], "tick is above another time");
+        pass(&[k(key, 100)]);
+
+        let key = "restarts";
+        pass(&[k(key, 0)]);
+        pass(&[k(key, 1000)]);
+        refuse(&[k(key, 1001)], "restarts is above 1000");
+        refuse(&[k(key, u32::MAX)], "restarts is above 1000");
+        refuse(
+            &[k(key, u64::from(u32::MAX) + 1)],
+            "configuration has a value of the wrong type",
         );
     }
 

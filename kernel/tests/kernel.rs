@@ -28,6 +28,8 @@ const MAX_WAIT: Duration = Duration::from_secs(3600);
 const MAX_TICK: Duration = Duration::from_secs(1);
 const MAX_TMP_ROOT: usize = 3840;
 const MAX_CONCUR_TX: usize = 4;
+/// `MAX_RESTARTS` (the most `restarts` that `Config::check` accepts).
+const MAX_RESTARTS: u32 = 1000;
 /// `codec::MAX_DECLARED` (the largest body the protocol declares).
 const MAX_BODY: usize = 1 << 20;
 /// `codec::MAX_HEADERS`, `MAX_HDR_NAME`, `MAX_HDR_VALUE` and `MAX_HDR_TOTAL` (the limits of the headers of one request).
@@ -64,6 +66,7 @@ fn fake_config() -> Config {
         exit_wait: 10 * SEC,
         kill_grace: 5 * SEC,
         restarts: 0,
+        restart_window: 60 * SEC,
     }
 }
 
@@ -613,8 +616,66 @@ fn check_counts() {
         },
         "records is below slots plus wait_queue",
     );
-    accepted(|c| c.restarts = u32::MAX);
     accepted(|c| c.rules_sha256 = [0xff; 32]);
+}
+
+#[test]
+fn check_restarts_are_at_most_1000_and_the_window_is_a_time() {
+    // 0 never restarts; 1000 is the most
+    accepted(|c| c.restarts = 0);
+    accepted(|c| c.restarts = 1);
+    accepted(|c| c.restarts = MAX_RESTARTS);
+    rejected(|c| c.restarts = MAX_RESTARTS + 1, "restarts is above 1000");
+    rejected(|c| c.restarts = u32::MAX, "restarts is above 1000");
+    // the window is above 0 and at most MAX_WAIT, and 1 ms is a window when the tick is that short
+    rejected(
+        |c| c.restart_window = Duration::ZERO,
+        "restart_window is out of range",
+    );
+    accepted(|c| {
+        c.tick = MS;
+        c.restart_window = MS;
+    });
+    rejected(
+        |c| {
+            c.tick = MS;
+            c.restart_window = Duration::ZERO;
+        },
+        "restart_window is out of range",
+    );
+    accepted(|c| c.restart_window = MAX_WAIT);
+    rejected(
+        |c| c.restart_window = MAX_WAIT + MS,
+        "restart_window is out of range",
+    );
+    // not below the tick
+    accepted(|c| c.restart_window = c.tick);
+    rejected(
+        |c| c.restart_window = c.tick - Duration::from_nanos(1),
+        "tick is above another time",
+    );
+    rejected(
+        |c| {
+            c.tick = MS;
+            c.restart_window = MS - Duration::from_nanos(1);
+        },
+        "tick is above another time",
+    );
+    // in the order of the rules: the window is the last of the times, and a time comes before `restarts`
+    rejected(
+        |c| {
+            c.kill_grace = Duration::ZERO;
+            c.restart_window = Duration::ZERO;
+        },
+        "kill_grace is out of range",
+    );
+    rejected(
+        |c| {
+            c.restarts = MAX_RESTARTS + 1;
+            c.restart_window = Duration::ZERO;
+        },
+        "restart_window is out of range",
+    );
 }
 
 /// Sets the time named `name` (the names of the fields of `Config`).
@@ -630,11 +691,12 @@ fn set_time(c: &mut Config, name: &str, d: Duration) {
         "drain_wait" => c.drain_wait = d,
         "exit_wait" => c.exit_wait = d,
         "kill_grace" => c.kill_grace = d,
+        "restart_window" => c.restart_window = d,
         _ => panic!("not a time: {name}"),
     }
 }
 
-const TIMES: [&str; 10] = [
+const TIMES: [&str; 11] = [
     "tick",
     "hello_wait",
     "frame_io",
@@ -645,6 +707,7 @@ const TIMES: [&str; 10] = [
     "drain_wait",
     "exit_wait",
     "kill_grace",
+    "restart_window",
 ];
 
 #[test]
@@ -700,7 +763,7 @@ fn check_tick_is_short_and_not_above_any_other_time() {
 }
 
 /// The messages in the order of the rules, and what repairs the one that is reported.
-const ORDER: [&str; 10] = [
+const ORDER: [&str; 11] = [
     "inspector path is not an absolute clean path",
     "rules path is not an absolute clean path",
     "tmp_root is not an absolute clean UTF-8 path",
@@ -711,6 +774,7 @@ const ORDER: [&str; 10] = [
     "records is below slots plus wait_queue",
     "discard_limit must be below u32::MAX",
     "tick is out of range",
+    "restarts is above 1000",
 ];
 
 fn repair(c: &mut Config, step: usize) {
@@ -725,6 +789,7 @@ fn repair(c: &mut Config, step: usize) {
         7 => c.records = 2,
         8 => c.discard_limit = 0,
         9 => TIMES.iter().for_each(|&name| set_time(c, name, SEC)),
+        10 => c.restarts = MAX_RESTARTS,
         _ => panic!("no such step"),
     }
 }
@@ -742,6 +807,7 @@ fn check_reports_the_first_broken_rule() {
     c.wait_queue = 0;
     c.records = 0;
     c.discard_limit = u32::MAX;
+    c.restarts = u32::MAX;
     TIMES
         .iter()
         .for_each(|&name| set_time(&mut c, name, Duration::ZERO));
@@ -1098,25 +1164,70 @@ fn a_different_rules_hash_fails_at_hello_without_restart() {
 
 #[test]
 #[ignore = "needs a built inspector"]
-fn a_budget_of_one_restart_is_used_up_by_two_failed_starts() {
-    // The inspector does not exist: both starts fail at spawn, before any process exists.
-    let root = make_root("budget");
+fn a_failed_start_ends_the_supervisor_when_no_restart_is_allowed() {
+    // The inspector does not exist: the one start fails at spawn, before any process exists.
+    let root = make_root("no_restart");
     let mut cfg = real_config_without_inspector(&root);
     cfg.inspector = root.join("absent-inspector");
     cfg.rules = root.join("absent-rules.conf");
-    cfg.restarts = 1;
+    cfg.restarts = 0;
     let mut run = Run::new(cfg, Some(root));
     let hs = [header(b"Host", b"example.test")];
     let id = run.submit(&request(b"GET", b"/", &hs, b""));
-    run.wait_for("the budget to be used up", |r| {
+    run.wait_for("the failure of the start", |r| {
         r.got.len() == 1 && matches!(r.sup.status().phase, Phase::Failed(_))
     });
     let st = run.sup.status();
     assert_eq!(st.phase, Phase::Failed(Failure::BudgetExhausted));
-    assert_eq!((st.restarts, st.inc), (1, 3));
+    assert_eq!((st.restarts, st.inc), (0, 2));
     assert_eq!((st.waiting, st.held), (0, 0));
     assert_eq!(run.verdict(id), UNAVAILABLE);
     let (st, bye) = run.finish();
     assert_eq!(st.phase, Phase::Failed(Failure::BudgetExhausted));
-    assert_eq!((st.restarts, st.inc, bye), (1, 3, false));
+    assert_eq!((st.restarts, st.inc, bye), (0, 2, false));
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_full_restart_window_waits_and_the_supervisor_does_not_fail() {
+    // The inspector does not exist, so every start fails at spawn. One restart is allowed in a window of 300 ms.
+    let window = 300 * MS;
+    let root = make_root("window");
+    let mut cfg = real_config_without_inspector(&root);
+    cfg.inspector = root.join("absent-inspector");
+    cfg.rules = root.join("absent-rules.conf");
+    (cfg.restarts, cfg.restart_window, cfg.wait_deadline) = (1, window, 400 * MS);
+    let mut run = Run::new(cfg, Some(root));
+    let hs = [header(b"Host", b"example.test")];
+    let started = Instant::now();
+    let waiting = run.submit(&request(b"GET", b"/", &hs, b""));
+    // Two whole windows pass. The supervisor never fails, it restarts no faster than once a window (at most one
+    // more than the windows that have passed), and its incarnations follow the restarts.
+    run.wait_for("two more restarts", |r| {
+        let st = r.sup.status();
+        assert_eq!(st.phase, Phase::Starting, "{st:?}");
+        assert!(
+            u128::from(st.restarts) <= 1 + started.elapsed().as_nanos() / window.as_nanos(),
+            "{st:?}"
+        );
+        assert!(
+            (st.restarts + 1..=st.restarts + 2).contains(&st.inc),
+            "{st:?}"
+        );
+        st.restarts >= 3
+    });
+    assert!(started.elapsed() >= 2 * window);
+    // The request that waited ended at its own deadline, not at the window or by a failure.
+    assert_eq!(
+        run.verdict(waiting),
+        Verdict::Uninspectable(Reason::WaitDeadline)
+    );
+    // A request that comes now waits, and the shutdown ends the wait.
+    let late = run.submit(&request(b"GET", b"/", &hs, b""));
+    let sd = run.sup.shutdown(Instant::now() + 20 * SEC);
+    assert_eq!(sd.results, vec![(late, UNAVAILABLE)]);
+    assert_eq!(sd.phase, Phase::Stopped);
+    run.got.extend(sd.results);
+    let (st, bye) = run.finish();
+    assert_eq!((st.phase, bye), (Phase::Stopped, false));
 }

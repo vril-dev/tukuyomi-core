@@ -488,6 +488,7 @@ mod tests {
             exit_wait: s,
             kill_grace: Duration::from_secs(5),
             restarts: 0,
+            restart_window: s,
         }
     }
 

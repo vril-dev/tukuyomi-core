@@ -1,8 +1,8 @@
 //! The operator's configuration of the kernel and its check.
 //!
 //! `check` looks at the values only, never at the file system (`start.rs` does that at each start). The limits
-//! below (`MAX_WAIT`, `MAX_TICK`, `MAX_TMP_ROOT`) only stop a wrong setting; they are not recommended values and
-//! there are no defaults.
+//! below (`MAX_WAIT`, `MAX_TICK`, `MAX_TMP_ROOT`, `MAX_RESTARTS`) only stop a wrong setting; they are not
+//! recommended values and there are no defaults.
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,9 @@ pub(crate) const MAX_TICK: Duration = Duration::from_secs(1);
 /// Longest accepted `tmp_root` in bytes: the per-start directory name and the inspector's own temporary file
 /// names must stay inside the Linux `PATH_MAX`.
 pub(crate) const MAX_TMP_ROOT: usize = 3840;
+/// Largest accepted `restarts`: the supervisor keeps the time of each restart of one window, so this bounds that
+/// list. A guard against a wrong setting, not a recommendation.
+pub(crate) const MAX_RESTARTS: u32 = 1000;
 
 /// Everything the kernel needs. No `Default`: every value is chosen by the operator and checked by `check`.
 #[derive(Clone, Debug)]
@@ -59,8 +62,12 @@ pub struct Config {
     pub exit_wait: Duration,
     /// After SIGKILL, until the exit must have been seen.
     pub kill_grace: Duration,
-    /// Restart budget for the Supervisor's whole life (0: never restart).
+    /// Restarts allowed within any `restart_window` (0: never restart; at most 1000). The first start is not
+    /// counted; a try to start that failed is. When that many have been made within the window, the next one
+    /// waits until the oldest is a whole window old, and the supervisor does not fail meanwhile.
     pub restarts: u32,
+    /// The sliding window that `restarts` is counted in. A longer window makes the restarts rarer.
+    pub restart_window: Duration,
 }
 
 /// The first rule of `Config::check` that a value breaks: a fixed short English text, never a value.
@@ -130,6 +137,7 @@ impl Config {
             ("drain_wait is out of range", self.drain_wait),
             ("exit_wait is out of range", self.exit_wait),
             ("kill_grace is out of range", self.kill_grace),
+            ("restart_window is out of range", self.restart_window),
         ];
         for (msg, d) in times {
             if d.is_zero() || d > MAX_WAIT {
@@ -141,6 +149,9 @@ impl Config {
         }
         if times.iter().any(|&(_, d)| self.tick > d) {
             return Err(ConfigError("tick is above another time"));
+        }
+        if self.restarts > MAX_RESTARTS {
+            return Err(ConfigError("restarts is above 1000"));
         }
         Ok(())
     }

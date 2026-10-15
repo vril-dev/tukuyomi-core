@@ -6,8 +6,9 @@
 //!
 //! The driver thread repeats one round. It takes in new tickets (at most one more than the waiting queue holds,
 //! so a round always goes on to the next steps), calls `cancel` once for every ticket whose connection went away,
-//! steps the kernel for one slice, delivers the results, and tells the main thread when the kernel became ready
-//! or failed. After a stop message it goes on serving the tickets of the connections that exist, calls `shutdown`
+//! steps the kernel for one slice, delivers the results, tells the main thread when the kernel became ready or
+//! failed, and records one line when the incarnation of the inspector changed, which is how a restart shows from
+//! outside. After a stop message it goes on serving the tickets of the connections that exist, calls `shutdown`
 //! once nothing can arrive any more (or when the stop deadline is reached), and from then on answers every ticket
 //! with `Outcome::Unavailable` until the last sender is gone.
 //!
@@ -256,6 +257,20 @@ fn stop_line(status: &Status) -> String {
     )
 }
 
+/// The record line for a new incarnation of the inspector, or `None` while it is the one seen last. The kernel
+/// numbers the next incarnation when the one before it has ended, so the number can change before the next
+/// process has started, or with none to follow; the line says only that the number changed and how many
+/// restarts the kernel has made in all. The first incarnation is the number the kernel starts with and gets no
+/// line. Fixed text and numbers only.
+fn restart_line(seen: u32, status: &Status) -> Option<String> {
+    (status.inc != seen).then(|| {
+        format!(
+            "driver: inspector incarnation changed, inc {}, restarts {}",
+            status.inc, status.restarts
+        )
+    })
+}
+
 /// Takes the result of every `(id, verdict)` out of the table: sends it to the connection unless `cancel` was
 /// called, and drops the ticket, which gives its permits back. A result for a request that is not in the table
 /// breaks the promise that every result comes out once.
@@ -313,6 +328,8 @@ struct Core<K> {
     closed: bool,
     signals: Signals,
     log: Log,
+    /// The incarnation number of the inspector that the last round saw.
+    inc: u32,
     /// The longest wait for a message while there is nothing to do.
     tick: Duration,
     /// The length of one kernel step.
@@ -331,6 +348,7 @@ impl<K: Kernel> Core<K> {
         slice: Duration,
         take: usize,
     ) -> Core<K> {
+        let inc = kernel.status().inc;
         Core {
             kernel,
             rx,
@@ -339,6 +357,7 @@ impl<K: Kernel> Core<K> {
             closed: false,
             signals,
             log,
+            inc,
             tick,
             slice: slice.min(tick).max(MIN_SLICE),
             take: take.max(1),
@@ -377,7 +396,9 @@ impl<K: Kernel> Core<K> {
         let until = now.checked_add(self.slice).unwrap_or(now);
         let results = self.kernel.poll(until);
         deliver(&mut self.pending, &results)?;
-        self.signals.note(self.kernel.status().phase);
+        let status = self.kernel.status();
+        self.signals.note(status.phase);
+        self.note_incarnation(&status);
         self.finish_if_due()
     }
 
@@ -451,6 +472,16 @@ impl<K: Kernel> Core<K> {
             },
             Mode::Down => Mode::Down,
         };
+    }
+
+    /// Records one line when the incarnation of the inspector is not the one seen last, and takes it in. It is
+    /// called with the status after a step and before `shutdown`, so the exit that `shutdown` confirms gives no
+    /// line.
+    fn note_incarnation(&mut self, status: &Status) {
+        if let Some(line) = restart_line(self.inc, status) {
+            self.log.line(&line);
+            self.inc = status.inc;
+        }
     }
 
     /// The last sender is gone. Without a stop message that is a stop whose deadline has passed: nothing can
@@ -662,6 +693,8 @@ mod tests {
         polls: VecDeque<Vec<(ReqId, Verdict)>>,
         until: Vec<Instant>,
         phase: Phase,
+        inc: u32,
+        restarts: u32,
         records: usize,
         at_shutdown: Vec<(ReqId, Verdict)>,
     }
@@ -677,6 +710,8 @@ mod tests {
                 polls: VecDeque::new(),
                 until: Vec::new(),
                 phase: Phase::Starting,
+                inc: 1,
+                restarts: 0,
                 records: 0,
                 at_shutdown: Vec::new(),
             }
@@ -732,8 +767,8 @@ mod tests {
         fn status(&self) -> Status {
             Status {
                 phase: self.phase,
-                inc: 1,
-                restarts: 0,
+                inc: self.inc,
+                restarts: self.restarts,
                 waiting: 0,
                 held: 0,
                 records: self.records,
@@ -742,6 +777,8 @@ mod tests {
 
         fn shutdown(&mut self, deadline: Instant) -> Shutdown {
             self.calls.push(Call::Shutdown(deadline));
+            // The exit that shutdown confirms numbers the next incarnation.
+            self.inc += 1;
             Shutdown {
                 results: mem::take(&mut self.at_shutdown),
                 phase: Phase::Stopped,
@@ -1185,6 +1222,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_restart_line_is_given_for_a_new_incarnation_and_not_for_the_same_one() {
+        let at = |phase, inc, restarts| Status {
+            phase,
+            inc,
+            restarts,
+            waiting: 1,
+            held: 2,
+            records: 3,
+        };
+        let starting = |inc, restarts| at(Phase::Starting, inc, restarts);
+        // the incarnation the kernel starts with is not a restart; a round in the same one gives no line,
+        // whatever else changed
+        assert_eq!(restart_line(1, &starting(1, 0)), None);
+        assert_eq!(restart_line(1, &at(Phase::Ready, 1, 0)), None);
+        assert_eq!(restart_line(4, &starting(4, 9)), None);
+        // the next number: one line of fixed text with the new number and the restarts made in all
+        assert_eq!(
+            restart_line(1, &starting(2, 1)).as_deref(),
+            Some("driver: inspector incarnation changed, inc 2, restarts 1")
+        );
+        // several tries between two rounds: one line, with the number now
+        assert_eq!(
+            restart_line(1, &starting(5, 4)).as_deref(),
+            Some("driver: inspector incarnation changed, inc 5, restarts 4")
+        );
+        // a restart that still waits for the window: the number is ahead of the restarts
+        assert_eq!(
+            restart_line(2, &starting(3, 1)).as_deref(),
+            Some("driver: inspector incarnation changed, inc 3, restarts 1")
+        );
+        // the kernel that may not restart changes its number as well, and then fails
+        assert_eq!(
+            restart_line(1, &at(Phase::Failed(Failure::BudgetExhausted), 2, 0)).as_deref(),
+            Some("driver: inspector incarnation changed, inc 2, restarts 0")
+        );
+        // the top of the range: the last number is a change, the same number after it is not
+        assert_eq!(
+            restart_line(u32::MAX - 1, &starting(u32::MAX, u32::MAX)).as_deref(),
+            Some("driver: inspector incarnation changed, inc 4294967295, restarts 4294967295")
+        );
+        assert_eq!(restart_line(u32::MAX, &starting(u32::MAX, u32::MAX)), None);
+    }
+
+    #[test]
+    fn a_round_takes_in_a_new_incarnation_once() {
+        let mut r = Rig::new(4, 8);
+        // the number the kernel started with is the one seen; rounds in it change nothing
+        assert_eq!(r.core.inc, 1);
+        for _ in 0..3 {
+            r.core.round().unwrap();
+            assert_eq!(r.core.inc, 1);
+        }
+        // restarts counted alone are not a new incarnation
+        r.core.kernel.restarts = 1;
+        r.core.round().unwrap();
+        assert_eq!(r.core.inc, 1);
+        // the round that sees a new number takes it in, and it stays
+        r.core.kernel.inc = 2;
+        for _ in 0..3 {
+            r.core.round().unwrap();
+            assert_eq!(r.core.inc, 2);
+        }
+        // several numbers between two rounds are one change
+        r.core.kernel.inc = 6;
+        r.core.round().unwrap();
+        assert_eq!(r.core.inc, 6);
+
+        // the seen number comes from the kernel, not from a fixed one
+        let (_tx, rx) = sync_channel(1);
+        let mut kernel = Fake::new();
+        kernel.inc = 7;
+        let core = Core::new(
+            kernel,
+            rx,
+            Signals::Told { _failed: None },
+            start_logger().unwrap(),
+            50 * MS,
+            20 * MS,
+            5,
+        );
+        assert_eq!(core.inc, 7);
+    }
+
+    #[test]
+    fn the_exit_that_shutdown_confirms_is_not_a_new_incarnation_of_the_round() {
+        let mut r = Rig::new(4, 8);
+        r.send(Msg::Stop {
+            inspect_by: Instant::now(),
+        });
+        assert!(r.core.round().unwrap().is_some());
+        // the stand-in numbers the next incarnation inside `shutdown`, as the kernel does for the exit it confirms
+        assert_eq!((r.core.inc, r.core.kernel.inc), (1, 2));
+    }
+
     // ---- the signals ----
 
     fn signals() -> (
@@ -1446,6 +1578,7 @@ mod tests {
             exit_wait: 10 * SEC,
             kill_grace: 5 * SEC,
             restarts: 0,
+            restart_window: 60 * SEC,
         }
     }
 
@@ -1553,6 +1686,54 @@ mod tests {
             }
             End::Fatal(why) => panic!("fatal: {why}"),
         }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn the_core_follows_the_incarnations_of_a_kernel_that_restarts_every_window() {
+        let base = scratch(&std::env::temp_dir(), "driver-restart");
+        let root = base.join("root");
+        DirBuilder::new().mode(0o700).create(&root).unwrap();
+        // Every start fails, for the inspector is not there. One restart is allowed in a window of 50 ms, so the
+        // kernel waits for the window and never fails.
+        let mut cfg = config(&root);
+        cfg.inspector = base.join("missing");
+        (cfg.restarts, cfg.restart_window) = (1, 50 * MS);
+        let (tx, rx) = sync_channel(2);
+        let mut core = Core::new(
+            Supervisor::new(cfg).unwrap(),
+            rx,
+            Signals::Told { _failed: None },
+            start_logger().unwrap(),
+            20 * MS,
+            5 * MS,
+            5,
+        );
+        assert_eq!(core.inc, 1);
+
+        let until = Instant::now() + 30 * SEC;
+        while core.kernel.status().restarts < 3 {
+            assert!(Instant::now() < until, "{:?}", core.kernel.status());
+            core.round().unwrap();
+            let status = core.kernel.status();
+            assert!(!matches!(status.phase, Phase::Failed(_)), "{status:?}");
+            // the round has seen the number the kernel has
+            assert_eq!(core.inc, status.inc);
+        }
+        // every restart used a number of its own
+        assert!(core.inc >= 4, "{} after three restarts", core.inc);
+
+        // the last sender goes: the kernel is stopped and its directory is removed
+        drop(tx);
+        let done = loop {
+            assert!(Instant::now() < until, "no end");
+            if let Some(done) = core.round().unwrap() {
+                break done;
+            }
+        };
+        assert_eq!(done.phase, Phase::Stopped);
+        assert!(done.exit_confirmed && done.dir_removed);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
         fs::remove_dir_all(&base).unwrap();
     }

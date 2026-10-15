@@ -31,6 +31,15 @@
 //!   from the client's side: the cut must come at the configured time, within a generous margin.
 //! - A client that resets is a socket closed with `SO_LINGER` set to zero. The standard library cannot set it, so
 //!   the socket is handed to tokio for that one call (`set_zero_linger`; `set_linger` is deprecated).
+//! - A gzip body is built in the test with `flate2`, with the exact bytes the scene needs: a plain body that is
+//!   much longer than its coded form (so the length that reaches the upstream cannot be the coded one), a body
+//!   that decodes to just over the limit from a few hundred bytes, a stream with one byte of its trailer changed,
+//!   or with bytes after its member.
+//! - A restart window is a scene in time. The window is counted from a kill, which is before the kernel's own
+//!   record of the restart, so the earliest time the kernel may start the inspector again is known to the test:
+//!   the kill plus the window. The scene checks its answers against that bound, and its other times (the wait
+//!   for a verdict and the time to the second kill) leave a large part of the window over. The few seconds that
+//!   remain are waited for in `wait_inspector`, not slept.
 //! - A kernel that never becomes ready is a stand-in for the inspector: `/bin/sh` runs a script that becomes
 //!   `/bin/sleep` and never says hello. The script is in the test root and is removed with it.
 
@@ -41,11 +50,13 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde_json::json;
 
 const MS: Duration = Duration::from_millis(1);
@@ -722,6 +733,8 @@ struct Knobs {
     upstream_header_ms: u64,
     response_idle_ms: u64,
     restarts: u32,
+    /// The window in which `restarts` restarts are allowed.
+    restart_window_ms: u64,
     stop_inspect_ms: u64,
     stop_wait_ms: u64,
     hello_wait_ms: u64,
@@ -751,6 +764,7 @@ impl Knobs {
             upstream_header_ms: 10_000,
             response_idle_ms: 10_000,
             restarts: 0,
+            restart_window_ms: 60_000,
             stop_inspect_ms: 10_000,
             stop_wait_ms: 20_000,
             hello_wait_ms: 10_000,
@@ -855,6 +869,7 @@ fn config_json(k: &Knobs, listen: SocketAddr, upstream: SocketAddr, root: &Path)
             "exit_wait_ms": 3_000,
             "kill_grace_ms": KILL_GRACE_MS,
             "restarts": k.restarts,
+            "restart_window_ms": k.restart_window_ms,
         },
     })
     .to_string()
@@ -909,6 +924,14 @@ fn assert_gone(pids: &[u32]) {
     }
 }
 
+/// The numbers in a record line, in order.
+fn numbers_in(line: &str) -> Vec<u64> {
+    line.split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().expect("a number"))
+        .collect()
+}
+
 /// The kernel's numbers in the record line that the driver writes when it is told to stop.
 #[derive(Debug, PartialEq, Eq)]
 struct StopCounts {
@@ -929,11 +952,7 @@ impl StopCounts {
             .iter()
             .find(|l| l.starts_with("driver: stop, records "))
             .unwrap_or_else(|| panic!("no stop line in {lines:#?}"));
-        let numbers: Vec<u64> = line
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.parse().expect("a number"))
-            .collect();
+        let numbers = numbers_in(line);
         match numbers[..] {
             [records, held, waiting] => StopCounts {
                 records,
@@ -1735,15 +1754,10 @@ fn bodies_of_other_types_and_encoded_bodies_give_415() {
     // Bodies with a length whose type is not inspected. Each is valid for its type: the type alone decides, and
     // the head is refused before any body is read.
     let typed = |content_type: &str, body: &[u8]| post_typed("/t", content_type, body);
-    // A gzip stream (header bytes only; it is refused before anything looks at it) under either inspected type.
-    let gzip = |content_type: &str| {
-        let mut request = format!(
-            "POST /g HTTP/1.1\r\nHost: example.test\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nContent-Length: 10\r\n\r\n"
-        )
-        .into_bytes();
-        request.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
-        request
-    };
+    // A body with a coding that is not decoded, under either inspected type. The body is a real gzip member, so
+    // that the coding alone decides: only the exact value `gzip` is taken, whatever follows or precedes it.
+    let member = gzip(b"probe=ok");
+    let coded = |content_type: &str, coding: &str| post_coded("/e", content_type, coding, &member);
     // JSON next to another type is not one type.
     let two_types = {
         let body = b"{\"probe\":\"ok\"}";
@@ -1757,15 +1771,26 @@ fn bodies_of_other_types_and_encoded_bodies_give_415() {
     };
     // A chunked body is refused only once it has been read and is known to be there.
     let chunked_text = chunked_typed("/c", "text/plain", &chunked_body(&[b"hello"], b""));
-    let requests = [
+    let mut requests = vec![
         typed("application/xml", b"<probe>ok</probe>"),
         typed("text/plain", b"probe=ok"),
         typed("text/x+json", b"{\"probe\":\"ok\"}"),
-        gzip(URLENCODED),
-        gzip(JSON),
         two_types,
         chunked_text,
     ];
+    // The last value holds a second `Content-Encoding` line: a list in one line and a repeated line are refused
+    // alike.
+    for coding in [
+        "x-gzip",
+        "deflate",
+        "br",
+        "gzip, gzip",
+        "gzip\r\nContent-Encoding: gzip",
+    ] {
+        for content_type in [URLENCODED, JSON] {
+            requests.push(coded(content_type, coding));
+        }
+    }
     let count = requests.len();
     for request in requests {
         let reply = exchange(proxy.port, &request);
@@ -1807,6 +1832,124 @@ fn killing_the_inspector_during_an_inspection_gives_503_and_no_upstream_connecti
     let replacement = proxy.wait_inspector(Some(victim));
     assert_ne!(replacement, victim);
     assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_second_kill_within_the_restart_window_gives_503_until_the_window_has_passed() {
+    // One restart in each window. The window is long, because two times have to fit into it with room to spare:
+    // the time to the second kill (a restart and a request through the new inspector, normally well under a
+    // second), and then the wait of a request for its verdict (`wait_deadline`, 5 s), which must end while the
+    // kernel is still waiting. `wait_deadline` stays at 5 s because the request that follows the first kill has to
+    // wait for the restart, hello included, within it; a shorter window would make the scene depend on the speed
+    // of the host.
+    let window = Duration::from_secs(15);
+    let knobs = Knobs {
+        restarts: 1,
+        restart_window_ms: 15_000,
+        ..Knobs::slow()
+    };
+    let wait_deadline = Duration::from_millis(knobs.wait_deadline_ms);
+    let mut proxy = Proxy::start("restart_window", knobs);
+    let records = proxy.records.clone();
+    let incarnation = |l: &str| l.starts_with("driver: inspector incarnation changed, ");
+    let first = proxy.inspector();
+    let mut sock = proxy.start_slow(&post_form("/submit", &padded_form("ok", MAX_BODY)));
+
+    // The first kill. The kernel records the restart after the kill, so its window cannot be over before
+    // `killed` and a whole window have passed.
+    let killed = Instant::now();
+    run_kill("KILL", first);
+    let answer = collect(&mut sock, killed);
+    assert_empty_answer(&answer, 503);
+    records.conn("the 503 record", |l| l.contains(": failed 503 inspector "));
+    assert_eq!(proxy.upstream.connections(), 0);
+
+    // The window had room: the kernel started an inspector, and a normal request passes through it.
+    let after = exchange(proxy.port, &get("/after"));
+    assert_eq!(after.status(), 200, "answer: {:?}", after.text());
+    let second = proxy.wait_inspector(Some(first));
+    assert_ne!(second, first);
+    assert_eq!(proxy.upstream.connections(), 1);
+    assert!(
+        killed.elapsed() < window / 2,
+        "the host is too slow for this scene: {:?} to restart the inspector, with a window of {window:?}",
+        killed.elapsed()
+    );
+
+    // The second kill, right away: the window holds its one restart. The record of the new incarnation shows that
+    // the kernel has seen the end of the second inspector.
+    run_kill("KILL", second);
+    let lines = records.wait_lines("the two incarnation records", 2, incarnation);
+    assert_eq!(
+        lines.iter().map(|l| numbers_in(l)).collect::<Vec<_>>(),
+        // The incarnation, and the restarts made in all: the second end did not make one.
+        [[2, 1], [3, 1]],
+        "records: {lines:#?}"
+    );
+
+    // While the kernel waits, requests wait for their own deadline and are answered 503. Two at once, so that the
+    // wait is the one deadline.
+    let port = proxy.port;
+    let waiting: Vec<Reply> = thread::scope(|scope| {
+        let clients: Vec<_> = (0..2)
+            .map(|_| scope.spawn(move || exchange(port, &get("/during"))))
+            .collect();
+        clients
+            .into_iter()
+            .map(|client| client.join().expect("a client panicked"))
+            .collect()
+    });
+    assert!(
+        Instant::now() < killed + window,
+        "the host is too slow for this scene: the answers came after the window may have passed"
+    );
+    for reply in &waiting {
+        assert_empty_answer(reply, 503);
+        assert!(
+            reply.took >= wait_deadline,
+            "the answer came after {:?}, before the wait deadline of {wait_deadline:?}",
+            reply.took
+        );
+    }
+    records.conns("the two 503 records", 2, |l| {
+        l.contains(": failed 503 inspection wait deadline ")
+    });
+    assert_eq!(proxy.upstream.connections(), 1);
+    // The kernel waits without a process, and the proxy is still there.
+    assert!(
+        children_of(proxy.pid)
+            .into_iter()
+            .all(|pid| !is_inspector(pid)),
+        "an inspector is running inside the window"
+    );
+    assert!(
+        matches!(proxy.exit.try_recv(), Err(TryRecvError::Empty)),
+        "the proxy ended; its records: {:#?}",
+        records.lines()
+    );
+
+    // The window passes: the kernel starts the inspector again, not before, and a request passes.
+    let third = proxy.wait_inspector(Some(second));
+    assert_ne!(third, second);
+    let started = Instant::now();
+    assert!(
+        started >= killed + window,
+        "the inspector was started again {:?} after the first kill, inside the window of {window:?}",
+        started.duration_since(killed)
+    );
+    let again = exchange(proxy.port, &get("/again"));
+    assert_eq!(again.status(), 200, "answer: {:?}", again.text());
+    assert_eq!(proxy.upstream.connections(), 2);
+
+    // The restarts made no other incarnation record, and the proxy was never in a failed state.
+    let lines = records.lines();
+    assert_eq!(
+        lines.iter().filter(|l| incarnation(l)).count(),
+        2,
+        "records: {lines:#?}"
+    );
+    assert_eq!(proxy.finish(2), StopCounts::NONE);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -2440,6 +2583,325 @@ fn a_json_content_type_without_a_body_is_forwarded() {
         l.contains(": forwarded 200 forwarded ")
     });
     assert_eq!(proxy.finish(2), StopCounts::NONE);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Bodies with the gzip coding
+// ---------------------------------------------------------------------------------------------------------
+
+/// One gzip member of `data`.
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).expect("compress the body");
+    encoder.finish().expect("finish the gzip stream")
+}
+
+/// A POST with a `Content-Length` whose body is `coded` and whose `Content-Encoding` line has the value `coding`
+/// exactly as given (it may be any spelling, or hold a second line).
+fn post_coded(path: &str, content_type: &str, coding: &str, coded: &[u8]) -> Vec<u8> {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: example.test\r\nContent-Type: {content_type}\r\nContent-Encoding: {coding}\r\nContent-Length: {}\r\n\r\n",
+        coded.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(coded);
+    request
+}
+
+/// The same request chunked, with `coded` cut into pieces of 7 bytes: the cuts fall inside the gzip header, inside
+/// the compressed data and inside the trailer.
+fn chunked_coded(path: &str, content_type: &str, coding: &str, coded: &[u8]) -> Vec<u8> {
+    let chunks: Vec<&[u8]> = coded.chunks(7).collect();
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: example.test\r\nContent-Type: {content_type}\r\nContent-Encoding: {coding}\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    .into_bytes();
+    request.extend_from_slice(&chunked_body(&chunks, b""));
+    request
+}
+
+/// Checks what the upstream got as its request number `index` after a gzip request: the decoded body byte for
+/// byte, with the length of the decoded body and without the coding or the chunked framing, and no byte of the
+/// coded stream anywhere (its first two bytes, the gzip magic, are not in the bytes the upstream read).
+fn assert_forwarded_decoded(
+    proxy: &Proxy,
+    index: usize,
+    start: &str,
+    content_type: &str,
+    plain: &[u8],
+) {
+    assert_forwarded_json(proxy, index, start, content_type, plain);
+    let requests = proxy.upstream.requests();
+    let seen = Message::parse(&requests[index]);
+    assert!(
+        !seen.names().contains(&"content-encoding"),
+        "fields: {:?}",
+        seen.fields
+    );
+    assert!(
+        find(&requests[index], &[0x1f, 0x8b]).is_none(),
+        "the upstream got coded bytes"
+    );
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_gzip_urlencoded_body_is_inspected_decoded_and_a_clean_one_is_forwarded_decoded() {
+    let proxy = Proxy::start("gzip_form", Knobs::quick());
+    // The coding is the value `gzip` in any case and with blanks around it. The rule has to be the one that
+    // answers: it can only match the argument in the decoded body.
+    let spellings = ["gzip", "GZip", " \t gzip \t"];
+    for (n, spelling) in spellings.into_iter().enumerate() {
+        let reply = exchange(
+            proxy.port,
+            &post_coded(
+                "/submit",
+                URLENCODED,
+                spelling,
+                &gzip(&padded_form("block", 300)),
+            ),
+        );
+        assert_empty_answer(&reply, 403);
+        proxy
+            .records
+            .conns(spelling, n + 1, |l| l.contains(&blocked_by(9202)));
+        assert_eq!(proxy.upstream.connections(), 0, "{spelling:?}");
+    }
+    // The same through the chunked coding, with the stream cut into pieces.
+    let reply = exchange(
+        proxy.port,
+        &chunked_coded(
+            "/submit",
+            URLENCODED,
+            "gzip",
+            &gzip(&padded_form("block", 300)),
+        ),
+    );
+    assert_empty_answer(&reply, 403);
+    proxy.records.conns("the chunked blocked record", 4, |l| {
+        l.contains(&blocked_by(9202))
+    });
+    assert_eq!(proxy.upstream.connections(), 0);
+    assert!(proxy.upstream.requests().is_empty());
+
+    // A clean body whose decoded form is much longer than its coded form: the length that reaches the upstream
+    // is the decoded one, and its bytes are the decoded ones.
+    let plain = padded_form("ok", 4096);
+    let coded = gzip(&plain);
+    assert!(coded.len() * 4 < plain.len(), "the body compresses well");
+    let passed = exchange(
+        proxy.port,
+        &post_coded("/submit", URLENCODED, "gzip", &coded),
+    );
+    assert_eq!(passed.status(), 200, "answer: {:?}", passed.text());
+    assert_eq!(passed.message().body, UPSTREAM_BODY.as_bytes());
+    assert_eq!(proxy.upstream.connections(), 1);
+    assert_eq!(proxy.upstream.requests().len(), 1);
+    assert_forwarded_decoded(&proxy, 0, "POST /submit HTTP/1.1", URLENCODED, &plain);
+
+    // The same through the chunked coding: one length, no chunked framing, no coding.
+    let chunked = exchange(
+        proxy.port,
+        &chunked_coded("/submit", URLENCODED, "gzip", &coded),
+    );
+    assert_eq!(chunked.status(), 200, "answer: {:?}", chunked.text());
+    assert_eq!(proxy.upstream.connections(), 2);
+    assert_eq!(proxy.upstream.requests().len(), 2);
+    assert_forwarded_decoded(&proxy, 1, "POST /submit HTTP/1.1", URLENCODED, &plain);
+    proxy.records.conns("two forwarded records", 2, |l| {
+        l.contains(": forwarded 200 forwarded ")
+    });
+    assert_eq!(proxy.finish(2), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_gzip_json_body_is_inspected_decoded_and_a_clean_one_is_forwarded_decoded() {
+    let proxy = Proxy::start("gzip_json", Knobs::quick());
+    let reply = exchange(
+        proxy.port,
+        &post_coded("/api", JSON, "gzip", &gzip(BLOCKED_JSON.as_bytes())),
+    );
+    assert_empty_answer(&reply, 403);
+    proxy
+        .records
+        .conns("the blocked record", 1, |l| l.contains(&blocked_by(9203)));
+    let reply = exchange(
+        proxy.port,
+        &chunked_coded("/api", JSON, "gzip", &gzip(BLOCKED_JSON.as_bytes())),
+    );
+    assert_empty_answer(&reply, 403);
+    proxy.records.conns("the chunked blocked record", 2, |l| {
+        l.contains(&blocked_by(9203))
+    });
+    assert_eq!(proxy.upstream.connections(), 0);
+    assert!(proxy.upstream.requests().is_empty());
+
+    // The clean body has escapes, non-ASCII text and a final line feed: it reaches the upstream byte for byte.
+    let clean = CLEAN_JSON.as_bytes();
+    let coded = gzip(clean);
+    let passed = exchange(proxy.port, &post_coded("/api", JSON, "gzip", &coded));
+    assert_eq!(passed.status(), 200, "answer: {:?}", passed.text());
+    assert_eq!(proxy.upstream.connections(), 1);
+    assert_forwarded_decoded(&proxy, 0, "POST /api HTTP/1.1", JSON, clean);
+    let chunked = exchange(proxy.port, &chunked_coded("/api", JSON, "gzip", &coded));
+    assert_eq!(chunked.status(), 200, "answer: {:?}", chunked.text());
+    assert_eq!(proxy.upstream.connections(), 2);
+    assert_forwarded_decoded(&proxy, 1, "POST /api HTTP/1.1", JSON, clean);
+    assert_eq!(proxy.upstream.requests().len(), 2);
+    assert_eq!(proxy.finish(2), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_gzip_body_that_decodes_to_more_than_the_limit_gives_413_and_no_upstream_connection() {
+    let proxy = Proxy::start("gzip_413", Knobs::quick());
+    // Each coded body is a few hundred bytes to a few tens of KiB, far below the limit on the coded length: only
+    // the decoded length can be refused. The rule would block each of them, so a 413 means nothing was inspected.
+    let over = padded_form("block", MAX_BODY + 1);
+    let bomb = vec![b'a'; 8 * MAX_BODY];
+    let coded_over = gzip(&over);
+    let coded_bomb = gzip(&bomb);
+    assert!(coded_over.len() < 64 * 1024 && coded_bomb.len() < 64 * 1024);
+    let requests = [
+        (
+            "one byte over the limit",
+            post_coded("/big", URLENCODED, "gzip", &coded_over),
+        ),
+        (
+            "one byte over the limit, chunked",
+            chunked_coded("/big", URLENCODED, "gzip", &coded_over),
+        ),
+        (
+            "8 times the limit",
+            post_coded("/big", URLENCODED, "gzip", &coded_bomb),
+        ),
+        (
+            "8 times the limit, chunked",
+            chunked_coded("/big", URLENCODED, "gzip", &coded_bomb),
+        ),
+    ];
+    for (n, (what, request)) in requests.into_iter().enumerate() {
+        let reply = exchange(proxy.port, &request);
+        assert_empty_answer(&reply, 413);
+        proxy.records.conns(what, n + 1, |l| {
+            l.contains(": rejected 413 decoded body over the limit ")
+        });
+        assert_eq!(proxy.upstream.connections(), 0, "{what}");
+    }
+    assert!(proxy.upstream.requests().is_empty());
+
+    // A body that decodes to the limit exactly is taken, and the upstream gets all of it.
+    let at_limit = padded_form("ok", MAX_BODY);
+    let passed = exchange(
+        proxy.port,
+        &post_coded("/big", URLENCODED, "gzip", &gzip(&at_limit)),
+    );
+    assert_eq!(passed.status(), 200, "answer: {:?}", passed.text());
+    assert_eq!(proxy.upstream.connections(), 1);
+    assert_forwarded_decoded(&proxy, 0, "POST /big HTTP/1.1", URLENCODED, &at_limit);
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_corrupt_gzip_body_or_data_after_its_member_gives_400_and_no_upstream_connection() {
+    let proxy = Proxy::start("gzip_400", Knobs::quick());
+    // Every plain body would be blocked by the rule, so a 400 means that nothing was inspected.
+    let plain = padded_form("block", 300);
+    let member = gzip(&plain);
+    let trailer = member.len() - 8;
+    let mut bad_crc = member.clone();
+    bad_crc[trailer] ^= 0xff;
+    let mut bad_length = member.clone();
+    bad_length[member.len() - 1] ^= 0xff;
+    let after_junk = [member.as_slice(), b"junk"].concat();
+    let after_zero = [member.as_slice(), &[0u8]].concat();
+    let after_member = [member.as_slice(), gzip(b"probe=ok").as_slice()].concat();
+    const MALFORMED: &str = "malformed gzip body";
+    const AFTER: &str = "data after the gzip member";
+    let rows: Vec<(&str, &str, Vec<u8>)> = vec![
+        (
+            "not a gzip stream",
+            MALFORMED,
+            post_coded("/g", URLENCODED, "gzip", &plain),
+        ),
+        (
+            "cut in the trailer",
+            MALFORMED,
+            post_coded("/g", URLENCODED, "gzip", &member[..member.len() - 4]),
+        ),
+        (
+            "cut after the header",
+            MALFORMED,
+            post_coded("/g", URLENCODED, "gzip", &member[..10]),
+        ),
+        (
+            "a wrong checksum",
+            MALFORMED,
+            post_coded("/g", URLENCODED, "gzip", &bad_crc),
+        ),
+        (
+            "a wrong checksum, chunked",
+            MALFORMED,
+            chunked_coded("/g", URLENCODED, "gzip", &bad_crc),
+        ),
+        (
+            "a wrong length",
+            MALFORMED,
+            post_coded("/g", URLENCODED, "gzip", &bad_length),
+        ),
+        (
+            "a few bytes after the member",
+            AFTER,
+            post_coded("/g", URLENCODED, "gzip", &after_junk),
+        ),
+        (
+            "a zero byte after the member",
+            AFTER,
+            post_coded("/g", URLENCODED, "gzip", &after_zero),
+        ),
+        (
+            "a second member",
+            AFTER,
+            post_coded("/g", URLENCODED, "gzip", &after_member),
+        ),
+        (
+            "a second member, chunked",
+            AFTER,
+            chunked_coded("/g", URLENCODED, "gzip", &after_member),
+        ),
+        (
+            "an empty chunked body",
+            "empty gzip body",
+            chunked_coded("/g", URLENCODED, "gzip", b""),
+        ),
+        (
+            "a length of zero",
+            "malformed request head",
+            post_coded("/g", URLENCODED, "gzip", b""),
+        ),
+    ];
+    for (n, (what, reason, request)) in rows.iter().enumerate() {
+        let reply = exchange(proxy.port, request);
+        assert_empty_answer(&reply, 400);
+        // The records of the rows before this one that gave the same reason are there as well.
+        let same = rows[..=n].iter().filter(|row| row.1 == *reason).count();
+        proxy.records.conns(what, same, |l| {
+            l.contains(&format!(": rejected 400 {reason} "))
+        });
+        assert_eq!(proxy.upstream.connections(), 0, "{what}");
+    }
+    assert!(proxy.upstream.requests().is_empty());
+
+    // Not a state of the proxy: a good stream still passes.
+    let passed = exchange(
+        proxy.port,
+        &post_coded("/g", URLENCODED, "gzip", &gzip(b"probe=ok")),
+    );
+    assert_eq!(passed.status(), 200, "answer: {:?}", passed.text());
+    assert_forwarded_decoded(&proxy, 0, "POST /g HTTP/1.1", URLENCODED, b"probe=ok");
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
 }
 
 // ---------------------------------------------------------------------------------------------------------
