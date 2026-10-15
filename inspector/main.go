@@ -297,12 +297,17 @@ func withoutPath(err error) error {
 // reservedDirectives follow the operator's rules in a separate WithDirectives
 // call. Coraza parses every call apart from the others (no continuation
 // or backtick state is carried over), and a later SecRuleEngine,
-// SecRequestBodyAccess or SecRequestBodyLimitAction replaces an earlier one.
-// So the engine is On, the body is accessible and a body over the limit is
-// rejected, whatever the operator's rules or a recommended configuration set.
+// SecRequestBodyAccess, SecRequestBodyLimitAction or
+// SecRequestBodyJsonDepthLimit replaces an earlier one.
+// So the engine is On, the body is accessible, a body over the limit is
+// rejected and a JSON body nests at most 64 levels, whatever the operator's
+// rules or a recommended configuration set (the recommended one sets 1024,
+// and the JSON processor reads the nested parts of a body again at every
+// level, so a deep body costs much more than a flat one).
 // The last SecRuleEngine On also avoids the switch of the body limit action to
 // ProcessPartial that NewWAF makes for DetectionOnly. A parse failure of the
-// body, a dropped argument and an unparsable URI become a block of phase 2.
+// body (a JSON body nested deeper than the limit is one), a dropped argument
+// and an unparsable URI become a block of phase 2.
 // Ids 4000001 to 4000003 are reserved for these rules. The start path rejects
 // SecIgnoreRuleCompilationErrors (checkRules) before newWAF, so a rule of the
 // operator with one of these ids stops NewWAF instead of displacing a reserved rule
@@ -313,6 +318,7 @@ func withoutPath(err error) error {
 const reservedDirectives = `SecRuleEngine On
 SecRequestBodyAccess On
 SecRequestBodyLimitAction Reject
+SecRequestBodyJsonDepthLimit 64
 SecRule REQBODY_ERROR "!@eq 0" "id:4000001,phase:2,t:none,deny"
 SecRule ARGUMENTS_LIMIT_REACHED "!@eq 0" "id:4000002,phase:2,t:none,deny"
 SecRule URI_PARSE_ERROR "!@eq 0" "id:4000003,phase:2,t:none,deny"

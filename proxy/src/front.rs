@@ -451,7 +451,9 @@ impl Conn {
             headers,
             field_bytes,
         } = represent(&self.head, bytes.len())?;
-        if self.head.chunked() && !bytes.is_empty() && !self.head.form_type() {
+        // The head check cannot tell whether a chunked body is empty, so its rule on the body type is applied
+        // here, with the same test.
+        if self.head.chunked() && !bytes.is_empty() && !self.head.inspectable_type() {
             return Err(Reject::UnsupportedMedia.into());
         }
         let body = Arc::new(BodyHold::new(bytes, budget));
@@ -2003,9 +2005,52 @@ mod tests {
     }
 
     #[test]
+    fn a_chunked_json_body_is_decoded_and_inspected_with_its_length() {
+        run(async {
+            let request = b"POST /j HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n5\r\n:\"b\"}\r\n0\r\n\r\n";
+            let (raw, seen) = exchange(config(), Mode::Answer(BLOCK), request).await;
+            assert_eq!(parse_response(&raw).status, 403);
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].body, b"{\"a\":\"b\"}");
+            assert_eq!(
+                seen[0].headers,
+                [
+                    pair("Host", "h"),
+                    pair("Content-Type", "application/json"),
+                    pair("Content-Length", "9")
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn a_chunked_json_suffix_body_is_decoded_and_inspected_with_its_length() {
+        run(async {
+            let request = b"POST /j HTTP/1.1\r\nHost: h\r\nContent-Type: application/vnd.api+json\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n5\r\n:\"b\"}\r\n0\r\n\r\n";
+            let (raw, seen) = exchange(config(), Mode::Answer(BLOCK), request).await;
+            assert_eq!(parse_response(&raw).status, 403);
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].body, b"{\"a\":\"b\"}");
+            assert_eq!(
+                seen[0].headers,
+                [
+                    pair("Host", "h"),
+                    pair("Content-Type", "application/vnd.api+json"),
+                    pair("Content-Length", "9")
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn a_chunked_body_of_another_type_is_415_but_an_empty_one_is_not() {
         run(async {
             let request = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n";
+            let (raw, seen) = exchange(config(), Mode::Answer(BLOCK), request).await;
+            assert_eq!(parse_response(&raw).status, 415);
+            assert!(seen.is_empty());
+            // A `+json` type outside `application/` is not JSON.
+            let request = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Type: text/x+json\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n";
             let (raw, seen) = exchange(config(), Mode::Answer(BLOCK), request).await;
             assert_eq!(parse_response(&raw).status, 415);
             assert!(seen.is_empty());

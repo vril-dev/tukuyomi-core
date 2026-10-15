@@ -734,6 +734,46 @@ func TestProcessHappyPath(t *testing.T) {
 	}
 }
 
+// A JSON body through the whole path: the start (checkRules accepts the depth
+// limit of the operator, newWAF replaces it), the protocol, begin that sets
+// the JSON processor, a rule of the operator on an argument of the body, and
+// the reserved rule on a body that nests deeper than the reserved limit.
+func TestProcessJSONBody(t *testing.T) {
+	p := startProc(t, procOpt{rules: baseRules + bigBody + "SecRequestBodyJsonDepthLimit 1024\n" + jsonProbeRule})
+	p.frame(t) // HELLO
+	pr := &peer{t: t, c: p.c}
+	cases := []struct {
+		body string
+		rule int64 // 0: Continue
+	}{
+		{jsonBody("block"), 9203},
+		{jsonBody("fine"), 0},
+		{nestedJSON(64, "fine"), 0},
+		{nestedJSON(65, "fine"), 4000001},
+	}
+	for i, c := range cases {
+		tx := uint64(i + 1)
+		pr.send(tFrame(kindTxBegin, tx, 1, jsonBegin(uint64(len(c.body))).payload()))
+		expectVerdict(t, pr.recv(), tx, 1, 1, false)
+		pr.send(tFrame(kindBody, tx, 2, []byte(c.body)))
+		pr.send(tFrame(kindBodyEnd, tx, 3, nil))
+		o := pr.recv()
+		expectVerdict(t, o, tx, 3, 2, c.rule != 0)
+		if c.rule != 0 && (o.rule != c.rule || o.stat != 403) {
+			t.Fatalf("body %d: %+v", i, o)
+		}
+		pr.send(tFrame(kindTxEnd, tx, 4, []byte{endComplete}))
+		expect(t, pr.recv(), kindClosed, tx, 4)
+	}
+	pr.send(tFrame(kindDrain, 0, 0, nil))
+	if o := pr.recv(); o.kind != kindBye || o.bye != [3]uint64{uint64(len(cases)), uint64(len(cases)), 0} {
+		t.Fatalf("%+v", o)
+	}
+	if c := p.exit(t); c != exitOK {
+		t.Fatalf("exit %d stderr %q", c, p.stderr.String())
+	}
+}
+
 func TestProcessExitCodes(t *testing.T) {
 	r, w, _ := os.Pipe()
 	defer r.Close()
@@ -1271,6 +1311,7 @@ func TestCheckRules(t *testing.T) {
 		{"comment line in a continuation", act + "\\\n# ctl:ruleEngine=Off\npass\"\n"},
 		{"engine and limit directives", "SecRuleEngine DetectionOnly\nSecRequestBodyLimitAction ProcessPartial\nSecRequestBodyAccess Off\n"},
 		{"other ctl", act + "ctl:requestBodyProcessor=JSON\"\n"},
+		{"JSON depth limit (the reserved directives replace it)", "SecRequestBodyJsonDepthLimit 1024\n"},
 		{"word include as an argument", "SecRule ARGS \"@contains include\" \"id:5,phase:1,pass\"\n"},
 		{"word SecIgnoreRuleCompilationErrors as an argument", "SecRule ARGS \"@contains SecIgnoreRuleCompilationErrors\" \"id:5,phase:1,pass\"\n"},
 		{"comment line with the ignore errors directive", "# SecIgnoreRuleCompilationErrors On\n"},

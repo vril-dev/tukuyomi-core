@@ -1046,6 +1046,8 @@ func flagCases() []flagCase {
 		{"uri", "", uri, "", 4000003},
 		{"arguments", "SecArgumentsLimit 2\n", args, "a=1&b=2&c=3", 4000002},
 		{"body", "", multipart, "garbage", 4000001},
+		{"json body", "", jsonBegin(1), "{", 4000001},
+		{"json arguments", "SecArgumentsLimit 2\n", jsonBegin(7), "[1,2,3]", 4000002},
 	}
 }
 
@@ -1201,6 +1203,8 @@ func TestRequestComplete(t *testing.T) {
 		{"MULTIPART", "URLENCODED", false}, {"URLENCODED", "MULTIPART", false},
 		{"URLENCODED", "", false}, {"MULTIPART", "", false}, {"", "", false}, {"", "URLENCODED", false},
 		{"RAW", "URLENCODED", false}, {"JSON", "MULTIPART", false}, {"XML", "URLENCODED", false},
+		{"JSON", "JSON", true}, {"URLENCODED", "JSON", false}, {"MULTIPART", "JSON", false}, {"JSON", "URLENCODED", false},
+		{"RAW", "JSON", false}, {"XML", "JSON", false}, {"", "JSON", false}, {"json", "JSON", false}, {"JSON ", "JSON", false},
 		{"urlencoded", "URLENCODED", false}, {"URLENCODED ", "URLENCODED", false}, {"UNKNOWN", "URLENCODED", false},
 	} {
 		f := &fakeTx{reqAccess: true, flags: map[variables.RuleVariable]string{variables.ReqbodyProcessor: c.read}}
@@ -1447,4 +1451,371 @@ func productWAFFor(t *testing.T, rules string) coraza.WAF {
 		t.Fatalf("newWAF: %v", err)
 	}
 	return waf
+}
+
+// ---- JSON bodies ----
+
+// jsonProbeRule matches the argument probe of a JSON body ({"probe":"block"}),
+// jsonAnyRule the value block anywhere in it.
+const (
+	jsonProbeRule = `SecRule ARGS_POST:json.probe "@streq block" "id:9203,phase:2,deny,status:403"` + "\n"
+	jsonAnyRule   = `SecRule ARGS_POST "@streq block" "id:9204,phase:2,deny,status:403"` + "\n"
+	bigBody       = "SecRequestBodyLimit 65536\n" // bodyReply sets 1024; the later directive wins
+)
+
+func jsonHeaders(ctype string) [][2]string {
+	return [][2]string{{"Host", "example.test"}, {"Content-Type", ctype}}
+}
+
+func jsonBody(v string) string { return `{"probe":"` + v + `"}` }
+
+// nestedJSON is n objects inside one another with the value v in the innermost.
+func nestedJSON(n int, v string) string {
+	return strings.Repeat(`{"a":`, n) + `"` + v + `"` + strings.Repeat("}", n)
+}
+
+// scalarsJSON is an array of n numbers.
+func scalarsJSON(n int) string { return "[" + strings.Repeat("1,", n-1) + "1]" }
+
+// expectRule checks the reply to BODY_END: a Continue for rule 0, else the
+// Block of that rule with status 403.
+func expectRule(t *testing.T, o out, msg uint32, rule int64) {
+	t.Helper()
+	expectVerdict(t, o, 1, msg, 2, rule != 0)
+	if rule != 0 && (o.rule != rule || o.stat != 403) {
+		t.Fatalf("%+v", o)
+	}
+}
+
+// beginOn runs begin of an owner on tx, on this goroutine, for the request b
+// and returns the owner and the one frame that begin sent.
+func beginOn(t *testing.T, tx types.Transaction, b tBegin) (*owner, out) {
+	t.Helper()
+	c := newCapture()
+	tab := newTable(testRun, testInc, func(string) types.Transaction { return tx }, c.send)
+	tb, err := decodeTxBegin(b.payload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := &owner{t: tab, e: newEntry(), id: 1}
+	o.begin(tb, 1)
+	return o, c.next(t)
+}
+
+// begin selects the expected processor from the first Content-Type by the rule
+// of Coraza, adds JSON to it (application/json by prefix, application/<name>+json
+// by the part before the first ";"), and sets the JSON processor after the
+// check of phase 1 for a request with a body (declared > 0) only. A phase 1
+// Block keeps its VERDICT; anything that keeps the processor from being set is
+// an ERROR code 25 and no Continue.
+func TestBeginSetsJSONProcessor(t *testing.T) {
+	good := func() *fakeTx { return &fakeTx{reqAccess: true} }
+	plain := func(f *fakeTx) types.Transaction { return plainTx{f} }
+	noProc := func(f *fakeTx) types.Transaction { return noProcessor{f} }
+	noAny := func(f *fakeTx) types.Transaction { return noFlags{f} }
+	for _, c := range []struct {
+		name     string
+		ctypes   []string // the Content-Type headers, in order
+		declared uint64
+		fake     func() *fakeTx
+		wrap     func(*fakeTx) types.Transaction // nil: the fake itself
+		wantProc string                          // the expected processor of the owner
+		sets     int                             // calls of Set
+		reply    string                          // "continue", "block" or "error"
+	}{
+		{"json", []string{"application/json"}, 5, good, nil, "JSON", 1, "continue"},
+		{"charset", []string{"application/json; charset=UTF-8"}, 5, good, nil, "JSON", 1, "continue"},
+		{"spaces and tab", []string{" \tapplication/json ; charset=utf-8 \t"}, 5, good, nil, "JSON", 1, "continue"},
+		{"upper case", []string{"APPLICATION/JSON"}, 5, good, nil, "JSON", 1, "continue"},
+		{"mixed case", []string{"Application/Json"}, 5, good, nil, "JSON", 1, "continue"},
+		{"no-break space", []string{" application/json"}, 5, good, nil, "JSON", 1, "continue"},
+		{"prefix of a longer name", []string{"application/jsonp"}, 5, good, nil, "JSON", 1, "continue"}, // the caller of the kernel refuses it first
+		{"json first", []string{"application/json", "text/plain"}, 5, good, nil, "JSON", 1, "continue"},
+		{"json after urlencoded", []string{"application/x-www-form-urlencoded", "application/json"}, 5, good, nil, "URLENCODED", 0, "continue"},
+		{"json after another type", []string{"text/plain", "application/json"}, 5, good, nil, "", 0, "continue"},
+		{"urlencoded", []string{"application/x-www-form-urlencoded"}, 5, good, nil, "URLENCODED", 0, "continue"},
+		{"multipart", []string{"multipart/form-data; boundary=xx"}, 5, good, nil, "MULTIPART", 0, "continue"},
+		{"text/json", []string{"text/json"}, 5, good, nil, "", 0, "continue"},
+		// application/<name>+json: the part before the first ";", trimmed and
+		// lower-cased, starts with application/ and ends with +json.
+		{"vnd.api+json", []string{"application/vnd.api+json"}, 5, good, nil, "JSON", 1, "continue"},
+		{"problem+json", []string{"application/problem+json"}, 5, good, nil, "JSON", 1, "continue"},
+		{"suffix with charset", []string{"application/vnd.api+json; charset=UTF-8"}, 5, good, nil, "JSON", 1, "continue"},
+		{"suffix, spaces and tab", []string{" \tapplication/vnd.api+json \t; charset=utf-8 \t"}, 5, good, nil, "JSON", 1, "continue"},
+		{"suffix, upper case", []string{"APPLICATION/VND.API+JSON"}, 5, good, nil, "JSON", 1, "continue"},
+		{"suffix, mixed case with charset", []string{"Application/Vnd.Api+Json; Charset=UTF-8"}, 5, good, nil, "JSON", 1, "continue"},
+		{"suffix, no-break space", []string{"\u00a0application/vnd.api+json"}, 5, good, nil, "JSON", 1, "continue"},
+		{"suffix, name of one character", []string{"application/x+json"}, 5, good, nil, "JSON", 1, "continue"},
+		{"suffix first", []string{"application/vnd.api+json", "text/plain"}, 5, good, nil, "JSON", 1, "continue"},
+		{"suffix after urlencoded", []string{"application/x-www-form-urlencoded", "application/vnd.api+json"}, 5, good, nil, "URLENCODED", 0, "continue"},
+		{"suffix after another type", []string{"text/plain", "application/vnd.api+json"}, 5, good, nil, "", 0, "continue"},
+		{"text/x+json", []string{"text/x+json"}, 5, good, nil, "", 0, "continue"},
+		{"no slash after application", []string{"application+json"}, 5, good, nil, "", 0, "continue"},
+		{"suffix of a longer name", []string{"application/x+jsonp"}, 5, good, nil, "", 0, "continue"},
+		{"hyphen, not plus", []string{"application/x-json"}, 5, good, nil, "", 0, "continue"},
+		{"+json only after the semicolon", []string{"application/x; y=+json"}, 5, good, nil, "", 0, "continue"},
+		{"+json at the end of the name, parameters after it", []string{"application/x+json; y=z"}, 5, good, nil, "JSON", 1, "continue"},
+		{"suffix, name of 122 characters", []string{"application/" + strings.Repeat("a", 122) + "+json"}, 5, good, nil, "JSON", 1, "continue"},
+		// Rust refuses an empty name and one of 123 characters; begin does not
+		// limit the name, so it takes everything that Rust accepts and more.
+		{"suffix, empty name", []string{"application/+json"}, 5, good, nil, "JSON", 1, "continue"},
+		{"suffix, name of 123 characters", []string{"application/" + strings.Repeat("a", 123) + "+json"}, 5, good, nil, "JSON", 1, "continue"},
+		// The urlencoded prefix is checked first, as in Coraza, so a name that
+		// starts with x-www-form-urlencoded is a form here (Rust refuses it,
+		// or a JSON body would be parsed as a form); one character less is JSON.
+		{"suffix, name of urlencoded", []string{"application/x-www-form-urlencoded+json"}, 5, good, nil, "URLENCODED", 0, "continue"},
+		{"suffix, name starting with urlencoded", []string{"application/x-www-form-urlencoded-x+json; y=z"}, 5, good, nil, "URLENCODED", 0, "continue"},
+		{"suffix, name one character short of urlencoded", []string{"application/x-www-form-urlencode+json"}, 5, good, nil, "JSON", 1, "continue"},
+		{"no Content-Type", nil, 5, good, nil, "", 0, "continue"},
+		{"empty Content-Type", []string{""}, 5, good, nil, "", 0, "continue"},
+		// The boundary of the body: one declared byte sets it, none does not.
+		{"one byte declared", []string{"application/json"}, 1, good, nil, "JSON", 1, "continue"},
+		{"nothing declared", []string{"application/json"}, 0, good, nil, "JSON", 0, "continue"},
+		{"suffix, one byte declared", []string{"application/vnd.api+json"}, 1, good, nil, "JSON", 1, "continue"},
+		{"suffix, nothing declared", []string{"application/vnd.api+json"}, 0, good, nil, "JSON", 0, "continue"},
+		{"suffix, processor without Set", []string{"application/vnd.api+json"}, 5, func() *fakeTx { return &fakeTx{reqAccess: true, plainProc: true} }, nil, "JSON", 0, "error"},
+		{"phase 1 block", []string{"application/json"}, 5, func() *fakeTx { return &fakeTx{reqAccess: true, phase1: blockIt(1001, 403)} }, nil, "JSON", 0, "block"},
+		{"rule engine off", []string{"application/json"}, 5, func() *fakeTx { return &fakeTx{reqAccess: true, ruleOff: true} }, nil, "JSON", 0, "error"},
+		{"body not accessible", []string{"application/json"}, 5, func() *fakeTx { return &fakeTx{} }, nil, "JSON", 0, "error"},
+		{"processor without Set", []string{"application/json"}, 5, func() *fakeTx { return &fakeTx{reqAccess: true, plainProc: true} }, nil, "JSON", 0, "error"},
+		{"not a TransactionState", []string{"application/json"}, 5, good, plain, "JSON", 0, "error"},
+		{"no collection for the processor", []string{"application/json"}, 5, good, noProc, "JSON", 0, "error"},
+		{"no collection at all", []string{"application/json"}, 5, good, noAny, "JSON", 0, "error"},
+		// The same fakes with a form: nothing asks for Set, so a missing one is no error.
+		{"urlencoded, processor without Set", []string{"application/x-www-form-urlencoded"}, 5, func() *fakeTx { return &fakeTx{reqAccess: true, plainProc: true} }, nil, "URLENCODED", 0, "continue"},
+		{"nothing declared, processor without Set", []string{"application/json"}, 0, func() *fakeTx { return &fakeTx{reqAccess: true, plainProc: true} }, plain, "JSON", 0, "continue"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := c.fake()
+			var tx types.Transaction = f
+			if c.wrap != nil {
+				tx = c.wrap(f)
+			}
+			b := defaultBegin(c.declared)
+			b.headers = [][2]string{{"Host", "example.test"}}
+			for _, v := range c.ctypes {
+				b.headers = append(b.headers, [2]string{"Content-Type", v})
+			}
+			o, rep := beginOn(t, tx, b)
+			if o.wantProc != c.wantProc {
+				t.Errorf("expected processor %q, want %q", o.wantProc, c.wantProc)
+			}
+			if got := f.sets(); len(got) != c.sets || (c.sets == 1 && got[0] != "JSON") {
+				t.Errorf("Set called with %q, want %d call of JSON", got, c.sets)
+			}
+			switch c.reply {
+			case "continue":
+				expectVerdict(t, rep, 1, 1, 1, false)
+				if o.state != stHeaders {
+					t.Errorf("state %v", o.state)
+				}
+			case "block":
+				expectVerdict(t, rep, 1, 1, 1, true)
+				if o.state != stBlockedRq || rep.rule != 1001 {
+					t.Errorf("state %v rule %d", o.state, rep.rule)
+				}
+			default:
+				expectError(t, rep, 1, 1, classTxFailed, codeIncomplete)
+				if o.state != stFailed {
+					t.Errorf("state %v", o.state)
+				}
+			}
+			if v := f.violations(); len(v) != 0 {
+				t.Errorf("findings %q", v)
+			}
+		})
+	}
+}
+
+// The processor that begin sets is the one that is read before the Continue
+// of phase 2, in this order: phase 1, Set, the body, phase 2.
+func TestJSONBodyFlowWithFakes(t *testing.T) {
+	h := newHarness(t, nil)
+	h.in(kindTxBegin, 1, 1, jsonBegin(7).payload())
+	expectVerdict(t, h.cap.next(t), 1, 1, 1, false)
+	h.in(kindBody, 1, 2, []byte(`{"a":1}`))
+	h.in(kindBodyEnd, 1, 3, nil)
+	expectVerdict(t, h.cap.next(t), 1, 3, 2, false)
+	h.in(kindTxEnd, 1, 4, []byte{endComplete})
+	expect(t, h.cap.next(t), kindClosed, 1, 4)
+	h.waitOwners()
+	f := h.fake(1)
+	if got := f.sets(); len(got) != 1 || got[0] != "JSON" {
+		t.Fatalf("Set called with %q", got)
+	}
+	calls := strings.Split(f.trace(), ",")
+	at := func(s string) int {
+		for i, c := range calls {
+			if c == s {
+				return i
+			}
+		}
+		return -1
+	}
+	if !(0 < at("phase1") && at("phase1") < at("setproc") && at("setproc") < at("write") && at("write") < at("phase2")) {
+		t.Fatalf("order %v", calls)
+	}
+
+	// A processor that is not JSON any more before the Continue of phase 2.
+	h = newHarness(t, func(string) *fakeTx {
+		f := &fakeTx{reqAccess: true}
+		f.reqBody = func() (*types.Interruption, error) {
+			f.mu.Lock()
+			f.flags = map[variables.RuleVariable]string{variables.ReqbodyProcessor: "URLENCODED"}
+			f.mu.Unlock()
+			return nil, nil
+		}
+		return f
+	})
+	h.in(kindTxBegin, 1, 1, jsonBegin(7).payload())
+	expectVerdict(t, h.cap.next(t), 1, 1, 1, false)
+	h.in(kindBody, 1, 2, []byte(`{"a":1}`))
+	h.in(kindBodyEnd, 1, 3, nil)
+	expectError(t, h.cap.next(t), 1, 3, classTxFailed, codeIncomplete)
+}
+
+// The Content-Type that Coraza does not know for JSON still selects it here
+// (the first one, lower-cased, trimmed, by prefix for application/json, by the
+// part before the first ";" for application/<name>+json), begin sets the
+// processor, so the body is parsed as JSON and judged by the rules on its
+// arguments. A name that starts with x-www-form-urlencoded is a form for
+// Coraza, so the JSON text is not judged as JSON.
+func TestRealJSONBodySelected(t *testing.T) {
+	host := [2]string{"Host", "example.test"}
+	urlenc := "application/x-www-form-urlencoded"
+	js := "application/json"
+	for _, c := range []struct {
+		name    string
+		headers [][2]string
+		want    string // "json": parsed as JSON and judged; "form": parsed as urlencoded; "error": ERROR code 25
+	}{
+		{"json", jsonHeaders(js), "json"},
+		{"charset", jsonHeaders("application/json; charset=UTF-8"), "json"},
+		{"spaces and tab", jsonHeaders("  application/json; charset=UTF-8 \t"), "json"},
+		{"upper case", jsonHeaders("APPLICATION/JSON"), "json"},
+		{"no-break space", jsonHeaders(" application/json"), "json"},
+		{"lower case name", [][2]string{host, {"content-type", js}}, "json"},
+		{"upper case name", [][2]string{host, {"CONTENT-TYPE", js}}, "json"},
+		{"json first", [][2]string{host, {"Content-Type", js}, {"content-type", urlenc}}, "json"},
+		{"urlencoded first", [][2]string{host, {"Content-Type", urlenc}, {"content-type", js}}, "form"},
+		{"other type first", [][2]string{host, {"Content-Type", "text/plain"}, {"Content-Type", js}}, "error"},
+		{"empty first", [][2]string{host, {"Content-Type", ""}, {"Content-Type", js}}, "error"},
+		{"structured suffix", jsonHeaders("application/vnd.api+json"), "json"},
+		{"structured suffix, charset and case", jsonHeaders(" Application/Problem+JSON ; Charset=UTF-8"), "json"},
+		{"structured suffix, name of one character", jsonHeaders("application/x+json"), "json"},
+		{"structured suffix, name of 122 characters", jsonHeaders("application/" + strings.Repeat("a", 122) + "+json"), "json"},
+		{"structured suffix first", [][2]string{host, {"Content-Type", "application/vnd.api+json"}, {"content-type", "text/plain"}}, "json"},
+		{"structured suffix after another type", [][2]string{host, {"Content-Type", "text/plain"}, {"Content-Type", "application/vnd.api+json"}}, "error"},
+		{"structured suffix, name of urlencoded", jsonHeaders("application/x-www-form-urlencoded+json"), "form"},
+		{"structured suffix, name one character short of urlencoded", jsonHeaders("application/x-www-form-urlencode+json"), "json"},
+		{"+json only after the semicolon", jsonHeaders("application/x; y=+json"), "error"},
+		{"text/x+json", jsonHeaders("text/x+json"), "error"},
+		{"suffix of a longer name", jsonHeaders("application/x+jsonp"), "error"},
+		{"text/json", jsonHeaders("text/json"), "error"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			o, msg := bodyReply(t, jsonProbeRule, c.headers, jsonBody("fine"))
+			if c.want == "error" {
+				expectError(t, o, 1, msg, classTxFailed, codeIncomplete)
+				return
+			}
+			expectRule(t, o, msg, 0)
+			o, msg = bodyReply(t, jsonProbeRule, c.headers, jsonBody("block"))
+			if c.want == "json" {
+				expectRule(t, o, msg, 9203)
+			} else { // the JSON text is a name of a urlencoded argument: no rule on json.probe matches
+				expectRule(t, o, msg, 0)
+			}
+		})
+	}
+}
+
+// A ctl of the operator in phase 1 replaces the processor before begin sets
+// JSON, and one in phase 2 is refused by Coraza: neither stops the JSON
+// processor, so the rule on the argument still matches.
+func TestRealJSONProcessorNotReplaced(t *testing.T) {
+	ctl := func(phase, v string) string {
+		return `SecRule REQUEST_METHOD "@streq POST" "id:1,phase:` + phase + `,pass,nolog,ctl:requestBodyProcessor=` + v + `"` + "\n"
+	}
+	force := `SecRule REQUEST_METHOD "@streq POST" "id:2,phase:1,pass,nolog,ctl:forceRequestBodyVariable=On"` + "\n"
+	for _, c := range []struct{ name, rules string }{
+		{"no ctl", ""},
+		{"URLENCODED", ctl("1", "URLENCODED")},
+		{"RAW", ctl("1", "RAW")},
+		{"MULTIPART", ctl("1", "MULTIPART")},
+		{"XML", ctl("1", "XML")},
+		{"unknown name", ctl("1", "NOPE")},
+		{"empty", ctl("1", "")},
+		{"empty and forced", ctl("1", "") + force},
+		{"forced", force},
+		{"phase 2 URLENCODED", ctl("2", "URLENCODED")},
+		{"phase 2 RAW", ctl("2", "RAW")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			headers := jsonHeaders("application/json")
+			o, msg := bodyReply(t, jsonProbeRule+c.rules, headers, jsonBody("block"))
+			expectRule(t, o, msg, 9203)
+			o, msg = bodyReply(t, jsonProbeRule+c.rules, headers, jsonBody("fine"))
+			expectRule(t, o, msg, 0)
+		})
+	}
+	// Without a body nothing is parsed and the processor is not asked.
+	t.Run("no body", func(t *testing.T) {
+		o, msg := bodyReply(t, jsonProbeRule+ctl("1", "RAW"), jsonHeaders("application/json"), "")
+		expectRule(t, o, msg, 0)
+	})
+}
+
+// The rules of phase 1 see an empty REQBODY_PROCESSOR for a JSON body (it is
+// set after them), the rules of phase 2 see JSON.
+func TestRealJSONProcessorSeenByRules(t *testing.T) {
+	const (
+		phase1 = `SecRule REQBODY_PROCESSOR "@streq JSON" "id:9301,phase:1,deny,status:403"` + "\n"
+		phase2 = `SecRule REQBODY_PROCESSOR "@streq JSON" "id:9302,phase:2,deny,status:403"` + "\n"
+	)
+	// bodyReply checks that phase 1 is a Continue, so the first rule does not match.
+	o, msg := bodyReply(t, phase1+phase2, jsonHeaders("application/json"), jsonBody("fine"))
+	expectRule(t, o, msg, 9302)
+	o, msg = bodyReply(t, phase1, jsonHeaders("application/json"), jsonBody("fine"))
+	expectRule(t, o, msg, 0)
+}
+
+// What the JSON processor and the reserved rules do with a body, at the
+// boundaries: a nesting depth of 64 containers passes and 65 is a body error
+// (rule 4000001), whatever depth limit the operator asks for; a body that is
+// not RFC 8259 JSON is a body error; 1000 scalars pass and 1001 are too many
+// arguments (rule 4000002).
+func TestRealJSONBodyLimits(t *testing.T) {
+	for _, c := range []struct {
+		name, rules, body string
+		rule              int64 // 0: Continue
+	}{
+		{"depth 64", "", nestedJSON(64, "fine"), 0},
+		{"depth 64 is read to the innermost value", jsonAnyRule, nestedJSON(64, "block"), 9204},
+		{"depth 65", jsonAnyRule, nestedJSON(65, "fine"), 4000001},
+		{"depth 1", "", nestedJSON(1, "fine"), 0},
+		{"operator limit 8, depth 20", "SecRequestBodyJsonDepthLimit 8\n", nestedJSON(20, "fine"), 0},
+		{"operator limit 8, depth 65", "SecRequestBodyJsonDepthLimit 8\n", nestedJSON(65, "fine"), 4000001},
+		{"operator limit 1024, depth 20", "SecRequestBodyJsonDepthLimit 1024\n", nestedJSON(20, "fine"), 0},
+		{"operator limit 1024, depth 64", "SecRequestBodyJsonDepthLimit 1024\n", nestedJSON(64, "fine"), 0},
+		{"operator limit 1024, depth 65", "SecRequestBodyJsonDepthLimit 1024\n", nestedJSON(65, "fine"), 4000001},
+		{"truncated", "", `{"probe":`, 4000001},
+		{"trailing comma", "", `{"probe":"fine",}`, 4000001},
+		{"missing value", "", `{"probe":}`, 4000001},
+		{"trailing text", "", `{"probe":"fine"}x`, 4000001},
+		{"NaN", "", `{"probe":NaN}`, 4000001},
+		{"white space only", "", " \n", 4000001},
+		{"byte order mark", "", "\xef\xbb\xbf" + jsonBody("fine"), 4000001},
+		{"UTF-16 with a byte order mark", "", "\xff\xfe{\x00\"\x00a\x00\"\x00:\x001\x00}\x00", 4000001},
+		{"UTF-16 without one", "", "{\x00\"\x00a\x00\"\x00:\x001\x00}\x00", 4000001},
+		{"UTF-32 with a byte order mark", "", "\xff\xfe\x00\x00{\x00\x00\x00}\x00\x00\x00", 4000001},
+		{"valid", "", jsonBody("fine"), 0},
+		{"1000 scalars", "", scalarsJSON(1000), 0},
+		{"1001 scalars", "", scalarsJSON(1001), 4000002},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			o, msg := bodyReply(t, bigBody+c.rules, jsonHeaders("application/json"), c.body)
+			expectRule(t, o, msg, c.rule)
+		})
+	}
 }

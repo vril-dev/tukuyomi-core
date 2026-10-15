@@ -72,6 +72,13 @@ func defaultBegin(declared uint64) tBegin {
 		[][2]string{{"Host", "example.test"}, {"Content-Type", "application/x-www-form-urlencoded"}}}
 }
 
+// jsonBegin is a request with a JSON body of the given length.
+func jsonBegin(declared uint64) tBegin {
+	b := defaultBegin(declared)
+	b.headers = [][2]string{{"Host", "example.test"}, {"Content-Type", "application/json"}}
+	return b
+}
+
 func (b tBegin) payload() []byte {
 	w := &pw{}
 	w.s(b.client)
@@ -285,7 +292,9 @@ type fakeTx struct {
 	hdrGate     chan struct{}                     // if set, ProcessRequestHeaders waits on it
 	ruleOff     bool                              // IsRuleEngineOff
 	accessLost  int                               // IsRequestBodyAccessible is false from this call on (1-based); 0: as reqAccess
-	flags       map[variables.RuleVariable]string // raw value of a flag; absent is empty, except REQBODY_PROCESSOR (URLENCODED)
+	flags       map[variables.RuleVariable]string // raw value of a flag; absent is empty, except REQBODY_PROCESSOR (URLENCODED); Set of the processor writes here
+	plainProc   bool                              // REQBODY_PROCESSOR is a fakeFlag, a value without Set, as a type of Coraza that changed would be
+	procSets    []string                          // the values given to Set of REQBODY_PROCESSOR
 	serverNames []string
 
 	owner  uint64 // goroutine that made the fake, else of the first call
@@ -439,12 +448,56 @@ func (fakeFlag) FindAll() []types.MatchData { return nil }
 func (fakeFlag) Name() string               { return "" }
 func (s fakeFlag) Get() string              { return s.v }
 
+// fakeProc is the REQBODY_PROCESSOR of a fakeTx. As the one of Coraza it is
+// a pointer and has Set; Set stores into the flags of the fake, where Get
+// reads, so the value that begin sets is the one that requestComplete reads.
+type fakeProc struct{ f *fakeTx }
+
+func (*fakeProc) FindAll() []types.MatchData { return nil }
+func (*fakeProc) Name() string               { return "" }
+func (p *fakeProc) Get() string              { return p.f.procValue() }
+func (p *fakeProc) Set(s string) {
+	defer p.f.enter("setproc")()
+	p.f.mu.Lock()
+	defer p.f.mu.Unlock()
+	m := make(map[variables.RuleVariable]string, len(p.f.flags)+1)
+	for k, v := range p.f.flags {
+		m[k] = v
+	}
+	m[variables.ReqbodyProcessor] = s
+	p.f.flags = m
+	p.f.procSets = append(p.f.procSets, s)
+}
+
+// procValue is the raw value of REQBODY_PROCESSOR.
+func (f *fakeTx) procValue() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if g, ok := f.flags[variables.ReqbodyProcessor]; ok {
+		return g
+	}
+	return "URLENCODED" // what the Content-Type of defaultBegin selects
+}
+
+// sets is the list of values given to Set of REQBODY_PROCESSOR.
+func (f *fakeTx) sets() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.procSets...)
+}
+
 func (f *fakeTx) Collection(v variables.RuleVariable) collection.Collection {
 	defer f.enter("flags")()
-	if g, ok := f.flags[v]; ok || v != variables.ReqbodyProcessor {
-		return fakeFlag{g}
+	if v == variables.ReqbodyProcessor {
+		if f.plainProc {
+			return fakeFlag{f.procValue()}
+		}
+		return &fakeProc{f}
 	}
-	return fakeFlag{"URLENCODED"} // what the Content-Type of defaultBegin selects
+	f.mu.Lock()
+	g := f.flags[v]
+	f.mu.Unlock()
+	return fakeFlag{g}
 }
 func (f *fakeTx) WriteRequestBody(b []byte) (*types.Interruption, int, error) {
 	defer f.enter("write")()

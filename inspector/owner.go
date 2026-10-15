@@ -145,7 +145,7 @@ type owner struct {
 	state    txState
 	lastMsg  uint32
 	declared uint64
-	wantProc string // request body processor that Coraza picks from the first Content-Type; empty: none
+	wantProc string // request body processor that the first Content-Type selects (urlencoded and multipart: Coraza; JSON: begin); empty: none
 	recv     uint64
 	rDecl    uint64
 	rRecv    uint64
@@ -219,14 +219,27 @@ func (o *owner) begin(b txBegin, msg uint32) {
 		}
 		// transaction.go:404-416 of the pinned Coraza version: only the first
 		// Content-Type selects the processor, from its lower-cased, trimmed
-		// value by prefix.
+		// value by prefix. Coraza picks urlencoded and multipart that way and
+		// never picks JSON; the same prefix rule gives JSON here for
+		// application/json. A second rule gives JSON for application/<name>+json:
+		// the part before the first ";", trimmed, starts with application/ and
+		// ends with +json. The processor is set below. The urlencoded check
+		// comes first, as in Coraza, so a name that starts with
+		// x-www-form-urlencoded is a form here and never JSON; Rust refuses
+		// such a type.
 		if !hasType && strings.EqualFold(h.name, "content-type") {
 			hasType = true
 			v := strings.TrimSpace(strings.ToLower(h.value))
+			essence, _, _ := strings.Cut(v, ";")
+			essence = strings.TrimSpace(essence)
 			if strings.HasPrefix(v, "application/x-www-form-urlencoded") {
 				o.wantProc = "URLENCODED"
 			} else if strings.HasPrefix(v, "multipart/form-data") {
 				o.wantProc = "MULTIPART"
+			} else if strings.HasPrefix(v, "application/json") {
+				o.wantProc = "JSON"
+			} else if strings.HasPrefix(essence, "application/") && strings.HasSuffix(essence, "+json") {
+				o.wantProc = "JSON"
 			}
 		}
 	}
@@ -239,6 +252,24 @@ func (o *owner) begin(b txBegin, msg uint32) {
 		o.fail(msg, codeIncomplete, "request inspection incomplete")
 		return
 	}
+	// The JSON processor is set here, after the rules of phase 1 (a ctl of
+	// the operator can no longer take it back: Coraza refuses
+	// ctl:requestBodyProcessor after the headers phase, ctl.go:253-255) and
+	// before the body is read (transaction.go:1142). The assertions are those
+	// of requestComplete, and the processor of the pinned Coraza has Set.
+	if it == nil && o.declared > 0 && o.wantProc == "JSON" {
+		ts, ok := o.tx.(plugintypes.TransactionState)
+		if !ok {
+			o.fail(msg, codeIncomplete, "request inspection incomplete")
+			return
+		}
+		p, ok := ts.Collection(variables.ReqbodyProcessor).(interface{ Set(string) })
+		if !ok {
+			o.fail(msg, codeIncomplete, "request inspection incomplete")
+			return
+		}
+		p.Set("JSON")
+	}
 	o.verdict(msg, 1, it)
 }
 
@@ -250,14 +281,17 @@ func (o *owner) begin(b txBegin, msg uint32) {
 // that is not accessible make the inspection incomplete. Before the Continue
 // of phase 2 the raw value of each flag that the reserved rules test must be
 // empty or "0"; and for a request with a body (declared > 0) the request body
-// processor must equal wantProc, the one that Coraza picks from the first
-// Content-Type (empty when that is neither urlencoded nor multipart, or when
-// there is none), and wantProc must not be empty. Otherwise the body was not
-// parsed as the Content-Type says: a rule of the operator replaced the
-// processor (ctl:requestBodyProcessor), forced one (ctl:forceRequestBodyVariable
-// sets URLENCODED when the processor is empty), or left it empty (an empty
-// processor parses nothing and sets no error). A transaction or collection
-// that is not of the expected type is incomplete.
+// processor must equal wantProc, the one that the first Content-Type selects
+// (URLENCODED and MULTIPART: Coraza picks them; JSON, for application/json
+// and application/<name>+json: begin sets it; empty when it is none of these,
+// or when there is none), and wantProc must not be empty. Otherwise the body
+// was not parsed as the Content-Type says: a rule of the operator replaced the
+// processor (ctl:requestBodyProcessor), forced one
+// (ctl:forceRequestBodyVariable sets URLENCODED when the processor is empty),
+// or left it empty (an empty processor parses nothing and sets no error). For
+// JSON a replacement in phase 1 is undone by begin, and Coraza refuses one in
+// phase 2. A transaction or collection that is not of the expected type is
+// incomplete.
 // The assertions use the experimental plugin interface of the pinned Coraza
 // version; the Transaction that its WAF returns implements it. The callers
 // ask only for a Continue: a Block keeps its VERDICT.

@@ -332,6 +332,36 @@ fn next(end: End, exit: Option<Exit>, halted: Option<Halt>, used: u32, budget: u
     Next::Restart
 }
 
+/// Whether `essence` (a Content-Type before its first `;`, without the blanks around it) is
+/// `application/<name>+json`, ASCII case ignored. The name is 1 to 122 characters: the first an ASCII letter or
+/// digit, the rest ASCII letters, digits, `.` or `-`. A name that starts with `x-www-form-urlencoded` does not
+/// count: Coraza selects its urlencoded processor for every value with that prefix, so such a body would not be
+/// parsed as JSON.
+fn is_json_suffix_type(essence: &[u8]) -> bool {
+    const HEAD: &[u8] = b"application/";
+    const TAIL: &[u8] = b"+json";
+    const URLENCODED: &[u8] = b"x-www-form-urlencoded";
+    const MAX_NAME: usize = 122;
+    let end = essence.len().saturating_sub(TAIL.len());
+    let (Some(head), Some(name), Some(tail)) = (
+        essence.get(..HEAD.len()),
+        essence.get(HEAD.len()..end),
+        essence.get(end..),
+    ) else {
+        return false;
+    };
+    head.eq_ignore_ascii_case(HEAD)
+        && tail.eq_ignore_ascii_case(TAIL)
+        && (1..=MAX_NAME).contains(&name.len())
+        && name.first().is_some_and(u8::is_ascii_alphanumeric)
+        && name
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        && !name
+            .get(..URLENCODED.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(URLENCODED))
+}
+
 impl Supervisor {
     /// Checks the configuration and nothing else: no process is started and the file system is not touched.
     pub fn new(cfg: Config) -> Result<Supervisor, ConfigError> {
@@ -410,7 +440,8 @@ impl Supervisor {
             }
         }
         if !req.body.is_empty() {
-            // Only these two types select a body processor in the inspector; any other body is not parsed.
+            // Only these types get a body processor: Coraza selects it for the first two, and the inspector sets the
+            // JSON processor for `application/json` and for `application/<name>+json`. Any other body is not parsed.
             let mut types = header(b"content-type");
             let known = match (types.next(), types.next()) {
                 (Some(t), None) => {
@@ -421,6 +452,8 @@ impl Supervisor {
                             .trim_ascii();
                     essence.eq_ignore_ascii_case(b"application/x-www-form-urlencoded")
                         || essence.eq_ignore_ascii_case(b"multipart/form-data")
+                        || essence.eq_ignore_ascii_case(b"application/json")
+                        || is_json_suffix_type(essence)
                 }
                 _ => false,
             };
@@ -1626,18 +1659,40 @@ mod tests {
             refused(with(b"/", &two, b"")),
             unsupported("content-length")
         );
-        // 4. a body needs exactly one Content-Type of the two the inspector parses
+        // 4. a body needs exactly one Content-Type of the kinds the inspector parses
         let none: [(&[u8], &[u8]); 1] = [(b"Content-Length", b"3")];
         assert_eq!(
             refused(with(b"/", &none, b"a=b")),
             unsupported("content-type")
         );
+        // application/ + a name of `len` characters + +json
+        let json_named = |len: usize| [&b"application/"[..], &vec![b'a'; len], b"+json"].concat();
+        let too_long = json_named(123);
         for bad in [
-            &b"application/json"[..],
+            &b"application/xml"[..],
             b"text/plain",
             b"",
             b"application/x-www-form-urlencoded2",
             b"multipart/mixed",
+            b"application/json2",
+            b"application/jsonp",
+            b"text/json",
+            // application/<name>+json: no name, a first character that is not a letter or digit, a character
+            // outside the set, the name Coraza reads as urlencoded (also in any case), another type, another end,
+            // a name one character too long
+            b"application/+json",
+            b"application/.x+json",
+            b"application/-x+json",
+            b"application/a+b+json",
+            b"application/x/y+json",
+            b"application/\xc3\xa9+json",
+            b"application/x-www-form-urlencoded+json",
+            b"Application/X-WWW-Form-Urlencoded+JSON",
+            b"application/x-www-form-urlencoded-x+json",
+            b"text/x+json",
+            b"application/x+json2",
+            b"application/x+jsonp",
+            &too_long[..],
         ] {
             let h: [(&[u8], &[u8]); 2] = [(b"Content-Length", b"3"), (b"Content-Type", bad)];
             assert_eq!(
@@ -1653,6 +1708,15 @@ mod tests {
         ];
         assert_eq!(
             refused(with(b"/", &twice, b"a=b")),
+            unsupported("content-type")
+        );
+        let mixed: [(&[u8], &[u8]); 3] = [
+            (b"Content-Length", b"3"),
+            (b"Content-Type", b"application/json"),
+            (b"content-type", b"application/x-www-form-urlencoded"),
+        ];
+        assert_eq!(
+            refused(with(b"/", &mixed, b"a=b")),
             unsupported("content-type")
         );
         // what TX_BEGIN cannot carry is refused right after the protocol's limit (1), before the header rules (2 to 4)
@@ -1672,7 +1736,7 @@ mod tests {
             }),
             Refused::Invalid("method length out of range")
         );
-        // accepted: the two types, in any case, with parameters and spaces; an empty body needs no type
+        // accepted: the two form types, in any case, with parameters and spaces; an empty body needs no type
         let mut s = Supervisor::new(cfg()).unwrap();
         let ok = |ct: &'static [u8]| -> [(&'static [u8], &'static [u8]); 2] {
             [(b"Content-Length", b"3"), (b"Content-Type", ct)]
@@ -1687,6 +1751,36 @@ mod tests {
         let zero: [(&[u8], &[u8]); 1] = [(b"Content-Length", b"0")];
         s.submit(&with(b"/", &zero, b"")).unwrap();
         assert_eq!(s.status().records, 4);
+        // accepted: application/json, in any case, with parameters, spaces and tabs
+        let mut j = Supervisor::new(cfg()).unwrap();
+        for ct in [
+            &b"application/json"[..],
+            b"Application/JSON; charset=UTF-8",
+            b"application/json;charset=utf-8",
+            b"  application/json  ",
+            b"\tapplication/json\t ; x=y",
+        ] {
+            j.submit(&with(b"/", &ok(ct), b"[1]")).unwrap();
+        }
+        assert_eq!(j.status().records, 5);
+        // accepted: application/<name>+json, in any case, with parameters; a name of 1 character, one that starts
+        // with a digit, one short of the urlencoded name by a character, and the longest name
+        let mut n = Supervisor::new(cfg()).unwrap();
+        let longest = json_named(122);
+        for ct in [
+            &b"application/vnd.api+json"[..],
+            b"application/problem+json",
+            b"application/merge-patch+json",
+            b"Application/VND.API+JSON; charset=utf-8",
+            b"application/a+json",
+            b"application/1x+json",
+            b"application/x-www-form-urlencode+json",
+            &longest[..],
+        ] {
+            let h: [(&[u8], &[u8]); 2] = [(b"Content-Length", b"3"), (b"Content-Type", ct)];
+            n.submit(&with(b"/", &h, b"[1]")).unwrap();
+        }
+        assert_eq!(n.status().records, 8);
         // the limit itself, in the largest number of fragments
         let max = vec![b'a'; codec::MAX_DECLARED as usize];
         let h: [(&[u8], &[u8]); 2] = [

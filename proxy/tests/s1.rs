@@ -2,8 +2,10 @@
 //!
 //! Every test starts the proxy binary with a configuration file that it writes into its own 0700 root, the real
 //! inspector and the test rules of the kernel crate (rule 9201: a URI beginning `/block-probe`, phase 1, status
-//! 403; rule 9202: the urlencoded argument `probe=block`, phase 2, status 403). It also runs a small upstream of
-//! its own on a loopback port, which records every connection and the bytes it received, and it talks to the
+//! 403; rule 9202: the urlencoded argument `probe=block`, phase 2, status 403; rule 9203: the top-level JSON
+//! member `probe` equal to `block`, phase 2, status 403). Rule 4000001 is not one of them: it is the inspector's
+//! own reserved rule that blocks a body its parser refuses (status 403). The tests also run a small upstream of
+//! their own on a loopback port, which records every connection and the bytes it received, and they talk to the
 //! proxy with a raw TCP client: the exact bytes out, everything read back until the proxy closes.
 //!
 //! These tests need the environment variables `TUKUYOMI_TEST_INSPECTOR` (the built inspector),
@@ -24,6 +26,13 @@
 //!   the budget or the permit coming back directly.
 //! - Waiting is done on a channel, a condition variable or an exit. The few pauses that remain are polls of a
 //!   `/proc` counter or of a socket state every 2 to 20 ms, bounded by `PATIENCE`.
+//! - A response that streams for as long as the proxy lets it is a head that promises a million bytes and then one
+//!   byte every 200 ms from the upstream. The scenes that cut it (the connection limit, the stop) are measured
+//!   from the client's side: the cut must come at the configured time, within a generous margin.
+//! - A client that resets is a socket closed with `SO_LINGER` set to zero. The standard library cannot set it, so
+//!   the socket is handed to tokio for that one call (`set_zero_linger`; `set_linger` is deprecated).
+//! - A kernel that never becomes ready is a stand-in for the inspector: `/bin/sh` runs a script that becomes
+//!   `/bin/sleep` and never says hello. The script is in the test root and is removed with it.
 
 use std::fs::{self, DirBuilder};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -45,6 +54,7 @@ const SEC: Duration = Duration::from_secs(1);
 const PATIENCE: Duration = Duration::from_secs(60);
 
 const URLENCODED: &str = "application/x-www-form-urlencoded";
+const JSON: &str = "application/json";
 /// The largest body the proxy is configured to take, which is also the largest body the kernel accepts.
 const MAX_BODY: usize = 1 << 20;
 /// `max_buffered_bytes` at its lowest: twice the largest body and the largest set of header fields.
@@ -53,6 +63,17 @@ const MIN_BUFFERED: usize = 2 * MAX_BODY + 24 * 1024;
 const FRAME: u64 = 64 * 1024;
 /// The body of the upstream's answer.
 const UPSTREAM_BODY: &str = "hello-from-upstream";
+/// The longest head the proxy reads from the upstream, interim answers included (`upstream_head_wire`).
+const UPSTREAM_HEAD_WIRE: usize = 64 * 1024;
+/// The time the kernel gives a process to end after it was told to stop (`kill_grace`).
+const KILL_GRACE_MS: u64 = 2_000;
+/// The name of the script that stands in for the inspector, in the test root.
+const STAND_IN: &str = "silent.sh";
+/// What a test adds to a time it has computed, where it only needs the event to come about in reasonable time.
+const MARGIN: Duration = Duration::from_secs(10);
+/// The length a streaming response promises, and the time between the bytes that it sends.
+const DRIP_PROMISE: usize = 1_000_000;
+const DRIP_STEP: Duration = Duration::from_millis(200);
 
 // ---------------------------------------------------------------------------------------------------------
 // The environment
@@ -312,14 +333,19 @@ fn get(path: &str) -> Vec<u8> {
     format!("GET {path} HTTP/1.1\r\nHost: example.test\r\n\r\n").into_bytes()
 }
 
-fn post_form(path: &str, body: &[u8]) -> Vec<u8> {
+/// A POST with a `Content-Length` and the `Content-Type` value exactly as given (it may be any spelling).
+fn post_typed(path: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
     let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: example.test\r\nContent-Type: {URLENCODED}\r\nContent-Length: {}\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: example.test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
         body.len()
     )
     .into_bytes();
     request.extend_from_slice(body);
     request
+}
+
+fn post_form(path: &str, body: &[u8]) -> Vec<u8> {
+    post_typed(path, URLENCODED, body)
 }
 
 /// A urlencoded body of exactly `total` bytes whose `probe` argument is `probe`.
@@ -330,14 +356,20 @@ fn padded_form(probe: &str, total: usize) -> Vec<u8> {
     body
 }
 
-/// A chunked urlencoded request whose body is `body`, exactly as given (it is the chunked coding, right or wrong).
-fn chunked_request(path: &str, body: &[u8]) -> Vec<u8> {
+/// A chunked request with the `Content-Type` value as given, whose body is `body`, exactly as given (it is the
+/// chunked coding, right or wrong).
+fn chunked_typed(path: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
     let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: example.test\r\nContent-Type: {URLENCODED}\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "POST {path} HTTP/1.1\r\nHost: example.test\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n"
     )
     .into_bytes();
     request.extend_from_slice(body);
     request
+}
+
+/// The same for the urlencoded type.
+fn chunked_request(path: &str, body: &[u8]) -> Vec<u8> {
+    chunked_typed(path, URLENCODED, body)
 }
 
 /// Chunks in the chunked coding, then the last chunk and `trailer` (raw field lines, each ending in CRLF).
@@ -447,7 +479,7 @@ fn free_port() -> u16 {
 // ---------------------------------------------------------------------------------------------------------
 
 /// What the upstream does with a request once it has read it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum Behaviour {
     /// Answers with `upstream_reply` and closes.
     #[default]
@@ -456,6 +488,12 @@ enum Behaviour {
     Silent,
     /// Sends a head that promises 10 body bytes and 3 of them, then waits for the proxy to close.
     Cut,
+    /// Writes exactly these bytes (a whole answer, or whatever else the test wants the proxy to read), then waits
+    /// for the proxy to close.
+    Raw(Vec<u8>),
+    /// Sends a head that promises `DRIP_PROMISE` body bytes, then one body byte every `DRIP_STEP` until the proxy
+    /// closes.
+    Drip,
 }
 
 fn upstream_reply() -> Vec<u8> {
@@ -575,13 +613,16 @@ fn serve_upstream(mut sock: TcpStream, seen: &Seen) {
         .expect("make the upstream connection blocking");
     sock.set_read_timeout(Some(PATIENCE))
         .expect("set the upstream read timeout");
+    sock.set_write_timeout(Some(PATIENCE))
+        .expect("set the upstream write timeout");
+    sock.set_nodelay(true).expect("set TCP_NODELAY");
     let Some(request) = read_request(&mut sock) else {
         seen.closed.add();
         return;
     };
     lock(&seen.requests).push(request);
     seen.arrived.add();
-    let behaviour = *lock(&seen.behaviour);
+    let behaviour = lock(&seen.behaviour).clone();
     match behaviour {
         Behaviour::Reply => {
             let _ = sock.write_all(&upstream_reply());
@@ -594,6 +635,36 @@ fn serve_upstream(mut sock: TcpStream, seen: &Seen) {
             let _ = sock.write_all(&upstream_cut());
             wait_closed(&mut sock);
             seen.closed.add();
+        }
+        Behaviour::Raw(bytes) => {
+            // A write can fail half way: the proxy may close on the bytes it has read, which is what is tested.
+            let _ = sock.write_all(&bytes);
+            wait_closed(&mut sock);
+            seen.closed.add();
+        }
+        Behaviour::Drip => drip(&mut sock, seen),
+    }
+}
+
+/// The head of a response that promises `DRIP_PROMISE` bytes of body.
+fn upstream_drip_head() -> Vec<u8> {
+    format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {DRIP_PROMISE}\r\n\r\n")
+        .into_bytes()
+}
+
+/// Sends the head and then one body byte every `DRIP_STEP` until a write fails, which means the proxy closed.
+/// Counts that as the proxy closing the connection. After `PATIENCE` it gives up without counting.
+fn drip(sock: &mut TcpStream, seen: &Seen) {
+    let end = Instant::now() + PATIENCE;
+    if sock.write_all(&upstream_drip_head()).is_err() {
+        seen.closed.add();
+        return;
+    }
+    while Instant::now() < end {
+        thread::sleep(DRIP_STEP);
+        if sock.write_all(b"x").is_err() {
+            seen.closed.add();
+            return;
         }
     }
 }
@@ -653,6 +724,16 @@ struct Knobs {
     restarts: u32,
     stop_inspect_ms: u64,
     stop_wait_ms: u64,
+    hello_wait_ms: u64,
+    frame_io_ms: u64,
+    verdict_wait_ms: u64,
+    ready_wait_ms: u64,
+    inspect_wait_ms: u64,
+    upstream_connect_ms: u64,
+    request_total_ms: u64,
+    conn_total_ms: u64,
+    /// The kernel starts a script that never says hello, not the inspector.
+    stand_in: bool,
 }
 
 impl Knobs {
@@ -672,6 +753,35 @@ impl Knobs {
             restarts: 0,
             stop_inspect_ms: 10_000,
             stop_wait_ms: 20_000,
+            hello_wait_ms: 10_000,
+            frame_io_ms: 1_000,
+            verdict_wait_ms: 3_000,
+            ready_wait_ms: 20_000,
+            inspect_wait_ms: 55_000,
+            upstream_connect_ms: 5_000,
+            request_total_ms: 60_000,
+            conn_total_ms: 120_000,
+            stand_in: false,
+        }
+    }
+
+    /// A connection time of 9 s, for a test that waits for it. The HTTP times cannot be shorter than what the
+    /// kernel may take for one inspection (the wait for a slot, two verdicts and 18 steps of a slice and a frame),
+    /// so the kernel's times are short too: its sum is 8.06 s here, and the HTTP waits sit above it.
+    fn short() -> Knobs {
+        Knobs {
+            wait_deadline_ms: 1_000,
+            frame_io_ms: 150,
+            verdict_wait_ms: 2_000,
+            inspect_wait_ms: 8_100,
+            request_total_ms: 9_000,
+            conn_total_ms: 9_000,
+            head_read_ms: 2_000,
+            body_read_ms: 2_000,
+            upstream_connect_ms: 2_000,
+            upstream_header_ms: 4_000,
+            response_idle_ms: 3_000,
+            ..Knobs::quick()
         }
     }
 
@@ -689,6 +799,14 @@ impl Knobs {
 }
 
 fn config_json(k: &Knobs, listen: SocketAddr, upstream: SocketAddr, root: &Path) -> String {
+    // The variables are read for every test, so that a stand-in test fails without them like all the others.
+    let mut inspector = var("TUKUYOMI_TEST_INSPECTOR");
+    let mut rules = var("TUKUYOMI_TEST_RULES");
+    if k.stand_in {
+        // The kernel passes the rules path as the only argument of the inspector, so the shell runs the script.
+        inspector = "/bin/sh".to_string();
+        rules = root.join(STAND_IN).to_string_lossy().into_owned();
+    }
     json!({
         "proxy": {
             "listen": listen.to_string(),
@@ -700,23 +818,23 @@ fn config_json(k: &Knobs, listen: SocketAddr, upstream: SocketAddr, root: &Path)
             "max_buffered_bytes": k.max_buffered_bytes,
             "upstream_max_headers": 100,
             "upstream_max_head_bytes": 16384,
-            "upstream_head_wire": 65536,
+            "upstream_head_wire": UPSTREAM_HEAD_WIRE,
             "drive_slice_ms": k.slice_ms,
-            "ready_wait_ms": 20_000,
+            "ready_wait_ms": k.ready_wait_ms,
             "head_read_ms": k.head_read_ms,
             "body_read_ms": k.body_read_ms,
-            "inspect_wait_ms": 55_000,
-            "upstream_connect_ms": 5_000,
+            "inspect_wait_ms": k.inspect_wait_ms,
+            "upstream_connect_ms": k.upstream_connect_ms,
             "upstream_header_ms": k.upstream_header_ms,
-            "request_total_ms": 60_000,
+            "request_total_ms": k.request_total_ms,
             "response_idle_ms": k.response_idle_ms,
-            "conn_total_ms": 120_000,
+            "conn_total_ms": k.conn_total_ms,
             "stop_inspect_ms": k.stop_inspect_ms,
             "stop_wait_ms": k.stop_wait_ms,
         },
         "kernel": {
-            "inspector": var("TUKUYOMI_TEST_INSPECTOR"),
-            "rules": var("TUKUYOMI_TEST_RULES"),
+            "inspector": inspector,
+            "rules": rules,
             "rules_sha256": parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256")),
             "tmp_root": root.to_string_lossy(),
             "gomaxprocs": 2,
@@ -727,15 +845,15 @@ fn config_json(k: &Knobs, listen: SocketAddr, upstream: SocketAddr, root: &Path)
             "records": 16,
             "discard_limit": 8,
             "tick_ms": k.tick_ms,
-            "hello_wait_ms": 10_000,
-            "frame_io_ms": 1_000,
-            "verdict_wait_ms": 3_000,
+            "hello_wait_ms": k.hello_wait_ms,
+            "frame_io_ms": k.frame_io_ms,
+            "verdict_wait_ms": k.verdict_wait_ms,
             "wait_deadline_ms": k.wait_deadline_ms,
             "closed_wait_ms": 3_000,
             "stop_after_ms": 5_000,
             "drain_wait_ms": 3_000,
             "exit_wait_ms": 3_000,
-            "kill_grace_ms": 2_000,
+            "kill_grace_ms": KILL_GRACE_MS,
             "restarts": k.restarts,
         },
     })
@@ -838,12 +956,24 @@ struct Proxy {
     /// Every inspector process that was seen, to check at the end that none is left.
     inspectors: Vec<u32>,
     knobs: Knobs,
+    /// When the process was started.
+    started: Instant,
     done: bool,
 }
 
 impl Proxy {
     /// Starts the proxy and waits until it listens and its inspector is there.
     fn start(test: &str, knobs: Knobs) -> Proxy {
+        let mut proxy = Proxy::spawn(test, knobs);
+        proxy
+            .records
+            .wait_line("the proxy to listen", |l| l == "start: listening");
+        proxy.wait_inspector(None);
+        proxy
+    }
+
+    /// Starts the proxy and returns at once, for a test that does not wait for it to listen.
+    fn spawn(test: &str, knobs: Knobs) -> Proxy {
         let root = make_root(test);
         let upstream = Upstream::start();
         let port = free_port();
@@ -851,6 +981,11 @@ impl Proxy {
         let config = root.join("config.json");
         fs::write(&config, config_json(&knobs, listen, upstream.addr, &root))
             .expect("write the configuration");
+        if knobs.stand_in {
+            fs::write(root.join(STAND_IN), "exec /bin/sleep 120\n")
+                .expect("write the stand-in for the inspector");
+        }
+        let started = Instant::now();
         let mut child = Command::new(env!("CARGO_BIN_EXE_tukuyomi-proxy"))
             .arg(&config)
             .stdin(Stdio::null())
@@ -880,7 +1015,7 @@ impl Proxy {
         thread::spawn(move || {
             let _ = tx.send(child.wait());
         });
-        let mut proxy = Proxy {
+        Proxy {
             root,
             port,
             pid,
@@ -890,13 +1025,9 @@ impl Proxy {
             upstream,
             inspectors: Vec::new(),
             knobs,
+            started,
             done: false,
-        };
-        proxy
-            .records
-            .wait_line("the proxy to listen", |l| l == "start: listening");
-        proxy.wait_inspector(None);
-        proxy
+        }
     }
 
     /// Waits for a live inspector process other than `old`, and remembers it.
@@ -933,21 +1064,34 @@ impl Proxy {
         sock
     }
 
+    /// Waits for a process that the kernel started in place of the inspector (a child of the proxy), and
+    /// remembers it, so that the end can check that it is gone.
+    fn wait_stand_in(&mut self) -> u32 {
+        let mut found = None;
+        wait_until("the stand-in for the inspector", || {
+            found = children_of(self.pid).first().copied();
+            found.is_some()
+        });
+        let pid = found.expect("a stand-in was found");
+        self.inspectors.push(pid);
+        pid
+    }
+
+    /// Sends the signal (`TERM`, `INT` or `HUP`) and returns the time just before it was sent. The proxy takes
+    /// its own time for the stop after that, so a time counted from here is never shorter than the proxy's.
+    fn signal(&self, signal: &str) -> Instant {
+        let at = Instant::now();
+        run_kill(signal, self.pid);
+        at
+    }
+
     fn term(&self) -> Instant {
-        run_kill("TERM", self.pid);
-        Instant::now()
+        self.signal("TERM")
     }
 
-    /// Ends the test: SIGTERM, a clean exit within `stop_wait`, and then every check of what must be left (or
-    /// not left): the records, the processes, the root, the upstream's connection count.
-    fn finish(self, upstream_connections: usize) -> StopCounts {
-        let since = self.term();
-        self.finish_after_term(since, upstream_connections)
-    }
-
-    /// The same, for a test that has sent SIGTERM at `since` itself.
-    fn finish_after_term(mut self, since: Instant, upstream_connections: usize) -> StopCounts {
-        let limit = Duration::from_millis(self.knobs.stop_wait_ms) + 30 * SEC;
+    /// Waits for the exit of the proxy and for the end of its records, for at most `limit`. Returns the exit
+    /// status and the time since `since`.
+    fn wait_exit(&mut self, since: Instant, limit: Duration) -> (ExitStatus, Duration) {
         let status = self
             .exit
             .recv_timeout(limit)
@@ -965,6 +1109,62 @@ impl Proxy {
             .expect("the reader runs")
             .join()
             .expect("the reader panicked");
+        (status, took)
+    }
+
+    /// Checks that the root holds the files the test put there and nothing else (the kernel removed its own
+    /// directory), and removes them and the root.
+    fn clear_root(&self, files: &[&str]) {
+        let mut left: Vec<String> = fs::read_dir(&self.root)
+            .expect("the test root is readable")
+            .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, _>>()
+            .expect("list the test root");
+        left.sort();
+        let mut want = files.to_vec();
+        want.sort_unstable();
+        assert_eq!(left, want, "the test root holds other files");
+        for file in files {
+            fs::remove_file(self.root.join(file)).expect("remove a file of the test root");
+        }
+        fs::remove_dir(&self.root).expect("the empty test root is removed");
+    }
+
+    /// Ends the test: SIGTERM, a clean exit within `stop_wait`, and then every check of what must be left (or
+    /// not left): the records, the processes, the root, the upstream's connection count.
+    fn finish(self, upstream_connections: usize) -> StopCounts {
+        let since = self.term();
+        self.finish_after_term(since, upstream_connections)
+    }
+
+    /// The same, for a test that has sent SIGTERM at `since` itself.
+    fn finish_after_term(self, since: Instant, upstream_connections: usize) -> StopCounts {
+        self.finish_after_signal("SIGTERM", since, upstream_connections)
+    }
+
+    /// The same, for a test that has sent the signal named `signal` (`SIGTERM`, `SIGINT` or `SIGHUP`) at `since`
+    /// itself.
+    fn finish_after_signal(
+        self,
+        signal: &str,
+        since: Instant,
+        upstream_connections: usize,
+    ) -> StopCounts {
+        let within = Duration::from_millis(self.knobs.stop_wait_ms);
+        self.finish_within(signal, since, within, upstream_connections)
+            .0
+    }
+
+    /// The checks of `finish` for a stop that may take as long as `within`. Returns the kernel's numbers and the
+    /// time the proxy took from `since` to its exit.
+    fn finish_within(
+        mut self,
+        signal: &str,
+        since: Instant,
+        within: Duration,
+        upstream_connections: usize,
+    ) -> (StopCounts, Duration) {
+        let (status, took) = self.wait_exit(since, within + 30 * SEC);
         let lines = self.records.lines();
         assert_eq!(
             status.code(),
@@ -972,12 +1172,11 @@ impl Proxy {
             "exit status {status}; records: {lines:#?}"
         );
         assert!(
-            took < Duration::from_millis(self.knobs.stop_wait_ms),
-            "the proxy needed {took:?} to stop; stop_wait is {} ms",
-            self.knobs.stop_wait_ms
+            took < within,
+            "the proxy needed {took:?} to stop; the limit is {within:?}"
         );
         assert!(
-            lines.iter().any(|l| l == "stop: SIGTERM"),
+            lines.iter().any(|l| *l == format!("stop: {signal}")),
             "no stop record: {lines:#?}"
         );
         assert!(
@@ -996,18 +1195,7 @@ impl Proxy {
         assert_gone(&self.inspectors);
 
         // Only the configuration is left in the root: the kernel removed its own directory.
-        let left: Vec<_> = fs::read_dir(&self.root)
-            .expect("the test root is readable")
-            .map(|e| e.map(|e| e.file_name()))
-            .collect::<Result<_, _>>()
-            .expect("list the test root");
-        assert_eq!(
-            left,
-            ["config.json"],
-            "the test root holds more than the configuration"
-        );
-        fs::remove_file(self.root.join("config.json")).expect("remove the configuration");
-        fs::remove_dir(&self.root).expect("the empty test root is removed");
+        self.clear_root(&["config.json"]);
 
         // The proxy is gone, so every connection it made to the upstream has been accepted by now.
         self.upstream.stop();
@@ -1016,7 +1204,7 @@ impl Proxy {
             upstream_connections,
             "connections to the upstream; records: {lines:#?}"
         );
-        counts
+        (counts, took)
     }
 }
 
@@ -1025,10 +1213,21 @@ impl Drop for Proxy {
         if self.done {
             return;
         }
-        // A test that failed: leave no proxy and no inspector behind.
+        // A test that failed: leave no proxy and no inspector behind. The stand-in for the inspector is looked for
+        // among the proxy's children while the proxy is still there.
+        let stand_ins = if self.knobs.stand_in {
+            children_of(self.pid)
+        } else {
+            Vec::new()
+        };
         let _ = Command::new("kill")
             .args(["-s", "KILL", &self.pid.to_string()])
             .status();
+        for pid in stand_ins {
+            let _ = Command::new("kill")
+                .args(["-s", "KILL", &pid.to_string()])
+                .status();
+        }
         for &pid in &self.inspectors {
             if is_inspector(pid) {
                 let _ = Command::new("kill")
@@ -1531,27 +1730,48 @@ fn a_broken_chunked_body_and_a_non_empty_trailer_give_400() {
 
 #[test]
 #[ignore = "needs a built inspector"]
-fn json_and_gzip_bodies_give_415() {
+fn bodies_of_other_types_and_encoded_bodies_give_415() {
     let proxy = Proxy::start("media_415", Knobs::quick());
-    let json = b"{\"probe\":\"block\"}";
-    let json_request = format!(
-        "POST /j HTTP/1.1\r\nHost: example.test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-        json.len(),
-        String::from_utf8_lossy(json)
-    );
-    // A gzip stream (header bytes only; it is refused before anything looks at it).
-    let mut gzip_request = format!(
-        "POST /g HTTP/1.1\r\nHost: example.test\r\nContent-Type: {URLENCODED}\r\nContent-Encoding: gzip\r\nContent-Length: 10\r\n\r\n"
-    )
-    .into_bytes();
-    gzip_request.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
-    let mut chunked_json = b"POST /c HTTP/1.1\r\nHost: example.test\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
-    chunked_json.extend_from_slice(&chunked_body(&[json], b""));
-    for request in [json_request.into_bytes(), gzip_request, chunked_json] {
+    // Bodies with a length whose type is not inspected. Each is valid for its type: the type alone decides, and
+    // the head is refused before any body is read.
+    let typed = |content_type: &str, body: &[u8]| post_typed("/t", content_type, body);
+    // A gzip stream (header bytes only; it is refused before anything looks at it) under either inspected type.
+    let gzip = |content_type: &str| {
+        let mut request = format!(
+            "POST /g HTTP/1.1\r\nHost: example.test\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nContent-Length: 10\r\n\r\n"
+        )
+        .into_bytes();
+        request.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
+        request
+    };
+    // JSON next to another type is not one type.
+    let two_types = {
+        let body = b"{\"probe\":\"ok\"}";
+        let mut request = format!(
+            "POST /two HTTP/1.1\r\nHost: example.test\r\nContent-Type: {JSON}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        request
+    };
+    // A chunked body is refused only once it has been read and is known to be there.
+    let chunked_text = chunked_typed("/c", "text/plain", &chunked_body(&[b"hello"], b""));
+    let requests = [
+        typed("application/xml", b"<probe>ok</probe>"),
+        typed("text/plain", b"probe=ok"),
+        typed("text/x+json", b"{\"probe\":\"ok\"}"),
+        gzip(URLENCODED),
+        gzip(JSON),
+        two_types,
+        chunked_text,
+    ];
+    let count = requests.len();
+    for request in requests {
         let reply = exchange(proxy.port, &request);
         assert_empty_answer(&reply, 415);
     }
-    proxy.records.conns("three 415 records", 3, |l| {
+    proxy.records.conns("the 415 records", count, |l| {
         l.contains(": rejected 415 body type not supported ")
     });
     assert_eq!(proxy.upstream.connections(), 0);
@@ -1587,4 +1807,820 @@ fn killing_the_inspector_during_an_inspection_gives_503_and_no_upstream_connecti
     let replacement = proxy.wait_inspector(Some(victim));
     assert_ne!(replacement, victim);
     assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Signals, and what a stop does to new and to running connections
+// ---------------------------------------------------------------------------------------------------------
+
+/// Serves one request, sends the signal and checks that the proxy ends as it does for SIGTERM: exit code 0, the
+/// kernel stopped cleanly, nothing left.
+fn a_signal_ends_the_proxy(test: &str, signal: &str, name: &str) {
+    let proxy = Proxy::start(test, Knobs::quick());
+    let served = exchange(proxy.port, &get("/before"));
+    assert_eq!(served.status(), 200, "answer: {:?}", served.text());
+    let since = proxy.signal(signal);
+    assert_eq!(proxy.finish_after_signal(name, since, 1), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn sigint_stops_the_proxy_with_exit_code_0() {
+    a_signal_ends_the_proxy("sigint", "INT", "SIGINT");
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn sighup_stops_the_proxy_with_exit_code_0() {
+    a_signal_ends_the_proxy("sighup", "HUP", "SIGHUP");
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_second_signal_during_the_stop_is_only_logged_and_the_exit_code_stays_0() {
+    let proxy = Proxy::start("second_signal", Knobs::slow());
+    let records = proxy.records.clone();
+    let mut sock = proxy.start_slow(&post_form("/submit", &padded_form("ok", MAX_BODY)));
+    let since = proxy.term();
+    records.wait_line("the first stop record", |l| l == "stop: SIGTERM");
+
+    // One signal at a time, each seen in the records before the next is sent: signals of one kind that are
+    // pending together count as one.
+    for (signal, name) in [("INT", "SIGINT"), ("HUP", "SIGHUP"), ("TERM", "SIGTERM")] {
+        proxy.signal(signal);
+        let again = format!("stop: {name} again");
+        records.wait_line(&again, |l| l == again);
+    }
+
+    // The stop went on as it was: the request in flight is forwarded and answered whole.
+    let answer = collect(&mut sock, since);
+    assert_eq!(answer.status(), 200, "answer: {:?}", answer.text());
+    assert_eq!(answer.message().body, UPSTREAM_BODY.as_bytes());
+    let counts = proxy.finish_after_term(since, 1);
+    assert!(
+        counts.records >= 1,
+        "the request was in flight when the stop began: {counts:?}"
+    );
+
+    // One stop, begun by the first signal: the others did not begin another.
+    let lines = records.lines();
+    let count = |want: &str| lines.iter().filter(|l| l.as_str() == want).count();
+    assert_eq!(count("stop: SIGTERM"), 1, "records: {lines:#?}");
+    assert_eq!(count("stop: SIGINT"), 0, "records: {lines:#?}");
+    assert_eq!(count("stop: SIGHUP"), 0, "records: {lines:#?}");
+    let begun = |prefix: &str| lines.iter().filter(|l| l.starts_with(prefix)).count();
+    assert_eq!(begun("driver: stop, records "), 1, "records: {lines:#?}");
+    assert_eq!(begun("stop: kernel "), 1, "records: {lines:#?}");
+}
+
+/// A new connection to the port is turned away: refused, or closed or reset before any byte of an answer (a
+/// connection that was in the queue of the listener when it was closed is reset). Any byte of an answer, and a
+/// connection that stays open, fail the test.
+fn assert_turned_away(port: u16) {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut sock = match TcpStream::connect_timeout(&addr, 10 * SEC) {
+        Ok(sock) => sock,
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => return,
+        Err(e) => panic!("connecting to the proxy failed in another way: {e}"),
+    };
+    // The write may fail with the reset as well; that is no answer either.
+    let _ = sock.write_all(&get("/late"));
+    sock.set_read_timeout(Some(PATIENCE))
+        .expect("set the read timeout");
+    let mut chunk = [0u8; 4096];
+    match sock.read(&mut chunk) {
+        Ok(0) => {}
+        Ok(n) => panic!(
+            "a new connection got an answer: {:?}",
+            String::from_utf8_lossy(&chunk[..n])
+        ),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+            ) => {}
+        Err(e) => panic!("the new connection neither closed nor reset: {e}"),
+    }
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn after_sigterm_new_connections_are_turned_away_and_the_request_in_flight_finishes() {
+    let proxy = Proxy::start("listener_closed", Knobs::slow());
+    let mut sock = proxy.start_slow(&post_form("/submit", &padded_form("ok", MAX_BODY)));
+    let since = proxy.term();
+    // The listener is closed right after this record is queued.
+    proxy
+        .records
+        .wait_line("the stop record", |l| l == "stop: SIGTERM");
+    assert_turned_away(proxy.port);
+
+    // The inspection goes on, the request is forwarded and answered whole; the new connection did not reach the
+    // upstream (the count at the end is the one of the request in flight).
+    let answer = collect(&mut sock, since);
+    assert_eq!(answer.status(), 200, "answer: {:?}", answer.text());
+    assert_eq!(answer.message().body, UPSTREAM_BODY.as_bytes());
+    proxy.finish_after_term(since, 1);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// A client that resets
+// ---------------------------------------------------------------------------------------------------------
+
+/// Closes the socket with an RST, not a FIN: `SO_LINGER` with a time of zero. The standard library cannot set
+/// it, so tokio does that for the one call. The socket is dropped while the runtime is still there.
+fn reset(sock: TcpStream) {
+    sock.set_nonblocking(true)
+        .expect("make the client socket non-blocking");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .expect("build a runtime for the client socket");
+    let _entered = runtime.enter();
+    let sock = tokio::net::TcpStream::from_std(sock).expect("hand the client socket to tokio");
+    sock.set_zero_linger().expect("set SO_LINGER to zero");
+    assert_eq!(
+        sock.linger().expect("read SO_LINGER back"),
+        Some(Duration::ZERO)
+    );
+    drop(sock);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_client_that_resets_during_the_inspection_causes_no_upstream_connection() {
+    // One slot: the next request can only be inspected when the slot of the abandoned one is free again.
+    let knobs = Knobs {
+        slots: 1,
+        wait_deadline_ms: 20_000,
+        ..Knobs::slow()
+    };
+    let proxy = Proxy::start("client_reset", knobs);
+    let sock = proxy.start_slow(&post_form("/submit", &padded_form("ok", MAX_BODY)));
+    let gone = Instant::now();
+    reset(sock);
+    proxy
+        .records
+        .conn("the record of the reset connection", |l| {
+            l.contains(": closed 0 ")
+        });
+    // The connection ended long before the inspection could have (it needs several seconds).
+    assert!(gone.elapsed() < 3 * SEC, "took {:?}", gone.elapsed());
+    assert_eq!(proxy.upstream.connections(), 0);
+
+    let after = exchange(proxy.port, &get("/after"));
+    assert_eq!(after.status(), 200, "answer: {:?}", after.text());
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// What the upstream's answer becomes
+// ---------------------------------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_head_answer_keeps_its_content_length_and_has_no_body() {
+    let proxy = Proxy::start("head_answer", Knobs::quick());
+    // A HEAD answer promises a body that it does not carry; the length is the one the upstream sent.
+    proxy.upstream.behave(Behaviour::Raw(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\n".to_vec(),
+    ));
+    let reply = exchange(
+        proxy.port,
+        b"HEAD /head HTTP/1.1\r\nHost: example.test\r\n\r\n",
+    );
+    let answer = reply.message();
+    assert_eq!(answer.status(), 200, "answer: {:?}", reply.text());
+    assert_eq!(
+        answer.values("content-length"),
+        ["10"],
+        "answer: {:?}",
+        reply.text()
+    );
+    assert_eq!(answer.values("connection"), ["close"]);
+    assert!(answer.body.is_empty(), "answer: {:?}", reply.text());
+
+    proxy
+        .upstream
+        .seen
+        .arrived
+        .wait_for("the upstream's request", 1);
+    let requests = proxy.upstream.requests();
+    assert_eq!(Message::parse(&requests[0]).start, "HEAD /head HTTP/1.1");
+    proxy.records.conn("the forwarded record", |l| {
+        l.contains(": forwarded 200 forwarded ")
+    });
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_304_answer_to_a_get_has_no_content_length_and_no_body() {
+    let proxy = Proxy::start("answer_304", Knobs::quick());
+    // The upstream promises a length on its 304, as it may. The server side of the proxy does not write a length
+    // for an answer to a GET that has no body, so the client gets none (unlike a HEAD answer, which keeps it).
+    proxy.upstream.behave(Behaviour::Raw(
+        b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 10\r\n\r\n".to_vec(),
+    ));
+    let reply = exchange(proxy.port, &get("/not-modified"));
+    let answer = reply.message();
+    assert_eq!(answer.status(), 304, "answer: {:?}", reply.text());
+    assert_eq!(answer.values("etag"), ["\"v1\""]);
+    assert_eq!(answer.values("connection"), ["close"]);
+    assert!(answer.body.is_empty(), "answer: {:?}", reply.text());
+    assert!(
+        answer.values("content-length").is_empty(),
+        "answer: {:?}",
+        reply.text()
+    );
+    assert!(
+        !answer.names().contains(&"transfer-encoding"),
+        "answer: {:?}",
+        reply.text()
+    );
+
+    proxy
+        .upstream
+        .seen
+        .arrived
+        .wait_for("the upstream's request", 1);
+    let requests = proxy.upstream.requests();
+    assert_eq!(
+        Message::parse(&requests[0]).start,
+        "GET /not-modified HTTP/1.1"
+    );
+    proxy.records.conn("the forwarded record", |l| {
+        l.contains(": forwarded 304 forwarded ")
+    });
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_200_answer_gets_the_length_of_the_body_that_is_sent() {
+    let proxy = Proxy::start("answer_200_length", Knobs::quick());
+    // The proxy drops the length of the upstream, and the client gets the length of the body that is sent. The
+    // upstream writes its length with leading zeros, which hyper would not write.
+    let length = format!("00{}", UPSTREAM_BODY.len());
+    proxy.upstream.behave(Behaviour::Raw(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {length}\r\n\r\n{UPSTREAM_BODY}"
+        )
+        .into_bytes(),
+    ));
+    let reply = exchange(proxy.port, &get("/full"));
+    let answer = reply.message();
+    assert_eq!(answer.status(), 200, "answer: {:?}", reply.text());
+    assert_eq!(
+        answer.values("content-length"),
+        [UPSTREAM_BODY.len().to_string()],
+        "answer: {:?}",
+        reply.text()
+    );
+    assert_eq!(answer.body, UPSTREAM_BODY.as_bytes());
+    proxy.records.conn("the forwarded record", |l| {
+        l.contains(": forwarded 200 forwarded ")
+    });
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn invalid_upstream_answers_give_502_and_nothing_of_them_reaches_the_client() {
+    let proxy = Proxy::start("upstream_invalid", Knobs::quick());
+    // Every answer has the word `leak` in a place that the client must not see, and each is refused for the
+    // reason that the record names. The last one is a head of interim answers that is longer than the proxy reads.
+    let mut flood = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(2 * UPSTREAM_HEAD_WIRE / 25);
+    flood.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nleak");
+    let invalid = "upstream response invalid";
+    let cases: [(&str, Vec<u8>, &str); 4] = [
+        (
+            "status 600",
+            b"HTTP/1.1 600 Leak\r\nContent-Length: 4\r\n\r\nleak".to_vec(),
+            invalid,
+        ),
+        (
+            "transfer-encoding with content-length",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n4\r\nleak\r\n0\r\n\r\n"
+                .to_vec(),
+            invalid,
+        ),
+        (
+            "a connection field that names content-length",
+            b"HTTP/1.1 200 OK\r\nConnection: close, Content-Length\r\nContent-Length: 4\r\n\r\nleak"
+                .to_vec(),
+            invalid,
+        ),
+        (
+            "a head over the cap through 100 Continue lines",
+            flood,
+            "upstream response head failed",
+        ),
+    ];
+    let mut reasons: Vec<&str> = Vec::new();
+    for (n, (what, answer, reason)) in cases.into_iter().enumerate() {
+        proxy.upstream.behave(Behaviour::Raw(answer));
+        let reply = exchange(proxy.port, &get("/invalid"));
+        assert_empty_answer(&reply, 502);
+        let text = reply.text().to_ascii_lowercase();
+        for word in ["leak", "chunked", "continue"] {
+            assert!(!text.contains(word), "{what}: answer: {text:?}");
+        }
+        reasons.push(reason);
+        let wanted = format!(": failed 502 {reason} ");
+        let same = reasons.iter().filter(|r| **r == reason).count();
+        proxy.records.conns(what, same, |l| l.contains(&wanted));
+        // The proxy dropped its connection to the upstream.
+        proxy.upstream.seen.closed.wait_for(what, n + 1);
+    }
+
+    // Not a state of the proxy: a normal answer passes afterwards.
+    proxy.upstream.behave(Behaviour::Reply);
+    let after = exchange(proxy.port, &get("/after"));
+    assert_eq!(after.status(), 200, "answer: {:?}", after.text());
+    assert_eq!(proxy.finish(5), StopCounts::NONE);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Bodies of the multipart type
+// ---------------------------------------------------------------------------------------------------------
+
+const MULTIPART: &str = "multipart/form-data; boundary=xx";
+
+/// A multipart body with one text field for each pair, in order, and the closing delimiter.
+fn multipart_body(fields: &[(&str, &str)]) -> Vec<u8> {
+    let mut body = String::new();
+    for (name, value) in fields {
+        body.push_str("--xx\r\nContent-Disposition: form-data; name=\"");
+        body.push_str(name);
+        body.push_str("\"\r\n\r\n");
+        body.push_str(value);
+        body.push_str("\r\n");
+    }
+    body.push_str("--xx--\r\n");
+    body.into_bytes()
+}
+
+fn post_multipart(path: &str, body: &[u8]) -> Vec<u8> {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: example.test\r\nContent-Type: {MULTIPART}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    request
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_multipart_body_with_the_blocked_field_is_blocked_and_a_clean_one_is_forwarded_byte_for_byte() {
+    let proxy = Proxy::start("multipart", Knobs::quick());
+    // The field is the second of two, so the body is parsed as multipart and not just looked at from its start.
+    let blocked = exchange(
+        proxy.port,
+        &post_multipart(
+            "/upload",
+            &multipart_body(&[("note", "hello"), ("probe", "block")]),
+        ),
+    );
+    assert_empty_answer(&blocked, 403);
+    proxy.records.conn("the blocked record", |l| {
+        l.contains(": blocked 403 blocked by a rule rule 9202 ")
+    });
+    assert_eq!(proxy.upstream.connections(), 0);
+
+    // A value with a line break and non-ASCII text, and an empty one: the upstream gets every byte.
+    let clean = multipart_body(&[
+        ("note", "two lines\r\nsecond line, \u{e9}\u{4e2d}"),
+        ("probe", "ok"),
+        ("empty", ""),
+    ]);
+    let passed = exchange(proxy.port, &post_multipart("/upload", &clean));
+    assert_eq!(passed.status(), 200, "answer: {:?}", passed.text());
+    let requests = proxy.upstream.requests();
+    assert_eq!(requests.len(), 1);
+    let seen = Message::parse(&requests[0]);
+    assert_eq!(seen.start, "POST /upload HTTP/1.1");
+    assert_eq!(seen.values("content-type"), [MULTIPART]);
+    assert_eq!(seen.values("content-length"), [clean.len().to_string()]);
+    assert!(
+        !seen.names().contains(&"transfer-encoding"),
+        "fields: {:?}",
+        seen.fields
+    );
+    assert_eq!(seen.body, clean);
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Bodies of the JSON type
+// ---------------------------------------------------------------------------------------------------------
+
+/// A JSON body that rule 9203 blocks: its top-level member `probe` is `block`, the second of two members.
+const BLOCKED_JSON: &str = "{\"note\": \"hello\", \"probe\": \"block\"}";
+
+/// A JSON body that a proxy which parsed and wrote it again would change: blanks and line breaks, an escape
+/// (`é`) next to the same letter as UTF-8, a three-byte character, numbers with a fraction and with an
+/// exponent, `null`, nesting, an empty string and a final line feed. Its member `probe` is `ok`.
+const CLEAN_JSON: &str = concat!(
+    "{\n",
+    "  \"probe\": \"ok\",\n",
+    "  \"note\": \"caf\\u00e9 caf\u{e9} \u{4e2d}\",\n",
+    "  \"n\": [1, 2.50, 2.5e3, true, null, {\"a\": {\"b\": []}}],\n",
+    "  \"empty\": \"\"\n",
+    "}\n"
+);
+
+/// The text of the record of a request that rule `id` blocked with 403.
+fn blocked_by(id: u32) -> String {
+    format!(": blocked 403 blocked by a rule rule {id} ")
+}
+
+/// Checks what the upstream got as its request number `index` (from 0): the start line, the `Content-Type` value
+/// as it was sent, the length of the body and no chunked coding, and the body byte for byte.
+fn assert_forwarded_json(
+    proxy: &Proxy,
+    index: usize,
+    start: &str,
+    content_type: &str,
+    body: &[u8],
+) {
+    let requests = proxy.upstream.requests();
+    let seen = Message::parse(
+        requests
+            .get(index)
+            .unwrap_or_else(|| panic!("the upstream got {} requests", requests.len())),
+    );
+    assert_eq!(seen.start, start);
+    assert_eq!(seen.values("content-type"), [content_type]);
+    assert_eq!(seen.values("content-length"), [body.len().to_string()]);
+    assert!(
+        !seen.names().contains(&"transfer-encoding"),
+        "fields: {:?}",
+        seen.fields
+    );
+    assert_eq!(
+        seen.body,
+        body,
+        "the upstream got another body: {:?}",
+        String::from_utf8_lossy(&seen.body)
+    );
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_json_body_rule_blocks_a_body_with_a_content_length_and_a_clean_one_is_forwarded_byte_for_byte()
+{
+    let proxy = Proxy::start("json_length", Knobs::quick());
+    let blocked = exchange(
+        proxy.port,
+        &post_typed("/api", JSON, BLOCKED_JSON.as_bytes()),
+    );
+    assert_empty_answer(&blocked, 403);
+    proxy
+        .records
+        .conn("the blocked record", |l| l.contains(&blocked_by(9203)));
+    assert_eq!(proxy.upstream.connections(), 0);
+
+    let clean = CLEAN_JSON.as_bytes();
+    let passed = exchange(proxy.port, &post_typed("/api", JSON, clean));
+    assert_eq!(passed.status(), 200, "answer: {:?}", passed.text());
+    assert_eq!(passed.message().body, UPSTREAM_BODY.as_bytes());
+    assert_eq!(proxy.upstream.connections(), 1);
+    assert_eq!(proxy.upstream.requests().len(), 1);
+    assert_forwarded_json(&proxy, 0, "POST /api HTTP/1.1", JSON, clean);
+    proxy.records.conn("the forwarded record", |l| {
+        l.contains(": forwarded 200 forwarded ")
+    });
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_json_body_rule_blocks_a_chunked_body_and_a_clean_one_is_forwarded_with_a_length() {
+    let proxy = Proxy::start("json_chunked", Knobs::quick());
+    // The value that the rule matches is split over two chunks: the body is decoded before it is inspected.
+    let blocked = exchange(
+        proxy.port,
+        &chunked_typed(
+            "/api",
+            JSON,
+            &chunked_body(&[b"{\"probe\":\"bl", b"ock\"}"], b""),
+        ),
+    );
+    assert_empty_answer(&blocked, 403);
+    proxy
+        .records
+        .conn("the blocked record", |l| l.contains(&blocked_by(9203)));
+    assert_eq!(proxy.upstream.connections(), 0);
+
+    // The clean body is cut inside the value `ok` and inside the three bytes of one character.
+    let clean = CLEAN_JSON.as_bytes();
+    let in_value = find(clean, b"\"ok\"").expect("the value is in the body") + 2;
+    let in_character =
+        find(clean, "\u{4e2d}".as_bytes()).expect("the character is in the body") + 1;
+    assert!(in_value < in_character);
+    let chunks = [
+        &clean[..in_value],
+        &clean[in_value..in_character],
+        &clean[in_character..],
+    ];
+    let passed = exchange(
+        proxy.port,
+        &chunked_typed("/api", JSON, &chunked_body(&chunks, b"")),
+    );
+    assert_eq!(passed.status(), 200, "answer: {:?}", passed.text());
+    assert_eq!(passed.message().body, UPSTREAM_BODY.as_bytes());
+    assert_eq!(proxy.upstream.connections(), 1);
+    // What was inspected is what was forwarded: the decoded body, with its length and without the coding.
+    assert_eq!(proxy.upstream.requests().len(), 1);
+    assert_forwarded_json(&proxy, 0, "POST /api HTTP/1.1", JSON, clean);
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn invalid_json_and_a_body_with_a_byte_order_mark_are_blocked_without_an_upstream_connection() {
+    let proxy = Proxy::start("json_invalid", Knobs::quick());
+    // No body here says `block`, so the only rule that can answer is the one for a body that cannot be parsed.
+    let with_mark = [b"\xEF\xBB\xBF".as_slice(), b"{\"probe\":\"ok\"}"].concat();
+    let cases: [(&str, Vec<u8>); 4] = [
+        ("a body that ends inside a member", b"{\"probe\":".to_vec()),
+        ("a trailing comma", b"{\"probe\":\"ok\",}".to_vec()),
+        ("text after the value", b"{\"probe\":\"ok\"}x".to_vec()),
+        ("a UTF-8 byte order mark", with_mark),
+    ];
+    for (n, (what, body)) in cases.into_iter().enumerate() {
+        let reply = exchange(proxy.port, &post_typed("/api", JSON, &body));
+        assert_empty_answer(&reply, 403);
+        // Every earlier case wrote the same line, so the count grows with each case.
+        proxy
+            .records
+            .conns(what, n + 1, |l| l.contains(&blocked_by(4_000_001)));
+        assert_eq!(proxy.upstream.connections(), 0, "{what}");
+    }
+    let lines = proxy.records.lines();
+    assert!(
+        !lines.iter().any(|l| l.contains("rule 9203")),
+        "records: {lines:#?}"
+    );
+
+    // Not a state of the proxy: a clean JSON body still passes.
+    let passed = exchange(proxy.port, &post_typed("/api", JSON, CLEAN_JSON.as_bytes()));
+    assert_eq!(passed.status(), 200, "answer: {:?}", passed.text());
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn the_spellings_of_the_json_type_that_the_proxy_takes_are_inspected() {
+    let proxy = Proxy::start("json_spellings", Knobs::quick());
+    // The part before the first `;` is compared without its blanks and tabs and without regard to case.
+    let spellings = [
+        "Application/JSON; charset=UTF-8",
+        " \t application/json \t",
+        "application/json \t; charset=utf-8",
+        "APPLICATION/JSON;charset=utf-8",
+    ];
+    for (n, spelling) in spellings.into_iter().enumerate() {
+        // The rule has to be the one that answers: a spelling that the inspector did not take for JSON would be
+        // forwarded (or fail on the body processor), not blocked by it.
+        let reply = exchange(
+            proxy.port,
+            &post_typed("/api", spelling, BLOCKED_JSON.as_bytes()),
+        );
+        assert_empty_answer(&reply, 403);
+        proxy
+            .records
+            .conns(spelling, n + 1, |l| l.contains(&blocked_by(9203)));
+        assert_eq!(proxy.upstream.connections(), 0, "{spelling:?}");
+    }
+
+    // A clean body with the first spelling is forwarded with that type as it was sent.
+    let clean = CLEAN_JSON.as_bytes();
+    let passed = exchange(proxy.port, &post_typed("/api", spellings[0], clean));
+    assert_eq!(passed.status(), 200, "answer: {:?}", passed.text());
+    assert_eq!(proxy.upstream.connections(), 1);
+    assert_forwarded_json(&proxy, 0, "POST /api HTTP/1.1", spellings[0], clean);
+    assert_eq!(proxy.finish(1), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_json_content_type_without_a_body_is_forwarded() {
+    let proxy = Proxy::start("json_no_body", Knobs::quick());
+    // A GET has no body and no length, and a POST says that its body is empty. The type is not looked at in
+    // either case: there is nothing to parse.
+    let get_json =
+        format!("GET /empty HTTP/1.1\r\nHost: example.test\r\nContent-Type: {JSON}\r\n\r\n");
+    let reply = exchange(proxy.port, get_json.as_bytes());
+    assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
+    assert_eq!(reply.message().body, UPSTREAM_BODY.as_bytes());
+    assert_eq!(proxy.upstream.connections(), 1);
+    let reply = exchange(proxy.port, &post_typed("/empty", JSON, b""));
+    assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
+    assert_eq!(reply.message().body, UPSTREAM_BODY.as_bytes());
+    assert_eq!(proxy.upstream.connections(), 2);
+
+    let requests = proxy.upstream.requests();
+    assert_eq!(requests.len(), 2);
+    let seen = Message::parse(&requests[0]);
+    assert_eq!(seen.start, "GET /empty HTTP/1.1");
+    assert_eq!(seen.values("content-type"), [JSON]);
+    assert!(
+        seen.values("content-length").is_empty(),
+        "fields: {:?}",
+        seen.fields
+    );
+    assert!(seen.body.is_empty());
+    assert_forwarded_json(&proxy, 1, "POST /empty HTTP/1.1", JSON, b"");
+    proxy.records.conns("two forwarded records", 2, |l| {
+        l.contains(": forwarded 200 forwarded ")
+    });
+    assert_eq!(proxy.finish(2), StopCounts::NONE);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// The limits that cut a response, and a kernel that is not ready
+// ---------------------------------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn conn_total_cuts_a_response_that_streams_slowly_without_end() {
+    let knobs = Knobs::short();
+    let conn_total = Duration::from_millis(knobs.conn_total_ms);
+    let proxy = Proxy::start("conn_total", knobs);
+    proxy.upstream.behave(Behaviour::Drip);
+    let start = Instant::now();
+    let mut sock = connect(proxy.port);
+    sock.write_all(&get("/drip")).expect("send the request");
+    // The head and the first body byte: the answer streams. The upstream sends a byte every 200 ms and the idle
+    // time is longer than that, so only the connection time can end it.
+    let mut raw = read_until(&mut sock, b"\r\n\r\nx");
+    raw.extend_from_slice(&read_to_close(&mut sock));
+    let cut = Reply {
+        raw,
+        took: start.elapsed(),
+    };
+    let answer = cut.message();
+    assert_eq!(answer.status(), 200, "answer: {:?}", cut.text());
+    assert_eq!(answer.values("content-length"), [DRIP_PROMISE.to_string()]);
+    assert!(
+        answer.body.len() > 1 && answer.body.len() < DRIP_PROMISE,
+        "the client got {} body bytes of {DRIP_PROMISE}",
+        answer.body.len()
+    );
+    assert!(answer.body.iter().all(|&b| b == b'x'));
+    assert!(
+        cut.took + 50 * MS >= conn_total,
+        "cut off after {:?}; conn_total is {conn_total:?}",
+        cut.took
+    );
+    assert!(
+        cut.took < conn_total + MARGIN,
+        "cut off after {:?}; conn_total is {conn_total:?}",
+        cut.took
+    );
+    proxy.records.conn("the cut-off record", |l| {
+        l.contains(": forwarded 200 closed while the response was sent ")
+    });
+    // The proxy closed its upstream connection with it.
+    proxy
+        .upstream
+        .seen
+        .closed
+        .wait_for("the proxy to close its upstream connection", 1);
+
+    proxy.upstream.behave(Behaviour::Reply);
+    let next = exchange(proxy.port, &get("/after"));
+    assert_eq!(next.status(), 200, "answer: {:?}", next.text());
+    assert_eq!(proxy.finish(2), StopCounts::NONE);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn stop_wait_aborts_a_connection_that_outlives_it_and_the_proxy_still_exits() {
+    // stop_wait is above stop_inspect plus the kernel's kill grace (1 s and 2 s).
+    let knobs = Knobs {
+        stop_inspect_ms: 1_000,
+        stop_wait_ms: 4_000,
+        ..Knobs::quick()
+    };
+    let stop_wait = Duration::from_millis(knobs.stop_wait_ms);
+    let within = stop_wait + Duration::from_millis(KILL_GRACE_MS) + MARGIN;
+    let proxy = Proxy::start("stop_wait_abort", knobs);
+    let records = proxy.records.clone();
+    proxy.upstream.behave(Behaviour::Drip);
+    let mut sock = connect(proxy.port);
+    sock.write_all(&get("/drip")).expect("send the request");
+    // The answer streams when the signal comes, and its end is never near.
+    let mut raw = read_until(&mut sock, b"\r\n\r\nx");
+    let since = proxy.term();
+    raw.extend_from_slice(&read_to_close(&mut sock));
+    let closed_after = since.elapsed();
+    let cut = Reply {
+        raw,
+        took: closed_after,
+    };
+    let answer = cut.message();
+    assert_eq!(answer.status(), 200, "answer: {:?}", cut.text());
+    assert!(
+        answer.body.len() > 1 && answer.body.len() < DRIP_PROMISE,
+        "the client got {} body bytes of {DRIP_PROMISE}",
+        answer.body.len()
+    );
+    // The stop waited for the connection for stop_wait and then ended it.
+    assert!(
+        closed_after + 100 * MS >= stop_wait,
+        "the connection ended {closed_after:?} after the signal; stop_wait is {stop_wait:?}"
+    );
+    assert!(
+        closed_after < within,
+        "the connection ended {closed_after:?} after the signal; the limit is {within:?}"
+    );
+
+    // The exit code of a stop by a signal whose kernel ended cleanly is 0, whether or not a connection had to be
+    // aborted. `finish_within` fails with the status if it is another code.
+    let (counts, took) = proxy.finish_within("SIGTERM", since, within, 1);
+    assert_eq!(counts, StopCounts::NONE);
+    assert!(
+        took + 100 * MS >= stop_wait,
+        "the proxy exited {took:?} after the signal; stop_wait is {stop_wait:?}"
+    );
+    let lines = records.lines();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "stop: the remaining connections are aborted"),
+        "no record of the abort: {lines:#?}"
+    );
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_kernel_that_is_not_ready_when_ready_wait_ends_stops_the_proxy_with_exit_code_1_and_it_never_listens()
+ {
+    // The stand-in never says hello. The restart budget is large, so the kernel is starting again when ready_wait
+    // passes: it has neither failed nor become ready.
+    let knobs = Knobs {
+        stand_in: true,
+        hello_wait_ms: 1_000,
+        ready_wait_ms: 1_500,
+        restarts: 50,
+        ..Knobs::quick()
+    };
+    let ready_wait = Duration::from_millis(knobs.ready_wait_ms);
+    let mut proxy = Proxy::spawn("ready_wait", knobs);
+    proxy
+        .records
+        .wait_line("the configuration to be accepted", |l| {
+            l == "start: configuration accepted"
+        });
+    proxy.wait_stand_in();
+    // Nothing listens while the kernel starts.
+    assert_turned_away(proxy.port);
+
+    let started = proxy.started;
+    let (status, took) = proxy.wait_exit(started, ready_wait + MARGIN);
+    let lines = proxy.records.lines();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "exit status {status}; records: {lines:#?}"
+    );
+    assert!(
+        took >= ready_wait,
+        "the proxy ended after {took:?}; ready_wait is {ready_wait:?}"
+    );
+    assert!(
+        took < ready_wait + MARGIN,
+        "the proxy ended after {took:?}; ready_wait is {ready_wait:?}"
+    );
+    // The cause is the wait, not a failure of the kernel, and the proxy never got as far as listening.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "stop: the kernel was not ready in time"),
+        "records: {lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("kernel failed")
+            || l == "start: the kernel is ready"
+            || l == "start: listening"),
+        "records: {lines:#?}"
+    );
+    // The kernel ended the start that was running, and nothing is left of it.
+    assert!(
+        lines.iter().any(|l| l.starts_with(
+            "stop: kernel Stopped, bye false, exit_confirmed true, dir_removed true, held_left 0, waiting_left 0"
+        )),
+        "the kernel did not stop cleanly: {lines:#?}"
+    );
+    assert_gone(&proxy.inspectors);
+    assert_turned_away(proxy.port);
+    proxy.clear_root(&["config.json", STAND_IN]);
+    proxy.upstream.stop();
+    assert_eq!(proxy.upstream.connections(), 0);
 }

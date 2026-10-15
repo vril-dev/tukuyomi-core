@@ -19,8 +19,9 @@
 //! 7. `Connection` lines are comma separated lists of tokens (no empty element) that do not name `host`,
 //!    `content-length`, `content-type` or `content-encoding`.
 //! 8. `Content-Encoding` is refused. A body that is not empty needs exactly one `Content-Type` that is
-//!    `application/x-www-form-urlencoded` or `multipart/form-data`; for a chunked body the caller applies the
-//!    same rule once the body has been read.
+//!    `application/x-www-form-urlencoded`, `multipart/form-data`, `application/json` or `application/<name>+json`
+//!    (the name is described at `inspectable_essence`); for a chunked body the caller applies the same rule once
+//!    the body has been read.
 //!
 //! A refusal is a fixed answer with no body that closes the connection.
 
@@ -126,7 +127,7 @@ pub struct Head {
     fields: Vec<(Range<usize>, Range<usize>)>,
     content_length: Option<u64>,
     chunked: bool,
-    form_type: bool,
+    inspectable_type: bool,
 }
 
 impl Head {
@@ -155,9 +156,10 @@ impl Head {
         self.chunked
     }
 
-    /// There is exactly one `Content-Type` and it is a form type that the inspection reads.
-    pub fn form_type(&self) -> bool {
-        self.form_type
+    /// There is exactly one `Content-Type` and its type is one that the inspection reads (urlencoded,
+    /// multipart or JSON).
+    pub fn inspectable_type(&self) -> bool {
+        self.inspectable_type
     }
 }
 
@@ -300,9 +302,11 @@ fn connection_ok(value: &[u8]) -> bool {
     })
 }
 
-/// The type of a body that the inspection reads. Same comparison as the kernel's: the part before the first `;`
-/// without blanks, ASCII case ignored.
-fn form_essence(value: &[u8]) -> bool {
+/// The type of a body that the inspection reads: urlencoded, multipart or JSON. Same comparison as the kernel's:
+/// the part before the first `;` without blanks, ASCII case ignored. The first three types are equal to the whole
+/// name (so `application/jsonp` and `text/json` are not JSON). The fourth is `application/<name>+json`, see
+/// `is_json_suffix_type` (so `text/x+json` and `application/x+jsonp` are not JSON either).
+fn inspectable_essence(value: &[u8]) -> bool {
     let essence = value
         .split(|&b| b == b';')
         .next()
@@ -310,6 +314,34 @@ fn form_essence(value: &[u8]) -> bool {
         .trim_ascii();
     essence.eq_ignore_ascii_case(b"application/x-www-form-urlencoded")
         || essence.eq_ignore_ascii_case(b"multipart/form-data")
+        || essence.eq_ignore_ascii_case(b"application/json")
+        || is_json_suffix_type(essence)
+}
+
+/// `application/<name>+json`, ASCII case ignored. The name has 1 to 122 bytes: the first is an ASCII letter or
+/// digit, the others ASCII letters, digits, `.` or `-`. A name that starts with `x-www-form-urlencoded` is
+/// refused: the inspection takes any type that starts with `application/x-www-form-urlencoded` for urlencoded,
+/// so such a body would not be read as JSON.
+fn is_json_suffix_type(essence: &[u8]) -> bool {
+    const NAME_MAX: usize = 122;
+    const FORM: &[u8] = b"x-www-form-urlencoded";
+    let Some((prefix, rest)) = essence.split_at_checked(b"application/".len()) else {
+        return false;
+    };
+    let Some(cut) = rest.len().checked_sub(b"+json".len()) else {
+        return false;
+    };
+    let (name, suffix) = rest.split_at(cut);
+    prefix.eq_ignore_ascii_case(b"application/")
+        && suffix.eq_ignore_ascii_case(b"+json")
+        && (1..=NAME_MAX).contains(&name.len())
+        && name.first().is_some_and(u8::is_ascii_alphanumeric)
+        && name
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && !name
+            .get(..FORM.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(FORM))
 }
 
 /// The rules. `buf` is what has been read so far; `Ok(None)` while the head is not complete. The result has an
@@ -429,8 +461,8 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         return Err(Reject::UnsupportedMedia);
     }
     let types: Vec<&[u8]> = named(b"content-type").collect();
-    let form_type = matches!(types.as_slice(), [value] if form_essence(value));
-    if content_length.is_some_and(|n| n > 0) && !form_type {
+    let inspectable_type = matches!(types.as_slice(), [value] if inspectable_essence(value));
+    if content_length.is_some_and(|n| n > 0) && !inspectable_type {
         return Err(Reject::UnsupportedMedia);
     }
 
@@ -442,7 +474,7 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         fields,
         content_length,
         chunked,
-        form_type,
+        inspectable_type,
     }))
 }
 
@@ -468,6 +500,8 @@ mod tests {
         max_body: 1 << 20,
     };
     const FORM: &str = "Content-Type: application/x-www-form-urlencoded";
+    const JSON: &str = "Content-Type: application/json";
+    const SUFFIXED: &str = "Content-Type: application/vnd.api+json";
 
     /// A GET head with a Host line and then the given lines.
     fn head_with(lines: &[&str]) -> Vec<u8> {
@@ -512,7 +546,7 @@ mod tests {
         assert_eq!(fields[1], (&b"X-A"[..], &b"v"[..]));
         assert_eq!(head.content_length(), Some(3));
         assert!(!head.chunked());
-        assert!(head.form_type());
+        assert!(head.inspectable_type());
     }
 
     #[test]
@@ -968,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn a_body_needs_exactly_one_form_content_type() {
+    fn a_body_needs_exactly_one_inspectable_content_type() {
         let lengthy = |lines: &[&str]| {
             let mut all = vec!["Content-Length: 1"];
             all.extend_from_slice(lines);
@@ -982,15 +1016,87 @@ mod tests {
             "content-type:  MULTIPART/Form-Data ; boundary=xyz",
         ]));
         ok(&lengthy(&["Content-Type: multipart/form-data"]));
+        // JSON is compared like the other two: the part before the first `;`, blanks and case ignored.
+        ok(&lengthy(&[JSON]));
+        ok(&lengthy(&["Content-Type: application/json; charset=UTF-8"]));
+        ok(&lengthy(&["Content-Type: Application/JSON"]));
+        ok(&lengthy(&[
+            "content-type:  application/json ; charset=utf-8",
+        ]));
+        ok(&lengthy(&[
+            "Content-Type:\tapplication/json\t;\tcharset=utf-8",
+        ]));
+        // `application/<name>+json` is compared the same way, and the name has its own rule.
+        ok(&lengthy(&[SUFFIXED]));
+        ok(&lengthy(&["Content-Type: application/problem+json"]));
+        ok(&lengthy(&["Content-Type: application/merge-patch+json"]));
+        ok(&lengthy(&[
+            "Content-Type: Application/VND.API+JSON; charset=UTF-8",
+        ]));
+        ok(&lengthy(&[
+            "content-type:  application/vnd.api+json ; charset=utf-8",
+        ]));
+        ok(&lengthy(&[
+            "Content-Type:\tapplication/problem+json\t;\tcharset=utf-8",
+        ]));
+        // The name: one byte, a digit first, `.` and `-` inside.
+        ok(&lengthy(&["Content-Type: application/x+json"]));
+        ok(&lengthy(&["Content-Type: application/1+json"]));
+        ok(&lengthy(&["Content-Type: application/vnd.api-v1.2+json"]));
+        // The `x-www-form-urlencoded` start is refused only when the name really starts with it.
+        ok(&lengthy(&[
+            "Content-Type: application/x-www-form-urlencode+json",
+        ]));
+        ok(&lengthy(&[
+            "Content-Type: application/xx-www-form-urlencoded+json",
+        ]));
+        // The longest name is 122 bytes.
+        let named = |len: usize| format!("Content-Type: application/{}+json", "a".repeat(len));
+        ok(&lengthy(&[&named(122)]));
+        assert_eq!(refused(&lengthy(&[&named(123)])), Reject::UnsupportedMedia);
         for lines in [
             &[][..],
             &["Content-Type: text/plain"],
-            &["Content-Type: application/json"],
+            &["Content-Type: application/xml"],
             &["Content-Type: application/x-www-form-urlencodedx"],
             &["Content-Type:"],
             &["Content-Type: multipart/form-data, text/plain"],
             &[FORM, FORM],
             &[FORM, "Content-Type: text/plain"],
+            &["Content-Type: application/jsonp"],
+            &["Content-Type: text/x+json"],
+            &["Content-Type: text/json"],
+            &["Content-Type: application /json"],
+            &["Content-Type: application/json, text/plain"],
+            &[JSON, JSON],
+            &[JSON, "Content-Type: text/plain"],
+            &["Content-Type: application/vnd.api+json, text/plain"],
+            &[SUFFIXED, SUFFIXED],
+            &[SUFFIXED, JSON],
+            &[SUFFIXED, "Content-Type: text/plain"],
+            // A name that is empty, starts with a symbol, or has a byte outside letters, digits, `.` and `-`.
+            &["Content-Type: application/+json"],
+            &["Content-Type: application/.x+json"],
+            &["Content-Type: application/-x+json"],
+            &["Content-Type: application/a+b+json"],
+            &["Content-Type: application/a_b+json"],
+            &["Content-Type: application/a/b+json"],
+            &["Content-Type: application/\u{e9}+json"],
+            &["Content-Type: application/vnd.api +json"],
+            &["Content-Type: application/vnd.api+ json"],
+            // A name that starts with the urlencoded type (any case), and types that are not `application/<name>+json`.
+            &["Content-Type: application/x-www-form-urlencoded+json"],
+            &["Content-Type: application/x-www-form-urlencoded-x+json"],
+            &["Content-Type: Application/X-WWW-Form-Urlencoded+JSON"],
+            &["Content-Type: application/x+json2"],
+            &["Content-Type: application/x+jsonp"],
+            &["Content-Type: application/x+jso"],
+            &["Content-Type: application/vnd.api-json"],
+            &["Content-Type: application/jso"],
+            &["Content-Type: application/"],
+            &["Content-Type: text/x+json"],
+            &["Content-Type: xapplication/x+json"],
+            &["Content-Type: text/plain-and-more+json"],
         ] {
             assert_eq!(
                 refused(&lengthy(lines)),
@@ -999,16 +1105,22 @@ mod tests {
             );
         }
         // No body: no type needed, and the flag says what the type is.
-        assert!(!ok(&head_with(&["Content-Length: 0"])).form_type());
-        assert!(ok(&head_with(&["Content-Length: 0", FORM])).form_type());
-        assert!(!ok(&head_with(&["Content-Type: text/plain"])).form_type());
+        assert!(!ok(&head_with(&["Content-Length: 0"])).inspectable_type());
+        assert!(ok(&head_with(&["Content-Length: 0", FORM])).inspectable_type());
+        assert!(ok(&head_with(&["Content-Length: 0", JSON])).inspectable_type());
+        assert!(ok(&head_with(&["Content-Length: 0", SUFFIXED])).inspectable_type());
+        assert!(!ok(&head_with(&["Content-Type: text/plain"])).inspectable_type());
         // A chunked body is checked by the caller once it knows the body is not empty.
         let chunked = ok(&head_with(&[
             "Transfer-Encoding: chunked",
             "Content-Type: text/plain",
         ]));
-        assert!(chunked.chunked() && !chunked.form_type());
-        assert!(ok(&head_with(&["Transfer-Encoding: chunked", FORM])).form_type());
+        assert!(chunked.chunked() && !chunked.inspectable_type());
+        assert!(ok(&head_with(&["Transfer-Encoding: chunked", FORM])).inspectable_type());
+        assert!(ok(&head_with(&["Transfer-Encoding: chunked", JSON])).inspectable_type());
+        assert!(ok(&head_with(&["Transfer-Encoding: chunked", SUFFIXED])).inspectable_type());
+        let near = head_with(&["Transfer-Encoding: chunked", "Content-Type: text/x+json"]);
+        assert!(!ok(&near).inspectable_type());
     }
 
     #[test]

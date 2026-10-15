@@ -37,6 +37,7 @@ const MAX_HDR_VALUE: usize = 4096;
 const MAX_HDR_TOTAL: usize = 24 * 1024;
 
 const URLENCODED: &[u8] = b"application/x-www-form-urlencoded";
+const JSON: &[u8] = b"application/json";
 const UNAVAILABLE: Verdict = Verdict::Uninspectable(Reason::Unavailable);
 
 /// A configuration that passes `check` and names nothing that exists.
@@ -315,13 +316,15 @@ fn refused_content_type() {
     ];
     let r = run.refused(&request(b"POST", b"/", &two, b"a=b"));
     assert_eq!(r, Refused::Unsupported("content-type"));
-    let wrong: [&[u8]; 6] = [
-        b"application/json",
+    let wrong: [&[u8]; 8] = [
+        b"application/jsonp",
+        b"text/json",
         b"text/plain",
         b"application/xml",
         b"",
         b"application/x-www-form-urlencoded-x",
         b"x/application/x-www-form-urlencoded",
+        b"x/application/json",
     ];
     for ct in wrong {
         let hs = [cl, header(b"Content-Type", ct)];
@@ -341,8 +344,35 @@ fn refused_content_type() {
         run.submit(&request(b"POST", b"/", &hs, b"a=b"));
     }
     // The rule is about a body: a request with none passes whatever it says.
-    let hs = [header(b"Content-Type", b"application/json")];
+    let hs = [header(b"Content-Type", b"application/xml")];
     run.submit(&request(b"GET", b"/", &hs, b""));
+    run.finish();
+}
+
+#[test]
+fn json_content_type_passes_the_content_type_rule() {
+    let mut run = Run::new(fake_config(), None);
+    let cl = header(b"Content-Length", b"3");
+    // application/json passes, in any case, with parameters, blanks and tabs; so does application/<name>+json.
+    let right: [&[u8]; 5] = [
+        JSON,
+        b"Application/JSON; charset=UTF-8",
+        b"  application/json  ",
+        b"\tapplication/json\t ; x=y",
+        b"application/vnd.api+json",
+    ];
+    for ct in right {
+        let hs = [cl, header(b"content-TYPE", ct)];
+        run.submit(&request(b"POST", b"/", &hs, b"[1]"));
+    }
+    // Exactly one Content-Type is allowed, as for the other types.
+    let two = [
+        cl,
+        header(b"Content-Type", JSON),
+        header(b"content-type", JSON),
+    ];
+    let r = run.refused(&request(b"POST", b"/", &two, b"[1]"));
+    assert_eq!(r, Refused::Unsupported("content-type"));
     run.finish();
 }
 
@@ -883,6 +913,165 @@ fn urlencoded_content_type_forms_the_submit_accepts_are_parsed() {
     assert_eq!(run.verdict(with_charset), blocked);
     assert_eq!(run.verdict(leading_space), blocked);
     assert_eq!(run.verdict(passed), Verdict::Allow);
+    finish_stopped(run);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn json_body_rule_blocks_in_phase_2() {
+    let mut run = real_run("json_block");
+    let mut post = |body: &[u8]| {
+        let cl = body.len().to_string();
+        let hs = [
+            header(b"Host", b"example.test"),
+            header(b"Content-Type", JSON),
+            header(b"Content-Length", cl.as_bytes()),
+        ];
+        run.submit(&request(b"POST", b"/submit", &hs, body))
+    };
+    let blocked = post(br#"{"probe":"block"}"#);
+    let passed = post(br#"{"probe":"pass"}"#);
+    run.wait_results(2);
+    assert_eq!(
+        run.verdict(blocked),
+        Verdict::Block {
+            phase: 2,
+            rule_id: 9203,
+            status: 403
+        }
+    );
+    assert_eq!(run.verdict(passed), Verdict::Allow);
+    finish_stopped(run);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_plus_json_body_rule_blocks_in_phase_2() {
+    // application/<name>+json is parsed by the JSON processor like application/json.
+    let mut run = real_run("plus_json_block");
+    let mut post = |body: &[u8]| {
+        let cl = body.len().to_string();
+        let hs = [
+            header(b"Host", b"example.test"),
+            header(b"Content-Type", b"application/vnd.api+json"),
+            header(b"Content-Length", cl.as_bytes()),
+        ];
+        run.submit(&request(b"POST", b"/submit", &hs, body))
+    };
+    let blocked = post(br#"{"probe":"block"}"#);
+    let passed = post(br#"{"probe":"pass"}"#);
+    run.wait_results(2);
+    assert_eq!(
+        run.verdict(blocked),
+        Verdict::Block {
+            phase: 2,
+            rule_id: 9203,
+            status: 403
+        }
+    );
+    assert_eq!(run.verdict(passed), Verdict::Allow);
+    finish_stopped(run);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn json_content_type_forms_the_submit_accepts_are_parsed() {
+    // The case of the type and a parameter after `;` are accepted by `submit`; the body must still be parsed.
+    let mut run = real_run("json_ct_forms");
+    let mut post = |content_type: &[u8], body: &[u8]| {
+        let cl = body.len().to_string();
+        let hs = [
+            header(b"Host", b"example.test"),
+            header(b"Content-Type", content_type),
+            header(b"Content-Length", cl.as_bytes()),
+        ];
+        run.submit(&request(b"POST", b"/submit", &hs, body))
+    };
+    let with_charset = post(b"Application/JSON; charset=UTF-8", br#"{"probe":"block"}"#);
+    let without_blank = post(b"application/json;charset=utf-8", br#"{"probe":"block"}"#);
+    let passed = post(b"Application/JSON; charset=UTF-8", br#"{"probe":"pass"}"#);
+    run.wait_results(3);
+    let blocked = Verdict::Block {
+        phase: 2,
+        rule_id: 9203,
+        status: 403,
+    };
+    assert_eq!(run.verdict(with_charset), blocked);
+    assert_eq!(run.verdict(without_blank), blocked);
+    assert_eq!(run.verdict(passed), Verdict::Allow);
+    finish_stopped(run);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn json_content_type_with_blanks_and_tabs_the_submit_accepts_is_parsed() {
+    // Spaces and tabs around the type are accepted by `submit`; the body must still be parsed.
+    let mut run = real_run("json_ct_blanks");
+    let mut post = |content_type: &[u8], body: &[u8]| {
+        let cl = body.len().to_string();
+        let hs = [
+            header(b"Host", b"example.test"),
+            header(b"Content-Type", content_type),
+            header(b"Content-Length", cl.as_bytes()),
+        ];
+        run.submit(&request(b"POST", b"/submit", &hs, body))
+    };
+    let spaces = post(b"  application/json  ", br#"{"probe":"block"}"#);
+    let tabs = post(b"\tapplication/json\t ; x=y", br#"{"probe":"block"}"#);
+    let passed = post(b"\tapplication/json\t ", br#"{"probe":"pass"}"#);
+    run.wait_results(3);
+    let blocked = Verdict::Block {
+        phase: 2,
+        rule_id: 9203,
+        status: 403,
+    };
+    assert_eq!(run.verdict(spaces), blocked);
+    assert_eq!(run.verdict(tabs), blocked);
+    assert_eq!(run.verdict(passed), Verdict::Allow);
+    finish_stopped(run);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn an_invalid_json_body_is_blocked_by_the_reserved_rule() {
+    // The JSON processor reports the error; the rule of the inspector (4000001) blocks it in phase 2.
+    let mut run = real_run("json_invalid");
+    let mut post = |body: &[u8]| {
+        let cl = body.len().to_string();
+        let hs = [
+            header(b"Host", b"example.test"),
+            header(b"Content-Type", JSON),
+            header(b"Content-Length", cl.as_bytes()),
+        ];
+        run.submit(&request(b"POST", b"/submit", &hs, body))
+    };
+    let invalid = post(b"{\"probe\": ");
+    let passed = post(br#"{"probe":"pass"}"#);
+    run.wait_results(2);
+    assert_eq!(
+        run.verdict(invalid),
+        Verdict::Block {
+            phase: 2,
+            rule_id: 4000001,
+            status: 403
+        }
+    );
+    assert_eq!(run.verdict(passed), Verdict::Allow);
+    finish_stopped(run);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_get_with_a_json_content_type_and_no_body_is_allowed() {
+    // There is no body to parse, whatever the Content-Type says.
+    let mut run = real_run("json_no_body");
+    let hs = [
+        header(b"Host", b"example.test"),
+        header(b"Content-Type", JSON),
+    ];
+    let id = run.submit(&request(b"GET", b"/", &hs, b""));
+    run.wait_results(1);
+    assert_eq!(run.verdict(id), Verdict::Allow);
     finish_stopped(run);
 }
 
