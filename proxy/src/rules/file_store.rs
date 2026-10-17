@@ -3,10 +3,16 @@
 //! The directory holds one directory per generation, `generations/<64 lowercase hex digits>/`, which is never
 //! changed after it was made, and the file `current`, which names the chosen generation: its 64 digits and a
 //! newline. `staging/<32 lowercase hex digits>/` is a bundle between `stage` and `commit` or `discard`, and `lock`
-//! is the file that a command holds with `File::try_lock` from `stage` (or `activate`) to its end, so that only one
+//! is the file that a command holds with `File::try_lock` from `stage` (or `activate` or `remove`) to its end, so that only one
 //! command changes the store at a time. `current` is replaced by writing `current.new`, syncing it and renaming it
 //! over `current`, and then syncing the directory; a generation becomes visible by one rename from `staging/` after
 //! its files and directories were synced.
+//!
+//! `using/<64 lowercase hex digits>` is an empty file for a generation that a proxy uses or a command removes. A
+//! running proxy holds a shared lock on it (`File::try_lock_shared`) for as long as it uses the generation, and
+//! `remove` takes the exclusive lock without waiting, so it never removes a generation that a proxy holds. A proxy
+//! asks `generation_dir` after it took the lock: a removal that has finished is found there, and one that is
+//! going on holds the exclusive lock.
 //!
 //! Only the store directory itself is examined (a real directory, owned by this process's user, no group or other
 //! bits): a user who cannot write there cannot make or replace a name inside it. What is read is opened without
@@ -25,7 +31,7 @@ use crate::host;
 use crate::rules::bundle::{
     Bundle, Fingerprint, MANIFEST_NAME, MAX_MANIFEST_BYTES, Manifest, sha256,
 };
-use crate::rules::store::{Committed, Generation, RuleStore, Staged, StoreError};
+use crate::rules::store::{Committed, Generation, Hold, RuleStore, Staged, StoreError};
 
 /// `O_NOFOLLOW` of Linux, which std has no name for. x86_64: the UAPI header `asm-generic/fcntl.h` (and Go's
 /// `syscall/zerrors_linux_amd64.go`). aarch64: Go's `syscall/zerrors_linux_arm64.go`, where the value differs.
@@ -47,6 +53,7 @@ const STAGING: &str = "staging";
 const CURRENT: &str = "current";
 const CURRENT_NEW: &str = "current.new";
 const LOCK: &str = "lock";
+const USING: &str = "using";
 
 /// A bundle between `stage` and `commit` or `discard`. The lock lives as long as the descriptor does.
 struct Import {
@@ -105,19 +112,11 @@ impl FileStore {
     /// Takes the lock without waiting; the file is made when it is not there. It is opened like every file that is
     /// read, so a link or a FIFO in its place is refused.
     fn lock(&self) -> Result<File, StoreError> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-            .open(self.dir.join(LOCK))
-            .map_err(|_| StoreError("the lock of the rules store cannot be opened"))?;
-        if !file.metadata().is_ok_and(|meta| meta.is_file()) {
-            return Err(StoreError(
-                "the lock of the rules store is not a regular file",
-            ));
-        }
+        let file = open_lock_file(
+            &self.dir.join(LOCK),
+            StoreError("the lock of the rules store cannot be opened"),
+            StoreError("the lock of the rules store is not a regular file"),
+        )?;
         match file.try_lock() {
             Ok(()) => Ok(file),
             Err(TryLockError::WouldBlock) => {
@@ -127,6 +126,16 @@ impl FileStore {
                 Err(StoreError("the lock of the rules store cannot be taken"))
             }
         }
+    }
+
+    /// The file that marks a generation as used, `using/<digits>`; it and `using/` are made when they are not there.
+    fn using_file(&self, generation: Fingerprint) -> Result<File, StoreError> {
+        let using = self.ensure_dir(USING)?;
+        open_lock_file(
+            &using.join(generation.hex()),
+            StoreError("the usage lock of the generation cannot be opened"),
+            StoreError("the usage lock of the generation is not a regular file"),
+        )
     }
 
     /// `<dir>/<name>`, made (0700) when it is not there; whatever else is there is refused.
@@ -339,6 +348,71 @@ impl RuleStore for FileStore {
         }
         Ok(())
     }
+
+    fn hold(&self, generation: Fingerprint) -> Result<Hold, StoreError> {
+        let file = self.using_file(generation)?;
+        match file.try_lock_shared() {
+            Ok(()) => Ok(Hold::new(file)),
+            Err(TryLockError::WouldBlock) => Err(StoreError("the generation is being removed")),
+            Err(TryLockError::Error(_)) => Err(StoreError(
+                "the usage lock of the generation cannot be taken",
+            )),
+        }
+    }
+
+    /// The order: the lock of the store, the chosen generation (a record that cannot be read leaves it unknown, and
+    /// then nothing is removed), the generation, the exclusive lock on its `using` file, then one rename out of
+    /// `generations` that is made durable before the files go, as `place` does for a broken generation.
+    fn remove(&mut self, generation: Fingerprint) -> Result<(), StoreError> {
+        const CANNOT: StoreError = StoreError("the generation cannot be removed");
+        let _lock = self.lock()?;
+        if self.current()? == Some(generation) {
+            return Err(StoreError("the generation is the current one"));
+        }
+        let dir = self.generation_dir(generation)?;
+        let using = self.using_file(generation)?;
+        match using.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(StoreError("the generation is used by a running proxy"));
+            }
+            Err(TryLockError::Error(_)) => {
+                return Err(StoreError(
+                    "the usage lock of the generation cannot be taken",
+                ));
+            }
+        }
+        let away = self.ensure_dir(STAGING)?.join(random_name()?);
+        fs::rename(&dir, &away).map_err(|_| CANNOT)?;
+        sync_dir(&self.dir.join(GENERATIONS)).map_err(|_| CANNOT)?;
+        // If it cannot be removed now, it stays in `staging` and the next `stage` removes it. The `using` file goes
+        // while its lock is still held.
+        let _ = remove_entry(&away);
+        let _ = fs::remove_file(self.dir.join(USING).join(generation.hex()));
+        Ok(())
+    }
+}
+
+/// Opens the file at `path` that a lock is taken on, and makes it (empty, 0600) when it is not there. It is opened
+/// like every file that is read: a link is not followed, a FIFO does not make the open wait, and what is not a
+/// regular file is refused. `cannot_open` and `not_regular` are the two sentences of the refusal.
+fn open_lock_file(
+    path: &Path,
+    cannot_open: StoreError,
+    not_regular: StoreError,
+) -> Result<File, StoreError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+        .map_err(|_| cannot_open)?;
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Err(not_regular);
+    }
+    Ok(file)
 }
 
 /// Removes the bundles an earlier command left: the entries of `staging` whose name is 32 lowercase hexadecimal

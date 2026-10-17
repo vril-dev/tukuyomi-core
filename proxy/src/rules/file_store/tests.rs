@@ -474,3 +474,102 @@ fn only_a_real_directory_under_a_fingerprint_is_a_generation() {
     );
     assert!(listed[0].made > 0);
 }
+
+// ---- the generations that a proxy uses ----
+
+fn other_rules() -> Bundle {
+    bundle(
+        &[("rules/other.conf", "SecDebugLogLevel 1\n")],
+        &["rules/other.conf"],
+    )
+}
+
+/// Makes the bundle a generation of the store.
+fn made(store: &mut FileStore, bundle: &Bundle) -> Fingerprint {
+    store.stage(bundle).unwrap();
+    store.commit().unwrap();
+    bundle.fingerprint()
+}
+
+#[test]
+fn a_generation_is_removed_unless_it_is_chosen_held_or_missing() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let first = made(&mut store, &rules());
+    let second = made(&mut store, &other_rules());
+    store.activate(first).unwrap();
+
+    assert_eq!(
+        refusal(store.remove(first)),
+        "the generation is the current one"
+    );
+    assert_eq!(
+        refusal(store.remove(generation())),
+        "the generation is not a real directory"
+    );
+    // Two holds can live together; the generation is in use as long as one of them does.
+    let (hold, other) = (store.hold(second).unwrap(), store.hold(second).unwrap());
+    let in_use = "the generation is used by a running proxy";
+    assert_eq!(refusal(store.remove(second)), in_use);
+    drop(hold);
+    assert_eq!(refusal(store.remove(second)), in_use);
+    drop(other);
+    assert!(store.generation_dir(second).is_ok());
+
+    assert_eq!(store.remove(second), Ok(()));
+    assert_eq!(
+        refusal(store.generation_dir(second)),
+        "the generation is not a real directory"
+    );
+    assert_eq!(store.list().unwrap().len(), 1);
+    // Nothing is left of it: no staged copy, no marker, and the lock of the store is free.
+    assert!(names(&root.path().join("staging")).is_empty());
+    assert!(names(&root.path().join("using")).is_empty());
+    assert_eq!(store.activate(first), Ok(()));
+}
+
+#[test]
+fn a_hold_taken_after_a_removal_is_found_out_by_the_generation_directory() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let second = made(&mut store, &other_rules());
+    store.remove(second).unwrap();
+    // The hold itself is given: the caller asks for the directory next, as the proxy does.
+    let _late = store.hold(second).unwrap();
+    assert_eq!(
+        refusal(store.generation_dir(second)),
+        "the generation is not a real directory"
+    );
+}
+
+#[test]
+fn nothing_is_removed_when_the_chosen_generation_cannot_be_told() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let first = made(&mut store, &rules());
+    fs::write(root.path().join("current"), "not a record\n").unwrap();
+    assert_eq!(
+        refusal(store.remove(first)),
+        "the current generation record is broken"
+    );
+    assert!(store.generation_dir(first).is_ok());
+}
+
+#[test]
+fn a_link_or_a_fifo_in_place_of_the_marker_is_refused_without_waiting() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let first = made(&mut store, &rules());
+    let using = root.path().join("using");
+    make_dir(&using);
+    let marker = using.join(first.hex());
+    symlink(root.path().join("lock"), &marker).unwrap();
+    let cannot = "the usage lock of the generation cannot be opened";
+    assert_eq!(refusal(store.hold(first)), cannot);
+    assert_eq!(refusal(store.remove(first)), cannot);
+    // A FIFO that nobody reads cannot be opened for writing without waiting, and the open does not wait.
+    fs::remove_file(&marker).unwrap();
+    make_fifo(&marker);
+    let store = FileStore::open(root.path()).unwrap();
+    assert_eq!(within(move || refusal(store.hold(first))), cannot);
+}

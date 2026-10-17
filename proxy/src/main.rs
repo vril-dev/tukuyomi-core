@@ -4,20 +4,25 @@
 //! starts.
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration
-//! file), the host checks, the configuration, the rules store (the chosen generation and its directory, and with
-//! them the kernel configuration), the runtime and the signal handlers, the driver thread, the wait for the
-//! kernel to be ready, bind, accept. The rules store is read here, once; a running proxy does not read it again.
-//! Handlers exist for SIGTERM, SIGINT and SIGHUP only and are installed before the kernel starts its child
-//! process; SIGCHLD is never handled. The listener is bound only after the kernel is ready, and a connection
-//! permit is taken before every accept.
+//! file), the host checks, the configuration, the rules store (the chosen generation, the hold on it, its
+//! directory, and with them the kernel configuration), the runtime and the signal handlers, the driver thread,
+//! the wait for the kernel to be ready, bind, accept. The rules store is read here, and again when SIGUSR1
+//! comes. Handlers exist for SIGTERM, SIGINT, SIGHUP and SIGUSR1 only and are installed before the kernel starts
+//! its child process; SIGCHLD is never handled. The listener is bound only after the kernel is ready, and a
+//! connection permit is taken before every accept.
+//!
+//! SIGUSR1 makes the proxy switch to the generation that the rules store chooses now (`rules::switch` reads the
+//! store, the driver starts the new inspector and moves the requests over when it is ready). It is a line in the
+//! records and nothing else before the listener is bound, while a switch is under way, and while the proxy stops.
 //!
 //! The first cause of a stop (a signal, or a failure of start-up or of the driver) fixes the time `t0`. The stop
 //! closes the listener, tells the driver to finish inspecting by `t0 + stop_inspect`, waits for the connections
 //! until `t0 + stop_wait` and aborts what is left, then waits for the driver's end until
 //! `t0 + stop_wait + kill_grace`. The exit code is 0 only when the stop was not caused by a failure and the driver
-//! reports a stopped kernel whose child exit and per-start directory removal are confirmed; 1 for any other end,
-//! and for a refused rules store or generation (nothing has been started then); 2 for a wrong argument or a
-//! refused configuration. The log is flushed for at most 200 ms at the end.
+//! reports a stopped kernel whose child exit and per-start directory removal are confirmed, and the same for every
+//! kernel that was stopped before it; 1 for any other end, and for a refused rules store or generation (nothing
+//! has been started then); 2 for a wrong argument or a refused configuration. The log is flushed for at most
+//! 200 ms at the end.
 
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
@@ -41,10 +46,12 @@ use tukuyomi_kernel::{Failure, Phase};
 use tukuyomi_proxy::config::{self, ProxyConfig};
 use tukuyomi_proxy::host;
 use tukuyomi_proxy::inbound::conn::{self, Ctx};
-use tukuyomi_proxy::inspect::driver::{self, Driver, End, Msg};
+use tukuyomi_proxy::inspect::driver::{self, Driver, End, Limits, Msg, Switch, Switched};
 use tukuyomi_proxy::log::{self, Log};
+use tukuyomi_proxy::rules::bundle::Fingerprint;
 use tukuyomi_proxy::rules::command;
 use tukuyomi_proxy::rules::store;
+use tukuyomi_proxy::rules::switch::{Next, Switcher};
 
 const EXIT_OK: u8 = 0;
 const EXIT_FAILED: u8 = 1;
@@ -125,6 +132,15 @@ fn start(log: &Log) -> u8 {
             return EXIT_FAILED;
         }
     };
+    // The hold comes before the directory is looked at: a removal that has finished is found there, and one that
+    // is going on keeps the hold from being taken.
+    let hold = match rules.hold(generation) {
+        Ok(hold) => hold,
+        Err(e) => {
+            log.line(&format!("start: rules store refused: {}", e.0));
+            return EXIT_FAILED;
+        }
+    };
     let dir = match rules.generation_dir(generation) {
         Ok(dir) => dir,
         Err(e) => {
@@ -140,6 +156,7 @@ fn start(log: &Log) -> u8 {
         }
     };
     log.line(&format!("start: rules generation {}", generation.hex()));
+    let switcher = Switcher::new(rules, loaded.kernel, generation, hold);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -150,11 +167,18 @@ fn start(log: &Log) -> u8 {
             return EXIT_FAILED;
         }
     };
-    runtime.block_on(run(loaded.proxy, kernel, log.clone()))
+    runtime.block_on(run(loaded.proxy, kernel, generation, switcher, log.clone()))
 }
 
-/// The runtime part: handlers, driver, the wait for ready, serving, and the stop.
-async fn run(proxy: ProxyConfig, kernel: tukuyomi_kernel::Config, log: Log) -> u8 {
+/// The runtime part: handlers, driver, the wait for ready, serving, and the stop. The holds of the switcher live
+/// to the end, so the generations in use are held until the stop is over.
+async fn run(
+    proxy: ProxyConfig,
+    kernel: tukuyomi_kernel::Config,
+    generation: Fingerprint,
+    mut switcher: Switcher,
+    log: Log,
+) -> u8 {
     let signals = match Signals::install() {
         Ok(signals) => signals,
         Err(_) => {
@@ -164,7 +188,12 @@ async fn run(proxy: ProxyConfig, kernel: tukuyomi_kernel::Config, log: Log) -> u
     };
     let wait_queue = kernel.wait_queue;
     let kill_grace = kernel.kill_grace;
-    let driver = match driver::start(kernel, proxy.drive_slice, log.clone()) {
+    let limits = Limits {
+        slice: proxy.drive_slice,
+        ready_wait: proxy.ready_wait,
+        stop_inspect: proxy.stop_inspect,
+    };
+    let driver = match driver::start(kernel, generation, limits, log.clone()) {
         Ok(driver) => driver,
         Err(text) => {
             log.line(&format!("start: cannot start the driver: {text}"));
@@ -178,7 +207,15 @@ async fn run(proxy: ProxyConfig, kernel: tukuyomi_kernel::Config, log: Log) -> u
         end,
     } = driver;
     let mut waits = Waits::new(signals, ready, failed, end);
-    let cause = until_stop(&mut waits, &proxy, wait_queue, &ingress, &log).await;
+    let cause = until_stop(
+        &mut waits,
+        &proxy,
+        wait_queue,
+        &ingress,
+        &mut switcher,
+        &log,
+    )
+    .await;
     stop(waits, cause, ingress, &proxy, kill_grace, &log).await
 }
 
@@ -188,6 +225,7 @@ async fn until_stop(
     proxy: &ProxyConfig,
     wait_queue: usize,
     ingress: &SyncSender<Msg>,
+    switcher: &mut Switcher,
     log: &Log,
 ) -> Cause {
     let Some(ready_by) = Instant::now().checked_add(proxy.ready_wait) else {
@@ -196,6 +234,7 @@ async fn until_stop(
     loop {
         match waits.wait(Some(ready_by)).await {
             Event::Ready(Ok(())) => break,
+            Event::Reload => log.line("reload: ignored while starting"),
             event => {
                 if let Some(cause) = Cause::of(event) {
                     return cause;
@@ -227,11 +266,42 @@ async fn until_stop(
             Event::AcceptErr(Some(errno)) => log.line(&format!("accept: failed, errno {errno}")),
             Event::AcceptErr(None) => log.line("accept: failed"),
             Event::Joined(done) => note_joined(done, log),
+            Event::Reload => reload(waits, switcher, ingress, log),
+            Event::Switched(switched) => switcher.finish(switched),
             event => {
                 if let Some(cause) = Cause::of(event) {
                     return cause;
                 }
             }
+        }
+    }
+}
+
+/// SIGUSR1: reads the rules store, and if it chooses another generation, orders the driver to switch to it. The
+/// answer comes as `Event::Switched`. Every other case is a record line, and the proxy goes on as it is.
+fn reload(waits: &mut Waits, switcher: &mut Switcher, ingress: &SyncSender<Msg>, log: &Log) {
+    log.line("reload: SIGUSR1");
+    match switcher.prepare() {
+        Next::Busy => log.line("reload: a switch is in progress, ignored"),
+        Next::Running(generation) => log.line(&format!(
+            "reload: generation {} is already running",
+            generation.hex()
+        )),
+        Next::Refused(why) => log.line(&format!("reload: rules store refused: {why}")),
+        Next::Ready { generation, kernel } => {
+            log.line(&format!("reload: starting generation {}", generation.hex()));
+            let (reply, told) = oneshot::channel();
+            let order = Msg::Switch(Switch {
+                generation,
+                kernel: *kernel,
+                reply,
+            });
+            if ingress.try_send(order).is_err() {
+                log.line("reload: the driver did not take the switch");
+                switcher.finish(false);
+                return;
+            }
+            waits.switch = Some(told);
         }
     }
 }
@@ -275,10 +345,10 @@ fn is_resource_error(errno: i32) -> bool {
 }
 
 /// The driver's end counts as clean only for a stopped kernel whose child exit and directory removal are
-/// confirmed.
+/// confirmed, when every kernel that was stopped before it stopped cleanly too.
 fn clean_shutdown(end: &End) -> bool {
-    matches!(end, End::Done(done)
-        if done.phase == Phase::Stopped && done.exit_confirmed && done.dir_removed)
+    matches!(end, End::Done { kernel, retired_clean: true }
+        if kernel.phase == Phase::Stopped && kernel.exit_confirmed && kernel.dir_removed)
 }
 
 /// Why the process stops.
@@ -304,7 +374,12 @@ impl Cause {
             Event::Ended(end) => Some(Cause::Ended(end)),
             Event::Lost(source) => Some(Cause::Lost(source)),
             Event::Late => Some(Cause::Late),
-            Event::Ready(Ok(())) | Event::Conn(..) | Event::AcceptErr(_) | Event::Joined(_) => None,
+            Event::Ready(Ok(()))
+            | Event::Reload
+            | Event::Switched(_)
+            | Event::Conn(..)
+            | Event::AcceptErr(_)
+            | Event::Joined(_) => None,
         }
     }
 }
@@ -357,8 +432,10 @@ impl Stop {
                 log.line(&format!("stop: the kernel failed: {failure:?}"));
             }
             Event::Joined(done) => note_joined(done, log),
+            Event::Reload => log.line("reload: ignored while stopping"),
             Event::Lost(_)
             | Event::Ready(_)
+            | Event::Switched(_)
             | Event::Late
             | Event::Conn(..)
             | Event::AcceptErr(_) => {}
@@ -423,15 +500,19 @@ async fn stop(
     }
 
     match &stop.ended {
-        Some(End::Done(done)) => log.line(&format!(
-            "stop: kernel {:?}, bye {}, exit_confirmed {}, dir_removed {}, held_left {}, waiting_left {}, results {}",
+        Some(End::Done {
+            kernel: done,
+            retired_clean,
+        }) => log.line(&format!(
+            "stop: kernel {:?}, bye {}, exit_confirmed {}, dir_removed {}, held_left {}, waiting_left {}, results {}, retired_clean {}",
             done.phase,
             done.bye,
             done.exit_confirmed,
             done.dir_removed,
             done.held_left,
             done.waiting_left,
-            done.results.len()
+            done.results.len(),
+            retired_clean
         )),
         Some(End::Fatal(text)) => log.line(&format!("stop: the driver stopped: {text}")),
         None => log.line("stop: the driver gave no end"),
@@ -444,11 +525,12 @@ async fn stop(
     }
 }
 
-/// The three signal streams. They are created before the driver starts.
+/// The four signal streams. They are created before the driver starts.
 struct Signals {
     term: Signal,
     int: Signal,
     hup: Signal,
+    usr1: Signal,
 }
 
 impl Signals {
@@ -457,6 +539,7 @@ impl Signals {
             term: signal(SignalKind::terminate())?,
             int: signal(SignalKind::interrupt())?,
             hup: signal(SignalKind::hangup())?,
+            usr1: signal(SignalKind::user_defined1())?,
         })
     }
 }
@@ -468,6 +551,7 @@ enum Source {
     Failed,
     End,
     Permits,
+    Switch,
 }
 
 impl Source {
@@ -477,6 +561,7 @@ impl Source {
             Source::Failed => "failed",
             Source::End => "end",
             Source::Permits => "connection permit",
+            Source::Switch => "switch",
         }
     }
 }
@@ -485,6 +570,10 @@ impl Source {
 enum Event {
     Ready(Result<(), Failure>),
     Signal(&'static str),
+    /// SIGUSR1.
+    Reload,
+    /// The driver answered a switch: whether the new generation serves.
+    Switched(bool),
     Failed(Failure),
     Ended(End),
     Lost(Source),
@@ -565,8 +654,11 @@ struct Waits {
     term: Signal,
     int: Signal,
     hup: Signal,
+    usr1: Signal,
     ready: Option<oneshot::Receiver<Result<(), Failure>>>,
     failed: Option<oneshot::Receiver<Failure>>,
+    /// The answer to the switch that is under way, if there is one.
+    switch: Option<oneshot::Receiver<Switched>>,
     end: Option<oneshot::Receiver<End>>,
     accept: Option<Acceptor>,
     conns: JoinSet<()>,
@@ -583,8 +675,10 @@ impl Waits {
             term: signals.term,
             int: signals.int,
             hup: signals.hup,
+            usr1: signals.usr1,
             ready: Some(ready),
             failed: Some(failed),
+            switch: None,
             end: Some(end),
             accept: None,
             conns: JoinSet::new(),
@@ -616,11 +710,22 @@ impl Waits {
                 return Poll::Ready(Event::Signal(name));
             }
         }
+        if self.usr1.poll_recv(cx).is_ready() {
+            return Poll::Ready(Event::Reload);
+        }
         if let Some(failed) = self.failed.as_mut()
             && let Poll::Ready(answer) = Pin::new(failed).poll(cx)
         {
             self.failed = None;
             return Poll::Ready(answer.map_or(Event::Lost(Source::Failed), Event::Failed));
+        }
+        if let Some(switch) = self.switch.as_mut()
+            && let Poll::Ready(answer) = Pin::new(switch).poll(cx)
+        {
+            self.switch = None;
+            return Poll::Ready(answer.map_or(Event::Lost(Source::Switch), |switched| {
+                Event::Switched(switched == Switched::Yes)
+            }));
         }
         if let Some(end) = self.end.as_mut()
             && let Poll::Ready(answer) = Pin::new(end).poll(cx)
@@ -675,15 +780,18 @@ mod tests {
     }
 
     fn shutdown(phase: Phase, confirmed: bool, removed: bool) -> End {
-        End::Done(Shutdown {
-            results: Vec::new(),
-            phase,
-            bye: true,
-            exit_confirmed: confirmed,
-            dir_removed: removed,
-            held_left: 0,
-            waiting_left: 0,
-        })
+        End::Done {
+            kernel: Shutdown {
+                results: Vec::new(),
+                phase,
+                bye: true,
+                exit_confirmed: confirmed,
+                dir_removed: removed,
+                held_left: 0,
+                waiting_left: 0,
+            },
+            retired_clean: true,
+        }
     }
 
     #[test]
@@ -700,6 +808,14 @@ mod tests {
         assert!(!clean_shutdown(&End::Fatal(
             "result for an unknown request"
         )));
+        // A kernel that was stopped before, and did not stop cleanly, makes the end unclean too.
+        let End::Done { kernel, .. } = shutdown(Phase::Stopped, true, true) else {
+            unreachable!()
+        };
+        assert!(!clean_shutdown(&End::Done {
+            kernel,
+            retired_clean: false
+        }));
     }
 
     #[test]
@@ -737,6 +853,29 @@ mod tests {
             assert!(matches!(
                 f.waits.wait(after(2000)).await,
                 Event::Lost(Source::Ready)
+            ));
+        });
+    }
+
+    #[test]
+    fn a_wait_returns_the_answer_to_a_switch_once() {
+        runtime().block_on(async {
+            let mut f = fixture();
+            let (reply, told) = oneshot::channel();
+            f.waits.switch = Some(told);
+            reply.send(Switched::Yes).unwrap();
+            assert!(matches!(
+                f.waits.wait(after(2000)).await,
+                Event::Switched(true)
+            ));
+            assert!(matches!(f.waits.wait(after(30)).await, Event::Late));
+
+            let (reply, told) = oneshot::channel::<Switched>();
+            f.waits.switch = Some(told);
+            drop(reply);
+            assert!(matches!(
+                f.waits.wait(after(2000)).await,
+                Event::Lost(Source::Switch)
             ));
         });
     }

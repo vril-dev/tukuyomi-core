@@ -1,11 +1,13 @@
 //! Where rule generations are kept.
 //!
 //! A generation is one rule bundle under the name of its fingerprint. The proxy reads the chosen generation
-//! (`current`, `generation_dir`) when it starts. The commands change the store in this order: `stage` writes a
-//! bundle where the inspector can read it and takes the lock of the store, the caller tries the bundle, then
-//! `commit` makes it a generation or `discard` throws it away, and either gives the lock back. `activate` chooses a
-//! generation, `list` and `verify` only read.
+//! (`current`, `generation_dir`) when it starts and again when it is told to switch, and it holds the generation it
+//! uses (`hold`) for as long as it uses it. The commands change the store in this order: `stage` writes a bundle
+//! where the inspector can read it and takes the lock of the store, the caller tries the bundle, then `commit`
+//! makes it a generation or `discard` throws it away, and either gives the lock back. `activate` chooses a
+//! generation, `remove` deletes one that is neither chosen nor held, `list` and `verify` only read.
 
+use std::any::Any;
 use std::path::PathBuf;
 
 use crate::config::StoreConfig;
@@ -43,6 +45,21 @@ pub struct Generation {
     pub made: i64,
 }
 
+/// A generation that a running proxy uses. While it lives, `remove` refuses the generation; dropping it gives the
+/// generation back. What it holds is the business of the store that made it.
+pub struct Hold {
+    _guard: Box<dyn Any>,
+}
+
+impl Hold {
+    /// A hold that lasts as long as `guard` does.
+    pub(crate) fn new(guard: impl Any) -> Hold {
+        Hold {
+            _guard: Box::new(guard),
+        }
+    }
+}
+
 /// Where rule generations are kept. `FileStore` is the only implementation; the configuration's `kind` picks it.
 pub trait RuleStore {
     /// The chosen generation; `Ok(None)` when none was chosen yet.
@@ -63,6 +80,12 @@ pub trait RuleStore {
     fn list(&self) -> Result<Vec<Generation>, StoreError>;
     /// Checks that the manifest of a generation is as its name says and that every file is as the manifest says.
     fn verify(&self, generation: Fingerprint) -> Result<(), StoreError>;
+    /// Marks the generation as used by a running proxy until the `Hold` is dropped, without waiting. A generation
+    /// that is being removed is refused. The generation itself is not looked at: the caller asks `generation_dir`
+    /// after the hold is taken, which is how it learns that a removal has finished.
+    fn hold(&self, generation: Fingerprint) -> Result<Hold, StoreError>;
+    /// Removes a generation that is neither the chosen one nor held. Takes the lock of the store.
+    fn remove(&mut self, generation: Fingerprint) -> Result<(), StoreError>;
 }
 
 /// Opens the store that the configuration names.

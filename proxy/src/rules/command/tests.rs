@@ -59,7 +59,7 @@ fn the_options_of_import_are_read_in_the_order_they_are_given() {
 fn a_wrong_argument_is_a_usage_error() {
     let config = "/etc/tukuyomi.json";
     assert_eq!(refusal(&[]), "a command is missing");
-    assert_eq!(refusal(&["remove", config]), "unknown command");
+    assert_eq!(refusal(&["delete", config]), "unknown command");
     assert_eq!(refusal(&["list"]), "the configuration file is missing");
     for relative in ["tukuyomi.json", "/etc/../tukuyomi.json", "/etc/"] {
         assert_eq!(
@@ -85,6 +85,16 @@ fn a_wrong_argument_is_a_usage_error() {
     assert!(matches!(
         parse(&args(&["activate", config, HEX])),
         Ok(Command::Activate { .. })
+    ));
+    assert_eq!(refusal(&["remove", config]), "remove takes one fingerprint");
+    assert_eq!(
+        refusal(&["remove", config, HEX, HEX]),
+        "remove takes one fingerprint"
+    );
+    assert_eq!(refusal(&["remove", config, &HEX[1..]]), digits);
+    assert!(matches!(
+        parse(&args(&["remove", config, HEX])),
+        Ok(Command::Remove { .. })
     ));
 
     let import = |text: &[&str]| {

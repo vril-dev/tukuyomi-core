@@ -872,6 +872,11 @@ impl Proxy {
         pid
     }
 
+    /// The root of the test: the configuration, the store, and what the test adds.
+    pub(crate) fn root(&self) -> &Path {
+        self.root.path()
+    }
+
     /// The inspector the test is talking to.
     pub(crate) fn inspector(&self) -> u32 {
         *self.inspectors.last().expect("an inspector was seen")

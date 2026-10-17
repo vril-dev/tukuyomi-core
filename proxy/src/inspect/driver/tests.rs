@@ -1,11 +1,13 @@
 use super::*;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use tokio::sync::Semaphore;
 use tokio::sync::oneshot::error::TryRecvError as SlotError;
 use tukuyomi_kernel::{Config, Reason};
 
+use crate::inspect::slot::{Pending, deliver, restart_line, submit};
 use crate::log::start_logger;
 
 const MS: Duration = Duration::from_millis(1);
@@ -27,6 +29,11 @@ fn answer<T>(slot: &mut oneshot::Receiver<T>) -> T {
         assert!(Instant::now() < until, "no answer in time");
         thread::sleep(2 * MS);
     }
+}
+
+/// The fingerprint that is `n` in every byte.
+fn generation(n: u8) -> Fingerprint {
+    Fingerprint::from_hex(format!("{n:02x}").repeat(32).as_bytes()).unwrap()
 }
 
 fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
@@ -131,6 +138,9 @@ struct Fake {
     restarts: u32,
     records: usize,
     at_shutdown: Vec<(ReqId, Verdict)>,
+    detail: Option<Vec<u8>>,
+    /// The deadlines of `shutdown`, seen from outside: a kernel that is retired is stopped on another thread.
+    shut: Arc<Mutex<Vec<Instant>>>,
 }
 
 impl Fake {
@@ -148,6 +158,8 @@ impl Fake {
             restarts: 0,
             records: 0,
             at_shutdown: Vec::new(),
+            detail: None,
+            shut: Arc::default(),
         }
     }
 
@@ -163,6 +175,10 @@ impl Fake {
 }
 
 impl Kernel for Fake {
+    fn create(_cfg: Config) -> Result<Fake, &'static str> {
+        Ok(Fake::new())
+    }
+
     fn submit(&mut self, req: &Request<'_>) -> Result<ReqId, Refused> {
         self.seen.push(Seen {
             client: req.client_addr.to_vec(),
@@ -209,8 +225,13 @@ impl Kernel for Fake {
         }
     }
 
+    fn start_detail(&self) -> Option<Vec<u8>> {
+        self.detail.clone()
+    }
+
     fn shutdown(&mut self, deadline: Instant) -> Shutdown {
         self.calls.push(Call::Shutdown(deadline));
+        self.shut.lock().unwrap().push(deadline);
         // The exit that shutdown confirms numbers the next incarnation.
         self.inc += 1;
         Shutdown {
@@ -222,6 +243,14 @@ impl Kernel for Fake {
             held_left: 0,
             waiting_left: 0,
         }
+    }
+}
+
+fn limits(slice: Duration) -> Limits {
+    Limits {
+        slice,
+        ready_wait: HOUR,
+        stop_inspect: HOUR,
     }
 }
 
@@ -237,12 +266,12 @@ impl Rig {
     fn new(wait_queue: usize, room: usize) -> Rig {
         let (tx, rx) = sync_channel(room);
         let core = Core::new(
-            Fake::new(),
+            Slot::new(generation(1), Fake::new()),
             rx,
             Signals::Told { _failed: None },
             start_logger().unwrap(),
+            limits(20 * MS),
             30 * MS,
-            20 * MS,
             wait_queue + 1,
         );
         Rig {
@@ -289,9 +318,16 @@ fn a_ticket_closed_before_submit_is_dropped_and_gives_back_what_it_held() {
     // one inspection permit each; the body and the copy of each take their bytes
     assert_eq!(r.world.free(), (INSPECT - 2, BUDGET - 14 - 18));
     r.core.intake(None).unwrap();
-    let uris: Vec<_> = r.core.kernel.seen.iter().map(|s| s.uri.clone()).collect();
+    let uris: Vec<_> = r
+        .core
+        .active
+        .kernel
+        .seen
+        .iter()
+        .map(|s| s.uri.clone())
+        .collect();
     assert_eq!(uris, vec![b"/live".to_vec()]);
-    assert_eq!(r.core.pending.len(), 1);
+    assert_eq!(r.core.active.pending.len(), 1);
     // the one that was never submitted gave back all it held at once; the submitted one holds its own
     assert_eq!(r.world.free(), (INSPECT - 1, BUDGET - 14));
 }
@@ -354,7 +390,7 @@ fn cancel_is_called_once_for_each_abandoned_ticket() {
     r.send(Msg::Ticket(b.ticket));
     r.core.round().unwrap();
     assert_eq!(
-        r.core.kernel.calls,
+        r.core.active.kernel.calls,
         vec![Call::Submit(0), Call::Submit(1), Call::Poll]
     );
 
@@ -364,7 +400,7 @@ fn cancel_is_called_once_for_each_abandoned_ticket() {
         r.core.round().unwrap();
     }
     assert_eq!(
-        r.core.kernel.calls,
+        r.core.active.kernel.calls,
         vec![
             Call::Submit(0),
             Call::Submit(1),
@@ -380,6 +416,7 @@ fn cancel_is_called_once_for_each_abandoned_ticket() {
     assert_eq!(r.world.free(), (INSPECT - 2, BUDGET - 12));
 
     r.core
+        .active
         .kernel
         .polls
         .push_back(vec![(0, Verdict::Uninspectable(Reason::Cancelled))]);
@@ -388,13 +425,13 @@ fn cancel_is_called_once_for_each_abandoned_ticket() {
     assert_eq!(r.world.free(), (INSPECT - 1, BUDGET - 3 - 6));
     drop(a.body);
     assert_eq!(r.world.free(), (INSPECT - 1, BUDGET - 6));
-    assert_eq!(r.core.pending.len(), 1);
+    assert_eq!(r.core.active.pending.len(), 1);
 }
 
 #[test]
 fn a_result_goes_to_the_ticket_it_belongs_to() {
     let mut r = Rig::new(4, 8);
-    r.core.kernel.ids = VecDeque::from([5, 2]);
+    r.core.active.kernel.ids = VecDeque::from([5, 2]);
     let mut a = r.world.ticket(b"/a", 0);
     let mut b = r.world.ticket(b"/b", 0);
     r.send(Msg::Ticket(a.ticket));
@@ -405,13 +442,14 @@ fn a_result_goes_to_the_ticket_it_belongs_to() {
         status: 403,
     };
     r.core
+        .active
         .kernel
         .polls
         .push_back(vec![(2, blocked), (5, Verdict::Allow)]);
     r.core.round().unwrap();
     assert_eq!(answer(&mut a.answer), Outcome::Verdict(Verdict::Allow));
     assert_eq!(answer(&mut b.answer), Outcome::Verdict(blocked));
-    assert!(r.core.pending.is_empty());
+    assert!(r.core.active.pending.is_empty());
 }
 
 #[test]
@@ -441,14 +479,14 @@ fn a_result_for_an_unknown_request_is_fatal() {
 #[test]
 fn a_duplicate_id_is_fatal() {
     let mut r = Rig::new(4, 8);
-    r.core.kernel.ids = VecDeque::from([3, 3]);
+    r.core.active.kernel.ids = VecDeque::from([3, 3]);
     let a = r.world.ticket(b"/a", 0);
     let b = r.world.ticket(b"/b", 0);
     r.send(Msg::Ticket(a.ticket));
     r.send(Msg::Ticket(b.ticket));
     assert_eq!(r.core.intake(None), Err("duplicate request id"));
     // the first ticket is still the one in the table
-    assert_eq!(r.core.pending.len(), 1);
+    assert_eq!(r.core.active.pending.len(), 1);
 }
 
 // ---- the wait rule ----
@@ -535,7 +573,7 @@ fn after_a_stop_tickets_are_still_submitted_and_shutdown_waits_for_the_ingress_t
     assert!(r.core.round().unwrap().is_none());
     assert_eq!(r.core.mode, Mode::Stopping { inspect_by: by });
     assert_eq!(
-        r.core.kernel.seen.len(),
+        r.core.active.kernel.seen.len(),
         2,
         "the ticket after Stop is submitted"
     );
@@ -555,14 +593,15 @@ fn after_a_stop_tickets_are_still_submitted_and_shutdown_waits_for_the_ingress_t
 
     // both results come out, but a sender is left: no shutdown yet
     r.core
+        .active
         .kernel
         .polls
         .push_back(vec![(0, Verdict::Allow), (1, Verdict::Allow)]);
     for _ in 0..3 {
         assert!(r.core.round().unwrap().is_none());
     }
-    assert!(r.core.pending.is_empty());
-    assert_eq!(r.core.kernel.shutdowns(), vec![]);
+    assert!(r.core.active.pending.is_empty());
+    assert_eq!(r.core.active.kernel.shutdowns(), vec![]);
     assert_eq!(answer(&mut a.answer), Outcome::Verdict(Verdict::Allow));
     assert_eq!(answer(&mut b.answer), Outcome::Verdict(Verdict::Allow));
 
@@ -570,7 +609,7 @@ fn after_a_stop_tickets_are_still_submitted_and_shutdown_waits_for_the_ingress_t
     r.close();
     let done = r.core.round().unwrap().expect("shutdown is due");
     assert_eq!(done.phase, Phase::Stopped);
-    assert_eq!(r.core.kernel.shutdowns(), vec![earlier]);
+    assert_eq!(r.core.active.kernel.shutdowns(), vec![earlier]);
     assert_eq!(r.core.mode, Mode::Down);
 }
 
@@ -582,7 +621,7 @@ fn at_the_stop_deadline_shutdown_is_called_and_a_late_ticket_is_unavailable() {
     r.core.round().unwrap();
 
     let unavailable = Verdict::Uninspectable(Reason::Unavailable);
-    r.core.kernel.at_shutdown = vec![(0, unavailable)];
+    r.core.active.kernel.at_shutdown = vec![(0, unavailable)];
     let by = Instant::now();
     r.send(Msg::Stop { inspect_by: by });
     let done = r.core.round().unwrap().expect("the deadline is reached");
@@ -597,10 +636,10 @@ fn at_the_stop_deadline_shutdown_is_called_and_a_late_ticket_is_unavailable() {
     r.close();
     r.core.quiesce().unwrap();
     assert_eq!(answer(&mut late.answer), Outcome::Unavailable);
-    assert_eq!(r.core.kernel.seen.len(), 1);
-    assert_eq!(r.core.kernel.shutdowns(), vec![by]);
+    assert_eq!(r.core.active.kernel.seen.len(), 1);
+    assert_eq!(r.core.active.kernel.shutdowns(), vec![by]);
     assert!(matches!(
-        r.core.kernel.calls.last(),
+        r.core.active.kernel.calls.last(),
         Some(Call::Shutdown(_))
     ));
     assert_eq!(r.world.free().0, INSPECT);
@@ -653,7 +692,12 @@ fn config(root: &Path) -> Config {
 #[test]
 fn a_kernel_that_cannot_start_says_so_once_through_ready_and_still_answers() {
     let root = Path::new("/driver-test/missing-root");
-    let mut d = start(config(root), 5 * MS, start_logger().unwrap()).unwrap();
+    let limits = Limits {
+        slice: 5 * MS,
+        ready_wait: 10 * SEC,
+        stop_inspect: 10 * SEC,
+    };
+    let mut d = start(config(root), generation(1), limits, start_logger().unwrap()).unwrap();
     let told = answer(&mut d.ready);
     assert!(matches!(told, Err(Failure::TmpDir(_))), "{told:?}");
     assert!(matches!(d.failed.try_recv(), Err(SlotError::Empty)));
@@ -679,10 +723,230 @@ fn a_kernel_that_cannot_start_says_so_once_through_ready_and_still_answers() {
     assert!(matches!(d.end.try_recv(), Err(SlotError::Empty)));
     drop(d.ingress);
     match answer(&mut d.end) {
-        End::Done(done) => {
+        End::Done {
+            kernel: done,
+            retired_clean,
+        } => {
             assert!(matches!(done.phase, Phase::Failed(Failure::TmpDir(_))));
-            assert!(done.exit_confirmed && done.dir_removed);
+            assert!(done.exit_confirmed && done.dir_removed && retired_clean);
         }
         End::Fatal(why) => panic!("fatal: {why}"),
     }
+}
+
+// ---- a switch of generation ----
+
+impl Rig {
+    /// Sends the order to switch to the generation `n`. The answer comes on the receiver.
+    fn send_switch(&self, n: u8) -> oneshot::Receiver<Switched> {
+        let (reply, told) = oneshot::channel();
+        self.send(Msg::Switch(Switch {
+            generation: generation(n),
+            kernel: config(Path::new("/driver-test/switch-root")),
+            reply,
+        }));
+        told
+    }
+
+    /// The kernel that does not get new tickets.
+    fn other(&mut self) -> &mut Fake {
+        &mut self.core.other().expect("a switch is under way").kernel
+    }
+}
+
+/// Runs rounds until the main thread is told how the switch ended.
+fn settle(r: &mut Rig, told: &mut oneshot::Receiver<Switched>) -> Switched {
+    let until = Instant::now() + 30 * SEC;
+    loop {
+        match told.try_recv() {
+            Ok(switched) => return switched,
+            Err(SlotError::Empty) => {}
+            Err(SlotError::Closed) => panic!("the driver went away without an answer"),
+        }
+        assert!(Instant::now() < until, "no answer in time");
+        r.core.round().unwrap();
+        thread::sleep(2 * MS);
+    }
+}
+
+fn uris(kernel: &Fake) -> Vec<Vec<u8>> {
+    kernel.seen.iter().map(|s| s.uri.clone()).collect()
+}
+
+#[test]
+fn a_ready_generation_gets_the_new_tickets_and_the_old_one_finishes_and_is_stopped() {
+    let mut r = Rig::new(4, 8);
+    let old_shut = r.core.active.kernel.shut.clone();
+    let mut a = r.world.ticket(b"/a", 0);
+    r.send(Msg::Ticket(a.ticket));
+    r.core.round().unwrap();
+    let mut told = r.send_switch(2);
+    r.core.round().unwrap();
+
+    // While the new kernel starts, new tickets still go to the old one.
+    let mut b = r.world.ticket(b"/b", 0);
+    r.send(Msg::Ticket(b.ticket));
+    r.core.round().unwrap();
+    assert_eq!(
+        uris(&r.core.active.kernel),
+        [b"/a".to_vec(), b"/b".to_vec()]
+    );
+    assert!(r.other().seen.is_empty());
+    assert_eq!(r.core.active.generation, generation(1));
+
+    // The new kernel is ready and takes the new tickets. Its first id is the id of `a`, which the old kernel holds.
+    r.other().phase = Phase::Ready;
+    r.other().ids = VecDeque::from([0]);
+    r.core.round().unwrap();
+    assert_eq!(r.core.active.generation, generation(2));
+    let blocked = Verdict::Block {
+        phase: 1,
+        rule_id: 9204,
+        status: 403,
+    };
+    r.core.active.kernel.polls.push_back(vec![(0, blocked)]);
+    r.other()
+        .polls
+        .push_back(vec![(0, Verdict::Allow), (1, Verdict::Allow)]);
+    let mut c = r.world.ticket(b"/c", 0);
+    r.send(Msg::Ticket(c.ticket));
+    r.core.round().unwrap();
+    assert_eq!(uris(&r.core.active.kernel), [b"/c".to_vec()]);
+    // Every result went to the request of its own kernel, although two requests have the id 0.
+    assert_eq!(answer(&mut a.answer), Outcome::Verdict(Verdict::Allow));
+    assert_eq!(answer(&mut b.answer), Outcome::Verdict(Verdict::Allow));
+    assert_eq!(answer(&mut c.answer), Outcome::Verdict(blocked));
+
+    // The old kernel holds nothing now: it is stopped, and the main thread is told when it is gone.
+    assert_eq!(settle(&mut r, &mut told), Switched::Yes);
+    assert_eq!(old_shut.lock().unwrap().len(), 1);
+    assert!(r.core.retired_clean);
+    assert!(matches!(r.core.switching, Switching::Idle));
+}
+
+#[test]
+fn an_old_kernel_that_is_out_of_time_is_stopped_at_once_with_its_requests_decided() {
+    let mut r = Rig::new(4, 8);
+    r.core.limits.stop_inspect = Duration::ZERO;
+    let old_shut = r.core.active.kernel.shut.clone();
+    let mut a = r.world.ticket(b"/a", 0);
+    r.send(Msg::Ticket(a.ticket));
+    r.core.round().unwrap();
+    let mut told = r.send_switch(2);
+    r.core.round().unwrap();
+    r.other().phase = Phase::Ready;
+    r.core.round().unwrap();
+    // The old kernel holds the request and has no time left for it.
+    let unavailable = Verdict::Uninspectable(Reason::Unavailable);
+    r.other().at_shutdown = vec![(0, unavailable)];
+    assert_eq!(settle(&mut r, &mut told), Switched::Yes);
+    assert_eq!(answer(&mut a.answer), Outcome::Verdict(unavailable));
+    let deadlines = old_shut.lock().unwrap().clone();
+    assert!(deadlines.len() == 1 && deadlines[0] <= Instant::now());
+}
+
+#[test]
+fn a_ready_generation_is_not_taken_while_the_serving_kernel_has_failed() {
+    let mut r = Rig::new(4, 8);
+    let _told = r.send_switch(2);
+    r.core.round().unwrap();
+    r.other().phase = Phase::Ready;
+    r.core.active.kernel.phase = Phase::Failed(Failure::Exit(3));
+    r.core.round().unwrap();
+    assert_eq!(r.core.active.generation, generation(1));
+    assert!(matches!(r.core.switching, Switching::Starting { .. }));
+}
+
+#[test]
+fn a_generation_that_fails_or_is_late_is_stopped_and_the_old_one_serves_on() {
+    let mut r = Rig::new(4, 8);
+    let (told_by, mut ready, mut failed) = signals();
+    r.core.signals = told_by;
+    r.core.active.kernel.phase = Phase::Ready;
+    r.core.round().unwrap();
+    assert_eq!(ready.try_recv(), Ok(Ok(())));
+
+    // A new kernel that fails to start. Its failure is not the failure of the kernel that serves.
+    let mut told = r.send_switch(2);
+    r.core.round().unwrap();
+    let new_shut = r.other().shut.clone();
+    r.other().phase = Phase::Failed(Failure::Exit(11));
+    r.other().detail = Some(b"tkv0-inspector: start: rules\n".to_vec());
+    assert_eq!(settle(&mut r, &mut told), Switched::No);
+    assert_eq!(new_shut.lock().unwrap().len(), 1);
+    assert!(matches!(failed.try_recv(), Err(SlotError::Empty)));
+
+    // A new kernel that is not ready in time.
+    r.core.limits.ready_wait = Duration::ZERO;
+    let mut told = r.send_switch(3);
+    assert_eq!(settle(&mut r, &mut told), Switched::No);
+    assert!(r.core.retired_clean);
+
+    // The old kernel served on all the time.
+    assert_eq!(r.core.active.generation, generation(1));
+    let mut a = r.world.ticket(b"/a", 0);
+    r.send(Msg::Ticket(a.ticket));
+    r.core
+        .active
+        .kernel
+        .polls
+        .push_back(vec![(0, Verdict::Allow)]);
+    r.core.round().unwrap();
+    assert_eq!(answer(&mut a.answer), Outcome::Verdict(Verdict::Allow));
+}
+
+#[test]
+fn a_stop_during_a_switch_stops_the_new_kernel_at_once_and_lets_the_old_one_finish() {
+    // While the new kernel starts.
+    let mut r = Rig::new(4, 8);
+    let mut told = r.send_switch(2);
+    r.core.round().unwrap();
+    let new_shut = r.other().shut.clone();
+    let by = Instant::now() + HOUR;
+    r.send(Msg::Stop { inspect_by: by });
+    r.core.round().unwrap();
+    assert_eq!(settle(&mut r, &mut told), Switched::No);
+    assert_eq!(*new_shut.lock().unwrap(), [by]);
+    // A switch that comes now is turned down.
+    let mut late = r.send_switch(3);
+    r.core.round().unwrap();
+    assert_eq!(late.try_recv(), Ok(Switched::No));
+    r.close();
+    match r.core.run() {
+        End::Done { retired_clean, .. } => assert!(retired_clean),
+        End::Fatal(why) => panic!("fatal: {why}"),
+    }
+
+    // While the old kernel finishes its requests: the stop waits for them until its deadline.
+    let mut r = Rig::new(4, 8);
+    let old_shut = r.core.active.kernel.shut.clone();
+    let mut a = r.world.ticket(b"/a", 0);
+    r.send(Msg::Ticket(a.ticket));
+    r.core.round().unwrap();
+    let mut told = r.send_switch(2);
+    r.core.round().unwrap();
+    r.other().phase = Phase::Ready;
+    r.core.round().unwrap();
+    assert_eq!(r.core.active.generation, generation(2));
+    let unavailable = Verdict::Uninspectable(Reason::Unavailable);
+    r.other().at_shutdown = vec![(0, unavailable)];
+    r.send(Msg::Stop {
+        inspect_by: Instant::now() + HOUR,
+    });
+    for _ in 0..3 {
+        assert!(r.core.round().unwrap().is_none());
+    }
+    assert!(old_shut.lock().unwrap().is_empty());
+    let by = Instant::now();
+    r.send(Msg::Stop { inspect_by: by });
+    let done = loop {
+        if let Some(done) = r.core.round().unwrap() {
+            break done;
+        }
+    };
+    assert_eq!(done.phase, Phase::Stopped);
+    assert_eq!(*old_shut.lock().unwrap(), [by]);
+    assert_eq!(answer(&mut a.answer), Outcome::Verdict(unavailable));
+    assert_eq!(told.try_recv(), Ok(Switched::Yes));
+    assert!(r.core.retired_clean);
 }

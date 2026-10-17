@@ -3,6 +3,7 @@ use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::thread;
 
 use crate::support::*;
 
@@ -216,4 +217,88 @@ fn a_rule_file_that_the_inspector_refuses_makes_no_generation() {
         &[STORE],
         "no generation is chosen",
     );
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn sigusr1_switches_to_the_chosen_generation_and_a_generation_in_use_is_not_removed() {
+    let mut proxy = Proxy::start("rules_switch", Knobs::quick());
+    let root = proxy.root().to_path_buf();
+    // The second generation has the rules of the first and one more, which blocks /reload-probe.
+    let extra = root.join("extra.conf");
+    fs::write(
+        &extra,
+        "SecRule REQUEST_URI \"@beginsWith /reload-probe\" \"id:9204,phase:1,deny,status:403,log,msg:'reload probe'\"\n",
+    )
+    .expect("write the rule file");
+    let basic = rules_file();
+    let imported = rules(
+        &root,
+        "import",
+        &[
+            OsStr::new("--rules"),
+            basic.as_os_str(),
+            OsStr::new("--rules"),
+            extra.as_os_str(),
+        ],
+    );
+    assert_eq!(imported.code, Some(0), "{}", imported.err);
+    let second = imported
+        .out
+        .strip_suffix(" created\n")
+        .unwrap_or_else(|| panic!("unexpected output {:?}", imported.out))
+        .to_owned();
+    let first = generation();
+    assert_ne!(second, first);
+    fs::remove_file(&extra).expect("remove the rule file");
+
+    // Choosing the generation does not change the one that runs, and the one that runs cannot be removed.
+    let chosen = rules(&root, "activate", &[OsStr::new(&second)]);
+    assert_eq!(chosen.code, Some(0), "{}", chosen.err);
+    assert_eq!(exchange(proxy.port, &get("/reload-probe")).status(), 200);
+    let in_use = "the generation is used by a running proxy";
+    let refused = rules(&root, "remove", &[OsStr::new(&first)]);
+    assert_eq!(refused.code, Some(1), "{}", refused.out);
+    assert!(refused.err.contains(in_use), "{}", refused.err);
+
+    let before = proxy.inspector();
+    proxy.signal("USR1");
+    let switched = format!("reload: generation {second} is ready, switched");
+    proxy
+        .records
+        .wait_lines("the switch", 1, |l| l == switched.as_str());
+    proxy.wait_inspector(Some(before));
+    assert_eq!(exchange(proxy.port, &get("/reload-probe")).status(), 403);
+    assert_eq!(exchange(proxy.port, &get("/ok")).status(), 200);
+
+    // The proxy lets go of the first generation when its inspector is stopped and the driver has said so, which
+    // is a moment after the record of the stop.
+    let retired = format!("reload: generation {first} retired, clean true");
+    proxy
+        .records
+        .wait_lines("the old generation to retire", 1, |l| l == retired.as_str());
+    let mut removed = rules(&root, "remove", &[OsStr::new(&first)]);
+    for _ in 0..200 {
+        if removed.code == Some(0) {
+            break;
+        }
+        assert!(removed.err.contains(in_use), "{}", removed.err);
+        thread::sleep(25 * MS);
+        removed = rules(&root, "remove", &[OsStr::new(&first)]);
+    }
+    assert_eq!(
+        (removed.code, removed.out.as_str(), removed.err.as_str()),
+        (Some(0), format!("{first} removed\n").as_str(), "")
+    );
+    let current = rules(&root, "remove", &[OsStr::new(&second)]);
+    assert_eq!(current.code, Some(1), "{}", current.out);
+    assert!(
+        current.err.contains("is the current one"),
+        "{}",
+        current.err
+    );
+    let listed = rules(&root, "list", &[]);
+    assert!(listed.out.starts_with(&second), "{}", listed.out);
+    assert_eq!(listed.out.lines().count(), 1, "{}", listed.out);
+    proxy.finish(2);
 }

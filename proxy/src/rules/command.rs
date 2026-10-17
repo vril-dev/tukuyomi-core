@@ -1,8 +1,10 @@
-//! The commands that change and show the rules store: `rules import`, `rules activate` and `rules list`.
+//! The commands that change and show the rules store: `rules import`, `rules activate`, `rules remove` and
+//! `rules list`.
 //!
 //! ```text
 //! tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--accept-block]
 //! tukuyomi-proxy rules activate <config> <fingerprint>
+//! tukuyomi-proxy rules remove <config> <fingerprint>
 //! tukuyomi-proxy rules list <config>
 //! ```
 //!
@@ -11,11 +13,13 @@
 //! writes them, from the working directory. `import` builds a bundle from the inputs (`collect`), stages it in the
 //! store, tries it (`trial`: an inspector is started on it, three requests are inspected) and makes it a generation
 //! only if the trial passes; it does not choose it. `activate` chooses a generation, which a proxy that starts later
-//! uses. `list` shows the generations.
+//! uses, and a running proxy that is told to switch. `remove` deletes a generation that is not the chosen one and
+//! that no running proxy uses. `list` shows the generations.
 //!
 //! The results go to the standard output, one line each, and the first word of a line is the fingerprint: `import`
-//! says `created`, `already exists` or `recreated` after it, `activate` says `current`, and `list` gives the time the
-//! generation was made (seconds since the epoch) and `current` for the chosen one. Everything else goes to the
+//! says `created`, `already exists` or `recreated` after it, `activate` says `current`, `remove` says `removed`, and
+//! `list` gives the time the generation was made (seconds since the epoch) and `current` for the chosen one.
+//! Everything else goes to the
 //! standard error, a line each, and starts with the name of the command. Whatever came from outside (an entry of a
 //! directory, the line an inspector left behind) is written with every byte outside 0x20 to 0x7e as `\xNN`.
 //!
@@ -35,12 +39,13 @@ use tukuyomi_kernel::Failure;
 
 use crate::config::{self, Loaded};
 use crate::host;
+use crate::log::escaped;
 use crate::rules::bundle::Fingerprint;
 use crate::rules::collect::{self, CollectError, Inputs};
 use crate::rules::store::{self, Committed, RuleStore, Staged};
 use crate::rules::trial::{self, Failed, Finish, Limits};
 
-const USAGE: &str = "usage: tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--accept-block]\n       tukuyomi-proxy rules activate <config> <fingerprint>\n       tukuyomi-proxy rules list <config>";
+const USAGE: &str = "usage: tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--accept-block]\n       tukuyomi-proxy rules activate <config> <fingerprint>\n       tukuyomi-proxy rules remove <config> <fingerprint>\n       tukuyomi-proxy rules list <config>";
 
 /// How a command ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +64,10 @@ enum Command {
         accept_block: bool,
     },
     Activate {
+        config: PathBuf,
+        generation: Fingerprint,
+    },
+    Remove {
         config: PathBuf,
         generation: Fingerprint,
     },
@@ -99,13 +108,14 @@ pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> Exit 
             accept_block,
         }) => import(&config, &inputs, accept_block, &mut term),
         Ok(Command::Activate { config, generation }) => activate(&config, generation, &mut term),
+        Ok(Command::Remove { config, generation }) => remove(&config, generation, &mut term),
         Ok(Command::List { config }) => list(&config, &mut term),
     }
 }
 
 fn parse(args: &[OsString]) -> Result<Command, &'static str> {
     let (name, rest) = args.split_first().ok_or("a command is missing")?;
-    if name != "import" && name != "activate" && name != "list" {
+    if name != "import" && name != "activate" && name != "remove" && name != "list" {
         return Err("unknown command");
     }
     let (config, rest) = rest
@@ -121,16 +131,28 @@ fn parse(args: &[OsString]) -> Result<Command, &'static str> {
         match rest {
             [generation] => Ok(Command::Activate {
                 config,
-                generation: Fingerprint::from_hex(generation.as_bytes())
-                    .ok_or("the fingerprint is not 64 lowercase hexadecimal digits")?,
+                generation: fingerprint(generation)?,
             }),
             _ => Err("activate takes one fingerprint"),
+        }
+    } else if name == "remove" {
+        match rest {
+            [generation] => Ok(Command::Remove {
+                config,
+                generation: fingerprint(generation)?,
+            }),
+            _ => Err("remove takes one fingerprint"),
         }
     } else if rest.is_empty() {
         Ok(Command::List { config })
     } else {
         Err("list takes no argument after the configuration file")
     }
+}
+
+fn fingerprint(arg: &OsString) -> Result<Fingerprint, &'static str> {
+    Fingerprint::from_hex(arg.as_bytes())
+        .ok_or("the fingerprint is not 64 lowercase hexadecimal digits")
 }
 
 fn parse_import(config: PathBuf, rest: &[OsString]) -> Result<Command, &'static str> {
@@ -169,20 +191,6 @@ fn parse_import(config: PathBuf, rest: &[OsString]) -> Result<Command, &'static 
         inputs,
         accept_block,
     })
-}
-
-/// Every byte outside 0x20 to 0x7e as `\xNN`, so that what is written cannot move the cursor, change the colours or
-/// bend the text (the C1 controls and the controls of the direction of text are bytes of 0x80 and over in UTF-8).
-pub fn escaped(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
-    for &byte in bytes {
-        if (0x20..=0x7e).contains(&byte) {
-            out.push(char::from(byte));
-        } else {
-            out.push_str(&format!("\\x{byte:02x}"));
-        }
-    }
-    out
 }
 
 /// `: "<escaped subject>"`, or nothing.
@@ -383,6 +391,24 @@ fn activate(config: &Path, generation: Fingerprint, term: &mut Terminal) -> Exit
     match store.activate(generation) {
         Ok(()) => {
             term.result(&format!("{} current", generation.hex()));
+            Exit::Done
+        }
+        Err(e) => {
+            term.note(&format!("{NAME}: {}", e.0));
+            Exit::Failed
+        }
+    }
+}
+
+fn remove(config: &Path, generation: Fingerprint, term: &mut Terminal) -> Exit {
+    const NAME: &str = "rules remove";
+    let (_, mut store) = match open_store(NAME, config, term) {
+        Ok(opened) => opened,
+        Err(exit) => return exit,
+    };
+    match store.remove(generation) {
+        Ok(()) => {
+            term.result(&format!("{} removed", generation.hex()));
             Exit::Done
         }
         Err(e) => {

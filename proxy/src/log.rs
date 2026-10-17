@@ -126,5 +126,19 @@ pub fn install_panic_hook(log: Log) {
     std::panic::set_hook(Box::new(move |info| log.line(&format!("panic: {info}"))));
 }
 
+/// Every byte outside 0x20 to 0x7e as `\xNN`, so that what is written cannot move the cursor, change the colours or
+/// bend the text (the C1 controls and the controls of the direction of text are bytes of 0x80 and over in UTF-8).
+pub fn escaped(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        if (0x20..=0x7e).contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests;

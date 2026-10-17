@@ -1,4 +1,4 @@
-//! The inspection driver: the only owner of the kernel's `Supervisor`, on its own thread.
+//! The inspection driver: the owner of the kernel's `Supervisor`s, on its own thread.
 //!
 //! A connection hands a `Ticket` over one bounded channel and waits on the reply slot of the ticket. The driver
 //! submits the ticket to the kernel, keeps it until the kernel's result for it comes out, and then answers on the
@@ -16,9 +16,16 @@
 //! back only when the result of its request has been taken, or when the ticket is dropped before it was
 //! submitted. A connection that gave up does not give it back: the kernel keeps the record until its result
 //! comes out.
+//!
+//! A switch message makes the driver serve two generations for a while. It makes a second kernel on the rules of
+//! the new generation and steps it in every round for the shortest step that can read a frame, while new tickets
+//! still go to the kernel that serves. When the new kernel is ready, new tickets go to it, and the other kernel
+//! finishes the requests it holds, for `stop_inspect` at the most, and is stopped on a thread of its own. A new
+//! kernel that fails to start, or that is not ready within `ready_wait`, is stopped the same way and the old one
+//! serves on. Each kernel has a table of its own for its requests (`slot`). A failure of the kernel that serves
+//! stops the proxy as ever, also in the middle of a switch. The main thread is told how a switch ended when the
+//! kernel that was stopped is gone.
 
-use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
 use std::mem;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,10 +39,9 @@ use tukuyomi_kernel::{
     Failure, Phase, Refused, ReqId, Request, Shutdown, Status, Supervisor, Verdict,
 };
 
-use crate::log::Log;
-
-/// The protocol of every request that is inspected.
-const PROTO: &[u8] = b"HTTP/1.1";
+use crate::inspect::slot::{Retired, Retirement, Slot};
+use crate::log::{Log, escaped};
+use crate::rules::bundle::Fingerprint;
 
 /// The shortest slice of one kernel step. A shorter one would end a step before it could read anything.
 const MIN_SLICE: Duration = Duration::from_millis(1);
@@ -97,12 +103,37 @@ pub enum Outcome {
 
 pub enum Msg {
     Ticket(Ticket),
-    Stop { inspect_by: Instant },
+    /// Serve another generation from now on.
+    Switch(Switch),
+    Stop {
+        inspect_by: Instant,
+    },
+}
+
+/// The order to switch to another generation.
+pub struct Switch {
+    pub generation: Fingerprint,
+    pub kernel: tukuyomi_kernel::Config,
+    /// How the switch ended. It is given once, when the kernel that was stopped is gone.
+    pub reply: oneshot::Sender<Switched>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Switched {
+    /// The new generation serves.
+    Yes,
+    /// The generation that served goes on.
+    No,
 }
 
 #[derive(Debug)]
 pub enum End {
-    Done(tukuyomi_kernel::Shutdown),
+    Done {
+        /// The end of the kernel that served last.
+        kernel: tukuyomi_kernel::Shutdown,
+        /// Every kernel that was stopped before it stopped with its process gone and its directory removed.
+        retired_clean: bool,
+    },
     Fatal(&'static str),
 }
 
@@ -114,19 +145,33 @@ pub struct Driver {
     pub end: oneshot::Receiver<End>,
 }
 
+/// The times of the proxy that the driver keeps.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// The length of one step of the kernel that serves.
+    pub slice: Duration,
+    /// The longest a new generation has to be ready.
+    pub ready_wait: Duration,
+    /// The longest a kernel that is replaced finishes its requests, and the deadline of the `shutdown` of a kernel
+    /// that is stopped while the proxy goes on.
+    pub stop_inspect: Duration,
+}
+
 /// Starts the driver thread and returns at once, without waiting for the kernel to be ready. `Err` means only
 /// that the thread could not be created. The kernel is created on the thread; a configuration it refuses ends
-/// the driver with `End::Fatal`.
+/// the driver with `End::Fatal`. `generation` names the rules that `cfg` is for.
 pub fn start(
     cfg: tukuyomi_kernel::Config,
-    slice: Duration,
+    generation: Fingerprint,
+    limits: Limits,
     log: Log,
 ) -> Result<Driver, &'static str> {
     let tick = cfg.tick;
-    // Room for every waiting ticket and for the stop message. A count that cannot be added to cannot pass the
+    // One intake takes at most every waiting ticket and the stop message. The channel has room for one more, a
+    // switch (the main thread has one under way at a time). A count that cannot be added to cannot pass the
     // kernel's configuration check either, so any capacity will do for it.
     let take = cfg.wait_queue.checked_add(1).unwrap_or(1);
-    let (ingress, rx) = sync_channel(take);
+    let (ingress, rx) = sync_channel(take.saturating_add(1));
     let (ready_tx, ready) = oneshot::channel();
     let (failed_tx, failed) = oneshot::channel();
     let (end_tx, end) = oneshot::channel();
@@ -138,7 +183,8 @@ pub fn start(
                     ready: ready_tx,
                     failed: failed_tx,
                 };
-                Core::new(kernel, rx, signals, log, tick, slice, take).drive(end_tx);
+                let slot = Slot::new(generation, kernel);
+                Core::new(slot, rx, signals, log, limits, tick, take).drive(end_tx);
             }
             Err(refused) => {
                 let _ = end_tx.send(End::Fatal(refused.0));
@@ -154,16 +200,25 @@ pub fn start(
 }
 
 /// The part of the supervisor that the driver uses. The driver runs on `Supervisor`; its tests run it on a
-/// stand-in that records the calls.
-trait Kernel {
+/// stand-in that records the calls. A kernel that is stopped goes to a thread of its own.
+pub(super) trait Kernel: Send + 'static {
+    /// A kernel for `cfg`. Nothing is started yet.
+    fn create(cfg: tukuyomi_kernel::Config) -> Result<Self, &'static str>
+    where
+        Self: Sized;
     fn submit(&mut self, req: &Request<'_>) -> Result<ReqId, Refused>;
     fn cancel(&mut self, id: ReqId);
     fn poll(&mut self, until: Instant) -> Vec<(ReqId, Verdict)>;
     fn status(&self) -> Status;
+    fn start_detail(&self) -> Option<Vec<u8>>;
     fn shutdown(&mut self, deadline: Instant) -> Shutdown;
 }
 
 impl Kernel for Supervisor {
+    fn create(cfg: tukuyomi_kernel::Config) -> Result<Supervisor, &'static str> {
+        Supervisor::new(cfg).map_err(|e| e.0)
+    }
+
     fn submit(&mut self, req: &Request<'_>) -> Result<ReqId, Refused> {
         Supervisor::submit(self, req)
     }
@@ -180,16 +235,13 @@ impl Kernel for Supervisor {
         Supervisor::status(self)
     }
 
+    fn start_detail(&self) -> Option<Vec<u8>> {
+        Supervisor::start_detail(self)
+    }
+
     fn shutdown(&mut self, deadline: Instant) -> Shutdown {
         Supervisor::shutdown(self, deadline)
     }
-}
-
-/// A submitted ticket that waits for its result.
-struct Pending {
-    ticket: Ticket,
-    /// `cancel` was called for it: its result is taken and not sent.
-    cancelled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,110 +309,80 @@ fn stop_line(status: &Status) -> String {
     )
 }
 
-/// The record line for a new incarnation of the inspector, or `None` while it is the one seen last. The kernel
-/// numbers the next incarnation when the one before it has ended, so the number can change before the next
-/// process has started, or with none to follow; the line says only that the number changed and how many
-/// restarts the kernel has made in all. The first incarnation is the number the kernel starts with and gets no
-/// line. Fixed text and numbers only.
-fn restart_line(seen: u32, status: &Status) -> Option<String> {
-    (status.inc != seen).then(|| {
-        format!(
-            "driver: inspector incarnation changed, inc {}, restarts {}",
-            status.inc, status.restarts
-        )
-    })
+/// `t + d`; a sum that does not fit is `t`: due at once.
+fn after(t: Instant, d: Duration) -> Instant {
+    t.checked_add(d).unwrap_or(t)
 }
 
-/// Takes the result of every `(id, verdict)` out of the table: sends it to the connection unless `cancel` was
-/// called, and drops the ticket, which gives its permits back. A result for a request that is not in the table
-/// breaks the promise that every result comes out once.
-fn deliver(
-    pending: &mut BTreeMap<ReqId, Pending>,
-    results: &[(ReqId, Verdict)],
-) -> Result<(), &'static str> {
-    for &(id, verdict) in results {
-        let Some(Pending { ticket, cancelled }) = pending.remove(&id) else {
-            return Err("result for an unknown request");
-        };
-        // The request and the hold live to the end of this turn, after the send.
-        let Ticket {
-            req: _req,
-            reply,
-            hold: _hold,
-        } = ticket;
-        if !cancelled {
-            // Err only says that the connection is gone already.
-            let _ = reply.send(Outcome::Verdict(verdict));
-        }
-    }
-    Ok(())
-}
-
-/// Hands the request of a ticket to the kernel. The bytes are the ones the connection will forward.
-fn submit(kernel: &mut impl Kernel, req: &InspectReq) -> Result<ReqId, Refused> {
-    let client = req.client.ip().to_canonical().to_string();
-    let server = req.server.ip().to_canonical().to_string();
-    let headers: Vec<(&[u8], &[u8])> = req
-        .headers
-        .iter()
-        .map(|(name, value)| (&name[..], &value[..]))
-        .collect();
-    kernel.submit(&Request {
-        client_addr: client.as_bytes(),
-        client_port: req.client.port(),
-        server_addr: server.as_bytes(),
-        server_port: req.server.port(),
-        method: &req.method,
-        uri: &req.uri,
-        proto: PROTO,
-        headers: &headers,
-        body: &req.body.bytes,
-    })
+/// What a switch of generation is doing. There is one at a time.
+enum Switching<K> {
+    Idle,
+    /// The new kernel starts. New tickets still go to the kernel that serves.
+    Starting {
+        next: Slot<K>,
+        ready_by: Instant,
+    },
+    /// The new kernel serves. The old one finishes the requests it holds, until `drain_by`.
+    Draining {
+        old: Slot<K>,
+        drain_by: Instant,
+    },
+    /// A kernel is being stopped on a thread of its own. `switched` is how the switch ends.
+    Retiring {
+        retirement: Retirement,
+        switched: Switched,
+    },
 }
 
 /// Everything the driver thread owns.
 struct Core<K> {
-    kernel: K,
     rx: Receiver<Msg>,
-    pending: BTreeMap<ReqId, Pending>,
+    /// The kernel that new tickets go to.
+    active: Slot<K>,
+    switching: Switching<K>,
+    /// Where to tell the main thread how the switch ended.
+    reply: Option<oneshot::Sender<Switched>>,
     mode: Mode,
     /// Every sender is gone: nothing can arrive any more.
     closed: bool,
     signals: Signals,
     log: Log,
-    /// The incarnation number of the inspector that the last round saw.
-    inc: u32,
     /// The longest wait for a message while there is nothing to do.
     tick: Duration,
-    /// The length of one kernel step.
-    slice: Duration,
+    /// The times of the proxy; the slice is cut to the tick, and is at least `MIN_SLICE`.
+    limits: Limits,
     /// The most messages one intake takes: one more than the waiting queue holds.
     take: usize,
+    /// Every kernel that was stopped so far stopped cleanly.
+    retired_clean: bool,
 }
 
 impl<K: Kernel> Core<K> {
     fn new(
-        kernel: K,
+        active: Slot<K>,
         rx: Receiver<Msg>,
         signals: Signals,
         log: Log,
+        limits: Limits,
         tick: Duration,
-        slice: Duration,
         take: usize,
     ) -> Core<K> {
-        let inc = kernel.status().inc;
         Core {
-            kernel,
             rx,
-            pending: BTreeMap::new(),
+            active,
+            switching: Switching::Idle,
+            reply: None,
             mode: Mode::Run,
             closed: false,
             signals,
             log,
-            inc,
             tick,
-            slice: slice.min(tick).max(MIN_SLICE),
+            limits: Limits {
+                slice: limits.slice.min(tick).max(MIN_SLICE),
+                ..limits
+            },
             take: take.max(1),
+            retired_clean: true,
         }
     }
 
@@ -380,7 +402,10 @@ impl<K: Kernel> Core<K> {
             }
         };
         match self.quiesce() {
-            Ok(()) => End::Done(done),
+            Ok(()) => End::Done {
+                kernel: done,
+                retired_clean: self.retired_clean,
+            },
             Err(why) => End::Fatal(why),
         }
     }
@@ -392,13 +417,14 @@ impl<K: Kernel> Core<K> {
         self.scan();
         self.wait()?;
         let now = Instant::now();
-        // A sum that does not fit is due at once; the slice is cut to the kernel's tick, so that does not happen.
-        let until = now.checked_add(self.slice).unwrap_or(now);
-        let results = self.kernel.poll(until);
-        deliver(&mut self.pending, &results)?;
-        let status = self.kernel.status();
-        self.signals.note(status.phase);
-        self.note_incarnation(&status);
+        let until = after(now, self.limits.slice);
+        self.active.step(until)?;
+        self.step_other()?;
+        self.signals.note(self.active.status().phase);
+        if let Some(line) = self.active.note_incarnation() {
+            self.log.line(&line);
+        }
+        self.advance()?;
         self.finish_if_due()
     }
 
@@ -425,6 +451,10 @@ impl<K: Kernel> Core<K> {
     fn accept(&mut self, msg: Msg) -> Result<(), &'static str> {
         match msg {
             Msg::Ticket(ticket) => self.admit(ticket),
+            Msg::Switch(switch) => {
+                self.begin_switch(switch);
+                Ok(())
+            }
             Msg::Stop { inspect_by } => {
                 self.stop(inspect_by);
                 Ok(())
@@ -432,39 +462,55 @@ impl<K: Kernel> Core<K> {
         }
     }
 
-    /// A ticket that is closed (its connection is gone) is dropped without a submit. After `shutdown`
-    /// nothing is submitted.
+    /// After `shutdown` nothing is submitted.
     fn admit(&mut self, ticket: Ticket) -> Result<(), &'static str> {
         if self.mode == Mode::Down {
             let _ = ticket.reply.send(Outcome::Unavailable);
             return Ok(());
         }
-        if ticket.reply.is_closed() {
-            return Ok(());
+        self.active.admit(ticket)
+    }
+
+    /// Makes the kernel of the new generation, when a switch can begin: the proxy runs and no other switch is
+    /// under way. The main thread sends one switch at a time, so the second condition is a guard.
+    fn begin_switch(&mut self, switch: Switch) {
+        let Switch {
+            generation,
+            kernel,
+            reply,
+        } = switch;
+        if self.mode != Mode::Run || !matches!(self.switching, Switching::Idle) {
+            let _ = reply.send(Switched::No);
+            return;
         }
-        match submit(&mut self.kernel, &ticket.req) {
-            Ok(id) => match self.pending.entry(id) {
-                Entry::Occupied(_) => Err("duplicate request id"),
-                Entry::Vacant(slot) => {
-                    slot.insert(Pending {
-                        ticket,
-                        cancelled: false,
-                    });
-                    Ok(())
-                }
-            },
-            Err(refused) => {
-                let _ = ticket.reply.send(Outcome::Refused(refused));
-                Ok(())
+        match K::create(kernel) {
+            Ok(kernel) => {
+                self.switching = Switching::Starting {
+                    next: Slot::new(generation, kernel),
+                    ready_by: after(Instant::now(), self.limits.ready_wait),
+                };
+                self.reply = Some(reply);
+            }
+            Err(why) => {
+                self.log.line(&format!(
+                    "reload: generation {} failed to start: {why}",
+                    generation.hex()
+                ));
+                let _ = reply.send(Switched::No);
             }
         }
     }
 
-    /// The first stop message records one line and sets the deadline; a later one can only bring it forward.
+    /// The first stop message records one line and sets the deadline; a later one can only bring it forward. A
+    /// kernel that is starting holds no request: it is stopped at once.
     fn stop(&mut self, inspect_by: Instant) {
         self.mode = match self.mode {
             Mode::Run => {
-                self.log.line(&stop_line(&self.kernel.status()));
+                self.log.line(&stop_line(&self.active.status()));
+                match mem::replace(&mut self.switching, Switching::Idle) {
+                    Switching::Starting { next, .. } => self.retire(next, inspect_by, Switched::No),
+                    other => self.switching = other,
+                }
                 Mode::Stopping { inspect_by }
             }
             Mode::Stopping { inspect_by: first } => Mode::Stopping {
@@ -472,16 +518,6 @@ impl<K: Kernel> Core<K> {
             },
             Mode::Down => Mode::Down,
         };
-    }
-
-    /// Records one line when the incarnation of the inspector is not the one seen last, and takes it in. It is
-    /// called with the status after a step and before `shutdown`, so the exit that `shutdown` confirms gives no
-    /// line.
-    fn note_incarnation(&mut self, status: &Status) {
-        if let Some(line) = restart_line(self.inc, status) {
-            self.log.line(&line);
-            self.inc = status.inc;
-        }
     }
 
     /// The last sender is gone. Without a stop message that is a stop whose deadline has passed: nothing can
@@ -493,24 +529,61 @@ impl<K: Kernel> Core<K> {
         }
     }
 
-    /// Calls `cancel` once for every submitted ticket whose connection went away. The mark is kept in the table,
-    /// not in a message, so a full channel cannot lose it.
-    fn scan(&mut self) {
-        for (&id, entry) in &mut self.pending {
-            if !entry.cancelled && entry.ticket.reply.is_closed() {
-                self.kernel.cancel(id);
-                entry.cancelled = true;
-            }
+    /// The kernel that does not get new tickets: the new one while it starts, the old one while it finishes.
+    fn other(&mut self) -> Option<&mut Slot<K>> {
+        match &mut self.switching {
+            Switching::Starting { next, .. } => Some(next),
+            Switching::Draining { old, .. } => Some(old),
+            Switching::Idle | Switching::Retiring { .. } => None,
         }
     }
 
-    /// Whether nothing is in flight and nothing is to be closed: the kernel is ready and holds no record.
+    /// Calls `cancel` for the tickets whose connection went away, in both kernels.
+    fn scan(&mut self) {
+        self.active.scan();
+        if let Some(other) = self.other() {
+            other.scan();
+        }
+    }
+
+    /// Steps the kernel that does not get new tickets, for the shortest step that can read a frame. A step whose
+    /// end has passed writes but reads nothing (`Supervisor::poll`), and this kernel has a frame to read: the
+    /// HELLO of a new inspector, the verdicts of an old one.
+    fn step_other(&mut self) -> Result<(), &'static str> {
+        let until = after(Instant::now(), MIN_SLICE);
+        let line = match self.other() {
+            Some(other) => {
+                other.step(until)?;
+                other.note_incarnation()
+            }
+            None => None,
+        };
+        if let Some(line) = line {
+            self.log.line(&line);
+        }
+        Ok(())
+    }
+
+    /// Whether the kernel that serves is ready and holds no record, and nothing else is going on: nothing is in
+    /// flight and nothing is to be closed.
     fn idle(&self) -> bool {
-        if self.mode != Mode::Run || !self.pending.is_empty() {
+        if self.mode != Mode::Run
+            || !matches!(self.switching, Switching::Idle)
+            || !self.active.pending.is_empty()
+        {
             return false;
         }
-        let status = self.kernel.status();
+        let status = self.active.status();
         status.records == 0 && status.phase == Phase::Ready
+    }
+
+    /// Whether no request waits for a result, in the kernel that serves and in the one that finishes.
+    fn nothing_pending(&self) -> bool {
+        let old = match &self.switching {
+            Switching::Draining { old, .. } => old.pending.is_empty(),
+            _ => true,
+        };
+        self.active.pending.is_empty() && old
     }
 
     /// Waits for a message, but only when idle. Anything else must go on stepping the kernel.
@@ -528,22 +601,145 @@ impl<K: Kernel> Core<K> {
         }
     }
 
-    /// Calls `shutdown` when it is due and delivers its results. Every request is decided by then, so a ticket
-    /// that is left in the table breaks the promise that every result comes out once.
+    /// Moves the switch on by what the round found out.
+    fn advance(&mut self) -> Result<(), &'static str> {
+        let now = Instant::now();
+        match mem::replace(&mut self.switching, Switching::Idle) {
+            Switching::Idle => {}
+            Switching::Starting { next, ready_by } => self.advance_starting(next, ready_by, now),
+            Switching::Draining { old, drain_by } => {
+                if old.pending.is_empty() || now >= drain_by {
+                    // A kernel that still holds requests is out of time: it is stopped at once, and `shutdown`
+                    // decides them. One that holds nothing is given the time to end by itself.
+                    let by = if old.pending.is_empty() {
+                        after(now, self.limits.stop_inspect)
+                    } else {
+                        now
+                    };
+                    self.retire(old, by, Switched::Yes);
+                } else {
+                    self.switching = Switching::Draining { old, drain_by };
+                }
+            }
+            Switching::Retiring {
+                mut retirement,
+                switched,
+            } => match retirement.poll()? {
+                Some(retired) => self.retired(&retired, switched),
+                None => {
+                    self.switching = Switching::Retiring {
+                        retirement,
+                        switched,
+                    };
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// The new kernel that was stepped in this round: serving from now on if it is ready, stopped if it failed
+    /// or is late.
+    fn advance_starting(&mut self, next: Slot<K>, ready_by: Instant, now: Instant) {
+        let serving_failed = matches!(self.active.status().phase, Phase::Failed(_));
+        match next.status().phase {
+            // The kernel that serves failed in this round: the proxy stops, and does not hurry to the new one.
+            Phase::Ready if !serving_failed => {
+                self.log.line(&format!(
+                    "reload: generation {} is ready, switched",
+                    next.generation.hex()
+                ));
+                let old = mem::replace(&mut self.active, next);
+                self.switching = Switching::Draining {
+                    old,
+                    drain_by: after(now, self.limits.stop_inspect),
+                };
+            }
+            // Ready, but the kernel that serves failed: the stop that follows retires it.
+            Phase::Ready => self.switching = Switching::Starting { next, ready_by },
+            Phase::Failed(why) => {
+                self.failed_to_start(&next, &format!("{why:?}"));
+                self.retire(next, after(now, self.limits.stop_inspect), Switched::No);
+            }
+            _ if now >= ready_by => {
+                self.failed_to_start(&next, "not ready in time");
+                self.retire(next, after(now, self.limits.stop_inspect), Switched::No);
+            }
+            _ => self.switching = Switching::Starting { next, ready_by },
+        }
+    }
+
+    /// Two record lines: what failed (fixed text), and the line that the inspector left, if there is one, with
+    /// every byte outside 0x20 to 0x7e escaped.
+    fn failed_to_start(&self, slot: &Slot<K>, kind: &str) {
+        self.log.line(&format!(
+            "reload: generation {} failed to start: {kind}",
+            slot.generation.hex()
+        ));
+        if let Some(detail) = slot.kernel.start_detail() {
+            let line = detail.strip_suffix(b"\n").unwrap_or(&detail);
+            self.log.line(&format!(
+                "reload: the inspector said: \"{}\"",
+                escaped(line)
+            ));
+        }
+    }
+
+    /// Gives the slot to a thread that stops it.
+    fn retire(&mut self, slot: Slot<K>, deadline: Instant, switched: Switched) {
+        self.switching = Switching::Retiring {
+            retirement: slot.retire(deadline),
+            switched,
+        };
+    }
+
+    /// A retirement is over: one record line, and the main thread is told how the switch ended.
+    fn retired(&mut self, retired: &Retired, switched: Switched) {
+        self.log.line(&format!(
+            "reload: generation {} retired, clean {}",
+            retired.generation.hex(),
+            retired.clean
+        ));
+        self.retired_clean &= retired.clean;
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(switched);
+        }
+    }
+
+    /// Waits for the retirement that is going on, if there is one.
+    fn collect(&mut self) -> Result<(), &'static str> {
+        if let Switching::Retiring {
+            retirement,
+            switched,
+        } = mem::replace(&mut self.switching, Switching::Idle)
+        {
+            let retired = retirement.wait()?;
+            self.retired(&retired, switched);
+        }
+        Ok(())
+    }
+
+    /// Calls `shutdown` when it is due and delivers its results. The old kernel of a switch goes on its own
+    /// thread, at the same time. Every request is decided by then, so a ticket that is left in a table breaks the
+    /// promise that every result comes out once.
     fn finish_if_due(&mut self) -> Result<Option<Shutdown>, &'static str> {
         let Mode::Stopping { inspect_by } = self.mode else {
             return Ok(None);
         };
-        let nothing_pending = self.pending.is_empty();
-        if !shutdown_due(self.closed, nothing_pending, inspect_by, Instant::now()) {
+        if !shutdown_due(
+            self.closed,
+            self.nothing_pending(),
+            inspect_by,
+            Instant::now(),
+        ) {
             return Ok(None);
         }
-        let done = self.kernel.shutdown(inspect_by);
-        self.mode = Mode::Down;
-        deliver(&mut self.pending, &done.results)?;
-        if !self.pending.is_empty() {
-            return Err("request left after shutdown");
+        match mem::replace(&mut self.switching, Switching::Idle) {
+            Switching::Draining { old, .. } => self.retire(old, inspect_by, Switched::Yes),
+            other => self.switching = other,
         }
+        let done = self.active.shutdown(inspect_by)?;
+        self.mode = Mode::Down;
+        self.collect()?;
         Ok(Some(done))
     }
 
