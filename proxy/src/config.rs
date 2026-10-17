@@ -1,22 +1,25 @@
-//! The configuration file: one JSON object `{"proxy": {..}, "kernel": {..}}`; every value is chosen by the
-//! operator and checked here.
+//! The configuration file: one JSON object `{"proxy": {..}, "kernel": {..}, "rules": {"store": {..}}}`; every
+//! value is chosen by the operator and checked here.
 //!
 //! The file is read whole (at most 64 KiB, UTF-8) and deserialized into plain structs. Every key must be present;
 //! an unknown or repeated key is refused, and so is a value of the wrong type, an array in place of an object
 //! included. A refusal is one fixed sentence per kind of fault and never carries a key or a value from the file.
 //! Then the values are checked in a fixed order and the first broken rule is returned: the `proxy` bounds, the
-//! conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's own check, and last the
-//! relations between the two objects.
+//! `rules.store` values, the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's own
+//! check, and last the relations between the `proxy` and `kernel` objects.
 //!
 //! Times are whole milliseconds under keys that end in `_ms`; the `proxy` times run from 1 ms to 3600 s.
-//! `listen` and `upstream` are an IP literal and a port (`[..]:port` for IPv6). `rules_sha256` is exactly 64
-//! lowercase hexadecimal digits.
+//! `listen` and `upstream` are an IP literal and a port (`[..]:port` for IPv6). `rules.store.kind` is `file`, the
+//! only kind there is, and `dir` is an absolute clean path of at most 3840 bytes. The `kernel` object has no
+//! rules path and no rules fingerprint: the directory and the fingerprint of the chosen generation come from the
+//! rules store when the proxy starts (`KernelSettings::for_generation`).
 
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,7 +29,12 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::error::Category;
 use tukuyomi_kernel::limits::{BODY, HEADER_TOTAL};
 
+use crate::rules::bundle::Fingerprint;
+
 const MAX_FILE: u64 = 64 * 1024;
+/// Longest accepted `rules.store.dir` in bytes: the paths below it must stay inside the Linux `PATH_MAX`. A guard
+/// against a wrong setting, not a recommendation.
+const MAX_STORE_DIR: usize = 3840;
 const MAX_MS: u64 = 3_600_000;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -62,7 +70,36 @@ pub struct ProxyConfig {
 #[derive(Clone, Debug)]
 pub struct Loaded {
     pub proxy: ProxyConfig,
-    pub kernel: tukuyomi_kernel::Config,
+    pub kernel: KernelSettings,
+    pub store: StoreConfig,
+}
+
+/// Where the rule generations are kept, as the file names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreConfig {
+    File { dir: PathBuf },
+}
+
+/// The kernel values of the file, checked. The rules directory and fingerprint come from the rules store at
+/// start-up.
+#[derive(Clone, Debug)]
+pub struct KernelSettings(tukuyomi_kernel::Config);
+
+impl KernelSettings {
+    /// The kernel configuration for one generation, checked again.
+    pub fn for_generation(
+        &self,
+        dir: PathBuf,
+        generation: Fingerprint,
+    ) -> Result<tukuyomi_kernel::Config, ConfigError> {
+        let kernel = tukuyomi_kernel::Config {
+            rules: dir,
+            rules_sha256: generation.bytes(),
+            ..self.0.clone()
+        };
+        kernel.check().map_err(|e| ConfigError(e.0))?;
+        Ok(kernel)
+    }
 }
 
 /// Why the file was refused: a fixed English sentence, never a value taken from the file.
@@ -74,6 +111,7 @@ pub struct ConfigError(pub &'static str);
 struct RawFile {
     proxy: Object<RawProxy>,
     kernel: Object<RawKernel>,
+    rules: Object<RawRules>,
 }
 
 #[derive(Deserialize)]
@@ -107,8 +145,6 @@ struct RawProxy {
 #[serde(deny_unknown_fields)]
 struct RawKernel {
     inspector: String,
-    rules: String,
-    rules_sha256: String,
     tmp_root: String,
     gomaxprocs: u16,
     gomemlimit: u64,
@@ -128,6 +164,19 @@ struct RawKernel {
     kill_grace_ms: u64,
     restarts: u32,
     restart_window_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRules {
+    store: Object<RawStore>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStore {
+    kind: String,
+    dir: String,
 }
 
 /// Accepts only a JSON object. A derived struct alone would also take an array of its values in field order,
@@ -177,7 +226,7 @@ fn parse(bytes: &[u8]) -> Result<Loaded, ConfigError> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| ConfigError("configuration file is not UTF-8"))?;
     let Object(file): Object<RawFile> = serde_json::from_str(text).map_err(|e| refusal(&e))?;
-    build(file.proxy.0, file.kernel.0)
+    build(file.proxy.0, file.rules.0.store.0, file.kernel.0)
 }
 
 /// The fixed sentence for a deserialization fault. The text of the fault is only used to tell the kinds apart.
@@ -226,25 +275,17 @@ fn same(a: SocketAddr, b: SocketAddr) -> bool {
     a.port() == b.port() && a.ip().to_canonical() == b.ip().to_canonical()
 }
 
-fn digit(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        _ => None,
-    }
-}
-
-fn sha256(hex: &str) -> Result<[u8; 32], ConfigError> {
-    const BAD: ConfigError = ConfigError("rules_sha256 is not 64 lowercase hex digits");
-    let text = hex.as_bytes();
-    if text.len() != 64 {
-        return Err(BAD);
-    }
-    let mut out = [0; 32];
-    for (byte, pair) in out.iter_mut().zip(text.chunks_exact(2)) {
-        *byte = digit(pair[0]).ok_or(BAD)? << 4 | digit(pair[1]).ok_or(BAD)?;
-    }
-    Ok(out)
+/// A path argument or a configured path must be absolute and already clean: no empty, `.` or `..` component, no
+/// trailing slash, no NUL, and shorter than the Linux `PATH_MAX`.
+pub fn clean_abs(p: &Path) -> bool {
+    let b = p.as_os_str().as_bytes();
+    b.len() > 1
+        && b.len() < 4096
+        && b[0] == b'/'
+        && !b.contains(&0)
+        && b[1..]
+            .split(|&c| c == b'/')
+            .all(|s| !s.is_empty() && s != b"." && s != b"..")
 }
 
 /// The least time the HTTP side must allow for an inspection: the kernel's wait for the first frame, two
@@ -257,7 +298,7 @@ fn inspect_floor(kernel: &tukuyomi_kernel::Config, slice: Duration) -> Option<Du
         .checked_add(steps)
 }
 
-fn build(p: RawProxy, k: RawKernel) -> Result<Loaded, ConfigError> {
+fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> {
     let listen = address(
         &p.listen,
         "listen is not an IP address and port",
@@ -318,10 +359,23 @@ fn build(p: RawProxy, k: RawKernel) -> Result<Loaded, ConfigError> {
     let stop_inspect = millis(p.stop_inspect_ms, "stop_inspect_ms is out of range")?;
     let stop_wait = millis(p.stop_wait_ms, "stop_wait_ms is out of range")?;
 
+    ensure(s.kind == "file", "rules store kind is not supported")?;
+    let dir = PathBuf::from(s.dir);
+    ensure(
+        clean_abs(&dir),
+        "rules store dir is not an absolute clean path",
+    )?;
+    ensure(
+        dir.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
+        "rules store dir is over 3840 bytes",
+    )?;
+
     let kernel = tukuyomi_kernel::Config {
         inspector: PathBuf::from(k.inspector),
-        rules: PathBuf::from(k.rules),
-        rules_sha256: sha256(&k.rules_sha256)?,
+        // The check looks at the form of the path only, so the directory of a generation, which is below this
+        // one, gets the same answer. The fingerprint is any value of its type.
+        rules: dir.join("generations"),
+        rules_sha256: [0; 32],
         tmp_root: PathBuf::from(k.tmp_root),
         gomaxprocs: k.gomaxprocs,
         gomemlimit: k.gomemlimit,
@@ -426,7 +480,8 @@ fn build(p: RawProxy, k: RawKernel) -> Result<Loaded, ConfigError> {
             stop_inspect,
             stop_wait,
         },
-        kernel,
+        kernel: KernelSettings(kernel),
+        store: StoreConfig::File { dir },
     })
 }
 

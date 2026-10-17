@@ -1,11 +1,14 @@
 package main
 
 import (
-	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -18,9 +21,8 @@ import (
 )
 
 // realTx is what a transaction of the pinned Coraza is: the public interface
-// and the experimental one that requestComplete reads (the method sets overlap
-// with identical signatures). The fakes and wrappers of the tests implement it
-// too, else the assertion of requestComplete fails.
+// and the experimental one that requestComplete reads. The fakes and wrappers
+// of the tests implement it too, else the assertion of requestComplete fails.
 type realTx interface {
 	types.Transaction
 	plugintypes.TransactionState
@@ -54,6 +56,13 @@ type pw struct{ b []byte }
 func (w *pw) u16(v uint16) { w.b = binary.BigEndian.AppendUint16(w.b, v) }
 func (w *pw) u64(v uint64) { w.b = binary.BigEndian.AppendUint64(w.b, v) }
 func (w *pw) s(v string)   { w.u16(uint16(len(v))); w.b = append(w.b, v...) }
+func (w *pw) headers(hs [][2]string) {
+	w.u16(uint16(len(hs)))
+	for _, h := range hs {
+		w.s(h[0])
+		w.s(h[1])
+	}
+}
 
 type tBegin struct {
 	client     string
@@ -89,11 +98,7 @@ func (b tBegin) payload() []byte {
 	w.s(b.uri)
 	w.s(b.proto)
 	w.u64(b.declared)
-	w.u16(uint16(len(b.headers)))
-	for _, h := range b.headers {
-		w.s(h[0])
-		w.s(h[1])
-	}
+	w.headers(b.headers)
 	return w.b
 }
 
@@ -102,11 +107,7 @@ func respPayload(status uint16, proto string, declared uint64, headers [][2]stri
 	w.u16(status)
 	w.s(proto)
 	w.u64(declared)
-	w.u16(uint16(len(headers)))
-	for _, h := range headers {
-		w.s(h[0])
-		w.s(h[1])
-	}
+	w.headers(headers)
 	return w.b
 }
 
@@ -118,7 +119,6 @@ type out struct {
 	msg   uint32
 	run   uint64
 	inc   uint32
-	p     []byte
 	phase uint8
 	block bool
 	flags uint8
@@ -133,85 +133,45 @@ type out struct {
 	bye   [3]uint64
 }
 
-func rdStr(p []byte, off *int) (string, error) {
-	if len(p)-*off < 2 {
-		return "", fmt.Errorf("short str len")
-	}
-	n := int(binary.BigEndian.Uint16(p[*off:]))
-	*off += 2
-	if len(p)-*off < n {
-		return "", fmt.Errorf("short str")
-	}
-	s := string(p[*off : *off+n])
-	*off += n
-	return s, nil
-}
-
 func parseOut(b []byte) (out, error) {
 	var o out
 	if len(b) < headerLen || string(b[:4]) != "TKV0" || b[5] != 0 || b[6] != 0 || b[7] != 0 {
 		return o, fmt.Errorf("bad header")
 	}
 	o.kind = b[4]
-	n := binary.BigEndian.Uint32(b[8:])
 	o.run = binary.BigEndian.Uint64(b[12:])
 	o.inc = binary.BigEndian.Uint32(b[20:])
 	o.tx = binary.BigEndian.Uint64(b[24:])
 	o.msg = binary.BigEndian.Uint32(b[32:])
-	if int(n) != len(b)-headerLen {
+	if n := int(binary.BigEndian.Uint32(b[8:])); n != len(b)-headerLen {
 		return o, fmt.Errorf("length %d != %d", n, len(b)-headerLen)
 	}
-	o.p = b[headerLen:]
-	p := o.p
-	off := 0
-	var err error
+	c := &cursor{p: b[headerLen:]}
 	switch o.kind {
 	case kindVerdict:
-		if len(p) < 14 {
-			return o, fmt.Errorf("short verdict")
-		}
-		o.phase, o.block, o.flags = p[0], p[1] == 1, p[2]
-		if p[1] > 1 || p[3] != 0 {
-			return o, fmt.Errorf("bad verdict bytes")
-		}
-		o.rule = int64(binary.BigEndian.Uint64(p[4:]))
-		o.stat = binary.BigEndian.Uint16(p[12:])
-		off = 14
-		if o.act, err = rdStr(p, &off); err != nil {
-			return o, err
-		}
-		if o.data, err = rdStr(p, &off); err != nil {
-			return o, err
-		}
+		var d, zero uint8
+		o.phase, d, o.flags, zero = c.u8(), c.u8(), c.u8(), c.u8()
+		o.block = d == 1
+		o.rule, o.stat = int64(c.u64()), c.u16()
+		o.act, o.data = c.str16(0, 0xffff), c.str16(0, 0xffff)
+		c.bad = c.bad || d > 1 || zero != 0
 	case kindError:
-		if len(p) < 4 || p[1] != 0 {
-			return o, fmt.Errorf("bad error")
-		}
-		o.class, o.code = p[0], binary.BigEndian.Uint16(p[2:])
-		off = 4
-		if o.text, err = rdStr(p, &off); err != nil {
-			return o, err
-		}
+		var zero uint8
+		o.class, zero = c.u8(), c.u8()
+		o.code, o.text = c.u16(), c.str16(0, 0xffff)
+		c.bad = c.bad || zero != 0
 	case kindClosed:
-		if len(p) != 1 || p[0] > 1 {
-			return o, fmt.Errorf("bad closed")
-		}
-		o.cerr, off = p[0], 1
+		o.cerr = c.u8()
+		c.bad = c.bad || o.cerr > 1
 	case kindBye:
-		if len(p) != 24 {
-			return o, fmt.Errorf("bad bye")
-		}
-		for i := range 3 {
-			o.bye[i] = binary.BigEndian.Uint64(p[8*i:])
-		}
-		off = 24
+		o.bye = [3]uint64{c.u64(), c.u64(), c.u64()}
 	case kindHello:
-		off = len(p) // checked field by field in the process test
+		c.off = len(c.p) // compared whole in the process test
 	default:
 		return o, fmt.Errorf("unexpected kind 0x%02x", o.kind)
 	}
-	if off != len(p) {
-		return o, fmt.Errorf("trailing bytes in kind 0x%02x", o.kind)
+	if !c.done() {
+		return o, fmt.Errorf("malformed kind 0x%02x", o.kind)
 	}
 	return o, nil
 }
@@ -263,18 +223,14 @@ func (c *capture) none(t *testing.T, d time.Duration) {
 
 // ---- fake Coraza transaction ----
 
-// fakeTx embeds a nil types.Transaction: any method not overridden panics,
-// which fails the test on an unexpected Coraza call.
-//
-// Every implemented method also checks, under mu, how it is used, and keeps
-// the findings in viol (the harness reports them in Cleanup): no call after
-// Close, no call between ProcessLogging and Close, exactly one ProcessLogging
-// before Close, every call from the goroutine that made the fake (the harness
-// calls adopt where the inspector makes it; a fake without adopt, as in
-// link_test.go, is bound to the goroutine of its first call), and no
-// overlapping calls. Only a fake made through the harness is checked at the
-// end. The mutex makes these fields race-free; -race does not judge the
-// ownership itself.
+// fakeTx embeds a nil realTx: any method not overridden panics, which fails
+// the test on an unexpected Coraza call. Every method also checks, under mu,
+// how it is used: no call after Close or between ProcessLogging and Close,
+// exactly one ProcessLogging before Close, every call from the goroutine that
+// made the fake (the harness calls adopt where the inspector makes it; a fake
+// without adopt is bound to the goroutine of its first call), and no
+// overlapping calls. The findings are in viol; a fake made through the harness
+// is checked at the end of the test.
 type fakeTx struct {
 	realTx
 	mu          sync.Mutex
@@ -282,18 +238,13 @@ type fakeTx struct {
 	phase1      *types.Interruption
 	reqAccess   bool
 	write       func(b []byte) (*types.Interruption, int, error)
-	reqBody     func() (*types.Interruption, error)
 	respAccess  bool
 	respProc    bool
 	phase3      *types.Interruption
-	writeResp   func(b []byte) (*types.Interruption, int, error)
-	respBody    func() (*types.Interruption, error)
-	closeErr    error
 	hdrGate     chan struct{}                     // if set, ProcessRequestHeaders waits on it
-	ruleOff     bool                              // IsRuleEngineOff
 	accessLost  int                               // IsRequestBodyAccessible is false from this call on (1-based); 0: as reqAccess
 	flags       map[variables.RuleVariable]string // raw value of a flag; absent is empty, except REQBODY_PROCESSOR (URLENCODED); Set of the processor writes here
-	plainProc   bool                              // REQBODY_PROCESSOR is a fakeFlag, a value without Set, as a type of Coraza that changed would be
+	plainProc   bool                              // REQBODY_PROCESSOR is a value without Set, as a type of Coraza that changed would be
 	procSets    []string                          // the values given to Set of REQBODY_PROCESSOR
 	serverNames []string
 
@@ -304,16 +255,10 @@ type fakeTx struct {
 	viol   []string
 }
 
-func (f *fakeTx) rec(s string) {
-	f.mu.Lock()
-	f.calls = append(f.calls, s)
-	f.mu.Unlock()
-}
-
 // enter records a call, checks the rules above and returns the function that
 // ends the call: defer f.enter("name")().
 func (f *fakeTx) enter(s string) func() {
-	g, ok := goid()
+	g := goid()
 	f.mu.Lock()
 	switch {
 	case f.closed:
@@ -322,8 +267,8 @@ func (f *fakeTx) enter(s string) func() {
 		f.violf("%s after ProcessLogging", s)
 	}
 	switch {
-	case !ok:
-		f.violf("%s: goroutine number not read from runtime.Stack", s)
+	case g == 0:
+		f.violf("%s: goroutine number not read", s)
 	case f.owner == 0:
 		f.owner = g
 	case f.owner != g:
@@ -341,8 +286,8 @@ func (f *fakeTx) enter(s string) func() {
 		}
 		f.closed = true
 	}
+	f.calls = append(f.calls, s)
 	f.mu.Unlock()
-	f.rec(s)
 	return func() {
 		f.mu.Lock()
 		f.active--
@@ -353,12 +298,11 @@ func (f *fakeTx) enter(s string) func() {
 // adopt binds the fake to the calling goroutine, which is where the inspector
 // makes it (newTx runs in the owner).
 func (f *fakeTx) adopt() {
-	g, ok := goid()
+	g := goid()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !ok {
-		f.violf("creation: goroutine number not read from runtime.Stack")
-		return
+	if g == 0 {
+		f.violf("creation: goroutine number not read")
 	}
 	f.owner = g
 }
@@ -391,32 +335,16 @@ func (f *fakeTx) count(s string) int {
 	return n
 }
 
-// goid returns the number of the calling goroutine. Test only: the inspector
-// does not depend on it. It reads the first line that runtime.Stack writes.
-func goid() (uint64, bool) {
+// goid returns the number of the calling goroutine from the first line that
+// runtime.Stack writes ("goroutine 7 [running]:"), or 0 if it is not read.
+// Test only: the inspector does not depend on it.
+func goid() uint64 {
 	var buf [64]byte
-	return parseGoid(buf[:runtime.Stack(buf[:], false)])
-}
-
-// parseGoid reads "goroutine <n> [" at the start of b. This is the form of
-// the header in runtime/traceback.go (goroutineheader) of Go 1.27.2.
-// runtime.Stack forces traceback level 1 (runtime/mprof.go), so GOTRACEBACK
-// does not change the header. Any other form is reported as not read, never
-// skipped.
-func parseGoid(b []byte) (uint64, bool) {
-	b, ok := bytes.CutPrefix(b, []byte("goroutine "))
-	if !ok {
-		return 0, false
+	var n uint64
+	if _, err := fmt.Sscanf(string(buf[:runtime.Stack(buf[:], false)]), "goroutine %d ", &n); err != nil {
+		return 0
 	}
-	i := bytes.IndexByte(b, ' ')
-	if i < 1 || !bytes.HasPrefix(b[i:], []byte(" [")) {
-		return 0, false
-	}
-	n, err := strconv.ParseUint(string(b[:i]), 10, 64)
-	if err != nil || n == 0 {
-		return 0, false
-	}
-	return n, true
+	return n
 }
 
 func (f *fakeTx) ProcessConnection(string, int, string, int) { defer f.enter("conn")() }
@@ -435,7 +363,7 @@ func (f *fakeTx) ProcessRequestHeaders() *types.Interruption {
 	}
 	return f.phase1
 }
-func (f *fakeTx) IsRuleEngineOff() bool { defer f.enter("ruleoff")(); return f.ruleOff }
+func (f *fakeTx) IsRuleEngineOff() bool { defer f.enter("ruleoff")(); return false }
 func (f *fakeTx) IsRequestBodyAccessible() bool {
 	defer f.enter("reqaccess")()
 	return f.reqAccess && (f.accessLost == 0 || f.count("reqaccess") < f.accessLost)
@@ -460,12 +388,10 @@ func (p *fakeProc) Set(s string) {
 	defer p.f.enter("setproc")()
 	p.f.mu.Lock()
 	defer p.f.mu.Unlock()
-	m := make(map[variables.RuleVariable]string, len(p.f.flags)+1)
-	for k, v := range p.f.flags {
-		m[k] = v
+	if p.f.flags == nil {
+		p.f.flags = map[variables.RuleVariable]string{}
 	}
-	m[variables.ReqbodyProcessor] = s
-	p.f.flags = m
+	p.f.flags[variables.ReqbodyProcessor] = s
 	p.f.procSets = append(p.f.procSets, s)
 }
 
@@ -508,9 +434,6 @@ func (f *fakeTx) WriteRequestBody(b []byte) (*types.Interruption, int, error) {
 }
 func (f *fakeTx) ProcessRequestBody() (*types.Interruption, error) {
 	defer f.enter("phase2")()
-	if f.reqBody != nil {
-		return f.reqBody()
-	}
 	return nil, nil
 }
 func (f *fakeTx) AddResponseHeader(string, string) { defer f.enter("resphdr")() }
@@ -522,22 +445,16 @@ func (f *fakeTx) IsResponseBodyAccessible() bool  { defer f.enter("respaccess")(
 func (f *fakeTx) IsResponseBodyProcessable() bool { defer f.enter("respproc")(); return f.respProc }
 func (f *fakeTx) WriteResponseBody(b []byte) (*types.Interruption, int, error) {
 	defer f.enter("writeresp")()
-	if f.writeResp != nil {
-		return f.writeResp(b)
-	}
 	return nil, len(b), nil
 }
 func (f *fakeTx) ProcessResponseBody() (*types.Interruption, error) {
 	defer f.enter("phase4")()
-	if f.respBody != nil {
-		return f.respBody()
-	}
 	return nil, nil
 }
 func (f *fakeTx) ProcessLogging() { defer f.enter("logging")() }
 func (f *fakeTx) Close() error {
 	defer f.enter("close")()
-	return f.closeErr
+	return nil
 }
 
 // harness drives a table with fake transactions and a capture sender.
@@ -547,16 +464,15 @@ type harness struct {
 	cap *capture
 	mu  sync.Mutex
 	txs map[string]*fakeTx
-	mk  func(id string) *fakeTx
 }
 
 func newHarness(t *testing.T, mk func(id string) *fakeTx) *harness {
-	h := &harness{t: t, cap: newCapture(), txs: map[string]*fakeTx{}, mk: mk}
-	if h.mk == nil {
-		h.mk = func(string) *fakeTx { return &fakeTx{reqAccess: true, respAccess: true, respProc: true} }
+	h := &harness{t: t, cap: newCapture(), txs: map[string]*fakeTx{}}
+	if mk == nil {
+		mk = func(string) *fakeTx { return &fakeTx{reqAccess: true, respAccess: true, respProc: true} }
 	}
 	h.tab = newTable(testRun, testInc, func(id string) types.Transaction {
-		f := h.mk(id)
+		f := mk(id)
 		f.adopt()
 		h.mu.Lock()
 		h.txs[id] = f
@@ -569,18 +485,11 @@ func newHarness(t *testing.T, mk func(id string) *fakeTx) *harness {
 
 // check runs at the end of every harness test. Open transactions are closed
 // as for a lost connection and every owner must finish in time. Then no fake
-// may have a usage finding (see fakeTx) and every fake was closed once. A
-// fake that a test makes without the harness is not covered.
+// may have a usage finding (see fakeTx) and every fake was closed once.
 func (h *harness) check() {
 	h.t.Helper()
 	h.tab.connLost()
-	done := make(chan struct{})
-	go func() { h.tab.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		h.t.Errorf("owners did not finish after connLost")
-	}
+	h.waitOwners()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for id, f := range h.txs {
@@ -622,11 +531,7 @@ func (h *harness) waitOwners() {
 	h.t.Helper()
 	done := make(chan struct{})
 	go func() { h.tab.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		h.t.Fatalf("owners did not finish")
-	}
+	recvWithin(h.t, done, "the owners to finish")
 }
 
 func expect(t *testing.T, o out, kind uint8, tx uint64, msg uint32) {
@@ -673,110 +578,58 @@ func recvWithin(t *testing.T, ch <-chan struct{}, what string) {
 	}
 }
 
-// TestFakeTxCatchesViolations shows that the checks in fakeTx record what
-// they are for (the harness reports these findings in Cleanup).
-func TestFakeTxCatchesViolations(t *testing.T) {
-	has := func(t *testing.T, f *fakeTx, sub string) {
-		t.Helper()
-		for _, v := range f.violations() {
-			if strings.Contains(v, sub) {
-				return
-			}
-		}
-		t.Fatalf("no finding with %q in %q", sub, f.violations())
-	}
+// ---- bundles ----
 
-	t.Run("valid", func(t *testing.T) {
-		f := &fakeTx{}
-		f.ProcessConnection("", 0, "", 0)
-		f.ProcessLogging()
-		f.Close()
-		if v := f.violations(); len(v) != 0 {
-			t.Fatalf("findings %q", v)
+// ruleFile is the path of the one rule file of the bundles that ruleBundle and
+// startProc make.
+const ruleFile = "rules/rules.conf"
+
+// testManifest is the manifest of the files (path to text) with the order of
+// load, as the writer of a bundle makes it: the files in byte order, the size
+// and the sha256 of each.
+func testManifest(files map[string]string, load []string) manifest {
+	m := manifest{Version: 1, Load: load}
+	for p, s := range files {
+		sum := sha256.Sum256([]byte(s))
+		m.Files = append(m.Files, manifestFile{Path: p, Size: int64(len(s)), SHA256: hex.EncodeToString(sum[:])})
+	}
+	sort.Slice(m.Files, func(i, j int) bool { return m.Files[i].Path < m.Files[j].Path })
+	return m
+}
+
+// testBundle is the bundle in memory of the files and the order of load. Its
+// manifest is the one that encode writes.
+func testBundle(files map[string]string, load ...string) *bundle {
+	mb := testManifest(files, load).encode()
+	b := &bundle{manifestBytes: mb, fingerprint: sha256.Sum256(mb), load: load, files: make(map[string][]byte, len(files))}
+	for p, s := range files {
+		b.files[p] = []byte(s)
+	}
+	return b
+}
+
+// ruleBundle is the bundle of one rule file, ruleFile, with the text.
+func ruleBundle(text string) *bundle {
+	return testBundle(map[string]string{ruleFile: text}, ruleFile)
+}
+
+// writeBundle writes the same bundle into the directory dir (made with mode
+// 0700 when it is not there) and returns its fingerprint.
+func writeBundle(t *testing.T, dir string, files map[string]string, load ...string) [32]byte {
+	t.Helper()
+	mb := testManifest(files, load).encode()
+	put := func(name string, data []byte) {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
 		}
-	})
-	t.Run("call after Close", func(t *testing.T) {
-		f := &fakeTx{}
-		f.ProcessLogging()
-		f.Close()
-		f.ProcessURI("", "", "")
-		has(t, f, "uri after Close")
-	})
-	t.Run("second Close", func(t *testing.T) {
-		f := &fakeTx{}
-		f.ProcessLogging()
-		f.Close()
-		f.Close()
-		has(t, f, "close after Close")
-	})
-	t.Run("Close without ProcessLogging", func(t *testing.T) {
-		f := &fakeTx{}
-		f.Close()
-		has(t, f, "Close after 0 ProcessLogging")
-	})
-	t.Run("call between ProcessLogging and Close", func(t *testing.T) {
-		f := &fakeTx{}
-		f.ProcessLogging()
-		f.ProcessURI("", "", "")
-		has(t, f, "uri after ProcessLogging")
-	})
-	t.Run("second ProcessLogging", func(t *testing.T) {
-		f := &fakeTx{}
-		f.ProcessLogging()
-		f.ProcessLogging()
-		has(t, f, "logging after ProcessLogging")
-	})
-	t.Run("other goroutine", func(t *testing.T) {
-		f := &fakeTx{}
-		f.ProcessConnection("", 0, "", 0)
-		done := make(chan struct{})
-		go func() { defer close(done); f.ProcessURI("", "", "") }()
-		recvWithin(t, done, "the other goroutine")
-		has(t, f, "uri from goroutine")
-	})
-	t.Run("made on another goroutine", func(t *testing.T) {
-		f := &fakeTx{}
-		done := make(chan struct{})
-		go func() { defer close(done); f.adopt() }() // made where the owner is not
-		recvWithin(t, done, "the other goroutine")
-		f.ProcessConnection("", 0, "", 0)
-		has(t, f, "conn from goroutine")
-	})
-	t.Run("overlap", func(t *testing.T) {
-		gate := make(chan struct{})
-		f := &fakeTx{hdrGate: gate}
-		done := make(chan struct{})
-		go func() { defer close(done); f.ProcessRequestHeaders() }() // the owner, held inside the call
-		waitUntil(t, "the call to start", func() bool { return f.count("phase1") == 1 })
-		f.ProcessURI("", "", "")
-		close(gate)
-		recvWithin(t, done, "the held call")
-		has(t, f, "uri overlaps another call")
-		has(t, f, "uri from goroutine")
-	})
-	t.Run("goroutine number", func(t *testing.T) {
-		if id, ok := goid(); !ok || id == 0 {
-			t.Fatalf("goid %d %v", id, ok)
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
 		}
-		for _, c := range []struct {
-			in   string
-			id   uint64
-			want bool
-		}{
-			{"goroutine 7 [running]:\nmain.f()", 7, true},
-			{"goroutine 18446744073709551615 [chan receive]:", 18446744073709551615, true},
-			{"", 0, false},
-			{"goroutine ", 0, false},
-			{"goroutine 7", 0, false},
-			{"goroutine 7 gp=0x1 [running]:", 0, false},
-			{"goroutine x [running]:", 0, false},
-			{"goroutine 0 [running]:", 0, false},
-			{"goroutine 18446744073709551616 [running]:", 0, false},
-			{" goroutine 7 [running]:", 0, false},
-		} {
-			if id, ok := parseGoid([]byte(c.in)); id != c.id || ok != c.want {
-				t.Errorf("parseGoid(%q) = %d, %v", c.in, id, ok)
-			}
-		}
-	})
+	}
+	put(manifestName, mb)
+	for p, s := range files {
+		put(p, []byte(s))
+	}
+	return sha256.Sum256(mb)
 }

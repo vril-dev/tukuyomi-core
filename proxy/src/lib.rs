@@ -8,3 +8,4 @@ pub mod host;
 pub mod inbound;
 pub mod inspect;
 pub mod log;
+pub mod rules;

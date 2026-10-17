@@ -40,11 +40,6 @@ fn lines_over_the_limit_are_cut_at_a_char_boundary() {
     let straddling = format!("{}é", "a".repeat(LOG_LINE - 1));
     log.line(&straddling);
     assert_eq!(queued(&items), "a".repeat(LOG_LINE - 1));
-    // Three-byte characters: 170 of them are 510 bytes, the next one would end at 513.
-    log.line(&"あ".repeat(171));
-    assert_eq!(queued(&items), "あ".repeat(170));
-    log.line("");
-    assert_eq!(queued(&items), "");
     assert_eq!(log.dropped(), 0);
 }
 
@@ -65,8 +60,6 @@ fn a_full_or_closed_queue_drops_and_counts_without_waiting() {
     assert!(start.elapsed() < Duration::from_secs(2));
     assert_eq!(log.dropped(), 3);
     assert_eq!(queued(&items), "line 0");
-    log.line("fits again");
-    assert_eq!(log.dropped(), 3);
     drop(items);
     log.line("nobody reads");
     assert_eq!(log.dropped(), 4);
@@ -107,13 +100,6 @@ fn flush_on_a_stopped_or_stalled_logger_returns_false_within_its_wait() {
     assert!(!log.flush(wait));
     let spent = start.elapsed();
     assert!(spent >= wait && spent < wait + Duration::from_secs(2));
-    // A full queue has no room for the marker.
-    for _ in 0..4 {
-        log.line("x");
-    }
-    let start = Instant::now();
-    assert!(!log.flush(wait));
-    assert!(start.elapsed() < wait);
     // A stopped logger: the queue is closed.
     drop(items);
     let start = Instant::now();

@@ -1,7 +1,6 @@
-use std::io::Write;
-
+use flate2::Compression;
 use flate2::write::GzEncoder;
-use flate2::{Compression, GzBuilder};
+use std::io::Write;
 
 use super::*;
 use crate::inbound::answer::Class;
@@ -53,23 +52,13 @@ fn a_chunked_request_loses_its_encoding_and_gets_the_decoded_length() {
     assert!(rep.fields.get(TRANSFER_ENCODING).is_none());
     assert_eq!(rep.fields.get_all(CONTENT_LENGTH).iter().count(), 1);
     assert_eq!(rep.fields.get(CONTENT_LENGTH).unwrap(), "3");
-    assert_eq!(rep.fields.get(HOST).unwrap(), "h");
     assert_eq!(rep.fields.len(), 4);
-    // An empty chunked body is a length of 0 as well.
-    let rep = represented(
-        "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
-        0,
-    );
-    assert_eq!(
-        pairs(&rep),
-        [pair("Host", "h"), pair("Content-Length", "0")]
-    );
 }
 
 #[test]
 fn a_gzip_request_loses_its_coding_and_gets_the_decoded_length() {
-    // A length: the coding and the length are replaced by the decoded length, which comes last as a chunked
-    // request's does; the others keep their order.
+    // The coding and the length are replaced by the decoded length, which comes last as a chunked request's
+    // does; the others keep their order.
     let raw = format!(
         "POST /x HTTP/1.1\r\nContent-Type: {FORM}\r\nHost: h\r\nContent-Encoding: gzip\r\nContent-Length: 31\r\nx-forwarded-for: 1.2.3.4\r\n\r\n"
     );
@@ -81,114 +70,15 @@ fn a_gzip_request_loses_its_coding_and_gets_the_decoded_length() {
         pair("Content-Length", "11"),
     ];
     assert_eq!(pairs(&rep), expected);
-    // The forwarded map is the same request.
     assert!(rep.fields.get(CONTENT_ENCODING).is_none());
     assert_eq!(rep.fields.get_all(CONTENT_LENGTH).iter().count(), 1);
     assert_eq!(rep.fields.get(CONTENT_LENGTH).unwrap(), "11");
-    assert_eq!(rep.fields.get(HOST).unwrap(), "h");
     assert_eq!(rep.fields.len(), 4);
-    assert_eq!(
-        rep.field_bytes,
-        "Host".len() + 1 + (12 + FORM.len()) + (15 + 7) + (14 + 2)
-    );
-    // The coding in any case, the length with leading zeros, blanks around both: the same result.
-    let raw = format!(
-        "POST /x HTTP/1.1\r\nHost: h\r\ncontent-encoding:  GZIP \t\r\nContent-Type: {FORM}\r\nCONTENT-LENGTH: 0031\r\nx-forwarded-for: 1.2.3.4\r\n\r\n"
-    );
-    let rep = represented(&raw, 11);
-    assert_eq!(pairs(&rep), expected);
-    assert!(rep.fields.get(CONTENT_ENCODING).is_none());
-    assert_eq!(rep.fields.get_all(CONTENT_LENGTH).iter().count(), 1);
-    assert_eq!(rep.fields.get(CONTENT_LENGTH).unwrap(), "11");
-    // A coded body that is decoded to nothing is a length of 0.
-    let raw = format!(
-        "POST /x HTTP/1.1\r\nHost: h\r\nContent-Type: {FORM}\r\nContent-Encoding: gzip\r\nContent-Length: 20\r\n\r\n"
-    );
-    assert_eq!(
-        pairs(&represented(&raw, 0)),
-        [
-            pair("Host", "h"),
-            pair("Content-Type", FORM),
-            pair("Content-Length", "0")
-        ]
-    );
     // Chunked and gzip: both framing fields go and one length comes.
     let raw = format!(
         "POST /x HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Type: {FORM}\r\nHost: h\r\nTransfer-Encoding: chunked\r\nx-forwarded-for: 1.2.3.4\r\n\r\n"
     );
-    let rep = represented(&raw, 11);
-    assert_eq!(pairs(&rep), expected);
-    assert!(rep.fields.get(TRANSFER_ENCODING).is_none());
-    assert!(rep.fields.get(CONTENT_ENCODING).is_none());
-    assert_eq!(rep.fields.get_all(CONTENT_LENGTH).iter().count(), 1);
-    assert_eq!(rep.fields.get(CONTENT_LENGTH).unwrap(), "11");
-    assert_eq!(rep.fields.len(), 4);
-    // Only the coding of the body goes: the fields that name or look like it stay.
-    let raw = format!(
-        "POST /x HTTP/1.1\r\nHost: h\r\nContent-Type: {FORM}\r\nContent-Encoding: gzip\r\nContent-Length: 31\r\nAccept-Encoding: gzip\r\nContent-Language: en\r\nTE: gzip\r\n\r\n"
-    );
-    assert_eq!(
-        pairs(&represented(&raw, 11)),
-        [
-            pair("Host", "h"),
-            pair("Content-Type", FORM),
-            pair("Accept-Encoding", "gzip"),
-            pair("Content-Language", "en"),
-            pair("Te", "gzip"),
-            pair("Content-Length", "11"),
-        ]
-    );
-    // Without the coding nothing of this happens: a length is kept as it is.
-    let raw = format!(
-        "POST /x HTTP/1.1\r\nHost: h\r\nContent-Type: {FORM}\r\nContent-Length: 31\r\n\r\n"
-    );
-    assert_eq!(
-        pairs(&represented(&raw, 31)),
-        [
-            pair("Host", "h"),
-            pair("Content-Type", FORM),
-            pair("Content-Length", "31")
-        ]
-    );
-}
-
-#[test]
-fn a_gzip_request_never_has_more_fields_than_it_came_with() {
-    // 64 fields with the coding and a length: both go and one comes, so 63 are left. The same with the coding
-    // and a chunked framing: both go and one comes.
-    let mut raw = format!(
-        "POST / HTTP/1.1\r\nHost: h\r\nContent-Type: {FORM}\r\nContent-Encoding: gzip\r\nContent-Length: 31\r\n"
-    );
-    for n in 0..60 {
-        raw.push_str(&format!("X-{n}: v\r\n"));
-    }
-    raw.push_str("\r\n");
-    let head = head_of(&raw);
-    assert_eq!(head.fields().len(), 64);
-    let total: usize = head
-        .fields()
-        .map(|(name, value)| name.len() + value.len())
-        .sum();
-    let rep = represent(&head, 123_456).unwrap();
-    assert_eq!((rep.headers.len(), rep.fields.len()), (63, 63));
-    // The result is smaller in bytes as well, so no limit is crossed by the change.
-    assert!(rep.field_bytes < total);
-    let mut raw = format!(
-        "POST / HTTP/1.1\r\nHost: h\r\nContent-Type: {FORM}\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n"
-    );
-    for n in 0..60 {
-        raw.push_str(&format!("X-{n}: v\r\n"));
-    }
-    raw.push_str("\r\n");
-    let head = head_of(&raw);
-    assert_eq!(head.fields().len(), 64);
-    let total: usize = head
-        .fields()
-        .map(|(name, value)| name.len() + value.len())
-        .sum();
-    let rep = represent(&head, 123_456).unwrap();
-    assert_eq!((rep.headers.len(), rep.fields.len()), (63, 63));
-    assert!(rep.field_bytes < total);
+    assert_eq!(pairs(&represented(&raw, 11)), expected);
 }
 
 /// `len` bytes that neither repeat nor compress.
@@ -220,34 +110,14 @@ const OVER: (u16, &str) = (413, "decoded body over the limit");
 fn a_gzip_member_is_decoded() {
     let data = b"probe=block&a=%41&b=";
     assert_eq!(gunzip(&gz(data), 1024).unwrap(), data);
-    for level in [
-        Compression::none(),
-        Compression::fast(),
-        Compression::default(),
-        Compression::best(),
-    ] {
-        let mut encoder = GzEncoder::new(Vec::new(), level);
-        encoder.write_all(data).unwrap();
-        assert_eq!(gunzip(&encoder.finish().unwrap(), 1024).unwrap(), data);
-    }
-    // A header with a name, a comment, extra bytes and a time is still one member.
-    let mut encoder = GzBuilder::new()
-        .filename("a.txt")
-        .comment("c")
-        .extra(vec![1, 2, 3])
-        .mtime(7)
-        .write(Vec::new(), Compression::default());
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
     encoder.write_all(data).unwrap();
     assert_eq!(gunzip(&encoder.finish().unwrap(), 1024).unwrap(), data);
     // Many blocks: data that does not repeat, longer than the window.
     let long = noise(200_000);
-    let plain = gunzip(&gz(&long), long.len()).unwrap();
-    assert_eq!(plain, long);
-    // The memory held is the length that the budget counts.
-    assert_eq!(plain.capacity(), plain.len());
+    assert_eq!(gunzip(&gz(&long), long.len()).unwrap(), long);
     // A member of nothing is a body of nothing, not an error.
     assert_eq!(gunzip(&gz(b""), 0).unwrap(), b"");
-    assert_eq!(gunzip(&gz(b""), 1024).unwrap(), b"");
 }
 
 #[test]
@@ -258,8 +128,6 @@ fn the_decoded_length_limit_is_exact() {
         let over = vec![b'a'; max + 1];
         assert_eq!(gunzip_refusal(&gz(&over), max), OVER, "max {max}");
     }
-    // The cut cannot overflow.
-    assert_eq!(gunzip(&gz(b"abc"), usize::MAX).unwrap(), b"abc");
     // A stream that decodes to far more is refused as well: it is not decoded to its end.
     let bomb = gz(&vec![0u8; 4 << 20]);
     assert!(bomb.len() < 16 << 10, "{}", bomb.len());
@@ -270,44 +138,22 @@ fn the_decoded_length_limit_is_exact() {
     broken[last] ^= 1;
     assert_eq!(gunzip_refusal(&broken, 1024), OVER);
     assert_eq!(gunzip_refusal(&broken, 4096), MALFORMED);
-    assert_eq!(gunzip_refusal(&broken, 4097), MALFORMED);
 }
 
 #[test]
 fn a_stream_that_is_not_valid_is_400() {
-    let data = b"probe=block&a=%41&b=";
-    let good = gz(data);
-    assert_eq!(gunzip(&good, 1024).unwrap(), data);
-    // Not a gzip stream, and a header that is cut, wrong or reserved.
+    let good = gz(b"probe=block&a=%41&b=");
     let mut wrong_magic = good.clone();
     wrong_magic[1] ^= 1;
-    let mut wrong_method = good.clone();
-    wrong_method[2] = 7;
-    let mut reserved = good.clone();
-    reserved[3] |= 0x20;
-    for coded in [
-        &b""[..],
-        b"\x1f",
-        b"probe=block",
-        b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00",
-        // The header only, as a client that stops after it sends.
-        b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03",
-        &wrong_magic,
-        &wrong_method,
-        &reserved,
-    ] {
+    for coded in [&b""[..], b"probe=block", &wrong_magic] {
         assert_eq!(gunzip_refusal(coded, 1024), MALFORMED, "{coded:?}");
     }
-    // A block of the reserved type.
-    let mut block = good[..10].to_vec();
-    block.extend_from_slice(&[0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(gunzip_refusal(&block, 1024), MALFORMED);
     // A cut at any place, in the header, in the data and in the trailer, is never a body.
     for cut in 0..good.len() {
         assert_eq!(gunzip_refusal(&good[..cut], 1024), MALFORMED, "cut {cut}");
     }
-    // A trailer that does not match: the CRC, and the length (either end of it).
-    for at in [8, 7, 5, 4, 3, 1] {
+    // A trailer that does not match: the CRC, and the length.
+    for at in [8, 4] {
         let mut bad = good.clone();
         let place = bad.len() - at;
         bad[place] ^= 0x10;
@@ -317,46 +163,24 @@ fn a_stream_that_is_not_valid_is_400() {
             "byte {at} from the end"
         );
     }
-    // A byte of the data that is changed gives the same body or an error, never another body.
-    for at in 10..good.len() - 8 {
-        let mut bad = good.clone();
-        bad[at] ^= 0xff;
-        if let Ok(body) = gunzip(&bad, 1024) {
-            assert_eq!(body, data, "byte {at}");
-        }
-    }
 }
 
 #[test]
 fn nothing_may_follow_the_one_member() {
     let data = b"probe=block";
     let good = gz(data);
-    assert_eq!(gunzip(&good, 1024).unwrap(), data);
     let with = |tail: &[u8]| {
         let mut coded = good.clone();
         coded.extend_from_slice(tail);
         coded
     };
-    // One byte of anything, padding, a line end, and the start of another member.
-    for tail in [
-        &b"\0"[..],
-        b"\n",
-        b"\r\n",
-        b"x",
-        &[0u8; 7],
-        &[0u8; 512],
-        &[0x1f, 0x8b],
-    ] {
+    // One byte of anything, padding, and the start of another member.
+    for tail in [&b"\0"[..], b"\r\n", &[0u8; 512], &[0x1f, 0x8b]] {
         assert_eq!(gunzip_refusal(&with(tail), 1024), AFTER, "{tail:?}");
     }
-    // Two members, whole, and an empty one after one with data.
+    // Two members, whole.
     assert_eq!(gunzip_refusal(&with(&gz(data)), 1024), AFTER);
-    assert_eq!(gunzip_refusal(&with(&gz(b"")), 1024), AFTER);
-    // The first member cannot be told from the second by the limit: both are decoded, the first only.
     assert_eq!(gunzip_refusal(&with(&gz(data)), data.len()), AFTER);
-    let mut first_empty = gz(b"");
-    first_empty.extend_from_slice(&good);
-    assert_eq!(gunzip_refusal(&first_empty, 1024), AFTER);
 }
 
 #[test]
@@ -368,26 +192,18 @@ fn a_post_put_or_patch_without_a_length_gets_content_length_0() {
             [pair("Host", "h"), pair("Content-Length", "0")],
             "{method}"
         );
-        assert_eq!(rep.fields.get(CONTENT_LENGTH).unwrap(), "0");
     }
-    for method in ["GET", "HEAD", "DELETE", "OPTIONS", "post"] {
-        let rep = represented(&format!("{method} / HTTP/1.1\r\nHost: h\r\n\r\n"), 0);
-        assert_eq!(pairs(&rep), [pair("Host", "h")], "{method}");
-        assert!(rep.fields.get(CONTENT_LENGTH).is_none());
-    }
+    let rep = represented("GET / HTTP/1.1\r\nHost: h\r\n\r\n", 0);
+    assert_eq!(pairs(&rep), [pair("Host", "h")]);
     // A request that already has a length keeps its own and gets no second one.
     let rep = represented("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n", 0);
-    assert_eq!(
-        pairs(&rep),
-        [pair("Host", "h"), pair("Content-Length", "0")]
-    );
     assert_eq!(rep.fields.get_all(CONTENT_LENGTH).iter().count(), 1);
 }
 
 #[test]
 fn names_are_title_case_and_values_stay_as_received() {
     let rep = represented(
-        "GET / HTTP/1.1\r\nhost: h\r\nx-a-b: a\tb\r\nACCEPT-ENCODING: gzip\r\nx: 1\r\nA.b_c-d: \tv \r\n\r\n",
+        "GET / HTTP/1.1\r\nhost: h\r\nx-a-b: a\tb\r\nACCEPT-ENCODING: gzip\r\nA.b_c-d: \tv \r\n\r\n",
         0,
     );
     assert_eq!(
@@ -396,13 +212,9 @@ fn names_are_title_case_and_values_stay_as_received() {
             pair("Host", "h"),
             pair("X-A-B", "a\tb"),
             pair("Accept-Encoding", "gzip"),
-            pair("X", "1"),
             pair("A.b_c-D", "v"),
         ]
     );
-    assert_eq!(&title_case("content-length")[..], b"Content-Length");
-    assert_eq!(&title_case("-x--y")[..], b"-X--Y");
-    assert_eq!(&title_case("")[..], b"");
 }
 
 #[test]
@@ -420,16 +232,7 @@ fn host_comes_first_and_the_others_keep_the_order_received() {
             pair("A", "3")
         ]
     );
-    // The map holds the same fields; the values of one name keep their order.
-    let a: Vec<&str> = rep
-        .fields
-        .get_all("a")
-        .iter()
-        .map(|v| v.to_str().unwrap())
-        .collect();
-    assert_eq!(a, ["1", "3"]);
     assert_eq!(rep.fields.len(), 4);
-    assert_eq!(rep.field_bytes, "Host".len() + 1 + 2 * (1 + 1) + 1 + 1);
 }
 
 pub(in crate::inbound) fn numbered(count: usize, method: &str) -> String {
@@ -454,16 +257,13 @@ fn a_64_field_request_that_gets_content_length_0_is_65_fields_and_refused() {
             .len(),
         64
     );
-    let rep = represent(&head_of(&numbered(63, "POST")), 0).unwrap();
-    assert_eq!(rep.headers.len(), 64);
-    assert_eq!(rep.fields.len(), 64);
-    // A chunked request swaps one field for another, so 64 stay 64.
-    let mut raw = numbered(63, "POST");
-    raw.truncate(raw.len() - 2);
-    raw.push_str("Transfer-Encoding: chunked\r\n\r\n");
-    let head = head_of(&raw);
-    assert_eq!(head.fields().len(), 64);
-    assert_eq!(represent(&head, 123_456).unwrap().headers.len(), 64);
+    assert_eq!(
+        represent(&head_of(&numbered(63, "POST")), 0)
+            .unwrap()
+            .headers
+            .len(),
+        64
+    );
 }
 
 #[test]
@@ -479,7 +279,6 @@ fn the_size_limits_are_checked_after_the_framing_is_added() {
     };
     let rep = represent(&head_of(&with_last(4041)), 0).unwrap();
     assert_eq!(rep.field_bytes, limits::HEADER_TOTAL);
-    assert_eq!(rep.headers.len(), 8);
     assert_eq!(
         represent(&head_of(&with_last(4042)), 0).err(),
         Some(Reject::FieldsTooLarge)

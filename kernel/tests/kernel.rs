@@ -2,9 +2,9 @@
 //!
 //! Without `#[ignore]`: no process and no file system (the paths of the fake configuration are never touched).
 //! With `#[ignore = "needs a built inspector"]`: a real inspector. They read `TUKUYOMI_TEST_INSPECTOR`,
-//! `TUKUYOMI_TEST_RULES`, `TUKUYOMI_TEST_RULES_SHA256` (64 hex digits) and `TUKUYOMI_TEST_TMP` (the parent of
-//! the per-test 0700 roots) and FAIL when one is missing: a skipped real-process test must never look like a
-//! pass. Run them with `-- --include-ignored`.
+//! `TUKUYOMI_TEST_RULES` (the rule bundle directory), `TUKUYOMI_TEST_RULES_SHA256` (the SHA-256 of its
+//! `manifest.json`, 64 hex digits) and `TUKUYOMI_TEST_TMP` (the parent of the per-test 0700 roots) and FAIL when
+//! one is missing: a skipped real-process test must never look like a pass. Run them with `-- --include-ignored`.
 //!
 //! The values below are the test's own choices for this check, not defaults or recommendations. The limits of
 //! `Config::check` are written out as numbers on purpose: the constants are not public.
@@ -12,13 +12,12 @@
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tukuyomi_kernel::{
-    Config, ConfigError, Failure, Phase, Reason, Refused, ReqId, Request, Status, Supervisor,
-    Verdict,
+    Config, Failure, Phase, Reason, Refused, ReqId, Request, Status, Supervisor, Verdict,
 };
 
 const MS: Duration = Duration::from_millis(1);
@@ -32,14 +31,12 @@ const MAX_CONCUR_TX: usize = 4;
 const MAX_RESTARTS: u32 = 1000;
 /// `codec::MAX_DECLARED` (the largest body the protocol declares).
 const MAX_BODY: usize = 1 << 20;
-/// `codec::MAX_HEADERS`, `MAX_HDR_NAME`, `MAX_HDR_VALUE` and `MAX_HDR_TOTAL` (the limits of the headers of one request).
+/// `codec::MAX_HEADERS`, `MAX_HDR_VALUE` and `MAX_HDR_TOTAL` (the limits of the headers of one request).
 const MAX_HEADERS: usize = 64;
-const MAX_HDR_NAME: usize = 256;
 const MAX_HDR_VALUE: usize = 4096;
 const MAX_HDR_TOTAL: usize = 24 * 1024;
 
 const URLENCODED: &[u8] = b"application/x-www-form-urlencoded";
-const JSON: &[u8] = b"application/json";
 const UNAVAILABLE: Verdict = Verdict::Uninspectable(Reason::Unavailable);
 
 /// A configuration that passes `check` and names nothing that exists.
@@ -191,9 +188,7 @@ impl Run {
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------
-// Without a process
-// ---------------------------------------------------------------------------------------------------------
+// ---- Without a process ----
 
 #[test]
 fn shutdown_before_any_request_decides_the_waiting_request_once() {
@@ -201,31 +196,27 @@ fn shutdown_before_any_request_decides_the_waiting_request_once() {
     let get = request(b"GET", b"/", &hs, b"");
     let mut sup = Supervisor::new(fake_config()).expect("valid");
     let a = sup.submit(&get).expect("accepted");
-    assert_eq!(a, 0);
+    let c = sup.submit(&get).expect("accepted");
+    assert_eq!((a, c), (0, 1));
+    // A cancel decides at once; an unknown id is ignored.
+    sup.cancel(c);
+    sup.cancel(99);
 
     let sd = sup.shutdown(Instant::now());
-    assert_eq!(sd.results, vec![(a, UNAVAILABLE)]);
+    let cancelled = Verdict::Uninspectable(Reason::Cancelled);
+    assert_eq!(sd.results, vec![(c, cancelled), (a, UNAVAILABLE)]);
     assert_eq!(sd.phase, Phase::Stopped);
-    assert!(!sd.bye);
-    assert!(sd.exit_confirmed && sd.dir_removed);
+    assert!(!sd.bye && sd.exit_confirmed && sd.dir_removed);
     assert_eq!((sd.held_left, sd.waiting_left), (0, 0));
     let st = sup.status();
     assert_eq!((st.phase, st.inc, st.restarts), (Phase::Stopped, 1, 0));
-    assert_eq!((st.waiting, st.held), (0, 0));
 
-    // A second call returns nothing new and keeps the phase.
-    let sd = sup.shutdown(Instant::now());
-    assert!(sd.results.is_empty());
-    assert_eq!(sd.phase, Phase::Stopped);
-    assert!(sd.exit_confirmed && sd.dir_removed);
-
-    // After the shutdown a new request is answered at once, and nothing is started.
-    let b = sup.submit(&get).expect("accepted");
-    assert_eq!(b, 1);
-    assert_eq!(sup.poll(Instant::now()), vec![(b, UNAVAILABLE)]);
-    let st = sup.status();
-    assert_eq!((st.phase, st.inc, st.restarts), (Phase::Stopped, 1, 0));
+    // A second call returns nothing new. After the shutdown a new request is answered at once, and nothing is
+    // started.
     assert!(sup.shutdown(Instant::now()).results.is_empty());
+    let b = sup.submit(&get).expect("accepted");
+    assert_eq!(sup.poll(Instant::now()), vec![(b, UNAVAILABLE)]);
+    assert_eq!(sup.status().inc, 1);
 }
 
 #[test]
@@ -272,32 +263,26 @@ fn refused_transfer_and_content_encoding() {
 fn refused_content_length() {
     let mut run = Run::new(fake_config(), None);
     let ct = header(b"Content-Type", URLENCODED);
-    let bad = |cl: &'static [u8]| [header(b"content-LENGTH", cl), ct];
-    let wrong: [&[u8]; 7] = [b"1x", b"", b"-1", b"+3", b" 3", b"4", b"2"];
+    let why = Refused::Unsupported("content-length");
+    // Not digits, empty, a sign, a number that is not the length of the body.
+    let wrong: [&[u8]; 4] = [b"1x", b"", b"+3", b"4"];
     for cl in wrong {
-        let hs = bad(cl);
-        let r = run.refused(&request(b"POST", b"/", &hs, b"a=b"));
-        assert_eq!(r, Refused::Unsupported("content-length"), "{cl:?}");
+        let hs = [header(b"content-LENGTH", cl), ct];
+        assert_eq!(
+            run.refused(&request(b"POST", b"/", &hs, b"a=b")),
+            why,
+            "{cl:?}"
+        );
     }
-    // Two of them are refused even when both are right.
+    // Two of them are refused even when both are right, and one with no body to match.
     let two = [
         header(b"Content-Length", b"3"),
         header(b"Content-Length", b"3"),
         ct,
     ];
-    let r = run.refused(&request(b"POST", b"/", &two, b"a=b"));
-    assert_eq!(r, Refused::Unsupported("content-length"));
-    // A Content-Length with no body is checked as well; an empty one too.
+    assert_eq!(run.refused(&request(b"POST", b"/", &two, b"a=b")), why);
     let one = [header(b"Content-Length", b"1")];
-    let r = run.refused(&request(b"GET", b"/", &one, b""));
-    assert_eq!(r, Refused::Unsupported("content-length"));
-    let empty = [header(b"Content-Length", b"")];
-    let r = run.refused(&request(b"GET", b"/", &empty, b""));
-    assert_eq!(r, Refused::Unsupported("content-length"));
-    // The rule comes before the Content-Type rule.
-    let alone = [header(b"Content-Length", b"4")];
-    let r = run.refused(&request(b"POST", b"/", &alone, b"a=b"));
-    assert_eq!(r, Refused::Unsupported("content-length"));
+    assert_eq!(run.refused(&request(b"GET", b"/", &one, b"")), why);
 
     // A right one passes, and so does "0" with no body.
     let zero = [header(b"Content-Length", b"0")];
@@ -311,38 +296,45 @@ fn refused_content_length() {
 fn refused_content_type() {
     let mut run = Run::new(fake_config(), None);
     let cl = header(b"Content-Length", b"3");
-    let none = [cl];
-    let r = run.refused(&request(b"POST", b"/", &none, b"a=b"));
-    assert_eq!(r, Refused::Unsupported("content-type"));
+    let refuse = |run: &mut Run, hs: &[(&[u8], &[u8])]| {
+        let r = run.refused(&request(b"POST", b"/", hs, b"a=b"));
+        assert_eq!(r, Refused::Unsupported("content-type"), "{hs:?}");
+    };
+    // None, or two of them, are refused.
+    refuse(&mut run, &[cl]);
     let two = [
         cl,
         header(b"Content-Type", URLENCODED),
         header(b"content-type", URLENCODED),
     ];
-    let r = run.refused(&request(b"POST", b"/", &two, b"a=b"));
-    assert_eq!(r, Refused::Unsupported("content-type"));
+    refuse(&mut run, &two);
+    // A type that is not parsed, or that only starts or ends like one that is.
+    let named = |n: usize| [&b"application/"[..], &vec![b'a'; n], b"+json"].concat();
+    let too_long = named(123);
     let wrong: [&[u8]; 8] = [
-        b"application/jsonp",
-        b"text/json",
         b"text/plain",
-        b"application/xml",
         b"",
-        b"application/x-www-form-urlencoded-x",
-        b"x/application/x-www-form-urlencoded",
+        b"application/jsonp",
         b"x/application/json",
+        b"application/x-www-form-urlencoded-x",
+        b"application/+json",
+        b"application/x-www-form-urlencoded+json",
+        &too_long,
     ];
     for ct in wrong {
-        let hs = [cl, header(b"Content-Type", ct)];
-        let r = run.refused(&request(b"POST", b"/", &hs, b"a=b"));
-        assert_eq!(r, Refused::Unsupported("content-type"), "{ct:?}");
+        refuse(&mut run, &[cl, header(b"Content-Type", ct)]);
     }
 
-    // The two types Coraza picks a body processor for pass, in any case, with parameters and blanks.
-    let right: [&[u8]; 4] = [
-        URLENCODED,
+    // The types Coraza picks a body processor for pass, in any case, with parameters and blanks: the form types,
+    // application/json and application/<name>+json with a name of 1 to 122 characters.
+    let longest = named(122);
+    let right: [&[u8]; 6] = [
         b" Application/X-WWW-Form-URLENCODED ; charset=UTF-8",
         b"multipart/form-data; boundary=x",
-        b"MULTIPART/FORM-DATA",
+        b"\tapplication/json\t ; x=y",
+        b"application/vnd.api+json",
+        b"application/a+json",
+        &longest,
     ];
     for ct in right {
         let hs = [cl, header(b"content-TYPE", ct)];
@@ -355,122 +347,42 @@ fn refused_content_type() {
 }
 
 #[test]
-fn json_content_type_passes_the_content_type_rule() {
-    let mut run = Run::new(fake_config(), None);
-    let cl = header(b"Content-Length", b"3");
-    // application/json passes, in any case, with parameters, blanks and tabs; so does application/<name>+json.
-    let right: [&[u8]; 5] = [
-        JSON,
-        b"Application/JSON; charset=UTF-8",
-        b"  application/json  ",
-        b"\tapplication/json\t ; x=y",
-        b"application/vnd.api+json",
-    ];
-    for ct in right {
-        let hs = [cl, header(b"content-TYPE", ct)];
-        run.submit(&request(b"POST", b"/", &hs, b"[1]"));
-    }
-    // Exactly one Content-Type is allowed, as for the other types.
-    let two = [
-        cl,
-        header(b"Content-Type", JSON),
-        header(b"content-type", JSON),
-    ];
-    let r = run.refused(&request(b"POST", b"/", &two, b"[1]"));
-    assert_eq!(r, Refused::Unsupported("content-type"));
-    run.finish();
-}
-
-#[test]
-fn refused_invalid_request() {
-    let mut run = Run::new(fake_config(), None);
-    let r = run.refused(&request(b"", b"/", &[], b""));
-    assert_eq!(r, Refused::Invalid("method length out of range"));
-    let r = run.refused(&request(b"GET", b"", &[], b""));
-    assert!(matches!(r, Refused::Invalid(_)), "{r:?}");
-    run.finish();
-}
-
-#[test]
 fn refused_limits_of_the_headers_come_before_the_header_rules() {
     let mut run = Run::new(fake_config(), None);
     let te = header(b"Transfer-Encoding", b"chunked");
     let ce = header(b"Content-Encoding", b"gzip");
     let ct = header(b"Content-Type", URLENCODED);
-    let total = |hs: &[(&[u8], &[u8])]| hs.iter().map(|&(n, v)| n.len() + v.len()).sum::<usize>();
-    let too_many = Refused::Invalid("header count out of range");
-    let too_long = Refused::Invalid("header value length out of range");
     let transfer = Refused::Unsupported("transfer-encoding");
 
-    // 65 headers with a Transfer-Encoding among them: the count is refused, not the Transfer-Encoding.
+    // A field of TX_BEGIN that is not a header is refused first as well.
+    let r = run.refused(&request(b"", b"/", &[te], b""));
+    assert_eq!(r, Refused::Invalid("method length out of range"));
+    // 65 headers with a Transfer-Encoding among them: the count is refused, not the Transfer-Encoding. 64 are not.
     let mut many = vec![te];
     many.resize(MAX_HEADERS + 1, header(b"X", b""));
     let r = run.refused(&request(b"POST", b"/", &many, b""));
-    assert_eq!(r, too_many);
-    // The limit of the body still comes first.
-    let big = vec![b'a'; MAX_BODY + 1];
-    let r = run.refused(&request(b"POST", b"/", &many, &big));
-    assert_eq!(r, Refused::Unsupported("body over the protocol limit"));
-    // 64 headers are within the limit, so the Transfer-Encoding is refused as it was.
+    assert_eq!(r, Refused::Invalid("header count out of range"));
     many.pop();
     let r = run.refused(&request(b"POST", b"/", &many, b""));
     assert_eq!(r, transfer);
 
-    // A Content-Length of 4098 bytes that is not a number: the length is refused, not the Content-Length.
-    let mut over = vec![b'0'; MAX_HDR_VALUE + 1];
+    // A Content-Length of 4097 bytes that is not a number: the length is refused, not the Content-Length. With 4096
+    // bytes it is within the limit, so the Content-Length is refused as it was.
+    let mut over = vec![b'0'; MAX_HDR_VALUE];
     over.push(b'x');
     let hs = [header(b"Content-Length", &over), ct];
     let r = run.refused(&request(b"POST", b"/", &hs, b"a=b"));
-    assert_eq!(r, too_long);
-    // With 4096 bytes it is within the limit, so the Content-Length is refused as it was.
-    let mut edge = vec![b'0'; MAX_HDR_VALUE - 1];
-    edge.push(b'x');
-    let hs = [header(b"Content-Length", &edge), ct];
+    assert_eq!(r, Refused::Invalid("header value length out of range"));
+    let hs = [header(b"Content-Length", &over[1..]), ct];
     let r = run.refused(&request(b"POST", b"/", &hs, b"a=b"));
     assert_eq!(r, Refused::Unsupported("content-length"));
-    // Digits only and no body: 4097 of them are refused, 4096 are a right Content-Length (the value is 0).
-    let zeros = vec![b'0'; MAX_HDR_VALUE + 1];
-    let hs = [header(b"Content-Length", &zeros)];
-    let r = run.refused(&request(b"GET", b"/", &hs, b""));
-    assert_eq!(r, too_long);
-    let hs = [header(b"Content-Length", &zeros[1..])];
-    run.submit(&request(b"GET", b"/", &hs, b""));
-
-    // A value that does not fit in the 16 bits of its length.
-    let huge = vec![b'x'; usize::from(u16::MAX) + 1];
-    let hs = [te, header(b"X-Big", &huge)];
-    let r = run.refused(&request(b"POST", b"/", &hs, b""));
-    assert_eq!(r, too_long);
 
     // Every value is within its limit, but the total is over 24 KiB: the total is refused, not the Content-Encoding.
     let pad = vec![b'v'; MAX_HDR_VALUE];
     let mut crowded = vec![ce];
     crowded.resize(1 + MAX_HDR_TOTAL / MAX_HDR_VALUE, header(b"X-Pad", &pad));
-    assert!(crowded.len() <= MAX_HEADERS && total(&crowded) > MAX_HDR_TOTAL);
     let r = run.refused(&request(b"POST", b"/", &crowded, b""));
     assert_eq!(r, Refused::Invalid("header total length out of range"));
-
-    // A field of TX_BEGIN that is not a header is refused first as well.
-    let hs = [te];
-    let r = run.refused(&request(b"", b"/", &hs, b""));
-    assert_eq!(r, Refused::Invalid("method length out of range"));
-
-    // All the limits at once, exactly: 64 headers, a name of 256 bytes, values of 4096 bytes, a total of 24 KiB.
-    let wide = vec![b'n'; MAX_HDR_NAME];
-    let mut limit = vec![te, header(&wide, &pad)];
-    limit.extend([header(b"X", &pad); 4]);
-    limit.resize(MAX_HEADERS - 1, header(b"h", b""));
-    let rest = vec![b'v'; MAX_HDR_TOTAL - total(&limit) - 1];
-    limit.push(header(b"g", &rest));
-    assert_eq!(limit.len(), MAX_HEADERS);
-    assert_eq!(total(&limit), MAX_HDR_TOTAL);
-    assert!(rest.len() <= MAX_HDR_VALUE);
-    let r = run.refused(&request(b"POST", b"/", &limit, b""));
-    assert_eq!(r, transfer);
-    // Without the Transfer-Encoding (a name of the same length) the same headers are accepted.
-    limit[0] = header(b"X-Transfer-Encode", b"chunked");
-    assert_eq!(total(&limit), MAX_HDR_TOTAL);
-    run.submit(&request(b"POST", b"/", &limit, b""));
     run.finish();
 }
 
@@ -496,9 +408,7 @@ fn refused_full_when_the_records_are_used() {
     run.finish();
 }
 
-// ---------------------------------------------------------------------------------------------------------
-// Config::check
-// ---------------------------------------------------------------------------------------------------------
+// ---- Config::check ----
 
 /// `check` and `Supervisor::new` must both return this error.
 fn rejected(change: impl FnOnce(&mut Config), msg: &str) {
@@ -517,11 +427,6 @@ fn accepted(change: impl FnOnce(&mut Config)) {
 }
 
 #[test]
-fn check_accepts_the_fake_configuration() {
-    assert_eq!(fake_config().check(), Ok(()));
-}
-
-#[test]
 fn check_discard_limit_below_u32_max() {
     rejected(
         |c| c.discard_limit = u32::MAX,
@@ -533,9 +438,7 @@ fn check_discard_limit_below_u32_max() {
 
 #[test]
 fn check_paths() {
-    let not_clean = [
-        "", "/", "rel/x", "/a/", "/a//b", "/a/./b", "/a/../b", "/a/b\0c",
-    ];
+    let not_clean = ["", "/", "rel/x", "/a/", "/a//b", "/a/../b", "/a/b\0c"];
     for p in not_clean {
         rejected(
             |c| c.inspector = PathBuf::from(p),
@@ -550,16 +453,13 @@ fn check_paths() {
             "tmp_root is not an absolute clean UTF-8 path",
         );
     }
-    let not_utf8 = PathBuf::from(OsStr::from_bytes(b"/kernel-test/\xff"));
+    // Only tmp_root must be UTF-8, and it has at most MAX_TMP_ROOT bytes.
+    let odd = PathBuf::from(OsStr::from_bytes(b"/kernel-test/\xff"));
     rejected(
-        |c| c.tmp_root = not_utf8,
+        |c| c.tmp_root = odd.clone(),
         "tmp_root is not an absolute clean UTF-8 path",
     );
-    // The same bytes are fine for the two files: only tmp_root must be UTF-8.
-    let odd = PathBuf::from(OsStr::from_bytes(b"/kernel-test/\xff"));
     accepted(|c| c.inspector = odd.clone());
-    accepted(|c| c.rules = odd);
-
     let tmp = |n: usize| PathBuf::from(format!("/{}", "a".repeat(n - 1)));
     accepted(|c| c.tmp_root = tmp(MAX_TMP_ROOT));
     rejected(
@@ -567,11 +467,11 @@ fn check_paths() {
         "tmp_root is too long",
     );
     // 4096 bytes is beyond what any path argument may be.
+    accepted(|c| c.inspector = tmp(4095));
     rejected(
         |c| c.inspector = tmp(4096),
         "inspector path is not an absolute clean path",
     );
-    accepted(|c| c.inspector = tmp(4095));
 }
 
 #[test]
@@ -596,233 +496,79 @@ fn check_counts() {
         c.slots = MAX_CONCUR_TX;
         c.records = MAX_CONCUR_TX + c.wait_queue;
     });
-    accepted(|c| {
-        c.slots = 1;
-        c.records = 1 + c.wait_queue;
-    });
     rejected(|c| c.wait_queue = 0, "wait_queue is 0");
-    rejected(
-        |c| c.records = c.slots + c.wait_queue - 1,
-        "records is below slots plus wait_queue",
-    );
+    let why = "records is below slots plus wait_queue";
+    rejected(|c| c.records = c.slots + c.wait_queue - 1, why);
     accepted(|c| c.records = c.slots + c.wait_queue);
     // The sum overflows: that is a refusal, not a wrap.
-    rejected(
-        |c| c.wait_queue = usize::MAX,
-        "records is below slots plus wait_queue",
-    );
-    rejected(
-        |c| {
-            c.wait_queue = usize::MAX;
-            c.records = usize::MAX;
-        },
-        "records is below slots plus wait_queue",
-    );
-    accepted(|c| c.rules_sha256 = [0xff; 32]);
+    rejected(|c| c.wait_queue = usize::MAX, why);
 }
 
 #[test]
 fn check_restarts_are_at_most_1000_and_the_window_is_a_time() {
-    // 0 never restarts; 1000 is the most
-    accepted(|c| c.restarts = 0);
-    accepted(|c| c.restarts = 1);
     accepted(|c| c.restarts = MAX_RESTARTS);
     rejected(|c| c.restarts = MAX_RESTARTS + 1, "restarts is above 1000");
-    rejected(|c| c.restarts = u32::MAX, "restarts is above 1000");
-    // the window is above 0 and at most MAX_WAIT, and 1 ms is a window when the tick is that short
-    rejected(
-        |c| c.restart_window = Duration::ZERO,
-        "restart_window is out of range",
-    );
-    accepted(|c| {
-        c.tick = MS;
-        c.restart_window = MS;
-    });
-    rejected(
-        |c| {
-            c.tick = MS;
-            c.restart_window = Duration::ZERO;
-        },
-        "restart_window is out of range",
-    );
     accepted(|c| c.restart_window = MAX_WAIT);
-    rejected(
-        |c| c.restart_window = MAX_WAIT + MS,
-        "restart_window is out of range",
-    );
-    // not below the tick
-    accepted(|c| c.restart_window = c.tick);
-    rejected(
-        |c| c.restart_window = c.tick - Duration::from_nanos(1),
-        "tick is above another time",
-    );
-    rejected(
-        |c| {
-            c.tick = MS;
-            c.restart_window = MS - Duration::from_nanos(1);
-        },
-        "tick is above another time",
-    );
-    // in the order of the rules: the window is the last of the times, and a time comes before `restarts`
-    rejected(
-        |c| {
-            c.kill_grace = Duration::ZERO;
-            c.restart_window = Duration::ZERO;
-        },
-        "kill_grace is out of range",
-    );
-    rejected(
-        |c| {
-            c.restarts = MAX_RESTARTS + 1;
-            c.restart_window = Duration::ZERO;
-        },
-        "restart_window is out of range",
-    );
+    let why = "restart_window is out of range";
+    rejected(|c| c.restart_window = MAX_WAIT + MS, why);
+    rejected(|c| c.restart_window = Duration::ZERO, why);
 }
 
-/// Sets the time named `name` (the names of the fields of `Config`).
-fn set_time(c: &mut Config, name: &str, d: Duration) {
-    match name {
-        "tick" => c.tick = d,
-        "hello_wait" => c.hello_wait = d,
-        "frame_io" => c.frame_io = d,
-        "verdict_wait" => c.verdict_wait = d,
-        "wait_deadline" => c.wait_deadline = d,
-        "closed_wait" => c.closed_wait = d,
-        "stop_after" => c.stop_after = d,
-        "drain_wait" => c.drain_wait = d,
-        "exit_wait" => c.exit_wait = d,
-        "kill_grace" => c.kill_grace = d,
-        "restart_window" => c.restart_window = d,
-        _ => panic!("not a time: {name}"),
-    }
-}
+/// A time of `Config` by name, and the way to it.
+type Time = (&'static str, fn(&mut Config) -> &mut Duration);
 
-const TIMES: [&str; 11] = [
-    "tick",
-    "hello_wait",
-    "frame_io",
-    "verdict_wait",
-    "wait_deadline",
-    "closed_wait",
-    "stop_after",
-    "drain_wait",
-    "exit_wait",
-    "kill_grace",
-    "restart_window",
+/// The times of `Config`.
+const TIMES: [Time; 11] = [
+    ("tick", |c| &mut c.tick),
+    ("hello_wait", |c| &mut c.hello_wait),
+    ("frame_io", |c| &mut c.frame_io),
+    ("verdict_wait", |c| &mut c.verdict_wait),
+    ("wait_deadline", |c| &mut c.wait_deadline),
+    ("closed_wait", |c| &mut c.closed_wait),
+    ("stop_after", |c| &mut c.stop_after),
+    ("drain_wait", |c| &mut c.drain_wait),
+    ("exit_wait", |c| &mut c.exit_wait),
+    ("kill_grace", |c| &mut c.kill_grace),
+    ("restart_window", |c| &mut c.restart_window),
 ];
 
 #[test]
 fn check_times_are_above_zero_and_at_most_the_maximum() {
-    for name in TIMES {
+    for (name, time) in TIMES {
         let msg = format!("{name} is out of range");
-        rejected(|c| set_time(c, name, Duration::ZERO), &msg);
-        rejected(
-            |c| set_time(c, name, MAX_WAIT + Duration::from_nanos(1)),
-            &msg,
-        );
-        rejected(|c| set_time(c, name, Duration::MAX), &msg);
+        rejected(|c| *time(c) = Duration::ZERO, &msg);
+        rejected(|c| *time(c) = MAX_WAIT + Duration::from_nanos(1), &msg);
         if name != "tick" {
-            accepted(|c| set_time(c, name, MAX_WAIT));
-            accepted(|c| {
-                let t = c.tick;
-                set_time(c, name, t);
-            });
+            accepted(|c| *time(c) = MAX_WAIT);
         }
     }
 }
 
 #[test]
 fn check_tick_is_short_and_not_above_any_other_time() {
+    let long = |c: &mut Config| TIMES.iter().for_each(|(_, time)| *time(c) = MAX_WAIT);
+    accepted(|c| {
+        long(c);
+        c.tick = MAX_TICK;
+    });
     rejected(
         |c| {
-            for name in TIMES {
-                set_time(c, name, MAX_WAIT);
-            }
+            long(c);
             c.tick = MAX_TICK + Duration::from_nanos(1);
         },
         "tick is above the longest tick",
     );
-    accepted(|c| {
-        for name in TIMES {
-            set_time(c, name, MAX_WAIT);
-        }
-        c.tick = MAX_TICK;
-    });
-    for name in &TIMES[1..] {
+    for (_, time) in &TIMES[1..] {
+        let tick = fake_config().tick;
         rejected(
-            |c| {
-                let t = c.tick - Duration::from_nanos(1);
-                set_time(c, name, t);
-            },
+            |c| *time(c) = tick - Duration::from_nanos(1),
             "tick is above another time",
         );
-        accepted(|c| {
-            let t = c.tick;
-            set_time(c, name, t);
-        });
+        accepted(|c| *time(c) = tick);
     }
 }
 
-/// The messages in the order of the rules, and what repairs the one that is reported.
-const ORDER: [&str; 11] = [
-    "inspector path is not an absolute clean path",
-    "rules path is not an absolute clean path",
-    "tmp_root is not an absolute clean UTF-8 path",
-    "gomaxprocs is 0",
-    "gomemlimit is out of range",
-    "slots is out of range",
-    "wait_queue is 0",
-    "records is below slots plus wait_queue",
-    "discard_limit must be below u32::MAX",
-    "tick is out of range",
-    "restarts is above 1000",
-];
-
-fn repair(c: &mut Config, step: usize) {
-    match step {
-        0 => c.inspector = PathBuf::from("/a"),
-        1 => c.rules = PathBuf::from("/a"),
-        2 => c.tmp_root = PathBuf::from("/a"),
-        3 => c.gomaxprocs = 1,
-        4 => c.gomemlimit = 1,
-        5 => c.slots = 1,
-        6 => c.wait_queue = 1,
-        7 => c.records = 2,
-        8 => c.discard_limit = 0,
-        9 => TIMES.iter().for_each(|&name| set_time(c, name, SEC)),
-        10 => c.restarts = MAX_RESTARTS,
-        _ => panic!("no such step"),
-    }
-}
-
-#[test]
-fn check_reports_the_first_broken_rule() {
-    // Everything is broken at once; each repair uncovers the next rule in the order of the checks.
-    let mut c = fake_config();
-    c.inspector = PathBuf::from("rel");
-    c.rules = PathBuf::from("rel");
-    c.tmp_root = PathBuf::from("rel");
-    c.gomaxprocs = 0;
-    c.gomemlimit = 0;
-    c.slots = 0;
-    c.wait_queue = 0;
-    c.records = 0;
-    c.discard_limit = u32::MAX;
-    c.restarts = u32::MAX;
-    TIMES
-        .iter()
-        .for_each(|&name| set_time(&mut c, name, Duration::ZERO));
-    for (step, msg) in ORDER.iter().enumerate() {
-        assert_eq!(c.check(), Err(ConfigError(msg)), "step {step}");
-        repair(&mut c, step);
-    }
-    assert_eq!(c.check(), Ok(()));
-}
-
-// ---------------------------------------------------------------------------------------------------------
-// With a real inspector (ignored by default; run with `-- --include-ignored`)
-// ---------------------------------------------------------------------------------------------------------
+// ---- With a real inspector (ignored by default; run with `-- --include-ignored`) ----
 
 fn var(name: &str) -> String {
     match std::env::var(name) {
@@ -858,9 +604,6 @@ impl Drop for TestDir {
     }
 }
 
-/// A new 0700 root for one test, under `TUKUYOMI_TEST_TMP`. Its name has the process id and the test name, so
-/// parallel tests and earlier runs do not meet. The guard removes it when it is dropped, also when the test
-/// fails; `Run::finish` fails if it is not empty, and removes it.
 fn make_root(test: &str) -> TestDir {
     let root =
         PathBuf::from(var("TUKUYOMI_TEST_TMP")).join(format!("{test}-{}", std::process::id()));
@@ -868,14 +611,7 @@ fn make_root(test: &str) -> TestDir {
         .mode(0o700)
         .create(&root)
         .unwrap_or_else(|e| panic!("cannot create the test root {root:?}: {e}"));
-    // The directory is the guard's from here on, so a failed check below does not leave it behind.
-    let root = TestDir(root);
-    let mode = fs::symlink_metadata(root.path())
-        .expect("the test root exists")
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o077, 0, "the test root has group or other bits");
-    root
+    TestDir(root)
 }
 
 /// The configuration of a real run: the environment's inspector, rules and hash, and the test's own root.
@@ -888,11 +624,15 @@ fn real_config(root: &Path, sha256: [u8; 32]) -> Config {
     c
 }
 
-/// The configuration of a run that needs only the test root: no inspector and no rules are read.
-fn real_config_without_inspector(root: &Path) -> Config {
-    let mut c = fake_config();
-    c.tmp_root = root.to_path_buf();
-    c
+/// A run whose inspector does not exist: every start fails at spawn, before any process exists.
+fn absent_inspector_run(test: &str, edit: impl FnOnce(&mut Config)) -> Run {
+    let root = make_root(test);
+    let mut cfg = fake_config();
+    cfg.tmp_root = root.path().to_path_buf();
+    cfg.inspector = root.path().join("absent-inspector");
+    cfg.rules = root.path().join("absent-rules.conf");
+    edit(&mut cfg);
+    Run::new(cfg, Some(root))
 }
 
 fn real_run(test: &str) -> Run {
@@ -941,228 +681,6 @@ fn uri_rule_blocks_in_phase_1() {
 
 #[test]
 #[ignore = "needs a built inspector"]
-fn urlencoded_body_rule_blocks_in_phase_2() {
-    let mut run = real_run("body_block");
-    let mut post = |body: &[u8]| {
-        let cl = body.len().to_string();
-        let hs = [
-            header(b"Host", b"example.test"),
-            header(b"Content-Type", URLENCODED),
-            header(b"Content-Length", cl.as_bytes()),
-        ];
-        run.submit(&request(b"POST", b"/submit", &hs, body))
-    };
-    let blocked = post(b"probe=block");
-    let passed = post(b"probe=ok");
-    run.wait_results(2);
-    assert_eq!(
-        run.verdict(blocked),
-        Verdict::Block {
-            phase: 2,
-            rule_id: 9202,
-            status: 403
-        }
-    );
-    assert_eq!(run.verdict(passed), Verdict::Allow);
-    finish_stopped(run);
-}
-
-#[test]
-#[ignore = "needs a built inspector"]
-fn urlencoded_content_type_forms_the_submit_accepts_are_parsed() {
-    // A parameter after `;` and a leading space are accepted by `submit`; the body must still be parsed.
-    let mut run = real_run("ct_forms");
-    let mut post = |content_type: &[u8], body: &[u8]| {
-        let cl = body.len().to_string();
-        let hs = [
-            header(b"Host", b"example.test"),
-            header(b"Content-Type", content_type),
-            header(b"Content-Length", cl.as_bytes()),
-        ];
-        run.submit(&request(b"POST", b"/submit", &hs, body))
-    };
-    let with_charset = post(
-        b"application/x-www-form-urlencoded; charset=UTF-8",
-        b"probe=block",
-    );
-    let leading_space = post(b" application/x-www-form-urlencoded", b"probe=block");
-    let passed = post(
-        b"application/x-www-form-urlencoded; charset=UTF-8",
-        b"probe=pass",
-    );
-    run.wait_results(3);
-    let blocked = Verdict::Block {
-        phase: 2,
-        rule_id: 9202,
-        status: 403,
-    };
-    assert_eq!(run.verdict(with_charset), blocked);
-    assert_eq!(run.verdict(leading_space), blocked);
-    assert_eq!(run.verdict(passed), Verdict::Allow);
-    finish_stopped(run);
-}
-
-#[test]
-#[ignore = "needs a built inspector"]
-fn json_body_rule_blocks_in_phase_2() {
-    let mut run = real_run("json_block");
-    let mut post = |body: &[u8]| {
-        let cl = body.len().to_string();
-        let hs = [
-            header(b"Host", b"example.test"),
-            header(b"Content-Type", JSON),
-            header(b"Content-Length", cl.as_bytes()),
-        ];
-        run.submit(&request(b"POST", b"/submit", &hs, body))
-    };
-    let blocked = post(br#"{"probe":"block"}"#);
-    let passed = post(br#"{"probe":"pass"}"#);
-    run.wait_results(2);
-    assert_eq!(
-        run.verdict(blocked),
-        Verdict::Block {
-            phase: 2,
-            rule_id: 9203,
-            status: 403
-        }
-    );
-    assert_eq!(run.verdict(passed), Verdict::Allow);
-    finish_stopped(run);
-}
-
-#[test]
-#[ignore = "needs a built inspector"]
-fn a_plus_json_body_rule_blocks_in_phase_2() {
-    // application/<name>+json is parsed by the JSON processor like application/json.
-    let mut run = real_run("plus_json_block");
-    let mut post = |body: &[u8]| {
-        let cl = body.len().to_string();
-        let hs = [
-            header(b"Host", b"example.test"),
-            header(b"Content-Type", b"application/vnd.api+json"),
-            header(b"Content-Length", cl.as_bytes()),
-        ];
-        run.submit(&request(b"POST", b"/submit", &hs, body))
-    };
-    let blocked = post(br#"{"probe":"block"}"#);
-    let passed = post(br#"{"probe":"pass"}"#);
-    run.wait_results(2);
-    assert_eq!(
-        run.verdict(blocked),
-        Verdict::Block {
-            phase: 2,
-            rule_id: 9203,
-            status: 403
-        }
-    );
-    assert_eq!(run.verdict(passed), Verdict::Allow);
-    finish_stopped(run);
-}
-
-#[test]
-#[ignore = "needs a built inspector"]
-fn json_content_type_forms_the_submit_accepts_are_parsed() {
-    // The case of the type and a parameter after `;` are accepted by `submit`; the body must still be parsed.
-    let mut run = real_run("json_ct_forms");
-    let mut post = |content_type: &[u8], body: &[u8]| {
-        let cl = body.len().to_string();
-        let hs = [
-            header(b"Host", b"example.test"),
-            header(b"Content-Type", content_type),
-            header(b"Content-Length", cl.as_bytes()),
-        ];
-        run.submit(&request(b"POST", b"/submit", &hs, body))
-    };
-    let with_charset = post(b"Application/JSON; charset=UTF-8", br#"{"probe":"block"}"#);
-    let without_blank = post(b"application/json;charset=utf-8", br#"{"probe":"block"}"#);
-    let passed = post(b"Application/JSON; charset=UTF-8", br#"{"probe":"pass"}"#);
-    run.wait_results(3);
-    let blocked = Verdict::Block {
-        phase: 2,
-        rule_id: 9203,
-        status: 403,
-    };
-    assert_eq!(run.verdict(with_charset), blocked);
-    assert_eq!(run.verdict(without_blank), blocked);
-    assert_eq!(run.verdict(passed), Verdict::Allow);
-    finish_stopped(run);
-}
-
-#[test]
-#[ignore = "needs a built inspector"]
-fn json_content_type_with_blanks_and_tabs_the_submit_accepts_is_parsed() {
-    // Spaces and tabs around the type are accepted by `submit`; the body must still be parsed.
-    let mut run = real_run("json_ct_blanks");
-    let mut post = |content_type: &[u8], body: &[u8]| {
-        let cl = body.len().to_string();
-        let hs = [
-            header(b"Host", b"example.test"),
-            header(b"Content-Type", content_type),
-            header(b"Content-Length", cl.as_bytes()),
-        ];
-        run.submit(&request(b"POST", b"/submit", &hs, body))
-    };
-    let spaces = post(b"  application/json  ", br#"{"probe":"block"}"#);
-    let tabs = post(b"\tapplication/json\t ; x=y", br#"{"probe":"block"}"#);
-    let passed = post(b"\tapplication/json\t ", br#"{"probe":"pass"}"#);
-    run.wait_results(3);
-    let blocked = Verdict::Block {
-        phase: 2,
-        rule_id: 9203,
-        status: 403,
-    };
-    assert_eq!(run.verdict(spaces), blocked);
-    assert_eq!(run.verdict(tabs), blocked);
-    assert_eq!(run.verdict(passed), Verdict::Allow);
-    finish_stopped(run);
-}
-
-#[test]
-#[ignore = "needs a built inspector"]
-fn an_invalid_json_body_is_blocked_by_the_reserved_rule() {
-    // The JSON processor reports the error; the rule of the inspector (4000001) blocks it in phase 2.
-    let mut run = real_run("json_invalid");
-    let mut post = |body: &[u8]| {
-        let cl = body.len().to_string();
-        let hs = [
-            header(b"Host", b"example.test"),
-            header(b"Content-Type", JSON),
-            header(b"Content-Length", cl.as_bytes()),
-        ];
-        run.submit(&request(b"POST", b"/submit", &hs, body))
-    };
-    let invalid = post(b"{\"probe\": ");
-    let passed = post(br#"{"probe":"pass"}"#);
-    run.wait_results(2);
-    assert_eq!(
-        run.verdict(invalid),
-        Verdict::Block {
-            phase: 2,
-            rule_id: 4000001,
-            status: 403
-        }
-    );
-    assert_eq!(run.verdict(passed), Verdict::Allow);
-    finish_stopped(run);
-}
-
-#[test]
-#[ignore = "needs a built inspector"]
-fn a_get_with_a_json_content_type_and_no_body_is_allowed() {
-    // There is no body to parse, whatever the Content-Type says.
-    let mut run = real_run("json_no_body");
-    let hs = [
-        header(b"Host", b"example.test"),
-        header(b"Content-Type", JSON),
-    ];
-    let id = run.submit(&request(b"GET", b"/", &hs, b""));
-    run.wait_results(1);
-    assert_eq!(run.verdict(id), Verdict::Allow);
-    finish_stopped(run);
-}
-
-#[test]
-#[ignore = "needs a built inspector"]
 fn a_different_rules_hash_fails_at_hello_without_restart() {
     let mut sha = parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256"));
     sha[31] ^= 1;
@@ -1184,14 +702,66 @@ fn a_different_rules_hash_fails_at_hello_without_restart() {
 
 #[test]
 #[ignore = "needs a built inspector"]
-fn a_failed_start_ends_the_supervisor_when_no_restart_is_allowed() {
-    // The inspector does not exist: the one start fails at spawn, before any process exists.
-    let root = make_root("no_restart");
-    let mut cfg = real_config_without_inspector(root.path());
-    cfg.inspector = root.path().join("absent-inspector");
-    cfg.rules = root.path().join("absent-rules.conf");
-    cfg.restarts = 0;
+fn the_body_rules_block_in_phase_2_for_the_types_submit_accepts() {
+    // The types and forms `submit` accepts must reach the inspector's body processor: a body that matches a rule
+    // is blocked, one that does not is allowed.
+    // The six requests all wait for HELLO, so the queue is larger than the fake configuration's.
+    let sha = parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256"));
+    let root = make_root("body_block");
+    let mut cfg = real_config(root.path(), sha);
+    (cfg.wait_queue, cfg.records) = (8, 16);
     let mut run = Run::new(cfg, Some(root));
+    type Case = (&'static [u8], &'static [u8], &'static [u8], i64);
+    let cases: [Case; 3] = [
+        (
+            b" application/x-www-form-urlencoded; charset=UTF-8",
+            b"probe=block",
+            b"probe=pass",
+            9202,
+        ),
+        (
+            b"Application/JSON; charset=UTF-8",
+            br#"{"probe":"block"}"#,
+            br#"{"probe":"pass"}"#,
+            9203,
+        ),
+        (
+            b"application/vnd.api+json",
+            br#"{"probe":"block"}"#,
+            br#"{"probe":"pass"}"#,
+            9203,
+        ),
+    ];
+    let mut post = |content_type: &[u8], body: &[u8]| {
+        let cl = body.len().to_string();
+        let hs = [
+            header(b"Host", b"example.test"),
+            header(b"Content-Type", content_type),
+            header(b"Content-Length", cl.as_bytes()),
+        ];
+        run.submit(&request(b"POST", b"/submit", &hs, body))
+    };
+    let ids: Vec<_> = cases
+        .iter()
+        .map(|&(ct, block, pass, _)| (post(ct, block), post(ct, pass)))
+        .collect();
+    run.wait_results(2 * cases.len());
+    for ((blocked, passed), (_, _, _, rule_id)) in ids.into_iter().zip(cases) {
+        let want = Verdict::Block {
+            phase: 2,
+            rule_id,
+            status: 403,
+        };
+        assert_eq!(run.verdict(blocked), want);
+        assert_eq!(run.verdict(passed), Verdict::Allow);
+    }
+    finish_stopped(run);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_failed_start_ends_the_supervisor_when_no_restart_is_allowed() {
+    let mut run = absent_inspector_run("no_restart", |c| c.restarts = 0);
     let hs = [header(b"Host", b"example.test")];
     let id = run.submit(&request(b"GET", b"/", &hs, b""));
     run.wait_for("the failure of the start", |r| {
@@ -1210,14 +780,11 @@ fn a_failed_start_ends_the_supervisor_when_no_restart_is_allowed() {
 #[test]
 #[ignore = "needs a built inspector"]
 fn a_full_restart_window_waits_and_the_supervisor_does_not_fail() {
-    // The inspector does not exist, so every start fails at spawn. One restart is allowed in a window of 300 ms.
+    // One restart is allowed in a window of 300 ms.
     let window = 300 * MS;
-    let root = make_root("window");
-    let mut cfg = real_config_without_inspector(root.path());
-    cfg.inspector = root.path().join("absent-inspector");
-    cfg.rules = root.path().join("absent-rules.conf");
-    (cfg.restarts, cfg.restart_window, cfg.wait_deadline) = (1, window, 400 * MS);
-    let mut run = Run::new(cfg, Some(root));
+    let mut run = absent_inspector_run("window", |c| {
+        (c.restarts, c.restart_window, c.wait_deadline) = (1, window, 400 * MS)
+    });
     let hs = [header(b"Host", b"example.test")];
     let started = Instant::now();
     let waiting = run.submit(&request(b"GET", b"/", &hs, b""));

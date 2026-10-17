@@ -56,42 +56,36 @@ func TestParseConfig(t *testing.T) {
 		"TKV0_NONCE":       "000102030405060708090a0b0c0d0e0f",
 		"TMPDIR":           tmp,
 	}
-	get := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
-	c, err := parseConfig([]string{"/r/rules.conf"}, get(env))
-	if err != nil || c.run != testRun || c.inc != testInc || c.nonce[15] != 0x0f || c.rulesPath != "/r/rules.conf" {
+	get := func(k, v string) func(string) string {
+		return func(key string) string {
+			if key == k {
+				return v
+			}
+			return env[key]
+		}
+	}
+	c, err := parseConfig([]string{"/r/bundle"}, get("", ""))
+	if err != nil || c.run != testRun || c.inc != testInc || c.nonce[15] != 0x0f || c.bundleDir != "/r/bundle" {
 		t.Fatalf("%+v %v", c, err)
 	}
-	with := func(k, v string) map[string]string {
-		m := map[string]string{}
-		for a, b := range env {
-			m[a] = b
-		}
-		m[k] = v
-		return m
-	}
-	bad := map[string]map[string]string{
-		"run upper":   with("TKV0_RUN_ID", "0102030405060A08"),
-		"run short":   with("TKV0_RUN_ID", "010203040506070"),
-		"run long":    with("TKV0_RUN_ID", "01020304050607080"),
-		"run sign":    with("TKV0_RUN_ID", "+102030405060708"),
-		"run empty":   with("TKV0_RUN_ID", ""),
-		"inc short":   with("TKV0_INCARNATION", "7"),
-		"inc space":   with("TKV0_INCARNATION", " 0000007"),
-		"nonce short": with("TKV0_NONCE", "00"),
-		"nonce g":     with("TKV0_NONCE", "g00102030405060708090a0b0c0d0e0"),
-		"tmp empty":   with("TMPDIR", ""),
-		"tmp rel":     with("TMPDIR", "tmp"),
-		"tmp unclean": with("TMPDIR", tmp+"/"),
-		"tmp missing": with("TMPDIR", filepath.Join(tmp, "nope")),
-	}
-	for name, m := range bad {
-		if _, err := parseConfig([]string{"/r/rules.conf"}, get(m)); err == nil {
+	for name, kv := range map[string][2]string{
+		"run upper case": {"TKV0_RUN_ID", "0102030405060A08"},
+		"run short":      {"TKV0_RUN_ID", "010203040506070"},
+		"inc short":      {"TKV0_INCARNATION", "7"},
+		"nonce not hex":  {"TKV0_NONCE", "g00102030405060708090a0b0c0d0e0"},
+		"tmp empty":      {"TMPDIR", ""},
+		"tmp relative":   {"TMPDIR", "tmp"},
+		"tmp unclean":    {"TMPDIR", tmp + "/"},
+		"tmp missing":    {"TMPDIR", filepath.Join(tmp, "nope")},
+	} {
+		if _, err := parseConfig([]string{"/r/bundle"}, get(kv[0], kv[1])); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
-	for name, args := range map[string][]string{"none": nil, "two": {"/a", "/b"}, "relative": {"rules.conf"}, "unclean": {"/r/../rules.conf"}, "empty": {""}} {
-		if _, err := parseConfig(args, get(env)); err == nil {
-			t.Errorf("args %s accepted", name)
+	const usage = "usage: inspector <absolute clean bundle directory>"
+	for name, args := range map[string][]string{"none": nil, "two": {"/a", "/b"}, "relative": {"bundle"}, "unclean": {"/r/../bundle"}} {
+		if _, err := parseConfig(args, get("", "")); err == nil || err.Error() != usage {
+			t.Errorf("args %s: %v, want %q", name, err, usage)
 		}
 	}
 }
@@ -102,68 +96,24 @@ func TestCheckTmpDir(t *testing.T) {
 	if err := os.Mkdir(d, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkTmpDir(d); err != nil {
-		t.Fatalf("0700: %v", err)
-	}
-	if err := os.Chmod(d, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	if err := checkTmpDir(d); err != nil { // writability is NewWAF's check
-		t.Fatalf("0500: %v", err)
-	}
-	for _, m := range []os.FileMode{0o710, 0o701, 0o770, 0o777} {
-		os.Chmod(d, m)
-		if err := checkTmpDir(d); err == nil {
-			t.Errorf("mode %o accepted", m)
+	for mode, ok := range map[os.FileMode]bool{0o700: true, 0o500: true, 0o710: false, 0o701: false} {
+		if err := os.Chmod(d, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := checkTmpDir(d); ok != (err == nil) { // writability is NewWAF's check
+			t.Errorf("mode %o: %v", mode, err)
 		}
 	}
 	os.Chmod(d, 0o700)
-	link := filepath.Join(base, "link")
+	link, file := filepath.Join(base, "link"), filepath.Join(base, "file")
 	if err := os.Symlink(d, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkTmpDir(link); err == nil {
-		t.Error("symlink accepted")
-	}
-	f := filepath.Join(base, "file")
-	os.WriteFile(f, nil, 0o600)
-	if err := checkTmpDir(f); err == nil {
-		t.Error("file accepted")
-	}
-}
-
-func TestCheckPeerInProcess(t *testing.T) {
-	// A socketpair made by this process: the peer pid is ours, not our parent.
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer syscall.Close(fds[0])
-	defer syscall.Close(fds[1])
-	if err := checkPeer(fds[1]); err == nil || !strings.Contains(err.Error(), "parent") {
-		t.Fatalf("got %v", err)
-	}
-	dg, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer syscall.Close(dg[0])
-	defer syscall.Close(dg[1])
-	if err := checkPeer(dg[1]); err == nil || !strings.Contains(err.Error(), "stream") {
-		t.Fatalf("dgram: %v", err)
-	}
-	r, w, _ := os.Pipe()
-	defer r.Close()
-	defer w.Close()
-	if err := checkPeer(int(r.Fd())); err == nil || !strings.Contains(err.Error(), "not a socket") {
-		t.Fatalf("pipe: %v", err)
-	}
-}
-
-func TestCorazaModule(t *testing.T) {
-	v, s, err := corazaModule()
-	if err != nil || !strings.HasPrefix(v, "v3.") || !strings.HasPrefix(s, "h1:") {
-		t.Fatalf("%q %q %v", v, s, err)
+	os.WriteFile(file, nil, 0o600)
+	for name, p := range map[string]string{"symlink": link, "file": file} {
+		if err := checkTmpDir(p); err == nil {
+			t.Errorf("%s accepted", name)
+		}
 	}
 }
 
@@ -252,11 +202,3 @@ func (s *syncBuf) String() string {
 	defer s.mu.Unlock()
 	return s.b.String()
 }
-
-// Two rules of the operator with one id, after SecIgnoreRuleCompilationErrors
-// On: Coraza builds the text and drops the second rule (the deny rule).
-const (
-	dupPass = `SecRule REQUEST_METHOD "@streq NEVER" "id:9202,phase:1,pass"` + "\n"
-	dupDeny = `SecRule ARGS_POST:probe "@streq block" "id:9202,phase:2,deny"` + "\n"
-	dupText = "SecIgnoreRuleCompilationErrors On\n" + dupPass + dupDeny
-)

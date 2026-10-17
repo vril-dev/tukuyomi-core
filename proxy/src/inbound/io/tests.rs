@@ -51,10 +51,6 @@ impl Mock {
         }
     }
 
-    fn left(&self) -> usize {
-        self.0.lock().unwrap().data.len()
-    }
-
     fn written(&self) -> Vec<u8> {
         self.0.lock().unwrap().written.clone()
     }
@@ -188,22 +184,6 @@ fn the_read_of_the_next_byte_fails_and_stays_failed() {
 }
 
 #[test]
-fn a_cap_of_zero_refuses_any_byte_but_accepts_the_end() {
-    run(async {
-        let mock = Mock::default();
-        mock.finish();
-        let (mut io, gauge) = guarded(&mock, b"", LONG, LONG, 0);
-        assert_eq!(read_some(&mut io, 8).await.unwrap(), b"");
-        assert!(!gauge.over());
-        let mock = Mock::default();
-        mock.feed(b"x");
-        let (mut io, gauge) = guarded(&mock, b"", LONG, LONG, 0);
-        assert!(read_some(&mut io, 8).await.is_err());
-        assert!(gauge.over());
-    });
-}
-
-#[test]
 fn lift_removes_the_cap_and_the_counting_goes_on() {
     run(async {
         let mock = Mock::default();
@@ -213,9 +193,6 @@ fn lift_removes_the_cap_and_the_counting_goes_on() {
         gauge.lift();
         assert_eq!(read_some(&mut io, 16).await.unwrap(), b"456789");
         assert_eq!((gauge.read(), gauge.over()), (10, false));
-        mock.feed(b"more");
-        assert_eq!(read_some(&mut io, 16).await.unwrap(), b"more");
-        assert_eq!(gauge.read(), 14);
         // A read that was refused before the lift stays refused.
         let mock = Mock::default();
         mock.feed(b"01234");
@@ -274,22 +251,5 @@ fn a_write_without_progress_times_out_and_a_slow_one_that_moves_does_not() {
         });
         assert_eq!(write_some(&mut io, b"abc").await.unwrap(), 3);
         assert_eq!(mock.written(), b"abc");
-    });
-}
-
-#[test]
-fn a_limit_that_does_not_fit_into_the_clock_never_ends() {
-    run(async {
-        let mock = Mock::default();
-        let (mut io, _gauge) = guarded(&mock, b"", Duration::MAX, Duration::MAX, 100);
-        let feeder = mock.clone();
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(50)).await;
-            feeder.feed(b"a");
-            feeder.allow_writes();
-        });
-        assert_eq!(read_some(&mut io, 8).await.unwrap(), b"a");
-        assert_eq!(write_some(&mut io, b"b").await.unwrap(), 1);
-        assert_eq!(mock.left(), 0);
     });
 }

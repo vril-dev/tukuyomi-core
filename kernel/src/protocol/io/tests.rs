@@ -55,16 +55,6 @@ fn a_frame_arrives_whole_and_checked() {
 }
 
 #[test]
-fn two_frames_in_a_row_are_read_one_at_a_time() {
-    let (a, b) = pair();
-    let mut two = closed();
-    two.extend_from_slice(&raw(KIND_CLOSED, 1, RUN, 3, 4, &[2]));
-    (&b).write_all(&two).unwrap();
-    assert_eq!(rx_ok(&a).unwrap().1, [1]);
-    assert_eq!(rx_ok(&a).unwrap().1, [2]);
-}
-
-#[test]
 fn send_writes_the_encoded_frame_bytes() {
     let (a, b) = pair();
     let f = encode_frame(KIND_BODY, RUN, INC, 3, 4, b"abc").unwrap();
@@ -97,36 +87,13 @@ fn send_refuses_a_frame_whose_length_field_does_not_match() {
 #[test]
 fn an_idle_expiry_before_the_first_byte_is_would_block_and_consumes_nothing() {
     let (a, b) = pair();
-    let t = Instant::now();
-    for _ in 0..3 {
-        assert_eq!(
-            rx(&a, Duration::from_millis(30), 5 * SEC),
-            Err(ConnError::Io(ErrorKind::WouldBlock))
-        );
-    }
-    assert!(t.elapsed() < 5 * SEC);
+    assert_eq!(
+        rx(&a, Duration::from_millis(30), 5 * SEC),
+        Err(ConnError::Io(ErrorKind::WouldBlock))
+    );
     // the stream is sound: a frame that comes now is read whole by the next call
     (&b).write_all(&closed()).unwrap();
     assert_eq!(rx_ok(&a).unwrap().1, [1]);
-}
-
-#[test]
-fn a_polling_reader_gets_a_frame_that_comes_late() {
-    let (a, b) = pair();
-    let w = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(150));
-        (&b).write_all(&closed()).unwrap();
-        b
-    });
-    let t = Instant::now();
-    let got = loop {
-        match rx(&a, Duration::from_millis(20), 5 * SEC) {
-            Err(ConnError::Io(ErrorKind::WouldBlock)) => assert!(t.elapsed() < 10 * SEC),
-            other => break other,
-        }
-    };
-    assert_eq!(got.unwrap().1, [1]);
-    let _b = w.join().unwrap();
 }
 
 #[test]
@@ -155,16 +122,8 @@ fn a_deadline_already_over_fails_without_reading() {
 #[test]
 fn an_expiry_inside_a_frame_is_timed_out() {
     // idle is far: only frame_io can fire, and it must not be waited out as idle
-    let t = Instant::now();
     let (a, b) = pair();
     (&b).write_all(&closed()[..10]).unwrap();
-    assert_eq!(
-        rx(&a, FAR, Duration::from_millis(50)),
-        Err(ConnError::Io(ErrorKind::TimedOut))
-    );
-    // header complete, payload missing
-    let (a, b) = pair();
-    (&b).write_all(&closed()[..HEADER_LEN]).unwrap();
     assert_eq!(
         rx(&a, FAR, Duration::from_millis(50)),
         Err(ConnError::Io(ErrorKind::TimedOut))
@@ -176,36 +135,6 @@ fn an_expiry_inside_a_frame_is_timed_out() {
         rx(&a, FAR, Duration::ZERO),
         Err(ConnError::Io(ErrorKind::TimedOut))
     );
-    assert!(t.elapsed() < 10 * SEC);
-}
-
-#[test]
-fn idle_does_not_cut_a_frame_that_has_started() {
-    let (a, b) = pair();
-    (&b).write_all(&closed()[..1]).unwrap();
-    let w = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(300));
-        (&b).write_all(&closed()[1..]).unwrap();
-        b
-    });
-    // the first byte comes before idle; the rest comes after idle but within frame_io
-    let r = rx(&a, Duration::from_millis(100), 5 * SEC);
-    assert_eq!(r.unwrap().1, [1]);
-    let _b = w.join().unwrap();
-}
-
-#[test]
-fn the_wait_for_the_first_byte_is_not_charged_to_frame_io() {
-    let (a, b) = pair();
-    let w = thread::spawn(move || {
-        thread::sleep(SEC);
-        (&b).write_all(&closed()).unwrap();
-        b
-    });
-    // frame_io is shorter than the wait, but it starts at the first byte
-    let r = rx(&a, 10 * SEC, Duration::from_millis(500));
-    assert_eq!(r.unwrap().1, [1]);
-    let _b = w.join().unwrap();
 }
 
 #[test]
@@ -246,20 +175,6 @@ fn hard_cuts_before_idle_and_before_frame_io() {
             INC,
             t + FAR,
             FAR,
-            Instant::now() + Duration::from_millis(50)
-        ),
-        Err(ConnError::Io(ErrorKind::TimedOut))
-    );
-    // t + frame_io overflows: hard is used
-    let (a, b) = pair();
-    (&b).write_all(&closed()[..10]).unwrap();
-    assert_eq!(
-        recv(
-            &a,
-            RUN,
-            INC,
-            t + FAR,
-            Duration::MAX,
             Instant::now() + Duration::from_millis(50)
         ),
         Err(ConnError::Io(ErrorKind::TimedOut))

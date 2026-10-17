@@ -45,7 +45,7 @@ fn after(base: Instant, d: Duration) -> Instant {
 /// directory made by `start.rs`.
 pub(crate) struct Spec<'a> {
     pub inspector: &'a Path,
-    /// The rules file: the only argument of the inspector.
+    /// The rule generation directory: the only argument of the inspector.
     pub rules: &'a Path,
     pub tmpdir: &'a Path,
     /// `GOMAXPROCS`; HELLO reports it.

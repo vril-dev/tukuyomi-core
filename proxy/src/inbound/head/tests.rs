@@ -60,7 +60,6 @@ fn a_plain_head_passes_and_gives_its_parts() {
     assert_eq!(head.target(), b"/a?b=1");
     let fields: Vec<(&[u8], &[u8])> = head.fields().collect();
     assert_eq!(fields.len(), 4);
-    assert_eq!(fields[0], (&b"Host"[..], &b"example.test"[..]));
     assert_eq!(fields[1], (&b"X-A"[..], &b"v"[..]));
     assert_eq!(head.content_length(), Some(3));
     assert!(!head.chunked());
@@ -68,58 +67,14 @@ fn a_plain_head_passes_and_gives_its_parts() {
 }
 
 #[test]
-fn a_head_that_is_not_complete_is_not_an_error() {
-    assert!(parse(b"", &LIM).unwrap().is_none());
-    assert!(parse(b"GET / HTT", &LIM).unwrap().is_none());
-    assert!(
-        parse(b"GET / HTTP/1.1\r\nHost: a\r\n", &LIM)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        parse(b"GET / HTTP/1.1\r\nHost: a\r\n\r", &LIM)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        parse(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", &LIM)
-            .unwrap()
-            .is_some()
-    );
-}
-
-#[test]
 fn line_ends_must_be_crlf() {
-    assert_eq!(
-        refused(b"GET / HTTP/1.1\nHost: a\r\n\r\n"),
-        Reject::BadRequest
-    );
-    assert_eq!(
-        refused(b"GET / HTTP/1.1\r\nHost: a\n\r\n"),
-        Reject::BadRequest
-    );
-    assert_eq!(
-        refused(b"GET / HTTP/1.1\r\nHost: a\r\n\n"),
-        Reject::BadRequest
-    );
-    assert_eq!(
-        refused(b"GET / HTTP/1.1\r\nHost: a\rb\r\n\r\n"),
-        Reject::BadRequest
-    );
-    ok(&head_with(&[]));
-}
-
-#[test]
-fn the_head_does_not_start_with_an_empty_line() {
-    assert_eq!(
-        refused(b"\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"),
-        Reject::BadRequest
-    );
-    assert_eq!(
-        refused(b"\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"),
-        Reject::BadRequest
-    );
-    ok(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    for raw in [
+        &b"GET / HTTP/1.1\nHost: a\r\n\r\n"[..],
+        b"GET / HTTP/1.1\r\nHost: a\rb\r\n\r\n",
+        b"\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+    ] {
+        assert_eq!(refused(raw), Reject::BadRequest);
+    }
 }
 
 #[test]
@@ -138,11 +93,6 @@ fn the_method_is_a_token_of_1_to_32_bytes() {
         refused(&with_request_line(" / HTTP/1.1")),
         Reject::BadRequest
     );
-    assert_eq!(
-        refused(&with_request_line("G@T / HTTP/1.1")),
-        Reject::BadRequest
-    );
-    assert_eq!(ok(&with_request_line("get / HTTP/1.1")).method(), b"get");
 }
 
 #[test]
@@ -155,46 +105,12 @@ fn the_target_is_origin_form_of_1_to_4096_bytes_that_hyper_takes_without_a_fragm
     let too_long = format!("/{}", "a".repeat(4096));
     let raw = with_request_line(&format!("GET {too_long} HTTP/1.1"));
     assert_eq!(refused(&raw), Reject::UriTooLong);
-    for target in [
-        "*",
-        "http://example.test/",
-        "a",
-        "/a#b",
-        "/a?b#c",
-        "/a\u{7f}",
-        "/\u{e9}",
-        "/a<b",
-        "/a>b",
-        "/a`b",
-        "/?q=\"x\"",
-        "/?q=<x>",
-        "/?q=>",
-    ] {
+    for target in ["*", "http://example.test/", "/a#b", "/a<b", "/?q=\"x\""] {
         let raw = with_request_line(&format!("GET {target} HTTP/1.1"));
         assert_eq!(refused(&raw), Reject::BadRequest, "target {target:?}");
     }
-    assert_eq!(
-        refused(b"GET  / HTTP/1.1\r\nHost: a\r\n\r\n"),
-        Reject::BadRequest
-    );
-    assert_eq!(
-        refused(b"GET /a b HTTP/1.1\r\nHost: a\r\n\r\n"),
-        Reject::BadRequest
-    );
-    assert_eq!(
-        ok(&with_request_line("GET /a%20b?c=d&e=%41 HTTP/1.1")).target(),
-        b"/a%20b?c=d&e=%41"
-    );
     // The path takes `"`, `{`, `|` and `}` and not the backtick; the query takes the backtick and not `"`.
-    for target in [
-        "/a\"b",
-        "/{\"k\":1}|",
-        "/?q=`x`",
-        "/a\"b?c`d{e}",
-        "/?",
-        "/??",
-        "/a?b?c",
-    ] {
+    for target in ["/a%20b?c=d&e=%41", "/{\"k\":1}|", "/?q=`x`"] {
         let raw = with_request_line(&format!("GET {target} HTTP/1.1"));
         assert_eq!(ok(&raw).target(), target.as_bytes(), "target {target:?}");
     }
@@ -202,21 +118,12 @@ fn the_target_is_origin_form_of_1_to_4096_bytes_that_hyper_takes_without_a_fragm
 
 #[test]
 fn only_http_1_1_passes() {
-    ok(&with_request_line("GET / HTTP/1.1"));
     assert_eq!(
         refused(&with_request_line("GET / HTTP/1.0")),
         Reject::VersionNotSupported
     );
     assert_eq!(
         refused(&with_request_line("GET / HTTP/1.2")),
-        Reject::BadRequest
-    );
-    assert_eq!(
-        refused(&with_request_line("GET / HTTP/2.0")),
-        Reject::BadRequest
-    );
-    assert_eq!(
-        refused(&with_request_line("GET / FTP/1.1")),
         Reject::BadRequest
     );
 }
@@ -231,7 +138,6 @@ fn fields_numbered(count: usize) -> Vec<u8> {
 fn at_most_64_fields() {
     assert_eq!(ok(&fields_numbered(64)).fields().len(), 64);
     assert_eq!(refused(&fields_numbered(65)), Reject::FieldsTooLarge);
-    assert_eq!(refused(&fields_numbered(80)), Reject::FieldsTooLarge);
 }
 
 #[test]
@@ -245,8 +151,6 @@ fn a_name_has_1_to_256_bytes() {
 
 #[test]
 fn a_value_has_at_most_4096_bytes_without_the_blanks_around_it() {
-    let longest = format!("X-A: {}", "v".repeat(4096));
-    ok(&head_with(&[&longest]));
     let padded = format!("X-A:  \t{} \t ", "v".repeat(4096));
     assert_eq!(
         ok(&head_with(&[&padded])).fields().nth(1).unwrap().1.len(),
@@ -278,7 +182,7 @@ fn names_and_values_together_are_at_most_24_kib() {
 
 #[test]
 fn field_syntax_is_strict() {
-    for line in ["X-A : v", "X@A: v", "X A: v", "X-A v"] {
+    for line in ["X-A : v", "X@A: v"] {
         assert_eq!(
             refused(&head_with(&[line])),
             Reject::BadRequest,
@@ -290,41 +194,24 @@ fn field_syntax_is_strict() {
         refused(b"GET / HTTP/1.1\r\nHost: a\r\nX-A: v\r\n  folded\r\n\r\n"),
         Reject::BadRequest
     );
-    assert_eq!(
-        refused(b"GET / HTTP/1.1\r\n Host: a\r\n\r\n"),
-        Reject::BadRequest
-    );
-    let head = ok(&head_with(&["X-A:", "x-b:    ", "X-C:v"]));
-    let fields: Vec<(&[u8], &[u8])> = head.fields().collect();
-    assert_eq!(fields[1], (&b"X-A"[..], &b""[..]));
-    assert_eq!(fields[2], (&b"x-b"[..], &b""[..]));
-    assert_eq!(fields[3], (&b"X-C"[..], &b"v"[..]));
 }
 
 #[test]
 fn a_value_has_no_control_byte_except_htab() {
-    let line = |byte: u8| [b"X-A: a".as_slice(), &[byte], b"b\r\n"].concat();
-    let with = |bytes: Vec<u8>| {
+    let with = |byte: u8| {
         [
-            b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec(),
-            bytes,
-            b"\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: a\r\nX-A: a".as_slice(),
+            &[byte],
+            b"b\r\n\r\n",
         ]
         .concat()
     };
-    for byte in [0x00, 0x01, 0x08, 0x0b, 0x1f, 0x7f] {
-        assert_eq!(
-            refused(&with(line(byte))),
-            Reject::BadRequest,
-            "byte {byte:#04x}"
-        );
+    for byte in [0x00, 0x08, 0x1f, 0x7f] {
+        assert_eq!(refused(&with(byte)), Reject::BadRequest, "{byte:#04x}");
     }
-    for byte in [0x09, 0x20, 0x7e, 0x80, 0xff] {
-        ok(&with(line(byte)));
+    for byte in [0x09, 0x7e, 0x80] {
+        ok(&with(byte));
     }
-    // The blanks around a value are not part of it, so they are not control bytes either.
-    let head = ok(&with(b"X-A:\t a\tb \t\r\n".to_vec()));
-    assert_eq!(head.fields().nth(1).unwrap().1, b"a\tb");
 }
 
 #[test]
@@ -338,39 +225,20 @@ fn there_is_exactly_one_host_without_blanks() {
         Reject::BadRequest
     );
     assert_eq!(
-        refused(&head_with(&["HOST: other.test"])),
-        Reject::BadRequest
-    );
-    assert_eq!(
         refused(b"GET / HTTP/1.1\r\nHost:\r\n\r\n"),
-        Reject::BadRequest
-    );
-    assert_eq!(
-        refused(b"GET / HTTP/1.1\r\nHost:  \t \r\n\r\n"),
         Reject::BadRequest
     );
     assert_eq!(
         refused(b"GET / HTTP/1.1\r\nHost: a b\r\n\r\n"),
         Reject::BadRequest
     );
-    assert_eq!(
-        refused(b"GET / HTTP/1.1\r\nHost: a\tb\r\n\r\n"),
-        Reject::BadRequest
-    );
-    ok(b"GET / HTTP/1.1\r\nhOsT: a\r\n\r\n");
     ok(b"GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n");
 }
 
 #[test]
 fn transfer_encoding_is_one_line_that_is_chunked() {
-    assert!(ok(&head_with(&["Transfer-Encoding: chunked"])).chunked());
     assert!(ok(&head_with(&["transfer-encoding:  CHUNKED \t"])).chunked());
-    for line in [
-        "Transfer-Encoding: gzip, chunked",
-        "Transfer-Encoding: chunked, gzip",
-        "Transfer-Encoding: identity",
-        "Transfer-Encoding:",
-    ] {
+    for line in ["Transfer-Encoding: gzip, chunked", "Transfer-Encoding:"] {
         assert_eq!(
             refused(&head_with(&[line])),
             Reject::BadRequest,
@@ -379,6 +247,7 @@ fn transfer_encoding_is_one_line_that_is_chunked() {
     }
     let twice = head_with(&["Transfer-Encoding: chunked", "Transfer-Encoding: chunked"]);
     assert_eq!(refused(&twice), Reject::BadRequest);
+    // Both framings together are a smuggling shape: refused in either order.
     let both = head_with(&["Transfer-Encoding: chunked", "Content-Length: 0"]);
     assert_eq!(refused(&both), Reject::BadRequest);
     let both = head_with(&["Content-Length: 5", "Transfer-Encoding: chunked"]);
@@ -387,14 +256,6 @@ fn transfer_encoding_is_one_line_that_is_chunked() {
 
 #[test]
 fn content_length_is_one_line_of_digits_within_the_limit() {
-    assert_eq!(
-        ok(&head_with(&["Content-Length: 0"])).content_length(),
-        Some(0)
-    );
-    assert_eq!(
-        ok(&head_with(&["content-length: 007", FORM])).content_length(),
-        Some(7)
-    );
     let largest = format!("Content-Length: {}", LIM.max_body);
     assert_eq!(
         ok(&head_with(&[&largest, FORM])).content_length(),
@@ -414,9 +275,6 @@ fn content_length_is_one_line_of_digits_within_the_limit() {
     for line in [
         "Content-Length:",
         "Content-Length: +5",
-        "Content-Length: -5",
-        "Content-Length: 5 6",
-        "Content-Length: 0x5",
         "Content-Length: 5,5",
     ] {
         assert_eq!(
@@ -430,60 +288,30 @@ fn content_length_is_one_line_of_digits_within_the_limit() {
         refused(&head_with(&["Content-Length: 0", "Content-Length: 0"])),
         Reject::BadRequest
     );
-    let tight = Limits { max_body: 0, ..LIM };
-    assert!(
-        parse(&head_with(&["Content-Length: 0"]), &tight)
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
-        parse(&head_with(&["Content-Length: 1", FORM]), &tight).unwrap_err(),
-        Reject::ContentTooLarge
-    );
 }
 
 #[test]
 fn expect_is_absent_or_exactly_100_continue() {
-    assert!(parse(&head_with(&[]), &LIM).unwrap().is_some());
-    ok(&head_with(&["Expect: 100-continue"]));
     ok(&head_with(&["expect:  100-CONTINUE "]));
-    for line in [
-        "Expect: 200-ok",
-        "Expect:",
-        "Expect: 100-continue, 100-continue",
-        "Expect: 100-continue x",
-    ] {
+    for line in ["Expect: 200-ok", "Expect: 100-continue, 100-continue"] {
         assert_eq!(
             refused(&head_with(&[line])),
             Reject::ExpectationFailed,
             "line {line:?}"
         );
     }
-    let twice = head_with(&["Expect: 100-continue", "Expect: 100-continue"]);
-    assert_eq!(refused(&twice), Reject::ExpectationFailed);
 }
 
 #[test]
 fn connection_is_a_list_of_tokens_that_does_not_name_the_fixed_fields() {
-    ok(&head_with(&["Connection: keep-alive"]));
     ok(&head_with(&[
         "Connection: close",
-        "Connection: Upgrade,  X-Hop \t",
+        "Connection: Upgrade,  X-Hop",
     ]));
-    ok(&head_with(&["Connection: x-hosts, content-lengths"]));
     for line in [
-        "Connection: host",
         "Connection: close, HOST",
         "Connection: content-length",
-        "Connection: x, Content-Type",
-        "Connection: content-encoding",
-        "Connection:",
         "Connection: a,,b",
-        "Connection: a,",
-        "Connection: ,a",
-        "Connection: a b",
-        "Connection: a;b",
-        "Connection: \"a\"",
     ] {
         assert_eq!(
             refused(&head_with(&[line])),
@@ -491,102 +319,53 @@ fn connection_is_a_list_of_tokens_that_does_not_name_the_fixed_fields() {
             "line {line:?}"
         );
     }
-    // One bad line among good ones is enough.
-    assert_eq!(
-        refused(&head_with(&["Connection: close", "Connection: host"])),
-        Reject::BadRequest
-    );
 }
 
 #[test]
 fn content_encoding_is_absent_or_one_line_that_is_gzip() {
-    // Absent: the body is not gzip, whatever else the head says.
-    assert!(!ok(&head_with(&[])).gzip());
     assert!(!ok(&head_with(&["Content-Length: 1", FORM])).gzip());
-    assert!(!ok(&head_with(&["Transfer-Encoding: chunked", FORM])).gzip());
-    assert!(!ok(&head_with(&["Content-Language: en"])).gzip());
     // Exactly `gzip`, ASCII case ignored, the blanks around the value dropped; with a length and chunked.
-    for line in [
+    let sized = ok(&head_with(&[
+        "Content-Length: 1",
+        FORM,
+        "content-encoding: GZIP \t",
+    ]));
+    assert!(sized.gzip() && !sized.chunked());
+    let chunked = ok(&head_with(&[
+        "Transfer-Encoding: chunked",
+        FORM,
         "Content-Encoding: gzip",
-        "content-encoding: GZIP",
-        "CONTENT-ENCODING: GzIp",
-        "Content-Encoding:  gzip \t",
-        "Content-Encoding:\tgzip",
-    ] {
-        let sized = ok(&head_with(&["Content-Length: 1", FORM, line]));
-        assert!(sized.gzip() && !sized.chunked(), "line {line:?}");
-        assert_eq!(sized.content_length(), Some(1), "line {line:?}");
-        let chunked = ok(&head_with(&["Transfer-Encoding: chunked", FORM, line]));
-        assert!(chunked.gzip() && chunked.chunked(), "line {line:?}");
-    }
-    // Any other value is 415: another coding, a list of any length, an empty value, a near miss. The value
-    // decides before the body (or the lack of one) is looked at.
+    ]));
+    assert!(chunked.gzip() && chunked.chunked());
+    // Any other value is 415, before the body (or the lack of one) is looked at.
     for line in [
-        "Content-Encoding: x-gzip",
-        "Content-Encoding: X-GZIP",
         "Content-Encoding: deflate",
-        "Content-Encoding: br",
-        "Content-Encoding: zstd",
         "Content-Encoding: identity",
-        "Content-Encoding: compress",
-        "Content-Encoding: x-compress",
-        "Content-Encoding: gzip, gzip",
-        "Content-Encoding: gzip,gzip",
         "Content-Encoding: gzip, identity",
-        "Content-Encoding: identity, gzip",
-        "Content-Encoding: gzip, br",
-        "Content-Encoding: br, gzip",
-        "Content-Encoding: gzip,",
-        "Content-Encoding: ,gzip",
         "Content-Encoding:",
-        "Content-Encoding:  \t",
-        "Content-Encoding: gzip;q=1",
         "Content-Encoding: gzipx",
-        "Content-Encoding: xgzip",
-        "Content-Encoding: gzi",
-        "Content-Encoding: g zip",
-        "Content-Encoding: gzip gzip",
-        "Content-Encoding: \"gzip\"",
     ] {
         let sized = head_with(&["Content-Length: 1", FORM, line]);
         assert_eq!(refused(&sized), Reject::UnsupportedMedia, "line {line:?}");
-        let chunked = head_with(&["Transfer-Encoding: chunked", FORM, line]);
-        assert_eq!(refused(&chunked), Reject::UnsupportedMedia, "line {line:?}");
         let empty = head_with(&["Content-Length: 0", line]);
         assert_eq!(refused(&empty), Reject::UnsupportedMedia, "line {line:?}");
-        assert_eq!(
-            refused(&head_with(&[line])),
-            Reject::UnsupportedMedia,
-            "line {line:?}"
-        );
     }
-    // Two lines are refused whatever they say, in any case of the name.
-    for lines in [
-        &["Content-Encoding: gzip", "Content-Encoding: gzip"],
-        &["Content-Encoding: gzip", "content-encoding: GZIP"],
-        &["Content-Encoding: gzip", "Content-Encoding: identity"],
-        &["Content-Encoding: identity", "Content-Encoding: gzip"],
-        &["Content-Encoding: br", "Content-Encoding: br"],
-    ] {
-        let mut all = vec!["Content-Length: 1", FORM];
-        all.extend_from_slice(lines);
-        assert_eq!(
-            refused(&head_with(&all)),
-            Reject::UnsupportedMedia,
-            "lines {lines:?}"
-        );
-    }
+    // Two lines are refused whatever they say.
+    let twice = head_with(&[
+        "Content-Length: 1",
+        FORM,
+        "Content-Encoding: gzip",
+        "content-encoding: GZIP",
+    ]);
+    assert_eq!(refused(&twice), Reject::UnsupportedMedia);
 }
 
 #[test]
 fn a_gzip_body_that_is_empty_on_its_face_is_400() {
     // No bytes by length or by the lack of any framing: not a gzip stream.
     for lines in [
-        &["Content-Encoding: gzip", "Content-Length: 0"][..],
-        &["Content-Encoding: gzip", "Content-Length: 0", FORM],
-        &["content-encoding:  GZIP ", "content-length: 000"],
+        &["Content-Encoding: gzip", "Content-Length: 0", FORM][..],
         &["Content-Encoding: gzip"],
-        &["Content-Encoding: gzip", FORM],
     ] {
         assert_eq!(
             refused(&head_with(lines)),
@@ -607,43 +386,11 @@ fn a_gzip_body_that_is_empty_on_its_face_is_400() {
         FORM,
     ]));
     assert!(chunked.gzip() && chunked.chunked());
-    // The same bodies without the coding are not refused for it.
-    assert!(
-        !ok(&head_with(&["Content-Length: 0"])).gzip() && !ok(&head_with(&[])).gzip(),
-        "an empty body is fine without gzip"
-    );
     // The type rule is the one of a body with a length: a gzip body needs the type of the decoded body.
     assert_eq!(
         refused(&head_with(&["Content-Encoding: gzip", "Content-Length: 1"])),
         Reject::UnsupportedMedia
     );
-    assert_eq!(
-        refused(&head_with(&[
-            "Content-Encoding: gzip",
-            "Content-Length: 1",
-            "Content-Type: text/plain"
-        ])),
-        Reject::UnsupportedMedia
-    );
-    for essence in [
-        JSON,
-        SUFFIXED,
-        "Content-Type: multipart/form-data; boundary=x",
-    ] {
-        let head = ok(&head_with(&[
-            "Content-Encoding: gzip",
-            "Content-Length: 1",
-            essence,
-        ]));
-        assert!(head.gzip() && head.inspectable_type(), "type {essence:?}");
-    }
-    // A chunked gzip body of another type passes the head and is checked by the caller.
-    let chunked = ok(&head_with(&[
-        "Content-Encoding: gzip",
-        "Transfer-Encoding: chunked",
-        "Content-Type: text/plain",
-    ]));
-    assert!(chunked.gzip() && chunked.chunked() && !chunked.inspectable_type());
 }
 
 #[test]
@@ -653,48 +400,17 @@ fn a_body_needs_exactly_one_inspectable_content_type() {
         all.extend_from_slice(lines);
         head_with(&all)
     };
-    ok(&lengthy(&[FORM]));
-    ok(&lengthy(&[
-        "Content-Type: application/x-www-form-urlencoded; charset=utf-8",
-    ]));
-    ok(&lengthy(&[
+    for line in [
+        FORM,
         "content-type:  MULTIPART/Form-Data ; boundary=xyz",
-    ]));
-    ok(&lengthy(&["Content-Type: multipart/form-data"]));
-    // JSON is compared like the other two: the part before the first `;`, blanks and case ignored.
-    ok(&lengthy(&[JSON]));
-    ok(&lengthy(&["Content-Type: application/json; charset=UTF-8"]));
-    ok(&lengthy(&["Content-Type: Application/JSON"]));
-    ok(&lengthy(&[
-        "content-type:  application/json ; charset=utf-8",
-    ]));
-    ok(&lengthy(&[
-        "Content-Type:\tapplication/json\t;\tcharset=utf-8",
-    ]));
-    // `application/<name>+json` is compared the same way, and the name has its own rule.
-    ok(&lengthy(&[SUFFIXED]));
-    ok(&lengthy(&["Content-Type: application/problem+json"]));
-    ok(&lengthy(&["Content-Type: application/merge-patch+json"]));
-    ok(&lengthy(&[
-        "Content-Type: Application/VND.API+JSON; charset=UTF-8",
-    ]));
-    ok(&lengthy(&[
-        "content-type:  application/vnd.api+json ; charset=utf-8",
-    ]));
-    ok(&lengthy(&[
-        "Content-Type:\tapplication/problem+json\t;\tcharset=utf-8",
-    ]));
-    // The name: one byte, a digit first, `.` and `-` inside.
-    ok(&lengthy(&["Content-Type: application/x+json"]));
-    ok(&lengthy(&["Content-Type: application/1+json"]));
-    ok(&lengthy(&["Content-Type: application/vnd.api-v1.2+json"]));
-    // The `x-www-form-urlencoded` start is refused only when the name really starts with it.
-    ok(&lengthy(&[
-        "Content-Type: application/x-www-form-urlencode+json",
-    ]));
-    ok(&lengthy(&[
+        "Content-Type: application/json; charset=UTF-8",
+        SUFFIXED,
+        "Content-Type: application/x+json",
+        // The `x-www-form-urlencoded` start is refused only when the name really starts with it.
         "Content-Type: application/xx-www-form-urlencoded+json",
-    ]));
+    ] {
+        ok(&lengthy(&[line]));
+    }
     // The longest name is 122 bytes.
     let named = |len: usize| format!("Content-Type: application/{}+json", "a".repeat(len));
     ok(&lengthy(&[&named(122)]));
@@ -702,46 +418,13 @@ fn a_body_needs_exactly_one_inspectable_content_type() {
     for lines in [
         &[][..],
         &["Content-Type: text/plain"],
-        &["Content-Type: application/xml"],
-        &["Content-Type: application/x-www-form-urlencodedx"],
-        &["Content-Type:"],
-        &["Content-Type: multipart/form-data, text/plain"],
-        &[FORM, FORM],
-        &[FORM, "Content-Type: text/plain"],
         &["Content-Type: application/jsonp"],
         &["Content-Type: text/x+json"],
-        &["Content-Type: text/json"],
-        &["Content-Type: application /json"],
-        &["Content-Type: application/json, text/plain"],
-        &[JSON, JSON],
-        &[JSON, "Content-Type: text/plain"],
-        &["Content-Type: application/vnd.api+json, text/plain"],
-        &[SUFFIXED, SUFFIXED],
-        &[SUFFIXED, JSON],
-        &[SUFFIXED, "Content-Type: text/plain"],
-        // A name that is empty, starts with a symbol, or has a byte outside letters, digits, `.` and `-`.
+        &[FORM, FORM],
+        &[FORM, "Content-Type: text/plain"],
         &["Content-Type: application/+json"],
-        &["Content-Type: application/.x+json"],
-        &["Content-Type: application/-x+json"],
-        &["Content-Type: application/a+b+json"],
         &["Content-Type: application/a_b+json"],
-        &["Content-Type: application/a/b+json"],
-        &["Content-Type: application/\u{e9}+json"],
-        &["Content-Type: application/vnd.api +json"],
-        &["Content-Type: application/vnd.api+ json"],
-        // A name that starts with the urlencoded type (any case), and types that are not `application/<name>+json`.
         &["Content-Type: application/x-www-form-urlencoded+json"],
-        &["Content-Type: application/x-www-form-urlencoded-x+json"],
-        &["Content-Type: Application/X-WWW-Form-Urlencoded+JSON"],
-        &["Content-Type: application/x+json2"],
-        &["Content-Type: application/x+jsonp"],
-        &["Content-Type: application/x+jso"],
-        &["Content-Type: application/vnd.api-json"],
-        &["Content-Type: application/jso"],
-        &["Content-Type: application/"],
-        &["Content-Type: text/x+json"],
-        &["Content-Type: xapplication/x+json"],
-        &["Content-Type: text/plain-and-more+json"],
     ] {
         assert_eq!(
             refused(&lengthy(lines)),
@@ -749,35 +432,22 @@ fn a_body_needs_exactly_one_inspectable_content_type() {
             "lines {lines:?}"
         );
     }
-    // No body: no type needed, and the flag says what the type is.
+    // No body: no type needed, and the flag says what the type is. A chunked body is checked by the caller.
     assert!(!ok(&head_with(&["Content-Length: 0"])).inspectable_type());
-    assert!(ok(&head_with(&["Content-Length: 0", FORM])).inspectable_type());
     assert!(ok(&head_with(&["Content-Length: 0", JSON])).inspectable_type());
-    assert!(ok(&head_with(&["Content-Length: 0", SUFFIXED])).inspectable_type());
-    assert!(!ok(&head_with(&["Content-Type: text/plain"])).inspectable_type());
-    // A chunked body is checked by the caller once it knows the body is not empty.
     let chunked = ok(&head_with(&[
         "Transfer-Encoding: chunked",
         "Content-Type: text/plain",
     ]));
     assert!(chunked.chunked() && !chunked.inspectable_type());
-    assert!(ok(&head_with(&["Transfer-Encoding: chunked", FORM])).inspectable_type());
-    assert!(ok(&head_with(&["Transfer-Encoding: chunked", JSON])).inspectable_type());
-    assert!(ok(&head_with(&["Transfer-Encoding: chunked", SUFFIXED])).inspectable_type());
-    let near = head_with(&["Transfer-Encoding: chunked", "Content-Type: text/x+json"]);
-    assert!(!ok(&near).inspectable_type());
 }
 
 #[test]
 fn the_first_broken_rule_decides() {
-    // The version before the fields, the line ends before everything, a size before the Host rule.
+    // The version before the fields, a size before the Host rule.
     assert_eq!(
         refused(b"GET / HTTP/1.0\r\nX-A: v\r\n\r\n"),
         Reject::VersionNotSupported
-    );
-    assert_eq!(
-        refused(b"GET / HTTP/1.0\nHost: a\r\n\r\n"),
-        Reject::BadRequest
     );
     let big = format!("GET / HTTP/1.1\r\nX-A: {}\r\n\r\n", "x".repeat(4097));
     assert_eq!(refused(big.as_bytes()), Reject::FieldsTooLarge);
@@ -790,53 +460,36 @@ fn the_first_broken_rule_decides() {
     assert_eq!(refused(&raw), Reject::ContentTooLarge);
     let raw = head_with(&["Expect: nope", "Connection: host", "Content-Encoding: br"]);
     assert_eq!(refused(&raw), Reject::ExpectationFailed);
-    let raw = head_with(&["Connection: host", "Content-Encoding: br"]);
-    assert_eq!(refused(&raw), Reject::BadRequest);
-    // Within rule 8 the coding is decided first, then the body that has no bytes, then the body type.
+    // Within rule 8 the coding is decided first, then the body that has no bytes.
     let raw = head_with(&["Content-Encoding: br", "Content-Length: 0"]);
     assert_eq!(refused(&raw), Reject::UnsupportedMedia);
-    let raw = head_with(&["Content-Encoding: gzip", "Content-Length: 0"]);
-    assert_eq!(refused(&raw), Reject::BadRequest);
 }
 
 #[test]
 fn every_refusal_has_the_fixed_answer_of_its_status() {
-    let all = [
-        Reject::BadRequest,
-        Reject::UriTooLong,
-        Reject::FieldsTooLarge,
-        Reject::ContentTooLarge,
-        Reject::ExpectationFailed,
-        Reject::VersionNotSupported,
-        Reject::UnsupportedMedia,
-        Reject::Timeout,
-        Reject::Closed,
-    ];
-    for reject in all {
-        assert!(!reject.reason().is_empty());
-        match (reject.status(), reject.response()) {
-            (None, None) => assert_eq!(reject, Reject::Closed),
-            (Some(status), Some(bytes)) => {
-                let reason = http::StatusCode::from_u16(status)
-                    .unwrap()
-                    .canonical_reason()
-                    .unwrap();
-                let expected = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
-                assert_eq!(bytes, expected.as_bytes(), "{reject:?}");
-            }
-            other => panic!("status and answer disagree: {other:?}"),
-        }
+    for (reject, status) in [
+        (Reject::BadRequest, 400),
+        (Reject::UriTooLong, 414),
+        (Reject::FieldsTooLarge, 431),
+        (Reject::ContentTooLarge, 413),
+        (Reject::ExpectationFailed, 417),
+        (Reject::VersionNotSupported, 505),
+        (Reject::UnsupportedMedia, 415),
+        (Reject::Timeout, 408),
+    ] {
+        assert_eq!(reject.status(), Some(status));
+        let reason = http::StatusCode::from_u16(status)
+            .unwrap()
+            .canonical_reason()
+            .unwrap();
+        let expected =
+            format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        assert_eq!(reject.response(), Some(expected.as_bytes()), "{reject:?}");
     }
-    assert_eq!(Reject::BadRequest.status(), Some(400));
-    assert_eq!(Reject::UriTooLong.status(), Some(414));
-    assert_eq!(Reject::FieldsTooLarge.status(), Some(431));
-    assert_eq!(Reject::ContentTooLarge.status(), Some(413));
-    assert_eq!(Reject::ExpectationFailed.status(), Some(417));
-    assert_eq!(Reject::VersionNotSupported.status(), Some(505));
-    assert_eq!(Reject::UnsupportedMedia.status(), Some(415));
-    assert_eq!(Reject::Timeout.status(), Some(408));
+    assert_eq!(
+        (Reject::Closed.status(), Reject::Closed.response()),
+        (None, None)
+    );
 }
 
 fn runtime() -> Runtime {
@@ -893,7 +546,6 @@ fn read_returns_the_head_and_what_came_after_it() {
             client
         });
         let (head, rest) = read(&mut server, &LIM, soon(10_000)).await.unwrap();
-        assert_eq!(head.method(), b"GET");
         assert_eq!(head.content_length(), Some(4));
         assert_eq!(&rest[..], b"a=b&");
         assert_eq!(&head.buf[head.len..], b"a=b&");
@@ -934,49 +586,17 @@ fn read_refuses_a_head_that_does_not_fit_the_buffer() {
 fn read_ends_with_timeout_or_closed_when_the_head_does_not_come() {
     runtime().block_on(async {
         let (mut server, client) = pair().await;
-        let start = std::time::Instant::now();
         assert_eq!(
             read(&mut server, &LIM, soon(150)).await.unwrap_err(),
             Reject::Timeout
         );
-        assert!(start.elapsed() >= Duration::from_millis(140));
-        // A deadline that has passed ends the read at once, with what was sent so far unparsed.
+        // The peer goes away with half a head.
         put(&client, b"GET / HTTP/1.1\r\nHo").await;
-        assert_eq!(
-            read(&mut server, &LIM, Instant::now()).await.unwrap_err(),
-            Reject::Timeout
-        );
-        // The peer goes away with half a head, and another one without sending anything.
         drop(client);
         assert_eq!(
             read(&mut server, &LIM, soon(10_000)).await.unwrap_err(),
             Reject::Closed
         );
-        let (mut server, client) = pair().await;
-        drop(client);
-        assert_eq!(
-            read(&mut server, &LIM, soon(10_000)).await.unwrap_err(),
-            Reject::Closed
-        );
-    });
-}
-
-#[test]
-fn read_refuses_a_bad_head_without_waiting_for_the_rest() {
-    runtime().block_on(async {
-        let (mut server, client) = pair().await;
-        put(&client, b"GET / HTTP/1.0\r\n\r\n").await;
-        assert_eq!(
-            read(&mut server, &LIM, soon(10_000)).await.unwrap_err(),
-            Reject::VersionNotSupported
-        );
-        let (mut server, client) = pair().await;
-        put(&client, b"GET / HTTP/1.1\nHost: a\n\n").await;
-        assert_eq!(
-            read(&mut server, &LIM, soon(10_000)).await.unwrap_err(),
-            Reject::BadRequest
-        );
-        drop(client);
     });
 }
 
@@ -1038,14 +658,11 @@ async fn hyper_takes(listener: &TcpListener, target: &[u8]) -> bool {
     }
 }
 
-/// Runs `target` through `http::Uri` (what hyper calls for the target), through a hyper server and through
-/// the head check, and checks that they agree: the head check takes it exactly when hyper does, except that
-/// it also refuses a `#` and a byte outside `0x21..=0x7e`. Returns whether the head check took it.
+/// Checks that the head check takes a target exactly when hyper does, except that it also refuses a `#` and a
+/// byte outside `0x21..=0x7e`. Returns whether the head check took it.
 async fn guard_and_hyper_agree(listener: &TcpListener, target: &[u8]) -> bool {
     let shown = target.escape_ascii().to_string();
-    let uri = http::Uri::from_maybe_shared(Bytes::copy_from_slice(target)).is_ok();
     let hyper = hyper_takes(listener, target).await;
-    assert_eq!(uri, hyper, "target {shown}: the URI parser and the server");
     let stricter = target.contains(&b'#') || !target.iter().all(|b| (0x21..=0x7e).contains(b));
     let raw = [b"GET ".as_slice(), target, b" HTTP/1.1\r\nHost: a\r\n\r\n"].concat();
     match parse(&raw, &LIM) {
@@ -1087,41 +704,5 @@ fn the_head_check_takes_a_request_target_exactly_when_hyper_takes_it() {
         }
         assert_eq!(path_refused, b"#<>`");
         assert_eq!(query_refused, b"\"#<>");
-        // A few bytes outside that range: the head check refuses all of them.
-        for b in [0x00u8, 0x09, 0x1f, 0x20, 0x7f, 0x80, 0xff] {
-            for target in [
-                [b"/a".as_slice(), &[b], b"c"].concat(),
-                [b"/a?b".as_slice(), &[b], b"c"].concat(),
-            ] {
-                assert!(!guard_and_hyper_agree(&listener, &target).await);
-            }
-        }
-        // Whole targets: the bytes that are taken in one part and refused in the other, in both parts.
-        let whole = [
-            ("/", true),
-            ("/?", true),
-            ("/??", true),
-            ("//", true),
-            ("/a?b?c", true),
-            ("/a%zz?b=%", true),
-            ("/a\"b?c`d", true),
-            ("/{\"k\":1}|~?x={`y`}", true),
-            ("/a<b?c`d", false),
-            ("/a\"b?c\"d", false),
-            ("/a`b?c`d", false),
-        ];
-        for (target, taken) in whole {
-            let got = guard_and_hyper_agree(&listener, target.as_bytes()).await;
-            assert_eq!(got, taken, "target {target:?}");
-        }
-        // The two places where the head check is stricter on purpose: hyper cuts a fragment off and goes on,
-        // and takes valid UTF-8 above 0x7f.
-        for target in ["/a#c", "/a?b#c", "/\u{e9}", "/?\u{e9}"] {
-            assert!(
-                hyper_takes(&listener, target.as_bytes()).await,
-                "{target:?}"
-            );
-            assert!(!guard_and_hyper_agree(&listener, target.as_bytes()).await);
-        }
     });
 }

@@ -745,9 +745,10 @@ pub(crate) const INSPECTOR_CORAZA_VERSION: &[u8] = b"v3.8.1";
 pub(crate) const INSPECTOR_CORAZA_SUM: &[u8] = b"h1:dMV55FbMR2vOks/acrT43RShR+VkzU6jwp+XPdxay8o=";
 
 /// What a valid HELLO contains besides the start's own pid, run, incarnation and nonce, and the pinned inspector
-/// build. The rules sha256 comes from the configuration. Go hashes the bytes it read and builds the WAF
-/// from the same bytes, so HELLO ties the loaded rules to `rules_sha256`. `mem_limit` is `GOMEMLIMIT` and `gomaxprocs`
-/// is `GOMAXPROCS`, as the inspector reports them.
+/// build. The rules sha256 comes from the configuration. Go hashes the bytes of the bundle's `manifest.json` it read,
+/// checks each file the manifest names against the sha256 it gives and builds the WAF from the bytes it checked, so
+/// HELLO ties the loaded rules to `rules_sha256`. `mem_limit` is `GOMEMLIMIT` and `gomaxprocs` is `GOMAXPROCS`, as the
+/// inspector reports them.
 pub(crate) struct HelloExpect<'a> {
     pub rules_sha256: &'a [u8; 32],
     pub mem_limit: u64,

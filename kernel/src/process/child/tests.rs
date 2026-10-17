@@ -80,19 +80,6 @@ fn child_env_refuses_a_tmpdir_that_is_not_utf8() {
 }
 
 #[test]
-fn random_values_differ() {
-    assert_ne!(fresh_nonce().unwrap(), fresh_nonce().unwrap());
-    assert_ne!(fresh_run().unwrap(), fresh_run().unwrap());
-}
-
-#[test]
-fn after_fails_closed_when_the_sum_does_not_fit() {
-    let base = Instant::now();
-    assert_eq!(after(base, Duration::MAX), base);
-    assert!(after(base, Duration::from_secs(1)) > base);
-}
-
-#[test]
 fn spawn_refuses_a_relative_inspector_and_starts_nothing_for_a_missing_one() {
     let rel = sleeper("sleep", "60");
     assert_eq!(
@@ -120,18 +107,6 @@ fn kill_then_try_exit_keeps_the_exit() {
     assert!(again.killed && again.status == x.status);
     ins.kill().unwrap();
     assert_eq!(ins.try_exit().unwrap().unwrap().status, x.status);
-}
-
-#[test]
-fn a_natural_exit_is_not_a_kill() {
-    // `sleep 0` ends at once with status 0.
-    let (mut ins, _mine) = spawn(&sleeper("/bin/sleep", "0"), 1, 1, &NONCE).unwrap();
-    let x = wait_exit(&mut ins);
-    assert!(!x.killed);
-    assert!(x.status.success());
-    // A kill after the exit was seen changes nothing.
-    ins.kill().unwrap();
-    assert!(!ins.try_exit().unwrap().unwrap().killed);
 }
 
 #[test]

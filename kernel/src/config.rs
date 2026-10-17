@@ -26,9 +26,9 @@ pub(crate) const MAX_RESTARTS: u32 = 1000;
 pub struct Config {
     /// Absolute clean path of the Go inspector executable.
     pub inspector: PathBuf,
-    /// Absolute clean path of the rules file (the inspector's only argument).
+    /// Absolute clean path of the rule generation directory (the inspector's only argument).
     pub rules: PathBuf,
-    /// SHA-256 of the rules file bytes; HELLO must report the same.
+    /// The bundle fingerprint: SHA-256 of that directory's `manifest.json` bytes; HELLO must report the same.
     pub rules_sha256: [u8; 32],
     /// Existing real directory, owned by this process's user, no group or other bits.
     pub tmp_root: PathBuf,

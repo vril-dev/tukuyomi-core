@@ -3,7 +3,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -43,6 +42,12 @@ func run(args []string) int {
 		d.printf("start: peer check failed: %v", err)
 		return exitPeer
 	}
+	// Coraza tries the working directory as a place for the file that a rule
+	// names, and its error then holds that path. At "/" no path of ours is in it.
+	if err := os.Chdir("/"); err != nil {
+		d.printf("start: chdir: %v", err)
+		return exitStartup
+	}
 	cfg, err := parseConfig(args, os.Getenv)
 	if err != nil {
 		d.printf("start: %v", err)
@@ -53,17 +58,22 @@ func run(args []string) int {
 		d.printf("start: %v", err)
 		return exitStartup
 	}
-	rules, err := readRules(cfg.rulesPath)
+	b, err := readBundle(cfg.bundleDir)
 	if err != nil {
 		d.printf("start: rules: %v", withoutPath(err))
 		return exitRules
 	}
-	sha := sha256.Sum256(rules)
-	if err := checkRules(string(rules)); err != nil {
-		d.printf("start: rules rejected: %v", err)
+	for _, p := range b.load {
+		if err := checkRules(string(b.files[p])); err != nil {
+			d.printf("start: rules rejected: %s: %v", p, err)
+			return exitRules
+		}
+	}
+	if p, err := checkMarkers(b); err != nil {
+		d.printf("start: rules rejected: %s: %v", p, err)
 		return exitRules
 	}
-	waf, err := newWAF(string(rules))
+	waf, err := newWAF(b)
 	if err != nil {
 		d.printf("start: rules build failed: %v", err)
 		return exitRules
@@ -79,7 +89,7 @@ func run(args []string) int {
 	}
 	h, err := encodeHello(cfg.run, cfg.inc, hello{
 		pid: uint32(os.Getpid()), nonce: cfg.nonce, goVersion: runtime.Version(),
-		corazaVersion: ver, corazaSum: sum, rulesSHA256: sha,
+		corazaVersion: ver, corazaSum: sum, rulesSHA256: b.fingerprint,
 		memLimit: debug.SetMemoryLimit(-1), gomaxprocs: uint16(procs),
 	})
 	if err != nil {
@@ -90,20 +100,20 @@ func run(args []string) int {
 }
 
 type config struct {
-	rulesPath string
+	bundleDir string
 	run       uint64
 	inc       uint32
 	nonce     [16]byte
 }
 
 // parseConfig validates argv and the binding variables. Formats are exact:
-// lowercase hex of fixed width, one absolute rules path, and TMPDIR.
+// lowercase hex of fixed width, one absolute bundle directory, and TMPDIR.
 func parseConfig(args []string, getenv func(string) string) (config, error) {
 	var c config
 	if len(args) != 1 || !filepath.IsAbs(args[0]) || filepath.Clean(args[0]) != args[0] {
-		return c, errors.New("usage: inspector <absolute clean rules path>")
+		return c, errors.New("usage: inspector <absolute clean bundle directory>")
 	}
-	c.rulesPath = args[0]
+	c.bundleDir = args[0]
 	var b [16]byte
 	if err := parseHex(getenv("TKV0_RUN_ID"), b[:8]); err != nil {
 		return c, fmt.Errorf("TKV0_RUN_ID: %w", err)

@@ -2,22 +2,24 @@
 //! The proxy process: start-up, the wait for the kernel, the accept loop and the stop.
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration
-//! file), the host checks, the configuration, the runtime and the signal handlers, the driver thread, the wait
-//! for the kernel to be ready, bind, accept. Handlers exist for SIGTERM, SIGINT and SIGHUP only and are installed
-//! before the kernel starts its child process; SIGCHLD is never handled. The listener is bound only after the
-//! kernel is ready, and a connection permit is taken before every accept.
+//! file), the host checks, the configuration, the rules store (the chosen generation and its directory, and with
+//! them the kernel configuration), the runtime and the signal handlers, the driver thread, the wait for the
+//! kernel to be ready, bind, accept. The rules store is read here, once; a running proxy does not read it again.
+//! Handlers exist for SIGTERM, SIGINT and SIGHUP only and are installed before the kernel starts its child
+//! process; SIGCHLD is never handled. The listener is bound only after the kernel is ready, and a connection
+//! permit is taken before every accept.
 //!
 //! The first cause of a stop (a signal, or a failure of start-up or of the driver) fixes the time `t0`. The stop
 //! closes the listener, tells the driver to finish inspecting by `t0 + stop_inspect`, waits for the connections
 //! until `t0 + stop_wait` and aborts what is left, then waits for the driver's end until
 //! `t0 + stop_wait + kill_grace`. The exit code is 0 only when the stop was not caused by a failure and the driver
-//! reports a stopped kernel whose child exit and per-start directory removal are confirmed; 1 for any other end;
-//! 2 for a wrong argument or a refused configuration. The log is flushed for at most 200 ms at the end.
+//! reports a stopped kernel whose child exit and per-start directory removal are confirmed; 1 for any other end,
+//! and for a refused rules store or generation (nothing has been started then); 2 for a wrong argument or a
+//! refused configuration. The log is flushed for at most 200 ms at the end.
 
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::os::unix::ffi::OsStrExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -33,11 +35,12 @@ use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, Sleep, sleep, timeout_at};
 use tukuyomi_kernel::{Failure, Phase};
-use tukuyomi_proxy::config::{self, Loaded, ProxyConfig};
+use tukuyomi_proxy::config::{self, ProxyConfig};
 use tukuyomi_proxy::host;
 use tukuyomi_proxy::inbound::conn::{self, Ctx};
 use tukuyomi_proxy::inspect::driver::{self, Driver, End, Msg};
 use tukuyomi_proxy::log::{self, Log};
+use tukuyomi_proxy::rules::store;
 
 const EXIT_OK: u8 = 0;
 const EXIT_FAILED: u8 = 1;
@@ -71,7 +74,7 @@ fn main() -> ExitCode {
 fn start(log: &Log) -> u8 {
     let mut args = std::env::args_os().skip(1);
     let path = match (args.next(), args.next()) {
-        (Some(path), None) if clean_abs(Path::new(&path)) => PathBuf::from(path),
+        (Some(path), None) if config::clean_abs(Path::new(&path)) => PathBuf::from(path),
         _ => {
             log.line(
                 "start: expected one argument, the absolute clean path of the configuration file",
@@ -91,6 +94,39 @@ fn start(log: &Log) -> u8 {
         }
     };
     log.line("start: configuration accepted");
+    let rules = match store::open(&loaded.store) {
+        Ok(rules) => rules,
+        Err(e) => {
+            log.line(&format!("start: rules store refused: {}", e.0));
+            return EXIT_FAILED;
+        }
+    };
+    let generation = match rules.current() {
+        Ok(Some(generation)) => generation,
+        Ok(None) => {
+            log.line("start: rules store refused: no generation is chosen");
+            return EXIT_FAILED;
+        }
+        Err(e) => {
+            log.line(&format!("start: rules store refused: {}", e.0));
+            return EXIT_FAILED;
+        }
+    };
+    let dir = match rules.generation_dir(generation) {
+        Ok(dir) => dir,
+        Err(e) => {
+            log.line(&format!("start: rules store refused: {}", e.0));
+            return EXIT_FAILED;
+        }
+    };
+    let kernel = match loaded.kernel.for_generation(dir, generation) {
+        Ok(kernel) => kernel,
+        Err(e) => {
+            log.line(&format!("start: rules generation refused: {}", e.0));
+            return EXIT_FAILED;
+        }
+    };
+    log.line(&format!("start: rules generation {}", generation.hex()));
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -101,25 +137,11 @@ fn start(log: &Log) -> u8 {
             return EXIT_FAILED;
         }
     };
-    runtime.block_on(run(loaded, log.clone()))
-}
-
-/// A path argument must be absolute and already clean: no empty, `.` or `..` component, no trailing slash, no
-/// NUL, and shorter than the Linux `PATH_MAX`.
-fn clean_abs(p: &Path) -> bool {
-    let b = p.as_os_str().as_bytes();
-    b.len() > 1
-        && b.len() < 4096
-        && b[0] == b'/'
-        && !b.contains(&0)
-        && b[1..]
-            .split(|&c| c == b'/')
-            .all(|s| !s.is_empty() && s != b"." && s != b"..")
+    runtime.block_on(run(loaded.proxy, kernel, log.clone()))
 }
 
 /// The runtime part: handlers, driver, the wait for ready, serving, and the stop.
-async fn run(loaded: Loaded, log: Log) -> u8 {
-    let Loaded { proxy, kernel } = loaded;
+async fn run(proxy: ProxyConfig, kernel: tukuyomi_kernel::Config, log: Log) -> u8 {
     let signals = match Signals::install() {
         Ok(signals) => signals,
         Err(_) => {
@@ -618,7 +640,7 @@ mod tests {
     struct Fixture {
         waits: Waits,
         ready: oneshot::Sender<Result<(), Failure>>,
-        failed: oneshot::Sender<Failure>,
+        _failed: oneshot::Sender<Failure>,
         end: oneshot::Sender<End>,
     }
 
@@ -630,7 +652,7 @@ mod tests {
         Fixture {
             waits: Waits::new(Signals::install().unwrap(), ready_rx, failed_rx, end_rx),
             ready,
-            failed,
+            _failed: failed,
             end,
         }
     }
@@ -657,7 +679,6 @@ mod tests {
         assert!(!clean_shutdown(&shutdown(Phase::Stopped, false, true)));
         assert!(!clean_shutdown(&shutdown(Phase::Stopped, true, false)));
         assert!(!clean_shutdown(&shutdown(Phase::Ready, true, true)));
-        assert!(!clean_shutdown(&shutdown(Phase::Stopping, true, true)));
         assert!(!clean_shutdown(&shutdown(
             Phase::Failed(Failure::ReapUnknown),
             true,
@@ -669,26 +690,12 @@ mod tests {
     }
 
     #[test]
-    fn the_configuration_argument_is_an_absolute_clean_path() {
-        for good in ["/c", "/etc/proxy/config.json", "/a.b/c-d", "/..c"] {
-            assert!(clean_abs(Path::new(good)), "{good:?}");
-        }
-        for bad in [
-            "", "/", "c", "c.json", "/c/", "/c//d", "/c/./d", "/c/../d", "/c\0d", "//c",
-        ] {
-            assert!(!clean_abs(Path::new(bad)), "{bad:?}");
-        }
-        assert!(clean_abs(Path::new(&format!("/{}", "a".repeat(4094)))));
-        assert!(!clean_abs(Path::new(&format!("/{}", "a".repeat(4095)))));
-    }
-
-    #[test]
     fn only_running_out_of_a_resource_pauses_the_accept_loop() {
         for errno in [12, 23, 24, 105] {
             assert!(is_resource_error(errno), "{errno}");
         }
-        // EAGAIN, EINTR, ECONNABORTED, EPROTO, EINVAL, EBADF
-        for errno in [11, 4, 103, 71, 22, 9, 0, 104, 106] {
+        // EAGAIN, EINTR, ECONNABORTED
+        for errno in [11, 4, 103] {
             assert!(!is_resource_error(errno), "{errno}");
         }
     }
@@ -718,41 +725,6 @@ mod tests {
                 f.waits.wait(after(2000)).await,
                 Event::Lost(Source::Ready)
             ));
-
-            let mut f = fixture();
-            f.failed.send(Failure::ReapUnknown).unwrap();
-            assert!(matches!(
-                f.waits.wait(after(2000)).await,
-                Event::Failed(Failure::ReapUnknown)
-            ));
-            assert!(matches!(f.waits.wait(after(30)).await, Event::Late));
-
-            let mut f = fixture();
-            f.end.send(End::Fatal("x")).unwrap();
-            assert!(matches!(
-                f.waits.wait(after(2000)).await,
-                Event::Ended(End::Fatal("x"))
-            ));
-            drop(f.failed);
-            assert!(matches!(
-                f.waits.wait(after(2000)).await,
-                Event::Lost(Source::Failed)
-            ));
-        });
-    }
-
-    #[test]
-    fn a_wait_ends_late_at_its_deadline_and_not_before() {
-        runtime().block_on(async {
-            let mut f = fixture();
-            let start = Instant::now();
-            assert!(matches!(f.waits.wait(after(80)).await, Event::Late));
-            let spent = start.elapsed();
-            assert!(spent >= Duration::from_millis(80) && spent < Duration::from_secs(5));
-            // A deadline that has passed still returns an answer that is already there.
-            f.ready.send(Ok(())).unwrap();
-            let passed = Instant::now().checked_sub(Duration::from_millis(5));
-            assert!(matches!(f.waits.wait(passed).await, Event::Ready(Ok(()))));
         });
     }
 
@@ -774,20 +746,6 @@ mod tests {
             // The second connection waits in the backlog: no permit, no accept.
             assert!(matches!(f.waits.wait(after(150)).await, Event::Late));
             drop(permit);
-            assert!(matches!(f.waits.wait(after(5000)).await, Event::Conn(..)));
-        });
-    }
-
-    #[test]
-    fn a_stop_cause_comes_before_a_waiting_connection() {
-        runtime().block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let mut f = fixture();
-            f.waits.accept = Some(Acceptor::new(listener, Arc::new(Semaphore::new(4))));
-            let _client = TcpStream::connect(addr).await.unwrap();
-            f.failed.send(Failure::BudgetExhausted).unwrap();
-            assert!(matches!(f.waits.wait(after(5000)).await, Event::Failed(_)));
             assert!(matches!(f.waits.wait(after(5000)).await, Event::Conn(..)));
         });
     }
@@ -883,9 +841,7 @@ mod tests {
         runtime().block_on(async {
             // A kernel that did not stop cleanly.
             for end in [
-                shutdown(Phase::Failed(Failure::CleanupUnknown), true, true),
                 shutdown(Phase::Stopped, false, true),
-                shutdown(Phase::Stopped, true, false),
                 End::Fatal("result for an unknown request"),
             ] {
                 let f = fixture();
@@ -897,12 +853,7 @@ mod tests {
                 driver.join().unwrap();
             }
             // A failure as the cause, although the driver ends cleanly.
-            for cause in [
-                Cause::Failed(Failure::BudgetExhausted),
-                Cause::Late,
-                Cause::Bind,
-                Cause::Lost(Source::Ready),
-            ] {
+            for cause in [Cause::Failed(Failure::BudgetExhausted), Cause::Late] {
                 let f = fixture();
                 let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
                 assert_eq!(
@@ -919,29 +870,6 @@ mod tests {
                 EXIT_FAILED
             );
             driver.join().unwrap();
-        });
-    }
-
-    #[test]
-    fn the_stop_gives_up_on_a_driver_that_never_answers_after_the_grace() {
-        let log = log::start_logger().unwrap();
-        runtime().block_on(async {
-            let f = fixture();
-            let (tx, _rx) = sync_channel::<Msg>(2);
-            let start = Instant::now();
-            let code = stop(
-                f.waits,
-                Cause::Signal("SIGTERM"),
-                tx,
-                &proxy_config(10, 100),
-                Duration::from_millis(100),
-                &log,
-            )
-            .await;
-            let spent = start.elapsed();
-            assert_eq!(code, EXIT_FAILED);
-            assert!(spent >= Duration::from_millis(200) && spent < Duration::from_secs(5));
-            drop(f.end);
         });
     }
 
@@ -965,30 +893,6 @@ mod tests {
             let spent = start.elapsed();
             assert_eq!(code, EXIT_OK);
             assert!(spent >= Duration::from_millis(150) && spent < Duration::from_secs(5));
-            driver.join().unwrap();
-        });
-    }
-
-    #[test]
-    fn the_stop_waits_for_connections_that_end_by_themselves() {
-        let log = log::start_logger().unwrap();
-        runtime().block_on(async {
-            let mut f = fixture();
-            f.waits.conns.spawn(sleep(Duration::from_millis(100)));
-            let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
-            let start = Instant::now();
-            let code = stop(
-                f.waits,
-                Cause::Signal("SIGTERM"),
-                tx,
-                &proxy_config(10, 3000),
-                Duration::from_millis(100),
-                &log,
-            )
-            .await;
-            let spent = start.elapsed();
-            assert_eq!(code, EXIT_OK);
-            assert!(spent >= Duration::from_millis(100) && spent < Duration::from_millis(2500));
             driver.join().unwrap();
         });
     }

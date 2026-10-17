@@ -4,9 +4,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -23,8 +23,6 @@ pub(crate) const URLENCODED: &str = "application/x-www-form-urlencoded";
 pub(crate) const JSON: &str = "application/json";
 /// The largest body the proxy is configured to take, which is also the largest body the kernel accepts.
 pub(crate) const MAX_BODY: usize = 1 << 20;
-/// `max_buffered_bytes` at its lowest: twice the largest body and the largest set of header fields.
-pub(crate) const MIN_BUFFERED: usize = 2 * MAX_BODY + 24 * 1024;
 /// The inspector has read a body frame (64 KiB) once its read counter has grown by this much.
 const FRAME: u64 = 64 * 1024;
 /// The body of the upstream's answer.
@@ -33,13 +31,10 @@ pub(crate) const UPSTREAM_BODY: &str = "hello-from-upstream";
 pub(crate) const UPSTREAM_HEAD_WIRE: usize = 64 * 1024;
 /// The time the kernel gives a process to end after it was told to stop (`kill_grace`).
 pub(crate) const KILL_GRACE_MS: u64 = 2_000;
-/// The name of the script that stands in for the inspector, in the test root.
-pub(crate) const STAND_IN: &str = "silent.sh";
+/// The name of the rules store directory, in the test root.
+pub(crate) const STORE: &str = "store";
 /// What a test adds to a time it has computed, where it only needs the event to come about in reasonable time.
 pub(crate) const MARGIN: Duration = Duration::from_secs(10);
-/// The length a streaming response promises, and the time between the bytes that it sends.
-pub(crate) const DRIP_PROMISE: usize = 1_000_000;
-const DRIP_STEP: Duration = Duration::from_millis(200);
 
 // ---------------------------------------------------------------------------------------------------------
 // The environment
@@ -52,13 +47,66 @@ fn var(name: &str) -> String {
     }
 }
 
-/// The rules hash as the configuration file wants it: 64 lowercase hex digits.
+/// The rules hash as the name of a generation wants it: 64 lowercase hex digits.
 fn parse_sha256(s: &str) -> String {
     assert!(
         s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()),
         "TUKUYOMI_TEST_RULES_SHA256 must be 64 hex digits"
     );
     s.to_ascii_lowercase()
+}
+
+/// The name of the generation that the store of a test holds: the fingerprint of the test rules.
+pub(crate) fn generation() -> String {
+    parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256"))
+}
+
+/// The directory of that generation, in the store of the test root `root`.
+pub(crate) fn generation_dir(root: &Path) -> PathBuf {
+    root.join(STORE).join("generations").join(generation())
+}
+
+fn make_dir(path: &Path) {
+    DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(path)
+        .unwrap_or_else(|e| panic!("cannot create {path:?}: {e}"));
+}
+
+/// Copies the regular files of the directory `from` to `to`, with the directories below it, each made 0700. Anything
+/// else in `from` fails the test: a copy that left it out would only show up as a refusal of the inspector.
+fn copy_tree(from: &Path, to: &Path) {
+    make_dir(to);
+    for entry in fs::read_dir(from).unwrap_or_else(|e| panic!("cannot read {from:?}: {e}")) {
+        let entry = entry.expect("list a directory of the rules");
+        let (source, target) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry
+            .file_type()
+            .expect("the kind of an entry of the rules");
+        if kind.is_dir() {
+            copy_tree(&source, &target);
+        } else if kind.is_file() {
+            fs::copy(&source, &target).unwrap_or_else(|e| panic!("cannot copy {source:?}: {e}"));
+        } else {
+            panic!("{source:?} is neither a directory nor a regular file");
+        }
+    }
+}
+
+/// The rules store of a test root: the bundle in `TUKUYOMI_TEST_RULES` as the generation named by
+/// `TUKUYOMI_TEST_RULES_SHA256`, and `current`, which chooses it. The directories are 0700, as the proxy demands
+/// of the store directory.
+fn make_store(root: &Path) {
+    copy_tree(
+        Path::new(&var("TUKUYOMI_TEST_RULES")),
+        &generation_dir(root),
+    );
+    fs::write(
+        root.join(STORE).join("current"),
+        format!("{}\n", generation()),
+    )
+    .expect("write the record of the current generation");
 }
 
 /// A fresh 0700 directory, removed with everything in it when dropped.
@@ -110,68 +158,20 @@ fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Counters and the record stream
+// The record stream
 // ---------------------------------------------------------------------------------------------------------
-
-/// A count that can be waited for.
-#[derive(Default)]
-pub(crate) struct Counter {
-    n: Mutex<usize>,
-    changed: Condvar,
-}
-
-impl Counter {
-    fn add(&self) {
-        *lock(&self.n) += 1;
-        self.changed.notify_all();
-    }
-
-    fn get(&self) -> usize {
-        *lock(&self.n)
-    }
-
-    pub(crate) fn wait_for(&self, what: &str, at_least: usize) {
-        let deadline = Instant::now() + PATIENCE;
-        let mut n = lock(&self.n);
-        while *n < at_least {
-            let left = deadline.saturating_duration_since(Instant::now());
-            assert!(!left.is_zero(), "timed out waiting for {what}");
-            n = self
-                .changed
-                .wait_timeout(n, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
-    }
-}
-
-#[derive(Default)]
-struct RecordState {
-    lines: Vec<String>,
-    /// The proxy closed its stderr.
-    ended: bool,
-}
 
 /// The lines the proxy writes to stderr, as they arrive.
 #[derive(Default)]
 pub(crate) struct Records {
-    state: Mutex<RecordState>,
-    changed: Condvar,
+    lines: Mutex<Vec<String>>,
+    /// The proxy closed its stderr.
+    ended: AtomicBool,
 }
 
 impl Records {
-    fn push(&self, line: String) {
-        lock(&self.state).lines.push(line);
-        self.changed.notify_all();
-    }
-
-    fn end(&self) {
-        lock(&self.state).ended = true;
-        self.changed.notify_all();
-    }
-
     pub(crate) fn lines(&self) -> Vec<String> {
-        lock(&self.state).lines.clone()
+        lock(&self.lines).clone()
     }
 
     /// Waits for `n` lines that satisfy `want` (lines that are there already count) and returns them. Fails with
@@ -183,38 +183,30 @@ impl Records {
         want: impl Fn(&str) -> bool,
     ) -> Vec<String> {
         let deadline = Instant::now() + PATIENCE;
-        let mut state = lock(&self.state);
         loop {
-            let found: Vec<String> = state.lines.iter().filter(|l| want(l)).cloned().collect();
+            // The end is read first: the lines are all there once it is set.
+            let ended = self.ended.load(Ordering::SeqCst);
+            let found: Vec<String> = self.lines().into_iter().filter(|l| want(l)).collect();
             if found.len() >= n {
                 return found;
             }
             assert!(
-                !state.ended,
+                !ended,
                 "the proxy ended before {what}; its records: {:#?}",
-                state.lines
+                self.lines()
             );
-            let left = deadline.saturating_duration_since(Instant::now());
             assert!(
-                !left.is_zero(),
+                Instant::now() < deadline,
                 "timed out waiting for {what}; the records so far: {:#?}",
-                state.lines
+                self.lines()
             );
-            state = self
-                .changed
-                .wait_timeout(state, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+            thread::sleep(5 * MS);
         }
-    }
-
-    pub(crate) fn wait_line(&self, what: &str, want: impl Fn(&str) -> bool) -> String {
-        self.wait_lines(what, 1, want).remove(0)
     }
 
     /// The connection record that satisfies `want`.
     pub(crate) fn conn(&self, what: &str, want: impl Fn(&str) -> bool) -> String {
-        self.wait_line(what, |l| l.starts_with("conn ") && want(l))
+        self.conns(what, 1, want).remove(0)
     }
 
     /// `n` connection records that satisfy `want`.
@@ -420,25 +412,6 @@ pub(crate) fn read_to_close(sock: &mut TcpStream) -> Vec<u8> {
     }
 }
 
-/// Reads until `marker` is in what was read; returns everything read so far.
-pub(crate) fn read_until(sock: &mut TcpStream, marker: &[u8]) -> Vec<u8> {
-    let deadline = Instant::now() + PATIENCE;
-    let mut raw = Vec::new();
-    let mut chunk = [0u8; 4096];
-    while find(&raw, marker).is_none() {
-        let left = deadline.saturating_duration_since(Instant::now());
-        assert!(!left.is_zero(), "no {marker:?} in time; got {raw:?}");
-        sock.set_read_timeout(Some(left))
-            .expect("set the read timeout");
-        match sock.read(&mut chunk) {
-            Ok(0) => panic!("the proxy closed before {marker:?}; got {raw:?}"),
-            Ok(n) => raw.extend_from_slice(&chunk[..n]),
-            Err(e) => panic!("read from the proxy failed: {e}; got {raw:?}"),
-        }
-    }
-    raw
-}
-
 /// Everything the proxy answers until it closes; `start` is when the exchange began.
 pub(crate) fn collect(sock: &mut TcpStream, start: Instant) -> Reply {
     Reply {
@@ -467,24 +440,6 @@ fn free_port() -> u16 {
 // The upstream
 // ---------------------------------------------------------------------------------------------------------
 
-/// What the upstream does with a request once it has read it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Behaviour {
-    /// Answers with `upstream_reply` and closes.
-    #[default]
-    Reply,
-    /// Never answers; waits for the proxy to close.
-    Silent,
-    /// Sends a head that promises 10 body bytes and 3 of them, then waits for the proxy to close.
-    Cut,
-    /// Writes exactly these bytes (a whole answer, or whatever else the test wants the proxy to read), then waits
-    /// for the proxy to close.
-    Raw(Vec<u8>),
-    /// Sends a head that promises `DRIP_PROMISE` body bytes, then one body byte every `DRIP_STEP` until the proxy
-    /// closes.
-    Drip,
-}
-
 fn upstream_reply() -> Vec<u8> {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close, X-Up-Hop\r\nKeep-Alive: timeout=9\r\nX-Up-Hop: 1\r\nX-Up: visible\r\n\r\n{UPSTREAM_BODY}",
@@ -493,23 +448,16 @@ fn upstream_reply() -> Vec<u8> {
     .into_bytes()
 }
 
-fn upstream_cut() -> Vec<u8> {
-    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\nabc".to_vec()
-}
-
 #[derive(Default)]
 pub(crate) struct Seen {
-    behaviour: Mutex<Behaviour>,
     /// Connections accepted.
-    connections: Counter,
+    connections: AtomicUsize,
     /// The bytes of each request that was read to its end (head and body).
     requests: Mutex<Vec<Vec<u8>>>,
-    pub(crate) arrived: Counter,
-    /// Connections that the proxy closed while the upstream waited (or before a request was complete).
-    pub(crate) closed: Counter,
 }
 
-/// A loopback listener on a port of its own. It counts every connection, also those that never send a byte.
+/// A loopback listener on a port of its own that answers every request with `upstream_reply`. It counts every
+/// connection, also those that never send a byte.
 pub(crate) struct Upstream {
     addr: SocketAddr,
     pub(crate) seen: Arc<Seen>,
@@ -538,12 +486,8 @@ impl Upstream {
         }
     }
 
-    pub(crate) fn behave(&self, behaviour: Behaviour) {
-        *lock(&self.seen.behaviour) = behaviour;
-    }
-
     pub(crate) fn connections(&self) -> usize {
-        self.seen.connections.get()
+        self.seen.connections.load(Ordering::SeqCst)
     }
 
     pub(crate) fn requests(&self) -> Vec<Vec<u8>> {
@@ -581,7 +525,7 @@ fn accept_loop(
     loop {
         match listener.accept() {
             Ok((sock, _)) => {
-                seen.connections.add();
+                seen.connections.fetch_add(1, Ordering::SeqCst);
                 let seen = seen.clone();
                 handlers.push(thread::spawn(move || serve_upstream(sock, &seen)));
             }
@@ -606,56 +550,10 @@ fn serve_upstream(mut sock: TcpStream, seen: &Seen) {
         .expect("set the upstream write timeout");
     sock.set_nodelay(true).expect("set TCP_NODELAY");
     let Some(request) = read_request(&mut sock) else {
-        seen.closed.add();
         return;
     };
     lock(&seen.requests).push(request);
-    seen.arrived.add();
-    let behaviour = lock(&seen.behaviour).clone();
-    match behaviour {
-        Behaviour::Reply => {
-            let _ = sock.write_all(&upstream_reply());
-        }
-        Behaviour::Silent => {
-            wait_closed(&mut sock);
-            seen.closed.add();
-        }
-        Behaviour::Cut => {
-            let _ = sock.write_all(&upstream_cut());
-            wait_closed(&mut sock);
-            seen.closed.add();
-        }
-        Behaviour::Raw(bytes) => {
-            // A write can fail half way: the proxy may close on the bytes it has read, which is what is tested.
-            let _ = sock.write_all(&bytes);
-            wait_closed(&mut sock);
-            seen.closed.add();
-        }
-        Behaviour::Drip => drip(&mut sock, seen),
-    }
-}
-
-/// The head of a response that promises `DRIP_PROMISE` bytes of body.
-fn upstream_drip_head() -> Vec<u8> {
-    format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {DRIP_PROMISE}\r\n\r\n")
-        .into_bytes()
-}
-
-/// Sends the head and then one body byte every `DRIP_STEP` until a write fails, which means the proxy closed.
-/// Counts that as the proxy closing the connection. After `PATIENCE` it gives up without counting.
-fn drip(sock: &mut TcpStream, seen: &Seen) {
-    let end = Instant::now() + PATIENCE;
-    if sock.write_all(&upstream_drip_head()).is_err() {
-        seen.closed.add();
-        return;
-    }
-    while Instant::now() < end {
-        thread::sleep(DRIP_STEP);
-        if sock.write_all(b"x").is_err() {
-            seen.closed.add();
-            return;
-        }
-    }
+    let _ = sock.write_all(&upstream_reply());
 }
 
 /// A request read to its end: the head, and as many body bytes as its `Content-Length` says. `None` if the
@@ -686,12 +584,6 @@ fn read_request(sock: &mut TcpStream) -> Option<Vec<u8>> {
     }
 }
 
-/// Reads and drops what comes until the peer closes (or the read times out).
-fn wait_closed(sock: &mut TcpStream) {
-    let mut chunk = [0u8; 4096];
-    while matches!(sock.read(&mut chunk), Ok(n) if n > 0) {}
-}
-
 // ---------------------------------------------------------------------------------------------------------
 // The proxy under test
 // ---------------------------------------------------------------------------------------------------------
@@ -702,29 +594,11 @@ pub(crate) struct Knobs {
     /// The driver's slice and the kernel's tick.
     pub(crate) slice_ms: u64,
     pub(crate) tick_ms: u64,
-    pub(crate) slots: usize,
-    pub(crate) wait_deadline_ms: u64,
     pub(crate) max_conns: usize,
-    pub(crate) max_buffered_bytes: usize,
     pub(crate) head_read_ms: u64,
-    pub(crate) body_read_ms: u64,
-    pub(crate) upstream_header_ms: u64,
-    pub(crate) response_idle_ms: u64,
     pub(crate) restarts: u32,
-    /// The window in which `restarts` restarts are allowed.
-    pub(crate) restart_window_ms: u64,
     pub(crate) stop_inspect_ms: u64,
     pub(crate) stop_wait_ms: u64,
-    pub(crate) hello_wait_ms: u64,
-    pub(crate) frame_io_ms: u64,
-    pub(crate) verdict_wait_ms: u64,
-    pub(crate) ready_wait_ms: u64,
-    pub(crate) inspect_wait_ms: u64,
-    pub(crate) upstream_connect_ms: u64,
-    pub(crate) request_total_ms: u64,
-    pub(crate) conn_total_ms: u64,
-    /// The kernel starts a script that never says hello, not the inspector.
-    pub(crate) stand_in: bool,
 }
 
 impl Knobs {
@@ -733,47 +607,11 @@ impl Knobs {
         Knobs {
             slice_ms: 20,
             tick_ms: 20,
-            slots: 2,
-            wait_deadline_ms: 5_000,
             max_conns: 64,
-            max_buffered_bytes: 8 << 20,
             head_read_ms: 10_000,
-            body_read_ms: 10_000,
-            upstream_header_ms: 10_000,
-            response_idle_ms: 10_000,
             restarts: 0,
-            restart_window_ms: 60_000,
             stop_inspect_ms: 10_000,
             stop_wait_ms: 20_000,
-            hello_wait_ms: 10_000,
-            frame_io_ms: 1_000,
-            verdict_wait_ms: 3_000,
-            ready_wait_ms: 20_000,
-            inspect_wait_ms: 55_000,
-            upstream_connect_ms: 5_000,
-            request_total_ms: 60_000,
-            conn_total_ms: 120_000,
-            stand_in: false,
-        }
-    }
-
-    /// A connection time of 9 s, for a test that waits for it. The HTTP times cannot be shorter than what the
-    /// kernel may take for one inspection (the wait for a slot, two verdicts and 18 steps of a slice and a frame),
-    /// so the kernel's times are short too: its sum is 8.06 s here, and the HTTP waits sit above it.
-    pub(crate) fn short() -> Knobs {
-        Knobs {
-            wait_deadline_ms: 1_000,
-            frame_io_ms: 150,
-            verdict_wait_ms: 2_000,
-            inspect_wait_ms: 8_100,
-            request_total_ms: 9_000,
-            conn_total_ms: 9_000,
-            head_read_ms: 2_000,
-            body_read_ms: 2_000,
-            upstream_connect_ms: 2_000,
-            upstream_header_ms: 4_000,
-            response_idle_ms: 3_000,
-            ..Knobs::quick()
         }
     }
 
@@ -791,14 +629,6 @@ impl Knobs {
 }
 
 fn config_json(k: &Knobs, listen: SocketAddr, upstream: SocketAddr, root: &Path) -> String {
-    // The variables are read for every test, so that a stand-in test fails without them like all the others.
-    let mut inspector = var("TUKUYOMI_TEST_INSPECTOR");
-    let mut rules = var("TUKUYOMI_TEST_RULES");
-    if k.stand_in {
-        // The kernel passes the rules path as the only argument of the inspector, so the shell runs the script.
-        inspector = "/bin/sh".to_string();
-        rules = root.join(STAND_IN).to_string_lossy().into_owned();
-    }
     json!({
         "proxy": {
             "listen": listen.to_string(),
@@ -807,47 +637,51 @@ fn config_json(k: &Knobs, listen: SocketAddr, upstream: SocketAddr, root: &Path)
             "max_head_bytes": 8192,
             "max_body": MAX_BODY,
             "max_body_wire": 2 * MAX_BODY,
-            "max_buffered_bytes": k.max_buffered_bytes,
+            "max_buffered_bytes": 8 << 20,
             "upstream_max_headers": 100,
             "upstream_max_head_bytes": 16384,
             "upstream_head_wire": UPSTREAM_HEAD_WIRE,
             "drive_slice_ms": k.slice_ms,
-            "ready_wait_ms": k.ready_wait_ms,
+            "ready_wait_ms": 20_000,
             "head_read_ms": k.head_read_ms,
-            "body_read_ms": k.body_read_ms,
-            "inspect_wait_ms": k.inspect_wait_ms,
-            "upstream_connect_ms": k.upstream_connect_ms,
-            "upstream_header_ms": k.upstream_header_ms,
-            "request_total_ms": k.request_total_ms,
-            "response_idle_ms": k.response_idle_ms,
-            "conn_total_ms": k.conn_total_ms,
+            "body_read_ms": 10_000,
+            "inspect_wait_ms": 55_000,
+            "upstream_connect_ms": 5_000,
+            "upstream_header_ms": 10_000,
+            "request_total_ms": 60_000,
+            "response_idle_ms": 10_000,
+            "conn_total_ms": 120_000,
             "stop_inspect_ms": k.stop_inspect_ms,
             "stop_wait_ms": k.stop_wait_ms,
         },
         "kernel": {
-            "inspector": inspector,
-            "rules": rules,
-            "rules_sha256": parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256")),
+            "inspector": var("TUKUYOMI_TEST_INSPECTOR"),
             "tmp_root": root.to_string_lossy(),
             "gomaxprocs": 2,
             "gomemlimit": 256 << 20,
-            "slots": k.slots,
+            "slots": 2,
             // A connection holds at most one inspection, so the queue is never longer than the connections.
             "wait_queue": k.max_conns.min(4),
             "records": 16,
             "discard_limit": 8,
             "tick_ms": k.tick_ms,
-            "hello_wait_ms": k.hello_wait_ms,
-            "frame_io_ms": k.frame_io_ms,
-            "verdict_wait_ms": k.verdict_wait_ms,
-            "wait_deadline_ms": k.wait_deadline_ms,
+            "hello_wait_ms": 10_000,
+            "frame_io_ms": 1_000,
+            "verdict_wait_ms": 3_000,
+            "wait_deadline_ms": 5_000,
             "closed_wait_ms": 3_000,
             "stop_after_ms": 5_000,
             "drain_wait_ms": 3_000,
             "exit_wait_ms": 3_000,
             "kill_grace_ms": KILL_GRACE_MS,
             "restarts": k.restarts,
-            "restart_window_ms": k.restart_window_ms,
+            "restart_window_ms": 60_000,
+        },
+        "rules": {
+            "store": {
+                "kind": "file",
+                "dir": root.join(STORE).to_string_lossy(),
+            },
         },
     })
     .to_string()
@@ -902,44 +736,21 @@ pub(crate) fn assert_gone(pids: &[u32]) {
     }
 }
 
-/// The numbers in a record line, in order.
-pub(crate) fn numbers_in(line: &str) -> Vec<u64> {
-    line.split(|c: char| !c.is_ascii_digit())
+/// The kernel's numbers in the record line that the driver writes when it is told to stop: the records, the
+/// requests held and the requests waiting.
+fn stop_counts(lines: &[String]) -> [u64; 3] {
+    let line = lines
+        .iter()
+        .find(|l| l.starts_with("driver: stop, records "))
+        .unwrap_or_else(|| panic!("no stop line in {lines:#?}"));
+    let numbers: Vec<u64> = line
+        .split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty())
         .map(|s| s.parse().expect("a number"))
-        .collect()
-}
-
-/// The kernel's numbers in the record line that the driver writes when it is told to stop.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct StopCounts {
-    pub(crate) records: u64,
-    held: u64,
-    waiting: u64,
-}
-
-impl StopCounts {
-    pub(crate) const NONE: StopCounts = StopCounts {
-        records: 0,
-        held: 0,
-        waiting: 0,
-    };
-
-    fn of(lines: &[String]) -> StopCounts {
-        let line = lines
-            .iter()
-            .find(|l| l.starts_with("driver: stop, records "))
-            .unwrap_or_else(|| panic!("no stop line in {lines:#?}"));
-        let numbers = numbers_in(line);
-        match numbers[..] {
-            [records, held, waiting] => StopCounts {
-                records,
-                held,
-                waiting,
-            },
-            _ => panic!("cannot read the stop line {line:?}"),
-        }
-    }
+        .collect();
+    numbers[..]
+        .try_into()
+        .unwrap_or_else(|_| panic!("cannot read the stop line {line:?}"))
 }
 
 pub(crate) struct Proxy {
@@ -966,13 +777,19 @@ impl Proxy {
         let mut proxy = Proxy::spawn(test, knobs);
         proxy
             .records
-            .wait_line("the proxy to listen", |l| l == "start: listening");
+            .wait_lines("the proxy to listen", 1, |l| l == "start: listening");
         proxy.wait_inspector(None);
         proxy
     }
 
     /// Starts the proxy and returns at once, for a test that does not wait for it to listen.
     pub(crate) fn spawn(test: &str, knobs: Knobs) -> Proxy {
+        Proxy::spawn_with(test, knobs, |_| {})
+    }
+
+    /// The same, with a change to the test root (the store above all) that `edit` makes after the configuration,
+    /// the store and the stand-in are written and before the process starts.
+    pub(crate) fn spawn_with(test: &str, knobs: Knobs, edit: impl FnOnce(&Path)) -> Proxy {
         let root = make_root(test);
         let upstream = Upstream::start();
         let port = free_port();
@@ -983,10 +800,8 @@ impl Proxy {
             config_json(&knobs, listen, upstream.addr, root.path()),
         )
         .expect("write the configuration");
-        if knobs.stand_in {
-            fs::write(root.path().join(STAND_IN), "exec /bin/sleep 120\n")
-                .expect("write the stand-in for the inspector");
-        }
+        make_store(root.path());
+        edit(root.path());
         let started = Instant::now();
         let mut child = Command::new(env!("CARGO_BIN_EXE_tukuyomi-proxy"))
             .arg(&config)
@@ -1007,10 +822,11 @@ impl Proxy {
                     buf.clear();
                     match input.read_until(b'\n', &mut buf) {
                         Ok(0) | Err(_) => break,
-                        Ok(_) => records.push(String::from_utf8_lossy(&buf).trim_end().to_string()),
+                        Ok(_) => lock(&records.lines)
+                            .push(String::from_utf8_lossy(&buf).trim_end().to_string()),
                     }
                 }
-                records.end();
+                records.ended.store(true, Ordering::SeqCst);
             })
         };
         let (tx, exit) = mpsc::channel();
@@ -1066,19 +882,6 @@ impl Proxy {
         sock
     }
 
-    /// Waits for a process that the kernel started in place of the inspector (a child of the proxy), and
-    /// remembers it, so that the end can check that it is gone.
-    pub(crate) fn wait_stand_in(&mut self) -> u32 {
-        let mut found = None;
-        wait_until("the stand-in for the inspector", || {
-            found = children_of(self.pid).first().copied();
-            found.is_some()
-        });
-        let pid = found.expect("a stand-in was found");
-        self.inspectors.push(pid);
-        pid
-    }
-
     /// Sends the signal (`TERM`, `INT` or `HUP`) and returns the time just before it was sent. The proxy takes
     /// its own time for the stop after that, so a time counted from here is never shorter than the proxy's.
     pub(crate) fn signal(&self, signal: &str) -> Instant {
@@ -1115,7 +918,7 @@ impl Proxy {
     }
 
     /// Checks that the root holds the files the test put there and nothing else (the kernel removed its own
-    /// directory), and removes them and the root.
+    /// directory), and removes them and the root. A name that is a directory (the store) goes with all it holds.
     pub(crate) fn clear_root(&self, files: &[&str]) {
         let mut left: Vec<String> = fs::read_dir(self.root.path())
             .expect("the test root is readable")
@@ -1127,49 +930,33 @@ impl Proxy {
         want.sort_unstable();
         assert_eq!(left, want, "the test root holds other files");
         for file in files {
-            fs::remove_file(self.root.path().join(file)).expect("remove a file of the test root");
+            let path = self.root.path().join(file);
+            let meta = fs::symlink_metadata(&path).expect("look at a file of the test root");
+            if meta.is_dir() {
+                fs::remove_dir_all(&path).expect("remove a directory of the test root");
+            } else {
+                fs::remove_file(&path).expect("remove a file of the test root");
+            }
         }
         fs::remove_dir(self.root.path()).expect("the empty test root is removed");
     }
 
     /// Ends the test: SIGTERM, a clean exit within `stop_wait`, and then every check of what must be left (or
-    /// not left): the records, the processes, the root, the upstream's connection count.
-    pub(crate) fn finish(self, upstream_connections: usize) -> StopCounts {
+    /// not left): the records, the processes, the root, the upstream's connection count. The kernel holds nothing.
+    pub(crate) fn finish(self, upstream_connections: usize) {
         let since = self.term();
-        self.finish_after_term(since, upstream_connections)
+        let counts = self.finish_after_term(since, upstream_connections);
+        assert_eq!(counts, [0, 0, 0], "the kernel held something at the stop");
     }
 
-    /// The same, for a test that has sent SIGTERM at `since` itself.
+    /// The same, for a test that has sent SIGTERM at `since` itself. Returns the kernel's numbers (records, held,
+    /// waiting) at the start of the stop.
     pub(crate) fn finish_after_term(
-        self,
-        since: Instant,
-        upstream_connections: usize,
-    ) -> StopCounts {
-        self.finish_after_signal("SIGTERM", since, upstream_connections)
-    }
-
-    /// The same, for a test that has sent the signal named `signal` (`SIGTERM`, `SIGINT` or `SIGHUP`) at `since`
-    /// itself.
-    pub(crate) fn finish_after_signal(
-        self,
-        signal: &str,
-        since: Instant,
-        upstream_connections: usize,
-    ) -> StopCounts {
-        let within = Duration::from_millis(self.knobs.stop_wait_ms);
-        self.finish_within(signal, since, within, upstream_connections)
-            .0
-    }
-
-    /// The checks of `finish` for a stop that may take as long as `within`. Returns the kernel's numbers and the
-    /// time the proxy took from `since` to its exit.
-    pub(crate) fn finish_within(
         mut self,
-        signal: &str,
         since: Instant,
-        within: Duration,
         upstream_connections: usize,
-    ) -> (StopCounts, Duration) {
+    ) -> [u64; 3] {
+        let within = Duration::from_millis(self.knobs.stop_wait_ms);
         let (status, took) = self.wait_exit(since, within + 30 * SEC);
         let lines = self.records.lines();
         assert_eq!(
@@ -1182,7 +969,7 @@ impl Proxy {
             "the proxy needed {took:?} to stop; the limit is {within:?}"
         );
         assert!(
-            lines.iter().any(|l| *l == format!("stop: {signal}")),
+            lines.iter().any(|l| l == "stop: SIGTERM"),
             "no stop record: {lines:#?}"
         );
         assert!(
@@ -1197,11 +984,11 @@ impl Proxy {
                 || l.contains("log lines dropped")),
             "the records show a fault: {lines:#?}"
         );
-        let counts = StopCounts::of(&lines);
+        let counts = stop_counts(&lines);
         assert_gone(&self.inspectors);
 
-        // Only the configuration is left in the root: the kernel removed its own directory.
-        self.clear_root(&["config.json"]);
+        // Only the configuration and the store are left in the root: the kernel removed its own directory.
+        self.clear_root(&["config.json", STORE]);
 
         // The proxy is gone, so every connection it made to the upstream has been accepted by now.
         self.upstream.stop();
@@ -1210,7 +997,7 @@ impl Proxy {
             upstream_connections,
             "connections to the upstream; records: {lines:#?}"
         );
-        (counts, took)
+        counts
     }
 }
 
@@ -1219,21 +1006,10 @@ impl Drop for Proxy {
         if self.done {
             return;
         }
-        // A test that failed: leave no proxy and no inspector behind. The stand-in for the inspector is looked for
-        // among the proxy's children while the proxy is still there.
-        let stand_ins = if self.knobs.stand_in {
-            children_of(self.pid)
-        } else {
-            Vec::new()
-        };
+        // A test that failed: leave no proxy and no inspector behind.
         let _ = Command::new("kill")
             .args(["-s", "KILL", &self.pid.to_string()])
             .status();
-        for pid in stand_ins {
-            let _ = Command::new("kill")
-                .args(["-s", "KILL", &pid.to_string()])
-                .status();
-        }
         for &pid in &self.inspectors {
             if is_inspector(pid) {
                 let _ = Command::new("kill")

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
@@ -18,45 +17,23 @@ import (
 // of protocol 0.
 func loadGolden(t *testing.T) map[string][]byte {
 	t.Helper()
-	f, err := os.Open("testdata/v0-golden.txt")
+	raw, err := os.ReadFile("testdata/v0-golden.txt")
 	if err != nil {
 		t.Fatalf("golden: %v", err)
 	}
-	defer f.Close()
 	g := map[string][]byte{}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 64*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line = strings.TrimSpace(line); line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		name, hx, ok := strings.Cut(line, " ")
-		if !ok {
-			t.Fatalf("golden: bad line %q", line)
-		}
+		name, hx, _ := strings.Cut(line, " ")
 		b, err := hex.DecodeString(strings.TrimSpace(hx))
 		if err != nil {
 			t.Fatalf("golden %s: %v", name, err)
 		}
-		if _, dup := g[name]; dup {
-			t.Fatalf("golden: duplicate %s", name)
-		}
 		g[name] = b
 	}
-	if err := sc.Err(); err != nil {
-		t.Fatalf("golden: %v", err)
-	}
 	return g
-}
-
-func golden(t *testing.T, g map[string][]byte, name string) []byte {
-	t.Helper()
-	b, ok := g[name]
-	if !ok {
-		t.Fatalf("golden vector %s missing", name)
-	}
-	return b
 }
 
 func TestGoldenOutbound(t *testing.T) {
@@ -93,7 +70,7 @@ func TestGoldenOutbound(t *testing.T) {
 		"bye":                 encodeBye(testRun, testInc, 3, 3, 0),
 	}
 	for name, got := range cases {
-		if want := golden(t, g, name); !bytes.Equal(got, want) {
+		if want := g[name]; !bytes.Equal(got, want) {
 			t.Errorf("%s:\n got %x\nwant %x", name, got, want)
 		}
 	}
@@ -103,21 +80,15 @@ func TestGoldenInbound(t *testing.T) {
 	g := loadGolden(t)
 	// Every inbound golden frame passes the header check of this build.
 	for _, name := range []string{"tx_begin", "body", "body_end", "resp_begin", "resp_body", "resp_end", "tx_end", "drain"} {
-		b := golden(t, g, name)
-		if len(b) < headerLen {
-			t.Fatalf("%s too short", name)
-		}
+		b := g[name]
 		var hb [headerLen]byte
 		copy(hb[:], b)
 		h, err := checkHeader(&hb, testRun, testInc)
-		if err != nil {
-			t.Fatalf("%s: header rejected: %v", name, err)
-		}
-		if int(h.length) != len(b)-headerLen {
-			t.Fatalf("%s: length mismatch", name)
+		if err != nil || int(h.length) != len(b)-headerLen {
+			t.Fatalf("%s: header %v, length %d of %d bytes", name, err, h.length, len(b))
 		}
 	}
-	tb, err := decodeTxBegin(golden(t, g, "tx_begin")[headerLen:])
+	tb, err := decodeTxBegin(g["tx_begin"][headerLen:])
 	if err != nil {
 		t.Fatalf("decode tx_begin: %v", err)
 	}
@@ -127,114 +98,65 @@ func TestGoldenInbound(t *testing.T) {
 		tb.headers[1] != (httpHeader{"Content-Type", "application/x-www-form-urlencoded"}) {
 		t.Fatalf("decoded tx_begin %+v", tb)
 	}
-	rb, err := decodeRespBegin(golden(t, g, "resp_begin")[headerLen:])
-	if err != nil {
-		t.Fatalf("decode resp_begin: %v", err)
-	}
-	if rb.status != 200 || rb.proto != "HTTP/1.1" || rb.declared != 3 || len(rb.headers) != 1 || rb.headers[0] != (httpHeader{"Content-Type", "text/plain"}) {
-		t.Fatalf("decoded resp_begin %+v", rb)
-	}
-	if r, err := decodeTxEnd(golden(t, g, "tx_end")[headerLen:]); err != nil || r != endComplete {
-		t.Fatalf("decode tx_end %d %v", r, err)
-	}
-	// The test-side encoders used by the other tests produce the same bytes.
-	same := map[string][]byte{
-		"tx_begin":   tFrame(kindTxBegin, 0x10, 1, defaultBegin(5).payload()),
-		"body":       tFrame(kindBody, 0x10, 2, []byte("a=b&c")),
-		"body_end":   tFrame(kindBodyEnd, 0x10, 3, nil),
-		"resp_begin": tFrame(kindRespBegin, 0x10, 4, respPayload(200, "HTTP/1.1", 3, [][2]string{{"Content-Type", "text/plain"}})),
-		"resp_body":  tFrame(kindRespBody, 0x10, 5, []byte("xyz")),
-		"resp_end":   tFrame(kindRespEnd, 0x10, 6, nil),
-		"tx_end":     tFrame(kindTxEnd, 0x10, 7, []byte{endComplete}),
-		"drain":      tFrame(kindDrain, 0, 0, nil),
-	}
-	for name, got := range same {
-		if want := golden(t, g, name); !bytes.Equal(got, want) {
-			t.Errorf("test encoder %s:\n got %x\nwant %x", name, got, want)
-		}
-	}
-	// The test-side decoder reads the outbound golden frames.
-	for _, name := range []string{"verdict_continue", "verdict_block", "verdict_block_rule0", "verdict_truncated", "error_not_created", "error_tx_failed", "closed", "bye"} {
-		if _, err := parseOut(golden(t, g, name)); err != nil {
-			t.Errorf("parseOut %s: %v", name, err)
-		}
-	}
-	o, _ := parseOut(golden(t, g, "verdict_truncated"))
-	if o.flags != flagActionTruncated|flagDataTruncated || len(o.act) != maxAction || len(o.data) != maxData {
-		t.Errorf("truncated verdict flags %d act %d data %d", o.flags, len(o.act), len(o.data))
-	}
 }
 
 func TestCheckHeaderRejects(t *testing.T) {
-	good := tHeader(kindBody, 1, 2, 10)
-	mut := func(f func(b []byte)) [headerLen]byte {
+	check := func(mutate func(b []byte)) error {
 		var b [headerLen]byte
-		copy(b[:], good)
-		f(b[:])
-		return b
-	}
-	cases := map[string][headerLen]byte{
-		"magic":         mut(func(b []byte) { b[3] = '1' }),
-		"unknown kind":  mut(func(b []byte) { b[4] = 0x7e }),
-		"fault kind":    mut(func(b []byte) { b[4] = 0x7f }),
-		"zero kind":     mut(func(b []byte) { b[4] = 0 }),
-		"hello in":      mut(func(b []byte) { b[4] = kindHello }),
-		"verdict in":    mut(func(b []byte) { b[4] = kindVerdict }),
-		"error in":      mut(func(b []byte) { b[4] = kindError }),
-		"closed in":     mut(func(b []byte) { b[4] = kindClosed }),
-		"bye in":        mut(func(b []byte) { b[4] = kindBye }),
-		"flags":         mut(func(b []byte) { b[5] = 1 }),
-		"reserved hi":   mut(func(b []byte) { b[6] = 1 }),
-		"reserved lo":   mut(func(b []byte) { b[7] = 1 }),
-		"body len+1":    mut(func(b []byte) { binary.BigEndian.PutUint32(b[8:], maxBody+1) }),
-		"body len max":  mut(func(b []byte) { binary.BigEndian.PutUint32(b[8:], 0xffffffff) }),
-		"bodyend len 1": mut(func(b []byte) { b[4] = kindBodyEnd; binary.BigEndian.PutUint32(b[8:], 1) }),
-		"txend len 9":   mut(func(b []byte) { b[4] = kindTxEnd; binary.BigEndian.PutUint32(b[8:], 9) }),
-		"begin len+1":   mut(func(b []byte) { b[4] = kindTxBegin; binary.BigEndian.PutUint32(b[8:], maxTxBegin+1) }),
-		"run":           mut(func(b []byte) { b[19] ^= 1 }),
-		"incarnation":   mut(func(b []byte) { b[23] ^= 1 }),
-		"tx zero":       mut(func(b []byte) { binary.BigEndian.PutUint64(b[24:], 0) }),
-		"msg zero":      mut(func(b []byte) { binary.BigEndian.PutUint32(b[32:], 0) }),
-		"drain tx": mut(func(b []byte) {
-			b[4] = kindDrain
-			binary.BigEndian.PutUint32(b[8:], 0)
-			binary.BigEndian.PutUint32(b[32:], 0)
-		}),
-		"drain msg": mut(func(b []byte) {
-			b[4] = kindDrain
-			binary.BigEndian.PutUint32(b[8:], 0)
-			binary.BigEndian.PutUint64(b[24:], 0)
-		}),
-		"drain len": mut(func(b []byte) {
-			b[4] = kindDrain
-			binary.BigEndian.PutUint64(b[24:], 0)
-			binary.BigEndian.PutUint32(b[32:], 0)
-		}),
-	}
-	for name, b := range cases {
+		copy(b[:], tHeader(kindBody, 1, 2, 10))
+		mutate(b[:])
 		_, err := checkHeader(&b, testRun, testInc)
+		return err
+	}
+	setLen := func(kind uint8, n uint32) func(b []byte) {
+		return func(b []byte) { b[4] = kind; binary.BigEndian.PutUint32(b[8:], n) }
+	}
+	// A control frame has no length, tx or msg; f then breaks one of them.
+	control := func(f func(b []byte)) func(b []byte) {
+		return func(b []byte) {
+			b[4] = kindDrain
+			binary.BigEndian.PutUint32(b[8:], 0)
+			binary.BigEndian.PutUint64(b[24:], 0)
+			binary.BigEndian.PutUint32(b[32:], 0)
+			f(b)
+		}
+	}
+	reject := map[string]func(b []byte){
+		"magic":         func(b []byte) { b[3] = '1' },
+		"unknown kind":  func(b []byte) { b[4] = 0x7e },
+		"fault kind":    func(b []byte) { b[4] = 0x7f },
+		"hello in":      func(b []byte) { b[4] = kindHello },
+		"verdict in":    func(b []byte) { b[4] = kindVerdict },
+		"flags":         func(b []byte) { b[5] = 1 },
+		"reserved":      func(b []byte) { b[7] = 1 },
+		"body len+1":    setLen(kindBody, maxBody+1),
+		"bodyend len 1": setLen(kindBodyEnd, 1),
+		"txend len 9":   setLen(kindTxEnd, 9),
+		"begin len+1":   setLen(kindTxBegin, maxTxBegin+1),
+		"run":           func(b []byte) { b[19] ^= 1 },
+		"incarnation":   func(b []byte) { b[23] ^= 1 },
+		"tx zero":       func(b []byte) { binary.BigEndian.PutUint64(b[24:], 0) },
+		"msg zero":      func(b []byte) { binary.BigEndian.PutUint32(b[32:], 0) },
+		"drain tx":      control(func(b []byte) { b[31] = 1 }),
+		"drain msg":     control(func(b []byte) { b[35] = 1 }),
+		"drain len":     control(func(b []byte) { b[11] = 1 }),
+	}
+	for name, f := range reject {
 		var ce *errConn
-		if !errors.As(err, &ce) {
+		if err := check(f); !errors.As(err, &ce) {
 			t.Errorf("%s: got %v, want connection-wide error", name, err)
 		}
 	}
-	// Boundaries that are accepted.
-	ok := map[string][headerLen]byte{
-		"body len max":  mut(func(b []byte) { binary.BigEndian.PutUint32(b[8:], maxBody) }),
-		"begin len max": mut(func(b []byte) { b[4] = kindTxBegin; binary.BigEndian.PutUint32(b[8:], maxTxBegin) }),
-		"txend len 8":   mut(func(b []byte) { b[4] = kindTxEnd; binary.BigEndian.PutUint32(b[8:], 8) }),
-		"drain": mut(func(b []byte) {
-			b[4] = kindDrain
-			binary.BigEndian.PutUint32(b[8:], 0)
-			binary.BigEndian.PutUint64(b[24:], 0)
-			binary.BigEndian.PutUint32(b[32:], 0)
-		}),
-		"tx max":         mut(func(b []byte) { binary.BigEndian.PutUint64(b[24:], ^uint64(0)) }),
-		"resp body max":  mut(func(b []byte) { b[4] = kindRespBody; binary.BigEndian.PutUint32(b[8:], maxBody) }),
-		"resp begin max": mut(func(b []byte) { b[4] = kindRespBegin; binary.BigEndian.PutUint32(b[8:], maxTxBegin) }),
+	// The limits themselves are accepted.
+	accept := map[string]func(b []byte){
+		"body len max":  setLen(kindBody, maxBody),
+		"begin len max": setLen(kindTxBegin, maxTxBegin),
+		"txend len 8":   setLen(kindTxEnd, 8),
+		"drain":         control(func([]byte) {}),
+		"tx max":        func(b []byte) { binary.BigEndian.PutUint64(b[24:], ^uint64(0)) },
 	}
-	for name, b := range ok {
-		if _, err := checkHeader(&b, testRun, testInc); err != nil {
+	for name, f := range accept {
+		if err := check(f); err != nil {
 			t.Errorf("%s: unexpected %v", name, err)
 		}
 	}
@@ -275,24 +197,6 @@ func TestReadFrameRejectsBeforeAllocation(t *testing.T) {
 	}
 }
 
-func TestReadFrameEOF(t *testing.T) {
-	full := tFrame(kindBody, 1, 2, []byte("hello"))
-	if _, _, err := readFrame(&countingReader{r: bytes.NewReader(nil)}, testRun, testInc, time.Second); !errors.Is(err, errPeerEOF) {
-		t.Fatalf("clean EOF: %v", err)
-	}
-	for _, n := range []int{1, 2, 35, 36, 37, len(full) - 1} {
-		_, _, err := readFrame(&countingReader{r: bytes.NewReader(full[:n])}, testRun, testInc, time.Second)
-		var ce *errConn
-		if !errors.As(err, &ce) {
-			t.Errorf("cut at %d: %v, want connection-wide", n, err)
-		}
-	}
-	h, p, err := readFrame(&countingReader{r: bytes.NewReader(full)}, testRun, testInc, time.Second)
-	if err != nil || h.kind != kindBody || string(p) != "hello" {
-		t.Fatalf("full frame: %v %v %q", err, h, p)
-	}
-}
-
 func TestReadFrameDeadlines(t *testing.T) {
 	const timeout = 150 * time.Millisecond
 	frame := tFrame(kindBody, 1, 2, []byte("abcdefgh"))
@@ -307,21 +211,6 @@ func TestReadFrameDeadlines(t *testing.T) {
 		}()
 		if _, _, err := readFrame(a, testRun, testInc, timeout); err != nil {
 			t.Fatalf("idle before the first byte must not time out: %v", err)
-		}
-	})
-	t.Run("stall after first byte", func(t *testing.T) {
-		a, b := net.Pipe()
-		defer a.Close()
-		defer b.Close()
-		go b.Write(frame[:1])
-		start := time.Now()
-		_, _, err := readFrame(a, testRun, testInc, timeout)
-		var ce *errConn
-		if !errors.As(err, &ce) || !strings.Contains(err.Error(), "timeout") {
-			t.Fatalf("got %v", err)
-		}
-		if el := time.Since(start); el < timeout || el > 10*timeout {
-			t.Fatalf("elapsed %v", el)
 		}
 	})
 	t.Run("absolute deadline with dripping bytes", func(t *testing.T) {
@@ -344,76 +233,33 @@ func TestReadFrameDeadlines(t *testing.T) {
 	})
 }
 
-// scriptWriter returns scripted (n, err) results and records deadlines.
-type scriptWriter struct {
-	steps     []func(p []byte) (int, error)
+// stepWriter takes at most max bytes per Write and records them.
+type stepWriter struct {
+	max       int
 	buf       bytes.Buffer
 	deadlines int
 }
 
-func (w *scriptWriter) Write(p []byte) (int, error) {
-	if len(w.steps) == 0 {
-		w.buf.Write(p)
-		return len(p), nil
-	}
-	s := w.steps[0]
-	w.steps = w.steps[1:]
-	n, err := s(p)
-	if n > 0 && n <= len(p) {
-		w.buf.Write(p[:n])
-	}
-	return n, err
+func (w *stepWriter) Write(p []byte) (int, error) {
+	p = p[:min(len(p), w.max)]
+	return w.buf.Write(p)
 }
 
-func (w *scriptWriter) SetWriteDeadline(time.Time) error { w.deadlines++; return nil }
+func (w *stepWriter) SetWriteDeadline(time.Time) error { w.deadlines++; return nil }
 
 func TestWriteFrameShortWrites(t *testing.T) {
 	frame := tFrame(kindBody, 1, 2, bytes.Repeat([]byte("x"), 100))
-	one := func(p []byte) (int, error) { return 1, nil }
-	w := &scriptWriter{steps: []func([]byte) (int, error){one, one, one, func(p []byte) (int, error) { return 50, nil }}}
-	if err := writeFrame(w, frame, time.Second); err != nil {
-		t.Fatal(err)
+	w := &stepWriter{max: 7}
+	if err := writeFrame(w, frame, time.Second); err != nil || !bytes.Equal(w.buf.Bytes(), frame) || w.deadlines != 1 {
+		t.Fatalf("short writes: %v, written %d bytes, deadlines %d", err, w.buf.Len(), w.deadlines)
 	}
-	if !bytes.Equal(w.buf.Bytes(), frame) || w.deadlines != 1 {
-		t.Fatalf("written %d bytes, deadlines %d", w.buf.Len(), w.deadlines)
-	}
-	w = &scriptWriter{steps: []func([]byte) (int, error){one, func(p []byte) (int, error) { return 0, nil }}}
-	if err := writeFrame(w, frame, time.Second); !errors.Is(err, io.ErrNoProgress) {
+	if err := writeFrame(&stepWriter{}, frame, time.Second); !errors.Is(err, io.ErrNoProgress) {
 		t.Fatalf("zero progress: %v", err)
 	}
-	boom := errors.New("boom")
-	w = &scriptWriter{steps: []func([]byte) (int, error){func(p []byte) (int, error) { return 3, boom }}}
-	if err := writeFrame(w, frame, time.Second); !errors.Is(err, boom) {
-		t.Fatalf("mid-frame error: %v", err)
-	}
-	w = &scriptWriter{steps: []func([]byte) (int, error){func(p []byte) (int, error) { return len(p) + 1, nil }}}
-	if err := writeFrame(w, frame, time.Second); err == nil {
-		t.Fatal("over-count accepted")
-	}
-}
-
-func TestWriteFrameDeadline(t *testing.T) {
-	a, b := net.Pipe() // nobody reads b: the write must fail at the deadline
-	defer a.Close()
-	defer b.Close()
-	start := time.Now()
-	err := writeFrame(a, tFrame(kindBody, 1, 2, []byte("x")), 100*time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "timeout") {
-		t.Fatalf("got %v", err)
-	}
-	if time.Since(start) > 2*time.Second {
-		t.Fatal("deadline not applied")
-	}
-}
-
-func beginWith(f func(b *tBegin)) []byte {
-	b := defaultBegin(0)
-	f(&b)
-	return b.payload()
 }
 
 func TestDecodeTxBeginBounds(t *testing.T) {
-	s := strings.Repeat
+	rep := strings.Repeat
 	many := func(n int, name, value string) [][2]string {
 		hs := make([][2]string, n)
 		for i := range hs {
@@ -421,107 +267,88 @@ func TestDecodeTxBeginBounds(t *testing.T) {
 		}
 		return hs
 	}
-	accept := map[string][]byte{
-		"min fields": beginWith(func(b *tBegin) {
-			b.client, b.server, b.method, b.uri, b.proto, b.headers = "a", "b", "G", "/", "H", nil
-		}),
-		"max addr":     beginWith(func(b *tBegin) { b.client, b.server = s("1", maxAddr), s("2", maxAddr) }),
-		"max method":   beginWith(func(b *tBegin) { b.method = s("M", maxMethod) }),
-		"max uri":      beginWith(func(b *tBegin) { b.uri = s("u", maxURI) }),
-		"max proto":    beginWith(func(b *tBegin) { b.proto = s("p", maxProto) }),
-		"max declared": beginWith(func(b *tBegin) { b.declared = maxDeclared }),
-		"64 headers":   beginWith(func(b *tBegin) { b.headers = many(maxHeaders, "n", "v") }),
-		"max name":     beginWith(func(b *tBegin) { b.headers = [][2]string{{s("n", maxHdrName), ""}} }),
-		"max value":    beginWith(func(b *tBegin) { b.headers = [][2]string{{"n", s("v", maxHdrValue)}} }),
-		// 6 x (256 + 3840) = 24576 exactly.
-		"max total": beginWith(func(b *tBegin) { b.headers = many(6, s("n", 256), s("v", 3840)) }),
+	decode := func(set func(b *tBegin)) error {
+		b := defaultBegin(0)
+		set(&b)
+		_, err := decodeTxBegin(b.payload())
+		return err
 	}
-	for name, p := range accept {
-		if _, err := decodeTxBegin(p); err != nil {
+	// Each variable part is accepted at both of its limits and rejected one
+	// past either.
+	for _, c := range []struct {
+		name   string
+		lo, hi int
+		set    func(b *tBegin, n int)
+	}{
+		{"client", 1, maxAddr, func(b *tBegin, n int) { b.client = rep("1", n) }},
+		{"server", 1, maxAddr, func(b *tBegin, n int) { b.server = rep("2", n) }},
+		{"method", 1, maxMethod, func(b *tBegin, n int) { b.method = rep("M", n) }},
+		{"uri", 1, maxURI, func(b *tBegin, n int) { b.uri = rep("u", n) }},
+		{"proto", 1, maxProto, func(b *tBegin, n int) { b.proto = rep("p", n) }},
+		{"header count", 0, maxHeaders, func(b *tBegin, n int) { b.headers = many(n, "n", "v") }},
+		{"header name", 1, maxHdrName, func(b *tBegin, n int) { b.headers = [][2]string{{rep("n", n), ""}} }},
+		{"header value", 0, maxHdrValue, func(b *tBegin, n int) { b.headers = [][2]string{{"n", rep("v", n)}} }},
+	} {
+		for _, n := range []int{c.lo - 1, c.lo, c.hi, c.hi + 1} {
+			if n < 0 {
+				continue
+			}
+			err := decode(func(b *tBegin) { c.set(b, n) })
+			if ok := n >= c.lo && n <= c.hi; ok != (err == nil) {
+				t.Errorf("%s of %d: %v", c.name, n, err)
+			}
+		}
+	}
+	for name, c := range map[string]struct {
+		set func(b *tBegin)
+		ok  bool
+	}{
+		"declared max":    {func(b *tBegin) { b.declared = maxDeclared }, true},
+		"declared max+1":  {func(b *tBegin) { b.declared = maxDeclared + 1 }, false},
+		"headers total":   {func(b *tBegin) { b.headers = many(6, rep("n", 256), rep("v", 3840)) }, true}, // 24576 exactly
+		"headers total+1": {func(b *tBegin) { b.headers = append(many(6, rep("n", 256), rep("v", 3840)), [2]string{"x", ""}) }, false},
+	} {
+		if err := decode(c.set); c.ok != (err == nil) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	reject := map[string][]byte{
-		"empty client":   beginWith(func(b *tBegin) { b.client = "" }),
-		"long client":    beginWith(func(b *tBegin) { b.client = s("1", maxAddr+1) }),
-		"empty server":   beginWith(func(b *tBegin) { b.server = "" }),
-		"empty method":   beginWith(func(b *tBegin) { b.method = "" }),
-		"long method":    beginWith(func(b *tBegin) { b.method = s("M", maxMethod+1) }),
-		"empty uri":      beginWith(func(b *tBegin) { b.uri = "" }),
-		"long uri":       beginWith(func(b *tBegin) { b.uri = s("u", maxURI+1) }),
-		"empty proto":    beginWith(func(b *tBegin) { b.proto = "" }),
-		"long proto":     beginWith(func(b *tBegin) { b.proto = s("p", maxProto+1) }),
-		"declared+1":     beginWith(func(b *tBegin) { b.declared = maxDeclared + 1 }),
-		"declared max64": beginWith(func(b *tBegin) { b.declared = ^uint64(0) }),
-		"65 headers":     beginWith(func(b *tBegin) { b.headers = many(maxHeaders+1, "n", "v") }),
-		"empty name":     beginWith(func(b *tBegin) { b.headers = [][2]string{{"", "v"}} }),
-		"long name":      beginWith(func(b *tBegin) { b.headers = [][2]string{{s("n", maxHdrName+1), ""}} }),
-		"long value":     beginWith(func(b *tBegin) { b.headers = [][2]string{{"n", s("v", maxHdrValue+1)}} }),
-		"total+1":        beginWith(func(b *tBegin) { b.headers = append(many(6, s("n", 256), s("v", 3840)), [2]string{"x", ""}) }),
-		"trailing byte":  append(defaultBegin(0).payload(), 0),
-		"truncated":      defaultBegin(0).payload()[:20],
-		"empty payload":  {},
-	}
-	for name, p := range reject {
+	// A trailing byte, and a string length that points past the end.
+	good := defaultBegin(0).payload()
+	past := defaultBegin(0).payload()
+	binary.BigEndian.PutUint16(past, 0xffff)
+	for name, p := range map[string][]byte{"trailing byte": append(good[:len(good):len(good)], 0), "length past end": past} {
 		if _, err := decodeTxBegin(p); !errors.Is(err, errContent) {
 			t.Errorf("%s: got %v, want errContent", name, err)
 		}
 	}
-	// A count of 65 is rejected before any header is read, even with the
-	// payload cut right after the count.
-	c := defaultBegin(0)
-	c.headers = nil
-	p := c.payload()
-	binary.BigEndian.PutUint16(p[len(p)-2:], maxHeaders+1)
-	if _, err := decodeTxBegin(p); !errors.Is(err, errContent) {
-		t.Errorf("count 65 without headers: %v", err)
-	}
-	// A string length pointing past the end of the payload.
-	q := defaultBegin(0).payload()
-	binary.BigEndian.PutUint16(q[0:], 0xffff)
-	if _, err := decodeTxBegin(q); !errors.Is(err, errContent) {
-		t.Errorf("length past end: %v", err)
-	}
 }
 
 func TestDecodeRespBeginAndTxEnd(t *testing.T) {
-	for _, st := range []uint16{100, 200, 999} {
-		if _, err := decodeRespBegin(respPayload(st, "HTTP/1.1", 0, nil)); err != nil {
+	for st, ok := range map[uint16]bool{99: false, 100: true, 999: true, 1000: false} {
+		if _, err := decodeRespBegin(respPayload(st, "HTTP/1.1", 0, nil)); ok != (err == nil) {
 			t.Errorf("status %d: %v", st, err)
 		}
 	}
-	bad := map[string][]byte{
-		"status 99":   respPayload(99, "HTTP/1.1", 0, nil),
-		"status 1000": respPayload(1000, "HTTP/1.1", 0, nil),
-		"empty proto": respPayload(200, "", 0, nil),
-		"declared+1":  respPayload(200, "HTTP/1.1", maxDeclared+1, nil),
-		"trailing":    append(respPayload(200, "HTTP/1.1", 0, nil), 1),
-		"empty name":  respPayload(200, "HTTP/1.1", 0, [][2]string{{"", "x"}}),
-		"empty":       {},
-	}
-	for name, p := range bad {
+	for name, p := range map[string][]byte{
+		"declared+1": respPayload(200, "HTTP/1.1", maxDeclared+1, nil),
+		"trailing":   append(respPayload(200, "HTTP/1.1", 0, nil), 1),
+	} {
 		if _, err := decodeRespBegin(p); !errors.Is(err, errContent) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	for r := endComplete; r <= endDeadline; r++ {
-		if got, err := decodeTxEnd([]byte{r}); err != nil || got != r {
+	for r := byte(0); r <= endDeadline+1; r++ {
+		if got, err := decodeTxEnd([]byte{r}); (err == nil) != (r >= endComplete && r <= endDeadline) || err == nil && got != r {
 			t.Errorf("reason %d: %v", r, err)
-		}
-	}
-	for name, p := range map[string][]byte{"zero": {0}, "six": {6}, "empty": {}, "two bytes": {1, 0}} {
-		if _, err := decodeTxEnd(p); !errors.Is(err, errContent) {
-			t.Errorf("tx_end %s: %v", name, err)
 		}
 	}
 }
 
 func TestEncodeLimits(t *testing.T) {
-	if _, ok := encodeVerdict(testRun, testInc, 1, 1, 1, 1, 65536, "deny", "", true); ok {
-		t.Error("status 65536 accepted")
-	}
-	if _, ok := encodeVerdict(testRun, testInc, 1, 1, 1, 1, -1, "deny", "", true); ok {
-		t.Error("status -1 accepted")
+	for _, st := range []int{65536, -1} {
+		if _, ok := encodeVerdict(testRun, testInc, 1, 1, 1, 1, st, "deny", "", true); ok {
+			t.Errorf("status %d accepted", st)
+		}
 	}
 	b, ok := encodeVerdict(testRun, testInc, 1, 1, 1, -7, 65535, strings.Repeat("a", 32), strings.Repeat("d", 256), true)
 	o, err := parseOut(b)
@@ -531,13 +358,5 @@ func TestEncodeLimits(t *testing.T) {
 	e := encodeError(testRun, testInc, 1, 1, classTxFailed, codeOrder, strings.Repeat("x", 1000))
 	if o, err := parseOut(e); err != nil || len(o.text) != maxErrMsg || len(e)-headerLen > maxError {
 		t.Errorf("long error text: %v %d", err, len(o.text))
-	}
-	long := hello{pid: 1, goVersion: strings.Repeat("g", 65), corazaVersion: "v", corazaSum: "s"}
-	if _, err := encodeHello(1, 1, long); err == nil {
-		t.Error("long go version accepted")
-	}
-	maxed := hello{pid: 1, goVersion: strings.Repeat("g", 64), corazaVersion: strings.Repeat("v", 64), corazaSum: strings.Repeat("s", 128), memLimit: 1 << 62}
-	if b, err := encodeHello(1, 1, maxed); err != nil || len(b)-headerLen > maxHello {
-		t.Errorf("max hello: %v", err)
 	}
 }

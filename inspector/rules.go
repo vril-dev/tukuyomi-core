@@ -3,51 +3,15 @@ package main
 import (
 	"bufio"
 	"errors"
-	"io"
-	"io/fs"
 	"os"
 	"strings"
-	"syscall"
 	"unicode"
 
 	"github.com/corazawaf/coraza/v3"
 )
 
-const maxRulesBytes = 1 << 20
-
-// readRules reads the rules file once: no symlink, a regular file, bounded
-// size, and the bytes read must match the size seen by fstat.
-func readRules(p string) ([]byte, error) {
-	// O_NONBLOCK: opening a FIFO must not wait for a writer; the fstat check
-	// below then rejects it. It does not affect reads of a regular file.
-	fd, err := syscall.Open(p, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	f := os.NewFile(uintptr(fd), p)
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !st.Mode().IsRegular() {
-		return nil, errors.New("not a regular file")
-	}
-	if st.Size() > maxRulesBytes {
-		return nil, errors.New("too large")
-	}
-	b, err := io.ReadAll(io.LimitReader(f, maxRulesBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(b)) != st.Size() {
-		return nil, errors.New("size changed while reading")
-	}
-	return b, nil
-}
-
 // withoutPath drops the path of an *os.PathError, so that the start-up
-// diagnostic does not print where the rules file is.
+// diagnostic does not print where the bundle directory is.
 func withoutPath(err error) error {
 	var pe *os.PathError
 	if errors.As(err, &pe) {
@@ -86,29 +50,34 @@ SecRule ARGUMENTS_LIMIT_REACHED "!@eq 0" "id:4000002,phase:2,t:none,deny"
 SecRule URI_PARSE_ERROR "!@eq 0" "id:4000003,phase:2,t:none,deny"
 `
 
-// noFiles is the root file system of the rules: no name exists in it. Every
-// file read that a rule causes (Include, and the file of @pmFromFile, @pmf,
-// @ipMatchFromFile, @ipMatchF and @validateSchema) goes through the root of
-// the Coraza parser, so a rule that names a file fails NewWAF, and nothing
-// outside the rules file, which rules_sha256 covers, is read. (An Include
-// with a glob matches nothing and reads nothing.)
-type noFiles struct{}
-
-func (noFiles) Open(name string) (fs.File, error) {
-	return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+// newWAF builds the WAF from the bundle: the rule files of load in their
+// order, then the reserved directives. The rules get the files of the bundle as
+// their root (bundleFS): without a root Coraza reads files from the operating
+// system, and the root is set before any rule is read. Every rule file is read
+// through that root, one call each, so Coraza closes its continuation and
+// backtick state at the end of every file, as checkRules assumes. Coraza reads
+// the files while it builds the WAF only, so the bundle lets go of the bytes
+// when newWAF returns. A panic inside Coraza (SecRuleRemoveByMsg after a
+// SecMarker is one) becomes a fixed error, so the start fails for good with
+// exit 11 and not with the exit code 2 of a panic; the panic value is dropped.
+func newWAF(b *bundle) (waf coraza.WAF, err error) {
+	defer func() {
+		b.files = nil
+		if recover() != nil {
+			waf, err = nil, errors.New("the rules made the WAF build panic")
+		}
+	}()
+	cfg := coraza.NewWAFConfig().WithRootFS(bundleFS{files: b.files})
+	for _, p := range b.load {
+		cfg = cfg.WithDirectivesFromFile(p)
+	}
+	return coraza.NewWAF(cfg.WithDirectives(reservedDirectives))
 }
 
-// newWAF builds the WAF from the operator's rules and the reserved directives.
-// The rules get noFiles as their root: without a root Coraza reads files from
-// the operating system, and the root is set before any rule is read.
-func newWAF(rules string) (coraza.WAF, error) {
-	return coraza.NewWAF(coraza.NewWAFConfig().WithRootFS(noFiles{}).WithDirectives(rules).WithDirectives(reservedDirectives))
-}
-
-// checkRules is the start-up guard for the operator's rules. A ctl action
-// can switch the rule engine or the request body access of one transaction
-// (DetectionOnly never interrupts, so a match would read as Allow), Include
-// reads files that rules_sha256 does not cover, and with
+// checkRules is the start-up guard for one rule file of the operator. A ctl
+// action can switch the rule engine or the request body access of one
+// transaction (DetectionOnly never interrupts, so a match would read as Allow),
+// Include reads a file that this guard does not run on, and with
 // SecIgnoreRuleCompilationErrors On a rule that fails to build (for example
 // one with a duplicate id) is dropped silently: a deny rule of the operator
 // can be missing, and nothing added after the operator's rules can bring it
@@ -122,8 +91,8 @@ func newWAF(rules string) (coraza.WAF, error) {
 // environment of the whole process, and ctl:requestBodyLimit sets the body
 // limit of one transaction. The operators that read a file (@pmFromFile,
 // @pmf, @ipMatchFromFile, @ipMatchF and @validateSchema) are not rejected
-// here: newWAF gives the rules a root without files, so a rule that uses one
-// fails NewWAF.
+// here: newWAF gives the rules a root that holds the files of the bundle only,
+// so a rule that names any other file fails NewWAF.
 //
 // It is a textual over-approximation, not a SecLang parser. False rejects are
 // accepted: a rejected text may be harmless in Coraza, for example the ctl
@@ -141,53 +110,14 @@ func newWAF(rules string) (coraza.WAF, error) {
 // a word that stands only in an argument or in a string such as msg is
 // rejected too.
 //
-// The text is first reduced to the logical directives that Coraza v3.8.1
-// evaluates, with the same conditions in the same order as its parseString:
-// the same line splitting and per-line TrimSpace, a line that starts with "#"
-// is skipped (also inside a continuation or a backtick block), a line that
-// ends with a backtick opens and a line that starts with one closes a block,
-// and a trailing backslash joins the next line without a separator. Coraza
-// silently drops a continuation that is open at the end and stops at a line
-// over the Scanner limit; both are rejected here. Coraza removes no backslash
-// between the directive text and the comparison of a ctl name (a quoted action
-// value is unquoted, only the argument of an operator has \" resolved), so the
-// ctl check does not remove backslashes.
+// The text is first reduced to its logical directives (logicalDirectives).
+// Coraza removes no backslash between the directive text and the comparison of
+// a ctl name (a quoted action value is unquoted, only the argument of an
+// operator has \" resolved), so the ctl check does not remove backslashes.
 func checkRules(rules string) error {
-	sc := bufio.NewScanner(strings.NewReader(rules))
-	var logical []string
-	var buf strings.Builder
-	inBackticks, joined := false, false
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || line[0] == '#' {
-			continue
-		}
-		last := len(line) - 1
-		if !inBackticks && line[last] == '`' {
-			inBackticks = true
-		} else if inBackticks && line[0] == '`' {
-			inBackticks = false
-		}
-		if inBackticks {
-			buf.WriteString(line)
-			buf.WriteByte('\n')
-			continue
-		}
-		if line[last] == '\\' {
-			buf.WriteString(line[:last])
-			joined = true
-			continue
-		}
-		buf.WriteString(line)
-		logical = append(logical, buf.String())
-		buf.Reset()
-		joined = false
-	}
-	if sc.Err() != nil {
-		return errors.New("a line is too long")
-	}
-	if inBackticks || joined {
-		return errors.New("a continuation or a backtick block is not closed")
+	logical, err := logicalDirectives(rules)
+	if err != nil {
+		return err
 	}
 	for _, l := range logical {
 		first := l
@@ -224,4 +154,208 @@ func checkRules(rules string) error {
 		return errors.New("@inspectFile, @rbl, setenv and ctl of requestBodyLimit are not allowed")
 	}
 	return nil
+}
+
+// logicalDirectives reduces the text of one rule file to the logical
+// directives that Coraza v3.8.1 evaluates, with the same conditions in the same
+// order as its parseString: the same line splitting and per-line TrimSpace, a
+// line that starts with "#" is skipped (also inside a continuation or a
+// backtick block), a line that ends with a backtick opens and a line that
+// starts with one closes a block, and a trailing backslash joins the next line
+// without a separator. Coraza silently drops a continuation that is open at the
+// end and stops at a line over the Scanner limit; both are errors here. Coraza
+// closes the continuation and the backtick state at the end of every file, so
+// the guards run on one file at a time.
+func logicalDirectives(rules string) ([]string, error) {
+	sc := bufio.NewScanner(strings.NewReader(rules))
+	var logical []string
+	var buf strings.Builder
+	inBackticks, joined := false, false
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		last := len(line) - 1
+		if !inBackticks && line[last] == '`' {
+			inBackticks = true
+		} else if inBackticks && line[0] == '`' {
+			inBackticks = false
+		}
+		if inBackticks {
+			buf.WriteString(line)
+			buf.WriteByte('\n')
+			continue
+		}
+		if line[last] == '\\' {
+			buf.WriteString(line[:last])
+			joined = true
+			continue
+		}
+		buf.WriteString(line)
+		logical = append(logical, buf.String())
+		buf.Reset()
+		joined = false
+	}
+	if sc.Err() != nil {
+		return nil, errors.New("a line is too long")
+	}
+	if inBackticks || joined {
+		return nil, errors.New("a continuation or a backtick block is not closed")
+	}
+	return logical, nil
+}
+
+var errUnreadable = errors.New("a skipAfter or SecMarker cannot be read")
+
+// checkMarkers is the start-up guard for skipAfter, over the rule files of load
+// in their order. A skipAfter whose marker does not follow it is no error in
+// Coraza, neither when the WAF is built nor in a transaction: the rest of the
+// phase is skipped silently, the blocking rules of the operator and of a rule
+// set with it. So every skipAfter has to name a SecMarker that comes later, in
+// the same file or in a later one (never in its own directive), and what cannot
+// be read with certainty is rejected. It returns the path of the file where it
+// stopped.
+//
+// It is a textual over-approximation like checkRules, on the logical
+// directives of logicalDirectives. The argument of a SecMarker is read as
+// Coraza reads it (markerName) and has to be a name of nameByte. Every
+// "skipafter" in a directive, in any case of the ASCII letters and wherever it
+// stands (a string such as msg too), has to be followed by optional ASCII white
+// space, ":", optional white space, a name or a name between single quotes,
+// optional white space, and then "," or a double quote or the end of the text.
+// Other spellings that Coraza may read (a name between double quotes, a name of
+// other bytes) are rejected, and so is every skipAfter in SecDefaultAction,
+// which Coraza merges into the rules that follow, where its position is lost.
+// Coraza compares action keys after strings.ToLower, which also folds U+212A to
+// "k" and U+0130 to "i": a directive where that finds more "skipafter" than the
+// ASCII fold does is rejected. ASCII white space is the ASCII part of
+// unicode.IsSpace, the white space that Coraza trims around an action value.
+// Names are compared by their bytes, as Coraza compares them.
+func checkMarkers(b *bundle) (string, error) {
+	type use struct {
+		name, path string
+		at         int
+	}
+	var uses []use
+	markers := make(map[string]int) // name -> position of the last SecMarker of that name
+	at := 0                         // position of the directive in the order of load
+	for _, p := range b.load {
+		logical, err := logicalDirectives(string(b.files[p]))
+		if err != nil {
+			return p, err
+		}
+		for _, l := range logical {
+			at++
+			first := l
+			if i := strings.IndexFunc(l, unicode.IsSpace); i >= 0 {
+				first = l[:i]
+			}
+			directive := strings.ToLower(first) // as in checkRules: Coraza compares strings.ToLower
+			if directive == "secmarker" {
+				m, ok := markerName(l)
+				if !ok {
+					return p, errUnreadable
+				}
+				markers[m] = at
+			}
+			lower, folded := strings.ToLower(l), asciiLower(l)
+			if directive == "secdefaultaction" && strings.Count(lower, "skipafter") > 0 {
+				return p, errors.New("skipAfter in SecDefaultAction is not allowed")
+			}
+			if strings.Count(lower, "skipafter") != strings.Count(folded, "skipafter") {
+				return p, errUnreadable
+			}
+			for off := 0; ; {
+				i := strings.Index(folded[off:], "skipafter")
+				if i < 0 {
+					break
+				}
+				off += i + len("skipafter")
+				m, ok := skipAfterName(l[off:])
+				if !ok {
+					return p, errUnreadable
+				}
+				uses = append(uses, use{m, p, at})
+			}
+		}
+	}
+	for _, u := range uses {
+		if markers[u.name] <= u.at { // no marker: 0
+			return u.path, errors.New("skipAfter names no marker after it")
+		}
+	}
+	return "", nil
+}
+
+// asciiLower folds the ASCII capitals and keeps every other byte, so an offset
+// in the result is an offset in s.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
+const asciiSpace = " \t\n\v\f\r"
+
+// markerName reads the name of the SecMarker directive l as Coraza does: the
+// text after the first space (none: empty) is the argument; one of 3 bytes or
+// more that starts and ends with a double quote loses all double quotes at both
+// ends; no white space is trimmed, so "SecMarker  X" names " X", which no
+// skipAfter reaches. The name has to be of nameByte.
+func markerName(l string) (string, bool) {
+	arg := ""
+	if i := strings.IndexByte(l, ' '); i >= 0 {
+		arg = l[i+1:]
+	}
+	if len(arg) >= 3 && arg[0] == '"' && arg[len(arg)-1] == '"' {
+		arg = strings.Trim(arg, "\"")
+	}
+	return arg, isName(arg)
+}
+
+// skipAfterName reads what follows the word skipafter: ":", a name or a name
+// between single quotes, and then "," or a double quote or the end. The name is
+// returned as written.
+func skipAfterName(rest string) (string, bool) {
+	rest = strings.TrimLeft(rest, asciiSpace)
+	if rest == "" || rest[0] != ':' {
+		return "", false
+	}
+	rest = strings.TrimLeft(rest[1:], asciiSpace)
+	quoted := rest != "" && rest[0] == '\''
+	if quoted {
+		rest = rest[1:]
+	}
+	n := 0
+	for n < len(rest) && nameByte(rest[n]) {
+		n++
+	}
+	name := rest[:n]
+	rest = rest[n:]
+	if quoted {
+		if rest == "" || rest[0] != '\'' {
+			return "", false
+		}
+		rest = rest[1:]
+	}
+	rest = strings.TrimLeft(rest, asciiSpace)
+	if name == "" || rest != "" && rest[0] != ',' && rest[0] != '"' {
+		return "", false
+	}
+	return name, true
+}
+
+// isName reports whether s is 1 or more bytes of nameByte.
+func isName(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !nameByte(s[i]) {
+			return false
+		}
+	}
+	return s != ""
 }

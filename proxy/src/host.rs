@@ -4,7 +4,7 @@
 //! with `std::process::Command`, which closes nothing by itself, so every descriptor above 2 must be
 //! close-on-exec. Both facts are read from `/proc`; a value that cannot be read or understood refuses the start.
 //! A SIGCHLD disposition that only has `SA_NOCLDWAIT` is not visible there; the kernel then fails closed when it
-//! cannot see its child exit.
+//! cannot see its child exit. The user id that the file system sees for this process is read from the same file.
 
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -41,6 +41,14 @@ pub fn check() -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+/// The user id that the file system sees for this process, which owns what the process creates (std has no
+/// `geteuid`). It is the fourth number of the `Uid:` line of `/proc/self/status`.
+pub fn fs_uid() -> Result<u32, &'static str> {
+    let status = read_proc("/proc/self/status", STATUS_READ)
+        .map_err(|_| "cannot read the process status")?;
+    fs_uid_of(&status)
 }
 
 /// At most `limit` bytes of a `/proc` file.
@@ -96,6 +104,22 @@ fn sigchld_ignored(status: &str) -> Result<bool, &'static str> {
         .and_then(|value| digits(value, 16, 16))
         .ok_or(BAD)?;
     Ok(mask & (1 << (SIGCHLD - 1)) != 0)
+}
+
+/// The file system user id of the `Uid:` line of `/proc/<pid>/status`: the real, effective, saved and file system
+/// ids, exactly four decimal numbers that each fit in a `u32`.
+fn fs_uid_of(status: &str) -> Result<u32, &'static str> {
+    const BAD: &str = "the user ids are missing or malformed";
+    let ids = field(status, "Uid:").and_then(|value| {
+        value
+            .split_ascii_whitespace()
+            .map(|id| digits(id, 10, 10).and_then(|n| u32::try_from(n).ok()))
+            .collect::<Option<Vec<u32>>>()
+    });
+    match ids.as_deref() {
+        Some(&[_, _, _, fs]) => Ok(fs),
+        _ => Err(BAD),
+    }
 }
 
 /// Whether the `flags` line of `/proc/<pid>/fdinfo/<fd>` (octal; the kernel adds `O_CLOEXEC` to what it prints)
