@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::codec;
+use crate::protocol::codec;
 
 /// Longest accepted time. A guard against a wrong setting, not a recommendation.
 pub(crate) const MAX_WAIT: Duration = Duration::from_secs(3600);

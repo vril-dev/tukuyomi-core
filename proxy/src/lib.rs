@@ -3,10 +3,8 @@
 //! forwarded.
 
 pub mod config;
-pub mod driver;
-pub mod front;
-pub mod head;
+pub mod forward;
 pub mod host;
-pub mod io;
+pub mod inbound;
+pub mod inspect;
 pub mod log;
-pub mod origin;

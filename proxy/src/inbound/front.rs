@@ -42,11 +42,11 @@ use tokio::time::{Instant, timeout_at};
 use tukuyomi_kernel::{Reason, Refused, Verdict, limits};
 
 use crate::config::ProxyConfig;
-use crate::driver::{BodyHold, Hold, InspectReq, Msg, Outcome, Ticket};
-use crate::head::{self, Head, Limits, Reject, trim_ows};
-use crate::io::{Gauge, Guarded};
+use crate::forward::origin::{self, Forward, OriginBody, OriginError};
+use crate::inbound::head::{self, Head, Limits, Reject, trim_ows};
+use crate::inbound::io::{Gauge, Guarded};
+use crate::inspect::driver::{BodyHold, Hold, InspectReq, Msg, Outcome, Ticket};
 use crate::log::Log;
-use crate::origin::{self, Forward, OriginBody, OriginError};
 
 /// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
 /// and the inspection permits (as many as the kernel's waiting queue).

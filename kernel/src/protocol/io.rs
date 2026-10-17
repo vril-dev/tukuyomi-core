@@ -23,7 +23,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use crate::codec::{ConnError, HEADER_LEN, Header, MAX_BODY, read_frame};
+use crate::protocol::codec::{ConnError, HEADER_LEN, Header, MAX_BODY, read_frame};
 
 /// Time left until `deadline`; `None` when it is reached or over.
 fn left(deadline: Instant) -> Option<Duration> {
@@ -134,7 +134,7 @@ pub(crate) fn send(stream: &UnixStream, frame: &[u8], deadline: Instant) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{KIND_BODY, KIND_CLOSED, KIND_HELLO, encode_frame};
+    use crate::protocol::codec::{KIND_BODY, KIND_CLOSED, KIND_HELLO, encode_frame};
     use std::thread;
 
     const RUN: u64 = 0x0102_0304_0506_0708;

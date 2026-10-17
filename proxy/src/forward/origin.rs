@@ -43,10 +43,10 @@ use tokio::net::TcpStream;
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, timeout_at};
 
-use crate::driver::BodyHold;
-use crate::front::Ctx;
-use crate::head::trim_ows;
-use crate::io::{Gauge, Guarded};
+use crate::inbound::front::Ctx;
+use crate::inbound::head::trim_ows;
+use crate::inbound::io::{Gauge, Guarded};
+use crate::inspect::driver::BodyHold;
 
 static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 static X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");

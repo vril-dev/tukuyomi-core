@@ -31,12 +31,12 @@ use std::ops::ControlFlow::{self, Break, Continue};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::child::{self, Exit};
-use crate::codec::{self, ConnError, Header, HelloExpect};
 use crate::config::{Config, ConfigError};
-use crate::io;
-use crate::start::{self, LaunchError, Start, StartDir, Step, Stopped, Stopping};
-use crate::state::{self, Decision, Engine, Halt, Limits, OutKind, SubmitError, Why};
+use crate::process::child::{self, Exit};
+use crate::process::start::{self, LaunchError, Start, StartDir, Step, Stopped, Stopping};
+use crate::protocol::codec::{self, ConnError, Header, HelloExpect};
+use crate::protocol::io;
+use crate::requests::state::{self, Decision, Engine, Halt, Limits, OutKind, SubmitError, Why};
 
 /// The wait between two tries to reap a child when the supervisor is dropped.
 const POLL: Duration = Duration::from_millis(5);
@@ -1180,7 +1180,7 @@ impl Drop for Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::ReturnReason;
+    use crate::requests::state::ReturnReason;
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
     use std::os::unix::process::ExitStatusExt;

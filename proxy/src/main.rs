@@ -34,9 +34,9 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, Sleep, sleep, timeout_at};
 use tukuyomi_kernel::{Failure, Phase};
 use tukuyomi_proxy::config::{self, Loaded, ProxyConfig};
-use tukuyomi_proxy::driver::{self, Driver, End, Msg};
-use tukuyomi_proxy::front::{self, Ctx};
 use tukuyomi_proxy::host;
+use tukuyomi_proxy::inbound::front::{self, Ctx};
+use tukuyomi_proxy::inspect::driver::{self, Driver, End, Msg};
 use tukuyomi_proxy::log::{self, Log};
 
 const EXIT_OK: u8 = 0;

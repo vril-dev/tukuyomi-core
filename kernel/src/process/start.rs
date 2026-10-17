@@ -28,8 +28,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::child::{self, Exit, Inspector, Spec};
 use crate::config::Config;
+use crate::process::child::{self, Exit, Inspector, Spec};
 
 /// A per-start directory this process created and can still identify.
 pub(crate) struct StartDir {
