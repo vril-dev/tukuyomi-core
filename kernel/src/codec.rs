@@ -856,7 +856,7 @@ mod tests {
     // ---- golden file ----
 
     fn hex_decode(s: &str) -> Vec<u8> {
-        assert!(s.len() % 2 == 0, "odd hex length");
+        assert!(s.len().is_multiple_of(2), "odd hex length");
         assert!(
             s.bytes()
                 .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
@@ -1703,6 +1703,7 @@ mod tests {
         v.extend_from_slice(s);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn verdict(
         phase: u8,
         decision: u8,
@@ -2405,7 +2406,7 @@ mod tests {
         assert!(p.windows(5).any(|w| w == [0, 3, 0xc3, 0x28, b' ']));
         // The worst case allowed by the item bounds stays under the 32 KiB limit, so that check cannot fail:
         // 64 headers with the 24 KiB total.
-        let name = vec![b'n'; 128];
+        let name = [b'n'; 128];
         let value = vec![b'v'; 256];
         let hs = vec![(&name[..], &value[..]); 64];
         let t = TxBegin {
@@ -2447,35 +2448,38 @@ mod tests {
         let f = |kind, tx, msg, payload: &[u8]| encode_frame(kind, RUN, INC, tx, msg, payload);
         let why = |r: Result<Vec<u8>, ContentError>| reason(r);
         // BODY: 1..=64 KiB.
-        for kind in [KIND_BODY] {
-            assert_eq!(why(f(kind, 0x10, 2, b"")), "payload length out of range");
-            assert_eq!(f(kind, 0x10, 2, b"x").unwrap().len(), HEADER_LEN + 1);
-            let full = f(kind, 0x10, 2, &vec![7u8; 65536]).unwrap();
-            assert_eq!(full.len(), HEADER_LEN + 65536);
-            assert_eq!(&full[8..12], &65536u32.to_be_bytes());
-            assert_eq!(
-                why(f(kind, 0x10, 2, &vec![7u8; 65537])),
-                "payload length out of range"
-            );
-        }
+        assert_eq!(
+            why(f(KIND_BODY, 0x10, 2, b"")),
+            "payload length out of range"
+        );
+        assert_eq!(f(KIND_BODY, 0x10, 2, b"x").unwrap().len(), HEADER_LEN + 1);
+        let full = f(KIND_BODY, 0x10, 2, &vec![7u8; 65536]).unwrap();
+        assert_eq!(full.len(), HEADER_LEN + 65536);
+        assert_eq!(&full[8..12], &65536u32.to_be_bytes());
+        assert_eq!(
+            why(f(KIND_BODY, 0x10, 2, &vec![7u8; 65537])),
+            "payload length out of range"
+        );
         // The empty kinds take no payload.
-        for kind in [KIND_BODY_END] {
-            assert!(f(kind, 0x10, 3, b"").is_ok());
-            assert_eq!(why(f(kind, 0x10, 3, b"x")), "payload length out of range");
-        }
+        assert!(f(KIND_BODY_END, 0x10, 3, b"").is_ok());
+        assert_eq!(
+            why(f(KIND_BODY_END, 0x10, 3, b"x")),
+            "payload length out of range"
+        );
         assert_eq!(
             why(f(KIND_DRAIN, 0, 0, b"x")),
             "payload length out of range"
         );
         // TX_BEGIN: up to 32 KiB by length, and the content must decode like Go's (32 KiB of zeros does not). TX_END:
         // up to 8 by length, and exactly one byte 1..=5 by content (8 bytes do not).
-        for (kind, bad) in [(KIND_TX_BEGIN, "string length out of range")] {
-            assert_eq!(why(f(kind, 0x10, 1, &vec![0u8; MAX_TX_BEGIN])), bad);
-            assert_eq!(
-                why(f(kind, 0x10, 1, &vec![0u8; MAX_TX_BEGIN + 1])),
-                "payload length out of range"
-            );
-        }
+        assert_eq!(
+            why(f(KIND_TX_BEGIN, 0x10, 1, &vec![0u8; MAX_TX_BEGIN])),
+            "string length out of range"
+        );
+        assert_eq!(
+            why(f(KIND_TX_BEGIN, 0x10, 1, &vec![0u8; MAX_TX_BEGIN + 1])),
+            "payload length out of range"
+        );
         assert_eq!(
             why(f(KIND_TX_END, 0x10, 7, &[1; 8])),
             "tx_end payload is not one byte 1..=5"
@@ -2702,7 +2706,7 @@ mod tests {
             ..begin()
         });
         let name = vec![b'n'; 256];
-        let value = vec![b'v'; 128];
+        let value = [b'v'; 128];
         let hs = vec![(&name[..], &value[..]); 64];
         let n = sendable(&TxBegin {
             client_addr: &[b'1'; 64],
@@ -2724,7 +2728,7 @@ mod tests {
             ..begin()
         });
         sendable(&TxBegin {
-            headers: &vec![(&name[..], &v3840[..]); 6],
+            headers: &[(&name[..], &v3840[..]); 6],
             ..begin()
         });
         sendable(&TxBegin {
@@ -2743,6 +2747,8 @@ mod tests {
     const PID: u32 = 4242;
     const RULES: [u8; 32] = [7; 32];
     const MEM: u64 = 256 << 20;
+
+    type Mutation = (&'static str, fn(&mut Hello));
 
     fn expect() -> HelloExpect<'static> {
         HelloExpect {
@@ -2801,7 +2807,7 @@ mod tests {
     #[test]
     fn hello_matches_and_every_field_is_checked() {
         assert_eq!(checked(&good_hello()), Ok(()));
-        let one: [(&str, fn(&mut Hello)); 13] = [
+        let one: [Mutation; 13] = [
             ("hello contract version is not v0", |h| h.version = 1),
             ("hello pid is not the child's pid", |h| h.pid += 1),
             ("hello nonce differs", |h| h.nonce[15] ^= 1),

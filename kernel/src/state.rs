@@ -598,14 +598,16 @@ impl Engine {
         }
         self.expire(now);
         let closed_wait = self.limits.closed_wait;
-        if let Some(l) = self.held.iter_mut().find(|l| l.tx == tx) {
-            if l.end_msg == Some(msg) && l.closed_due.is_none() && !l.closed_overflow {
-                l.closed_due = after(now, closed_wait);
-                if l.closed_due.is_none() {
-                    // The wait is over at once: Close is unconfirmed, and the wait is not started again.
-                    l.closed_overflow = true;
-                    rec(&mut self.reqs, l.req).out.close_unconfirmed = true;
-                }
+        if let Some(l) = self.held.iter_mut().find(|l| l.tx == tx)
+            && l.end_msg == Some(msg)
+            && l.closed_due.is_none()
+            && !l.closed_overflow
+        {
+            l.closed_due = after(now, closed_wait);
+            if l.closed_due.is_none() {
+                // The wait is over at once: Close is unconfirmed, and the wait is not started again.
+                l.closed_overflow = true;
+                rec(&mut self.reqs, l.req).out.close_unconfirmed = true;
             }
         }
     }
@@ -708,15 +710,15 @@ impl Engine {
         let mut stop: Option<StopReason> = None;
         for l in &self.held {
             let o = &self.reqs[&l.req].out;
-            if let Some(p) = o.stop.filter(|p| l.stop_overflow || now > p.at) {
-                if stop.is_none_or(|s| p.at < s.at) {
-                    stop = Some(StopReason {
-                        req: l.req,
-                        tx: l.tx,
-                        at: p.at,
-                        origin: p.origin,
-                    });
-                }
+            if let Some(p) = o.stop.filter(|p| l.stop_overflow || now > p.at)
+                && stop.is_none_or(|s| p.at < s.at)
+            {
+                stop = Some(StopReason {
+                    req: l.req,
+                    tx: l.tx,
+                    at: p.at,
+                    origin: p.origin,
+                });
             }
         }
         stop
@@ -965,10 +967,10 @@ impl Engine {
         self.out.retain(|q| q.tx != l.tx);
         let r = rec(&mut self.reqs, l.req);
         r.out.returns.push((l.tx, reason));
-        if matches!(reason, ReturnReason::Closed | ReturnReason::NotCreated) {
-            if let Some(p) = r.out.stop.as_mut() {
-                p.cleared = true;
-            }
+        if matches!(reason, ReturnReason::Closed | ReturnReason::NotCreated)
+            && let Some(p) = r.out.stop.as_mut()
+        {
+            p.cleared = true;
         }
         if r.delivered {
             self.reqs.remove(&l.req);
