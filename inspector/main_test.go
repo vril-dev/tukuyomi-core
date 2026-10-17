@@ -1248,9 +1248,13 @@ func TestCheckRules(t *testing.T) {
 	// Every row is rejected. A row with a kind is a spelling that Coraza v3.8.1
 	// evaluates as the ctl, the Include or the SecIgnoreRuleCompilationErrors On
 	// that checkRules guards against: rawEffect shows its effect in Coraza. A row
-	// without a kind is a false reject by design: Coraza gets no observable
-	// effect from it, or does not read it as the directive with On (Off, no
-	// argument), and telling On from Off would need a parser of the argument.
+	// without a kind is either a false reject by design: Coraza gets no
+	// observable effect from it, or does not read it as the directive with On
+	// (Off, no argument), and telling On from Off would need a parser of the
+	// argument; or a row of the name and word guards (the SecAuditLog,
+	// SecDebugLog and SecUpload directives, @inspectFile, @rbl, setenv and
+	// ctl:requestBodyLimit), whose effect is a file, a program, a DNS query or
+	// the environment and is not run here.
 	reject := []struct{ name, kind, rules string }{
 		{"plain", "engine", act + "ctl:ruleEngine=Off\"\n"},
 		{"DetectionOnly value (no observable effect)", "", act + "ctl:ruleEngine=DetectionOnly\"\n"},
@@ -1280,6 +1284,59 @@ func TestCheckRules(t *testing.T) {
 		{"ignore errors after a comment line", "ignore", "# note\nSecIgnoreRuleCompilationErrors On\n"},
 		{"ignore errors after white space", "ignore", " \t SecIgnoreRuleCompilationErrors On\n"},
 		{"ignore errors after rules", "", baseRules + "SecRule ARGS \"@contains a\" \"id:5,phase:1,pass\"\nSecIgnoreRuleCompilationErrors Off\n"},
+		// A directive that starts with SecAuditLog, SecDebugLog or SecUpload:
+		// the start of the name decides, whatever the argument.
+		{"audit log", "", "SecAuditLog /x\n"},
+		{"audit log type", "", "SecAuditLogType HTTPS\n"},
+		{"audit log format", "", "SecAuditLogFormat JSON\n"},
+		{"audit log storage dir", "", "SecAuditLogStorageDir /x\n"},
+		{"audit log dir mode", "", "SecAuditLogDirMode 0700\n"},
+		{"audit log file mode", "", "SecAuditLogFileMode 0600\n"},
+		{"audit log parts", "", "SecAuditLogParts ABZ\n"},
+		{"audit log relevant status", "", "SecAuditLogRelevantStatus ^5\n"},
+		{"debug log", "", "SecDebugLog /x\n"},
+		{"debug log level", "", "SecDebugLogLevel 0\n"},
+		{"upload dir", "", "SecUploadDir /x\n"},
+		{"upload keep files", "", "SecUploadKeepFiles On\n"},
+		{"upload file mode", "", "SecUploadFileMode 0600\n"},
+		{"upload file limit", "", "SecUploadFileLimit 10\n"},
+		{"audit log without an argument", "", "SecAuditLog\n"},
+		{"audit log mixed case", "", "secAUDITlog /x\n"},
+		{"debug log upper case", "", "SECDEBUGLOG /x\n"},
+		{"upload dir mixed case", "", "sEcUpLoAdDiR /x\n"},
+		{"audit log dotted capital I", "", "SecAudİtLog /x\n"},
+		{"audit log split by a continuation", "", "SecAudit\\\nLog /x\n"},
+		{"debug log split by a continuation", "", "SecDebug\\\nLog /x\n"},
+		{"upload dir split by a continuation", "", "SecUpload\\\nDir /x\n"},
+		{"audit log after a comment line", "", "# note\nSecAuditLog /x\n"},
+		{"audit log after white space", "", " \t SecAuditLog /x\n"},
+		{"audit log after rules", "", baseRules + "SecAuditLog /x\n"},
+		// @inspectFile, @rbl, setenv: and ctl:requestBodyLimit: the word decides,
+		// wherever it stands in the reduced text.
+		{"@inspectFile", "", `SecRule ARGS "@inspectFile /x" "id:5,phase:1,pass"` + "\n"},
+		{"@inspectFile negated", "", `SecRule ARGS "!@inspectFile /x" "id:5,phase:1,pass"` + "\n"},
+		{"@inspectFile after a space", "", `SecRule ARGS " @inspectFile /x" "id:5,phase:1,pass"` + "\n"},
+		{"@inspectFile split by a continuation", "", "SecRule ARGS \"@inspect\\\nFile /x\" \"id:5,phase:1,pass\"\n"},
+		{"@inspectFile mixed case (a false reject: operator names have a case)", "", `SecRule ARGS "@InspectFILE /x" "id:5,phase:1,pass"` + "\n"},
+		{"@rbl", "", `SecRule REMOTE_ADDR "@rbl sbl.example.net" "id:5,phase:1,pass"` + "\n"},
+		{"@rbl negated", "", `SecRule REMOTE_ADDR "!@rbl sbl.example.net" "id:5,phase:1,pass"` + "\n"},
+		{"setenv", "", act + "setenv:A=B\"\n"},
+		{"setenv with single quotes", "", act + "setenv:'A=B'\"\n"},
+		{"setenv with a space before the colon", "", act + "setenv :A=B\"\n"},
+		{"setenv upper case with spaces", "", act + "SETENV : A=B\"\n"},
+		{"setenv with a no-break space", "", act + "setenv: A=B\"\n"},
+		{"setenv split by a continuation", "", act + "set\\\nenv:A=B\"\n"},
+		{"setenv in a backtick block", "", "SecAction id:1,phase:1,pass,msg:'`\n',setenv:\nA=B,msg:'\n`'\n"},
+		{"ctl requestBodyLimit", "", act + "ctl:requestBodyLimit=1\"\n"},
+		{"ctl requestBodyLimit with spaces", "", act + "ctl : requestBodyLimit = 1\"\n"},
+		{"ctl requestBodyLimit with single quotes", "", act + "ctl:'requestBodyLimit=1'\"\n"},
+		{"ctl requestBodyLimit upper case key", "", act + "CTL:requestBodyLimit=1\"\n"},
+		{"ctl requestBodyLimit split by a continuation", "", act + "ctl:requestBody\\\nLimit=1\"\n"},
+		{"ctl requestBodyLimit in a backtick block", "", "SecAction id:1,phase:1,pass,msg:'`\n',ctl:\nrequestBodyLimit=1,msg:'\n`'\n"},
+		{"ctl requestBodyLimit mixed case (a false reject: ctl names have a case)", "", act + "ctl:REQUESTbodyLIMIT=1\"\n"},
+		{"setenv after rules", "", baseRules + act + "setenv:A=B\"\n"},
+		{"word setenv: in a string (a false reject)", "", "SecRule ARGS \"@contains setenv:\" \"id:5,phase:1,pass\"\n"},
+		{"word @rbl in msg (a false reject)", "", act + "msg:'see @rbl'\"\n"},
 	}
 	for _, c := range reject {
 		t.Run("reject/"+c.name, func(t *testing.T) {
@@ -1304,7 +1361,10 @@ func TestCheckRules(t *testing.T) {
 			}
 		})
 	}
-	// Accepted: the same conditions as Coraza leave these without effect.
+	// Accepted: the same conditions as Coraza leave a comment line without
+	// effect, and the other rows hold none of what the guards look for. The
+	// file operators are accepted too: the root of newWAF stops them (see
+	// TestNewWAFReadsNoFile).
 	accept := []struct{ name, rules string }{
 		{"base rules", baseRules},
 		{"comment line", "# " + act + "ctl:ruleEngine=Off\"\n"},
@@ -1315,6 +1375,18 @@ func TestCheckRules(t *testing.T) {
 		{"word include as an argument", "SecRule ARGS \"@contains include\" \"id:5,phase:1,pass\"\n"},
 		{"word SecIgnoreRuleCompilationErrors as an argument", "SecRule ARGS \"@contains SecIgnoreRuleCompilationErrors\" \"id:5,phase:1,pass\"\n"},
 		{"comment line with the ignore errors directive", "# SecIgnoreRuleCompilationErrors On\n"},
+		{"comment line with a SecAuditLog directive", "# SecAuditLog /x\n"},
+		{"comment line with the operators", "# SecRule ARGS \"@inspectFile /x\" \"id:5,phase:1,pass\"\n# SecRule REMOTE_ADDR \"@rbl sbl.example.net\" \"id:6,phase:1,pass\"\n"},
+		{"comment line with setenv", "# " + act + "setenv:A=B\"\n"},
+		{"comment line with ctl requestBodyLimit", "# " + act + "ctl:requestBodyLimit=1\"\n"},
+		{"comment line in a continuation with setenv", act + "\\\n# setenv:A=B\npass\"\n"},
+		{"SecDefaultAction line", "SecDefaultAction \"phase:1,log,auditlog,pass\"\n"},
+		{"SecAuditEngine line (not a name that starts with SecAuditLog)", "SecAuditEngine RelevantOnly\n"},
+		{"word SecAuditLog as an argument", "SecRule ARGS \"@contains SecAuditLog\" \"id:5,phase:1,pass\"\n"},
+		{"@pm", "SecRule ARGS \"@pm a b\" \"id:5,phase:1,pass\"\n"},
+		{"@pmFromFile (newWAF stops it)", "SecRule ARGS \"@pmFromFile /x/words.data\" \"id:5,phase:1,pass\"\n"},
+		{"ctl ruleRemoveByTag", act + "ctl:ruleRemoveByTag=x\"\n"},
+		{"ctl forceRequestBodyVariable", act + "ctl:forceRequestBodyVariable=On\"\n"},
 	}
 	for _, c := range accept {
 		t.Run("accept/"+c.name, func(t *testing.T) {
@@ -1378,6 +1450,59 @@ func TestCheckRulesDroppedRule(t *testing.T) {
 	}
 }
 
+// The root of the rules answers every name with "does not exist" and never
+// returns a file.
+func TestNoFiles(t *testing.T) {
+	for _, name := range []string{"", ".", "x", "/abs/x", "../x", "a/*.conf"} {
+		f, err := noFiles{}.Open(name)
+		var pe *os.PathError
+		if f != nil || !errors.As(err, &pe) || pe.Op != "open" || pe.Path != name || pe.Err != os.ErrNotExist {
+			t.Errorf("%q: %v %v", name, f, err)
+		}
+	}
+}
+
+// The rules read no file: newWAF gives them a root without files. Each row
+// names a file that exists, and Coraza builds the same rule without that root,
+// so the root is what stops the read; newWAF fails with the answer of the root.
+// The relative name is found from the directory of the package, which is the
+// directory of a test.
+func TestNewWAFReadsNoFile(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	dir := t.TempDir()
+	write := func(name, data string) string {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	words := write("words.data", "attack\n")
+	ips := write("ips.data", "192.0.2.1\n")
+	schema := write("schema.json", "{}\n")
+	rows := []struct{ name, rules string }{
+		{"@pmFromFile by an absolute name", `SecRule ARGS "@pmFromFile ` + words + `" "id:5,phase:1,pass"` + "\n"},
+		{"@pmFromFile by a relative name", `SecRule ARGS "@pmFromFile testdata/v0-golden.txt" "id:5,phase:1,pass"` + "\n"},
+		{"@ipMatchFromFile", `SecRule REMOTE_ADDR "@ipMatchFromFile ` + ips + `" "id:5,phase:1,pass"` + "\n"},
+		{"@validateSchema", `SecRule REQUEST_BODY "@validateSchema ` + schema + `" "id:5,phase:2,pass"` + "\n"},
+	}
+	for _, c := range rows {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives("SecRuleEngine On\n" + c.rules)); err != nil {
+				t.Fatalf("Coraza does not build the rule without the root: %v", err)
+			}
+			_, err := newWAF(c.rules)
+			if err == nil {
+				t.Fatal("the rule that reads a file was built")
+			}
+			if !strings.Contains(err.Error(), "file does not exist") {
+				t.Fatalf("not the answer of the root: %v", err)
+			}
+		})
+	}
+}
+
 func TestProcessRejectedRules(t *testing.T) {
 	p := startProc(t, procOpt{rules: baseRules + "SecAction \"id:1,phase:1,pass,ctl:ruleEngine=Off\"\n"})
 	if got := p.exit(t); got != exitRules {
@@ -1402,6 +1527,36 @@ func TestProcessRejectedRulesIgnoreErrors(t *testing.T) {
 	}
 	if _, err := readOne(p.c); err == nil {
 		t.Fatal("a frame was sent")
+	}
+}
+
+// A rule that reaches outside the process stops the start: exit 11, no frame,
+// and no path of the rules file in the diagnostic. The directive and the
+// operator are stopped by checkRules (a fixed text), the read of an existing
+// file by the root of newWAF (the text of Coraza, which names the data file).
+func TestProcessRejectedRulesOutside(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "words.data")
+	if err := os.WriteFile(data, []byte("attack\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ name, rules, want string }{
+		{"audit log", baseRules + "SecAuditLog " + filepath.Join(t.TempDir(), "audit.log") + "\n", "start: rules rejected: the SecAuditLog, SecDebugLog and SecUpload directives are not allowed"},
+		{"@inspectFile", baseRules + `SecRule ARGS "@inspectFile /bin/true" "id:5,phase:1,pass"` + "\n", "start: rules rejected: @inspectFile, @rbl, setenv and ctl of requestBodyLimit are not allowed"},
+		{"@pmFromFile by an absolute name", baseRules + `SecRule ARGS "@pmFromFile ` + data + `" "id:5,phase:1,pass"` + "\n", "start: rules build failed: "},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := startProc(t, procOpt{rules: c.rules})
+			if got := p.exit(t); got != exitRules {
+				t.Fatalf("exit %d stderr %q", got, p.stderr.String())
+			}
+			if s := p.stderr.String(); !strings.Contains(s, c.want) || strings.Contains(s, "rules.conf") {
+				t.Fatalf("stderr %q", s)
+			}
+			if _, err := readOne(p.c); err == nil {
+				t.Fatal("a frame was sent")
+			}
+		})
 	}
 }
 
