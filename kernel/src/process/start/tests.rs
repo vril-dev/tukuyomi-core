@@ -145,7 +145,7 @@ fn drive(mut st: Stopping) -> Stopped {
 
 fn done(s: Stopped) -> (u32, Exit) {
     match s {
-        Stopped::Done { inc, exit } => (inc, exit),
+        Stopped::Done { inc, exit, .. } => (inc, exit),
         Stopped::Waiting(_) => panic!("Waiting"),
         Stopped::DirLeft { why, .. } => panic!("DirLeft: {why}"),
         Stopped::Unreaped { why, .. } => panic!("Unreaped: {why}"),
@@ -536,6 +536,7 @@ fn a_directory_that_cannot_be_removed_is_handed_back_with_the_exit() {
             exit,
             dir,
             why,
+            ..
         } => {
             assert_eq!(why, "start dir removal failed");
             (inc, exit, dir)
@@ -551,4 +552,72 @@ fn a_directory_that_cannot_be_removed_is_handed_back_with_the_exit() {
     dir.remove().ok().unwrap();
     assert!(gone(&p));
     assert!(root.names().is_empty());
+}
+
+// ---- start-failure ----
+
+/// The bytes of `start-failure`, by the checks of `StartDir::read_failure`, for what the test put at the name.
+#[test]
+fn start_failure_is_read_only_as_a_small_regular_file_of_the_directory() {
+    let root = TestDir::new();
+    let outside = TestDir::new();
+    let dir = created(StartDir::create(root.path(), 11, 1));
+    let name = dir.path().join(FAILURE_FILE);
+    // Absent.
+    assert_eq!(dir.read_failure(), None);
+    // The limit and the first byte past it.
+    fs::write(&name, vec![b'x'; 512]).unwrap();
+    assert_eq!(dir.read_failure(), Some(vec![b'x'; 512]));
+    fs::write(&name, vec![b'x'; 513]).unwrap();
+    assert_eq!(dir.read_failure(), None);
+    // Nothing to say.
+    fs::write(&name, b"").unwrap();
+    assert_eq!(dir.read_failure(), None);
+    // A link is not followed, also to a file that is fine.
+    fs::remove_file(&name).unwrap();
+    fs::write(outside.path().join("line"), b"outside\n").unwrap();
+    symlink(outside.path().join("line"), &name).unwrap();
+    assert_eq!(dir.read_failure(), None);
+    // Not a regular file.
+    fs::remove_file(&name).unwrap();
+    fs::create_dir(&name).unwrap();
+    assert_eq!(dir.read_failure(), None);
+    fs::remove_dir(&name).unwrap();
+    // A directory that was replaced by another one is not read, whatever the new one holds.
+    fs::write(&name, b"mine\n").unwrap();
+    assert_eq!(dir.read_failure(), Some(b"mine\n".to_vec()));
+    let moved = root.path().join("moved");
+    fs::rename(dir.path(), &moved).unwrap();
+    fs::create_dir(dir.path()).unwrap();
+    fs::write(&name, b"other\n").unwrap();
+    assert_eq!(dir.read_failure(), None);
+    fs::remove_dir_all(dir.path()).unwrap();
+    fs::rename(&moved, dir.path()).unwrap();
+    dir.remove().ok().unwrap();
+}
+
+/// The read happens at the end of the stop, for a refusal only, and the directory goes either way.
+#[test]
+fn the_stop_hands_back_start_failure_after_a_refusal_only() {
+    let root = TestDir::new();
+    let fixtures = TestDir::new();
+    for (code, want) in [(10, true), (11, true), (14, true), (0, false), (12, false)] {
+        let cfg = script(
+            root.path(),
+            &fixtures,
+            &format!(
+                "printf 'tkv0-inspector: refused\\n' > \"$TMPDIR/start-failure\"\nexit {code}\n"
+            ),
+        );
+        let start = launch_ok(&cfg, 12, 1);
+        let p = start.dir.path().to_path_buf();
+        let stopped = drive(start.stop(Instant::now() + Duration::from_secs(30)));
+        let Stopped::Done { exit, detail, .. } = stopped else {
+            panic!("exit {code}: the stop did not end with the directory removed");
+        };
+        assert_eq!(exit.status.code(), Some(code));
+        let line = b"tkv0-inspector: refused\n".to_vec();
+        assert_eq!(detail, want.then_some(line), "exit {code}");
+        assert!(gone(&p) && root.names().is_empty(), "exit {code}");
+    }
 }

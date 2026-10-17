@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
-//! The proxy process: start-up, the wait for the kernel, the accept loop and the stop.
+//! The proxy process: start-up, the wait for the kernel, the accept loop and the stop. When the first argument is
+//! `rules` the process is a short command on the rules store instead (`rules::command`), and nothing of the proxy
+//! starts.
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration
 //! file), the host checks, the configuration, the rules store (the chosen generation and its directory, and with
@@ -17,6 +19,7 @@
 //! and for a refused rules store or generation (nothing has been started then); 2 for a wrong argument or a
 //! refused configuration. The log is flushed for at most 200 ms at the end.
 
+use std::ffi::OsString;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -40,6 +43,7 @@ use tukuyomi_proxy::host;
 use tukuyomi_proxy::inbound::conn::{self, Ctx};
 use tukuyomi_proxy::inspect::driver::{self, Driver, End, Msg};
 use tukuyomi_proxy::log::{self, Log};
+use tukuyomi_proxy::rules::command;
 use tukuyomi_proxy::rules::store;
 
 const EXIT_OK: u8 = 0;
@@ -72,7 +76,16 @@ fn main() -> ExitCode {
 
 /// Everything before the runtime runs, then the runtime. Returns the exit code.
 fn start(log: &Log) -> u8 {
-    let mut args = std::env::args_os().skip(1);
+    let mut args = std::env::args_os().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "rules") {
+        args.next();
+        let args: Vec<OsString> = args.collect();
+        return match command::run(&args, &mut io::stdout(), &mut io::stderr()) {
+            command::Exit::Done => EXIT_OK,
+            command::Exit::Failed => EXIT_FAILED,
+            command::Exit::Usage => EXIT_USAGE,
+        };
+    }
     let path = match (args.next(), args.next()) {
         (Some(path), None) if config::clean_abs(Path::new(&path)) => PathBuf::from(path),
         _ => {

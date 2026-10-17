@@ -298,6 +298,36 @@ func TestProcessRejectedRules(t *testing.T) {
 	}
 }
 
+// A failed start also leaves its line in start-failure in TMPDIR, byte for
+// byte as on stderr (here the build fails in the second file, and the line
+// names it). A TMPDIR that checkTmpDir rejects is not written to, though its
+// owner could write there.
+func TestProcessStartFailureFile(t *testing.T) {
+	p := startProc(t, procOpt{
+		files: map[string]string{"rules/a.conf": baseRules, "rules/b.conf": "SecNoSuchDirective 1\n"},
+		load:  []string{"rules/a.conf", "rules/b.conf"},
+	})
+	p.failsStart(t, exitRules, "start: rules build failed: rules/b.conf: ")
+	file := filepath.Join(p.dir, "tmp", startFailureName)
+	got, err := os.ReadFile(file)
+	st, serr := os.Stat(file)
+	if err != nil || serr != nil || string(got) != p.stderr.String() || st.Mode().Perm() != 0o600 {
+		t.Fatalf("file %q (%v, %v), stderr %q", got, err, serr, p.stderr.String())
+	}
+
+	bad := filepath.Join(t.TempDir(), "tmp")
+	if err := os.Mkdir(bad, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bad, 0o710); err != nil {
+		t.Fatal(err)
+	}
+	startProc(t, procOpt{env: map[string]string{"TMPDIR": bad}}).failsStart(t, exitStartup, "start: TMPDIR")
+	if _, err := os.Lstat(filepath.Join(bad, startFailureName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a file in the rejected TMPDIR: %v", err)
+	}
+}
+
 func TestProcessFrameDeadline(t *testing.T) {
 	p := startProc(t, procOpt{})
 	p.frame(t)

@@ -19,9 +19,18 @@
 //! The owner of the created directory is taken as this process's file system uid (std has no `geteuid`, and nothing
 //! outside the file system is read for it); the root must be owned by the same uid. The inspector checks its
 //! `TMPDIR` itself (inspector/main.go `checkTmpDir`).
+//!
+//! An inspector that refuses to start (exit code 10, 11 or 14) may leave one line in `start-failure` in its start
+//! directory. `Stopping::step` reads it once, after the exit was seen and before the directory is removed
+//! (`StartDir::read_failure`): the same identity checks as for the removal, `lstat` of a regular file, then the open
+//! and `fstat` of that same file, at most `FAILURE_MAX` bytes. Anything else leaves no detail. std cannot open
+//! without waiting (`O_NONBLOCK`) and this crate has no `unsafe`, so a process that was this inspector's user could
+//! replace the name by a FIFO between its exit and this read and block the read; no other user can make a name in
+//! the directory, and the same user could do much more damage.
 #![forbid(unsafe_code)]
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::UnixStream;
@@ -30,6 +39,21 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::process::child::{self, Exit, Inspector, Spec};
+
+/// The file of the start directory that an inspector which refuses to start may leave.
+const FAILURE_FILE: &str = "start-failure";
+/// The most bytes read from it; a longer file leaves no detail.
+const FAILURE_MAX: u64 = 512;
+
+/// The exit code of a refusal that is final (inspector/main.go: 10 the peer, 11 the rules, 14 the start-up input),
+/// or `None` for any other end, a signal included. The supervisor does not restart after a refusal, and the
+/// inspector may have left `start-failure`.
+pub(crate) fn refusal(exit: &Exit) -> Option<i32> {
+    match exit.status.code() {
+        code @ Some(10 | 11 | 14) => code,
+        _ => None,
+    }
+}
 
 /// A per-start directory this process created and can still identify.
 pub(crate) struct StartDir {
@@ -149,6 +173,42 @@ impl StartDir {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The bytes of `start-failure`, or `None` for anything else: the directory is no longer the one created, the
+    /// name is absent, a link or not a regular file, it changes between the `lstat` and the open, it is over
+    /// `FAILURE_MAX` bytes, empty, or changes its size while it is read.
+    fn read_failure(&self) -> Option<Vec<u8>> {
+        let dm = fs::symlink_metadata(&self.path).ok()?;
+        if !(dm.file_type().is_dir()
+            && dm.dev() == self.dev
+            && dm.ino() == self.ino
+            && dm.uid() == self.uid)
+        {
+            return None;
+        }
+        let path = self.path.join(FAILURE_FILE);
+        let seen = fs::symlink_metadata(&path).ok()?;
+        if !seen.file_type().is_file() {
+            return None;
+        }
+        let file = File::open(&path).ok()?;
+        let opened = file.metadata().ok()?;
+        if !(opened.is_file()
+            && opened.dev() == seen.dev()
+            && opened.ino() == seen.ino()
+            && opened.len() <= FAILURE_MAX)
+        {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(opened.len().saturating_add(1))
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if u64::try_from(bytes.len()).ok() != Some(opened.len()) {
+            return None;
+        }
+        (!bytes.is_empty()).then_some(bytes)
     }
 
     /// Removes the directory and everything in it, only if it is still the one created. `remove_dir_all` does not
@@ -282,15 +342,18 @@ pub(crate) struct Stopping {
 
 pub(crate) enum Stopped {
     Waiting(Stopping),
-    /// Exit seen and directory removed.
+    /// Exit seen and directory removed. `detail` is the line the inspector left in `start-failure`, only after a
+    /// refusal (`refusal`).
     Done {
         inc: u32,
         exit: Exit,
+        detail: Option<Vec<u8>>,
     },
     /// Exit seen, directory kept.
     DirLeft {
         inc: u32,
         exit: Exit,
+        detail: Option<Vec<u8>>,
         dir: StartDir,
         #[cfg_attr(
             not(test),
@@ -354,14 +417,17 @@ impl Stopping {
         Stopped::Waiting(self)
     }
 
-    /// The exit is seen: the directory goes now. `self.ins` is dropped here with its exit known (no kill, no wait).
+    /// The exit is seen: after a refusal `start-failure` is read, then the directory goes. `self.ins` is dropped here
+    /// with its exit known (no kill, no wait).
     fn finished(self, exit: Exit) -> Stopped {
         let Stopping { inc, dir, .. } = self;
+        let detail = refusal(&exit).and_then(|_| dir.read_failure());
         match dir.remove() {
-            Ok(()) => Stopped::Done { inc, exit },
+            Ok(()) => Stopped::Done { inc, exit, detail },
             Err((dir, why)) => Stopped::DirLeft {
                 inc,
                 exit,
+                detail,
                 dir,
                 why,
             },

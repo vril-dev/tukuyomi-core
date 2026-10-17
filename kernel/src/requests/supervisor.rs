@@ -262,6 +262,8 @@ pub struct Supervisor {
     not_before: Option<Instant>,
     /// `None` until the first `shutdown`; then that call's deadline.
     shutdown_by: Option<Instant>,
+    /// The line an inspector left in `start-failure` when its start ended in a refusal (`start_detail`).
+    detail: Option<Vec<u8>>,
 }
 
 /// `t + d` (a sum that overflows is `t`: due at once), cut at `cap` when it is `Some`.
@@ -353,7 +355,7 @@ fn apply_stop(engine: &mut Engine, now: Instant, inc: u32, tag: StopTag) -> Opti
 /// full restart window makes the next start wait.
 fn next(end: End, exit: Option<Exit>, halted: Option<Halt>, _used: u32, budget: u32) -> Next {
     // A status with a code (not killed by a signal) of 10, 11 or 14 is a deterministic refusal of the inspector.
-    if let Some(code @ (10 | 11 | 14)) = exit.and_then(|x| x.status.code()) {
+    if let Some(code) = exit.as_ref().and_then(start::refusal) {
         return Next::Fail(Failure::Exit(code));
     }
     if let End::Fail(f) = end {
@@ -435,6 +437,7 @@ impl Supervisor {
             restart_times,
             not_before: None,
             shutdown_by: None,
+            detail: None,
         })
     }
 
@@ -556,6 +559,14 @@ impl Supervisor {
         }
     }
 
+    /// The bytes an inspector left in `start-failure` of its start directory when it ended in a refusal (exit code 10,
+    /// 11 or 14, which is `Failure::Exit`): at most 512, read once after the exit was seen and before the directory
+    /// was removed. `None` when there is none, also when the file was not what it should be. The bytes are the
+    /// inspector's own and no one else checked them: the caller must not write them anywhere unescaped.
+    pub fn start_detail(&self) -> Option<Vec<u8>> {
+        self.detail.clone()
+    }
+
     /// Ends the intake for good. Callable again: a reap or clean-up left unknown stays owned and is retried.
     ///
     /// Every request accepted and not decided is decided in this call, whatever the state, and comes out in
@@ -587,12 +598,20 @@ impl Supervisor {
                                     thread::sleep(wake.saturating_duration_since(t));
                                     s = w;
                                 }
-                                Stopped::Done { inc, .. } => {
+                                Stopped::Done { inc, detail, .. } => {
                                     self.engine.exit_confirmed(t, inc);
+                                    if detail.is_some() {
+                                        self.detail = detail;
+                                    }
                                     break None;
                                 }
-                                Stopped::DirLeft { inc, dir, .. } => {
+                                Stopped::DirLeft {
+                                    inc, dir, detail, ..
+                                } => {
                                     self.engine.exit_confirmed(t, inc);
+                                    if detail.is_some() {
+                                        self.detail = detail;
+                                    }
                                     break Some(Leftover::Dir(dir));
                                 }
                                 Stopped::Unreaped { left: s2, .. } => {
@@ -1082,23 +1101,37 @@ impl Supervisor {
             }
         };
         let _ = self.engine.tick(now);
-        let (inc, tag, exit, left) = match stop.step(now) {
+        let (inc, tag, exit, left, detail) = match stop.step(now) {
             Stopped::Waiting(stop) => {
                 let wake = stop.next_at();
                 self.run = Run::Stopping { stop, end };
                 return self.nap(now, until, Some(wake));
             }
-            Stopped::Done { inc, exit } => (inc, StopTag::Done, Some(exit), None),
-            Stopped::DirLeft { inc, exit, dir, .. } => {
-                (inc, StopTag::DirLeft, Some(exit), Some(Leftover::Dir(dir)))
-            }
+            Stopped::Done { inc, exit, detail } => (inc, StopTag::Done, Some(exit), None, detail),
+            Stopped::DirLeft {
+                inc,
+                exit,
+                detail,
+                dir,
+                ..
+            } => (
+                inc,
+                StopTag::DirLeft,
+                Some(exit),
+                Some(Leftover::Dir(dir)),
+                detail,
+            ),
             Stopped::Unreaped { left: rest, .. } => (
                 rest.inc(),
                 StopTag::Unreaped,
                 None,
                 Some(Leftover::Running(rest)),
+                None,
             ),
         };
+        if detail.is_some() {
+            self.detail = detail;
+        }
         match apply_stop(&mut self.engine, now, inc, tag) {
             Some(why) => self.fail(now, why, left),
             None => {

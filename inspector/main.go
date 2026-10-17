@@ -38,50 +38,45 @@ func run(args []string) int {
 	signal.Notify(make(chan os.Signal, 1), syscall.SIGPIPE)
 	d := &diag{w: os.Stderr}
 
+	// A failure to start goes through startFail. It also writes the line to the
+	// file start-failure in TMPDIR, but only after parseConfig has checked
+	// TMPDIR (d.tmp), so an earlier failure never writes to an unchecked path.
 	if err := checkPeer(0); err != nil {
-		d.printf("start: peer check failed: %v", err)
-		return exitPeer
+		return d.startFail(exitPeer, "start: peer check failed: %v", err)
 	}
 	// Coraza tries the working directory as a place for the file that a rule
 	// names, and its error then holds that path. At "/" no path of ours is in it.
 	if err := os.Chdir("/"); err != nil {
-		d.printf("start: chdir: %v", err)
-		return exitStartup
+		return d.startFail(exitStartup, "start: chdir: %v", err)
 	}
 	cfg, err := parseConfig(args, os.Getenv)
 	if err != nil {
-		d.printf("start: %v", err)
-		return exitStartup
+		return d.startFail(exitStartup, "start: %v", err)
 	}
+	d.tmp = cfg.tmpDir
 	ver, sum, err := corazaModule()
 	if err != nil {
-		d.printf("start: %v", err)
-		return exitStartup
+		return d.startFail(exitStartup, "start: %v", err)
 	}
 	b, err := readBundle(cfg.bundleDir)
 	if err != nil {
-		d.printf("start: rules: %v", withoutPath(err))
-		return exitRules
+		return d.startFail(exitRules, "start: rules: %v", withoutPath(err))
 	}
 	for _, p := range b.load {
 		if err := checkRules(string(b.files[p])); err != nil {
-			d.printf("start: rules rejected: %s: %v", p, err)
-			return exitRules
+			return d.startFail(exitRules, "start: rules rejected: %s: %v", p, err)
 		}
 	}
 	if p, err := checkMarkers(b); err != nil {
-		d.printf("start: rules rejected: %s: %v", p, err)
-		return exitRules
+		return d.startFail(exitRules, "start: rules rejected: %s: %v", p, err)
 	}
 	waf, err := newWAF(b)
 	if err != nil {
-		d.printf("start: rules build failed: %v", err)
-		return exitRules
+		return d.startFail(exitRules, "start: rules build failed: %v", err)
 	}
 	conn, err := peerConn(0)
 	if err != nil {
-		d.printf("start: peer conn: %v", err)
-		return exitPeer
+		return d.startFail(exitPeer, "start: peer conn: %v", err)
 	}
 	procs := runtime.GOMAXPROCS(0)
 	if procs > 0xffff {
@@ -93,14 +88,14 @@ func run(args []string) int {
 		memLimit: debug.SetMemoryLimit(-1), gomaxprocs: uint16(procs),
 	})
 	if err != nil {
-		d.printf("start: hello: %v", err)
-		return exitStartup
+		return d.startFail(exitStartup, "start: hello: %v", err)
 	}
 	return serve(conn, cfg.run, cfg.inc, h, waf.NewTransactionWithID, d, lostTimeout)
 }
 
 type config struct {
 	bundleDir string
+	tmpDir    string // checked: see checkTmpDir
 	run       uint64
 	inc       uint32
 	nonce     [16]byte
@@ -127,9 +122,11 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	if err := parseHex(getenv("TKV0_NONCE"), c.nonce[:]); err != nil {
 		return c, fmt.Errorf("TKV0_NONCE: %w", err)
 	}
-	if err := checkTmpDir(getenv("TMPDIR")); err != nil {
+	tmp := getenv("TMPDIR")
+	if err := checkTmpDir(tmp); err != nil {
 		return c, fmt.Errorf("TMPDIR: %w", err)
 	}
+	c.tmpDir = tmp
 	return c, nil
 }
 

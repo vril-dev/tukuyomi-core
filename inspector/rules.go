@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/corazawaf/coraza/v3"
@@ -50,28 +52,69 @@ SecRule ARGUMENTS_LIMIT_REACHED "!@eq 0" "id:4000002,phase:2,t:none,deny"
 SecRule URI_PARSE_ERROR "!@eq 0" "id:4000003,phase:2,t:none,deny"
 `
 
+// locateBudget bounds the search of failingFile. The process that starts the
+// inspector waits a limited time for the HELLO; a search that outlasts it would
+// end with the process killed, not with exit 11 and this diagnostic.
+const locateBudget = 2 * time.Second
+
 // newWAF builds the WAF from the bundle: the rule files of load in their
-// order, then the reserved directives. The rules get the files of the bundle as
-// their root (bundleFS): without a root Coraza reads files from the operating
-// system, and the root is set before any rule is read. Every rule file is read
-// through that root, one call each, so Coraza closes its continuation and
-// backtick state at the end of every file, as checkRules assumes. Coraza reads
-// the files while it builds the WAF only, so the bundle lets go of the bytes
-// when newWAF returns. A panic inside Coraza (SecRuleRemoveByMsg after a
-// SecMarker is one) becomes a fixed error, so the start fails for good with
-// exit 11 and not with the exit code 2 of a panic; the panic value is dropped.
-func newWAF(b *bundle) (waf coraza.WAF, err error) {
+// order, then the reserved directives. Coraza reads the files while it builds
+// the WAF only, so the bundle lets go of the bytes when newWAF returns. The
+// error of Coraza does not name a file, so when the build fails the error
+// starts with the path of the file that failingFile finds, if any.
+func newWAF(b *bundle) (coraza.WAF, error) {
+	defer func() { b.files = nil }()
+	waf, err := buildWAF(b.files, b.load)
+	if err != nil {
+		if p := failingFile(b.files, b.load, locateBudget); p != "" {
+			err = fmt.Errorf("%s: %w", p, err)
+		}
+		return nil, err
+	}
+	return waf, nil
+}
+
+// buildWAF builds the WAF from the files of load, in their order, then the
+// reserved directives. The rules get the files as their root (bundleFS):
+// without a root Coraza reads files from the operating system, and the root is
+// set before any rule is read. Every rule file is read through that root, one
+// call each, so Coraza closes its continuation and backtick state at the end of
+// every file, as checkRules assumes. A panic inside Coraza (SecRuleRemoveByMsg
+// after a SecMarker is one) becomes a fixed error, so the start fails for good
+// with exit 11 and not with the exit code 2 of a panic; the panic value is
+// dropped.
+func buildWAF(files map[string][]byte, load []string) (waf coraza.WAF, err error) {
 	defer func() {
-		b.files = nil
 		if recover() != nil {
 			waf, err = nil, errors.New("the rules made the WAF build panic")
 		}
 	}()
-	cfg := coraza.NewWAFConfig().WithRootFS(bundleFS{files: b.files})
-	for _, p := range b.load {
+	cfg := coraza.NewWAFConfig().WithRootFS(bundleFS{files: files})
+	for _, p := range load {
 		cfg = cfg.WithDirectivesFromFile(p)
 	}
 	return coraza.NewWAF(cfg.WithDirectives(reservedDirectives))
+}
+
+// failingFile returns the first file of load that makes the build fail: it
+// builds again with load[:i], from none to all, and the first build that fails
+// names load[i-1]. It returns "" when the build fails with no file (the
+// reserved directives alone, for example when TMPDIR cannot be written), when
+// every build succeeds, and when the search is not finished within budget.
+func failingFile(files map[string][]byte, load []string, budget time.Duration) string {
+	start := time.Now()
+	for i := 0; i <= len(load); i++ {
+		if time.Since(start) >= budget {
+			return ""
+		}
+		if _, err := buildWAF(files, load[:i]); err != nil {
+			if i == 0 {
+				return ""
+			}
+			return load[i-1]
+		}
+	}
+	return ""
 }
 
 // checkRules is the start-up guard for one rule file of the operator. A ctl

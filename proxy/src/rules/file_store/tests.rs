@@ -1,4 +1,5 @@
 use super::*;
+use crate::rules::bundle::BundlePath;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -205,6 +206,21 @@ fn a_fifo_as_the_record_is_refused_without_waiting_for_a_writer() {
 }
 
 #[test]
+fn a_file_is_read_only_if_it_is_the_one_that_was_looked_at() {
+    let root = scratch();
+    let path = root.path().join("input");
+    fs::write(&path, "x\n").unwrap();
+    let seen = fs::symlink_metadata(&path).unwrap();
+    let identity = (seen.dev(), seen.ino());
+    assert_eq!(read_regular(&path, 2, Some(identity)).unwrap(), b"x\n");
+    // Another inode on the same device is another file; so is the same inode number on another device.
+    for other in [(identity.0, identity.1 + 1), (identity.0 + 1, identity.1)] {
+        let e = read_regular(&path, 2, Some(other)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
+#[test]
 fn a_generation_directory_is_the_generation_below_the_generations_directory() {
     let root = scratch();
     let store = opened(root.path());
@@ -243,4 +259,218 @@ fn a_link_as_the_generation_is_not_a_real_directory() {
         refusal(store.generation_dir(generation())),
         "the generation is not a real directory"
     );
+}
+
+// ---- the write side ----
+
+fn bundle(files: &[(&str, &str)], load: &[&str]) -> Bundle {
+    let path = |text: &str| BundlePath::parse(text).unwrap();
+    let files = files
+        .iter()
+        .map(|(name, data)| (path(name), data.as_bytes().to_vec()))
+        .collect();
+    Bundle::new(files, load.iter().map(|name| path(name)).collect()).unwrap()
+}
+
+fn rules() -> Bundle {
+    bundle(
+        &[
+            ("crs/rules/a.conf", "SecRuleEngine On\n"),
+            ("crs/rules/a.data", "one\ntwo\n"),
+            ("rules/local.conf", "SecDebugLogLevel 0\n"),
+        ],
+        &["crs/rules/a.conf", "rules/local.conf"],
+    )
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().mode() & 0o7777
+}
+
+#[test]
+fn a_staged_bundle_becomes_a_generation_and_nothing_stays_staged() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let bundle = rules();
+    let staged = store.stage(&bundle).unwrap();
+    assert_eq!(staged.fingerprint, bundle.fingerprint());
+    assert_eq!(staged.dir.parent().unwrap(), root.path().join("staging"));
+    assert!(staged.dir.join("manifest.json").is_file());
+    assert_eq!(store.commit(), Ok(Committed::Created));
+
+    let generation = root
+        .path()
+        .join("generations")
+        .join(bundle.fingerprint().hex());
+    assert_eq!(
+        store.generation_dir(bundle.fingerprint()),
+        Ok(generation.clone())
+    );
+    assert_eq!(
+        fs::read(generation.join("manifest.json")).unwrap(),
+        bundle.manifest()
+    );
+    assert_eq!(
+        fs::read(generation.join("crs/rules/a.data")).unwrap(),
+        b"one\ntwo\n"
+    );
+    assert_eq!(mode(&generation), 0o700);
+    assert_eq!(mode(&generation.join("crs/rules")), 0o700);
+    assert_eq!(mode(&generation.join("manifest.json")), 0o600);
+    assert_eq!(mode(&generation.join("crs/rules/a.conf")), 0o600);
+    assert!(names(&root.path().join("staging")).is_empty());
+    assert_eq!(store.verify(bundle.fingerprint()), Ok(()));
+    // Making a generation does not choose it.
+    assert_eq!(store.current(), Ok(None));
+    let listed = store.list().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].fingerprint, bundle.fingerprint());
+}
+
+#[test]
+fn the_same_bundle_again_is_kept_and_a_broken_generation_is_made_again() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let bundle = rules();
+    store.stage(&bundle).unwrap();
+    assert_eq!(store.commit(), Ok(Committed::Created));
+    store.stage(&bundle).unwrap();
+    assert_eq!(store.commit(), Ok(Committed::Existing));
+    assert!(names(&root.path().join("staging")).is_empty());
+
+    // A file that is not as the manifest says: the next import makes the generation again.
+    let generation = root
+        .path()
+        .join("generations")
+        .join(bundle.fingerprint().hex());
+    fs::write(generation.join("rules/local.conf"), "SecDebugLogLevel 9\n").unwrap();
+    assert_eq!(
+        refusal(store.verify(bundle.fingerprint())),
+        "a file of the generation differs from its manifest"
+    );
+    store.stage(&bundle).unwrap();
+    assert_eq!(store.commit(), Ok(Committed::Repaired));
+    assert_eq!(store.verify(bundle.fingerprint()), Ok(()));
+    assert_eq!(
+        fs::read(generation.join("rules/local.conf")).unwrap(),
+        b"SecDebugLogLevel 0\n"
+    );
+    assert!(names(&root.path().join("staging")).is_empty());
+    assert_eq!(store.list().unwrap().len(), 1);
+}
+
+#[test]
+fn one_command_at_a_time_changes_the_store() {
+    let root = scratch();
+    let (mut first, mut second) = (opened(root.path()), opened(root.path()));
+    let bundle = rules();
+    first.stage(&bundle).unwrap();
+    let busy = "the rules store is in use by another command";
+    assert_eq!(refusal(second.stage(&bundle)), busy);
+    assert_eq!(refusal(second.activate(bundle.fingerprint())), busy);
+    // Reading does not need the lock.
+    assert_eq!(second.list(), Ok(Vec::new()));
+    assert_eq!(refusal(first.stage(&bundle)), "a bundle is staged already");
+    first.discard().unwrap();
+    assert!(names(&root.path().join("staging")).is_empty());
+    second.stage(&bundle).unwrap();
+    assert_eq!(second.commit(), Ok(Committed::Created));
+    assert_eq!(refusal(second.commit()), "no bundle is staged");
+}
+
+#[test]
+fn activate_verifies_the_generation_before_it_replaces_the_record() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let bundle = rules();
+    let other = Fingerprint::from_hex(HEX.as_bytes()).unwrap();
+    assert_eq!(
+        refusal(store.activate(other)),
+        "the generations directory is not a real directory"
+    );
+    store.stage(&bundle).unwrap();
+    store.commit().unwrap();
+    assert_eq!(
+        refusal(store.activate(other)),
+        "the generation is not a real directory"
+    );
+
+    // A `current.new` that was left behind, also a link, is replaced.
+    let target = root.path().join("record");
+    fs::write(&target, "x").unwrap();
+    symlink(&target, root.path().join("current.new")).unwrap();
+    assert_eq!(store.activate(bundle.fingerprint()), Ok(()));
+    assert_eq!(store.current(), Ok(Some(bundle.fingerprint())));
+    let record = fs::read(root.path().join("current")).unwrap();
+    assert_eq!(
+        record,
+        format!("{}\n", bundle.fingerprint().hex()).as_bytes()
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"x");
+    assert!(!root.path().join("current.new").exists());
+
+    // A generation that is broken is not chosen, and the record stays.
+    let generation = root
+        .path()
+        .join("generations")
+        .join(bundle.fingerprint().hex());
+    fs::write(generation.join("crs/rules/a.data"), "three\n").unwrap();
+    let before = fs::read(root.path().join("current")).unwrap();
+    assert_eq!(
+        refusal(store.activate(bundle.fingerprint())),
+        "a file of the generation differs from its manifest"
+    );
+    assert_eq!(fs::read(root.path().join("current")).unwrap(), before);
+}
+
+#[test]
+fn a_stage_removes_only_the_old_bundles_of_the_right_name_and_kind() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    store.stage(&rules()).unwrap();
+    store.discard().unwrap();
+    let staging = root.path().join("staging");
+    let (old, other, link) = ("0".repeat(32), "not-ours".to_owned(), "1".repeat(32));
+    make_dir(&staging.join(&old));
+    fs::write(staging.join(&old).join("file"), "x").unwrap();
+    make_dir(&staging.join(&other));
+    symlink(root.path(), staging.join(&link)).unwrap();
+    store.stage(&rules()).unwrap();
+    let mut left = names(&staging);
+    left.retain(|name| *name != store_stage_name(&store));
+    assert_eq!(left, [link, other]);
+    assert!(root.path().join("lock").is_file());
+    store.discard().unwrap();
+}
+
+/// The name of the bundle that is staged now.
+fn store_stage_name(store: &FileStore) -> String {
+    let import = store.import.as_ref().unwrap();
+    import.dir.file_name().unwrap().to_str().unwrap().to_owned()
+}
+
+#[test]
+fn only_a_real_directory_under_a_fingerprint_is_a_generation() {
+    let root = scratch();
+    let store = opened(root.path());
+    let generations = root.path().join("generations");
+    make_dir(&generations);
+    make_dir(&generations.join(HEX));
+    make_dir(&generations.join("not-a-fingerprint"));
+    fs::write(generations.join("1".repeat(64)), "x").unwrap();
+    let listed = store.list().unwrap();
+    assert_eq!(
+        listed.iter().map(|g| g.fingerprint).collect::<Vec<_>>(),
+        [generation()]
+    );
+    assert!(listed[0].made > 0);
 }

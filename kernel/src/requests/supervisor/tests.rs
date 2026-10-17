@@ -594,6 +594,41 @@ fn a_tmp_root_that_does_not_exist_ends_the_supervisor_at_the_first_start() {
     assert_eq!(sd.phase, st.phase);
 }
 
+/// An inspector that refuses its rules says why in `start-failure` and exits 11: the supervisor fails for good and
+/// hands the line over, as it was written. The stand-in is a script run by `/bin/sh`.
+#[test]
+fn a_refusing_inspector_leaves_its_line_as_the_start_detail() {
+    let root = TempRoot::under(&std::env::temp_dir());
+    let fixtures = TempRoot::under(&std::env::temp_dir());
+    let script = fixtures.path().join("inspector.sh");
+    fs::write(
+        &script,
+        "printf 'tkv0-inspector: start: rules: x\\n' > \"$TMPDIR/start-failure\"\nexit 11\n",
+    )
+    .unwrap();
+    let mut c = cfg();
+    c.inspector = PathBuf::from("/bin/sh");
+    c.rules = script.clone();
+    c.tmp_root = root.path().to_path_buf();
+    c.restarts = 0;
+    let mut s = Supervisor::new(c).unwrap();
+    assert_eq!(s.start_detail(), None);
+    let guard = within(30);
+    while !matches!(s.status().phase, Phase::Failed(_)) {
+        assert!(Instant::now() < guard, "no failure: {:?}", s.status());
+        s.poll(soon());
+    }
+    assert_eq!(s.status().phase, Phase::Failed(Failure::Exit(11)));
+    let line = b"tkv0-inspector: start: rules: x\n".to_vec();
+    assert_eq!(s.start_detail(), Some(line.clone()));
+    // The detail stays after the shutdown, and nothing is left in the root.
+    let sd = s.shutdown(within(10));
+    assert!(sd.exit_confirmed && sd.dir_removed, "{sd:?}");
+    assert_eq!(s.start_detail(), Some(line));
+    assert_eq!(root.entries(), 0);
+    fs::remove_file(&script).unwrap();
+}
+
 fn past() -> Instant {
     Instant::now().checked_sub(MS).unwrap()
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -122,11 +123,17 @@ func TestDiag(t *testing.T) {
 	d := &diag{w: &b}
 	d.printf("a\nb\x00c\\%s", strings.Repeat("x", 2000))
 	line := b.String()
-	if strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") || strings.ContainsRune(line[:len(line)-1], 0) || len(line) > maxDiagLine+8 {
+	if strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") || strings.ContainsRune(line[:len(line)-1], 0) || len(line) != maxDiagLine {
 		t.Fatalf("line %q", line)
 	}
 	if !strings.Contains(line, `a\x0ab\x00c\x5c`) {
 		t.Fatalf("escaping %q", line[:40])
+	}
+	// The cut falls before an escape that does not fit, never inside it.
+	b.Reset()
+	d.printf("%s\x01\x01", strings.Repeat("x", 493))
+	if line = b.String(); len(line) != 510 || !strings.HasSuffix(line, "x\n") {
+		t.Fatalf("line %q", line)
 	}
 	ew := &errWriter{}
 	d = &diag{w: ew}
@@ -135,6 +142,36 @@ func TestDiag(t *testing.T) {
 	d.printf("three")
 	if ew.calls != 1 || !d.broken || d.dropped != 3 {
 		t.Fatalf("calls %d broken %v dropped %d", ew.calls, d.broken, d.dropped)
+	}
+}
+
+// start-failure is created once, with mode 0600, and a link in its place is not
+// followed.
+func TestWriteStartFailure(t *testing.T) {
+	line := diagLine("start: %s", "rules\n")
+	dir := t.TempDir()
+	if err := writeStartFailure(dir, line); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, startFailureName)
+	got, err := os.ReadFile(p)
+	st, serr := os.Stat(p)
+	if err != nil || serr != nil || !bytes.Equal(got, line) || st.Mode().Perm() != 0o600 {
+		t.Fatalf("file %q (%v, %v)", got, err, serr)
+	}
+	if err := writeStartFailure(dir, line); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("second write: %v", err)
+	}
+	dir = t.TempDir()
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.Symlink(victim, filepath.Join(dir, startFailureName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeStartFailure(dir, line); err == nil {
+		t.Fatal("wrote through a link")
+	}
+	if _, err := os.Lstat(victim); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the target of the link: %v", err)
 	}
 }
 

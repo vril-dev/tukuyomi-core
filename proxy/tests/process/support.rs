@@ -61,6 +61,14 @@ pub(crate) fn generation() -> String {
     parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256"))
 }
 
+/// The rule file of the test rules, which `rules import` takes as `--rules`: the bundle of the test rules has this one
+/// file, so the generation that the import makes is the one that `generation` names.
+pub(crate) fn rules_file() -> PathBuf {
+    Path::new(&var("TUKUYOMI_TEST_RULES"))
+        .join("rules")
+        .join("basic.conf")
+}
+
 /// The directory of that generation, in the store of the test root `root`.
 pub(crate) fn generation_dir(root: &Path) -> PathBuf {
     root.join(STORE).join("generations").join(generation())

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/corazawaf/coraza/v3"
 	"github.com/corazawaf/coraza/v3/types"
@@ -132,8 +133,43 @@ func TestNewWAFReadsBundleData(t *testing.T) {
 func TestNewWAFPanicIsError(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	waf, err := newWAF(ruleBundle("SecMarker X\nSecRuleRemoveByMsg x\n"))
-	if waf != nil || err == nil || err.Error() != "the rules made the WAF build panic" {
+	if waf != nil || err == nil || err.Error() != ruleFile+": the rules made the WAF build panic" {
 		t.Fatalf("%v %v", waf, err)
+	}
+}
+
+// The error of Coraza does not name a file, so newWAF finds the first file
+// after which the build fails: the third one here, whose rule repeats the id of
+// the first (it is bad only with the files before it). The fourth is never
+// reached. A build that fails with no file at all names none, and so does a
+// search that has no time left.
+func TestFailingFile(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	rule := func(id int) string { return fmt.Sprintf("SecAction \"id:%d,phase:1,pass\"\n", id) }
+	files := map[string]string{"rules/a.conf": rule(1), "rules/b.conf": rule(2), "rules/c.conf": rule(1), "rules/d.conf": "SecNoSuchDirective 1\n"}
+	load := []string{"rules/a.conf", "rules/b.conf", "rules/c.conf", "rules/d.conf"}
+	b := testBundle(files, load...)
+	if p := failingFile(b.files, b.load, time.Minute); p != "rules/c.conf" {
+		t.Fatalf("failing file %q", p)
+	}
+	if p := failingFile(b.files, b.load, 0); p != "" {
+		t.Fatalf("with no time left: %q", p)
+	}
+	if _, err := newWAF(b); err == nil || !strings.HasPrefix(err.Error(), "rules/c.conf: ") {
+		t.Fatalf("newWAF: %v", err)
+	}
+	ro := filepath.Join(t.TempDir(), "ro")
+	if err := os.Mkdir(ro, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(ro, 0o700) })
+	t.Setenv("TMPDIR", ro)
+	b = testBundle(files, load...)
+	if _, err := buildWAF(b.files, nil); err == nil {
+		t.Fatal("the reserved directives build with an unwritable TMPDIR")
+	}
+	if p := failingFile(b.files, b.load, time.Minute); p != "" {
+		t.Fatalf("an unwritable TMPDIR blamed %q", p)
 	}
 }
 
