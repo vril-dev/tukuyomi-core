@@ -35,7 +35,7 @@ use tokio::time::{Instant, Sleep, sleep, timeout_at};
 use tukuyomi_kernel::{Failure, Phase};
 use tukuyomi_proxy::config::{self, Loaded, ProxyConfig};
 use tukuyomi_proxy::host;
-use tukuyomi_proxy::inbound::front::{self, Ctx};
+use tukuyomi_proxy::inbound::conn::{self, Ctx};
 use tukuyomi_proxy::inspect::driver::{self, Driver, End, Msg};
 use tukuyomi_proxy::log::{self, Log};
 
@@ -222,7 +222,7 @@ fn spawn_connection(
     let ingress = ingress.clone();
     conns.spawn(async move {
         let _permit = permit;
-        front::serve(sock, peer, local, ctx, ingress).await;
+        conn::serve(sock, peer, local, ctx, ingress).await;
     });
 }
 

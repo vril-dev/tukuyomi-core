@@ -271,7 +271,7 @@ func (c *capture) none(t *testing.T, d time.Duration) {
 // Close, no call between ProcessLogging and Close, exactly one ProcessLogging
 // before Close, every call from the goroutine that made the fake (the harness
 // calls adopt where the inspector makes it; a fake without adopt, as in
-// main_test.go, is bound to the goroutine of its first call), and no
+// link_test.go, is bound to the goroutine of its first call), and no
 // overlapping calls. Only a fake made through the harness is checked at the
 // end. The mutex makes these fields race-free; -race does not judge the
 // ownership itself.
