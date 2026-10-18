@@ -81,6 +81,69 @@ fn the_mode_of_the_inputs_is_the_mode_of_the_bundle() {
 }
 
 #[test]
+fn the_routes_of_the_inputs_go_into_the_manifest_in_the_order_they_are_written() {
+    let root = scratch();
+    let file = root.put("mine/a.conf", b"a\n");
+    let none = Manifest::parse(collect(&rules_only(file.clone())).unwrap().manifest()).unwrap();
+    assert!(none.routes().is_empty());
+    let text =
+        br#"[{"path":"/b/","action":"bypass"},{"host":"h.test","path":"/a","action":"bypass"}]"#;
+    let inputs = Inputs {
+        routes: Some(root.put("mine/routes.json", text)),
+        ..rules_only(file)
+    };
+    let bundle = collect(&inputs).unwrap();
+    let manifest = Manifest::parse(bundle.manifest()).unwrap();
+    let listed: Vec<_> = manifest
+        .routes()
+        .as_slice()
+        .iter()
+        .map(|route| (route.host(), route.path()))
+        .collect();
+    assert_eq!(listed, [(None, "/b/"), (Some("h.test"), "/a")]);
+    assert!(
+        bundle
+            .manifest()
+            .starts_with(br#"{"version":3,"mode":"block","#)
+    );
+}
+
+#[test]
+fn a_routes_file_that_is_refused_names_the_file_and_the_reason() {
+    let root = scratch();
+    let file = root.put("mine/a.conf", b"a\n");
+    let cases = [
+        ("[]", "the routes file has no route"),
+        (
+            r#"[{"path":"/","action":"bypass"}]"#,
+            "a route path of / alone would skip the inspection of every request",
+        ),
+        (
+            "not json",
+            "the routes file is not a JSON array of routes of the expected form",
+        ),
+    ];
+    for (text, reason) in cases {
+        let routes = root.put("mine/routes.json", text.as_bytes());
+        let inputs = Inputs {
+            routes: Some(routes.clone()),
+            ..rules_only(file.clone())
+        };
+        let refused = collect(&inputs).unwrap_err();
+        assert_eq!(refused.reason, reason, "{text}");
+        assert_eq!(refused.subject, Some(routes.into_os_string()));
+    }
+    let inputs = Inputs {
+        routes: Some(root.path().join("mine/missing.json")),
+        ..rules_only(file)
+    };
+    assert_eq!(
+        collect(&inputs).unwrap_err().reason,
+        "an input file does not exist"
+    );
+}
+
+#[test]
 fn the_bundle_has_the_crs_and_the_operator_files_in_the_load_order() {
     let root = scratch();
     let inputs = Inputs {

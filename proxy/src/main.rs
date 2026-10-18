@@ -4,8 +4,8 @@
 //! starts.
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration
-//! file), the host checks, the configuration, the rules store (the chosen generation, the hold on it, its
-//! directory and mode, and with them the kernel configuration), the runtime and the signal handlers, the driver
+//! file), the host checks, the configuration, the rules store (the chosen generation, the hold on it, its directory,
+//! mode and routes, and with them the kernel configuration), the runtime and the signal handlers, the driver
 //! thread, the wait for the kernel to be ready, bind, accept. The rules store is read here, and again when SIGUSR1
 //! comes. Handlers exist for SIGTERM, SIGINT, SIGHUP and SIGUSR1 only and are installed before the kernel starts
 //! its child process; SIGCHLD is never handled. The listener is bound only after the kernel is ready, and a
@@ -50,6 +50,7 @@ use tukuyomi_proxy::inspect::driver::{self, Driver, End, Limits, Msg, Switch, Sw
 use tukuyomi_proxy::log::{self, Log};
 use tukuyomi_proxy::rules::bundle::{Fingerprint, Mode};
 use tukuyomi_proxy::rules::command;
+use tukuyomi_proxy::rules::routes::{Routes, SharedRoutes};
 use tukuyomi_proxy::rules::store;
 use tukuyomi_proxy::rules::switch::{Next, Switcher};
 
@@ -155,6 +156,13 @@ fn start(log: &Log) -> u8 {
             return EXIT_FAILED;
         }
     };
+    let routes = match rules.routes(generation) {
+        Ok(routes) => routes,
+        Err(e) => {
+            log.line(&format!("start: rules store refused: {}", e.0));
+            return EXIT_FAILED;
+        }
+    };
     let kernel = match loaded.kernel.for_generation(dir, generation) {
         Ok(kernel) => kernel,
         Err(e) => {
@@ -164,6 +172,7 @@ fn start(log: &Log) -> u8 {
     };
     log.line(&format!("start: rules generation {}", generation.hex()));
     log.line(&format!("start: rules mode {}", mode.name()));
+    log.line(&format!("start: rules routes {}", routes.len()));
     let switcher = Switcher::new(rules, loaded.kernel, generation, hold);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -180,6 +189,7 @@ fn start(log: &Log) -> u8 {
         kernel,
         generation,
         mode,
+        routes,
         switcher,
         log.clone(),
     ))
@@ -192,6 +202,7 @@ async fn run(
     kernel: tukuyomi_kernel::Config,
     generation: Fingerprint,
     mode: Mode,
+    routes: Routes,
     mut switcher: Switcher,
     log: Log,
 ) -> u8 {
@@ -209,7 +220,17 @@ async fn run(
         ready_wait: proxy.ready_wait,
         stop_inspect: proxy.stop_inspect,
     };
-    let driver = match driver::start(kernel, generation, mode, limits, log.clone()) {
+    // The connections read the routes of the generation that serves, and the driver replaces them when another
+    // generation takes over.
+    let routes = SharedRoutes::new(routes);
+    let driver = match driver::start(
+        kernel,
+        generation,
+        mode,
+        routes.clone(),
+        limits,
+        log.clone(),
+    ) {
         Ok(driver) => driver,
         Err(text) => {
             log.line(&format!("start: cannot start the driver: {text}"));
@@ -228,6 +249,7 @@ async fn run(
         &proxy,
         wait_queue,
         &ingress,
+        &routes,
         &mut switcher,
         &log,
     )
@@ -241,6 +263,7 @@ async fn until_stop(
     proxy: &ProxyConfig,
     wait_queue: usize,
     ingress: &SyncSender<Msg>,
+    routes: &SharedRoutes,
     switcher: &mut Switcher,
     log: &Log,
 ) -> Cause {
@@ -268,6 +291,7 @@ async fn until_stop(
         cfg: proxy.clone(),
         budget: Arc::new(Semaphore::new(proxy.max_buffered_bytes)),
         inspect: Arc::new(Semaphore::new(wait_queue)),
+        routes: routes.clone(),
         log: log.clone(),
     });
     let permits = Arc::new(Semaphore::new(proxy.max_conns));
@@ -307,14 +331,17 @@ fn reload(waits: &mut Waits, switcher: &mut Switcher, ingress: &SyncSender<Msg>,
         Next::Ready {
             generation,
             mode,
+            routes,
             kernel,
         } => {
             log.line(&format!("reload: starting generation {}", generation.hex()));
             log.line(&format!("reload: rules mode {}", mode.name()));
+            log.line(&format!("reload: rules routes {}", routes.len()));
             let (reply, told) = oneshot::channel();
             let order = Msg::Switch(Switch {
                 generation,
                 mode,
+                routes,
                 kernel: *kernel,
                 reply,
             });

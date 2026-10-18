@@ -2,7 +2,8 @@
 //!
 //! A connection hands a `Ticket` over one bounded channel and waits on the reply slot of the ticket. The driver
 //! submits the ticket to the kernel, keeps it until the kernel's result for it comes out, and then answers on the
-//! reply slot. Nothing is shared with the connections besides the channels: no lock, no shared state.
+//! reply slot. Besides the channels, the driver shares one thing with the connections: the table of the routes
+//! (`SharedRoutes`), which the connections read and the driver replaces.
 //!
 //! The driver thread repeats one round. It takes in new tickets (at most one more than the waiting queue holds,
 //! so a round always goes on to the next steps), calls `cancel` once for every ticket whose connection went away,
@@ -29,6 +30,12 @@
 //! Each slot keeps the mode of its generation. A generation that blocks never has a request that is only detected,
 //! so a `Detected` that its kernel gives is not believed: the ticket is answered with `Uninspectable`, and the
 //! first time it happens in a slot the driver records one line.
+//!
+//! The routes of the generation that serves are not kept by the slots. A connection matches its request against the
+//! shared table before it makes a ticket, so a request that a route matches never reaches the driver, and nothing
+//! the kernel does or fails to do has a part in it. The driver replaces the table at the moment it makes a new
+//! generation the one that serves (the routes come with the switch message), so the table and the generation that
+//! inspects change together. A switch that fails leaves the table as it is.
 
 use std::mem;
 use std::net::SocketAddr;
@@ -46,6 +53,7 @@ use tukuyomi_kernel::{
 use crate::inspect::slot::{Retired, Retirement, Slot};
 use crate::log::{Log, escaped};
 use crate::rules::bundle::{self, Fingerprint};
+use crate::rules::routes::{Routes, SharedRoutes};
 
 /// The shortest slice of one kernel step. A shorter one would end a step before it could read anything.
 const MIN_SLICE: Duration = Duration::from_millis(1);
@@ -119,6 +127,9 @@ pub struct Switch {
     pub generation: Fingerprint,
     /// What the rules of the generation do to a request they match.
     pub mode: bundle::Mode,
+    /// The requests of the generation that skip the inspection. They are the shared table from the moment the
+    /// generation serves.
+    pub routes: Routes,
     pub kernel: tukuyomi_kernel::Config,
     /// How the switch ended. It is given once, when the kernel that was stopped is gone.
     pub reply: oneshot::Sender<Switched>,
@@ -165,12 +176,14 @@ pub struct Limits {
 
 /// Starts the driver thread and returns at once, without waiting for the kernel to be ready. `Err` means only
 /// that the thread could not be created. The kernel is created on the thread; a configuration it refuses ends
-/// the driver with `End::Fatal`. `generation` names the rules that `cfg` is for, and `mode` is what they do to a
-/// request they match.
+/// the driver with `End::Fatal`. `generation` names the rules that `cfg` is for, `mode` is what they do to a
+/// request they match, and `routes` is the shared table of the requests that skip the inspection, which holds the
+/// routes of `generation` already and which the driver replaces when another generation serves.
 pub fn start(
     cfg: tukuyomi_kernel::Config,
     generation: Fingerprint,
     mode: bundle::Mode,
+    routes: SharedRoutes,
     limits: Limits,
     log: Log,
 ) -> Result<Driver, &'static str> {
@@ -192,7 +205,7 @@ pub fn start(
                     failed: failed_tx,
                 };
                 let slot = Slot::new(generation, mode, kernel);
-                Core::new(slot, rx, signals, log, limits, tick, take).drive(end_tx);
+                Core::new(slot, routes, rx, signals, log, limits, tick, take).drive(end_tx);
             }
             Err(refused) => {
                 let _ = end_tx.send(End::Fatal(refused.0));
@@ -329,6 +342,8 @@ enum Switching<K> {
     Starting {
         next: Slot<K>,
         ready_by: Instant,
+        /// The routes of `next`: they become the shared table when it serves.
+        routes: Routes,
     },
     /// The new kernel serves. The old one finishes the requests it holds, until `drain_by`.
     Draining {
@@ -347,6 +362,8 @@ struct Core<K> {
     rx: Receiver<Msg>,
     /// The kernel that new tickets go to.
     active: Slot<K>,
+    /// The routes of the generation of `active`, which the connections read.
+    routes: SharedRoutes,
     switching: Switching<K>,
     /// Where to tell the main thread how the switch ended.
     reply: Option<oneshot::Sender<Switched>>,
@@ -366,8 +383,11 @@ struct Core<K> {
 }
 
 impl<K: Kernel> Core<K> {
+    // One argument for each part of the state of the driver; a struct of them would only repeat the fields of `Core`.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         active: Slot<K>,
+        routes: SharedRoutes,
         rx: Receiver<Msg>,
         signals: Signals,
         log: Log,
@@ -378,6 +398,7 @@ impl<K: Kernel> Core<K> {
         Core {
             rx,
             active,
+            routes,
             switching: Switching::Idle,
             reply: None,
             mode: Mode::Run,
@@ -488,6 +509,7 @@ impl<K: Kernel> Core<K> {
         let Switch {
             generation,
             mode,
+            routes,
             kernel,
             reply,
         } = switch;
@@ -500,6 +522,7 @@ impl<K: Kernel> Core<K> {
                 self.switching = Switching::Starting {
                     next: Slot::new(generation, mode, kernel),
                     ready_by: after(Instant::now(), self.limits.ready_wait),
+                    routes,
                 };
                 self.reply = Some(reply);
             }
@@ -618,7 +641,11 @@ impl<K: Kernel> Core<K> {
         let now = Instant::now();
         match mem::replace(&mut self.switching, Switching::Idle) {
             Switching::Idle => {}
-            Switching::Starting { next, ready_by } => self.advance_starting(next, ready_by, now),
+            Switching::Starting {
+                next,
+                ready_by,
+                routes,
+            } => self.advance_starting(next, ready_by, routes, now),
             Switching::Draining { old, drain_by } => {
                 if old.pending.is_empty() || now >= drain_by {
                     // A kernel that still holds requests is out of time: it is stopped at once, and `shutdown`
@@ -649,9 +676,9 @@ impl<K: Kernel> Core<K> {
         Ok(())
     }
 
-    /// The new kernel that was stepped in this round: serving from now on if it is ready, stopped if it failed
-    /// or is late.
-    fn advance_starting(&mut self, next: Slot<K>, ready_by: Instant, now: Instant) {
+    /// The new kernel that was stepped in this round: serving from now on if it is ready, with its `routes` as the
+    /// shared table, stopped if it failed or is late, and then the table stays as it is.
+    fn advance_starting(&mut self, next: Slot<K>, ready_by: Instant, routes: Routes, now: Instant) {
         let serving_failed = matches!(self.active.status().phase, Phase::Failed(_));
         match next.status().phase {
             // The kernel that serves failed in this round: the proxy stops, and does not hurry to the new one.
@@ -661,13 +688,20 @@ impl<K: Kernel> Core<K> {
                     next.generation.hex()
                 ));
                 let old = mem::replace(&mut self.active, next);
+                self.routes.replace(routes);
                 self.switching = Switching::Draining {
                     old,
                     drain_by: after(now, self.limits.stop_inspect),
                 };
             }
             // Ready, but the kernel that serves failed: the stop that follows retires it.
-            Phase::Ready => self.switching = Switching::Starting { next, ready_by },
+            Phase::Ready => {
+                self.switching = Switching::Starting {
+                    next,
+                    ready_by,
+                    routes,
+                }
+            }
             Phase::Failed(why) => {
                 self.failed_to_start(&next, &format!("{why:?}"));
                 self.retire(next, after(now, self.limits.stop_inspect), Switched::No);
@@ -676,7 +710,13 @@ impl<K: Kernel> Core<K> {
                 self.failed_to_start(&next, "not ready in time");
                 self.retire(next, after(now, self.limits.stop_inspect), Switched::No);
             }
-            _ => self.switching = Switching::Starting { next, ready_by },
+            _ => {
+                self.switching = Switching::Starting {
+                    next,
+                    ready_by,
+                    routes,
+                }
+            }
         }
     }
 

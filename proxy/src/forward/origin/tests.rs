@@ -12,6 +12,7 @@ use tokio::time::{sleep, timeout};
 use super::*;
 use crate::config::ProxyConfig;
 use crate::log::start_logger;
+use crate::rules::routes::{Routes, SharedRoutes};
 
 const BUDGET: usize = 4 << 20;
 const PEER: &str = "203.0.113.9:5555";
@@ -50,6 +51,7 @@ fn ctx(cfg: ProxyConfig) -> Ctx {
     Ctx {
         budget: Arc::new(Semaphore::new(cfg.max_buffered_bytes)),
         inspect: Arc::new(Semaphore::new(1)),
+        routes: SharedRoutes::new(Routes::default()),
         log: start_logger().unwrap(),
         cfg,
     }

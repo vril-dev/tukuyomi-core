@@ -2,6 +2,7 @@ use super::*;
 use crate::config;
 use crate::rules::bundle::{Bundle, BundlePath, Mode};
 use crate::rules::file_store::FileStore;
+use crate::rules::routes::{Route, Routes};
 use crate::rules::store::StoreError;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -37,6 +38,7 @@ fn bundle(name: &str) -> Bundle {
         Mode::Block,
         vec![(path.clone(), format!("SecRuleEngine {name}\n").into_bytes())],
         vec![path],
+        Routes::default(),
     )
     .unwrap()
 }
@@ -88,12 +90,14 @@ fn the_chosen_generation_is_held_until_the_switch_is_finished() {
     let Next::Ready {
         generation,
         mode,
+        routes,
         kernel,
     } = switcher.prepare()
     else {
         panic!("the chosen generation was not prepared");
     };
     assert_eq!((generation, mode), (b, Mode::Block));
+    assert!(routes.is_empty());
     let kernel = *kernel;
     assert_eq!(kernel.rules, root.0.join("generations").join(b.hex()));
     assert_eq!(kernel.rules_sha256, b.bytes());
@@ -116,21 +120,22 @@ fn the_chosen_generation_is_held_until_the_switch_is_finished() {
 }
 
 #[test]
-fn the_mode_of_the_generation_comes_with_the_switch_and_a_manifest_that_cannot_be_read_refuses_it()
-{
+fn the_mode_and_the_routes_of_the_generation_come_with_the_switch_and_a_manifest_that_cannot_be_read_refuses_it()
+ {
     let root = scratch();
     let (mut commands, made) = made_in(&root.0, &["a"]);
     let path = BundlePath::parse("rules/d.conf").unwrap();
     let files = vec![(path.clone(), b"SecRuleEngine d\n".to_vec())];
-    let detect = Bundle::new(Mode::Detect, files, vec![path]).unwrap();
+    let table = Routes::new(vec![Route::new(Some("example.test"), "/static/").unwrap()]).unwrap();
+    let detect = Bundle::new(Mode::Detect, files, vec![path], table.clone()).unwrap();
     commands.stage(&detect).unwrap();
     commands.commit().unwrap();
     commands.activate(detect.fingerprint()).unwrap();
     let mut switcher = switcher(&root.0, made[0]);
-    let Next::Ready { mode, .. } = switcher.prepare() else {
+    let Next::Ready { mode, routes, .. } = switcher.prepare() else {
         panic!("the chosen generation was not prepared");
     };
-    assert_eq!(mode, Mode::Detect);
+    assert_eq!((mode, routes), (Mode::Detect, table));
     switcher.finish(false);
 
     let manifest = root

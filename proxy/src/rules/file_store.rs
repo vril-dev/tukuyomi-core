@@ -31,6 +31,7 @@ use crate::host;
 use crate::rules::bundle::{
     Bundle, Fingerprint, MANIFEST_NAME, MAX_MANIFEST_BYTES, Manifest, Mode, sha256,
 };
+use crate::rules::routes::Routes;
 use crate::rules::store::{Committed, Generation, Hold, RuleStore, Staged, StoreError};
 
 /// `O_NOFOLLOW` of Linux, which std has no name for. x86_64: the UAPI header `asm-generic/fcntl.h` (and Go's
@@ -345,6 +346,11 @@ impl RuleStore for FileStore {
     fn mode(&self, generation: Fingerprint) -> Result<Mode, StoreError> {
         let dir = self.generation_dir(generation)?;
         Ok(read_manifest(&dir, generation)?.mode())
+    }
+
+    fn routes(&self, generation: Fingerprint) -> Result<Routes, StoreError> {
+        let dir = self.generation_dir(generation)?;
+        Ok(read_manifest(&dir, generation)?.routes().clone())
     }
 
     fn hold(&self, generation: Fingerprint) -> Result<Hold, StoreError> {

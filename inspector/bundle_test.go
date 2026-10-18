@@ -49,7 +49,7 @@ func TestParseManifest(t *testing.T) {
 		{"version 2 without the mode", strings.Replace(base, `"version":1`, `"version":2`, 1), canonical},
 		{"version 1 with the mode", strings.Replace(detect, `"version":2`, `"version":1`, 1), canonical},
 		{"mode block", strings.Replace(detect, `"detect"`, `"block"`, 1), canonical},
-		{"version 3", strings.Replace(base, `"version":1`, `"version":3`, 1), "version is not 1 or 2"},
+		{"version 4", strings.Replace(base, `"version":1`, `"version":4`, 1), "version is not 1, 2 or 3"},
 		{"dot dot component", canon(oneFile("rules/../a.conf", 3), "rules/../a.conf"), "a path is malformed"},
 		{"paths out of order", canon([]manifestFile{{Path: "rules/b.conf", Size: 3, SHA256: sumABC}, {Path: a, Size: 3, SHA256: sumABC}}, a), "strictly increasing"},
 		{"size 2 MiB + 1", canon(oneFile(a, maxFileBytes+1), a), "a size is out of range"},
@@ -68,14 +68,17 @@ func TestParseManifest(t *testing.T) {
 // The golden files are the forms that the writer of a manifest has to produce:
 // each is read, written again to the same bytes, and has the sha256 of its
 // file. The one of version 2 is the one of version 1 with the mode, and a
-// variant of it is refused: another mode, or the keys in another order.
+// variant of it is refused: another mode, or the keys in another order. The
+// one of version 3 is the one of version 1 with the mode and two routes.
 func TestManifestGolden(t *testing.T) {
 	for _, g := range []struct {
 		file    string
 		version int
+		routes  int
 	}{
-		{"testdata/manifest-v1-golden.json", versionBlock},
-		{"testdata/manifest-v2-golden.json", versionDetect},
+		{"testdata/manifest-v1-golden.json", versionBlock, 0},
+		{"testdata/manifest-v2-golden.json", versionDetect, 0},
+		{"testdata/manifest-v3-golden.json", versionRoutes, 2},
 	} {
 		t.Run(g.file, func(t *testing.T) {
 			b, err := os.ReadFile(g.file)
@@ -89,8 +92,8 @@ func TestManifestGolden(t *testing.T) {
 			if !bytes.Equal(m.encode(), b) {
 				t.Fatalf("written again: %q", m.encode())
 			}
-			if m.Version != g.version || len(m.Files) != 10 || len(m.Load) != 7 {
-				t.Fatalf("version %d, %d files, %d in load", m.Version, len(m.Files), len(m.Load))
+			if m.Version != g.version || len(m.Files) != 10 || len(m.Load) != 7 || len(m.Routes) != g.routes {
+				t.Fatalf("version %d, %d files, %d in load, %d routes", m.Version, len(m.Files), len(m.Load), len(m.Routes))
 			}
 			want, err := os.ReadFile(g.file + ".sha256")
 			if err != nil {
@@ -119,6 +122,122 @@ func TestManifestGolden(t *testing.T) {
 		}
 		if _, err := parseManifest([]byte(in)); err == nil || !strings.Contains(err.Error(), "not in the canonical form") {
 			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// A manifest of version 3 is refused unless it is the one canonical form with
+// a mode and routes in the form that the proxy accepts. The rows put their own
+// routes (or another key) into the golden file; an empty want is a manifest
+// that is read.
+func TestParseManifestRoutes(t *testing.T) {
+	const canonical = "not in the canonical form"
+	const badPath, badHost, twice = "a route path is malformed", "a route host is malformed", "twice"
+	gb, err := os.ReadFile("testdata/manifest-v3-golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := string(gb)
+	const routes = `[{"path":"/static/","action":"bypass"},{"host":"example.test","path":"/health","action":"bypass"}]`
+	if !strings.Contains(g, routes) || !strings.Contains(g, `{"version":3,"mode":"block",`) {
+		t.Fatal("the golden file is not the one these rows change")
+	}
+	with := func(r string) string { return strings.Replace(g, routes, r, 1) }
+	one := func(p string) string { return `[{"path":"` + p + `","action":"bypass"}]` }
+	onHost := func(h string) string { return `[{"host":"` + h + `","path":"/a","action":"bypass"}]` }
+	many := func(n int) string {
+		var rs []string
+		for i := 0; i < n; i++ {
+			rs = append(rs, fmt.Sprintf(`{"path":"/r%03d","action":"bypass"}`, i))
+		}
+		return "[" + strings.Join(rs, ",") + "]"
+	}
+	long := "/" + strings.Repeat("a", 254) // 255 bytes
+	rows := []struct{ name, in, want string }{
+		{"no routes key", strings.Replace(g, `,"routes":`+routes, "", 1), canonical},
+		{"keys in another order", strings.Replace(g, `{"version":3,"mode":"block",`, `{"mode":"block","version":3,`, 1), canonical},
+		{"route keys in another order", with(`[{"path":"/static/","action":"bypass"},{"path":"/health","host":"example.test","action":"bypass"}]`), canonical},
+		{"action is not bypass", with(`[{"path":"/static/","action":"deny"}]`), canonical},
+		{"host given and empty", with(`[{"host":"","path":"/static/","action":"bypass"}]`), canonical},
+		{"version 1 with routes", strings.Replace(g, `{"version":3,"mode":"block",`, `{"version":1,`, 1), canonical},
+		{"version 2 with routes", strings.Replace(g, `"version":3,"mode":"block"`, `"version":2,"mode":"detect"`, 1), canonical},
+		{"mode with a capital", strings.Replace(g, `"mode":"block"`, `"mode":"Block"`, 1), "mode is not block or detect"},
+		{"routes empty", with(`[]`), "no routes"},
+		{"256 routes", with(many(256)), ""},
+		{"257 routes", with(many(257)), "too many routes"},
+		{"path is /", with(one("/")), badPath},
+		{"path is /a", with(one("/a")), ""},
+		{"path without a leading /", with(one("static/")), badPath},
+		{"path of 255 bytes", with(one(long)), ""},
+		{"path of 256 bytes", with(one(long + "a")), badPath},
+		{"path with an escape", with(one("/a%41%7e/")), ""},
+		{"path with a ;", with(one("/a;b")), badPath},
+		{"escape cut short", with(one("/a%2")), badPath},
+		{"escape that is not hex", with(one("/a%zz")), badPath},
+		{"escaped /", with(one("/a%2f")), badPath},
+		{"escaped . with a capital", with(one("/a%2E")), badPath},
+		{"escaped backslash", with(one("/a%5c")), badPath},
+		{"escaped zero byte", with(one("/a%00")), badPath},
+		{"escaped %", with(one("/a%252e")), badPath},
+		{"dot dot component", with(one("/a/../b")), badPath},
+		{"empty component", with(one("/a//b")), badPath},
+		{"host of 253 bytes", with(onHost(strings.Repeat("a", 253))), ""},
+		{"host of 254 bytes", with(onHost(strings.Repeat("a", 254))), badHost},
+		{"host with a capital", with(onHost("Example.test")), badHost},
+		{"host ends with a dot", with(onHost("example.test.")), badHost},
+		{"port 65535", with(onHost("example.test:65535")), ""},
+		{"port 65536", with(onHost("example.test:65536")), badHost},
+		{"port 0", with(onHost("example.test:0")), badHost},
+		{"same path twice", with(`[{"path":"/a","action":"bypass"},{"path":"/a","action":"bypass"}]`), twice},
+		{"same host and path twice", with(`[{"host":"h","path":"/a","action":"bypass"},{"host":"h","path":"/a","action":"bypass"}]`), twice},
+		{"same path with and without a host", with(`[{"path":"/a","action":"bypass"},{"host":"h","path":"/a","action":"bypass"}]`), ""},
+		{"mode detect", strings.Replace(g, `"mode":"block"`, `"mode":"detect"`, 1), ""},
+	}
+	for _, c := range rows {
+		t.Run(c.name, func(t *testing.T) {
+			m, err := parseManifest([]byte(c.in))
+			switch {
+			case c.want == "" && (err != nil || !bytes.Equal(m.encode(), []byte(c.in))):
+				t.Fatalf("rejected or written again in another form: %v", err)
+			case c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)):
+				t.Fatalf("error %v, want a part %q", err, c.want)
+			}
+		})
+	}
+}
+
+// writeRoutesBundle writes the bundle like writeBundle, then replaces its
+// manifest with one of version 3 that has the mode and one route. It returns
+// the fingerprint.
+func writeRoutesBundle(t *testing.T, dir, mode string, files map[string]string, load ...string) [32]byte {
+	t.Helper()
+	writeBundle(t, dir, files, load...)
+	m := testManifest(files, load)
+	m.Version, m.Mode, m.Routes = versionRoutes, mode, []manifestRoute{{Path: "/static/"}}
+	mb := m.encode()
+	if err := os.WriteFile(filepath.Join(dir, manifestName), mb, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return sha256.Sum256(mb)
+}
+
+// A bundle of version 3 knows its mode from the key "mode", and carries the
+// sha256 of its manifest bytes. The WAF of the mode "detect" has the two rules
+// around the files and the one of the mode "block" has not: a file that takes
+// the id of one of them stops the build in the first only.
+func TestReadBundleRoutes(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	files := map[string]string{ruleFile: fmt.Sprintf("SecAction \"id:%d,phase:1,pass\"\n", detectBeginID)}
+	for _, mode := range []string{"block", "detect"} {
+		detect := mode == "detect"
+		dir := t.TempDir()
+		sum := writeRoutesBundle(t, dir, mode, files, ruleFile)
+		b, err := readBundle(dir)
+		if err != nil || b.detect != detect || b.fingerprint != sum {
+			t.Fatalf("mode %s: detect %v, fingerprint %x, error %v", mode, b != nil && b.detect, sum, err)
+		}
+		if _, err := newWAF(b); (err != nil) != detect {
+			t.Errorf("mode %s: the build of a file with the id of the rule before the files: %v", mode, err)
 		}
 	}
 }

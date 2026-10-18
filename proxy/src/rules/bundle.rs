@@ -3,25 +3,31 @@
 //! A bundle is a set of files (the rule files in the order they are loaded, and the data files that rules read)
 //! below one root. `manifest.json` in the root lists every file with its size and SHA-256 and names the rule files
 //! in the order they are loaded. The fingerprint of the bundle is the SHA-256 of the bytes of the manifest, so it
-//! covers every file, every path, the order, the load list and the mode. It names a generation in the rules store.
+//! covers every file, every path, the order, the load list, the mode and the routes. It names a generation in the
+//! rules store.
 //!
 //! A bundle has a mode. A bundle in `Block` mode stops a request that a rule blocks. A bundle in `Detect` mode lets
-//! the request through, and the inspector reports the rule that would have blocked it. The manifest of a `Block`
-//! bundle is version 1, and that of a `Detect` bundle is version 2, which has the key `mode`.
+//! the request through, and the inspector reports the rule that would have blocked it. A bundle may also have
+//! routes (`routes`): requests that skip the inspection. The manifest of a `Block` bundle without routes is
+//! version 1, that of a `Detect` bundle without routes is version 2, which has the key `mode`, and that of a bundle
+//! with routes is version 3, which has the keys `mode` (`block` or `detect`) and `routes` (at least one route).
 //!
-//! The manifest has one form for each mode, which `Manifest::encode` writes by hand and does not take from a
-//! serializer: the keys in the order `version`, `mode` (version 2 only, always `"detect"`), `files`, `load` (`path`,
-//! `size`, `sha256` in a file), no white space, strings between quotes without any escape (a path and a hexadecimal
-//! digest hold no character that needs one), numbers in decimal, one newline at the end. `Manifest::parse` reads a
-//! manifest with a loose decoder, writes what it read in that form again and requires the very bytes that were read,
-//! so every other spelling of the same values is refused. The Go inspector reads and checks a bundle the same way,
-//! and both sides are tested against the same golden files (`inspector/testdata/manifest-v1-golden.json` and
-//! `manifest-v2-golden.json`).
+//! The manifest has one form for each kind of bundle, which `Manifest::encode` writes by hand and does not take from a
+//! serializer: the keys in the order `version`, `mode` (versions 2 and 3; always `"detect"` in version 2), `files`,
+//! `load` (`path`, `size`, `sha256` in a file), `routes` (version 3 only; `host` if the route has one, `path`,
+//! `action` in a route), no white space, strings between quotes without any escape (a path, a host and a
+//! hexadecimal digest hold no character that needs one), numbers in decimal, one newline at the end.
+//! `Manifest::parse` reads a manifest with a loose decoder, writes what it read in that form again and requires the
+//! very bytes that were read, so every other spelling of the same values is refused. The Go inspector reads and
+//! checks a bundle the same way, and both sides are tested against the same golden files
+//! (`inspector/testdata/manifest-v1-golden.json`, `manifest-v2-golden.json` and `manifest-v3-golden.json`).
 
 use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+use crate::rules::routes::{RawRoute, Routes};
 
 /// The name of the manifest in the root of a bundle.
 pub const MANIFEST_NAME: &str = "manifest.json";
@@ -158,12 +164,14 @@ pub struct Entry {
     pub sha256: [u8; 32],
 }
 
-/// The content of `manifest.json`: version 1 for the mode `Block`, version 2 for the mode `Detect`.
+/// The content of `manifest.json`: version 1 for the mode `Block`, version 2 for the mode `Detect`, version 3 for
+/// either mode with routes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     mode: Mode,
     files: Vec<Entry>,
     load: Vec<BundlePath>,
+    routes: Routes,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +181,7 @@ struct RawManifest {
     mode: Option<String>,
     files: Vec<RawEntry>,
     load: Vec<String>,
+    routes: Option<Vec<RawRoute>>,
 }
 
 #[derive(Deserialize)]
@@ -185,12 +194,13 @@ struct RawEntry {
 
 impl Manifest {
     /// A manifest of `files`, which must be in strictly increasing order of their paths, and of the rule files
-    /// that are `load`ed in this order, for the rules of the given `mode`. Every limit of a bundle is checked here
-    /// except the size of the encoded manifest, which `Bundle::new` and `parse` check.
+    /// that are `load`ed in this order, for the rules of the given `mode`, with the given `routes`. Every limit of
+    /// a bundle is checked here except the size of the encoded manifest, which `Bundle::new` and `parse` check.
     pub fn new(
         mode: Mode,
         files: Vec<Entry>,
         load: Vec<BundlePath>,
+        routes: Routes,
     ) -> Result<Manifest, BundleError> {
         if files.is_empty() {
             return Err(BundleError("the bundle has no files"));
@@ -225,7 +235,12 @@ impl Manifest {
                 return Err(BundleError("load names a path twice"));
             }
         }
-        Ok(Manifest { mode, files, load })
+        Ok(Manifest {
+            mode,
+            files,
+            load,
+            routes,
+        })
     }
 
     /// What the rules of the bundle do to a request they match.
@@ -243,11 +258,18 @@ impl Manifest {
         &self.load
     }
 
+    /// The requests that skip the inspection.
+    pub fn routes(&self) -> &Routes {
+        &self.routes
+    }
+
     /// The bytes of `manifest.json`: the one form.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = String::from(match self.mode {
-            Mode::Block => r#"{"version":1,"files":["#,
-            Mode::Detect => r#"{"version":2,"mode":"detect","files":["#,
+        let mut out = String::from(match (self.mode, self.routes.is_empty()) {
+            (Mode::Block, true) => r#"{"version":1,"files":["#,
+            (Mode::Detect, true) => r#"{"version":2,"mode":"detect","files":["#,
+            (Mode::Block, false) => r#"{"version":3,"mode":"block","files":["#,
+            (Mode::Detect, false) => r#"{"version":3,"mode":"detect","files":["#,
         });
         for (i, file) in self.files.iter().enumerate() {
             if i > 0 {
@@ -270,7 +292,9 @@ impl Manifest {
             out.push_str(path.as_str());
             out.push('"');
         }
-        out.push_str("]}\n");
+        out.push(']');
+        self.routes.write_to(&mut out);
+        out.push_str("}\n");
         out.into_bytes()
     }
 
@@ -283,15 +307,21 @@ impl Manifest {
             return Err(BundleError("the manifest is over 64 KiB"));
         }
         let raw: RawManifest = serde_json::from_slice(bytes).map_err(|_| BAD)?;
-        let mode = match (raw.version, raw.mode.as_deref()) {
-            (1, None) => Mode::Block,
-            (2, Some("detect")) => Mode::Detect,
-            (1 | 2, _) => {
+        let mode = match (raw.version, raw.mode.as_deref(), raw.routes.is_some()) {
+            (1, None, false) => Mode::Block,
+            (2, Some("detect"), false) => Mode::Detect,
+            (3, Some("block"), true) => Mode::Block,
+            (3, Some("detect"), true) => Mode::Detect,
+            (1..=3, _, _) => {
                 return Err(BundleError(
-                    "the mode of the manifest does not fit its version",
+                    "the mode or the routes of the manifest do not fit its version",
                 ));
             }
-            _ => return Err(BundleError("the version of the manifest is not 1 or 2")),
+            _ => return Err(BundleError("the version of the manifest is not 1, 2 or 3")),
+        };
+        let routes = match raw.routes {
+            Some(list) => Routes::from_raw(list)?,
+            None => Routes::default(),
         };
         let path = |text: &str| BundlePath::parse(text).ok_or(BundleError("a path is malformed"));
         let files = raw
@@ -312,7 +342,7 @@ impl Manifest {
             .iter()
             .map(|text| path(text))
             .collect::<Result<Vec<_>, BundleError>>()?;
-        let manifest = Manifest::new(mode, files, load)?;
+        let manifest = Manifest::new(mode, files, load, routes)?;
         if manifest.encode() != bytes {
             return Err(BundleError("the manifest is not in the canonical form"));
         }
@@ -330,11 +360,12 @@ pub struct Bundle {
 
 impl Bundle {
     /// A bundle of `files`, in any order but each path once, and of the rule files that are `load`ed in this order,
-    /// for the rules of the given `mode`.
+    /// for the rules of the given `mode`, with the given `routes`.
     pub fn new(
         mode: Mode,
         mut files: Vec<(BundlePath, Vec<u8>)>,
         load: Vec<BundlePath>,
+        routes: Routes,
     ) -> Result<Bundle, BundleError> {
         files.sort_by(|a, b| a.0.cmp(&b.0));
         if files.windows(2).any(|pair| pair[0].0 == pair[1].0) {
@@ -351,9 +382,15 @@ impl Bundle {
                 })
             })
             .collect::<Result<Vec<_>, BundleError>>()?;
-        let manifest = Manifest::new(mode, entries, load)?.encode();
+        let checked = Manifest::new(mode, entries, load, routes)?;
+        let manifest = checked.encode();
         if u64::try_from(manifest.len()).is_ok_and(|n| n > MAX_MANIFEST_BYTES) {
-            return Err(BundleError("the manifest of the bundle is over 64 KiB"));
+            // The routes are in the manifest and can take most of its room, so the sentence names them.
+            return Err(BundleError(if checked.routes().is_empty() {
+                "the manifest of the bundle is over 64 KiB"
+            } else {
+                "the manifest of the bundle is over 64 KiB, and the routes of the bundle take room in the manifest"
+            }));
         }
         let fingerprint = Fingerprint::of(&manifest);
         Ok(Bundle {

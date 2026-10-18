@@ -14,6 +14,9 @@
 //!
 //! Every file is read as a regular file that is not a link, of at most 2 MiB, and the bundle may have at most 128
 //! files of at most 8 MiB in all. A directory is scanned for at most 1024 entries.
+//!
+//! The file of the routes, if one is named, is read like an input file. It is not a file of the bundle: its routes
+//! are checked (`routes`) and go into the manifest, in the order they are written.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -25,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 use crate::rules::bundle::{Bundle, BundlePath, MAX_BUNDLE_BYTES, MAX_FILE_BYTES, MAX_FILES, Mode};
 use crate::rules::file_store::read_regular;
+use crate::rules::routes::Routes;
 
 /// The most entries read from a directory of the CRS.
 const MAX_ENTRIES: usize = 1024;
@@ -42,6 +46,8 @@ pub struct Inputs {
     pub data: Vec<PathBuf>,
     /// What the rules do to a request they match.
     pub mode: Mode,
+    /// The file of the routes: a JSON array of the requests that skip the inspection.
+    pub routes: Option<PathBuf>,
 }
 
 /// Why the inputs were refused: a fixed English sentence, and the name or path of the input that it is about,
@@ -127,10 +133,15 @@ pub fn collect(inputs: &Inputs) -> Result<Bundle, CollectError> {
             subject: None,
         });
     }
+    let routes = match &inputs.routes {
+        Some(source) => Routes::from_json(&read_input(source)?).or_else(|e| refuse(e.0, source))?,
+        None => Routes::default(),
+    };
     Bundle::new(
         inputs.mode,
         collector.files.into_iter().collect(),
         collector.load,
+        routes,
     )
     .map_err(|e| CollectError {
         reason: e.0,

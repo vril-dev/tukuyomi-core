@@ -14,6 +14,7 @@ use super::*;
 use crate::inbound::represent::tests::head_of;
 use crate::inspect::driver::Outcome;
 use crate::log::start_logger;
+use crate::rules::routes::{Route, Routes};
 
 pub(in crate::inbound) const FORM: &str = "application/x-www-form-urlencoded";
 const BUDGET: usize = 1 << 20;
@@ -206,6 +207,7 @@ impl Rig {
             cfg,
             budget,
             inspect: Arc::new(Semaphore::new(PERMITS)),
+            routes: SharedRoutes::new(Routes::default()),
             log: start_logger().unwrap(),
         });
         let (tx, rx) = sync_channel(if matches!(mode, Mode::Full) {
@@ -419,6 +421,53 @@ fn a_blocked_request_is_answered_with_the_status_of_the_rule() {
             ("GET", "/a")
         );
         assert_eq!(seen[0].headers, [pair("Host", "h")]);
+    });
+}
+
+/// A request for `path` on a rig where the table has the route `/static/`: the status of the answer, and what the
+/// driver saw. `used_up` takes every inspection permit first.
+async fn routed(mode: Mode, used_up: bool, path: &str) -> (u16, Vec<Seen>) {
+    let rig = Rig::new(config(), mode).await;
+    let table = Routes::new(vec![Route::new(None, "/static/").unwrap()]).unwrap();
+    rig.ctx.routes.replace(table);
+    let permits = u32::try_from(PERMITS).unwrap();
+    let held = used_up.then(|| {
+        rig.ctx
+            .inspect
+            .clone()
+            .try_acquire_many_owned(permits)
+            .unwrap()
+    });
+    let (client, task) = rig.connect().await;
+    put(
+        &client,
+        format!("GET {path} HTTP/1.1\r\nHost: h\r\n\r\n").as_bytes(),
+    )
+    .await;
+    let status = parse_response(&read_all(&client).await).status;
+    drop(held);
+    (status, rig.finish(task).await)
+}
+
+#[test]
+fn a_request_under_a_route_goes_on_to_the_upstream_when_the_inspection_cannot_take_it() {
+    run(async {
+        // Nothing listens at the address of the upstream, so a request that goes on ends in 502 here. Under a
+        // route it takes no permit, no budget and no place in the way to the driver, so it makes no ticket and
+        // goes on whether the driver is gone, the way to it is full or every permit is taken. A request that is
+        // not under a route is refused with 503.
+        for (mode, used_up) in [
+            (Mode::Gone, false),
+            (Mode::Full, false),
+            (Mode::Answer(BLOCK), true),
+        ] {
+            let (status, seen) = routed(mode, used_up, "/static/a").await;
+            assert_eq!(status, 502, "under the route");
+            assert!(seen.is_empty());
+            let (status, seen) = routed(mode, used_up, "/dynamic").await;
+            assert_eq!(status, 503, "not under the route");
+            assert!(seen.is_empty());
+        }
     });
 }
 

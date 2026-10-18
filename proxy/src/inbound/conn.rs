@@ -4,8 +4,10 @@
 //! far then go back in front of the socket and hyper parses the request again; the service compares what hyper
 //! saw with what the head check saw and answers 400 on any difference. The body is read through hyper into a
 //! budgeted buffer, a gzip body is decoded by `represent::gunzip` (exactly one member, at most `max_body` bytes
-//! of output), the request is handed to the inspection driver as a ticket, and only an `Allow` or a `Detected` is
-//! forwarded.
+//! of output), and then the request either matches a route of the generation that serves, and is forwarded without
+//! being inspected, or is handed to the inspection driver as a ticket, and only an `Allow` or a `Detected` is
+//! forwarded. A request under a route takes no inspection permit, no byte of the kernel's copy and no place in the
+//! driver's channel, so it goes on also when the inspection is full or the inspector is down.
 //! What is inspected and what is forwarded is the same request, in the form that `represent` builds it: the
 //! decoded body, without its `Content-Encoding`, with its decoded length.
 //!
@@ -41,19 +43,23 @@ use tukuyomi_kernel::limits;
 
 use crate::config::ProxyConfig;
 use crate::forward::origin::{self, Forward, OriginBody, OriginError};
-use crate::inbound::answer::{Abort, Class, Decision, Out, Reply, Stop, answer, decide, record};
+use crate::inbound::answer::{
+    Abort, Class, Decision, Out, Passed, Reply, Stop, answer, decide, record,
+};
 use crate::inbound::head::{self, Head, Limits, Reject, trim_ows};
 use crate::inbound::io::{Gauge, Guarded};
 use crate::inbound::represent::{Represented, gunzip, represent};
 use crate::inspect::driver::{BodyHold, Hold, InspectReq, Msg, Ticket};
 use crate::log::Log;
+use crate::rules::routes::SharedRoutes;
 
 /// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
-/// and the inspection permits (as many as the kernel's waiting queue).
+/// the inspection permits (as many as the kernel's waiting queue) and the routes of the generation that serves.
 pub struct Ctx {
     pub cfg: ProxyConfig,
     pub budget: Arc<Semaphore>,
     pub inspect: Arc<Semaphore>,
+    pub routes: SharedRoutes,
     pub log: Log,
 }
 
@@ -243,8 +249,9 @@ struct Conn {
     times: Times,
     /// When the head was complete: the body stage counts from here.
     head_end: Instant,
-    /// The way to the driver, taken for the one ticket and dropped as soon as it is sent. Holding it for the
-    /// life of a streaming response would keep the driver from seeing that no sender is left.
+    /// The way to the driver, taken for the one ticket and dropped as soon as it is sent, or as soon as a route
+    /// lets the request through without one. Holding it for the life of a streaming response would keep the driver
+    /// from seeing that no sender is left.
     ingress: Mutex<Option<SyncSender<Msg>>>,
     reply: Mutex<Reply>,
 }
@@ -253,8 +260,8 @@ impl Conn {
     /// The service: one request per connection.
     async fn handle(&self, req: Request<Incoming>) -> Result<Response<Out>, Abort> {
         let (reply, response) = match self.exchange(req).await {
-            Ok((response, detected)) => {
-                let reply = Reply::forwarded(response.status().as_u16(), detected);
+            Ok((response, passed)) => {
+                let reply = Reply::forwarded(response.status().as_u16(), passed);
                 (reply, Ok(response.map(|body| Out::Origin(Box::pin(body)))))
             }
             Err(Stop::Reply(reply)) => (reply, Ok(answer(reply.status))),
@@ -270,11 +277,11 @@ impl Conn {
         response
     }
 
-    /// Everything up to the response of the upstream, and the rule of a detection if there was one.
+    /// Everything up to the response of the upstream, and how the request was let through.
     async fn exchange(
         &self,
         req: Request<Incoming>,
-    ) -> Result<(Response<OriginBody>, Option<i64>), Stop> {
+    ) -> Result<(Response<OriginBody>, Passed), Stop> {
         let (parts, body) = req.into_parts();
         if !same_head(&self.head, &parts) {
             return Err(Reply::rejected(400, "the two parsers disagree").into());
@@ -296,7 +303,7 @@ impl Conn {
             return Err(Reject::UnsupportedMedia.into());
         }
         let body = Arc::new(BodyHold::new(bytes, budget));
-        let detected = self.ask(headers, field_bytes, &body).await?;
+        let passed = self.ask(headers, field_bytes, &body).await?;
         if Instant::now() >= self.times.request_by {
             return Err(Reply::failed(503, "request time used up").into());
         }
@@ -309,7 +316,7 @@ impl Conn {
         };
         origin::forward(forward, &self.ctx, self.times.request_by)
             .await
-            .map(|response| (response, detected))
+            .map(|response| (response, passed))
             .map_err(|e| {
                 Reply::failed(
                     502,
@@ -418,14 +425,31 @@ impl Conn {
         }
     }
 
-    /// Hands the request to the driver and waits for the verdict. `Ok` is an `Allow` (`None`) or a `Detected`
-    /// (the rule); everything else is the answer to give.
+    /// Lets the request through at once if a route of the generation that serves matches it; otherwise hands it to
+    /// the driver and waits for the verdict. `Ok` is how the request is let through (a bypass by a route, an
+    /// `Allow` or a `Detected`); everything else is the answer to give. The routes are read before the permit and
+    /// the budget are taken, so that a request under a route does not depend on the inspection.
     async fn ask(
         &self,
         headers: Vec<(Bytes, Bytes)>,
         field_bytes: usize,
         body: &Arc<BodyHold>,
-    ) -> Result<Option<i64>, Stop> {
+    ) -> Result<Passed, Stop> {
+        if self
+            .ctx
+            .routes
+            .current()
+            .matches(host_of(&headers), self.head.target())
+        {
+            // No ticket will be sent, so the way to the driver is let go as it is after a ticket.
+            drop(
+                self.ingress
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(),
+            );
+            return Ok(Passed::Bypassed);
+        }
         let permit = self
             .ctx
             .inspect
@@ -469,11 +493,18 @@ impl Conn {
             Ok(Ok(outcome)) => outcome,
         };
         match decide(outcome) {
-            Decision::Allow => Ok(None),
-            Decision::Detected { rule } => Ok(Some(rule)),
+            Decision::Pass(passed) => Ok(passed),
             Decision::Answer(reply) => Err(reply.into()),
         }
     }
+}
+
+/// The value of the `Host` field of the request. The head check has made sure that there is exactly one.
+fn host_of(headers: &[(Bytes, Bytes)]) -> Option<&[u8]> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(b"host"))
+        .map(|(_, value)| &value[..])
 }
 
 /// Whether the body failed because the peer went away, not because of what it sent.

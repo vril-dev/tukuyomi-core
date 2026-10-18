@@ -5,9 +5,12 @@ fn the_answer_table() {
     use Reason::*;
     let answer = |outcome| match decide(outcome) {
         Decision::Answer(reply) => reply,
-        Decision::Allow | Decision::Detected { .. } => panic!("not an answer"),
+        Decision::Pass(_) => panic!("not an answer"),
     };
-    assert_eq!(decide(Outcome::Verdict(Verdict::Allow)), Decision::Allow);
+    assert_eq!(
+        decide(Outcome::Verdict(Verdict::Allow)),
+        Decision::Pass(Passed::Allowed)
+    );
     // A detection goes on like an allow, whatever status the rule would have blocked with.
     for status in [0, 403, 600] {
         let detected = Outcome::Verdict(Verdict::Detected {
@@ -16,7 +19,7 @@ fn the_answer_table() {
         });
         assert_eq!(
             decide(detected),
-            Decision::Detected { rule: 9201 },
+            Decision::Pass(Passed::Detected { rule: 9201 }),
             "{status}"
         );
     }
@@ -111,15 +114,27 @@ fn the_record_has_numbers_and_fixed_texts_only() {
         "conn 8: closed 0 no answer rule - 1 ms"
     );
     assert_eq!(
-        record(9, &Reply::forwarded(200, None), Duration::from_millis(3)),
+        record(
+            9,
+            &Reply::forwarded(200, Passed::Allowed),
+            Duration::from_millis(3)
+        ),
         "conn 9: forwarded 200 forwarded rule - 3 ms"
     );
     assert_eq!(
         record(
             10,
-            &Reply::forwarded(200, Some(9201)),
+            &Reply::forwarded(200, Passed::Detected { rule: 9201 }),
             Duration::from_millis(3)
         ),
         "conn 10: forwarded 200 detected by a rule rule 9201 3 ms"
+    );
+    assert_eq!(
+        record(
+            11,
+            &Reply::forwarded(200, Passed::Bypassed),
+            Duration::from_millis(3)
+        ),
+        "conn 11: forwarded 200 bypassed by a route rule - 3 ms"
     );
 }

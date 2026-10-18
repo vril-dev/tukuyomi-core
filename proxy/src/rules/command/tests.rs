@@ -68,6 +68,27 @@ fn detect_only_makes_a_detect_bundle_wherever_it_stands() {
 }
 
 #[test]
+fn routes_names_one_file_wherever_it_stands() {
+    for text in [
+        ["--routes", "r.json", "--rules", "a.conf"],
+        ["--rules", "a.conf", "--routes", "r.json"],
+    ] {
+        let (inputs, _) = import(&text);
+        assert_eq!(inputs.routes, Some(PathBuf::from("r.json")));
+    }
+    assert_eq!(import(&["--rules", "a.conf"]).0.routes, None);
+    let config = "/etc/tukuyomi.json";
+    assert_eq!(
+        refusal(&["import", config, "--routes", "a.json", "--routes", "b.json"]),
+        "--routes is given twice"
+    );
+    assert_eq!(
+        refusal(&["import", config, "--routes"]),
+        "an option needs a value that does not start with --"
+    );
+}
+
+#[test]
 fn a_wrong_argument_is_a_usage_error() {
     let config = "/etc/tukuyomi.json";
     assert_eq!(refusal(&[]), "a command is missing");

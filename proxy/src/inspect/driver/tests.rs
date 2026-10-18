@@ -9,6 +9,7 @@ use tukuyomi_kernel::{Config, Reason};
 
 use crate::inspect::slot::{Pending, deliver, restart_line, submit};
 use crate::log::start_logger;
+use crate::rules::routes::Route;
 
 const MS: Duration = Duration::from_millis(1);
 const SEC: Duration = Duration::from_secs(1);
@@ -267,6 +268,7 @@ impl Rig {
         let (tx, rx) = sync_channel(room);
         let core = Core::new(
             Slot::new(generation(1), bundle::Mode::Block, Fake::new()),
+            SharedRoutes::new(Routes::default()),
             rx,
             Signals::Told { _failed: None },
             start_logger().unwrap(),
@@ -547,6 +549,44 @@ fn a_duplicate_id_is_fatal() {
     assert_eq!(r.core.active.pending.len(), 1);
 }
 
+// ---- routes ----
+
+fn route(host: Option<&str>, path: &str) -> Route {
+    Route::new(host, path).unwrap()
+}
+
+/// A table of routes without a host, one for each path.
+fn routes(paths: &[&str]) -> Routes {
+    Routes::new(paths.iter().map(|path| route(None, path)).collect()).unwrap()
+}
+
+#[test]
+fn the_shared_routes_follow_the_generation_that_serves() {
+    let mut r = Rig::new(4, 8);
+    r.core.routes.replace(routes(&["/old/"]));
+    let mut told = r.send_switch_with(2, routes(&["/new/"]));
+    r.core.round().unwrap();
+    // While the new kernel starts, the table is the one of the kernel that serves.
+    assert_eq!(*r.core.routes.current(), routes(&["/old/"]));
+    r.other().phase = Phase::Ready;
+    r.core.round().unwrap();
+    assert_eq!(r.core.active.generation, generation(2));
+    assert_eq!(*r.core.routes.current(), routes(&["/new/"]));
+    assert_eq!(settle(&mut r, &mut told), Switched::Yes);
+
+    // A new kernel that fails to start, or is late, leaves the table as it is.
+    let mut told = r.send_switch_with(3, routes(&["/third/"]));
+    r.core.round().unwrap();
+    r.other().phase = Phase::Failed(Failure::Exit(11));
+    assert_eq!(settle(&mut r, &mut told), Switched::No);
+    assert_eq!(*r.core.routes.current(), routes(&["/new/"]));
+    r.core.limits.ready_wait = Duration::ZERO;
+    let mut told = r.send_switch_with(4, routes(&["/fourth/"]));
+    assert_eq!(settle(&mut r, &mut told), Switched::No);
+    assert_eq!(*r.core.routes.current(), routes(&["/new/"]));
+    assert_eq!(r.core.active.generation, generation(2));
+}
+
 // ---- the wait rule ----
 
 #[test]
@@ -759,6 +799,7 @@ fn a_kernel_that_cannot_start_says_so_once_through_ready_and_still_answers() {
         config(root),
         generation(1),
         bundle::Mode::Block,
+        SharedRoutes::new(Routes::default()),
         limits,
         start_logger().unwrap(),
     )
@@ -804,10 +845,16 @@ fn a_kernel_that_cannot_start_says_so_once_through_ready_and_still_answers() {
 impl Rig {
     /// Sends the order to switch to the generation `n`. The answer comes on the receiver.
     fn send_switch(&self, n: u8) -> oneshot::Receiver<Switched> {
+        self.send_switch_with(n, Routes::default())
+    }
+
+    /// Sends the order to switch to the generation `n`, whose routes are `routes`.
+    fn send_switch_with(&self, n: u8, routes: Routes) -> oneshot::Receiver<Switched> {
         let (reply, told) = oneshot::channel();
         self.send(Msg::Switch(Switch {
             generation: generation(n),
             mode: bundle::Mode::Block,
+            routes,
             kernel: config(Path::new("/driver-test/switch-root")),
             reply,
         }));
@@ -914,13 +961,14 @@ fn an_old_kernel_that_is_out_of_time_is_stopped_at_once_with_its_requests_decide
 #[test]
 fn a_ready_generation_is_not_taken_while_the_serving_kernel_has_failed() {
     let mut r = Rig::new(4, 8);
-    let _told = r.send_switch(2);
+    let _told = r.send_switch_with(2, routes(&["/new/"]));
     r.core.round().unwrap();
     r.other().phase = Phase::Ready;
     r.core.active.kernel.phase = Phase::Failed(Failure::Exit(3));
     r.core.round().unwrap();
     assert_eq!(r.core.active.generation, generation(1));
     assert!(matches!(r.core.switching, Switching::Starting { .. }));
+    assert!(r.core.routes.current().is_empty());
 }
 
 #[test]

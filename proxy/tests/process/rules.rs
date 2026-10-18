@@ -342,6 +342,112 @@ fn a_detect_only_generation_lets_a_matched_request_through_and_a_blocking_one_of
 
 #[test]
 #[ignore = "needs a built inspector"]
+fn a_request_under_a_route_is_forwarded_without_inspection_and_an_ambiguous_one_is_inspected() {
+    let mut routed = String::new();
+    let mut proxy = Proxy::spawn_with("rules_routes", Knobs::quick(), |root| {
+        // The routes lie under /block-probe, which the URI rule of the test rules blocks, so that a request that
+        // is forwarded under a route shows that the inspection was skipped and not that no rule matched. The
+        // import makes another manifest (with routes), so another generation, and its trial starts the inspector
+        // on it, which reads the manifest in its one form: the third route holds every character that a path may
+        // hold, and the second one a host with a port.
+        let table = root.join("routes.json");
+        fs::write(
+            &table,
+            r#"[{"path":"/block-probe/pass/","action":"bypass"},{"host":"other.test:8080","path":"/block-probe/other/","action":"bypass"},{"path":"/block-probe/%41-._~!$&'()*+,=:@/","action":"bypass"}]"#,
+        )
+        .expect("write the routes file");
+        let conf = rules_file();
+        let imported = rules(
+            root,
+            "import",
+            &[
+                OsStr::new("--rules"),
+                conf.as_os_str(),
+                OsStr::new("--routes"),
+                table.as_os_str(),
+            ],
+        );
+        fs::remove_file(&table).expect("remove the routes file");
+        assert_eq!(imported.code, Some(0), "{}", imported.err);
+        assert!(imported.err.is_empty(), "{}", imported.err);
+        routed = imported
+            .out
+            .strip_suffix(" created\n")
+            .unwrap_or_else(|| panic!("unexpected output {:?}", imported.out))
+            .to_owned();
+        assert_ne!(routed, generation());
+        let chosen = rules(root, "activate", &[OsStr::new(&routed)]);
+        assert_eq!(chosen.code, Some(0), "{}", chosen.err);
+        // The list gives the number of routes after the mode and before `current`, and nothing for a generation
+        // without routes.
+        let listed = rules(root, "list", &[]);
+        let line = |fingerprint: &str| {
+            listed
+                .out
+                .lines()
+                .find(|l| l.starts_with(fingerprint))
+                .unwrap_or_else(|| panic!("{fingerprint} is not listed in {:?}", listed.out))
+        };
+        assert!(
+            line(&routed).ends_with(" block routes 3 current"),
+            "{}",
+            line(&routed)
+        );
+        assert!(
+            line(&generation()).ends_with(" block"),
+            "{}",
+            line(&generation())
+        );
+    });
+    proxy
+        .records
+        .wait_lines("the proxy to listen", 1, |l| l == "start: listening");
+    proxy.wait_inspector(None);
+    let lines = proxy.records.lines();
+    for line in [
+        format!("start: rules generation {routed}"),
+        "start: rules mode block".to_owned(),
+        "start: rules routes 3".to_owned(),
+    ] {
+        assert!(lines.contains(&line), "records: {lines:#?}");
+    }
+
+    // Without a route the URI rule blocks the probe.
+    assert_empty_answer(&exchange(proxy.port, &get("/block-probe/x")), 403);
+    // Under the route it is not inspected: the request goes to the upstream and the record says why.
+    let reply = exchange(proxy.port, &get("/block-probe/pass/x"));
+    assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
+    assert_eq!(reply.message().body, UPSTREAM_BODY.as_bytes());
+    proxy.records.conn("the bypass record", |l| {
+        l.contains(": forwarded 200 bypassed by a route rule - ")
+    });
+    let seen = Message::parse(&proxy.upstream.requests()[0]);
+    assert_eq!(seen.start, "GET /block-probe/pass/x HTTP/1.1");
+    // A path that can be read in two ways does not match the route, so it is inspected and blocked. So is one
+    // that is escaped twice.
+    assert_empty_answer(&exchange(proxy.port, &get("/block-probe/pass/..%2fx")), 403);
+    assert_empty_answer(
+        &exchange(proxy.port, &get("/block-probe/pass/%252e%252e/x")),
+        403,
+    );
+    // A route with a host holds for that host, in any case of its letters, and for no other.
+    assert_empty_answer(&exchange(proxy.port, &get("/block-probe/other/x")), 403);
+    let other = b"GET /block-probe/other/x HTTP/1.1\r\nHost: Other.Test:8080\r\n\r\n";
+    assert_eq!(exchange(proxy.port, other).status(), 200);
+    // A path with every character that a route may hold.
+    let marks = get("/block-probe/%41-._~!$&'()*+,=:@/x");
+    assert_eq!(exchange(proxy.port, &marks).status(), 200);
+    proxy.records.conns("the bypass records", 3, |l| {
+        l.contains(": forwarded 200 bypassed by a route rule - ")
+    });
+    proxy
+        .records
+        .conns("the blocked records", 4, |l| l.contains(&blocked_by(9201)));
+    proxy.finish(3);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
 fn sigusr1_switches_to_the_chosen_generation_and_a_generation_in_use_is_not_removed() {
     let mut proxy = Proxy::start("rules_switch", Knobs::quick());
     let root = proxy.root().to_path_buf();

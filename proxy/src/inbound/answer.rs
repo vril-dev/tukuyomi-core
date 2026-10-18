@@ -83,17 +83,18 @@ impl Reply {
         }
     }
 
-    /// The response of the upstream was sent. `detected` is the rule that matched while the rules only detect.
-    pub(super) fn forwarded(status: u16, detected: Option<i64>) -> Reply {
+    /// The response of the upstream was sent. `passed` is how the request was let through.
+    pub(super) fn forwarded(status: u16, passed: Passed) -> Reply {
+        let (reason, rule) = match passed {
+            Passed::Allowed => ("forwarded", None),
+            Passed::Detected { rule } => ("detected by a rule", Some(rule)),
+            Passed::Bypassed => ("bypassed by a route", None),
+        };
         Reply {
             status,
             class: Class::Forwarded,
-            reason: if detected.is_some() {
-                "detected by a rule"
-            } else {
-                "forwarded"
-            },
-            rule: detected,
+            reason,
+            rule,
             internal: false,
         }
     }
@@ -195,22 +196,32 @@ pub(super) fn record(id: u64, reply: &Reply, elapsed: Duration) -> String {
     )
 }
 
+/// How a request that goes on to the upstream was let through, for the record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Passed {
+    /// The rules allowed it.
+    Allowed,
+    /// A rule matched while the rules only detect. The request goes on like an allowed one; the rule is for the
+    /// record. The status of the verdict is not used.
+    Detected { rule: i64 },
+    /// A route of the generation that serves skipped the inspection.
+    Bypassed,
+}
+
 /// What the verdict of the driver means for the request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Decision {
-    Allow,
-    /// Goes on to the upstream like `Allow`; the rule is for the record. The status of the verdict is not used.
-    Detected {
-        rule: i64,
-    },
+    Pass(Passed),
     Answer(Reply),
 }
 
-/// The answer table. Only `Allow` and `Detected` go on to the upstream.
+/// The answer table. Only `Pass` goes on to the upstream.
 pub(super) fn decide(outcome: Outcome) -> Decision {
     match outcome {
-        Outcome::Verdict(Verdict::Allow) => Decision::Allow,
-        Outcome::Verdict(Verdict::Detected { rule_id, .. }) => Decision::Detected { rule: rule_id },
+        Outcome::Verdict(Verdict::Allow) => Decision::Pass(Passed::Allowed),
+        Outcome::Verdict(Verdict::Detected { rule_id, .. }) => {
+            Decision::Pass(Passed::Detected { rule: rule_id })
+        }
         Outcome::Verdict(Verdict::Block {
             rule_id, status, ..
         }) => Decision::Answer(match status {

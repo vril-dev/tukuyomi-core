@@ -1,5 +1,6 @@
 use super::*;
 use crate::rules::bundle::BundlePath;
+use crate::rules::routes::Route;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -273,6 +274,7 @@ fn bundle(files: &[(&str, &str)], load: &[&str]) -> Bundle {
         Mode::Block,
         files,
         load.iter().map(|name| path(name)).collect(),
+        Routes::default(),
     )
     .unwrap()
 }
@@ -374,26 +376,35 @@ fn the_same_bundle_again_is_kept_and_a_broken_generation_is_made_again() {
 }
 
 #[test]
-fn the_mode_of_a_generation_is_read_from_its_manifest_and_a_manifest_that_is_not_sound_is_refused()
-{
+fn the_mode_and_the_routes_of_a_generation_are_read_from_its_manifest_and_a_manifest_that_is_not_sound_is_refused()
+ {
     let root = scratch();
     let mut store = opened(root.path());
     let one = BundlePath::parse("rules/a.conf").unwrap();
-    let make = |mode| {
+    let table = Routes::new(vec![Route::new(None, "/static/").unwrap()]).unwrap();
+    let make = |mode, routes| {
         Bundle::new(
             mode,
             vec![(one.clone(), b"SecRuleEngine On\n".to_vec())],
             vec![one.clone()],
+            routes,
         )
         .unwrap()
     };
-    let (block, detect) = (make(Mode::Block), make(Mode::Detect));
-    for bundle in [&block, &detect] {
+    let (block, detect) = (
+        make(Mode::Block, Routes::default()),
+        make(Mode::Detect, Routes::default()),
+    );
+    let routed = make(Mode::Detect, table.clone());
+    for bundle in [&block, &detect, &routed] {
         store.stage(bundle).unwrap();
         store.commit().unwrap();
     }
     assert_eq!(store.mode(block.fingerprint()), Ok(Mode::Block));
     assert_eq!(store.mode(detect.fingerprint()), Ok(Mode::Detect));
+    assert_eq!(store.mode(routed.fingerprint()), Ok(Mode::Detect));
+    assert_eq!(store.routes(block.fingerprint()), Ok(Routes::default()));
+    assert_eq!(store.routes(routed.fingerprint()), Ok(table));
     // A manifest that is not the one its name says (here the other one), and one that is not there, are refused.
     let manifest = |bundle: &Bundle| {
         root.path()
@@ -413,6 +424,10 @@ fn the_mode_of_a_generation_is_read_from_its_manifest_and_a_manifest_that_is_not
     );
     assert_eq!(
         refusal(store.mode(generation())),
+        "the generation is not a real directory"
+    );
+    assert_eq!(
+        refusal(store.routes(generation())),
         "the generation is not a real directory"
     );
 }
