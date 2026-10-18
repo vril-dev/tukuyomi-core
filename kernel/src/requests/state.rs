@@ -827,6 +827,11 @@ impl Engine {
         self.waiting.len()
     }
 
+    /// The frames in the writer queue that no `next_frame` has taken yet.
+    pub fn queued(&self) -> usize {
+        self.out.len()
+    }
+
     /// The request records alive.
     pub fn records(&self) -> usize {
         self.reqs.len()

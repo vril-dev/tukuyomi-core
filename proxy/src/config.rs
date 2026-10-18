@@ -52,6 +52,8 @@ pub struct ProxyConfig {
     pub upstream_max_headers: usize,
     pub upstream_max_head_bytes: usize,
     pub upstream_head_wire: usize,
+    /// How long the driver steps the kernel in one round. It takes in new requests between the rounds, so this is
+    /// the longest a new request waits for it while others are in flight.
     pub drive_slice: Duration,
     pub ready_wait: Duration,
     pub head_read: Duration,

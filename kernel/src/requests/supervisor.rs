@@ -1,8 +1,8 @@
 //! The single owner of the engine, of the current start and of the times of the restarts.
 //!
 //! One thread drives everything. `poll` and `shutdown` repeat `step`: the engine's clock and halt are looked at
-//! first, then at most one frame is written (the engine's frames, and DRAIN through the same writer), then at most
-//! one frame is read. There is no reader thread.
+//! first, then the frames the engine has queued at that moment are written (and DRAIN, through the same writer),
+//! then at most one frame is read. There is no reader thread.
 //!
 //! Deadlines are absolute `Instant`s and are never extended: the HELLO wait counts from just before the spawn,
 //! the wait of a request from its `submit` (also across a restart), the wait for BYE from DRAIN. A sum that does
@@ -240,7 +240,7 @@ enum StopTag {
 /// of its own; waiting by pid for its own unrelated children is fine.
 ///
 /// What the caller can rely on, and what it cannot: `poll(until)` with an `until` that has already passed writes
-/// at most one frame but reads none (the wait for the first byte is over before it begins), so a caller must not
+/// the queued frames but reads none (the wait for the first byte is over before it begins), so a caller must not
 /// repeat only `poll` calls whose `until` is not after the current time: nothing is read from the inspector that way;
 /// `cancel` does not change a result that is already decided and not yet delivered (`Allow` included), which comes
 /// out once as it is; `shutdown` returns every result not delivered before in its `Shutdown.results`;
@@ -533,8 +533,9 @@ impl Supervisor {
     }
 
     /// Steps until a result is ready or `until`, and returns the results (each once). `until` is looked at between
-    /// steps: one step writes one frame and reads one frame, so the return can be later than `until` by what one
-    /// frame takes. A step whose `until` has passed writes but does not read. At least one step is made.
+    /// steps: one step writes the frames queued when it begins and reads one frame, so the return can be later than
+    /// `until` by what those writes and that read take (every write is cut at `frame_io`). A step whose `until` has
+    /// passed writes but does not read. At least one step is made.
     /// The return can also be later by a start made in that call (creating the start directory, spawning the
     /// inspector, reading `/dev/urandom`), by the removal of a start directory after an exit, and by the operating
     /// system's scheduling delay. A read in progress is not cut.
@@ -693,9 +694,9 @@ impl Supervisor {
 
     /// One turn. Down: wait while the restart window is full, else one try to start. Stopping: one try to see the
     /// exit. Stopped and Failed: wait. With a stream: the shutdown deadline, the engine's clock and halt, DRAIN
-    /// once the intake has ended and nothing is held, at most one frame written, at most one frame read (a tick
-    /// long when nothing arrives). `until` cuts the wait for the first byte; the frame that has begun is read to
-    /// its end.
+    /// once the intake has ended and nothing is held, every frame the engine has queued at that point, at most one
+    /// frame read (a tick long when nothing arrives). `until` cuts the wait for the first byte; the frame that has
+    /// begun is read to its end.
     fn step(&mut self, until: Instant) {
         let now = Instant::now();
         match self.run {
@@ -707,11 +708,16 @@ impl Supervisor {
         if self.expired(now).is_break()
             || self.check(now).is_break()
             || self.drain_if_done(now).is_break()
-            || self.write_step().is_break()
+            || self.write_queued().is_break()
         {
             return;
         }
-        let _ = self.read_step(until);
+        // Frames are left only when the engine's own deadlines queued them during the writes. A read waits for its
+        // first byte (it reads nothing when `until` has passed), and no answer may come until those frames have
+        // gone out, so the step ends here and the next one goes on writing.
+        if self.engine.queued() == 0 {
+            let _ = self.read_step(until);
+        }
     }
 
     /// Sleeps until the next tick, `until` or `next`, whichever is first.
@@ -780,6 +786,17 @@ impl Supervisor {
             other => self.run = other,
         }
         self.check(Instant::now())
+    }
+
+    /// The frames the engine has queued when the call begins, written one after the other by `write_step`, so each
+    /// has its own checks and deadline. That count is the bound of the step: nothing is read meanwhile, so no
+    /// answer can queue more, and what the engine's own deadlines queue during the writes (an end of a transaction,
+    /// a frame for a request that waited) goes out in the next step.
+    fn write_queued(&mut self) -> ControlFlow<()> {
+        for _ in 0..self.engine.queued() {
+            self.write_step()?;
+        }
+        Continue(())
     }
 
     /// The engine's next frame, if any, written. `next_frame` is the writer's take: the message number and the

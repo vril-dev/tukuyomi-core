@@ -1,7 +1,9 @@
 use super::*;
 use crate::requests::state::ReturnReason;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -422,6 +424,68 @@ fn shutdown_retries_the_removal_of_a_directory_left_behind() {
     }
     assert!(fs::symlink_metadata(&path).is_ok());
     fs::remove_file(&path).unwrap();
+    assert_eq!(root.entries(), 0);
+}
+
+/// The next frame the supervisor wrote to the other end of the connection: its kind and the length of its payload.
+fn frame_from(peer: &mut UnixStream) -> (u8, usize) {
+    let mut head = [0u8; codec::HEADER_LEN];
+    peer.read_exact(&mut head).unwrap();
+    let len = u32::from_be_bytes([head[8], head[9], head[10], head[11]]);
+    let len = usize::try_from(len).unwrap();
+    peer.read_exact(&mut vec![0u8; len]).unwrap();
+    (head[4], len)
+}
+
+/// After the verdict of phase 1 the body frames and BODY_END are queued together, and no answer can come before
+/// BODY_END: one step must write them all, and not stop after the first and wait.
+#[test]
+fn the_frames_of_a_body_are_written_up_to_body_end_in_one_step() {
+    let root = TempRoot::under(&std::env::temp_dir());
+    let mut c = cfg();
+    // The stand-in ends at once; its connection is replaced by one whose other end is the test.
+    (c.inspector, c.tmp_root) = (PathBuf::from("/bin/true"), root.path().to_path_buf());
+    let mut s = Supervisor::new(c).unwrap();
+    let (run, inc) = (child::fresh_run().unwrap(), s.engine.incarnation());
+    let mut start = start::launch(&s.cfg, run, inc).ok().expect("started");
+    let (mine, mut peer) = UnixStream::pair().unwrap();
+    start.stream = mine;
+    peer.set_read_timeout(Some(secs(5))).unwrap();
+    (s.run_id, s.run) = (Some(run), Run::Ready { start });
+    s.engine.ready(Instant::now(), inc);
+    // Two body fragments: the largest one and one byte.
+    let body = vec![b'a'; codec::MAX_BODY + 1];
+    let headers: [(&[u8], &[u8]); 2] = [
+        (b"Host", b"example.test"),
+        (b"Content-Type", b"application/x-www-form-urlencoded"),
+    ];
+    let post = Request {
+        method: b"POST",
+        ..with(b"/", &headers, &body)
+    };
+    let id = s.submit(&post).unwrap();
+    let tx = s.engine.outcome(id).unwrap().txs[0];
+    // With an `until` that has passed a step reads nothing, so none of these steps can wait.
+    s.step(past());
+    assert_eq!(frame_from(&mut peer).0, codec::KIND_TX_BEGIN);
+    let now = Instant::now();
+    s.engine
+        .on_verdict(now, tx, 1, 1, false, 0, 0, &[])
+        .unwrap();
+    assert_eq!(s.engine.queued(), 3);
+    s.step(past());
+    assert_eq!(s.engine.queued(), 0);
+    let body_frames = [
+        (codec::KIND_BODY, codec::MAX_BODY),
+        (codec::KIND_BODY, 1),
+        (codec::KIND_BODY_END, 0),
+    ];
+    for want in body_frames {
+        assert_eq!(frame_from(&mut peer), want);
+    }
+    assert!(matches!(s.run, Run::Ready { .. }));
+    let sd = s.shutdown(past());
+    assert!(sd.exit_confirmed && sd.dir_removed, "{sd:?}");
     assert_eq!(root.entries(), 0);
 }
 
