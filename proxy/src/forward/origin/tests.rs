@@ -1,16 +1,18 @@
 use std::future::Future;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant as StdInstant;
 
 use http_body_util::BodyExt;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::runtime::Builder;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 use super::*;
-use crate::config::ProxyConfig;
+use crate::config::{ForwardConfig, ProxyConfig};
+use crate::forward::group::Upstreams;
 use crate::inspect::driver::Ingress;
 use crate::log::start_logger;
 use crate::rules::routes::{Routes, SharedRoutes};
@@ -20,11 +22,10 @@ const PEER: &str = "203.0.113.9:5555";
 
 pub(in crate::forward) type Outcome = Result<Response<OriginBody>, OriginError>;
 
-pub(in crate::forward) fn config(upstream: SocketAddr) -> ProxyConfig {
+pub(in crate::forward) fn config() -> ProxyConfig {
     let secs = Duration::from_secs;
     ProxyConfig {
         listen: "127.0.0.1:1".parse().unwrap(),
-        upstream,
         max_conns: 16,
         max_head_bytes: 8192,
         max_body: 1 << 20,
@@ -59,11 +60,16 @@ pub(in crate::forward) fn config(upstream: SocketAddr) -> ProxyConfig {
     }
 }
 
-pub(in crate::forward) fn ctx(cfg: ProxyConfig) -> Ctx {
+/// A context whose one group has one server, at `upstream`.
+pub(in crate::forward) fn ctx(upstream: SocketAddr, cfg: ProxyConfig) -> Ctx {
+    ctx_of(&ForwardConfig::of(&[upstream]), cfg)
+}
+
+pub(in crate::forward) fn ctx_of(forward: &ForwardConfig, cfg: ProxyConfig) -> Ctx {
     // The forwarding never reaches the driver: nobody receives on this channel.
     let (to_driver, _) = std::sync::mpsc::sync_channel(1);
     Ctx {
-        pool: Pool::new(&cfg),
+        upstreams: Upstreams::new(forward, &cfg),
         budget: Arc::new(Semaphore::new(cfg.max_buffered_bytes)),
         inspect: Arc::new(Semaphore::new(1)),
         routes: SharedRoutes::new(Routes::default()),
@@ -84,6 +90,11 @@ pub(in crate::forward) fn run<F: Future>(body: F) -> F::Output {
                 .await
                 .expect("the test hung")
         })
+}
+
+/// Forwards to the one group of `ctx`, and returns what came of it.
+pub(in crate::forward) async fn send(f: Forward, ctx: &Ctx, by: Instant) -> Outcome {
+    forward(f, ctx.upstreams.group(0), ctx, by).await.result
 }
 
 /// Far enough away to play no part.
@@ -280,8 +291,8 @@ async fn answering(sock: TcpStream, reply: Vec<u8>, linger: bool) -> bool {
 async fn ask(method: &str, reply: &[u8], linger: bool) -> (Outcome, JoinHandle<bool>) {
     let reply = reply.to_vec();
     let (addr, up) = upstream(move |sock| answering(sock, reply, linger)).await;
-    let ctx = ctx(config(addr));
-    let out = forward(bare(&ctx, method), &ctx, far()).await;
+    let ctx = ctx(addr, config());
+    let out = send(bare(&ctx, method), &ctx, far()).await;
     (out, up)
 }
 
@@ -532,8 +543,8 @@ fn the_body_streams_and_its_trailers_are_dropped() {
             closed(&sock).await
         })
         .await;
-        let ctx = ctx(config(addr));
-        let response = forward(bare(&ctx, "GET"), &ctx, far()).await.unwrap();
+        let ctx = ctx(addr, config());
+        let response = send(bare(&ctx, "GET"), &ctx, far()).await.unwrap();
         assert!(response.headers().get("transfer-encoding").is_none());
         assert!(response.headers().get("trailer").is_none());
         assert_eq!(response.headers().get("x-a").unwrap(), "b");
@@ -569,16 +580,16 @@ fn the_bytes_up_to_the_final_head_are_capped_as_a_whole() {
         for (cap, passes) in [(reply.len(), true), (reply.len() - 1, false)] {
             let r = reply.clone();
             let (addr, up) = upstream(move |sock| answering(sock, r, true)).await;
-            let mut cfg = config(addr);
+            let mut cfg = config();
             cfg.upstream_head_wire = cap;
-            let ctx = ctx(cfg);
-            let out = forward(bare(&ctx, "GET"), &ctx, far()).await;
+            let ctx = ctx(addr, cfg);
+            let out = send(bare(&ctx, "GET"), &ctx, far()).await;
             if passes {
                 let response = out.unwrap();
                 assert_eq!(response.status(), 200);
                 drop(response);
             } else {
-                assert_eq!(refused(out), OriginError::Head);
+                assert_eq!(refused(out), OriginError::Invalid);
             }
             assert!(
                 up.await.unwrap(),
@@ -601,10 +612,10 @@ fn the_cap_is_lifted_once_the_head_is_here() {
         })
         .await;
         // The head fits and the body does not: only a cap that is lifted lets it through.
-        let mut cfg = config(addr);
+        let mut cfg = config();
         cfg.upstream_head_wire = head.len() + 1500;
-        let ctx = ctx(cfg);
-        let response = forward(bare(&ctx, "GET"), &ctx, far()).await.unwrap();
+        let ctx = ctx(addr, cfg);
+        let response = send(bare(&ctx, "GET"), &ctx, far()).await.unwrap();
         let (data, _) = collect(response.into_body()).await;
         assert_eq!(data.len(), 3000);
         assert!(up.await.unwrap());
@@ -619,14 +630,14 @@ fn a_refused_connection_is_connect() {
             .unwrap()
             .local_addr()
             .unwrap();
-        let ctx = ctx(config(addr));
-        let out = forward(bare(&ctx, "GET"), &ctx, far()).await;
+        let ctx = ctx(addr, config());
+        let out = send(bare(&ctx, "GET"), &ctx, far()).await;
         assert_eq!(refused(out), OriginError::Connect);
     });
 }
 
 #[test]
-fn a_failure_is_head_once_an_answer_began_and_send_before() {
+fn a_failure_is_send_before_an_answer_began_head_after_it_and_invalid_if_the_head_is_not_one() {
     run(async {
         // Nothing of an answer: the upstream closes after reading the request.
         let (out, _) = ask("GET", b"", false).await;
@@ -636,13 +647,13 @@ fn a_failure_is_head_once_an_answer_began_and_send_before() {
         assert_eq!(refused(out), OriginError::Head);
         // Bytes that are not an answer.
         let (out, _) = ask("GET", b"NOT HTTP\r\n\r\n", false).await;
-        assert_eq!(refused(out), OriginError::Head);
+        assert_eq!(refused(out), OriginError::Invalid);
         // A head that is longer than hyper takes.
         let mut long = b"HTTP/1.1 200 OK\r\nX-Long: ".to_vec();
         long.extend_from_slice(&[b'a'; 9000]);
         long.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
         let (out, _) = ask("GET", &long, false).await;
-        assert_eq!(refused(out), OriginError::Head);
+        assert_eq!(refused(out), OriginError::Invalid);
     });
 }
 
@@ -657,7 +668,7 @@ fn the_upstream_gets_the_inspected_request_with_the_listed_changes() {
             seen
         })
         .await;
-        let ctx = ctx(config(addr));
+        let ctx = ctx(addr, config());
         let f = request(
             &ctx,
             "POST",
@@ -676,7 +687,7 @@ fn the_upstream_gets_the_inspected_request_with_the_listed_changes() {
             ],
             b"a=1&b=%00",
         );
-        let response = forward(f, &ctx, far()).await.unwrap();
+        let response = send(f, &ctx, far()).await.unwrap();
         let (data, trailers) = collect(response.into_body()).await;
         assert_eq!((data.as_slice(), trailers), (&b"ok"[..], 0));
         let seen = up.await.unwrap();
@@ -787,15 +798,321 @@ fn an_upstream_that_never_answers_ends_at_the_deadline_with_head() {
             closed(&sock).await
         })
         .await;
-        let mut cfg = config(addr);
+        let mut cfg = config();
         cfg.upstream_header = Duration::from_millis(400);
-        let ctx = ctx(cfg);
+        let ctx = ctx(addr, cfg);
         let start = StdInstant::now();
-        let out = forward(bare(&ctx, "GET"), &ctx, far()).await;
+        let out = send(bare(&ctx, "GET"), &ctx, far()).await;
         let took = start.elapsed();
         assert_eq!(refused(out), OriginError::Head);
         assert!(took >= Duration::from_millis(350), "{took:?}");
         assert!(took < Duration::from_secs(5), "{took:?}");
         assert!(up.await.unwrap(), "the upstream connection was dropped");
+    });
+}
+
+// ---- the next server of the group ----
+
+const OK_REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+/// An address where nothing listens.
+async fn nobody() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap()
+}
+
+/// A server that reads each request and closes the connection with no answer. It counts the connections.
+async fn silent() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let counted = count.clone();
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            next_request(&sock).await;
+        }
+    });
+    (addr, count)
+}
+
+#[test]
+fn a_connection_that_cannot_be_made_goes_on_to_the_next_server_for_any_method() {
+    run(async {
+        for method in ["GET", "POST"] {
+            let dead = nobody().await;
+            let (live, up) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
+            let ctx = ctx_of(&ForwardConfig::of(&[dead, live]), config());
+            let sent = forward(bare(&ctx, method), ctx.upstreams.group(0), &ctx, far()).await;
+            assert_eq!(sent.server, Some(live), "{method}");
+            assert_eq!(sent.result.unwrap().status(), 200, "{method}");
+            up.await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn a_request_that_was_sent_goes_on_only_if_it_does_no_harm_when_sent_twice() {
+    run(async {
+        for (method, goes_on) in [("GET", true), ("POST", false)] {
+            let (silent, seen) = silent().await;
+            let (live, up) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
+            let ctx = ctx_of(&ForwardConfig::of(&[silent, live]), config());
+            let sent = forward(bare(&ctx, method), ctx.upstreams.group(0), &ctx, far()).await;
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "{method}");
+            if goes_on {
+                assert_eq!(sent.server, Some(live));
+                assert_eq!(sent.result.unwrap().status(), 200);
+                up.await.unwrap();
+            } else {
+                // It stops at the first server: the second one is not asked.
+                assert_eq!(sent.server, Some(silent));
+                assert_eq!(refused(sent.result), OriginError::Send);
+                assert!(!up.is_finished());
+                up.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn each_server_is_tried_once_and_a_group_with_none_to_try_is_unavailable() {
+    run(async {
+        let mut addresses = Vec::new();
+        let mut counts = Vec::new();
+        for _ in 0..3 {
+            let (addr, seen) = silent().await;
+            addresses.push(addr);
+            counts.push(seen);
+        }
+        let ctx = ctx_of(&ForwardConfig::of(&addresses), config());
+        let group = ctx.upstreams.group(0);
+        let tried = |counts: &[Arc<AtomicUsize>]| -> Vec<usize> {
+            counts.iter().map(|c| c.load(Ordering::SeqCst)).collect()
+        };
+        let sent = forward(bare(&ctx, "GET"), group, &ctx, far()).await;
+        assert_eq!(refused(sent.result), OriginError::Send);
+        assert_eq!(tried(&counts), [1, 1, 1]);
+        // Each one failed once, and one failure leaves a server out: the next request has none to try.
+        let sent = forward(bare(&ctx, "GET"), group, &ctx, far()).await;
+        assert_eq!(sent.server, None);
+        assert_eq!(refused(sent.result), OriginError::Unavailable);
+        assert_eq!(tried(&counts), [1, 1, 1]);
+    });
+}
+
+/// A server that takes each connection and never answers. It counts the connections.
+async fn mute() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let counted = count.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            held.push(sock);
+        }
+    });
+    (addr, count)
+}
+
+/// A server where a new connection stays pending: its queue of connections is full, and what is more is neither
+/// taken nor refused. The listener and the connections that fill the queue are returned to be kept.
+async fn stalled() -> (SocketAddr, (TcpListener, Vec<TcpStream>)) {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(1).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut filled = Vec::new();
+    loop {
+        match timeout(Duration::from_millis(200), TcpStream::connect(addr)).await {
+            Ok(Ok(sock)) => filled.push(sock),
+            Ok(Err(e)) => panic!("the connection failed: {e}"),
+            Err(_) => break,
+        }
+        assert!(filled.len() < 64, "the queue of the listener does not fill");
+    }
+    (addr, (listener, filled))
+}
+
+/// The servers that the group gives over four choices, none tried.
+fn gives(group: &Group) -> Vec<usize> {
+    (0..4)
+        .filter_map(|_| group.pick(Tried::default(), Instant::now()))
+        .collect()
+}
+
+/// A GET to a group of `slow`, which holds up one stage, and a live server, with the request time ending at `by`.
+/// `own`: the limit of the stage in `cfg` comes first, so the server failed. It is left out, and the request went
+/// on to the live server. Otherwise the end of the request time comes first and no server is at fault: nothing is
+/// counted, and the request ends there.
+async fn held_up(slow: SocketAddr, cfg: ProxyConfig, by: Instant, own: bool) {
+    let (live, up) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
+    let ctx = ctx_of(&ForwardConfig::of(&[slow, live]), cfg);
+    let group = ctx.upstreams.group(0);
+    let sent = forward(bare(&ctx, "GET"), group, &ctx, by).await;
+    if own {
+        assert_eq!(sent.server, Some(live));
+        assert_eq!(sent.result.unwrap().status(), 200);
+        up.await.unwrap();
+        assert!(!gives(group).contains(&0), "the server is left out");
+    } else {
+        assert_eq!(sent.server, Some(slow));
+        assert_eq!(refused(sent.result), OriginError::Late);
+        assert!(!up.is_finished(), "the live server was not asked");
+        up.abort();
+        assert!(gives(group).contains(&0), "the server is not left out");
+    }
+}
+
+#[test]
+fn a_head_wait_cut_short_by_the_request_time_is_not_the_fault_of_the_server() {
+    run(async {
+        for own in [true, false] {
+            let (mute, seen) = mute().await;
+            let mut cfg = config();
+            // One failure leaves a server out. The wait for the head lasts 0.3 s or 5 s, and the request time
+            // ends after 0.3 s or 30 s.
+            cfg.upstream_header = Duration::from_millis(if own { 300 } else { 5000 });
+            let by = Instant::now() + Duration::from_millis(if own { 30_000 } else { 300 });
+            held_up(mute, cfg, by, own).await;
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "own: {own}");
+        }
+    });
+}
+
+#[test]
+fn a_connect_cut_short_by_the_request_time_is_not_the_fault_of_the_server() {
+    run(async {
+        for own in [true, false] {
+            let (stalled, _kept) = stalled().await;
+            let mut cfg = config();
+            cfg.upstream_connect = Duration::from_millis(if own { 300 } else { 5000 });
+            let by = Instant::now() + Duration::from_millis(if own { 30_000 } else { 300 });
+            held_up(stalled, cfg, by, own).await;
+        }
+    });
+}
+
+#[test]
+fn a_request_time_that_is_used_up_before_the_first_try_asks_no_server_and_is_late() {
+    run(async {
+        let (mute, seen) = mute().await;
+        let ctx = ctx_of(&ForwardConfig::of(&[mute]), config());
+        let group = ctx.upstreams.group(0);
+        let sent = forward(bare(&ctx, "GET"), group, &ctx, Instant::now()).await;
+        assert_eq!(sent.server, None);
+        assert_eq!(refused(sent.result), OriginError::Late);
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn only_a_refusal_a_reset_or_an_unreachable_server_fails_a_connect_other_errors_are_local() {
+    for kind in [
+        io::ErrorKind::ConnectionRefused,
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::HostUnreachable,
+        io::ErrorKind::NetworkUnreachable,
+        io::ErrorKind::TimedOut,
+    ] {
+        assert_eq!(
+            connect_error(&io::Error::from(kind)),
+            OriginError::Connect,
+            "{kind:?}"
+        );
+    }
+    // ENOMEM, ENFILE, EMFILE, ENOBUFS, EADDRNOTAVAIL, EPERM; and an error that has no number.
+    for errno in [12, 23, 24, 105, 99, 1] {
+        assert_eq!(
+            connect_error(&io::Error::from_raw_os_error(errno)),
+            OriginError::Local,
+            "{errno}"
+        );
+    }
+    assert_eq!(connect_error(&io::Error::other("x")), OriginError::Local);
+    // Such an error and a time that ran out are counted against no server, and are not tried on another.
+    for error in [OriginError::Local, OriginError::Late] {
+        assert!(!failure_of_server(error), "{error:?}");
+        assert!(!may_go_on(error, &Method::GET), "{error:?}");
+    }
+}
+
+/// A GET to a group of two servers: the first is served by `serve`, the other answers 200. Tells what came of it
+/// (the status, or why there was none), whether it went on to the second server, and whether the first one is
+/// left out of the group afterwards.
+async fn first_of_two<T, F, Fut>(
+    serve: F,
+    cfg: ProxyConfig,
+) -> (Result<u16, OriginError>, bool, bool)
+where
+    F: FnOnce(TcpStream) -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (first, _) = upstream(serve).await;
+    let (second, _) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
+    let ctx = ctx_of(&ForwardConfig::of(&[first, second]), cfg);
+    let group = ctx.upstreams.group(0);
+    let sent = forward(bare(&ctx, "GET"), group, &ctx, far()).await;
+    let went_on = sent.server == Some(second);
+    let result = sent.result.map(|response| response.status().as_u16());
+    (result, went_on, !gives(group).contains(&0))
+}
+
+#[test]
+fn a_head_over_a_limit_is_not_the_fault_of_the_server_and_is_not_tried_on_another() {
+    run(async {
+        // What the request alone can make an upstream say (a path, an `Origin` or a `Cookie` that it repeats into
+        // a `Location` or a `Set-Cookie`): a field longer than hyper takes, more fields than it takes (64), and
+        // more bytes up to the final head than the cap.
+        let mut long = b"HTTP/1.1 200 OK\r\nX-Long: ".to_vec();
+        long.extend_from_slice(&[b'a'; 9000]);
+        long.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+        let mut many = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for i in 0..65 {
+            many.extend_from_slice(format!("X-{i}: a\r\n").as_bytes());
+        }
+        many.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+        let mut early = Vec::new();
+        for _ in 0..60 {
+            early.extend_from_slice(b"HTTP/1.1 102 Processing\r\n\r\n");
+        }
+        early.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let cap = early.len() - 1;
+        for (name, reply, cap) in [
+            ("long", long, 65536),
+            ("many", many, 65536),
+            ("early", early, cap),
+        ] {
+            let mut cfg = config();
+            cfg.upstream_head_wire = cap;
+            let (result, went_on, left_out) =
+                first_of_two(move |sock| answering(sock, reply, false), cfg).await;
+            assert_eq!(result, Err(OriginError::Invalid), "{name}");
+            assert!(!went_on, "{name}: it was tried on the second server");
+            assert!(!left_out, "{name}: the server is left out");
+        }
+    });
+}
+
+#[test]
+fn a_connection_reset_in_the_middle_of_a_head_is_the_fault_of_the_server() {
+    run(async {
+        let (result, went_on, left_out) = first_of_two(
+            |sock| async move {
+                read_request(&sock).await;
+                put(&sock, b"HTTP/1.1 20").await.unwrap();
+                // Closing with a reset in place of the end of the stream.
+                sock.set_zero_linger().unwrap();
+            },
+            config(),
+        )
+        .await;
+        assert_eq!(result, Ok(200));
+        assert!(went_on, "it was not tried on the second server");
+        assert!(left_out, "the server is not left out");
     });
 }

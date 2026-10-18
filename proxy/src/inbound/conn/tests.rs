@@ -1,5 +1,6 @@
 use std::future::poll_fn;
 use std::io::Write;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::{self, JoinHandle};
@@ -14,9 +15,11 @@ use tokio::time::{sleep, timeout};
 use tukuyomi_kernel::Verdict;
 
 use super::*;
+use crate::config::ForwardConfig;
 use crate::inbound::session::{run as run_session, serve};
 use crate::inspect::driver::Outcome;
 use crate::log::start_logger;
+use crate::route::{Rule, Table};
 use crate::rules::routes::{Route, Routes};
 
 pub(in crate::inbound) const FORM: &str = "application/x-www-form-urlencoded";
@@ -54,7 +57,6 @@ pub(in crate::inbound) fn config() -> ProxyConfig {
     let secs = Duration::from_secs;
     ProxyConfig {
         listen: "127.0.0.1:1".parse().unwrap(),
-        upstream: "127.0.0.1:2".parse().unwrap(),
         max_conns: 16,
         max_head_bytes: 8192,
         max_body: 1024,
@@ -179,7 +181,18 @@ pub(in crate::inbound) fn run<F: std::future::Future>(body: F) -> F::Output {
 }
 
 impl Rig {
+    /// A rig whose one group has one server, at an address where nothing listens, so a request that goes on ends
+    /// in 502.
     pub(in crate::inbound) async fn new(cfg: ProxyConfig, mode: Mode) -> Rig {
+        let server = "127.0.0.1:2".parse().unwrap();
+        Rig::with(cfg, mode, &ForwardConfig::of(&[server])).await
+    }
+
+    pub(in crate::inbound) async fn with(
+        cfg: ProxyConfig,
+        mode: Mode,
+        forward: &ForwardConfig,
+    ) -> Rig {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let budget = Arc::new(Semaphore::new(cfg.max_buffered_bytes));
         let (tx, rx) = sync_channel(if matches!(mode, Mode::Full) {
@@ -188,7 +201,7 @@ impl Rig {
             PERMITS + 1
         });
         let ctx = Arc::new(Ctx {
-            pool: Pool::new(&cfg),
+            upstreams: Upstreams::new(forward, &cfg),
             cfg,
             budget,
             inspect: Arc::new(Semaphore::new(PERMITS)),
@@ -481,6 +494,40 @@ fn a_request_under_a_route_goes_on_to_the_upstream_when_the_inspection_cannot_ta
             let (status, seen) = routed(mode, used_up, "/dynamic").await;
             assert_eq!(status, 503, "not under the route");
             assert!(seen.is_empty());
+        }
+    });
+}
+
+/// A forwarding configuration with one group at an address where nothing listens, which only a request for the
+/// host `h.test` is routed to.
+pub(in crate::inbound) fn routed_to_h_test() -> ForwardConfig {
+    let mut forward = ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]);
+    let rule = Rule::forward(Some("h.test"), None).unwrap();
+    forward.routes = Table::new(vec![(rule, 0)]).unwrap();
+    forward.default = None;
+    forward
+}
+
+#[test]
+fn a_request_that_no_route_holds_for_is_answered_with_404_and_is_not_inspected() {
+    run(async {
+        // The inspection answers every ticket with a block. A request for the routed host (in any case, with
+        // any port) is inspected and blocked; one for another host is answered with 404 and makes no ticket.
+        for (host, status, inspected) in [
+            ("h.test", 403, 1),
+            ("H.TEST:8080", 403, 1),
+            ("other.test", 404, 0),
+        ] {
+            let rig = Rig::with(config(), Mode::Answer(BLOCK), &routed_to_h_test()).await;
+            let (client, task) = rig.connect().await;
+            let request = format!(
+                "POST /a HTTP/1.1\r\nHost: {host}\r\nContent-Type: {FORM}\r\nContent-Length: 3\r\n\r\na=b"
+            );
+            put(&client, request.as_bytes()).await;
+            let response = parse_response(&read_all(&client).await);
+            drop(client);
+            let seen = rig.finish(task).await;
+            assert_eq!((response.status, seen.len()), (status, inspected), "{host}");
         }
     });
 }

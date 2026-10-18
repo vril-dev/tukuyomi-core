@@ -1,12 +1,15 @@
-//! One request of a connection: the body, the inspection, and then the answer or the forwarding.
+//! One request of a connection: the route, the body, the inspection, and then the answer or the forwarding.
 //!
 //! The head was checked by `head` and passed by `gate` before this runs, and the session hands it over with the
-//! request that hyper made of the same bytes. The body is read through hyper into a budgeted buffer, a gzip body
-//! is decoded by `represent::gunzip` (exactly one member, at most `max_body` bytes of output), and then the
-//! request either matches a route of the generation that serves, and is forwarded without being inspected, or is
-//! handed to the inspection driver as a ticket, and only an `Allow` or a `Detected` is forwarded. A request under a
-//! route takes no inspection permit, no byte of the kernel's copy and no place in the driver's channel, so it goes
-//! on also when the inspection is full or the inspector is down.
+//! request that hyper made of the same bytes. The upstream group for the request is looked up first, by its `Host`
+//! and its target; a request that no route holds for, with no default group, is answered with 404 before anything
+//! of its body is read and before the inspection is asked for. The body is read through hyper into a budgeted
+//! buffer, a gzip body is decoded by `represent::gunzip` (exactly one member, at most `max_body` bytes of output),
+//! and then the request either matches a route of the generation that serves, and is forwarded without being
+//! inspected, or is handed to the inspection driver as a ticket, and only an `Allow` or a `Detected` is forwarded
+//! (to a server of the group that was looked up). A request under a route takes no inspection permit, no byte of
+//! the kernel's copy and no place in the driver's channel, so it goes on also when the inspection is full or the
+//! inspector is down.
 //! What is inspected and what is forwarded is the same request, in the form that `represent` builds it: the
 //! decoded body, without its `Content-Encoding`, with its decoded length.
 //!
@@ -21,7 +24,7 @@
 //! the connection time counted from the accept. A sum that does not fit into the clock counts as passed.
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -36,9 +39,11 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::config::ProxyConfig;
 use crate::forward::client_ip;
+use crate::forward::group::{Group, Upstreams};
 use crate::forward::origin::{self, Forward, OriginBody, OriginError};
-use crate::forward::pool::Pool;
-use crate::inbound::answer::{Abort, Decision, Out, Passed, Reply, Stop, answer, decide};
+use crate::inbound::answer::{
+    Abort, Decision, Noted, Out, Passed, Reply, Stop, Via, answer, decide,
+};
 use crate::inbound::head::{Head, Reject};
 use crate::inbound::io::Gauge;
 use crate::inbound::represent::{Represented, gunzip, represent};
@@ -48,13 +53,14 @@ use crate::rules::routes::SharedRoutes;
 
 /// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
 /// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, the
-/// connections to the upstream that wait to be used again, and the way to the driver.
+/// upstream groups with the routes to them and the connections that wait to be used again, and the way to the
+/// driver.
 pub struct Ctx {
     pub cfg: ProxyConfig,
     pub budget: Arc<Semaphore>,
     pub inspect: Arc<Semaphore>,
     pub routes: SharedRoutes,
-    pub pool: Pool,
+    pub upstreams: Upstreams,
     pub log: Log,
     pub ingress: Arc<Ingress>,
 }
@@ -90,13 +96,13 @@ pub(super) struct Conn {
     ingress: Mutex<Option<SyncSender<Msg>>>,
     /// The body of the request was read to its end.
     read_done: AtomicBool,
+    /// Where the request was sent, set when it is.
+    via: Mutex<Option<Via>>,
 }
 
-/// What a request came to: the reply for the record and the address of the client it is recorded under, and the
-/// response, or the order to close without one.
+/// What a request came to: what the record shows of it, and the response, or the order to close without one.
 pub(super) struct Handled {
-    pub(super) reply: Reply,
-    pub(super) client: IpAddr,
+    pub(super) noted: Noted,
     pub(super) response: Result<Response<Out>, Abort>,
 }
 
@@ -126,6 +132,7 @@ impl Conn {
             head_end: Instant::now(),
             ingress: Mutex::new(ctx.ingress.sender()),
             read_done: AtomicBool::new(false),
+            via: Mutex::new(None),
         }
     }
 
@@ -154,9 +161,17 @@ impl Conn {
                 Err(Abort),
             ),
         };
+        let via = self
+            .via
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         Handled {
-            reply,
-            client: self.client.ip(),
+            noted: Noted {
+                reply,
+                client: self.client.ip(),
+                via,
+            },
             response,
         }
     }
@@ -167,6 +182,7 @@ impl Conn {
         parts: Parts,
         body: Incoming,
     ) -> Result<(Response<OriginBody>, Passed), Stop> {
+        let group = self.route()?;
         let (bytes, budget) = self.read_body(body).await?;
         let (bytes, budget) = if self.head.gzip() {
             self.unpack(bytes, budget)?
@@ -195,20 +211,38 @@ impl Conn {
             body,
             peer: self.peer,
         };
-        origin::forward(forward, &self.ctx, self.request_by)
-            .await
-            .map(|response| (response, passed))
-            .map_err(|e| {
-                Reply::failed(
-                    502,
-                    match e {
-                        OriginError::Connect => "upstream connection failed",
-                        OriginError::Send => "upstream send failed",
-                        OriginError::Head => "upstream response head failed",
-                        OriginError::Invalid => "upstream response invalid",
-                    },
-                )
-                .into()
+        let sent = origin::forward(forward, group, &self.ctx, self.request_by).await;
+        *self.via.lock().unwrap_or_else(PoisonError::into_inner) = Some(Via {
+            group: group.name().clone(),
+            server: sent.server,
+        });
+        sent.result.map(|response| (response, passed)).map_err(|e| {
+            match e {
+                OriginError::Unavailable => Reply::failed(502, "upstream unavailable"),
+                OriginError::Connect => Reply::failed(502, "upstream connection failed"),
+                OriginError::Send => Reply::failed(502, "upstream send failed"),
+                OriginError::Head => Reply::failed(502, "upstream response head failed"),
+                OriginError::Invalid => Reply::failed(502, "upstream response invalid"),
+                // Not the fault of the upstream: the answers of the proxy's own limits are 503.
+                OriginError::Late => Reply::failed(503, "request time used up"),
+                OriginError::Local => Reply::failed(503, "local connection failure"),
+            }
+            .into()
+        })
+    }
+
+    /// The group the request goes to. A request that no route holds for, and that has no default group, is
+    /// answered with 404 here, before its body is read; the connection goes on after that answer only if there
+    /// was no body to read.
+    fn route(&self) -> Result<&Group, Stop> {
+        self.ctx
+            .upstreams
+            .find(self.head.host(), self.head.target())
+            .ok_or_else(|| {
+                if !self.head.chunked() && self.head.content_length().unwrap_or(0) == 0 {
+                    self.read_done.store(true, Ordering::Release);
+                }
+                Reply::rejected(404, "no route matches").into()
             })
     }
 
@@ -322,7 +356,7 @@ impl Conn {
             .ctx
             .routes
             .current()
-            .matches(host_of(&headers), self.head.target())
+            .matches(self.head.host(), self.head.target())
         {
             // No ticket will be sent, so the way to the driver is let go as it is after a ticket.
             drop(
@@ -381,14 +415,6 @@ impl Conn {
             Decision::Answer(reply) => Err(reply.into()),
         }
     }
-}
-
-/// The value of the `Host` field of the request. The head check has made sure that there is exactly one.
-fn host_of(headers: &[(Bytes, Bytes)]) -> Option<&[u8]> {
-    headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(b"host"))
-        .map(|(_, value)| &value[..])
 }
 
 /// Whether the body failed because the peer went away, not because of what it sent.

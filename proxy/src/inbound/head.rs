@@ -135,6 +135,13 @@ impl Head {
         &self.buf[self.target.clone()]
     }
 
+    /// The value of the `Host` field. The head check has made sure that there is exactly one.
+    pub fn host(&self) -> Option<&[u8]> {
+        self.fields()
+            .find(|(name, _)| name.eq_ignore_ascii_case(b"host"))
+            .map(|(_, value)| value)
+    }
+
     /// The fields in the order received, as name and value.
     pub fn fields(&self) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> {
         self.fields

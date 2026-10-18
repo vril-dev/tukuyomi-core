@@ -100,12 +100,45 @@ fn a_route_with_a_host_holds_for_that_host_in_any_case_and_for_no_other() {
         assert!(!hit(&routes, host, "/api/x"), "{host}");
     }
     assert!(hit(&routes, "EXAMPLE.test", "/health"));
-    assert!(!hit(&routes, "example.test.", "/health"));
+    // A route is for the name as the request wrote it: the upstream gets the `Host` with its trailing dot, so a
+    // name with one is not the route's host, and the request is inspected. A name with an empty label is not either.
+    for host in ["example.test.", "example.test.:80", "EXAMPLE.test.:8080"] {
+        assert!(!hit(&routes, host, "/health"), "{host}");
+    }
+    assert!(!hit(&routes, "example.test.:8080", "/api/x"));
+    assert!(!hit(&routes, "example..test", "/health"));
     assert!(!routes.matches(None, b"/api/x"));
     // A route without a host holds for every host, and for a request that has none.
     let any = table(&[(None, "/s/")]);
     assert!(any.matches(None, b"/s/x"));
     assert!(hit(&any, "whatever.test", "/s/x"));
+    assert!(hit(&any, "whatever.test.", "/s/x"));
+}
+
+#[test]
+fn a_route_without_a_port_holds_for_every_port_and_one_with_a_port_for_that_port_only() {
+    let routes = table(&[
+        (Some("example.test"), "/a/"),
+        (Some("other.test:8080"), "/b/"),
+    ]);
+    for host in ["example.test", "example.test:80", "EXAMPLE.test:65535"] {
+        assert!(hit(&routes, host, "/a/x"), "{host}");
+    }
+    assert!(!hit(&routes, "example.test:0", "/a/x"));
+    assert!(hit(&routes, "other.test:8080", "/b/x"));
+    for host in ["other.test", "other.test:80"] {
+        assert!(!hit(&routes, host, "/b/x"), "{host}");
+    }
+}
+
+#[test]
+fn a_route_is_not_a_wildcard_and_not_wider_than_a_path_of_two_bytes() {
+    // The manifest is checked by the inspector in this form, so the proxy writes no other.
+    assert_eq!(
+        refused(Some("*.example.test"), "/a/"),
+        "a route host is malformed"
+    );
+    assert!(refused(None, "/").contains("/ alone"));
 }
 
 #[test]

@@ -1,10 +1,11 @@
-//! The connections to the upstream that wait to be used again.
+//! The connections to the servers of one upstream group that wait to be used again.
 //!
 //! A connection that has carried a whole answer, and that neither side has ended, goes back here instead of being
-//! closed. At most `upstream_keepalive` of them wait; when one more comes, the one that has waited longest is
-//! closed. A connection waits for at most `upstream_keepalive_timeout` and carries at most
-//! `upstream_keepalive_requests` requests. The newest waiting connection is taken first, so the others age out
-//! when the load is low.
+//! closed. At most `upstream_keepalive` of them wait in all, whichever servers of the group they are connected to;
+//! when one more comes, the one that has waited longest is closed. A connection waits for at most
+//! `upstream_keepalive_timeout` and carries at most `upstream_keepalive_requests` requests. A connection is taken
+//! only for the server it is connected to, and the newest waiting connection of that server is taken first, so the
+//! others age out when the load is low.
 //!
 //! A connection ends by itself at the end of its wait: when it goes back, the idle limit of its reads becomes
 //! `upstream_keepalive_timeout`, and when it is taken the caller puts the limit of the request back (see
@@ -62,6 +63,8 @@ impl Lease {
 
 struct Idle {
     lease: Lease,
+    /// The server it is connected to: its place in the group.
+    server: usize,
     /// When it went back into the pool.
     since: Instant,
 }
@@ -74,10 +77,13 @@ struct Shared {
     requests: usize,
 }
 
-/// The waiting connections to the upstream. A handle: a clone is the same pool.
+/// The waiting connections to the servers of a group, seen from one of the servers: it takes and returns the
+/// connections to that server. A handle: a clone is the same pool.
 #[derive(Clone)]
 pub struct Pool {
     shared: Arc<Shared>,
+    /// The server this handle is for: its place in the group.
+    server: usize,
 }
 
 fn lock(idle: &Mutex<VecDeque<Idle>>) -> MutexGuard<'_, VecDeque<Idle>> {
@@ -85,8 +91,8 @@ fn lock(idle: &Mutex<VecDeque<Idle>>) -> MutexGuard<'_, VecDeque<Idle>> {
 }
 
 impl Pool {
-    /// A pool as `upstream_keepalive`, `upstream_keepalive_timeout` and `upstream_keepalive_requests` say. With
-    /// `upstream_keepalive` 0 nothing waits.
+    /// The pool of a group, as `upstream_keepalive`, `upstream_keepalive_timeout` and `upstream_keepalive_requests`
+    /// say, seen from its first server. With `upstream_keepalive` 0 nothing waits.
     pub fn new(cfg: &ProxyConfig) -> Pool {
         Pool {
             shared: Arc::new(Shared {
@@ -95,6 +101,15 @@ impl Pool {
                 timeout: cfg.upstream_keepalive_timeout,
                 requests: cfg.upstream_keepalive_requests,
             }),
+            server: 0,
+        }
+    }
+
+    /// The same pool, seen from the server at `index` of the group.
+    pub fn of(&self, index: usize) -> Pool {
+        Pool {
+            shared: self.shared.clone(),
+            server: index,
         }
     }
 
@@ -112,17 +127,25 @@ impl Pool {
         f(&mut idle)
     }
 
-    /// The newest waiting connection that can carry a request, or `None` if there is none (the caller connects).
-    /// A connection that is closed, or not ready by `by`, is dropped. The cap of its socket and the idle limit of
-    /// its reads are those of the wait, and the caller gives it those of the request (`Gauge::rearm`).
+    /// The newest waiting connection to the server that can carry a request, or `None` if there is none (the caller
+    /// connects). A connection that is closed is dropped, and so is one that is not ready by `by`; `by` has passed
+    /// then, and the connections that are left stay where they are. The cap of its socket and the idle limit of its
+    /// reads are those of the wait, and the caller gives it those of the request (`Gauge::rearm`).
     pub(super) async fn take(&self, by: Instant) -> Option<Lease> {
         loop {
-            let mut lease = self.with(VecDeque::pop_back)?.lease;
+            let mut lease = self
+                .with(|idle| {
+                    let at = idle.iter().rposition(|next| next.server == self.server)?;
+                    idle.remove(at)
+                })?
+                .lease;
             if lease.sender.is_closed() {
                 continue;
             }
-            if let Ok(Ok(())) = timeout_at(by, lease.sender.ready()).await {
-                return Some(lease);
+            match timeout_at(by, lease.sender.ready()).await {
+                Ok(Ok(())) => return Some(lease),
+                Ok(Err(_)) => {}
+                Err(_) => return None,
             }
         }
     }
@@ -131,7 +154,8 @@ impl Pool {
     /// its socket was cut off, if it is not ready to carry a request now (it is closed), if the bytes of the
     /// request are still waiting to be written (the upstream answered without reading them, and a request sent
     /// on this connection would wait behind them), or if the pool keeps none. A connection that stays has the
-    /// idle limit of its reads set to the time it may wait, so it closes by itself at the end of that time.
+    /// idle limit of its reads set to the time it may wait, so it closes by itself at the end of that time. Room for
+    /// it is made by closing the connection that has waited longest in the group, to whichever server.
     pub(super) fn put(&self, lease: Lease) {
         let shared = &self.shared;
         if shared.most == 0
@@ -149,12 +173,13 @@ impl Pool {
             }
             idle.push_back(Idle {
                 lease,
+                server: self.server,
                 since: Instant::now(),
             });
         });
     }
 
-    /// The number of waiting connections, for the tests.
+    /// The number of waiting connections in the group, for the tests.
     #[cfg(test)]
     pub(super) fn waiting(&self) -> usize {
         lock(&self.shared.idle).len()

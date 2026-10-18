@@ -1,18 +1,19 @@
-//! The configuration file: one JSON object `{"proxy": {..}, "kernel": {..}, "rules": {"store": {..}}}`; every
-//! value is chosen by the operator and checked here.
+//! The configuration file: one JSON object `{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store":
+//! {..}}}`; every value is chosen by the operator and checked here.
 //!
-//! The file is read whole (at most 64 KiB, UTF-8) and deserialized into plain structs. Every key must be present;
-//! an unknown or repeated key is refused, and so is a value of the wrong type, an array in place of an object
-//! included. A refusal is one fixed sentence per kind of fault and never carries a key or a value from the file.
-//! Then the values are checked in a fixed order and the first broken rule is returned: the `proxy` bounds, the
-//! `rules.store` values, the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's own
-//! check, and last the relations between the `proxy` and `kernel` objects.
+//! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present
+//! (a route may leave out its `host` and its `path`); an unknown or repeated key is refused, and so is a value of the
+//! wrong type, an array in place of an object included. A refusal is one fixed sentence per kind of fault and never
+//! carries a key or a value from the file. Then the values are checked in a fixed order and the first broken rule is
+//! returned: the `proxy` bounds, the `forward` values (see `forward`), the `rules.store` values, the conversion of
+//! the `kernel` object into `tukuyomi_kernel::Config` with that type's own check, and last the relations between the
+//! `proxy` and `kernel` objects.
 //!
 //! Times are whole milliseconds under keys that end in `_ms`; the `proxy` times run from 1 ms to 3600 s, except
 //! `keepalive_timeout_ms`, which also takes 0 (a connection is not kept after its response), and `conn_total_ms`,
 //! which runs up to 24 h.
 //! `trusted_proxies` is a list of networks, `address/prefix` in the form `Cidr::parse` takes, and may be empty.
-//! `listen` and `upstream` are an IP literal and a port (`[..]:port` for IPv6). `rules.store.kind` is `file`, the
+//! `listen` is an IP literal and a port (`[..]:port` for IPv6). `rules.store.kind` is `file`, the
 //! only kind there is, and `dir` is an absolute clean path of at most 3840 bytes. The `kernel` object has no
 //! rules path and no rules fingerprint: the directory and the fingerprint of the chosen generation come from the
 //! rules store when the proxy starts (`KernelSettings::for_generation`).
@@ -35,7 +36,11 @@ use tukuyomi_kernel::limits::{BODY, HEADER_TOTAL};
 use crate::forward::client_ip::Cidr;
 use crate::rules::bundle::Fingerprint;
 
-const MAX_FILE: u64 = 64 * 1024;
+mod forward;
+
+pub use forward::{ForwardConfig, GroupConfig, ServerConfig};
+
+const MAX_FILE: u64 = 256 * 1024;
 /// Longest accepted `rules.store.dir` in bytes: the paths below it must stay inside the Linux `PATH_MAX`. A guard
 /// against a wrong setting, not a recommendation.
 const MAX_STORE_DIR: usize = 3840;
@@ -51,7 +56,6 @@ const GIB: u64 = 1 << 30;
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
     pub listen: SocketAddr,
-    pub upstream: SocketAddr,
     pub max_conns: usize,
     pub max_head_bytes: usize,
     pub max_body: usize,
@@ -91,12 +95,12 @@ pub struct ProxyConfig {
     /// The peers that are believed when they say who the client is, by the `X-Forwarded-For` of a request. Empty:
     /// the client is always the peer.
     pub trusted_proxies: Vec<Cidr>,
-    /// The most connections to the upstream that wait to be used again. Zero: a connection is closed after its
-    /// answer.
+    /// The most connections that wait to be used again in each upstream group, to all its servers together. Zero: a
+    /// connection is closed after its answer.
     pub upstream_keepalive: usize,
-    /// How long a connection to the upstream waits to be used again.
+    /// How long a connection to a server waits to be used again.
     pub upstream_keepalive_timeout: Duration,
-    /// The most requests one connection to the upstream carries.
+    /// The most requests one connection to a server carries.
     pub upstream_keepalive_requests: usize,
 }
 
@@ -104,6 +108,7 @@ pub struct ProxyConfig {
 #[derive(Clone, Debug)]
 pub struct Loaded {
     pub proxy: ProxyConfig,
+    pub forward: ForwardConfig,
     pub kernel: KernelSettings,
     pub store: StoreConfig,
 }
@@ -144,6 +149,7 @@ pub struct ConfigError(pub &'static str);
 #[serde(deny_unknown_fields)]
 struct RawFile {
     proxy: Object<RawProxy>,
+    forward: Object<forward::RawForward>,
     kernel: Object<RawKernel>,
     rules: Object<RawRules>,
 }
@@ -152,7 +158,6 @@ struct RawFile {
 #[serde(deny_unknown_fields)]
 struct RawProxy {
     listen: String,
-    upstream: String,
     max_conns: usize,
     max_head_bytes: usize,
     max_body: usize,
@@ -265,12 +270,17 @@ pub fn load(path: &Path) -> Result<Loaded, ConfigError> {
 
 fn parse(bytes: &[u8]) -> Result<Loaded, ConfigError> {
     if !u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_FILE) {
-        return Err(ConfigError("configuration file is over 64 KiB"));
+        return Err(ConfigError("configuration file is over 256 KiB"));
     }
     let text =
         std::str::from_utf8(bytes).map_err(|_| ConfigError("configuration file is not UTF-8"))?;
     let Object(file): Object<RawFile> = serde_json::from_str(text).map_err(|e| refusal(&e))?;
-    build(file.proxy.0, file.rules.0.store.0, file.kernel.0)
+    build(
+        file.proxy.0,
+        file.forward.0,
+        file.rules.0.store.0,
+        file.kernel.0,
+    )
 }
 
 /// The fixed sentence for a deserialization fault. The text of the fault is only used to tell the kinds apart.
@@ -342,20 +352,16 @@ fn inspect_floor(kernel: &tukuyomi_kernel::Config, slice: Duration) -> Option<Du
         .checked_add(steps)
 }
 
-fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> {
+fn build(
+    p: RawProxy,
+    f: forward::RawForward,
+    s: RawStore,
+    k: RawKernel,
+) -> Result<Loaded, ConfigError> {
     let listen = address(
         &p.listen,
         "listen is not an IP address and port",
         "listen port is 0",
-    )?;
-    let upstream = address(
-        &p.upstream,
-        "upstream is not an IP address and port",
-        "upstream port is 0",
-    )?;
-    ensure(
-        !same(listen, upstream),
-        "listen and upstream are the same address",
     )?;
     ensure(within(p.max_conns, 1, 65536), "max_conns is out of range")?;
     ensure(
@@ -450,6 +456,8 @@ fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> 
         "upstream_keepalive_requests is out of range",
     )?;
 
+    let forward = forward::check(f, listen)?;
+
     ensure(s.kind == "file", "rules store kind is not supported")?;
     let dir = PathBuf::from(s.dir);
     ensure(
@@ -513,13 +521,15 @@ fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> 
         inspect_wait <= request_total,
         "inspect_wait_ms is above request_total_ms",
     )?;
+    // The two stages of the exchange with the upstream follow each other, and both must end before the request time
+    // does. A server that holds a stage up is counted against only if the limit of the stage comes first; if the end
+    // of the request time comes first, the request ends there and no server is at fault. A slow client or a long
+    // inspection can still use up the time that is left, and the request then ends the same way.
     ensure(
-        upstream_connect <= request_total,
-        "upstream_connect_ms is above request_total_ms",
-    )?;
-    ensure(
-        upstream_header <= request_total,
-        "upstream_header_ms is above request_total_ms",
+        upstream_connect
+            .checked_add(upstream_header)
+            .is_some_and(|n| n < request_total),
+        "upstream_connect_ms plus upstream_header_ms is not below request_total_ms",
     )?;
     ensure(
         request_total <= conn_total,
@@ -571,7 +581,6 @@ fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> 
     Ok(Loaded {
         proxy: ProxyConfig {
             listen,
-            upstream,
             max_conns: p.max_conns,
             max_head_bytes: p.max_head_bytes,
             max_body: p.max_body,
@@ -603,6 +612,7 @@ fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> 
             upstream_keepalive_timeout,
             upstream_keepalive_requests: p.upstream_keepalive_requests,
         },
+        forward,
         kernel: KernelSettings(kernel),
         store: StoreConfig::File { dir },
     })

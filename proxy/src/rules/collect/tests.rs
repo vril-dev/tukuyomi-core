@@ -96,9 +96,8 @@ fn the_routes_of_the_inputs_go_into_the_manifest_in_the_order_they_are_written()
     let manifest = Manifest::parse(bundle.manifest()).unwrap();
     let listed: Vec<_> = manifest
         .routes()
-        .as_slice()
         .iter()
-        .map(|route| (route.host(), route.path()))
+        .map(|rule| (rule.host(), rule.path().unwrap()))
         .collect();
     assert_eq!(listed, [(None, "/b/"), (Some("h.test"), "/a")]);
     assert!(

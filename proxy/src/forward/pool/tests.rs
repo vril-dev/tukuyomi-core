@@ -7,11 +7,13 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Instant, sleep, timeout};
 
-use crate::config::ProxyConfig;
+use crate::config::{ForwardConfig, ProxyConfig};
+use crate::forward::group::Tried;
+use crate::forward::origin::OriginError;
 use crate::forward::origin::tests::{
-    Outcome, Seen, bare, collect, config, ctx, far, next_request, pull, put, refused, request, run,
+    Outcome, Seen, bare, collect, config, ctx, ctx_of, far, next_request, pull, put, refused,
+    request, run, send,
 };
-use crate::forward::origin::{OriginError, forward};
 use crate::inbound::conn::Ctx;
 
 const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -92,17 +94,22 @@ async fn serve_ok(sock: TcpStream, seen: Arc<Mutex<Vec<Seen>>>, pause: Duration)
     }
 }
 
+/// The connections that wait for the one server.
+fn idle(ctx: &Ctx) -> usize {
+    ctx.upstreams.group(0).server(0).pool().waiting()
+}
+
 /// A configuration that keeps connections.
-fn keeping(addr: SocketAddr) -> ProxyConfig {
+fn keeping() -> ProxyConfig {
     ProxyConfig {
         upstream_keepalive: 32,
-        ..config(addr)
+        ..config()
     }
 }
 
 /// Forwards a request with no body and reads the answer to its end: the status and the body.
 async fn fetch(ctx: &Ctx, method: &str) -> Result<(u16, Vec<u8>), OriginError> {
-    let out: Outcome = forward(bare(ctx, method), ctx, far()).await;
+    let out: Outcome = send(bare(ctx, method), ctx, far()).await;
     let response = out?;
     let status = response.status().as_u16();
     Ok((status, collect(response.into_body()).await.0))
@@ -112,12 +119,12 @@ async fn fetch(ctx: &Ctx, method: &str) -> Result<(u16, Vec<u8>), OriginError> {
 fn requests_to_one_upstream_share_a_connection_and_do_not_ask_it_to_close() {
     run(async {
         let up = Upstream::keeping().await;
-        let ctx = ctx(keeping(up.addr));
+        let ctx = ctx(up.addr, keeping());
         for _ in 0..5 {
             assert_eq!(fetch(&ctx, "GET").await.unwrap(), (200, b"ok".to_vec()));
         }
         assert_eq!(up.accepted(), 1);
-        assert_eq!(ctx.pool.waiting(), 1);
+        assert_eq!(idle(&ctx), 1);
         let seen = up.seen.lock().unwrap();
         assert_eq!(seen.len(), 5);
         assert!(
@@ -131,12 +138,12 @@ fn requests_to_one_upstream_share_a_connection_and_do_not_ask_it_to_close() {
 fn without_a_pool_every_request_has_its_own_connection_and_asks_it_to_close() {
     run(async {
         let up = Upstream::keeping().await;
-        let ctx = ctx(config(up.addr));
+        let ctx = ctx(up.addr, config());
         for _ in 0..3 {
             assert_eq!(fetch(&ctx, "GET").await.unwrap(), (200, b"ok".to_vec()));
         }
         assert_eq!(up.accepted(), 3);
-        assert_eq!(ctx.pool.waiting(), 0);
+        assert_eq!(idle(&ctx), 0);
         up.ended(3).await;
         let seen = up.seen.lock().unwrap();
         assert!(
@@ -150,10 +157,13 @@ fn without_a_pool_every_request_has_its_own_connection_and_asks_it_to_close() {
 fn a_connection_carries_the_configured_number_of_requests_and_no_more() {
     run(async {
         let up = Upstream::keeping().await;
-        let ctx = ctx(ProxyConfig {
-            upstream_keepalive_requests: 2,
-            ..keeping(up.addr)
-        });
+        let ctx = ctx(
+            up.addr,
+            ProxyConfig {
+                upstream_keepalive_requests: 2,
+                ..keeping()
+            },
+        );
         for _ in 0..5 {
             fetch(&ctx, "GET").await.unwrap();
         }
@@ -162,14 +172,17 @@ fn a_connection_carries_the_configured_number_of_requests_and_no_more() {
 
         // One request per connection: nothing is kept.
         let up = Upstream::keeping().await;
-        let ctx = self::ctx(ProxyConfig {
-            upstream_keepalive_requests: 1,
-            ..keeping(up.addr)
-        });
+        let ctx = self::ctx(
+            up.addr,
+            ProxyConfig {
+                upstream_keepalive_requests: 1,
+                ..keeping()
+            },
+        );
         for _ in 0..3 {
             fetch(&ctx, "GET").await.unwrap();
         }
-        assert_eq!((up.accepted(), ctx.pool.waiting()), (3, 0));
+        assert_eq!((up.accepted(), idle(&ctx)), (3, 0));
     });
 }
 
@@ -177,10 +190,13 @@ fn a_connection_carries_the_configured_number_of_requests_and_no_more() {
 fn a_connection_waits_for_the_configured_time_and_not_longer() {
     run(async {
         let up = Upstream::keeping().await;
-        let ctx = ctx(ProxyConfig {
-            upstream_keepalive_timeout: Duration::from_millis(600),
-            ..keeping(up.addr)
-        });
+        let ctx = ctx(
+            up.addr,
+            ProxyConfig {
+                upstream_keepalive_timeout: Duration::from_millis(600),
+                ..keeping()
+            },
+        );
         fetch(&ctx, "GET").await.unwrap();
         sleep(Duration::from_millis(100)).await;
         fetch(&ctx, "GET").await.unwrap();
@@ -198,11 +214,14 @@ fn a_connection_that_waits_closes_itself_at_the_end_of_the_wait() {
     run(async {
         let up = Upstream::keeping().await;
         // The reads of a busy connection may idle for a minute; a waiting one may wait for a third of a second.
-        let ctx = ctx(ProxyConfig {
-            response_idle: Duration::from_secs(60),
-            upstream_keepalive_timeout: Duration::from_millis(300),
-            ..keeping(up.addr)
-        });
+        let ctx = ctx(
+            up.addr,
+            ProxyConfig {
+                response_idle: Duration::from_secs(60),
+                upstream_keepalive_timeout: Duration::from_millis(300),
+                ..keeping()
+            },
+        );
         fetch(&ctx, "GET").await.unwrap();
         let start = Instant::now();
         // Nothing takes or puts a connection from here on, and the upstream still sees this one closed.
@@ -220,11 +239,14 @@ fn a_connection_that_is_taken_gets_the_limit_of_the_request_back() {
         // must not be the limit of the answer.
         let up =
             Upstream::start(|_, sock, seen| serve_ok(sock, seen, Duration::from_millis(600))).await;
-        let ctx = ctx(ProxyConfig {
-            response_idle: Duration::from_secs(60),
-            upstream_keepalive_timeout: Duration::from_millis(400),
-            ..keeping(up.addr)
-        });
+        let ctx = ctx(
+            up.addr,
+            ProxyConfig {
+                response_idle: Duration::from_secs(60),
+                upstream_keepalive_timeout: Duration::from_millis(400),
+                ..keeping()
+            },
+        );
         for _ in 0..3 {
             assert_eq!(fetch(&ctx, "GET").await.unwrap().0, 200);
         }
@@ -251,15 +273,18 @@ fn a_connection_whose_request_is_still_being_written_is_not_kept() {
             sleep(Duration::from_secs(30)).await;
         })
         .await;
-        let ctx = ctx(ProxyConfig {
-            max_buffered_bytes: 64 << 20,
-            ..keeping(up.addr)
-        });
+        let ctx = ctx(
+            up.addr,
+            ProxyConfig {
+                max_buffered_bytes: 64 << 20,
+                ..keeping()
+            },
+        );
         let sent = request(&ctx, "POST", &[("Host", "h.test")], &vec![b'a'; 32 << 20]);
-        let response = forward(sent, &ctx, far()).await.unwrap();
+        let response = send(sent, &ctx, far()).await.unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(collect(response.into_body()).await.0, b"ok");
-        assert_eq!(ctx.pool.waiting(), 0);
+        assert_eq!(idle(&ctx), 0);
     });
 }
 
@@ -268,10 +293,13 @@ fn the_pool_keeps_the_configured_number_and_closes_the_one_that_waited_longest()
     run(async {
         let up =
             Upstream::start(|_, sock, seen| serve_ok(sock, seen, Duration::from_millis(100))).await;
-        let ctx = Arc::new(ctx(ProxyConfig {
-            upstream_keepalive: 2,
-            ..keeping(up.addr)
-        }));
+        let ctx = Arc::new(ctx(
+            up.addr,
+            ProxyConfig {
+                upstream_keepalive: 2,
+                ..keeping()
+            },
+        ));
         let fetching: Vec<_> = (0..3)
             .map(|_| {
                 let ctx = ctx.clone();
@@ -282,11 +310,11 @@ fn the_pool_keeps_the_configured_number_and_closes_the_one_that_waited_longest()
             assert_eq!(fetching.await.unwrap().unwrap().0, 200);
         }
         assert_eq!(up.accepted(), 3);
-        assert_eq!(ctx.pool.waiting(), 2);
+        assert_eq!(idle(&ctx), 2);
         up.ended(1).await;
         // The newest connection is taken first: a request in turn finds one, and makes no new connection.
         fetch(&ctx, "GET").await.unwrap();
-        assert_eq!((up.accepted(), ctx.pool.waiting()), (3, 2));
+        assert_eq!((up.accepted(), idle(&ctx)), (3, 2));
     });
 }
 
@@ -301,7 +329,7 @@ fn a_connection_that_the_upstream_closed_while_it_waited_is_not_used() {
             // The upstream closes a connection that has done its work, with no word to the proxy.
         })
         .await;
-        let ctx = ctx(keeping(up.addr));
+        let ctx = ctx(up.addr, keeping());
         fetch(&ctx, "POST").await.unwrap();
         up.ended(1).await;
         sleep(Duration::from_millis(100)).await;
@@ -338,10 +366,10 @@ fn a_request_that_fails_on_a_pooled_connection_is_sent_again_if_it_may_be() {
     run(async {
         for method in ["GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"] {
             let up = closing_upstream().await;
-            let ctx = ctx(keeping(up.addr));
+            let ctx = ctx(up.addr, keeping());
             fetch(&ctx, "GET").await.unwrap();
             let sent = request(&ctx, method, &[("Host", "h.test")], b"abc");
-            let response = forward(sent, &ctx, far()).await.unwrap();
+            let response = send(sent, &ctx, far()).await.unwrap();
             assert_eq!(response.status(), 200, "{method}");
             collect(response.into_body()).await;
             // The same request, body and all, went to the new connection.
@@ -355,11 +383,32 @@ fn a_request_that_fails_on_a_pooled_connection_is_sent_again_if_it_may_be() {
 }
 
 #[test]
+fn a_failure_on_a_waiting_connection_that_is_not_sent_again_does_not_leave_the_server_out() {
+    run(async {
+        let stale = closing_upstream().await;
+        let other = Upstream::keeping().await;
+        let ctx = ctx_of(&ForwardConfig::of(&[stale.addr, other.addr]), keeping());
+        // The servers take turns: the first request leaves a connection of the first server waiting, the second
+        // goes to the other, and the POST finds the connection of the first closed.
+        fetch(&ctx, "GET").await.unwrap();
+        fetch(&ctx, "GET").await.unwrap();
+        let sent = request(&ctx, "POST", &[("Host", "h.test")], b"abc");
+        assert_eq!(refused(send(sent, &ctx, far()).await), OriginError::Send);
+        // One failure would leave the server out; this one was not counted.
+        let group = ctx.upstreams.group(0);
+        let picked: Vec<usize> = (0..4)
+            .filter_map(|_| group.pick(Tried::default(), Instant::now()))
+            .collect();
+        assert!(picked.contains(&0), "{picked:?}");
+    });
+}
+
+#[test]
 fn a_request_that_must_not_be_sent_twice_is_not_sent_again() {
     run(async {
         for method in ["POST", "LOCK", "PATCH"] {
             let up = closing_upstream().await;
-            let ctx = ctx(keeping(up.addr));
+            let ctx = ctx(up.addr, keeping());
             fetch(&ctx, "GET").await.unwrap();
             // A key from the client does not make the request safe to send twice.
             let sent = request(
@@ -368,7 +417,7 @@ fn a_request_that_must_not_be_sent_twice_is_not_sent_again() {
                 &[("Host", "h.test"), ("Idempotency-Key", "k1")],
                 b"abc",
             );
-            assert_eq!(refused(forward(sent, &ctx, far()).await), OriginError::Send);
+            assert_eq!(refused(send(sent, &ctx, far()).await), OriginError::Send);
             sleep(Duration::from_millis(200)).await;
             assert_eq!(up.accepted(), 1, "{method}");
             // The next request is not troubled by it.
@@ -388,7 +437,7 @@ fn a_new_connection_that_fails_is_not_tried_again() {
             }
         })
         .await;
-        let ctx = ctx(keeping(up.addr));
+        let ctx = ctx(up.addr, keeping());
         assert_eq!(fetch(&ctx, "GET").await.unwrap_err(), OriginError::Send);
         sleep(Duration::from_millis(200)).await;
         assert_eq!(up.accepted(), 1);
@@ -411,10 +460,10 @@ fn a_body_that_is_dropped_before_its_end_does_not_return_the_connection() {
             while next_request(&sock).await.is_some() {}
         })
         .await;
-        let ctx = ctx(keeping(up.addr));
-        let response = forward(bare(&ctx, "GET"), &ctx, far()).await.unwrap();
+        let ctx = ctx(up.addr, keeping());
+        let response = send(bare(&ctx, "GET"), &ctx, far()).await.unwrap();
         drop(response);
-        assert_eq!(ctx.pool.waiting(), 0);
+        assert_eq!(idle(&ctx), 0);
         up.ended(1).await;
         assert_eq!(fetch(&ctx, "GET").await.unwrap().0, 200);
         assert_eq!(up.accepted(), 2);
@@ -458,11 +507,11 @@ fn an_answer_that_ends_the_connection_does_not_return_it() {
                 while !closes && next_request(&sock).await.is_some() {}
             })
             .await;
-            let ctx = ctx(keeping(up.addr));
+            let ctx = ctx(up.addr, keeping());
             let (status, body) = fetch(&ctx, "GET").await.unwrap();
             let text = String::from_utf8_lossy(reply);
             assert_eq!((status, body), (200, b"ok".to_vec()), "{text:?}");
-            assert_eq!(ctx.pool.waiting(), waiting, "{text:?}");
+            assert_eq!(idle(&ctx), waiting, "{text:?}");
         }
     });
 }
@@ -471,12 +520,12 @@ fn an_answer_that_ends_the_connection_does_not_return_it() {
 fn an_answer_without_a_body_returns_its_connection_with_its_head() {
     run(async {
         let up = Upstream::keeping().await;
-        let ctx = ctx(keeping(up.addr));
+        let ctx = ctx(up.addr, keeping());
         // The answer to a HEAD request: the response is not read at all.
-        let response = forward(bare(&ctx, "HEAD"), &ctx, far()).await.unwrap();
-        assert_eq!(ctx.pool.waiting(), 1);
+        let response = send(bare(&ctx, "HEAD"), &ctx, far()).await.unwrap();
+        assert_eq!(idle(&ctx), 1);
         drop(response);
-        assert_eq!(ctx.pool.waiting(), 1);
+        assert_eq!(idle(&ctx), 1);
         assert_eq!(fetch(&ctx, "GET").await.unwrap().0, 200);
         assert_eq!(up.accepted(), 1);
     });
@@ -496,14 +545,17 @@ fn the_cap_on_the_head_holds_again_on_a_connection_that_is_used_again() {
             while next_request(&sock).await.is_some() {}
         })
         .await;
-        let ctx = ctx(ProxyConfig {
-            // The first answer fits, a head of 300 bytes does not.
-            upstream_head_wire: 200,
-            ..keeping(up.addr)
-        });
+        let ctx = ctx(
+            up.addr,
+            ProxyConfig {
+                // The first answer fits, a head of 300 bytes does not.
+                upstream_head_wire: 200,
+                ..keeping()
+            },
+        );
         assert_eq!(fetch(&ctx, "GET").await.unwrap().0, 200);
-        assert_eq!(fetch(&ctx, "GET").await.unwrap_err(), OriginError::Head);
-        assert_eq!((up.accepted(), ctx.pool.waiting()), (1, 0));
+        assert_eq!(fetch(&ctx, "GET").await.unwrap_err(), OriginError::Invalid);
+        assert_eq!((up.accepted(), idle(&ctx)), (1, 0));
     });
 }
 
@@ -524,14 +576,51 @@ fn a_connection_that_waited_is_not_cut_off_by_the_time_it_waited() {
             }
         })
         .await;
-        let ctx = ctx(ProxyConfig {
-            response_idle: Duration::from_millis(1000),
-            upstream_keepalive_timeout: Duration::from_millis(1000),
-            ..keeping(up.addr)
-        });
+        let ctx = ctx(
+            up.addr,
+            ProxyConfig {
+                response_idle: Duration::from_millis(1000),
+                upstream_keepalive_timeout: Duration::from_millis(1000),
+                ..keeping()
+            },
+        );
         fetch(&ctx, "GET").await.unwrap();
         sleep(Duration::from_millis(600)).await;
         assert_eq!(fetch(&ctx, "GET").await.unwrap().0, 200);
         assert_eq!(up.accepted(), 1);
+    });
+}
+
+#[test]
+fn the_servers_of_a_group_share_the_bound_on_the_connections_that_wait() {
+    run(async {
+        let ups = [
+            Upstream::keeping().await,
+            Upstream::keeping().await,
+            Upstream::keeping().await,
+        ];
+        let addresses: Vec<SocketAddr> = ups.iter().map(|up| up.addr).collect();
+        let ctx = ctx_of(
+            &ForwardConfig::of(&addresses),
+            ProxyConfig {
+                upstream_keepalive: 2,
+                ..keeping()
+            },
+        );
+        // The servers take turns. Three connections wait for one server each, and the bound is two in all: the one
+        // that has waited longest, which is the first server's, is closed.
+        for _ in 0..3 {
+            fetch(&ctx, "GET").await.unwrap();
+        }
+        assert_eq!(idle(&ctx), 2);
+        ups[0].ended(1).await;
+        // From here on the bound is never passed, and a connection is used only by the server it belongs to.
+        for _ in 0..6 {
+            fetch(&ctx, "GET").await.unwrap();
+            assert!(idle(&ctx) <= 2);
+        }
+        for up in &ups {
+            assert_eq!(up.seen.lock().unwrap().len(), 3);
+        }
     });
 }

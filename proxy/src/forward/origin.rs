@@ -1,4 +1,4 @@
-//! Forwarding an allowed request to the one upstream, and checking its answer.
+//! Forwarding an allowed request to a server of an upstream group, and checking its answer.
 //!
 //! The request leaves in the form that was inspected, with these changes only: the fields that belong to the
 //! connection with the client are removed, the forwarding fields are added (and `Connection: close` when the
@@ -12,11 +12,32 @@
 //! all of those claims are dropped, `X-Forwarded-For` is the address of the peer alone and `X-Forwarded-Proto` is
 //! `http`. `X-Forwarded-Host` is the `Host` of the request whoever the peer is.
 //!
-//! The connection to the upstream is the newest one in the pool that is ready, or a new one. It goes back to the
-//! pool when the body of the answer has been read to its end and nothing in the exchange ended it; a body that is
-//! dropped before its end ends the connection. A pooled connection that fails before any byte of an answer was
-//! read may have been closed by the upstream while it waited: a request that does no harm when it is sent twice
-//! (GET, HEAD, OPTIONS, PUT, DELETE, TRACE) is then sent once more on a new connection, and any other is not.
+//! The server is chosen by the group (see `group`). The connection to it is the newest one that waits for that server
+//! in the pool of the group and is ready, or a new one. It goes back to the pool when the body of the answer has been
+//! read to its end and nothing in the exchange ended it; a body that is dropped before its end ends the connection.
+//! A pooled connection that fails before any byte of an answer was read may have been closed by the server while it
+//! waited: a request that does no harm when it is sent twice (GET, HEAD, OPTIONS, PUT, DELETE, TRACE) is then sent
+//! once more on a new connection to the same server, and any other is not.
+//!
+//! A server fails a request when the connection to it is refused or reset, the server cannot be reached, or the
+//! connection is not made within `upstream_connect` (`Connect`), when the request cannot be sent, or the head of
+//! the answer is not read within `upstream_header` or is cut off (`Send`, `Head`). The group counts such a failure
+//! against the server, except one on a waiting connection that was not sent again: the server may only have closed
+//! that connection while it waited. An answer whose head cannot be parsed, is longer than the limits for a head, or
+//! is refused (`Invalid`), and any status the server gave, are not a failure of the server, and are never tried
+//! again on another one: what a server answers can follow from the request (a path, `Origin` or `Cookie` that it
+//! repeats into a long `Location` or `Set-Cookie`), so one request could otherwise take every server out of the
+//! group. After a failure the request goes on to the next server of the group, which has not been tried, when the
+//! connection could not be made (nothing was sent), or when the method does no harm when it is sent twice (the list
+//! above). It does not go on after the head of an answer was returned: from then on the response is on its way to
+//! the client, and this function has ended. At most as many servers are tried as the group has, within the time
+//! that bounds the exchange. A request that no server could take is `Unavailable`.
+//!
+//! Two kinds of failure are not the fault of a server, so nothing is counted against one and the request is not
+//! tried on another. A stage that the end of the request time cut short, or that was not started because that end
+//! had been reached, is `Late`: a slow client may have used the time up, and it must not be able to take servers
+//! out of the group by that. A connection that the proxy itself could not make (no descriptor, port or memory
+//! left, a socket that cannot be set up) is `Local`: another server would fail in the same way.
 //!
 //! The answer is checked before it is passed on. A status outside 200..=599, unclear framing, and a `Connection`
 //! field that is not a list of tokens or that names a field the answer must keep are refused, and the connection
@@ -24,8 +45,8 @@
 //! connection with the upstream are removed, and the trailers of the answer are dropped.
 //!
 //! Every wait before the head of the answer ends at an absolute instant that is never extended, and a stage whose
-//! end has already been reached does not start. Informational responses are read over and not passed on; the bytes
-//! read from the upstream up to the final head, they included, are capped as a whole.
+//! end has already been reached does not start (see `Stage`). Informational responses are read over and not passed
+//! on; the bytes read from the upstream up to the final head, they included, are capped as a whole.
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -56,6 +77,7 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::config::ProxyConfig;
 use crate::forward::client_ip;
+use crate::forward::group::{Group, Server, Tried};
 use crate::forward::pool::{Lease, Pool};
 use crate::inbound::conn::Ctx;
 use crate::inbound::head::trim_ows;
@@ -182,17 +204,25 @@ impl Body for OriginBody {
     }
 }
 
-/// Every one of these is answered with 502.
+/// Why a request got no response head from the upstream. `Late` and `Local` are answered with 503, the others with
+/// 502.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OriginError {
-    /// The connection to the upstream could not be made in time.
+    /// No server of the group could be tried: each one is left out.
+    Unavailable,
+    /// The connection to the upstream was refused or reset, could not be reached, or was not made in time.
     Connect,
     /// The request could not be sent: the connection failed before any byte of an answer had been read.
     Send,
-    /// The head of the answer did not arrive in time, was cut off, was not valid, or was longer than the cap.
+    /// The head of the answer did not arrive in time, or the connection ended or was reset after it began.
     Head,
-    /// The head of the answer is valid HTTP but is refused.
+    /// The head of the answer cannot be parsed, is longer than the limits for a head (its size, the number of its
+    /// fields, the bytes read up to the final head), or is valid HTTP but is refused. The server did answer.
     Invalid,
+    /// The time of the request was used up, in a stage of the exchange or before it began. No server is at fault.
+    Late,
+    /// The proxy could not make the connection for a reason of its own. No server is at fault.
+    Local,
 }
 
 /// The request body: the inspected bytes. It keeps the share of the byte budget until hyper drops it, which is
@@ -231,10 +261,32 @@ impl Body for Sent {
     }
 }
 
-/// The end of a stage that starts at `start` and lasts `len`, within `by`. A sum that does not fit into the clock
-/// counts as passed.
-fn stage(start: Instant, len: Duration, by: Instant) -> Instant {
-    start.checked_add(len).unwrap_or(start).min(by)
+/// A stage of the exchange with the upstream: the instant it ends at, and who set it, the stage itself (the time the
+/// server may take) or the end of the request time.
+#[derive(Clone, Copy)]
+struct Stage {
+    end: Instant,
+    /// The limit of the stage comes before the end of the request time. When they are the same instant, the end of
+    /// the request time is the one that counts.
+    own: bool,
+}
+
+impl Stage {
+    /// The stage that starts at `start` and lasts `len`, within `by`. A sum that does not fit into the clock counts
+    /// as passed, and is not the fault of the server.
+    fn new(start: Instant, len: Duration, by: Instant) -> Stage {
+        let own = start.checked_add(len);
+        Stage {
+            end: own.unwrap_or(start).min(by),
+            own: own.is_some_and(|own| own < by),
+        }
+    }
+
+    /// What it comes to when the time of the stage has run out: `error` if the limit of the stage ended it, `Late`
+    /// if the end of the request time did.
+    fn ran_out(self, error: OriginError) -> OriginError {
+        if self.own { error } else { OriginError::Late }
+    }
 }
 
 /// True once `by` has been reached: a stage whose end is already here does not start.
@@ -398,12 +450,17 @@ fn idle_timeout(e: &hyper::Error) -> bool {
     false
 }
 
-/// Where a failure of the exchange belongs: `Head` once any byte of an answer has been read (`base` is what had
-/// been read from the connection before the exchange), when the cap for the head was hit, or when the connection
-/// made no progress for the idle limit; `Send` when nothing of an answer had arrived and the connection failed in
-/// another way.
+/// Where a failure of the exchange belongs: `Invalid` when the head of the answer cannot be parsed or is too long
+/// (hyper reports a head with too many bytes or fields as a parse error) or when the cap for the head was hit; the
+/// server answered, and what it answers can follow from the request. `Head` once any byte of an answer has been
+/// read (`base` is what had been read from the connection before the exchange), or when the connection made no
+/// progress for the idle limit; `Send` when nothing of an answer had arrived and the connection failed in another
+/// way.
 fn failure(e: &hyper::Error, gauge: &Gauge, base: u64) -> OriginError {
-    if gauge.read() > base || gauge.over() || idle_timeout(e) {
+    // The cap fails the read, so hyper reports it as an I/O error and not as a parse error.
+    if e.is_parse() || gauge.over() {
+        OriginError::Invalid
+    } else if gauge.read() > base || idle_timeout(e) {
         OriginError::Head
     } else {
         OriginError::Send
@@ -442,21 +499,41 @@ fn head_cap(cfg: &ProxyConfig) -> u64 {
     u64::try_from(cfg.upstream_head_wire).unwrap_or(0)
 }
 
-/// The end of the stage in which a connection to the upstream is taken or made; `Connect` if it is already past.
-fn connect_end(cfg: &ProxyConfig, by: Instant) -> Result<Instant, OriginError> {
-    let end = stage(Instant::now(), cfg.upstream_connect, by);
-    if reached(end) {
-        return Err(OriginError::Connect);
+/// The stage in which a connection to the upstream is taken or made; the error if its end is already past.
+fn connect_stage(cfg: &ProxyConfig, by: Instant) -> Result<Stage, OriginError> {
+    let stage = Stage::new(Instant::now(), cfg.upstream_connect, by);
+    if reached(stage.end) {
+        return Err(stage.ran_out(OriginError::Connect));
     }
-    Ok(end)
+    Ok(stage)
 }
 
-/// Makes a connection to the upstream within `connect_by`.
-async fn connect(cfg: &ProxyConfig, connect_by: Instant) -> Result<Lease, OriginError> {
-    let Ok(Ok(stream)) = timeout_at(connect_by, TcpStream::connect(cfg.upstream)).await else {
-        return Err(OriginError::Connect);
+/// Where a failed attempt to connect belongs. The server refusing the connection, resetting it, not being reachable
+/// or not answering is its fault (`Connect`). Anything else is an error of the proxy itself (`Local`): no
+/// descriptor, buffer, memory or port is left, or the system does not allow the connection.
+fn connect_error(e: &io::Error) -> OriginError {
+    match e.kind() {
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::TimedOut => OriginError::Connect,
+        _ => OriginError::Local,
+    }
+}
+
+/// Makes a connection to the server at `address` within `stage`.
+async fn connect(
+    address: SocketAddr,
+    cfg: &ProxyConfig,
+    stage: Stage,
+) -> Result<Lease, OriginError> {
+    let stream = match timeout_at(stage.end, TcpStream::connect(address)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(connect_error(&e)),
+        Err(_) => return Err(stage.ran_out(OriginError::Connect)),
     };
-    stream.set_nodelay(true).map_err(|_| OriginError::Connect)?;
+    stream.set_nodelay(true).map_err(|_| OriginError::Local)?;
     // Up to the final head the reads are capped as a whole; the cap is lifted as soon as the head is here.
     let (guarded, gauge) = Guarded::new(
         stream,
@@ -474,38 +551,38 @@ async fn connect(cfg: &ProxyConfig, connect_by: Instant) -> Result<Lease, Origin
     let (sender, conn) = client
         .handshake(TokioIo::new(guarded))
         .await
-        .map_err(|_| OriginError::Connect)?;
+        .map_err(|_| OriginError::Local)?;
     let task = tokio::spawn(async move {
         let _ = conn.await;
     });
     Ok(Lease::new(sender, gauge, task.abort_handle()))
 }
 
-/// Sends `request` on the connection and returns the checked head of the answer; `head_by` bounds that. The
+/// Sends `request` on the connection and returns the checked head of the answer; `head` bounds that. The
 /// connection is closed if this fails. It goes back to `pool` at the end of the body of the answer if nothing in
 /// the head ends it.
 async fn exchange(
     mut lease: Lease,
     request: Request<Sent>,
-    head_by: Instant,
+    head: Stage,
     head_request: bool,
     pool: &Pool,
 ) -> Result<Response<OriginBody>, OriginError> {
-    if reached(head_by) {
-        return Err(OriginError::Head);
+    if reached(head.end) {
+        return Err(head.ran_out(OriginError::Head));
     }
     let base = lease.gauge.read();
     lease.used = lease.used.saturating_add(1);
-    let response = match timeout_at(head_by, lease.sender.send_request(request)).await {
+    let response = match timeout_at(head.end, lease.sender.send_request(request)).await {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => return Err(failure(&e, &lease.gauge, base)),
-        Err(_) => return Err(OriginError::Head),
+        Err(_) => return Err(head.ran_out(OriginError::Head)),
     };
     lease.gauge.lift();
     // The connection may have started reading the body before the cap was lifted. A read that was refused
-    // has cut the answer off, so it is not passed on.
+    // has cut the answer off, so it is not passed on; as in `failure`, the cap is not the fault of the server.
     if lease.gauge.over() {
-        return Err(OriginError::Head);
+        return Err(OriginError::Invalid);
     }
     let (mut parts, body) = response.into_parts();
     let reuse = lasts(&parts, head_request);
@@ -523,13 +600,95 @@ async fn exchange(
     Ok(Response::from_parts(parts, body))
 }
 
-/// Sends the request to the upstream and returns its checked response head; `by` bounds the whole exchange up to
-/// the head.
-pub async fn forward(
-    f: Forward,
-    ctx: &Ctx,
+/// What came of sending a request to a group: the address of the server that was tried last (none if no server
+/// was tried), and the checked head of its response or why there is none.
+pub struct Dispatched {
+    pub server: Option<SocketAddr>,
+    pub result: Result<Response<OriginBody>, OriginError>,
+}
+
+/// Whether `error` is a failure of the server: the group counts it, and the request may go to another one.
+fn failure_of_server(error: OriginError) -> bool {
+    matches!(
+        error,
+        OriginError::Connect | OriginError::Send | OriginError::Head
+    )
+}
+
+/// Whether a request may go to another server after `error`: always if the connection could not be made, for
+/// nothing was sent then, and otherwise only if it does no harm when it reaches a server twice.
+fn may_go_on(error: OriginError, method: &Method) -> bool {
+    match error {
+        OriginError::Connect => true,
+        OriginError::Send | OriginError::Head => idempotent(method),
+        OriginError::Invalid
+        | OriginError::Unavailable
+        | OriginError::Late
+        | OriginError::Local => false,
+    }
+}
+
+/// Why a try on a server gave no response head, and whether the group counts it against the server.
+struct Failed {
+    error: OriginError,
+    counted: bool,
+}
+
+impl Failed {
+    fn counted(error: OriginError) -> Failed {
+        Failed {
+            error,
+            counted: failure_of_server(error),
+        }
+    }
+}
+
+/// One try on one server. `request` makes the request for each send.
+async fn attempt(
+    server: &Server,
+    cfg: &ProxyConfig,
+    request: &impl Fn() -> Request<Sent>,
+    method: &Method,
+    head_request: bool,
     by: Instant,
-) -> Result<Response<OriginBody>, OriginError> {
+) -> Result<Response<OriginBody>, Failed> {
+    let pool = server.pool();
+    if let Some(lease) = pool
+        .take(connect_stage(cfg, by).map_err(Failed::counted)?.end)
+        .await
+    {
+        lease.gauge.rearm(head_cap(cfg), cfg.response_idle);
+        let head = Stage::new(Instant::now(), cfg.upstream_header, by);
+        match exchange(lease, request(), head, head_request, pool).await {
+            // The server may have closed the connection while it waited. If nothing of an answer had arrived,
+            // a request that does no harm when it is sent twice is sent on a new connection, once. The stages of
+            // that go on to end by `by`. Any other request is not sent again, and the failure is not counted.
+            Err(OriginError::Send) if idempotent(method) => {}
+            Err(OriginError::Send) => {
+                return Err(Failed {
+                    error: OriginError::Send,
+                    counted: false,
+                });
+            }
+            done => return done.map_err(Failed::counted),
+        }
+    }
+    let lease = connect(
+        server.address(),
+        cfg,
+        connect_stage(cfg, by).map_err(Failed::counted)?,
+    )
+    .await
+    .map_err(Failed::counted)?;
+    let head = Stage::new(Instant::now(), cfg.upstream_header, by);
+    exchange(lease, request(), head, head_request, pool)
+        .await
+        .map_err(Failed::counted)
+}
+
+/// Sends the request to a server of the group and returns its checked response head; `by` bounds the whole exchange
+/// up to the head, the tries on other servers included.
+pub async fn forward(f: Forward, group: &Group, ctx: &Ctx, by: Instant) -> Dispatched {
     let cfg = &ctx.cfg;
     let Forward {
         method,
@@ -539,7 +698,15 @@ pub async fn forward(
         peer,
     } = f;
     let trusted = client_ip::trusts(&cfg.trusted_proxies, peer.ip());
-    let fields = forwarded_fields(fields, peer.ip(), trusted, cfg.upstream_keepalive == 0)?;
+    let fields = match forwarded_fields(fields, peer.ip(), trusted, cfg.upstream_keepalive == 0) {
+        Ok(fields) => fields,
+        Err(error) => {
+            return Dispatched {
+                server: None,
+                result: Err(error),
+            };
+        }
+    };
     let head_request = method == Method::HEAD;
     let request = || {
         let mut request = Request::new(Sent::new(body.clone()));
@@ -550,20 +717,43 @@ pub async fn forward(
         request
     };
 
-    if let Some(lease) = ctx.pool.take(connect_end(cfg, by)?).await {
-        lease.gauge.rearm(head_cap(cfg), cfg.response_idle);
-        let head_by = stage(Instant::now(), cfg.upstream_header, by);
-        match exchange(lease, request(), head_by, head_request, &ctx.pool).await {
-            // The upstream may have closed the connection while it waited. If nothing of an answer had arrived,
-            // a request that does no harm when it is sent twice is sent on a new connection, once. The stages of
-            // that go on to end by `by`.
-            Err(OriginError::Send) if idempotent(&method) => {}
-            done => return done,
+    let mut tried = Tried::default();
+    let mut server = None;
+    let mut error = OriginError::Unavailable;
+    for _ in 0..group.len() {
+        if reached(by) {
+            // A try that cannot start for want of time is the fault of no server.
+            error = OriginError::Late;
+            break;
+        }
+        let Some(index) = group.pick(tried, Instant::now()) else {
+            break;
+        };
+        tried.add(index);
+        let chosen = group.server(index);
+        server = Some(chosen.address());
+        match attempt(chosen, cfg, &request, &method, head_request, by).await {
+            Ok(response) => {
+                return Dispatched {
+                    server,
+                    result: Ok(response),
+                };
+            }
+            Err(failed) => {
+                error = failed.error;
+                if failed.counted {
+                    group.fail(index, Instant::now());
+                }
+                if !failure_of_server(error) || !may_go_on(error, &method) {
+                    break;
+                }
+            }
         }
     }
-    let lease = connect(cfg, connect_end(cfg, by)?).await?;
-    let head_by = stage(Instant::now(), cfg.upstream_header, by);
-    exchange(lease, request(), head_by, head_request, &ctx.pool).await
+    Dispatched {
+        server,
+        result: Err(error),
+    }
 }
 
 #[cfg(test)]

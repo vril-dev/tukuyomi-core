@@ -13,6 +13,9 @@
 //! connection is taken from the backlog to wait for a permit, and the connections that wait for their next
 //! request are told to close, so that the permits of idle connections come back.
 //!
+//! The upstream groups and the routes to them are read from the configuration file when the proxy starts, and stay
+//! as they are until it is started again.
+//!
 //! SIGUSR1 makes the proxy switch to the generation that the rules store chooses now (`rules::switch` reads the
 //! store, the driver starts the new inspector and moves the requests over when it is ready). It is a line in the
 //! records and nothing else before the listener is bound, while a switch is under way, and while the proxy stops.
@@ -46,8 +49,8 @@ use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, Sleep, sleep, timeout_at};
 use tukuyomi_kernel::{Failure, Phase};
-use tukuyomi_proxy::config::{self, ProxyConfig};
-use tukuyomi_proxy::forward::pool::Pool;
+use tukuyomi_proxy::config::{self, ForwardConfig, ProxyConfig};
+use tukuyomi_proxy::forward::group::Upstreams;
 use tukuyomi_proxy::host;
 use tukuyomi_proxy::inbound::conn::Ctx;
 use tukuyomi_proxy::inbound::session;
@@ -191,6 +194,7 @@ fn start(log: &Log) -> u8 {
     };
     runtime.block_on(run(
         loaded.proxy,
+        loaded.forward,
         kernel,
         generation,
         mode,
@@ -202,8 +206,12 @@ fn start(log: &Log) -> u8 {
 
 /// The runtime part: handlers, driver, the wait for ready, serving, and the stop. The holds of the switcher live
 /// to the end, so the generations in use are held until the stop is over.
+// One argument for each part of what the configuration, the rules store and the logger give; a struct of them would
+// only repeat their names.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     proxy: ProxyConfig,
+    forward: ForwardConfig,
     kernel: tukuyomi_kernel::Config,
     generation: Fingerprint,
     mode: Mode,
@@ -255,7 +263,7 @@ async fn run(
         budget: Arc::new(Semaphore::new(proxy.max_buffered_bytes)),
         inspect: Arc::new(Semaphore::new(wait_queue)),
         routes: routes.clone(),
-        pool: Pool::new(&proxy),
+        upstreams: Upstreams::new(&forward, &proxy),
         log: log.clone(),
         ingress: Arc::new(Ingress::new(ingress.clone())),
     });
@@ -1021,7 +1029,6 @@ mod tests {
         let ms = Duration::from_millis;
         ProxyConfig {
             listen: any,
-            upstream: any,
             max_conns: 1,
             max_head_bytes: 1024,
             max_body: 0,

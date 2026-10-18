@@ -108,11 +108,11 @@ fn the_record_has_numbers_and_fixed_texts_and_the_address_of_the_client_only() {
     };
     let client: IpAddr = "203.0.113.9".parse().unwrap();
     assert_eq!(
-        record(7, &blocked, Duration::from_millis(12), client),
+        record(7, &blocked, Duration::from_millis(12), client, None),
         "conn 7: blocked 403 blocked by a rule rule 9201 12 ms client 203.0.113.9"
     );
     assert_eq!(
-        record(8, &Reply::NONE, Duration::from_micros(1999), client),
+        record(8, &Reply::NONE, Duration::from_micros(1999), client, None),
         "conn 8: closed 0 no answer rule - 1 ms client 203.0.113.9"
     );
     assert_eq!(
@@ -120,7 +120,8 @@ fn the_record_has_numbers_and_fixed_texts_and_the_address_of_the_client_only() {
             9,
             &Reply::forwarded(200, Passed::Allowed),
             Duration::from_millis(3),
-            client
+            client,
+            None
         ),
         "conn 9: forwarded 200 forwarded rule - 3 ms client 203.0.113.9"
     );
@@ -129,7 +130,8 @@ fn the_record_has_numbers_and_fixed_texts_and_the_address_of_the_client_only() {
             10,
             &Reply::forwarded(200, Passed::Detected { rule: 9201 }),
             Duration::from_millis(3),
-            client
+            client,
+            None
         ),
         "conn 10: forwarded 200 detected by a rule rule 9201 3 ms client 203.0.113.9"
     );
@@ -138,13 +140,40 @@ fn the_record_has_numbers_and_fixed_texts_and_the_address_of_the_client_only() {
             11,
             &Reply::forwarded(200, Passed::Bypassed),
             Duration::from_millis(3),
-            client
+            client,
+            None
         ),
         "conn 11: forwarded 200 bypassed by a route rule - 3 ms client 203.0.113.9"
     );
     // An IPv6 address, and an IPv4 address in its mapped form, are written in the canonical form.
     let v6: IpAddr = "2001:db8::1".parse().unwrap();
     let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
-    assert!(record(12, &Reply::NONE, Duration::ZERO, v6).ends_with(" client 2001:db8::1"));
-    assert!(record(13, &Reply::NONE, Duration::ZERO, mapped).ends_with(" client 203.0.113.9"));
+    assert!(record(12, &Reply::NONE, Duration::ZERO, v6, None).ends_with(" client 2001:db8::1"));
+    assert!(
+        record(13, &Reply::NONE, Duration::ZERO, mapped, None).ends_with(" client 203.0.113.9")
+    );
+}
+
+#[test]
+fn the_record_of_a_request_that_went_to_an_upstream_names_the_group_and_the_server() {
+    let client: IpAddr = "203.0.113.9".parse().unwrap();
+    let reply = Reply::forwarded(200, Passed::Allowed);
+    let tried = Via {
+        group: Arc::from("web-1"),
+        server: Some("192.0.2.7:8080".parse().unwrap()),
+    };
+    assert_eq!(
+        record(14, &reply, Duration::from_millis(3), client, Some(&tried)),
+        "conn 14: forwarded 200 forwarded rule - 3 ms client 203.0.113.9 upstream web-1/192.0.2.7:8080"
+    );
+    // A group with no server to try: the server is a dash.
+    let none = Via {
+        group: Arc::from("web-1"),
+        server: None,
+    };
+    let reply = Reply::failed(502, "upstream unavailable");
+    assert_eq!(
+        record(15, &reply, Duration::ZERO, client, Some(&none)),
+        "conn 15: failed 502 upstream unavailable rule - 0 ms client 203.0.113.9 upstream web-1/-"
+    );
 }

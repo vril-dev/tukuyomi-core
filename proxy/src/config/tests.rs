@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","upstream":"127.0.0.1:9000","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
+const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"forward":{"upstreams":{"main":{"servers":[{"address":"127.0.0.1:9000","weight":1,"max_fails":1,"fail_timeout_ms":10000,"backup":false}]},"api":{"servers":[{"address":"127.0.0.1:9001","weight":3,"max_fails":2,"fail_timeout_ms":5000,"backup":false},{"address":"127.0.0.1:9002","weight":1,"max_fails":0,"fail_timeout_ms":5000,"backup":true}]}},"routes":[{"host":"api.example.test","path":"/v1/","upstream":"api"}],"default_upstream":"main"},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
 
 /// Marks a value that must never appear in an error sentence.
 const MARK: &str = "qqmark";
@@ -21,6 +21,15 @@ fn k(key: &'static str, value: impl Into<Value>) -> Edit {
 
 fn s(key: &'static str, value: impl Into<Value>) -> Edit {
     ("/rules/store", key, value.into())
+}
+
+fn f(key: &'static str, value: impl Into<Value>) -> Edit {
+    ("/forward", key, value.into())
+}
+
+/// A key of the first server of the group `api`.
+fn sv(key: &'static str, value: impl Into<Value>) -> Edit {
+    ("/forward/upstreams/api/servers/0", key, value.into())
 }
 
 fn base() -> Value {
@@ -62,7 +71,6 @@ fn the_base_document_loads_with_every_value_converted() {
     let loaded = parse(BASE.as_bytes()).unwrap();
     let (proxy, kernel) = (&loaded.proxy, &loaded.kernel.0);
     assert_eq!(proxy.listen, "127.0.0.1:8080".parse().unwrap());
-    assert_eq!(proxy.upstream, "127.0.0.1:9000".parse().unwrap());
     assert_eq!(proxy.max_buffered_bytes, 8 << 20);
     assert_eq!(proxy.drive_slice, Duration::from_millis(50));
     assert_eq!(proxy.stop_wait, Duration::from_millis(10_000));
@@ -79,6 +87,39 @@ fn the_base_document_loads_with_every_value_converted() {
         Duration::from_millis(60_000)
     );
     assert_eq!(proxy.upstream_keepalive_requests, 1000);
+    let forward = &loaded.forward;
+    let names: Vec<&str> = forward.groups.iter().map(|g| g.name.as_str()).collect();
+    assert_eq!(names, ["main", "api"]);
+    assert_eq!(forward.default, Some(0));
+    assert_eq!(
+        forward.groups[1].servers,
+        [
+            ServerConfig {
+                address: "127.0.0.1:9001".parse().unwrap(),
+                weight: 3,
+                max_fails: 2,
+                fail_timeout: Duration::from_millis(5000),
+                backup: false,
+            },
+            ServerConfig {
+                address: "127.0.0.1:9002".parse().unwrap(),
+                weight: 1,
+                max_fails: 0,
+                fail_timeout: Duration::from_millis(5000),
+                backup: true,
+            },
+        ]
+    );
+    // The route holds for its host in any case and with any port, and for paths below its path.
+    assert_eq!(
+        forward.routes.find(Some(b"API.example.test:80"), b"/v1/x"),
+        Some(&1)
+    );
+    assert_eq!(
+        forward.routes.find(Some(b"api.example.test"), b"/v2/x"),
+        None
+    );
+    assert_eq!(forward.routes.find(Some(b"other.test"), b"/v1/x"), None);
     assert_eq!(kernel.inspector, PathBuf::from("/opt/tukuyomi/inspector"));
     // The directory and the fingerprint of a generation are not in the file: the check ran with placeholders.
     assert_eq!(
@@ -97,10 +138,13 @@ fn the_base_document_loads_with_every_value_converted() {
 }
 
 #[test]
-fn the_file_is_at_most_64_kib_and_utf8() {
-    let at_limit = format!("{BASE}{}", " ".repeat(65536 - BASE.len()));
+fn the_file_is_at_most_256_kib_and_utf8() {
+    let at_limit = format!("{BASE}{}", " ".repeat(262_144 - BASE.len()));
     assert!(parse(at_limit.as_bytes()).is_ok());
-    refuse_text(&format!("{at_limit} "), "configuration file is over 64 KiB");
+    refuse_text(
+        &format!("{at_limit} "),
+        "configuration file is over 256 KiB",
+    );
 
     let mut bytes = BASE
         .replace("/opt/tukuyomi/inspector", "/opt/qqmark")
@@ -131,6 +175,10 @@ fn a_missing_key_is_refused_in_every_object() {
         ("", "rules"),
         ("/rules", "store"),
         ("/proxy", "max_conns"),
+        ("/forward", "default_upstream"),
+        ("/forward/upstreams/api", "servers"),
+        ("/forward/upstreams/api/servers/0", "weight"),
+        ("/forward/routes/0", "upstream"),
         ("/kernel", "tick_ms"),
         ("/rules/store", "dir"),
     ] {
@@ -152,6 +200,8 @@ fn an_unknown_key_is_refused_in_every_object() {
     value["qqmark"] = Value::from(1);
     refuse_text(&value.to_string(), sentence);
     refuse(&[p("qqmark", 1)], sentence);
+    refuse(&[f("qqmark", 1)], sentence);
+    refuse(&[sv("qqmark", 1)], sentence);
     refuse(&[k("qqmark", 1)], sentence);
     // The kernel object has no rules path and no fingerprint: they come from the rules store.
     refuse(&[k("rules", "/etc/tukuyomi/rules")], sentence);
@@ -172,6 +222,18 @@ fn a_value_of_the_wrong_type_is_refused_for_every_key() {
     for (path, key, wrong) in [
         ("/proxy", "listen", Value::from(5)),
         ("/proxy", "max_conns", Value::from("5")),
+        ("/forward", "default_upstream", Value::from(5)),
+        (
+            "/forward/upstreams/api/servers/0",
+            "weight",
+            Value::from("1"),
+        ),
+        ("/forward/upstreams/api/servers/0", "backup", Value::from(0)),
+        (
+            "/forward/upstreams/api/servers/0",
+            "weight",
+            Value::from(1.5),
+        ),
         ("/kernel", "tick_ms", Value::Null),
         ("/rules/store", "dir", Value::from(true)),
     ] {
@@ -203,6 +265,17 @@ fn an_array_never_stands_in_for_an_object() {
         refuse_text(&positional.to_string(), sentence);
     }
     refuse_text("null", sentence);
+    // Neither does an array stand in for a server, a route, or the object of the groups.
+    let mut value = base();
+    value["forward"]["upstreams"]["api"]["servers"][0] =
+        serde_json::json!(["127.0.0.1:9001", 3, 2, 5000, false]);
+    refuse_text(&value.to_string(), sentence);
+    let mut value = base();
+    value["forward"]["routes"][0] = serde_json::json!(["api.example.test", "/v1/", "api"]);
+    refuse_text(&value.to_string(), sentence);
+    let mut value = base();
+    value["forward"]["upstreams"] = serde_json::json!([]);
+    refuse_text(&value.to_string(), sentence);
 }
 
 #[test]
@@ -213,6 +286,9 @@ fn errors_never_carry_a_value_or_a_key_from_the_file() {
         doc(&[p(MARK, 1)]),
         doc(&[k("inspector", MARK)]),
         doc(&[k("tmp_root", MARK)]),
+        doc(&[f("default_upstream", MARK)]),
+        doc(&[sv("address", MARK)]),
+        BASE.replace("\"api\"", "\"qqmark!\"").into_bytes(),
         format!("{BASE}{MARK}").into_bytes(),
         format!("{{\"{MARK}\":1,\"{MARK}\":2}}").into_bytes(),
     ];
@@ -236,15 +312,16 @@ fn addresses_are_ip_literals_with_a_port_and_differ() {
     pass(&[p("listen", "[::1]:8080")]);
     refuse(&[p("listen", "127.0.0.1:0")], "listen port is 0");
     refuse(
-        &[p("upstream", "example.com:80")],
-        "upstream is not an IP address and port",
+        &[sv("address", "example.com:80")],
+        "a server address is not an IP address and port",
     );
-    refuse(&[p("upstream", "127.0.0.1:0")], "upstream port is 0");
+    refuse(&[sv("address", "127.0.0.1:0")], "a server port is 0");
 
-    let same = "listen and upstream are the same address";
-    refuse(&[p("upstream", "127.0.0.1:8080")], same);
-    refuse(&[p("upstream", "[::ffff:127.0.0.1]:8080")], same);
-    pass(&[p("upstream", "127.0.0.1:8081")]);
+    let same = "listen and a server are the same address";
+    refuse(&[sv("address", "127.0.0.1:8080")], same);
+    refuse(&[sv("address", "[::ffff:127.0.0.1]:8080")], same);
+    pass(&[sv("address", "127.0.0.1:8081")]);
+    pass(&[sv("address", "[::1]:8080")]);
 }
 
 #[test]
@@ -421,6 +498,149 @@ fn the_keep_alive_wait_is_between_0_and_3600_s_and_0_means_no_keep_alive() {
 }
 
 #[test]
+fn a_server_is_checked_at_the_limits_of_its_numbers() {
+    let weight = "a server weight is out of range";
+    pass(&[sv("weight", 1)]);
+    pass(&[sv("weight", 100)]);
+    refuse(&[sv("weight", 0)], weight);
+    refuse(&[sv("weight", 101)], weight);
+    let fails = "a server max_fails is out of range";
+    pass(&[sv("max_fails", 0)]);
+    pass(&[sv("max_fails", 100)]);
+    refuse(&[sv("max_fails", 101)], fails);
+    let time = "a server fail_timeout_ms is out of range";
+    pass(&[sv("fail_timeout_ms", 1)]);
+    pass(&[sv("fail_timeout_ms", 3_600_000)]);
+    refuse(&[sv("fail_timeout_ms", 0)], time);
+    refuse(&[sv("fail_timeout_ms", 3_600_001)], time);
+}
+
+/// The base document with the group `api` called `name`, which the one route names.
+fn named(name: &str) -> Vec<u8> {
+    let mut value = base();
+    let group = value["forward"]["upstreams"]
+        .as_object_mut()
+        .unwrap()
+        .remove("api")
+        .unwrap();
+    value["forward"]["upstreams"][name] = group;
+    value["forward"]["routes"][0]["upstream"] = Value::from(name);
+    value.to_string().into_bytes()
+}
+
+#[test]
+fn the_names_and_the_numbers_of_groups_servers_and_routes_are_bounded() {
+    let name = "an upstream name is not 1 to 64 letters, digits, - and _";
+    for good in ["a", "A_b-9", &"x".repeat(64)] {
+        assert!(parse(&named(good)).is_ok(), "{good}");
+    }
+    for bad in ["", "a b", "a.b", "a/b", "é", &"x".repeat(65)] {
+        assert_eq!(parse(&named(bad)).err().map(|e| e.0), Some(name), "{bad:?}");
+    }
+
+    // 64 groups pass, 65 do not, and none does not either.
+    let groups = |n: usize| {
+        let mut value = base();
+        let one = value["forward"]["upstreams"]["main"].clone();
+        let list: serde_json::Map<String, Value> =
+            (0..n).map(|i| (format!("g{i}"), one.clone())).collect();
+        value["forward"]["upstreams"] = Value::Object(list);
+        value["forward"]["routes"] = Value::Array(Vec::new());
+        value["forward"]["default_upstream"] = Value::from("");
+        value.to_string().into_bytes()
+    };
+    let sentence = "upstreams has no group or more than 64 groups";
+    assert!(parse(&groups(64)).is_ok());
+    for n in [0, 65] {
+        assert_eq!(parse(&groups(n)).err().map(|e| e.0), Some(sentence), "{n}");
+    }
+
+    let servers = |n: usize| {
+        let mut value = base();
+        let one = value["forward"]["upstreams"]["main"]["servers"][0].clone();
+        value["forward"]["upstreams"]["main"]["servers"] = Value::Array(vec![one; n]);
+        value.to_string().into_bytes()
+    };
+    let sentence = "an upstream has no server or more than 64 servers";
+    assert!(parse(&servers(64)).is_ok());
+    for n in [0, 65] {
+        assert_eq!(parse(&servers(n)).err().map(|e| e.0), Some(sentence), "{n}");
+    }
+
+    let routes = |n: usize| {
+        let routes: Vec<Value> = (0..n)
+            .map(|i| serde_json::json!({"path": format!("/r{i}"), "upstream": "main"}))
+            .collect();
+        doc(&[f("routes", Value::Array(routes))])
+    };
+    assert!(parse(&routes(1024)).is_ok());
+    assert_eq!(
+        parse(&routes(1025)).err().map(|e| e.0),
+        Some("routes has more than 1024 entries")
+    );
+}
+
+#[test]
+fn a_route_names_a_group_that_is_there_and_is_a_rule_that_holds() {
+    let undefined = "a route names an upstream that is not defined";
+    let route = |value: Value| f("routes", Value::Array(vec![value]));
+    refuse(
+        &[route(serde_json::json!({"upstream": "qqmark"}))],
+        undefined,
+    );
+    refuse(
+        &[f("default_upstream", "qqmark")],
+        "default_upstream names an upstream that is not defined",
+    );
+    // No default group: a request that no route holds for gets 404.
+    let loaded = parse(&doc(&[f("default_upstream", "")])).unwrap();
+    assert_eq!(loaded.forward.default, None);
+
+    // A route may have neither host nor path, a path of `/`, and a wildcard host.
+    for good in [
+        serde_json::json!({"upstream": "api"}),
+        serde_json::json!({"path": "/", "upstream": "api"}),
+        serde_json::json!({"host": "*.example.test:8080", "upstream": "api"}),
+        serde_json::json!({"host": null, "path": null, "upstream": "api"}),
+    ] {
+        pass(&[route(good)]);
+    }
+    for (bad, sentence) in [
+        (
+            serde_json::json!({"path": "", "upstream": "api"}),
+            "a route path is not 1 to 255 bytes",
+        ),
+        (
+            serde_json::json!({"path": "/a/../b", "upstream": "api"}),
+            "a route path can be read in more than one way",
+        ),
+        (
+            serde_json::json!({"host": "Example.test", "upstream": "api"}),
+            "a route host is malformed",
+        ),
+        (
+            serde_json::json!({"host": "*", "upstream": "api"}),
+            "a route host is malformed",
+        ),
+    ] {
+        refuse(&[route(bad)], sentence);
+    }
+    let twice = serde_json::json!({"path": "/a/", "upstream": "api"});
+    refuse(
+        &[f("routes", Value::Array(vec![twice.clone(), twice]))],
+        "two routes have the same host and path",
+    );
+
+    // A group name that is repeated is a repeated key.
+    let repeated = BASE.replacen(
+        "\"upstreams\":{",
+        "\"upstreams\":{\"main\":{\"servers\":[]},",
+        1,
+    );
+    refuse_text(&repeated, "configuration has a repeated key");
+}
+
+#[test]
 fn the_kernel_object_is_converted_and_checked_by_the_kernel() {
     // The kernel's own sentences come through unchanged.
     refuse(
@@ -454,19 +674,23 @@ fn each_relation_between_the_two_objects_has_a_boundary() {
         "ready_wait_ms is below the kernel hello_wait",
     );
     pass(&[p("ready_wait_ms", 5000)]);
-    // head_read, body_read, upstream_connect, upstream_header <= request_total (60000 ms)
-    for key in [
-        "head_read_ms",
-        "body_read_ms",
-        "upstream_connect_ms",
-        "upstream_header_ms",
-    ] {
+    // head_read, body_read <= request_total (60000 ms)
+    for key in ["head_read_ms", "body_read_ms"] {
         refuse(
             &[p(key, 60001)],
             &format!("{key} is above request_total_ms"),
         );
         pass(&[p(key, 60000)]);
     }
+    // upstream_connect + upstream_header < request_total (5000 + 30000 against 60000 ms): the limit of a stage
+    // must come before the end of the request time, or a server that holds the stage up is never counted.
+    let stages = "upstream_connect_ms plus upstream_header_ms is not below request_total_ms";
+    refuse(&[p("upstream_header_ms", 55_000)], stages);
+    pass(&[p("upstream_header_ms", 54_999)]);
+    refuse(&[p("upstream_connect_ms", 30_000)], stages);
+    pass(&[p("upstream_connect_ms", 29_999)]);
+    refuse(&[p("request_total_ms", 35_000)], stages);
+    pass(&[p("request_total_ms", 35_001)]);
     // request_total, response_idle <= conn_total (120000 ms)
     refuse(
         &[p("request_total_ms", 120_001)],
@@ -578,15 +802,15 @@ fn scratch() -> TestDir {
 }
 
 #[test]
-fn load_reads_a_regular_file_of_at_most_64_kib() {
+fn load_reads_a_regular_file_of_at_most_256_kib() {
     let dir = scratch();
     let file = dir.path().join("config.json");
-    fs::write(&file, format!("{BASE}{}", " ".repeat(65536 - BASE.len()))).unwrap();
+    fs::write(&file, format!("{BASE}{}", " ".repeat(262_144 - BASE.len()))).unwrap();
     assert!(load(&file).is_ok());
-    fs::write(&file, format!("{BASE}{}", " ".repeat(65537 - BASE.len()))).unwrap();
+    fs::write(&file, format!("{BASE}{}", " ".repeat(262_145 - BASE.len()))).unwrap();
     assert_eq!(
         load(&file).err(),
-        Some(ConfigError("configuration file is over 64 KiB"))
+        Some(ConfigError("configuration file is over 256 KiB"))
     );
 
     assert_eq!(

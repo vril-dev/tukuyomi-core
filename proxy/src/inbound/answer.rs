@@ -1,7 +1,8 @@
 //! What a request is answered with: its reply and class, the answer table, the empty response and the record line.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -182,16 +183,45 @@ impl Body for Out {
     }
 }
 
-/// The one record line of a connection: its number, class, status, reason, rule id, the time it took and the
-/// address of the client. Only numbers, fixed texts and an address in its canonical form, so nothing the peer
-/// sent can get in: an address that a trusted peer put in a field is an IP literal before it is written, and
-/// the text of the field is not.
-pub(super) fn record(id: u64, reply: &Reply, elapsed: Duration, client: IpAddr) -> String {
+/// The upstream a request went to, for the record: the name of the group, and the address of the server that was
+/// tried last, if any was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Via {
+    pub(super) group: Arc<str>,
+    pub(super) server: Option<SocketAddr>,
+}
+
+/// What the record shows of a request besides the time it took: its reply, the address of the client it is recorded
+/// under, and the upstream it went to, if it got as far as that.
+pub(super) struct Noted {
+    pub(super) reply: Reply,
+    pub(super) client: IpAddr,
+    pub(super) via: Option<Via>,
+}
+
+/// The one record line of a request: its connection's number, class, status, reason, rule id, the time it took and
+/// the address of the client, and, for a request that was sent to an upstream, the group and the server. Only
+/// numbers, fixed texts, the name of a group from the configuration and addresses in their canonical forms, so
+/// nothing the peer sent can get in: an address that a trusted peer put in a field is an IP literal before it is
+/// written, and the text of the field is not.
+pub(super) fn record(
+    id: u64,
+    reply: &Reply,
+    elapsed: Duration,
+    client: IpAddr,
+    via: Option<&Via>,
+) -> String {
     let rule = reply
         .rule
         .map_or_else(|| "-".to_string(), |rule| rule.to_string());
+    let upstream = via.map_or_else(String::new, |via| {
+        let server = via
+            .server
+            .map_or_else(|| "-".to_string(), |s| s.to_string());
+        format!(" upstream {}/{server}", via.group)
+    });
     format!(
-        "conn {id}: {} {} {} rule {rule} {} ms client {}",
+        "conn {id}: {} {} {} rule {rule} {} ms client {}{upstream}",
         reply.class.name(),
         reply.status,
         reply.reason,

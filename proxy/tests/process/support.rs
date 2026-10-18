@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use serde_json::json;
+use serde_json::{Value, json};
 
 pub(crate) const MS: Duration = Duration::from_millis(1);
 pub(crate) const SEC: Duration = Duration::from_secs(1);
@@ -503,6 +503,10 @@ impl Upstream {
         }
     }
 
+    pub(crate) fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
     pub(crate) fn connections(&self) -> usize {
         self.seen.connections.load(Ordering::SeqCst)
     }
@@ -623,6 +627,11 @@ pub(crate) struct Knobs {
     pub(crate) upstream_keeps: bool,
     /// The networks of `trusted_proxies`.
     pub(crate) trusted_proxies: Vec<String>,
+    /// How many upstreams are started, each on a port of its own. The first is `Proxy::upstream`, the others are
+    /// `Proxy::others`.
+    pub(crate) upstreams: usize,
+    /// The `forward` object, made from the addresses of the upstreams in the order they were started.
+    pub(crate) forward: fn(&[SocketAddr]) -> Value,
     pub(crate) restarts: u32,
     pub(crate) stop_inspect_ms: u64,
     pub(crate) stop_wait_ms: u64,
@@ -642,6 +651,8 @@ impl Knobs {
             upstream_keepalive: 0,
             upstream_keeps: false,
             trusted_proxies: Vec::new(),
+            upstreams: 1,
+            forward: only_first,
             restarts: 0,
             stop_inspect_ms: 10_000,
             stop_wait_ms: 20_000,
@@ -661,11 +672,30 @@ impl Knobs {
     }
 }
 
-fn config_json(k: &Knobs, listen: SocketAddr, upstream: SocketAddr, root: &Path) -> String {
+/// A server of a group: weight 1, one failure leaves it out for 30 s, not a backup.
+pub(crate) fn server(address: SocketAddr) -> Value {
+    json!({
+        "address": address.to_string(),
+        "weight": 1,
+        "max_fails": 1,
+        "fail_timeout_ms": 30_000,
+        "backup": false,
+    })
+}
+
+/// The `forward` object of a proxy with the first upstream only: one group, every request goes to it.
+fn only_first(addresses: &[SocketAddr]) -> Value {
+    json!({
+        "upstreams": {"main": {"servers": [server(addresses[0])]}},
+        "routes": [],
+        "default_upstream": "main",
+    })
+}
+
+fn config_json(k: &Knobs, listen: SocketAddr, upstreams: &[SocketAddr], root: &Path) -> String {
     json!({
         "proxy": {
             "listen": listen.to_string(),
-            "upstream": upstream.to_string(),
             "max_conns": k.max_conns,
             "max_head_bytes": 8192,
             "max_body": MAX_BODY,
@@ -699,6 +729,7 @@ fn config_json(k: &Knobs, listen: SocketAddr, upstream: SocketAddr, root: &Path)
             "upstream_keepalive_timeout_ms": 10_000,
             "upstream_keepalive_requests": 1000,
         },
+        "forward": (k.forward)(upstreams),
         "kernel": {
             "inspector": var("TUKUYOMI_TEST_INSPECTOR"),
             "tmp_root": root.to_string_lossy(),
@@ -805,6 +836,8 @@ pub(crate) struct Proxy {
     reader: Option<JoinHandle<()>>,
     pub(crate) records: Arc<Records>,
     pub(crate) upstream: Upstream,
+    /// The upstreams after the first, if the test started more.
+    pub(crate) others: Vec<Upstream>,
     /// Every inspector process that was seen, to check at the end that none is left.
     pub(crate) inspectors: Vec<u32>,
     knobs: Knobs,
@@ -837,12 +870,19 @@ impl Proxy {
     pub(crate) fn spawn_with(test: &str, knobs: Knobs, edit: impl FnOnce(&Path)) -> Proxy {
         let root = make_root(test);
         let upstream = Upstream::start(knobs.upstream_keeps);
+        let others: Vec<Upstream> = (1..knobs.upstreams)
+            .map(|_| Upstream::start(knobs.upstream_keeps))
+            .collect();
+        let addresses: Vec<SocketAddr> = std::iter::once(&upstream)
+            .chain(&others)
+            .map(|up| up.addr)
+            .collect();
         let port = free_port();
         let listen = SocketAddr::from(([127, 0, 0, 1], port));
         let config = root.path().join("config.json");
         fs::write(
             &config,
-            config_json(&knobs, listen, upstream.addr, root.path()),
+            config_json(&knobs, listen, &addresses, root.path()),
         )
         .expect("write the configuration");
         make_store(root.path());
@@ -885,6 +925,7 @@ impl Proxy {
             reader: Some(reader),
             records,
             upstream,
+            others,
             inspectors: Vec::new(),
             knobs,
             started,
@@ -1042,6 +1083,9 @@ impl Proxy {
 
         // The proxy is gone, so every connection it made to the upstream has been accepted by now.
         self.upstream.stop();
+        for other in &mut self.others {
+            other.stop();
+        }
         assert_eq!(
             self.upstream.connections(),
             upstream_connections,
