@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","upstream":"127.0.0.1:9000","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":30000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
+const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","upstream":"127.0.0.1:9000","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
 
 /// Marks a value that must never appear in an error sentence.
 const MARK: &str = "qqmark";
@@ -72,6 +72,13 @@ fn the_base_document_loads_with_every_value_converted() {
     assert_eq!(proxy.lingering_time, Duration::from_millis(30_000));
     assert_eq!(proxy.lingering_timeout, Duration::from_millis(5_000));
     assert_eq!(proxy.lingering_bytes, 262_144);
+    assert!(proxy.trusted_proxies.is_empty());
+    assert_eq!(proxy.upstream_keepalive, 32);
+    assert_eq!(
+        proxy.upstream_keepalive_timeout,
+        Duration::from_millis(60_000)
+    );
+    assert_eq!(proxy.upstream_keepalive_requests, 1000);
     assert_eq!(kernel.inspector, PathBuf::from("/opt/tukuyomi/inspector"));
     // The directory and the fingerprint of a generation are not in the file: the check ran with placeholders.
     assert_eq!(
@@ -248,6 +255,7 @@ fn counts_and_sizes_are_inside_their_bounds() {
         ("max_head_bytes", 1024, 32768),
         ("upstream_max_headers", 1, 1024),
         ("keepalive_requests", 1, 1_000_000),
+        ("upstream_keepalive_requests", 1, 1_000_000),
         ("lingering_bytes", 1, 4 << 20),
     ] {
         pass(&[p(key, low)]);
@@ -255,6 +263,12 @@ fn counts_and_sizes_are_inside_their_bounds() {
         refuse(&[p(key, low - 1)], &out(key));
         refuse(&[p(key, high + 1)], &out(key));
     }
+
+    // upstream_keepalive: 0 (no connection is kept) to 1024.
+    let key = "upstream_keepalive";
+    pass(&[p(key, 0)]);
+    pass(&[p(key, 1024)]);
+    refuse(&[p(key, 1025)], &out(key));
 
     // max_conns: 1 to 65536. The lowest value needs a wait_queue of 1 (checked as a relation below).
     let key = "max_conns";
@@ -313,6 +327,7 @@ fn every_proxy_time_is_between_1_ms_and_3600_s() {
         "stop_inspect_ms",
         "stop_wait_ms",
         "keepalive_time_ms",
+        "upstream_keepalive_timeout_ms",
         "lingering_time_ms",
         "lingering_timeout_ms",
     ] {
@@ -320,7 +335,11 @@ fn every_proxy_time_is_between_1_ms_and_3600_s() {
         refuse(&[p(key, 0)], &sentence);
         refuse(&[p(key, 3_600_001)], &sentence);
     }
-    pass(&[p("drive_slice_ms", 1), p("response_idle_ms", 1)]);
+    pass(&[
+        p("drive_slice_ms", 1),
+        p("response_idle_ms", 1),
+        p("upstream_keepalive_timeout_ms", 1),
+    ]);
     pass(&[
         p("ready_wait_ms", 3_600_000),
         p("inspect_wait_ms", 3_600_000),
@@ -330,6 +349,54 @@ fn every_proxy_time_is_between_1_ms_and_3600_s() {
         p("keepalive_time_ms", 3_600_000),
         p("lingering_time_ms", 3_600_000),
     ]);
+}
+
+#[test]
+fn trusted_proxies_is_a_list_of_networks_that_may_be_empty() {
+    let bad = "trusted_proxies has an entry that is not a network";
+    pass(&[p("trusted_proxies", Value::Array(Vec::new()))]);
+    let loaded = parse(&doc(&[p(
+        "trusted_proxies",
+        serde_json::json!(["10.0.0.0/8", "2001:db8::/32", "192.0.2.7/32"]),
+    )]))
+    .unwrap();
+    let nets = &loaded.proxy.trusted_proxies;
+    assert_eq!(nets.len(), 3);
+    assert!(nets[0].contains("10.9.9.9".parse().unwrap()));
+    assert!(nets[1].contains("2001:db8::7".parse().unwrap()));
+    assert!(!nets[2].contains("192.0.2.8".parse().unwrap()));
+    // An entry is refused: one that is not a network, and one with a bit below the prefix.
+    for entry in [
+        Value::from("10.0.0.0"),
+        Value::from("10.0.0.1/8"),
+        Value::from("10.0.0.0/33"),
+        Value::from("localhost/8"),
+        Value::from(""),
+        Value::from(MARK),
+    ] {
+        refuse(&[p("trusted_proxies", Value::Array(vec![entry]))], bad);
+    }
+    let wrong = "configuration has a value of the wrong type";
+    refuse(
+        &[p("trusted_proxies", Value::Array(vec![Value::from(8)]))],
+        wrong,
+    );
+    refuse(&[p("trusted_proxies", "10.0.0.0/8")], wrong);
+    refuse(&[p("trusted_proxies", Value::Null)], wrong);
+    // The list has at most 256 networks.
+    let many = |n: usize| Value::Array(vec![Value::from("10.0.0.0/8"); n]);
+    pass(&[p("trusted_proxies", many(256))]);
+    refuse(
+        &[p("trusted_proxies", many(257))],
+        "trusted_proxies has more than 256 entries",
+    );
+    // The refusal carries nothing from the file.
+    let e = parse(&doc(&[p(
+        "trusted_proxies",
+        Value::Array(vec![MARK.into()]),
+    )]))
+    .unwrap_err();
+    assert!(!e.0.contains(MARK));
 }
 
 #[test]
@@ -410,6 +477,12 @@ fn each_relation_between_the_two_objects_has_a_boundary() {
         &[p("response_idle_ms", 120_001)],
         "response_idle_ms is above conn_total_ms",
     );
+    // upstream_keepalive_timeout <= response_idle (60000 ms)
+    refuse(
+        &[p("upstream_keepalive_timeout_ms", 60_001)],
+        "upstream_keepalive_timeout_ms is above response_idle_ms",
+    );
+    pass(&[p("upstream_keepalive_timeout_ms", 60_000)]);
     // keepalive_timeout <= conn_total (120000 ms)
     refuse(
         &[p("keepalive_timeout_ms", 120_001)],

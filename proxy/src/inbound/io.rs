@@ -4,9 +4,9 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
@@ -20,6 +20,16 @@ struct Shared {
     cap: AtomicU64,
     lifted: AtomicBool,
     over: AtomicBool,
+    /// The read idle period starts again, with the limit in `read_limit`, at the next read call. Only the `Guarded`
+    /// clears it.
+    restart: AtomicBool,
+    /// The read idle limit of a restarted period, in nanoseconds.
+    read_limit: AtomicU64,
+    /// The task that reads, to be woken when the period is restarted, so that a read that is pending does not
+    /// wait for the end of the old period.
+    reader: Mutex<Option<Waker>>,
+    /// The last write could not go on: some bytes it was given are not written yet.
+    blocked: AtomicBool,
 }
 
 impl Shared {
@@ -39,6 +49,31 @@ impl Shared {
         let total = self.read.load(Ordering::Relaxed).saturating_add(n);
         self.read.store(total, Ordering::Relaxed);
     }
+
+    /// Notes the task that reads.
+    fn park(&self, waker: &Waker) {
+        let mut slot = self.reader.lock().unwrap_or_else(PoisonError::into_inner);
+        if !slot.as_ref().is_some_and(|have| have.will_wake(waker)) {
+            *slot = Some(waker.clone());
+        }
+    }
+
+    /// Wakes the task that reads, if one has read. The lock is not held while it is woken.
+    fn wake(&self) {
+        let waker = self
+            .reader
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// A limit in nanoseconds, cut at the most that fits in 64 bits (some 584 years).
+fn nanos(limit: Duration) -> u64 {
+    u64::try_from(limit.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The idle limit of one direction. The timer starts at the first call that cannot go on and stops as soon as
@@ -61,6 +96,12 @@ impl Idle {
 
     /// Bytes moved (or the end was reached): the next stall starts a new period.
     fn moved(&mut self) {
+        self.armed = false;
+    }
+
+    /// The limit is `limit` from now on, and the next stall starts a new period.
+    fn restart(&mut self, limit: Duration) {
+        self.limit = limit;
         self.armed = false;
     }
 
@@ -108,7 +149,7 @@ impl Idle {
 /// A stream with three guards. Bytes given as `prefix` are read first and are not counted. At most `read_cap`
 /// bytes are read from the inner stream: the read that would take the next byte fails and sets the over flag, and
 /// every read after it fails too. A read or a write that is pending without progress for `read_idle` or
-/// `write_idle` fails with `TimedOut`.
+/// `write_idle` fails with `TimedOut`. The owner of the `Gauge` can change the read limit (`Gauge::restart`).
 pub struct Guarded<T> {
     inner: T,
     prefix: Bytes,
@@ -139,6 +180,10 @@ impl<T> Guarded<T> {
             cap: AtomicU64::new(read_cap),
             lifted: AtomicBool::new(false),
             over: AtomicBool::new(false),
+            restart: AtomicBool::new(false),
+            read_limit: AtomicU64::new(nanos(read_idle)),
+            reader: Mutex::new(None),
+            blocked: AtomicBool::new(false),
         });
         let gauge = Gauge {
             shared: shared.clone(),
@@ -174,6 +219,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for Guarded<T> {
         let this = self.get_mut();
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
+        }
+        // The task is noted before the flag is looked at, so a restart that comes after the look wakes it.
+        this.shared.park(cx.waker());
+        if this.shared.restart.swap(false, Ordering::AcqRel) {
+            let limit = Duration::from_nanos(this.shared.read_limit.load(Ordering::Acquire));
+            this.read_idle.restart(limit);
         }
         if !this.prefix.is_empty() {
             let n = this.prefix.len().min(buf.remaining());
@@ -232,6 +283,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Guarded<T> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.shared
+            .blocked
+            .store(polled.is_pending(), Ordering::Release);
         this.write_idle.judge(cx, polled)
     }
 
@@ -254,6 +308,12 @@ impl Gauge {
         self.shared.over.load(Ordering::Acquire)
     }
 
+    /// The last write could not go on, so bytes that the writer handed over are still waiting to be written: a
+    /// peer that does not read keeps them there. It is false again as soon as a write goes through.
+    pub fn write_blocked(&self) -> bool {
+        self.shared.blocked.load(Ordering::Acquire)
+    }
+
     /// Bytes read from `inner` so far; the prefix is not counted.
     pub fn read(&self) -> u64 {
         self.shared.read.load(Ordering::Relaxed)
@@ -273,6 +333,26 @@ impl Gauge {
             .load(Ordering::Relaxed)
             .saturating_add(more);
         self.shared.cap.store(total, Ordering::Release);
+    }
+
+    /// The read idle limit is `limit` from now on, and its period starts again at once, not at the time the
+    /// stream went quiet. This holds for a read that is pending as well as for the next one: the task that reads
+    /// is woken. A stream that waits for another exchange is kept to a shorter limit this way.
+    pub fn restart(&self, limit: Duration) {
+        self.shared
+            .read_limit
+            .store(nanos(limit), Ordering::Release);
+        self.shared.restart.store(true, Ordering::Release);
+        self.shared.wake();
+    }
+
+    /// For a stream that is used for another exchange after it waited: the cap is back as a new one of `more`
+    /// bytes (see `limit`), and the read idle limit is `read_idle` with a period that counts from now (see
+    /// `restart`). A read that was already refused stays refused.
+    pub fn rearm(&self, more: u64, read_idle: Duration) {
+        self.limit(more);
+        self.shared.lifted.store(false, Ordering::Release);
+        self.restart(read_idle);
     }
 }
 

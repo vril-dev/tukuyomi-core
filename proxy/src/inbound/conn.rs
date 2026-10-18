@@ -21,7 +21,7 @@
 //! the connection time counted from the accept. A sum that does not fit into the clock counts as passed.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -35,7 +35,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 
 use crate::config::ProxyConfig;
+use crate::forward::client_ip;
 use crate::forward::origin::{self, Forward, OriginBody, OriginError};
+use crate::forward::pool::Pool;
 use crate::inbound::answer::{Abort, Decision, Out, Passed, Reply, Stop, answer, decide};
 use crate::inbound::head::{Head, Reject};
 use crate::inbound::io::Gauge;
@@ -45,13 +47,14 @@ use crate::log::Log;
 use crate::rules::routes::SharedRoutes;
 
 /// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
-/// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, and
-/// the way to the driver.
+/// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, the
+/// connections to the upstream that wait to be used again, and the way to the driver.
 pub struct Ctx {
     pub cfg: ProxyConfig,
     pub budget: Arc<Semaphore>,
     pub inspect: Arc<Semaphore>,
     pub routes: SharedRoutes,
+    pub pool: Pool,
     pub log: Log,
     pub ingress: Arc<Ingress>,
 }
@@ -72,6 +75,9 @@ pub(super) struct Conn {
     ctx: Arc<Ctx>,
     head: Head,
     peer: SocketAddr,
+    /// The address that stands for the client: the peer, or what a trusted peer says (see `client_ip`). The
+    /// inspection and the record use it.
+    client: SocketAddr,
     local: SocketAddr,
     gauge: Gauge,
     /// End of the request time: the last instant for the answer, or for the upstream's response head.
@@ -86,9 +92,11 @@ pub(super) struct Conn {
     read_done: AtomicBool,
 }
 
-/// What a request came to: the reply for the record, and the response, or the order to close without one.
+/// What a request came to: the reply for the record and the address of the client it is recorded under, and the
+/// response, or the order to close without one.
 pub(super) struct Handled {
     pub(super) reply: Reply,
+    pub(super) client: IpAddr,
     pub(super) response: Result<Response<Out>, Abort>,
 }
 
@@ -101,8 +109,15 @@ impl Conn {
         gauge: Gauge,
         request_by: Instant,
     ) -> Conn {
+        let lines: Vec<&[u8]> = head
+            .fields()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(b"x-forwarded-for"))
+            .map(|(_, value)| value)
+            .collect();
+        let client = client_ip::effective(peer, &ctx.cfg.trusted_proxies, &lines);
         Conn {
             ctx: ctx.clone(),
+            client,
             head,
             peer,
             local,
@@ -139,7 +154,11 @@ impl Conn {
                 Err(Abort),
             ),
         };
-        Handled { reply, response }
+        Handled {
+            reply,
+            client: self.client.ip(),
+            response,
+        }
     }
 
     /// Everything up to the response of the upstream, and how the request was let through.
@@ -324,7 +343,7 @@ impl Conn {
         let (reply, verdict) = oneshot::channel();
         let ticket = Ticket {
             req: InspectReq {
-                client: self.peer,
+                client: self.client,
                 server: self.local,
                 method: Bytes::copy_from_slice(self.head.method()),
                 uri: Bytes::copy_from_slice(self.head.target()),

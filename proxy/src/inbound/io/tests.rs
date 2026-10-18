@@ -222,6 +222,72 @@ fn limit_sets_a_cap_that_counts_from_the_bytes_read_so_far() {
 }
 
 #[test]
+fn rearm_gives_a_new_cap_and_a_new_idle_period() {
+    run(async {
+        let idle = Duration::from_millis(600);
+        let mock = Mock::default();
+        mock.feed(b"0123");
+        let (mut io, gauge) = guarded(&mock, b"", idle, LONG, 4);
+        assert_eq!(read_some(&mut io, 16).await.unwrap(), b"0123");
+        gauge.lift();
+        // The stream goes quiet: a read that waits starts the idle period, and the period runs out.
+        assert!(
+            timeout(Duration::from_millis(200), read_some(&mut io, 16))
+                .await
+                .is_err()
+        );
+        sleep(Duration::from_millis(500)).await;
+        let err = read_some(&mut io, 16).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        // Used again: the period counts from now, so a wait shorter than the limit is not cut off.
+        gauge.rearm(4, idle);
+        assert!(
+            timeout(Duration::from_millis(300), read_some(&mut io, 16))
+                .await
+                .is_err()
+        );
+        // The cap is back, counted from the bytes read so far, and nothing was lost.
+        mock.feed(b"abcdefg");
+        assert_eq!(read_some(&mut io, 16).await.unwrap(), b"abcd");
+        assert_eq!((gauge.read(), gauge.over()), (8, false));
+        assert!(read_some(&mut io, 16).await.is_err());
+        assert_eq!((gauge.read(), gauge.over()), (8, true));
+    });
+}
+
+#[test]
+fn a_write_that_cannot_go_on_is_reported_until_it_goes_on() {
+    run(async {
+        let mock = Mock::default();
+        let (mut io, gauge) = guarded(&mock, b"", LONG, LONG, 100);
+        assert!(!gauge.write_blocked());
+        let writing = tokio::spawn(async move { write_some(&mut io, b"abc").await });
+        sleep(Duration::from_millis(50)).await;
+        assert!(gauge.write_blocked());
+        mock.allow_writes();
+        assert_eq!(writing.await.unwrap().unwrap(), 3);
+        assert!(!gauge.write_blocked());
+    });
+}
+
+#[test]
+fn restart_changes_the_limit_of_a_read_that_is_already_pending() {
+    run(async {
+        let mock = Mock::default();
+        let (mut io, gauge) = guarded(&mock, b"", LONG, LONG, 100);
+        let reading = tokio::spawn(async move { read_some(&mut io, 8).await });
+        // The read waits under the long limit. It is not polled again by anything but the restart.
+        sleep(Duration::from_millis(100)).await;
+        let start = StdInstant::now();
+        gauge.restart(Duration::from_millis(300));
+        let err = reading.await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        assert!(start.elapsed() < Duration::from_secs(10));
+    });
+}
+
+#[test]
 fn a_read_without_progress_times_out_and_a_slow_one_that_moves_does_not() {
     run(async {
         let idle = Duration::from_millis(400);

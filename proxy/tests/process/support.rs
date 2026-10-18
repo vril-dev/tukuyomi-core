@@ -448,7 +448,15 @@ fn free_port() -> u16 {
 // The upstream
 // ---------------------------------------------------------------------------------------------------------
 
-fn upstream_reply() -> Vec<u8> {
+/// The answer of the upstream: it ends the connection, unless the upstream keeps connections.
+fn upstream_reply(keeps: bool) -> Vec<u8> {
+    if keeps {
+        return format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nX-Up: visible\r\n\r\n{UPSTREAM_BODY}",
+            UPSTREAM_BODY.len()
+        )
+        .into_bytes();
+    }
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close, X-Up-Hop\r\nKeep-Alive: timeout=9\r\nX-Up-Hop: 1\r\nX-Up: visible\r\n\r\n{UPSTREAM_BODY}",
         UPSTREAM_BODY.len()
@@ -465,7 +473,8 @@ pub(crate) struct Seen {
 }
 
 /// A loopback listener on a port of its own that answers every request with `upstream_reply`. It counts every
-/// connection, also those that never send a byte.
+/// connection, also those that never send a byte. It answers once and closes the connection, or, when it keeps
+/// connections, answers one request after another until the other side closes.
 pub(crate) struct Upstream {
     addr: SocketAddr,
     pub(crate) seen: Arc<Seen>,
@@ -474,7 +483,7 @@ pub(crate) struct Upstream {
 }
 
 impl Upstream {
-    fn start() -> Upstream {
+    fn start(keeps: bool) -> Upstream {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind the upstream");
         listener
             .set_nonblocking(true)
@@ -484,7 +493,7 @@ impl Upstream {
         let stopping = Arc::new(AtomicBool::new(false));
         let accepter = {
             let (seen, stopping) = (seen.clone(), stopping.clone());
-            thread::spawn(move || accept_loop(&listener, &seen, &stopping))
+            thread::spawn(move || accept_loop(&listener, &seen, &stopping, keeps))
         };
         Upstream {
             addr,
@@ -528,6 +537,7 @@ fn accept_loop(
     listener: &TcpListener,
     seen: &Arc<Seen>,
     stopping: &AtomicBool,
+    keeps: bool,
 ) -> Vec<JoinHandle<()>> {
     let mut handlers = Vec::new();
     loop {
@@ -535,7 +545,7 @@ fn accept_loop(
             Ok((sock, _)) => {
                 seen.connections.fetch_add(1, Ordering::SeqCst);
                 let seen = seen.clone();
-                handlers.push(thread::spawn(move || serve_upstream(sock, &seen)));
+                handlers.push(thread::spawn(move || serve_upstream(sock, &seen, keeps)));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 if stopping.load(Ordering::SeqCst) {
@@ -549,7 +559,7 @@ fn accept_loop(
     handlers
 }
 
-fn serve_upstream(mut sock: TcpStream, seen: &Seen) {
+fn serve_upstream(mut sock: TcpStream, seen: &Seen, keeps: bool) {
     sock.set_nonblocking(false)
         .expect("make the upstream connection blocking");
     sock.set_read_timeout(Some(PATIENCE))
@@ -557,11 +567,12 @@ fn serve_upstream(mut sock: TcpStream, seen: &Seen) {
     sock.set_write_timeout(Some(PATIENCE))
         .expect("set the upstream write timeout");
     sock.set_nodelay(true).expect("set TCP_NODELAY");
-    let Some(request) = read_request(&mut sock) else {
-        return;
-    };
-    lock(&seen.requests).push(request);
-    let _ = sock.write_all(&upstream_reply());
+    while let Some(request) = read_request(&mut sock) {
+        lock(&seen.requests).push(request);
+        if sock.write_all(&upstream_reply(keeps)).is_err() || !keeps {
+            return;
+        }
+    }
 }
 
 /// A request read to its end: the head, and as many body bytes as its `Content-Length` says. `None` if the
@@ -606,6 +617,12 @@ pub(crate) struct Knobs {
     pub(crate) head_read_ms: u64,
     /// How long a connection waits for its next request after a response; 0: it closes after every response.
     pub(crate) keepalive_timeout_ms: u64,
+    /// The most connections to the upstream that wait to be used again; 0: every request has a connection of its own.
+    pub(crate) upstream_keepalive: usize,
+    /// The upstream keeps a connection and answers one request after another on it, instead of answering once.
+    pub(crate) upstream_keeps: bool,
+    /// The networks of `trusted_proxies`.
+    pub(crate) trusted_proxies: Vec<String>,
     pub(crate) restarts: u32,
     pub(crate) stop_inspect_ms: u64,
     pub(crate) stop_wait_ms: u64,
@@ -621,6 +638,10 @@ impl Knobs {
             head_read_ms: 10_000,
             // The tests that read until the proxy closes need a connection that closes after its response.
             keepalive_timeout_ms: 0,
+            // Each request has a connection to the upstream of its own, and the upstream ends it.
+            upstream_keepalive: 0,
+            upstream_keeps: false,
+            trusted_proxies: Vec::new(),
             restarts: 0,
             stop_inspect_ms: 10_000,
             stop_wait_ms: 20_000,
@@ -672,6 +693,11 @@ fn config_json(k: &Knobs, listen: SocketAddr, upstream: SocketAddr, root: &Path)
             "lingering_time_ms": 30_000,
             "lingering_timeout_ms": 5_000,
             "lingering_bytes": 262_144,
+            "trusted_proxies": k.trusted_proxies,
+            "upstream_keepalive": k.upstream_keepalive,
+            // Not above response_idle_ms.
+            "upstream_keepalive_timeout_ms": 10_000,
+            "upstream_keepalive_requests": 1000,
         },
         "kernel": {
             "inspector": var("TUKUYOMI_TEST_INSPECTOR"),
@@ -810,7 +836,7 @@ impl Proxy {
     /// the store and the stand-in are written and before the process starts.
     pub(crate) fn spawn_with(test: &str, knobs: Knobs, edit: impl FnOnce(&Path)) -> Proxy {
         let root = make_root(test);
-        let upstream = Upstream::start();
+        let upstream = Upstream::start(knobs.upstream_keeps);
         let port = free_port();
         let listen = SocketAddr::from(([127, 0, 0, 1], port));
         let config = root.path().join("config.json");

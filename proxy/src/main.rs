@@ -47,6 +47,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, Sleep, sleep, timeout_at};
 use tukuyomi_kernel::{Failure, Phase};
 use tukuyomi_proxy::config::{self, ProxyConfig};
+use tukuyomi_proxy::forward::pool::Pool;
 use tukuyomi_proxy::host;
 use tukuyomi_proxy::inbound::conn::Ctx;
 use tukuyomi_proxy::inbound::session;
@@ -254,6 +255,7 @@ async fn run(
         budget: Arc::new(Semaphore::new(proxy.max_buffered_bytes)),
         inspect: Arc::new(Semaphore::new(wait_queue)),
         routes: routes.clone(),
+        pool: Pool::new(&proxy),
         log: log.clone(),
         ingress: Arc::new(Ingress::new(ingress.clone())),
     });
@@ -1046,6 +1048,10 @@ mod tests {
             lingering_time: ms(1),
             lingering_timeout: ms(1),
             lingering_bytes: 1,
+            trusted_proxies: Vec::new(),
+            upstream_keepalive: 0,
+            upstream_keepalive_timeout: ms(1),
+            upstream_keepalive_requests: 1,
         }
     }
 

@@ -1,10 +1,22 @@
 //! Forwarding an allowed request to the one upstream, and checking its answer.
 //!
 //! The request leaves in the form that was inspected, with these changes only: the fields that belong to the
-//! connection with the client are removed, the forwarding fields and `Connection: close` are added, and the body
-//! is the inspected bytes. The names that the client listed in `Connection` are collected before anything is
-//! removed and are removed with the other hop-by-hop fields. The fields that are added come after the removal, so
-//! a client cannot take them away by naming them. Every request gets its own connection to the upstream.
+//! connection with the client are removed, the forwarding fields are added (and `Connection: close` when the
+//! connections to the upstream are not kept), and the body is the inspected bytes. The names that the client
+//! listed in `Connection` are collected before anything is removed and are removed with the other hop-by-hop
+//! fields. The fields that are added come after the removal, so a client cannot take them away by naming them.
+//!
+//! The forwarding fields tell the upstream who the client is. A peer that is in `trusted_proxies` is believed: its
+//! `X-Forwarded-For` lines are kept and its own address is added at the end, and its `X-Forwarded-Proto` is kept if
+//! it is exactly `http` or `https`; its other claims (see `CLIENT_CLAIMS`) pass as they are. From any other peer
+//! all of those claims are dropped, `X-Forwarded-For` is the address of the peer alone and `X-Forwarded-Proto` is
+//! `http`. `X-Forwarded-Host` is the `Host` of the request whoever the peer is.
+//!
+//! The connection to the upstream is the newest one in the pool that is ready, or a new one. It goes back to the
+//! pool when the body of the answer has been read to its end and nothing in the exchange ended it; a body that is
+//! dropped before its end ends the connection. A pooled connection that fails before any byte of an answer was
+//! read may have been closed by the upstream while it waited: a request that does no harm when it is sent twice
+//! (GET, HEAD, OPTIONS, PUT, DELETE, TRACE) is then sent once more on a new connection, and any other is not.
 //!
 //! The answer is checked before it is passed on. A status outside 200..=599, unclear framing, and a `Connection`
 //! field that is not a list of tokens or that names a field the answer must keep are refused, and the connection
@@ -40,9 +52,11 @@ use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
-use tokio::task::AbortHandle;
 use tokio::time::{Instant, timeout_at};
 
+use crate::config::ProxyConfig;
+use crate::forward::client_ip;
+use crate::forward::pool::{Lease, Pool};
 use crate::inbound::conn::Ctx;
 use crate::inbound::head::trim_ows;
 use crate::inbound::io::{Gauge, Guarded};
@@ -80,7 +94,27 @@ const RESPONSE_HOP: [&str; 8] = [
     "upgrade",
 ];
 
-/// An allowed request, as it is forwarded.
+/// Fields by which a peer says who the client is and how it came, in the spellings that servers and proxies in
+/// common use take for the address of the client. They are believed from a trusted peer only. `X-Forwarded-Host` is
+/// not among them: it is always made from the `Host` of the request. The names with an underscore never get here
+/// (see `represent`).
+const CLIENT_CLAIMS: [&str; 13] = [
+    "x-forwarded-for",
+    "x-real-ip",
+    "forwarded",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-ssl",
+    "x-forwarded-scheme",
+    "x-client-ip",
+    "true-client-ip",
+    "x-cluster-client-ip",
+    "cf-connecting-ip",
+    "fastly-client-ip",
+    "x-original-forwarded-for",
+];
+
+/// An allowed request, as it is forwarded. `peer` is the address of the connection the request came on.
 pub struct Forward {
     pub method: Method,
     pub uri: Uri,
@@ -89,19 +123,26 @@ pub struct Forward {
     pub peer: SocketAddr,
 }
 
-/// Aborts the spawned future that drives the connection to the upstream when it is dropped.
-struct Abort(AbortHandle);
-
-impl Drop for Abort {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// The upstream's response body without its trailers. Dropping it ends the upstream connection.
+/// The upstream's response body without its trailers. At its end the connection to the upstream goes back to the
+/// pool, if the exchange allows it. Dropping the body before that ends the connection.
 pub struct OriginBody {
     body: Incoming,
-    _conn: Abort,
+    /// The connection, until the body has ended.
+    lease: Option<Lease>,
+    pool: Pool,
+    /// Nothing in the answer ends the connection.
+    reuse: bool,
+}
+
+impl OriginBody {
+    /// The body has ended: the connection goes back to the pool, or is closed if the answer ended it.
+    fn end(&mut self) {
+        if let Some(lease) = self.lease.take()
+            && self.reuse
+        {
+            self.pool.put(lease);
+        }
+    }
 }
 
 impl Body for OriginBody {
@@ -116,6 +157,17 @@ impl Body for OriginBody {
         loop {
             match Pin::new(&mut this.body).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => {}
+                Poll::Ready(Some(Ok(frame))) => {
+                    // The server side stops asking for frames once the end is known, so it is looked for here.
+                    if this.body.is_end_stream() {
+                        this.end();
+                    }
+                    return Poll::Ready(Some(Ok(frame)));
+                }
+                Poll::Ready(None) => {
+                    this.end();
+                    return Poll::Ready(None);
+                }
                 other => return other,
             }
         }
@@ -145,7 +197,7 @@ pub enum OriginError {
 
 /// The request body: the inspected bytes. It keeps the share of the byte budget until hyper drops it, which is
 /// when the bytes are written or the connection is gone.
-struct Sent {
+pub(super) struct Sent {
     bytes: Full<Bytes>,
     _hold: Arc<BodyHold>,
 }
@@ -197,7 +249,8 @@ fn listed(line: &HeaderValue) -> impl Iterator<Item = Result<HeaderName, Invalid
         .map(|item| HeaderName::from_bytes(trim_ows(item)))
 }
 
-/// The `X-Forwarded-For` value: the lines the request has, in order, and then the address of the peer.
+/// The `X-Forwarded-For` value: the lines the request has, in order, and then the address of the peer. The
+/// address is the one of the connection, not the client address that the lines may lead to.
 fn forwarded_for(fields: &HeaderMap, peer: IpAddr) -> Result<HeaderValue, OriginError> {
     let mut chain = Vec::new();
     for line in fields.get_all(&X_FORWARDED_FOR) {
@@ -208,10 +261,25 @@ fn forwarded_for(fields: &HeaderMap, peer: IpAddr) -> Result<HeaderValue, Origin
     HeaderValue::from_bytes(&chain).map_err(|_| OriginError::Send)
 }
 
+/// The `X-Forwarded-Proto` value: the one line the request has if it is exactly `http` or `https`, `http` otherwise.
+fn forwarded_proto(fields: &HeaderMap) -> HeaderValue {
+    let mut lines = fields.get_all(&X_FORWARDED_PROTO).iter();
+    match (lines.next(), lines.next()) {
+        (Some(line), None) if matches!(line.as_bytes(), b"http" | b"https") => line.clone(),
+        _ => HeaderValue::from_static("http"),
+    }
+}
+
 /// The fields the upstream gets, in this order: the names listed in `Connection` are collected from the fields as
-/// they were inspected; the hop-by-hop fields and the listed names are removed; then the forwarding fields and
-/// `Connection: close` are put in. All other fields stay as they were inspected.
-fn forwarded_fields(mut fields: HeaderMap, peer: IpAddr) -> Result<HeaderMap, OriginError> {
+/// they were inspected; the hop-by-hop fields and the listed names are removed; if the peer is not `trusted`, so
+/// are the fields by which it says who the client is; then the forwarding fields are put in, and `Connection:
+/// close` if `close`. All other fields stay as they were inspected.
+fn forwarded_fields(
+    mut fields: HeaderMap,
+    peer: IpAddr,
+    trusted: bool,
+    close: bool,
+) -> Result<HeaderMap, OriginError> {
     let named: Vec<HeaderName> = fields
         .get_all(CONNECTION)
         .iter()
@@ -224,7 +292,13 @@ fn forwarded_fields(mut fields: HeaderMap, peer: IpAddr) -> Result<HeaderMap, Or
     for name in &named {
         fields.remove(name);
     }
+    if !trusted {
+        for name in CLIENT_CLAIMS {
+            fields.remove(name);
+        }
+    }
     let chain = forwarded_for(&fields, peer)?;
+    let proto = forwarded_proto(&fields);
     let host = fields.get(HOST).cloned();
     fields.insert(X_FORWARDED_FOR.clone(), chain);
     match host {
@@ -235,8 +309,10 @@ fn forwarded_fields(mut fields: HeaderMap, peer: IpAddr) -> Result<HeaderMap, Or
             fields.remove(&X_FORWARDED_HOST);
         }
     }
-    fields.insert(X_FORWARDED_PROTO.clone(), HeaderValue::from_static("http"));
-    fields.insert(CONNECTION, HeaderValue::from_static("close"));
+    fields.insert(X_FORWARDED_PROTO.clone(), proto);
+    if close {
+        fields.insert(CONNECTION, HeaderValue::from_static("close"));
+    }
     Ok(fields)
 }
 
@@ -322,15 +398,129 @@ fn idle_timeout(e: &hyper::Error) -> bool {
     false
 }
 
-/// Where a failure of the exchange belongs: `Head` once any byte of an answer has been read, when the cap for the
-/// head was hit, or when the connection made no progress for the idle limit; `Send` when nothing of an answer had
-/// arrived and the connection failed in another way.
-fn failure(e: &hyper::Error, gauge: &Gauge) -> OriginError {
-    if gauge.read() > 0 || gauge.over() || idle_timeout(e) {
+/// Where a failure of the exchange belongs: `Head` once any byte of an answer has been read (`base` is what had
+/// been read from the connection before the exchange), when the cap for the head was hit, or when the connection
+/// made no progress for the idle limit; `Send` when nothing of an answer had arrived and the connection failed in
+/// another way.
+fn failure(e: &hyper::Error, gauge: &Gauge, base: u64) -> OriginError {
+    if gauge.read() > base || gauge.over() || idle_timeout(e) {
         OriginError::Head
     } else {
         OriginError::Send
     }
+}
+
+/// The methods whose request does no harm when it reaches the upstream twice.
+fn idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::PUT | Method::DELETE | Method::TRACE
+    )
+}
+
+/// True when nothing in the head of the answer ends the connection with the upstream: it is HTTP/1.1, no
+/// `Connection` line lists `close` or `upgrade`, and the body is not the bytes up to the end of the connection
+/// (the answer to a HEAD request, a 204 and a 304 have none, the others say how long they are).
+fn lasts(parts: &Parts, head_request: bool) -> bool {
+    let framed = head_request
+        || matches!(parts.status.as_u16(), 204 | 304)
+        || parts.headers.contains_key(CONTENT_LENGTH)
+        || parts.headers.contains_key(TRANSFER_ENCODING);
+    framed
+        && parts.version == Version::HTTP_11
+        && !parts
+            .headers
+            .get_all(CONNECTION)
+            .iter()
+            .flat_map(listed)
+            .any(|name| name.is_ok_and(|name| name == "close" || name == "upgrade"))
+}
+
+/// The most bytes that are read from the upstream up to the final head. A value that does not fit into 64 bits
+/// cannot happen; if it did, nothing could be read.
+fn head_cap(cfg: &ProxyConfig) -> u64 {
+    u64::try_from(cfg.upstream_head_wire).unwrap_or(0)
+}
+
+/// The end of the stage in which a connection to the upstream is taken or made; `Connect` if it is already past.
+fn connect_end(cfg: &ProxyConfig, by: Instant) -> Result<Instant, OriginError> {
+    let end = stage(Instant::now(), cfg.upstream_connect, by);
+    if reached(end) {
+        return Err(OriginError::Connect);
+    }
+    Ok(end)
+}
+
+/// Makes a connection to the upstream within `connect_by`.
+async fn connect(cfg: &ProxyConfig, connect_by: Instant) -> Result<Lease, OriginError> {
+    let Ok(Ok(stream)) = timeout_at(connect_by, TcpStream::connect(cfg.upstream)).await else {
+        return Err(OriginError::Connect);
+    };
+    stream.set_nodelay(true).map_err(|_| OriginError::Connect)?;
+    // Up to the final head the reads are capped as a whole; the cap is lifted as soon as the head is here.
+    let (guarded, gauge) = Guarded::new(
+        stream,
+        Bytes::new(),
+        cfg.response_idle,
+        cfg.response_idle,
+        head_cap(cfg),
+    );
+    let mut client = http1::Builder::new();
+    client
+        .max_headers(cfg.upstream_max_headers)
+        .max_header_size(cfg.upstream_max_head_bytes)
+        .max_buf_size(cfg.upstream_max_head_bytes.max(8192))
+        .title_case_headers(true);
+    let (sender, conn) = client
+        .handshake(TokioIo::new(guarded))
+        .await
+        .map_err(|_| OriginError::Connect)?;
+    let task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(Lease::new(sender, gauge, task.abort_handle()))
+}
+
+/// Sends `request` on the connection and returns the checked head of the answer; `head_by` bounds that. The
+/// connection is closed if this fails. It goes back to `pool` at the end of the body of the answer if nothing in
+/// the head ends it.
+async fn exchange(
+    mut lease: Lease,
+    request: Request<Sent>,
+    head_by: Instant,
+    head_request: bool,
+    pool: &Pool,
+) -> Result<Response<OriginBody>, OriginError> {
+    if reached(head_by) {
+        return Err(OriginError::Head);
+    }
+    let base = lease.gauge.read();
+    lease.used = lease.used.saturating_add(1);
+    let response = match timeout_at(head_by, lease.sender.send_request(request)).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => return Err(failure(&e, &lease.gauge, base)),
+        Err(_) => return Err(OriginError::Head),
+    };
+    lease.gauge.lift();
+    // The connection may have started reading the body before the cap was lifted. A read that was refused
+    // has cut the answer off, so it is not passed on.
+    if lease.gauge.over() {
+        return Err(OriginError::Head);
+    }
+    let (mut parts, body) = response.into_parts();
+    let reuse = lasts(&parts, head_request);
+    check_head(&mut parts, head_request)?;
+    let mut body = OriginBody {
+        body,
+        lease: Some(lease),
+        pool: pool.clone(),
+        reuse,
+    };
+    // An answer without a body (to a HEAD request, a 204, a 304, a length of 0) is whole with its head.
+    if body.is_end_stream() {
+        body.end();
+    }
+    Ok(Response::from_parts(parts, body))
 }
 
 /// Sends the request to the upstream and returns its checked response head; `by` bounds the whole exchange up to
@@ -348,73 +538,33 @@ pub async fn forward(
         body,
         peer,
     } = f;
-    let fields = forwarded_fields(fields, peer.ip())?;
+    let trusted = client_ip::trusts(&cfg.trusted_proxies, peer.ip());
+    let fields = forwarded_fields(fields, peer.ip(), trusted, cfg.upstream_keepalive == 0)?;
     let head_request = method == Method::HEAD;
-
-    let connect_by = stage(Instant::now(), cfg.upstream_connect, by);
-    if reached(connect_by) {
-        return Err(OriginError::Connect);
-    }
-    let Ok(Ok(stream)) = timeout_at(connect_by, TcpStream::connect(cfg.upstream)).await else {
-        return Err(OriginError::Connect);
+    let request = || {
+        let mut request = Request::new(Sent::new(body.clone()));
+        *request.method_mut() = method.clone();
+        *request.uri_mut() = uri.clone();
+        *request.version_mut() = Version::HTTP_11;
+        *request.headers_mut() = fields.clone();
+        request
     };
-    let connected = Instant::now();
-    let head_by = stage(connected, cfg.upstream_header, by);
-    if reached(head_by) {
-        return Err(OriginError::Head);
-    }
-    stream.set_nodelay(true).map_err(|_| OriginError::Connect)?;
-    // Up to the final head the reads are capped as a whole; the cap is lifted as soon as the head is here. A value
-    // that does not fit into 64 bits cannot happen; if it did, nothing could be read.
-    let cap = u64::try_from(cfg.upstream_head_wire).unwrap_or(0);
-    let (guarded, gauge) = Guarded::new(
-        stream,
-        Bytes::new(),
-        cfg.response_idle,
-        cfg.response_idle,
-        cap,
-    );
-    let mut client = http1::Builder::new();
-    client
-        .max_headers(cfg.upstream_max_headers)
-        .max_header_size(cfg.upstream_max_head_bytes)
-        .max_buf_size(cfg.upstream_max_head_bytes.max(8192))
-        .title_case_headers(true);
-    let (mut sender, conn) = client
-        .handshake(TokioIo::new(guarded))
-        .await
-        .map_err(|_| OriginError::Connect)?;
-    let conn = Abort(
-        tokio::spawn(async move {
-            let _ = conn.await;
-        })
-        .abort_handle(),
-    );
 
-    let mut request = Request::new(Sent::new(body));
-    *request.method_mut() = method;
-    *request.uri_mut() = uri;
-    *request.version_mut() = Version::HTTP_11;
-    *request.headers_mut() = fields;
-
-    let response = match timeout_at(head_by, sender.send_request(request)).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(e)) => return Err(failure(&e, &gauge)),
-        Err(_) => return Err(OriginError::Head),
-    };
-    gauge.lift();
-    // The connection may have started reading the body before the cap was lifted. A read that was refused
-    // has cut the answer off, so it is not passed on.
-    if gauge.over() {
-        return Err(OriginError::Head);
+    if let Some(lease) = ctx.pool.take(connect_end(cfg, by)?).await {
+        lease.gauge.rearm(head_cap(cfg), cfg.response_idle);
+        let head_by = stage(Instant::now(), cfg.upstream_header, by);
+        match exchange(lease, request(), head_by, head_request, &ctx.pool).await {
+            // The upstream may have closed the connection while it waited. If nothing of an answer had arrived,
+            // a request that does no harm when it is sent twice is sent on a new connection, once. The stages of
+            // that go on to end by `by`.
+            Err(OriginError::Send) if idempotent(&method) => {}
+            done => return done,
+        }
     }
-    let (mut parts, body) = response.into_parts();
-    check_head(&mut parts, head_request)?;
-    Ok(Response::from_parts(
-        parts,
-        OriginBody { body, _conn: conn },
-    ))
+    let lease = connect(cfg, connect_end(cfg, by)?).await?;
+    let head_by = stage(Instant::now(), cfg.upstream_header, by);
+    exchange(lease, request(), head_by, head_request, &ctx.pool).await
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

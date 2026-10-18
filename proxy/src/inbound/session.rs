@@ -22,12 +22,13 @@
 //! linger: there is no response to protect.
 //!
 //! Every response has one line in the record, written when the response has been given to the connection or was
-//! cut off. A connection that never had a response, and one that was closed over a head that was refused after
-//! the first, have a line of their own when they end.
+//! cut off. The line has the address of the client that the inspection was told (see `conn`); a line that is
+//! written before a request has been read has the address of the peer. A connection that never had a response, and
+//! one that was closed over a head that was refused after the first, have a line of their own when they end.
 
 use std::future::{Future, poll_fn};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -117,7 +118,8 @@ pub async fn serve(sock: TcpStream, peer: SocketAddr, local: SocketAddr, ctx: Ar
                 summary.id, reply.reason
             ));
         }
-        ctx.log.line(&record(summary.id, &reply, accept.elapsed()));
+        ctx.log
+            .line(&record(summary.id, &reply, accept.elapsed(), peer.ip()));
     }
 }
 
@@ -241,7 +243,15 @@ impl Session {
         let Some(Taken { head, start }) = self.link.take_for(&parts) else {
             // Hyper made a request of bytes that the head check did not pass as that request.
             let reply = Reply::rejected(400, "the two parsers disagree");
-            return Ok(self.respond(reply, answer(400), Then::Close, false, Instant::now()));
+            let client = self.peer.ip();
+            return Ok(self.respond(
+                reply,
+                client,
+                answer(400),
+                Then::Close,
+                false,
+                Instant::now(),
+            ));
         };
         let conn = Conn::new(
             &self.ctx,
@@ -251,15 +261,19 @@ impl Session {
             self.gauge.clone(),
             after(start, self.ctx.cfg.request_total),
         );
-        let Handled { reply, response } = conn.handle(parts, body).await;
+        let Handled {
+            reply,
+            client,
+            response,
+        } = conn.handle(parts, body).await;
         match response {
             Ok(response) => {
                 let then = self.then(&conn, n);
                 let old = conn.head().http10();
-                Ok(self.respond(reply, response, then, old, start))
+                Ok(self.respond(reply, client, response, then, old, start))
             }
             Err(abort) => {
-                self.note(reply, start);
+                self.note(reply, client, start);
                 Err(abort)
             }
         }
@@ -290,6 +304,7 @@ impl Session {
     fn respond(
         self: &Arc<Self>,
         reply: Reply,
+        client: IpAddr,
         mut response: Response<Out>,
         then: Then,
         old: bool,
@@ -306,14 +321,15 @@ impl Session {
             body,
             session: self.clone(),
             reply,
+            client,
             start,
             ended: false,
             _finish: self.link.finish(),
         })
     }
 
-    /// Writes the line of a request in the record.
-    fn note(&self, reply: Reply, start: Instant) {
+    /// Writes the line of a request in the record; `client` is the address it is recorded under.
+    fn note(&self, reply: Reply, client: IpAddr, start: Instant) {
         #[cfg(test)]
         {
             *self.last.lock().unwrap_or_else(PoisonError::into_inner) = reply;
@@ -325,7 +341,9 @@ impl Session {
                 self.id, reply.reason
             ));
         }
-        self.ctx.log.line(&record(self.id, &reply, start.elapsed()));
+        self.ctx
+            .log
+            .line(&record(self.id, &reply, start.elapsed(), client));
     }
 
     /// Answers a first head that was refused, and closes. A head that did not come in time gets its answer and
@@ -406,6 +424,7 @@ struct Tracked {
     body: Out,
     session: Arc<Session>,
     reply: Reply,
+    client: IpAddr,
     start: Instant,
     /// The body gave its end.
     ended: bool,
@@ -445,7 +464,7 @@ impl Drop for Tracked {
         if !whole && reply.class == Class::Forwarded {
             reply.reason = "closed while the response was sent";
         }
-        self.session.note(reply, self.start);
+        self.session.note(reply, self.client, self.start);
     }
 }
 

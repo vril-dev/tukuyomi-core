@@ -1,5 +1,6 @@
 //! What a request is answered with: its reply and class, the answer table, the empty response and the record line.
 
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -181,18 +182,21 @@ impl Body for Out {
     }
 }
 
-/// The one record line of a connection: its number, class, status, reason, rule id and the time it took. Only
-/// numbers and fixed texts, so nothing the peer sent can get in.
-pub(super) fn record(id: u64, reply: &Reply, elapsed: Duration) -> String {
+/// The one record line of a connection: its number, class, status, reason, rule id, the time it took and the
+/// address of the client. Only numbers, fixed texts and an address in its canonical form, so nothing the peer
+/// sent can get in: an address that a trusted peer put in a field is an IP literal before it is written, and
+/// the text of the field is not.
+pub(super) fn record(id: u64, reply: &Reply, elapsed: Duration, client: IpAddr) -> String {
     let rule = reply
         .rule
         .map_or_else(|| "-".to_string(), |rule| rule.to_string());
     format!(
-        "conn {id}: {} {} {} rule {rule} {} ms",
+        "conn {id}: {} {} {} rule {rule} {} ms client {}",
         reply.class.name(),
         reply.status,
         reply.reason,
-        elapsed.as_millis()
+        elapsed.as_millis(),
+        client.to_canonical()
     )
 }
 

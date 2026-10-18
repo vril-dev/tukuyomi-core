@@ -82,6 +82,10 @@ pub(in crate::inbound) fn config() -> ProxyConfig {
         lingering_time: secs(1),
         lingering_timeout: Duration::from_millis(100),
         lingering_bytes: 1 << 20,
+        trusted_proxies: Vec::new(),
+        upstream_keepalive: 0,
+        upstream_keepalive_timeout: secs(5),
+        upstream_keepalive_requests: 1000,
     }
 }
 
@@ -103,6 +107,8 @@ pub(in crate::inbound) struct Seen {
     pub(in crate::inbound) method: String,
     pub(in crate::inbound) uri: String,
     pub(in crate::inbound) proto: String,
+    /// The address the inspection was told is the client's.
+    pub(in crate::inbound) client: SocketAddr,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     /// For a ticket that was kept: the connection had dropped its end when the driver stopped.
@@ -119,6 +125,7 @@ fn driver(rx: Receiver<Msg>, answer: Option<Outcome>) -> JoinHandle<Vec<Seen>> {
                 method: String::from_utf8_lossy(&req.method).into_owned(),
                 uri: String::from_utf8_lossy(&req.uri).into_owned(),
                 proto: String::from_utf8_lossy(req.proto).into_owned(),
+                client: req.client,
                 headers: req
                     .headers
                     .iter()
@@ -181,6 +188,7 @@ impl Rig {
             PERMITS + 1
         });
         let ctx = Arc::new(Ctx {
+            pool: Pool::new(&cfg),
             cfg,
             budget,
             inspect: Arc::new(Semaphore::new(PERMITS)),
@@ -387,6 +395,46 @@ fn a_blocked_request_is_answered_with_the_status_of_the_rule() {
             ("GET", "/a")
         );
         assert_eq!(seen[0].headers, [pair("Host", "h")]);
+    });
+}
+
+/// The address that the inspection is told is the client's, for a request from the loopback address with
+/// the given `X-Forwarded-For` lines, when `trusted` are the networks of `trusted_proxies`.
+async fn told_client(trusted: &[&str], lines: &[&str]) -> SocketAddr {
+    let cfg = ProxyConfig {
+        trusted_proxies: trusted
+            .iter()
+            .map(|net| crate::forward::client_ip::Cidr::parse(net).unwrap())
+            .collect(),
+        ..config()
+    };
+    let mut request = String::from("GET /a HTTP/1.1\r\nHost: h\r\n");
+    for line in lines {
+        request.push_str(&format!("X-Forwarded-For: {line}\r\n"));
+    }
+    request.push_str("\r\n");
+    let (_, seen) = exchange(cfg, Mode::Answer(BLOCK), request.as_bytes()).await;
+    assert_eq!(seen.len(), 1);
+    seen[0].client
+}
+
+#[test]
+fn the_inspection_is_told_the_client_that_a_trusted_peer_names_and_the_peer_otherwise() {
+    run(async {
+        let lines = ["203.0.113.1, 198.51.100.7", "127.0.0.9"];
+        // A peer that is not trusted is the client: the lines are not read.
+        for trusted in [&[][..], &["10.0.0.0/8"][..]] {
+            let client = told_client(trusted, &lines).await;
+            assert_eq!(client.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+            assert_ne!(client.port(), 0);
+        }
+        // A trusted peer: the first address from the right that is not trusted, and no port.
+        let named = told_client(&["127.0.0.0/8"], &lines).await;
+        assert_eq!(named, "198.51.100.7:0".parse().unwrap());
+        // An entry that is not an address leaves the peer.
+        let client = told_client(&["127.0.0.0/8"], &["198.51.100.7, nonsense"]).await;
+        assert_eq!(client.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_ne!(client.port(), 0);
     });
 }
 

@@ -98,7 +98,7 @@ fn an_answer_is_empty_with_a_length_of_0_and_close_after_marks_the_last_one() {
 }
 
 #[test]
-fn the_record_has_numbers_and_fixed_texts_only() {
+fn the_record_has_numbers_and_fixed_texts_and_the_address_of_the_client_only() {
     let blocked = Reply {
         status: 403,
         class: Class::Blocked,
@@ -106,36 +106,45 @@ fn the_record_has_numbers_and_fixed_texts_only() {
         rule: Some(9201),
         internal: false,
     };
+    let client: IpAddr = "203.0.113.9".parse().unwrap();
     assert_eq!(
-        record(7, &blocked, Duration::from_millis(12)),
-        "conn 7: blocked 403 blocked by a rule rule 9201 12 ms"
+        record(7, &blocked, Duration::from_millis(12), client),
+        "conn 7: blocked 403 blocked by a rule rule 9201 12 ms client 203.0.113.9"
     );
     assert_eq!(
-        record(8, &Reply::NONE, Duration::from_micros(1999)),
-        "conn 8: closed 0 no answer rule - 1 ms"
+        record(8, &Reply::NONE, Duration::from_micros(1999), client),
+        "conn 8: closed 0 no answer rule - 1 ms client 203.0.113.9"
     );
     assert_eq!(
         record(
             9,
             &Reply::forwarded(200, Passed::Allowed),
-            Duration::from_millis(3)
+            Duration::from_millis(3),
+            client
         ),
-        "conn 9: forwarded 200 forwarded rule - 3 ms"
+        "conn 9: forwarded 200 forwarded rule - 3 ms client 203.0.113.9"
     );
     assert_eq!(
         record(
             10,
             &Reply::forwarded(200, Passed::Detected { rule: 9201 }),
-            Duration::from_millis(3)
+            Duration::from_millis(3),
+            client
         ),
-        "conn 10: forwarded 200 detected by a rule rule 9201 3 ms"
+        "conn 10: forwarded 200 detected by a rule rule 9201 3 ms client 203.0.113.9"
     );
     assert_eq!(
         record(
             11,
             &Reply::forwarded(200, Passed::Bypassed),
-            Duration::from_millis(3)
+            Duration::from_millis(3),
+            client
         ),
-        "conn 11: forwarded 200 bypassed by a route rule - 3 ms"
+        "conn 11: forwarded 200 bypassed by a route rule - 3 ms client 203.0.113.9"
     );
+    // An IPv6 address, and an IPv4 address in its mapped form, are written in the canonical form.
+    let v6: IpAddr = "2001:db8::1".parse().unwrap();
+    let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+    assert!(record(12, &Reply::NONE, Duration::ZERO, v6).ends_with(" client 2001:db8::1"));
+    assert!(record(13, &Reply::NONE, Duration::ZERO, mapped).ends_with(" client 203.0.113.9"));
 }

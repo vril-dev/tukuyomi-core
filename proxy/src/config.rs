@@ -11,6 +11,7 @@
 //! Times are whole milliseconds under keys that end in `_ms`; the `proxy` times run from 1 ms to 3600 s, except
 //! `keepalive_timeout_ms`, which also takes 0 (a connection is not kept after its response), and `conn_total_ms`,
 //! which runs up to 24 h.
+//! `trusted_proxies` is a list of networks, `address/prefix` in the form `Cidr::parse` takes, and may be empty.
 //! `listen` and `upstream` are an IP literal and a port (`[..]:port` for IPv6). `rules.store.kind` is `file`, the
 //! only kind there is, and `dir` is an absolute clean path of at most 3840 bytes. The `kernel` object has no
 //! rules path and no rules fingerprint: the directory and the fingerprint of the chosen generation come from the
@@ -31,6 +32,7 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::error::Category;
 use tukuyomi_kernel::limits::{BODY, HEADER_TOTAL};
 
+use crate::forward::client_ip::Cidr;
 use crate::rules::bundle::Fingerprint;
 
 const MAX_FILE: u64 = 64 * 1024;
@@ -40,6 +42,8 @@ const MAX_STORE_DIR: usize = 3840;
 const MAX_MS: u64 = 3_600_000;
 /// The longest `conn_total_ms`: the connection time has room for `keepalive_time_ms` and one request after it.
 const MAX_CONN_MS: u64 = 86_400_000;
+/// The most networks in `trusted_proxies`.
+const MAX_TRUSTED: usize = 256;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
@@ -84,6 +88,16 @@ pub struct ProxyConfig {
     pub lingering_time: Duration,
     pub lingering_timeout: Duration,
     pub lingering_bytes: usize,
+    /// The peers that are believed when they say who the client is, by the `X-Forwarded-For` of a request. Empty:
+    /// the client is always the peer.
+    pub trusted_proxies: Vec<Cidr>,
+    /// The most connections to the upstream that wait to be used again. Zero: a connection is closed after its
+    /// answer.
+    pub upstream_keepalive: usize,
+    /// How long a connection to the upstream waits to be used again.
+    pub upstream_keepalive_timeout: Duration,
+    /// The most requests one connection to the upstream carries.
+    pub upstream_keepalive_requests: usize,
 }
 
 /// A configuration that passed every check.
@@ -165,6 +179,10 @@ struct RawProxy {
     lingering_time_ms: u64,
     lingering_timeout_ms: u64,
     lingering_bytes: usize,
+    trusted_proxies: Vec<String>,
+    upstream_keepalive: usize,
+    upstream_keepalive_timeout_ms: u64,
+    upstream_keepalive_requests: usize,
 }
 
 #[derive(Deserialize)]
@@ -407,6 +425,30 @@ fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> 
         within(p.lingering_bytes, 1, 4 * MIB),
         "lingering_bytes is out of range",
     )?;
+    ensure(
+        p.trusted_proxies.len() <= MAX_TRUSTED,
+        "trusted_proxies has more than 256 entries",
+    )?;
+    let trusted_proxies = p
+        .trusted_proxies
+        .iter()
+        .map(|text| Cidr::parse(text))
+        .collect::<Option<Vec<Cidr>>>()
+        .ok_or(ConfigError(
+            "trusted_proxies has an entry that is not a network",
+        ))?;
+    ensure(
+        within(p.upstream_keepalive, 0, 1024),
+        "upstream_keepalive is out of range",
+    )?;
+    let upstream_keepalive_timeout = millis(
+        p.upstream_keepalive_timeout_ms,
+        "upstream_keepalive_timeout_ms is out of range",
+    )?;
+    ensure(
+        within(p.upstream_keepalive_requests, 1, 1_000_000),
+        "upstream_keepalive_requests is out of range",
+    )?;
 
     ensure(s.kind == "file", "rules store kind is not supported")?;
     let dir = PathBuf::from(s.dir);
@@ -491,6 +533,12 @@ fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> 
         keepalive_timeout <= conn_total,
         "keepalive_timeout_ms is above conn_total_ms",
     )?;
+    // A connection that waits in the pool is read from the whole time, and a read that waits for longer than
+    // `response_idle` fails.
+    ensure(
+        upstream_keepalive_timeout <= response_idle,
+        "upstream_keepalive_timeout_ms is above response_idle_ms",
+    )?;
     // A request that starts before `keepalive_time` gets its answer, or the upstream's response head, before
     // the connection time is over (`request_total` bounds that part of a request, not a streamed body).
     ensure(
@@ -550,6 +598,10 @@ fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> 
             lingering_time,
             lingering_timeout,
             lingering_bytes: p.lingering_bytes,
+            trusted_proxies,
+            upstream_keepalive: p.upstream_keepalive,
+            upstream_keepalive_timeout,
+            upstream_keepalive_requests: p.upstream_keepalive_requests,
         },
         kernel: KernelSettings(kernel),
         store: StoreConfig::File { dir },

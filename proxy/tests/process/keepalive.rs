@@ -12,6 +12,15 @@ fn kept() -> Knobs {
     }
 }
 
+/// Knobs for a proxy that keeps the connections to the upstream too, and an upstream that lets it.
+fn reusing() -> Knobs {
+    Knobs {
+        upstream_keepalive: 32,
+        upstream_keeps: true,
+        ..kept()
+    }
+}
+
 /// Reads one response with a `Content-Length` from a connection that stays open: its head and exactly its body.
 fn read_response(sock: &mut TcpStream) -> Message {
     sock.set_read_timeout(Some(30 * SEC))
@@ -52,6 +61,36 @@ fn read_until_end(sock: &mut TcpStream) -> Vec<u8> {
             Err(e) => panic!("the connection failed after {} bytes: {e}", raw.len()),
         }
     }
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn requests_share_one_connection_to_the_upstream_and_do_not_ask_it_to_close() {
+    let proxy = Proxy::start("upstream_reuse", reusing());
+
+    // Three requests on one client connection, and one more on another client connection.
+    let mut sock = connect(proxy.port);
+    for path in ["/one", "/two", "/three"] {
+        sock.write_all(&get(path)).expect("send a request");
+        let answer = read_response(&mut sock);
+        assert_eq!(answer.status(), 200);
+        assert_eq!(answer.body, UPSTREAM_BODY.as_bytes());
+    }
+    drop(sock);
+    let mut sock = connect(proxy.port);
+    sock.write_all(&get("/four")).expect("send a request");
+    assert_eq!(read_response(&mut sock).status(), 200);
+    drop(sock);
+
+    assert_eq!(proxy.upstream.requests().len(), 4);
+    assert_eq!(proxy.upstream.connections(), 1);
+    for request in proxy.upstream.requests() {
+        assert!(Message::parse(&request).values("connection").is_empty());
+    }
+    proxy.records.conns("four forwarded records", 4, |l| {
+        l.contains(": forwarded 200 forwarded rule - ")
+    });
+    proxy.finish(1);
 }
 
 #[test]

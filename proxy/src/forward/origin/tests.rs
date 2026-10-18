@@ -18,9 +18,9 @@ use crate::rules::routes::{Routes, SharedRoutes};
 const BUDGET: usize = 4 << 20;
 const PEER: &str = "203.0.113.9:5555";
 
-type Outcome = Result<Response<OriginBody>, OriginError>;
+pub(in crate::forward) type Outcome = Result<Response<OriginBody>, OriginError>;
 
-fn config(upstream: SocketAddr) -> ProxyConfig {
+pub(in crate::forward) fn config(upstream: SocketAddr) -> ProxyConfig {
     let secs = Duration::from_secs;
     ProxyConfig {
         listen: "127.0.0.1:1".parse().unwrap(),
@@ -51,13 +51,19 @@ fn config(upstream: SocketAddr) -> ProxyConfig {
         lingering_time: secs(10),
         lingering_timeout: secs(5),
         lingering_bytes: 262_144,
+        trusted_proxies: Vec::new(),
+        // A connection is not kept, unless a test turns it on.
+        upstream_keepalive: 0,
+        upstream_keepalive_timeout: secs(5),
+        upstream_keepalive_requests: 1000,
     }
 }
 
-fn ctx(cfg: ProxyConfig) -> Ctx {
+pub(in crate::forward) fn ctx(cfg: ProxyConfig) -> Ctx {
     // The forwarding never reaches the driver: nobody receives on this channel.
     let (to_driver, _) = std::sync::mpsc::sync_channel(1);
     Ctx {
+        pool: Pool::new(&cfg),
         budget: Arc::new(Semaphore::new(cfg.max_buffered_bytes)),
         inspect: Arc::new(Semaphore::new(1)),
         routes: SharedRoutes::new(Routes::default()),
@@ -68,7 +74,7 @@ fn ctx(cfg: ProxyConfig) -> Ctx {
 }
 
 /// Runs a test body; a body that hangs fails the test instead of the run.
-fn run<F: Future>(body: F) -> F::Output {
+pub(in crate::forward) fn run<F: Future>(body: F) -> F::Output {
     Builder::new_current_thread()
         .enable_all()
         .build()
@@ -81,7 +87,7 @@ fn run<F: Future>(body: F) -> F::Output {
 }
 
 /// Far enough away to play no part.
-fn far() -> Instant {
+pub(in crate::forward) fn far() -> Instant {
     Instant::now() + Duration::from_secs(30)
 }
 
@@ -105,7 +111,12 @@ fn hold(ctx: &Ctx, bytes: &[u8]) -> Arc<BodyHold> {
     Arc::new(BodyHold::new(Bytes::copy_from_slice(bytes), permit))
 }
 
-fn request(ctx: &Ctx, method: &str, pairs: &[(&str, &str)], body: &[u8]) -> Forward {
+pub(in crate::forward) fn request(
+    ctx: &Ctx,
+    method: &str,
+    pairs: &[(&str, &str)],
+    body: &[u8],
+) -> Forward {
     Forward {
         method: method.parse().unwrap(),
         uri: "/p?q=1".parse().unwrap(),
@@ -116,13 +127,13 @@ fn request(ctx: &Ctx, method: &str, pairs: &[(&str, &str)], body: &[u8]) -> Forw
 }
 
 /// A request with a Host field and nothing else.
-fn bare(ctx: &Ctx, method: &str) -> Forward {
+pub(in crate::forward) fn bare(ctx: &Ctx, method: &str) -> Forward {
     request(ctx, method, &[("Host", "h.test")], b"")
 }
 
 // ---- a raw upstream: a listener on 127.0.0.1 that serves one connection ----
 
-async fn pull(sock: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+pub(in crate::forward) async fn pull(sock: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         sock.readable().await?;
         match sock.try_read(buf) {
@@ -132,7 +143,7 @@ async fn pull(sock: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-async fn put(sock: &TcpStream, mut bytes: &[u8]) -> io::Result<()> {
+pub(in crate::forward) async fn put(sock: &TcpStream, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         sock.writable().await?;
         match sock.try_write(bytes) {
@@ -174,14 +185,14 @@ where
 }
 
 /// The request as the upstream read it.
-struct Seen {
-    line: String,
-    fields: Vec<(String, String)>,
-    body: Vec<u8>,
+pub(in crate::forward) struct Seen {
+    pub(in crate::forward) line: String,
+    pub(in crate::forward) fields: Vec<(String, String)>,
+    pub(in crate::forward) body: Vec<u8>,
 }
 
 impl Seen {
-    fn all(&self, name: &str) -> Vec<&str> {
+    pub(in crate::forward) fn all(&self, name: &str) -> Vec<&str> {
         self.fields
             .iter()
             .filter(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -201,14 +212,18 @@ impl Seen {
     }
 }
 
-async fn read_request(sock: &TcpStream) -> Seen {
+/// The next request on the connection, or `None` when the other side has closed before a byte of it came.
+pub(in crate::forward) async fn next_request(sock: &TcpStream) -> Option<Seen> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 16384];
     let end = loop {
         if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
             break at + 4;
         }
-        let n = pull(sock, &mut buf).await.unwrap();
+        let n = pull(sock, &mut buf).await.unwrap_or(0);
+        if n == 0 && raw.is_empty() {
+            return None;
+        }
         assert!(n > 0, "the request ended before its head did");
         raw.extend_from_slice(&buf[..n]);
     };
@@ -244,7 +259,13 @@ async fn read_request(sock: &TcpStream) -> Seen {
         assert!(n > 0, "the body ended early");
         body.extend_from_slice(&buf[..n]);
     }
-    Seen { line, fields, body }
+    Some(Seen { line, fields, body })
+}
+
+pub(in crate::forward) async fn read_request(sock: &TcpStream) -> Seen {
+    next_request(sock)
+        .await
+        .expect("the request ended before its head did")
 }
 
 /// Reads the request, sends `reply`, then (with `linger`) waits for the proxy to close the connection and
@@ -264,7 +285,7 @@ async fn ask(method: &str, reply: &[u8], linger: bool) -> (Outcome, JoinHandle<b
     (out, up)
 }
 
-fn refused(out: Outcome) -> OriginError {
+pub(in crate::forward) fn refused(out: Outcome) -> OriginError {
     match out {
         Ok(response) => panic!("passed on with status {}", response.status()),
         Err(e) => e,
@@ -272,7 +293,7 @@ fn refused(out: Outcome) -> OriginError {
 }
 
 /// The data of a body and the number of trailer frames it gave.
-async fn collect(mut body: OriginBody) -> (Vec<u8>, usize) {
+pub(in crate::forward) async fn collect(mut body: OriginBody) -> (Vec<u8>, usize) {
     let mut data = Vec::new();
     let mut trailers = 0;
     while let Some(frame) = body.frame().await {
@@ -308,7 +329,7 @@ fn every_hop_by_hop_field_is_removed_from_the_request() {
     let peer: IpAddr = "203.0.113.9".parse().unwrap();
     for name in REQUEST_HOP {
         let sent = fields(&[("Host", "h.test"), (name, "x"), ("X-Keep", "1")]);
-        let out = forwarded_fields(sent, peer).unwrap();
+        let out = forwarded_fields(sent, peer, true, true).unwrap();
         if name == "connection" {
             assert_eq!(only(&out, name), [b"close"], "{name}");
         } else {
@@ -332,7 +353,7 @@ fn the_names_are_collected_before_the_removal_and_the_additions_come_after_it() 
         ("X-Hop", "1"),
         ("X-Keep", "k"),
     ]);
-    let out = forwarded_fields(sent, peer).unwrap();
+    let out = forwarded_fields(sent, peer, true, true).unwrap();
     // The client's own lines are gone with the names it listed; ours come after, and listing a name does not
     // take ours away, not even for `Connection` itself.
     assert_eq!(only(&out, "x-forwarded-for"), [b"203.0.113.9"]);
@@ -362,8 +383,92 @@ fn x_forwarded_for_joins_the_lines_in_order_and_ends_with_the_peer() {
     for (lines, peer, expected) in cases {
         let mut pairs = vec![("Host", "h.test")];
         pairs.extend(lines.iter().map(|line| ("X-Forwarded-For", *line)));
-        let out = forwarded_fields(fields(&pairs), peer).unwrap();
+        let out = forwarded_fields(fields(&pairs), peer, true, true).unwrap();
         assert_eq!(only(&out, "x-forwarded-for"), [expected], "{lines:?}");
+    }
+}
+
+#[test]
+fn a_peer_that_is_not_trusted_cannot_tell_the_upstream_who_the_client_is() {
+    let peer: IpAddr = "203.0.113.9".parse().unwrap();
+    let sent = fields(&[
+        ("Host", "h.test"),
+        ("X-Forwarded-For", "198.51.100.1, 10.0.0.1"),
+        ("X-Forwarded-For", "192.0.2.5"),
+        ("X-Real-IP", "198.51.100.1"),
+        ("Forwarded", "for=198.51.100.1;proto=https"),
+        ("X-Forwarded-Proto", "https"),
+        ("X-Forwarded-Host", "evil.test"),
+        ("X-Keep", "k"),
+    ]);
+    let out = forwarded_fields(sent, peer, false, false).unwrap();
+    // The upstream gets the address of the peer alone, and our own scheme and host.
+    assert_eq!(only(&out, "x-forwarded-for"), [b"203.0.113.9"]);
+    assert_eq!(only(&out, "x-forwarded-proto"), [b"http"]);
+    assert_eq!(only(&out, "x-forwarded-host"), [b"h.test"]);
+    assert!(out.get("x-real-ip").is_none());
+    assert!(out.get("forwarded").is_none());
+    // Nothing else is touched, and the connection is not told to close when it is kept.
+    assert_eq!(only(&out, "x-keep"), [b"k"]);
+    assert!(out.get("connection").is_none());
+    assert_eq!(out.len(), 5);
+}
+
+#[test]
+fn a_trusted_peer_keeps_its_claims_and_the_scheme_is_http_or_https_only() {
+    let peer: IpAddr = "10.0.0.2".parse().unwrap();
+    let sent = fields(&[
+        ("Host", "h.test"),
+        ("X-Forwarded-For", "198.51.100.1"),
+        ("X-Real-IP", "198.51.100.1"),
+        ("Forwarded", "for=198.51.100.1"),
+        ("X-Forwarded-Proto", "https"),
+    ]);
+    let out = forwarded_fields(sent, peer, true, false).unwrap();
+    assert_eq!(only(&out, "x-forwarded-for"), [b"198.51.100.1, 10.0.0.2"]);
+    assert_eq!(only(&out, "x-real-ip"), [b"198.51.100.1"]);
+    assert_eq!(only(&out, "forwarded"), [b"for=198.51.100.1"]);
+    assert_eq!(only(&out, "x-forwarded-proto"), [b"https"]);
+    // Only these two values, byte for byte and on one line, are kept; anything else is our own.
+    let proto = |lines: &[&str]| {
+        let mut pairs = vec![("Host", "h.test")];
+        pairs.extend(lines.iter().map(|line| ("X-Forwarded-Proto", *line)));
+        let out = forwarded_fields(fields(&pairs), peer, true, false).unwrap();
+        only(&out, "x-forwarded-proto")
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(proto(&["http"]), [b"http"]);
+    assert_eq!(proto(&["https"]), [b"https"]);
+    for lines in [
+        &["HTTPS"][..],
+        &["ftp"],
+        &[""],
+        &["https, http"],
+        &[" https"],
+        &["https", "https"],
+        &[],
+    ] {
+        assert_eq!(proto(lines), [b"http"], "{lines:?}");
+    }
+}
+
+#[test]
+fn the_other_claims_about_the_client_are_kept_from_a_trusted_peer_and_dropped_from_any_other() {
+    // `X-Forwarded-For` and `X-Forwarded-Proto` are made anew in both cases, and are looked at above.
+    let claims = CLIENT_CLAIMS
+        .into_iter()
+        .filter(|name| !matches!(*name, "x-forwarded-for" | "x-forwarded-proto"));
+    for name in claims {
+        let sent = fields(&[("Host", "h.test"), (name, "198.51.100.1"), ("X-Keep", "k")]);
+        let untrusted =
+            forwarded_fields(sent.clone(), "203.0.113.9".parse().unwrap(), false, false);
+        let untrusted = untrusted.unwrap();
+        assert!(untrusted.get(name).is_none(), "{name}");
+        assert_eq!(only(&untrusted, "x-keep"), [b"k"], "{name}");
+        let trusted = forwarded_fields(sent, "10.0.0.2".parse().unwrap(), true, false).unwrap();
+        assert_eq!(only(&trusted, name), [b"198.51.100.1"], "{name}");
     }
 }
 

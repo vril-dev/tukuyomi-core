@@ -203,7 +203,7 @@ fn a_post_put_or_patch_without_a_length_gets_content_length_0() {
 #[test]
 fn names_are_title_case_and_values_stay_as_received() {
     let rep = represented(
-        "GET / HTTP/1.1\r\nhost: h\r\nx-a-b: a\tb\r\nACCEPT-ENCODING: gzip\r\nA.b_c-d: \tv \r\n\r\n",
+        "GET / HTTP/1.1\r\nhost: h\r\nx-a-b: a\tb\r\nACCEPT-ENCODING: gzip\r\nA.b-c-d: \tv \r\n\r\n",
         0,
     );
     assert_eq!(
@@ -212,9 +212,34 @@ fn names_are_title_case_and_values_stay_as_received() {
             pair("Host", "h"),
             pair("X-A-B", "a\tb"),
             pair("Accept-Encoding", "gzip"),
-            pair("A.b_c-D", "v"),
+            pair("A.b-C-D", "v"),
         ]
     );
+}
+
+#[test]
+fn a_field_with_an_underscore_in_its_name_is_neither_inspected_nor_forwarded() {
+    let rep = represented(
+        "POST / HTTP/1.1\r\nHost: h\r\nX_Forwarded_For: 198.51.100.1\r\nX-Keep: k\r\nx_real-ip: 198.51.100.1\r\nX-Forwarded-For: 198.51.100.2\r\nContent-Length: 0\r\n\r\n",
+        0,
+    );
+    let expected = [
+        pair("Host", "h"),
+        pair("X-Keep", "k"),
+        pair("X-Forwarded-For", "198.51.100.2"),
+        pair("Content-Length", "0"),
+    ];
+    assert_eq!(pairs(&rep), expected);
+    assert_eq!(rep.fields.len(), 4);
+    assert!(rep.fields.get("x_forwarded_for").is_none());
+    assert!(rep.fields.get("x_real-ip").is_none());
+    assert_eq!(rep.fields.get("x-forwarded-for").unwrap(), "198.51.100.2");
+    // Its bytes are not counted either.
+    let bytes: usize = expected
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    assert_eq!(rep.field_bytes, bytes);
 }
 
 #[test]

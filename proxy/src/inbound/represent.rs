@@ -1,4 +1,10 @@
 //! The form of the request that is inspected and forwarded, and the decoding of a gzip body.
+//!
+//! A field whose name has an underscore is dropped where the fields of the head become the fields of the request:
+//! it is neither inspected nor forwarded, whoever the peer is. Many servers behind a proxy read `X_Forwarded_For`
+//! and `X-Forwarded-For` as the same variable, so a client could use that name to speak for the address that the
+//! proxy sets. A server that does not accept underscores in field names does the same. The head check is not
+//! changed.
 
 use std::io::Read;
 
@@ -61,17 +67,21 @@ fn title_case(name: &str) -> Bytes {
     Bytes::from(out)
 }
 
-/// Builds the inspected and forwarded form of the request, whose body is `body_len` bytes once decoded. The
-/// changes to the framing: a chunked request loses its `Transfer-Encoding` and gets a `Content-Length` of the
-/// decoded length; a gzip request loses its `Content-Encoding` and its `Content-Length` (if it has one) and gets
-/// one `Content-Length` of the decoded length, last like a chunked one; a POST, PUT or PATCH with neither gets
-/// `Content-Length: 0`. The limits of the kernel are checked on the result, so a request that fit before the
-/// change and not after it is refused here and never reaches the kernel.
+/// Builds the inspected and forwarded form of the request, whose body is `body_len` bytes once decoded. A field
+/// with an underscore in its name is left out. The changes to the framing: a chunked request loses its
+/// `Transfer-Encoding` and gets a `Content-Length` of the decoded length; a gzip request loses its
+/// `Content-Encoding` and its `Content-Length` (if it has one) and gets one `Content-Length` of the decoded
+/// length, last like a chunked one; a POST, PUT or PATCH with neither gets `Content-Length: 0`. The limits of the
+/// kernel are checked on the result, so a request that fit before the change and not after it is refused here and
+/// never reaches the kernel.
 pub(super) fn represent(head: &Head, body_len: usize) -> Result<Represented, Reject> {
     let mut fields = HeaderMap::with_capacity(head.fields().len() + 1);
     let mut host = None;
     let mut others = Vec::with_capacity(head.fields().len() + 1);
     for (name, value) in head.fields() {
+        if name.contains(&b'_') {
+            continue;
+        }
         let name = HeaderName::from_bytes(name).map_err(|_| Reject::BadRequest)?;
         if head.chunked() && name == TRANSFER_ENCODING {
             continue;
