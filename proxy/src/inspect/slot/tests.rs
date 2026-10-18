@@ -59,8 +59,9 @@ fn shutdown(results: Vec<(ReqId, Verdict)>, exit_confirmed: bool) -> Shutdown {
     }
 }
 
-/// A slot that holds one request, with the id 0, and the answer of the request.
-fn slot_with_a_request(done: Shutdown) -> (Slot<Stub>, oneshot::Receiver<Outcome>) {
+/// A slot of a generation with the mode `mode` that holds one request, with the id 0, and the answer of the
+/// request.
+fn slot_with_a_request(mode: Mode, done: Shutdown) -> (Slot<Stub>, oneshot::Receiver<Outcome>) {
     let permits = Arc::new(Semaphore::new(3));
     let take = || permits.clone().try_acquire_owned().unwrap();
     let (reply, answer) = oneshot::channel();
@@ -77,7 +78,7 @@ fn slot_with_a_request(done: Shutdown) -> (Slot<Stub>, oneshot::Receiver<Outcome
         hold: Hold::new(take(), take()),
     };
     let generation = Fingerprint::from_hex(&[b'7'; 64]).unwrap();
-    let mut slot = Slot::new(generation, Stub { done: Some(done) });
+    let mut slot = Slot::new(generation, mode, Stub { done: Some(done) });
     slot.pending.insert(
         0,
         Pending {
@@ -93,7 +94,8 @@ fn a_retired_slot_gets_the_results_of_its_shutdown_and_tells_whether_it_stopped_
     let deadline = Instant::now() + Duration::from_secs(1);
     let unavailable = Verdict::Uninspectable(Reason::Unavailable);
     for confirmed in [true, false] {
-        let (slot, mut answer) = slot_with_a_request(shutdown(vec![(0, unavailable)], confirmed));
+        let (slot, mut answer) =
+            slot_with_a_request(Mode::Block, shutdown(vec![(0, unavailable)], confirmed));
         let generation = slot.generation;
         let retired = slot.retire(deadline).wait();
         assert_eq!(
@@ -110,14 +112,35 @@ fn a_retired_slot_gets_the_results_of_its_shutdown_and_tells_whether_it_stopped_
 #[test]
 fn a_retirement_with_a_request_left_or_a_result_of_nobody_is_a_fault() {
     let deadline = Instant::now() + Duration::from_secs(1);
-    let (slot, _answer) = slot_with_a_request(shutdown(Vec::new(), true));
+    let (slot, _answer) = slot_with_a_request(Mode::Block, shutdown(Vec::new(), true));
     assert_eq!(
         slot.retire(deadline).wait(),
         Err("request left after shutdown")
     );
-    let (slot, _answer) = slot_with_a_request(shutdown(vec![(1, Verdict::Allow)], true));
+    let (slot, _answer) =
+        slot_with_a_request(Mode::Block, shutdown(vec![(1, Verdict::Allow)], true));
     assert_eq!(
         slot.retire(deadline).wait(),
         Err("result for an unknown request")
     );
+}
+
+#[test]
+fn a_retired_slot_does_not_deliver_a_detection_of_a_generation_that_blocks() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let detected = Verdict::Detected {
+        rule_id: 949110,
+        status: 403,
+    };
+    let (slot, mut answer) = slot_with_a_request(Mode::Block, shutdown(vec![(0, detected)], true));
+    assert!(slot.retire(deadline).wait().is_ok());
+    assert_eq!(
+        answer.try_recv(),
+        Ok(Outcome::Verdict(Verdict::Uninspectable(Reason::Protocol)))
+    );
+
+    // A generation that detects gets it as it is.
+    let (slot, mut answer) = slot_with_a_request(Mode::Detect, shutdown(vec![(0, detected)], true));
+    assert!(slot.retire(deadline).wait().is_ok());
+    assert_eq!(answer.try_recv(), Ok(Outcome::Verdict(detected)));
 }

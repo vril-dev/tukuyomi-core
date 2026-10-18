@@ -353,18 +353,30 @@ func productWAFFor(t *testing.T, rules string) coraza.WAF {
 
 // realHarness runs the owners on the transactions of the WAF that Coraza
 // builds from the directives alone, productHarness on the WAF that the
-// inspector builds (newWAF).
+// inspector builds (newWAF), detectHarness on the one it builds for a bundle of
+// version 2, whose rules only detect.
 func realHarness(t *testing.T, directives string) *harness {
-	return harnessFor(t, realWAF(t, directives))
+	return harnessFor(t, realWAF(t, directives), false)
 }
 
 func productHarness(t *testing.T, rules string) *harness {
-	return harnessFor(t, productWAFFor(t, rules))
+	return harnessFor(t, productWAFFor(t, rules), false)
 }
 
-func harnessFor(t *testing.T, waf coraza.WAF) *harness {
+func detectHarness(t *testing.T, rules string) *harness {
+	t.Helper()
+	t.Setenv("TMPDIR", t.TempDir())
+	b := detectBundle(rules)
+	waf, err := newWAF(b)
+	if err != nil {
+		t.Fatalf("newWAF: %v", err)
+	}
+	return harnessFor(t, waf, b.detect)
+}
+
+func harnessFor(t *testing.T, waf coraza.WAF, detect bool) *harness {
 	h := &harness{t: t, cap: newCapture(), txs: map[string]*fakeTx{}}
-	h.tab = newTable(testRun, testInc, func(id string) types.Transaction { return waf.NewTransactionWithID(id) }, h.cap.send)
+	h.tab = newTable(testRun, testInc, func(id string) types.Transaction { return waf.NewTransactionWithID(id) }, detect, h.cap.send)
 	t.Cleanup(h.check) // as for a lost connection; every owner must finish
 	return h
 }
@@ -659,7 +671,7 @@ func expectRule(t *testing.T, o out, msg uint32, rule int64) {
 func beginOn(t *testing.T, tx types.Transaction, b tBegin) (*owner, out) {
 	t.Helper()
 	c := newCapture()
-	tab := newTable(testRun, testInc, func(string) types.Transaction { return tx }, c.send)
+	tab := newTable(testRun, testInc, func(string) types.Transaction { return tx }, false, c.send)
 	tb, err := decodeTxBegin(b.payload())
 	if err != nil {
 		t.Fatal(err)
@@ -780,4 +792,145 @@ func TestRealJSONBodyLimits(t *testing.T) {
 		o, msg := bodyReply(t, jsonProbeRule, jsonHeaders("application/vnd.api+json"), jsonBody("block"))
 		expectRule(t, o, msg, 9203)
 	})
+}
+
+// ---- a bundle that only detects ----
+
+// expectDetected checks the reply to BODY_END of a request that a rule of the
+// operator matched while the rules only detect: a Continue of phase 2 with
+// flagDetected, the rule, and the status and action it would have blocked with.
+func expectDetected(t *testing.T, o out, msg uint32, rule int64, status uint16) {
+	t.Helper()
+	expectVerdict(t, o, 1, msg, 2, false)
+	if o.flags != flagDetected || o.rule != rule || o.stat != status || o.act != "deny" {
+		t.Fatalf("%+v", o)
+	}
+}
+
+// A rule of the operator that denies does not stop a request of a bundle that
+// only detects: the Continue of phase 2 carries the first match, also one of
+// phase 1 (whose own Continue carries nothing), and not a later one. A request
+// that no rule matches continues as before.
+func TestDetectionOnly(t *testing.T) {
+	const post = `SecRule REQUEST_METHOD "@streq POST" "id:9201,phase:1,deny,status:401"` + "\n"
+	rules := baseRules + "SecRequestBodyLimit 1024\n"
+	t.Run("a rule of phase 2", func(t *testing.T) {
+		o, msg := flagCase{begin: defaultBegin(11), body: "probe=block"}.send(t, detectHarness(t, rules+probeRule))
+		expectDetected(t, o, msg, 9202, 403)
+	})
+	t.Run("the first match, from phase 1", func(t *testing.T) {
+		h := detectHarness(t, rules+post+probeRule)
+		h.in(kindTxBegin, 1, 1, defaultBegin(11).payload())
+		o := h.cap.next(t)
+		expectVerdict(t, o, 1, 1, 1, false)
+		if o.flags != 0 || o.rule != 0 {
+			t.Fatalf("the Continue of phase 1 carries a match: %+v", o)
+		}
+		h.in(kindBody, 1, 2, []byte("probe=block"))
+		h.in(kindBodyEnd, 1, 3, nil)
+		expectDetected(t, h.cap.next(t), 3, 9201, 401)
+	})
+	t.Run("no match", func(t *testing.T) {
+		o, msg := flagCase{begin: defaultBegin(10), body: "probe=fine"}.send(t, detectHarness(t, rules+probeRule))
+		expectVerdict(t, o, 1, msg, 2, false)
+		if o.flags != 0 || o.rule != 0 {
+			t.Fatalf("%+v", o)
+		}
+	})
+}
+
+// A bundle that only detects still blocks what is not a rule of the operator:
+// the reserved rules (a URI, too many arguments, a body and a JSON body that do
+// not parse) and the limit of the body, which Coraza rejects while the engine of
+// the transaction is DetectionOnly.
+func TestDetectionOnlyKeepsBlocking(t *testing.T) {
+	for _, c := range flagCases() {
+		t.Run(c.name, func(t *testing.T) {
+			o, msg := c.send(t, detectHarness(t, baseRules+c.rules))
+			expectVerdict(t, o, 1, msg, 2, true)
+			if o.rule != int64(c.rule) || o.act != "deny" || o.flags != 0 {
+				t.Fatalf("%+v", o)
+			}
+		})
+	}
+	t.Run("a body over the limit", func(t *testing.T) { // the limit of baseRules is 16
+		h := detectHarness(t, baseRules)
+		h.in(kindTxBegin, 1, 1, defaultBegin(16).payload())
+		expectVerdict(t, h.cap.next(t), 1, 1, 1, false)
+		h.in(kindBody, 1, 2, []byte(strings.Repeat("a", 16)))
+		if o := h.cap.next(t); o.kind != kindVerdict || !o.block || o.rule != 0 || o.stat != 413 || o.flags != 0 {
+			t.Fatalf("%+v", o)
+		}
+	})
+}
+
+// A rule of the operator can remove one of the two rules around its files.
+// Then nothing says what the engine did, and the Continue of phase 2 is none:
+// ERROR code 25. SecRuleRemoveById reaches the rule before the files only (the
+// other is added after them); ctl:ruleRemoveById removes the other at run time.
+func TestDetectionOnlyRulesRemoved(t *testing.T) {
+	for name, rules := range map[string]string{
+		"the rule before the files": "SecRuleRemoveById 4000010\n",
+		"the rule after the files":  `SecRule REQUEST_METHOD "@streq POST" "id:1,phase:1,pass,nolog,ctl:ruleRemoveById=4000011"` + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			o, msg := flagCase{begin: defaultBegin(0)}.send(t, detectHarness(t, baseRules+rules))
+			expectError(t, o, 1, msg, classTxFailed, codeIncomplete)
+		})
+	}
+}
+
+// Without the rule before the files the transaction is On, so a rule of the
+// operator that denies would block it as in a bundle that blocks. A
+// transaction that was not switched to DetectionOnly is not inspected as the
+// bundle says: ERROR code 25 in phase 1, in phase 2 and for the limit of the
+// body, which all keep their Block when that rule ran (TestDetectionOnly,
+// TestDetectionOnlyKeepsBlocking).
+func TestDetectionOnlyNoBlockWithoutRule(t *testing.T) {
+	const remove = "SecRuleRemoveById 4000010\n"
+	const post = `SecRule REQUEST_METHOD "@streq POST" "id:9201,phase:1,deny,status:401"` + "\n"
+	t.Run("a rule of phase 1", func(t *testing.T) {
+		h := detectHarness(t, baseRules+remove+post)
+		h.in(kindTxBegin, 1, 1, defaultBegin(11).payload())
+		expectError(t, h.cap.next(t), 1, 1, classTxFailed, codeIncomplete)
+	})
+	t.Run("a rule of phase 2", func(t *testing.T) {
+		o, msg := flagCase{begin: defaultBegin(11), body: "probe=block"}.send(t, detectHarness(t, baseRules+remove+probeRule))
+		expectError(t, o, 1, msg, classTxFailed, codeIncomplete)
+	})
+	t.Run("a body over the limit", func(t *testing.T) { // the limit of baseRules is 16
+		h := detectHarness(t, baseRules+remove)
+		h.in(kindTxBegin, 1, 1, defaultBegin(16).payload())
+		expectVerdict(t, h.cap.next(t), 1, 1, 1, false)
+		h.in(kindBody, 1, 2, []byte(strings.Repeat("a", 16)))
+		expectError(t, h.cap.next(t), 1, 2, classTxFailed, codeIncomplete)
+	})
+}
+
+// detectionOf trusts a transaction only after both rules ran, and only when it
+// can say what DetectionOnly kept back.
+func TestDetectionOf(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	waf, err := newWAF(detectBundle(baseRules))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := waf.NewTransaction()
+	defer tx.Close()
+	tx.ProcessConnection("127.0.0.1", 1, "127.0.0.1", 2)
+	tx.ProcessURI("/", "GET", "HTTP/1.1")
+	tx.ProcessRequestHeaders()
+	if _, ok := detectionOf(tx); ok {
+		t.Error("trusted after phase 1: the rule of phase 2 has not run")
+	}
+	if _, err := tx.ProcessRequestBody(); err != nil {
+		t.Fatal(err)
+	}
+	if it, ok := detectionOf(tx); !ok || it != nil {
+		t.Errorf("after phase 2: %+v %v", it, ok)
+	}
+	if _, ok := detectionOf(plainTx{tx}); ok {
+		t.Error("trusted a transaction that cannot say what DetectionOnly kept back")
+	}
+	tx.ProcessLogging()
 }

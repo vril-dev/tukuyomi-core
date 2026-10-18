@@ -23,7 +23,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::rules::bundle::{Bundle, BundlePath, MAX_BUNDLE_BYTES, MAX_FILE_BYTES, MAX_FILES};
+use crate::rules::bundle::{Bundle, BundlePath, MAX_BUNDLE_BYTES, MAX_FILE_BYTES, MAX_FILES, Mode};
 use crate::rules::file_store::read_regular;
 
 /// The most entries read from a directory of the CRS.
@@ -40,6 +40,8 @@ pub struct Inputs {
     pub rules: Vec<PathBuf>,
     /// Data files that rules read.
     pub data: Vec<PathBuf>,
+    /// What the rules do to a request they match.
+    pub mode: Mode,
 }
 
 /// Why the inputs were refused: a fixed English sentence, and the name or path of the input that it is about,
@@ -125,7 +127,12 @@ pub fn collect(inputs: &Inputs) -> Result<Bundle, CollectError> {
             subject: None,
         });
     }
-    Bundle::new(collector.files.into_iter().collect(), collector.load).map_err(|e| CollectError {
+    Bundle::new(
+        inputs.mode,
+        collector.files.into_iter().collect(),
+        collector.load,
+    )
+    .map_err(|e| CollectError {
         reason: e.0,
         subject: None,
     })

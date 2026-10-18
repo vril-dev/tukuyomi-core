@@ -34,6 +34,7 @@ type procOpt struct {
 	rules  string            // text of the one rule file of the bundle; "" means baseRules
 	files  map[string]string // the files of the bundle, instead of rules
 	load   []string          // their order of load
+	detect bool              // the manifest is of version 2: the rules only detect
 	stdin  *os.File          // overrides the socketpair
 	dgram  bool
 	stderr io.Writer
@@ -55,7 +56,11 @@ func startProc(t *testing.T, o procOpt) *proc {
 		files, load = o.files, o.load
 	}
 	bp := filepath.Join(dir, "bundle")
-	sum := writeBundle(t, bp, files, load...)
+	version := versionBlock
+	if o.detect {
+		version = versionDetect
+	}
+	sum := writeBundleVersion(t, bp, version, files, load...)
 	env := map[string]string{
 		"TKV0_TEST_MODE": "inspector", "TKV0_TEST_RULES": bp,
 		"TKV0_RUN_ID": "0102030405060708", "TKV0_INCARNATION": "00000007", "TKV0_NONCE": testNonceHex,
@@ -229,6 +234,50 @@ func TestProcessHappyPath(t *testing.T) {
 	}
 	if !strings.Contains(p.stderr.String(), "exit=0 started=3 closed=3 close_errors=0") {
 		t.Fatalf("stderr %q", p.stderr.String())
+	}
+}
+
+// The acceptance run of a bundle that only detects, through the whole start:
+// the manifest of version 2 is read, a rule of the operator that matches does
+// not stop the request but its Continue carries the match, and a JSON body that
+// does not parse is still blocked by a reserved rule.
+func TestProcessDetectionOnly(t *testing.T) {
+	p := startProc(t, procOpt{rules: baseRules + bigBody + jsonProbeRule, detect: true})
+	if o, err := parseOut(p.frame(t)); err != nil || o.kind != kindHello {
+		t.Fatalf("HELLO: %+v %v", o, err)
+	}
+	pr := &peer{t: t, c: p.c}
+	deep := nestedJSON(65, "fine")
+	for i, c := range []struct {
+		begin tBegin
+		body  string
+		rule  int64
+		block bool
+		flags uint8
+	}{
+		{jsonBegin(uint64(len(jsonBody("block")))), jsonBody("block"), 9203, false, flagDetected},
+		{jsonBegin(uint64(len(deep))), deep, 4000001, true, 0},
+	} {
+		tx, msg := uint64(i+1), uint32(2)
+		pr.send(tFrame(kindTxBegin, tx, 1, c.begin.payload()))
+		expectVerdict(t, pr.recv(), tx, 1, 1, false)
+		pr.send(tFrame(kindBody, tx, msg, []byte(c.body)))
+		msg++
+		pr.send(tFrame(kindBodyEnd, tx, msg, nil))
+		o := pr.recv()
+		expectVerdict(t, o, tx, msg, 2, c.block)
+		if o.flags != c.flags || o.rule != c.rule || o.stat != 403 {
+			t.Fatalf("tx %d: %+v", tx, o)
+		}
+		pr.send(tFrame(kindTxEnd, tx, msg+1, []byte{endComplete}))
+		expect(t, pr.recv(), kindClosed, tx, msg+1)
+	}
+	pr.send(tFrame(kindDrain, 0, 0, nil))
+	if o := pr.recv(); o.kind != kindBye || o.bye != [3]uint64{2, 2, 0} {
+		t.Fatalf("%+v", o)
+	}
+	if c := p.exit(t); c != exitOK {
+		t.Fatalf("exit %d stderr %q", c, p.stderr.String())
 	}
 }
 

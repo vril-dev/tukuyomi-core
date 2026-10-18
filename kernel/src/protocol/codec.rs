@@ -65,9 +65,11 @@ const MAX_GO_VERSION: usize = 64;
 const MAX_CORAZA_VERSION: usize = 64;
 const MAX_CORAZA_SUM: usize = 128;
 
-// VERDICT cut flags and ERROR classes.
+// VERDICT flags (the two cuts and the detection) and ERROR classes.
 pub(crate) const FLAG_ACTION_TRUNCATED: u8 = 1 << 0;
 pub(crate) const FLAG_DATA_TRUNCATED: u8 = 1 << 1;
+/// A continue of phase 2 that carries a match which did not stop the request (the rules only detect).
+pub(crate) const FLAG_DETECTED: u8 = 1 << 2;
 pub(crate) const CLASS_NOT_CREATED: u8 = 1;
 pub(crate) const CLASS_TX_FAILED: u8 = 2;
 
@@ -639,8 +641,9 @@ pub(crate) fn decode_hello(p: &[u8]) -> Result<Hello, ContentError> {
 }
 
 /// Decodes VERDICT. Go cuts action and data only at their limits and then sets the matching flag (codec.go
-/// `encodeVerdict`), so a flag needs the exact cut length (32 or 256), and a continuation carries no rule id, status,
-/// action or data.
+/// `encodeVerdict`), so a flag needs the exact cut length (32 or 256). A continuation carries no rule id, status,
+/// action or data, except the continue of phase 2 with `FLAG_DETECTED`: it carries them like a block, with the same
+/// cuts. That flag is refused on a block and in any other phase.
 pub(crate) fn decode_verdict(p: &[u8]) -> Result<Verdict, ContentError> {
     let mut c = Cursor { p };
     let phase = c.u8()?;
@@ -653,7 +656,7 @@ pub(crate) fn decode_verdict(p: &[u8]) -> Result<Verdict, ContentError> {
         _ => return Err(ContentError("verdict decision out of range")),
     };
     let flags = c.u8()?;
-    if flags & !(FLAG_ACTION_TRUNCATED | FLAG_DATA_TRUNCATED) != 0 {
+    if flags & !(FLAG_ACTION_TRUNCATED | FLAG_DATA_TRUNCATED | FLAG_DETECTED) != 0 {
         return Err(ContentError("verdict flags out of range"));
     }
     if c.u8()? != 0 {
@@ -664,7 +667,16 @@ pub(crate) fn decode_verdict(p: &[u8]) -> Result<Verdict, ContentError> {
     let action = c.str16(0, MAX_ACTION)?;
     let data = c.str16(0, MAX_DATA)?;
     c.done()?;
-    if !block && (rule_id != 0 || status != 0 || !action.is_empty() || !data.is_empty()) {
+    let detected = flags & FLAG_DETECTED != 0;
+    if detected && (block || phase != 2) {
+        return Err(ContentError(
+            "verdict detected flag needs a continue of phase 2",
+        ));
+    }
+    if !block
+        && !detected
+        && (rule_id != 0 || status != 0 || !action.is_empty() || !data.is_empty())
+    {
         return Err(ContentError("verdict continue carries interruption fields"));
     }
     if flags & FLAG_ACTION_TRUNCATED != 0 && action.len() != MAX_ACTION {

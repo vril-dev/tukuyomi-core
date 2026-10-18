@@ -6,7 +6,10 @@
 //! (paranoia level 1) give them no score: `GET /`, `POST /` with the urlencoded body `a=b`, and `POST /` with the JSON
 //! body `{"a":"b"}`. The trial passes when the inspector is ready within `ready_wait` and each request gets `Allow`
 //! within `inspect_wait`. A `Block` fails it too, unless the operator accepts blocks; then the rule is reported and
-//! the trial goes on. A request that cannot be inspected fails the trial, and so does a start that ends in a failure.
+//! the trial goes on. A `Detected` (a rule matched while the rules only detect) is not a failure when the bundle only
+//! detects: it is reported and the trial goes on. From a bundle that blocks, a `Detected` cannot be what its rules
+//! said, so it fails the trial as a request that cannot be inspected. A request that cannot be inspected fails the
+//! trial, and so does a start that ends in a failure.
 //!
 //! The trial runs on the part of the kernel that it needs (`TrialKernel`), which the supervisor is and which a test
 //! replaces. The supervisor of a trial never restarts the inspector (`restarts` 0): the first end of a start is the
@@ -18,6 +21,8 @@ use std::time::{Duration, Instant};
 use tukuyomi_kernel::{
     Config, Failure, Phase, Reason, Refused, ReqId, Request, Shutdown, Status, Supervisor, Verdict,
 };
+
+use crate::rules::bundle::Mode;
 
 /// The addresses and the protocol of the requests. They are documentation addresses (RFC 5737).
 const CLIENT: &[u8] = b"192.0.2.10";
@@ -75,6 +80,8 @@ pub struct Limits {
     pub slice: Duration,
     /// A `Block` is not a failure.
     pub accept_block: bool,
+    /// What the rules of the bundle do to a request they match. A `Detected` is accepted only for `Detect`.
+    pub mode: Mode,
 }
 
 /// A request of the trial.
@@ -134,19 +141,26 @@ pub enum Failed {
     NotStopped,
 }
 
-/// A `Block` that was accepted.
+/// A request that did not fail the trial and is reported: a `Block` that was accepted, or a `Detected`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Accepted {
-    pub probe: &'static str,
-    pub phase: u8,
-    pub rule_id: i64,
-    pub status: u16,
+pub enum Accepted {
+    Block {
+        probe: &'static str,
+        phase: u8,
+        rule_id: i64,
+        status: u16,
+    },
+    Detected {
+        probe: &'static str,
+        rule_id: i64,
+        status: u16,
+    },
 }
 
 /// The end of a trial.
 #[derive(Debug)]
 pub struct Finish {
-    /// The accepted blocks of a trial that passed, or why it failed.
+    /// The accepted blocks and the detections of a trial that passed, or why it failed.
     pub result: Result<Vec<Accepted>, Failed>,
     /// What the inspector left in `start-failure`, if it refused to start. The bytes are the inspector's own.
     pub detail: Option<Vec<u8>>,
@@ -199,26 +213,39 @@ fn judge(
     for probe in &PROBES {
         match inspect(kernel, limits, interrupt, probe)? {
             Verdict::Allow => {}
+            Verdict::Detected { rule_id, status } if limits.mode == Mode::Detect => {
+                accepted.push(Accepted::Detected {
+                    probe: probe.name,
+                    rule_id,
+                    status,
+                });
+            }
+            // A bundle that blocks has no request that is only detected: the inspector is not believed.
+            Verdict::Detected { .. } => {
+                return Err(Failed::Uninspectable {
+                    probe: probe.name,
+                    reason: Reason::Protocol,
+                });
+            }
             Verdict::Block {
                 phase,
                 rule_id,
                 status,
             } => {
-                let block = Accepted {
-                    probe: probe.name,
-                    phase,
-                    rule_id,
-                    status,
-                };
                 if !limits.accept_block {
                     return Err(Failed::Blocked {
-                        probe: block.probe,
+                        probe: probe.name,
                         phase,
                         rule_id,
                         status,
                     });
                 }
-                accepted.push(block);
+                accepted.push(Accepted::Block {
+                    probe: probe.name,
+                    phase,
+                    rule_id,
+                    status,
+                });
             }
             Verdict::Uninspectable(reason) => {
                 return Err(Failed::Uninspectable {

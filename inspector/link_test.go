@@ -28,7 +28,7 @@ func startServe(t *testing.T, c conn, newTx func(string) types.Transaction, clos
 	}
 	s := &served{code: make(chan int, 1), buf: &syncBuf{}}
 	s.d = &diag{w: s.buf}
-	go func() { s.code <- serve(c, testRun, testInc, hello, newTx, s.d, closeDeadline) }()
+	go func() { s.code <- serve(c, testRun, testInc, hello, newTx, false, s.d, closeDeadline) }()
 	return s
 }
 

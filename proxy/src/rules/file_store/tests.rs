@@ -269,7 +269,12 @@ fn bundle(files: &[(&str, &str)], load: &[&str]) -> Bundle {
         .iter()
         .map(|(name, data)| (path(name), data.as_bytes().to_vec()))
         .collect();
-    Bundle::new(files, load.iter().map(|name| path(name)).collect()).unwrap()
+    Bundle::new(
+        Mode::Block,
+        files,
+        load.iter().map(|name| path(name)).collect(),
+    )
+    .unwrap()
 }
 
 fn rules() -> Bundle {
@@ -366,6 +371,50 @@ fn the_same_bundle_again_is_kept_and_a_broken_generation_is_made_again() {
     );
     assert!(names(&root.path().join("staging")).is_empty());
     assert_eq!(store.list().unwrap().len(), 1);
+}
+
+#[test]
+fn the_mode_of_a_generation_is_read_from_its_manifest_and_a_manifest_that_is_not_sound_is_refused()
+{
+    let root = scratch();
+    let mut store = opened(root.path());
+    let one = BundlePath::parse("rules/a.conf").unwrap();
+    let make = |mode| {
+        Bundle::new(
+            mode,
+            vec![(one.clone(), b"SecRuleEngine On\n".to_vec())],
+            vec![one.clone()],
+        )
+        .unwrap()
+    };
+    let (block, detect) = (make(Mode::Block), make(Mode::Detect));
+    for bundle in [&block, &detect] {
+        store.stage(bundle).unwrap();
+        store.commit().unwrap();
+    }
+    assert_eq!(store.mode(block.fingerprint()), Ok(Mode::Block));
+    assert_eq!(store.mode(detect.fingerprint()), Ok(Mode::Detect));
+    // A manifest that is not the one its name says (here the other one), and one that is not there, are refused.
+    let manifest = |bundle: &Bundle| {
+        root.path()
+            .join("generations")
+            .join(bundle.fingerprint().hex())
+            .join("manifest.json")
+    };
+    fs::write(manifest(&block), detect.manifest()).unwrap();
+    assert_eq!(
+        refusal(store.mode(block.fingerprint())),
+        "the manifest of the generation does not match its name"
+    );
+    fs::remove_file(manifest(&detect)).unwrap();
+    assert_eq!(
+        refusal(store.mode(detect.fingerprint())),
+        "the manifest of the generation cannot be read"
+    );
+    assert_eq!(
+        refusal(store.mode(generation())),
+        "the generation is not a real directory"
+    );
 }
 
 #[test]

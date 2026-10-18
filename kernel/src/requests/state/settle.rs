@@ -27,8 +27,8 @@ impl Engine {
         }
     }
 
-    /// Record the result of the current stage once: the request decision. A decision other than Forward frees
-    /// the payloads. The request is queued for `next_done` where the decision is first made.
+    /// Record the result of the current stage once: the request decision. A decision other than Forward and
+    /// Detected frees the payloads. The request is queued for `next_done` where the decision is first made.
     pub(super) fn set_result(&mut self, now: Instant, ti: usize, e: Ending) {
         let l = &self.held[ti];
         if l.stage == Stage::Ended {
@@ -50,11 +50,12 @@ impl Engine {
                 Ending::Uninspectable(w) => Decision::Uninspectable(w),
                 Ending::Disconnect => Decision::ClientDisconnect,
                 Ending::Done => Decision::Forward,
+                Ending::Detected { rule_id, status } => Decision::Detected { rule_id, status },
             });
             r.out.decided_at = Some(now);
             self.done.push_back(id);
         }
-        if !matches!(e, Ending::Done) {
+        if !matches!(e, Ending::Done | Ending::Detected { .. }) {
             free(r);
         }
     }
@@ -73,7 +74,7 @@ impl Engine {
     /// Settle the stage and hand TX_END to the writer queue.
     pub(super) fn end_tx(&mut self, now: Instant, ti: usize, e: Ending) {
         let reason = match e {
-            Ending::Done => 1,
+            Ending::Done | Ending::Detected { .. } => 1,
             Ending::Block { .. } => 2,
             Ending::Uninspectable(Why::VerdictDeadline) => 5,
             Ending::Uninspectable(_) => 3,

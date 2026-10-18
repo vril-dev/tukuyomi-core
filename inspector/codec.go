@@ -122,6 +122,7 @@ const (
 
 	flagActionTruncated uint8 = 1 << 0
 	flagDataTruncated   uint8 = 1 << 1
+	flagDetected        uint8 = 1 << 2 // a Continue of phase 2 that carries a match which did not stop the request
 )
 
 // header is the fixed 36-byte frame header.
@@ -489,23 +490,36 @@ func encodeHello(run uint64, inc uint32, v hello) ([]byte, error) {
 // and data are cut to their limits with a flag; a rule id or status outside the
 // encodable range is reported by ok=false so the caller sends an ERROR instead.
 func encodeVerdict(run uint64, inc uint32, tx uint64, msg uint32, phase uint8, ruleID int, status int, action, data string, block bool) ([]byte, bool) {
+	d := decisionContinue
+	if block {
+		d = decisionBlock
+	}
+	return verdictFrame(run, inc, tx, msg, phase, d, 0, ruleID, status, action, data)
+}
+
+// encodeDetected encodes the VERDICT of a request that a rule matched while the
+// engine only detected: a Continue of phase 2 with flagDetected, which holds
+// the rule, the status and the action it would have blocked with, and the data,
+// cut like those of a block. Only this form can carry the flag.
+func encodeDetected(run uint64, inc uint32, tx uint64, msg uint32, ruleID int, status int, action, data string) ([]byte, bool) {
+	return verdictFrame(run, inc, tx, msg, 2, decisionContinue, flagDetected, ruleID, status, action, data)
+}
+
+// verdictFrame is the frame of encodeVerdict and encodeDetected; flags holds
+// the flags that the caller sets, and the cuts add theirs.
+func verdictFrame(run uint64, inc uint32, tx uint64, msg uint32, phase, decision, flags uint8, ruleID int, status int, action, data string) ([]byte, bool) {
 	if status < 0 || status > 0xffff {
 		return nil, false
 	}
-	var flags uint8
 	if len(action) > maxAction {
 		action, flags = action[:maxAction], flags|flagActionTruncated
 	}
 	if len(data) > maxData {
 		data, flags = data[:maxData], flags|flagDataTruncated
 	}
-	d := decisionContinue
-	if block {
-		d = decisionBlock
-	}
 	f := newFrame(header{kind: kindVerdict, run: run, inc: inc, tx: tx, msg: msg})
 	f.u8(phase)
-	f.u8(d)
+	f.u8(decision)
 	f.u8(flags)
 	f.u8(0)
 	f.u64(uint64(int64(ruleID)))

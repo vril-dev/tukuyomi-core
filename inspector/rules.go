@@ -36,7 +36,8 @@ func withoutPath(err error) error {
 // ProcessPartial that NewWAF makes for DetectionOnly. A parse failure of the
 // body (a JSON body nested deeper than the limit is one), a dropped argument
 // and an unparsable URI become a block of phase 2.
-// Ids 4000001 to 4000003 are reserved for these rules. The start path rejects
+// Ids 4000001 to 4000003 are reserved for these rules (4000010 and 4000011 for
+// the rules of detectBegin and detectEnd). The start path rejects
 // SecIgnoreRuleCompilationErrors (checkRules) before newWAF, so a rule of the
 // operator with one of these ids stops NewWAF instead of displacing a reserved rule
 // silently. The rules can still be skipped at run time (allow, skipAfter,
@@ -52,21 +53,40 @@ SecRule ARGUMENTS_LIMIT_REACHED "!@eq 0" "id:4000002,phase:2,t:none,deny"
 SecRule URI_PARSE_ERROR "!@eq 0" "id:4000003,phase:2,t:none,deny"
 `
 
+// A bundle that only detects (detect of the bundle) puts two rules around the
+// files of the operator, each in a WithDirectives of its own like the reserved
+// directives. detectBegin runs first in phase 1 and makes the engine of the
+// transaction DetectionOnly: a rule of the operator that would block keeps its
+// first match in the transaction (DetectionOnlyInterruption) and the request
+// goes on. detectEnd runs after the rules of the operator in phase 2 and makes
+// the engine On again, so the reserved rules that follow block. The engine of
+// the WAF stays On (see reservedDirectives), so the limit of the body rejects
+// as before. A rule of the operator can still remove or skip these two, so the
+// owner reads the matched rules before a phase 2 Continue (detectionOf). The
+// two ids are the ones in the two texts.
+const (
+	detectBeginID = 4000010
+	detectEndID   = 4000011
+	detectBegin   = `SecAction "id:4000010,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"` + "\n"
+	detectEnd     = `SecAction "id:4000011,phase:2,pass,nolog,ctl:ruleEngine=On"` + "\n"
+)
+
 // locateBudget bounds the search of failingFile. The process that starts the
 // inspector waits a limited time for the HELLO; a search that outlasts it would
 // end with the process killed, not with exit 11 and this diagnostic.
 const locateBudget = 2 * time.Second
 
 // newWAF builds the WAF from the bundle: the rule files of load in their
-// order, then the reserved directives. Coraza reads the files while it builds
+// order (inside detectBegin and detectEnd for a bundle that only detects), then
+// the reserved directives. Coraza reads the files while it builds
 // the WAF only, so the bundle lets go of the bytes when newWAF returns. The
 // error of Coraza does not name a file, so when the build fails the error
 // starts with the path of the file that failingFile finds, if any.
 func newWAF(b *bundle) (coraza.WAF, error) {
 	defer func() { b.files = nil }()
-	waf, err := buildWAF(b.files, b.load)
+	waf, err := buildWAF(b.files, b.load, b.detect)
 	if err != nil {
-		if p := failingFile(b.files, b.load, locateBudget); p != "" {
+		if p := failingFile(b.files, b.load, b.detect, locateBudget); p != "" {
 			err = fmt.Errorf("%s: %w", p, err)
 		}
 		return nil, err
@@ -75,7 +95,8 @@ func newWAF(b *bundle) (coraza.WAF, error) {
 }
 
 // buildWAF builds the WAF from the files of load, in their order, then the
-// reserved directives. The rules get the files as their root (bundleFS):
+// reserved directives; with detect, detectBegin comes before the files and
+// detectEnd after them. The rules get the files as their root (bundleFS):
 // without a root Coraza reads files from the operating system, and the root is
 // set before any rule is read. Every rule file is read through that root, one
 // call each, so Coraza closes its continuation and backtick state at the end of
@@ -83,31 +104,39 @@ func newWAF(b *bundle) (coraza.WAF, error) {
 // after a SecMarker is one) becomes a fixed error, so the start fails for good
 // with exit 11 and not with the exit code 2 of a panic; the panic value is
 // dropped.
-func buildWAF(files map[string][]byte, load []string) (waf coraza.WAF, err error) {
+func buildWAF(files map[string][]byte, load []string, detect bool) (waf coraza.WAF, err error) {
 	defer func() {
 		if recover() != nil {
 			waf, err = nil, errors.New("the rules made the WAF build panic")
 		}
 	}()
 	cfg := coraza.NewWAFConfig().WithRootFS(bundleFS{files: files})
+	if detect {
+		cfg = cfg.WithDirectives(detectBegin)
+	}
 	for _, p := range load {
 		cfg = cfg.WithDirectivesFromFile(p)
+	}
+	if detect {
+		cfg = cfg.WithDirectives(detectEnd)
 	}
 	return coraza.NewWAF(cfg.WithDirectives(reservedDirectives))
 }
 
 // failingFile returns the first file of load that makes the build fail: it
 // builds again with load[:i], from none to all, and the first build that fails
-// names load[i-1]. It returns "" when the build fails with no file (the
-// reserved directives alone, for example when TMPDIR cannot be written), when
-// every build succeeds, and when the search is not finished within budget.
-func failingFile(files map[string][]byte, load []string, budget time.Duration) string {
+// names load[i-1]. Every build has the same detect as the one that failed, so
+// the rules around the files are in the search. It returns "" when the build
+// fails with no file (the reserved directives alone, for example when TMPDIR
+// cannot be written), when every build succeeds, and when the search is not
+// finished within budget.
+func failingFile(files map[string][]byte, load []string, detect bool, budget time.Duration) string {
 	start := time.Now()
 	for i := 0; i <= len(load); i++ {
 		if time.Since(start) >= budget {
 			return ""
 		}
-		if _, err := buildWAF(files, load[:i]); err != nil {
+		if _, err := buildWAF(files, load[:i], detect); err != nil {
 			if i == 0 {
 				return ""
 			}

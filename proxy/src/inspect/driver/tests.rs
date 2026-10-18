@@ -266,7 +266,7 @@ impl Rig {
     fn new(wait_queue: usize, room: usize) -> Rig {
         let (tx, rx) = sync_channel(room);
         let core = Core::new(
-            Slot::new(generation(1), Fake::new()),
+            Slot::new(generation(1), bundle::Mode::Block, Fake::new()),
             rx,
             Signals::Told { _failed: None },
             start_logger().unwrap(),
@@ -452,6 +452,57 @@ fn a_result_goes_to_the_ticket_it_belongs_to() {
     assert!(r.core.active.pending.is_empty());
 }
 
+const DETECTED: Verdict = Verdict::Detected {
+    rule_id: 949110,
+    status: 403,
+};
+
+#[test]
+fn a_detection_from_a_generation_that_blocks_is_not_inspectable_and_one_that_detects_goes_on() {
+    // The generation blocks: the inspector is not believed, and the line is made once, after a step.
+    let mut r = Rig::new(4, 8);
+    let mut a = r.world.ticket(b"/a", 0);
+    let mut b = r.world.ticket(b"/b", 0);
+    r.send(Msg::Ticket(a.ticket));
+    r.send(Msg::Ticket(b.ticket));
+    r.core.intake(None).unwrap();
+    r.core
+        .active
+        .kernel
+        .polls
+        .push_back(vec![(0, DETECTED), (1, Verdict::Allow)]);
+    r.core.active.step(Instant::now()).unwrap();
+    let not_inspectable = Verdict::Uninspectable(Reason::Protocol);
+    assert_eq!(answer(&mut a.answer), Outcome::Verdict(not_inspectable));
+    assert_eq!(answer(&mut b.answer), Outcome::Verdict(Verdict::Allow));
+    let line = r.core.active.note_turned().expect("the line is made");
+    assert!(line.contains(&generation(1).hex()), "{line}");
+    assert_eq!(r.core.active.note_turned(), None);
+
+    // The generation detects: the detection goes on as it is, and no line is made.
+    let mut r = Rig::new(4, 8);
+    r.core.active.mode = bundle::Mode::Detect;
+    let mut a = r.world.ticket(b"/a", 0);
+    r.send(Msg::Ticket(a.ticket));
+    r.core.intake(None).unwrap();
+    r.core.active.kernel.polls.push_back(vec![(0, DETECTED)]);
+    r.core.active.step(Instant::now()).unwrap();
+    assert_eq!(answer(&mut a.answer), Outcome::Verdict(DETECTED));
+    assert_eq!(r.core.active.note_turned(), None);
+
+    // What `shutdown` decides is checked the same way.
+    let mut r = Rig::new(4, 8);
+    let mut a = r.world.ticket(b"/a", 0);
+    r.send(Msg::Ticket(a.ticket));
+    r.core.round().unwrap();
+    r.core.active.kernel.at_shutdown = vec![(0, DETECTED)];
+    r.send(Msg::Stop {
+        inspect_by: Instant::now(),
+    });
+    r.core.round().unwrap().expect("the deadline is reached");
+    assert_eq!(answer(&mut a.answer), Outcome::Verdict(not_inspectable));
+}
+
 #[test]
 fn a_result_for_an_unknown_request_is_fatal() {
     let world = World::new();
@@ -467,13 +518,20 @@ fn a_result_for_an_unknown_request_is_fatal() {
     // the known result is delivered, the unknown one stops the delivery
     let unknown = Err("result for an unknown request");
     assert_eq!(
-        deliver(&mut pending, &[(1, Verdict::Allow), (2, Verdict::Allow)]),
+        deliver(
+            &mut pending,
+            &[(1, Verdict::Allow), (2, Verdict::Allow)],
+            bundle::Mode::Block
+        ),
         unknown
     );
     assert_eq!(answer(&mut made.answer), Outcome::Verdict(Verdict::Allow));
     // a result comes out once: the same id again is unknown
-    assert_eq!(deliver(&mut pending, &[(1, Verdict::Allow)]), unknown);
-    assert_eq!(deliver(&mut pending, &[]), Ok(()));
+    assert_eq!(
+        deliver(&mut pending, &[(1, Verdict::Allow)], bundle::Mode::Block),
+        unknown
+    );
+    assert_eq!(deliver(&mut pending, &[], bundle::Mode::Block), Ok(false));
 }
 
 #[test]
@@ -697,7 +755,14 @@ fn a_kernel_that_cannot_start_says_so_once_through_ready_and_still_answers() {
         ready_wait: 10 * SEC,
         stop_inspect: 10 * SEC,
     };
-    let mut d = start(config(root), generation(1), limits, start_logger().unwrap()).unwrap();
+    let mut d = start(
+        config(root),
+        generation(1),
+        bundle::Mode::Block,
+        limits,
+        start_logger().unwrap(),
+    )
+    .unwrap();
     let told = answer(&mut d.ready);
     assert!(matches!(told, Err(Failure::TmpDir(_))), "{told:?}");
     assert!(matches!(d.failed.try_recv(), Err(SlotError::Empty)));
@@ -742,6 +807,7 @@ impl Rig {
         let (reply, told) = oneshot::channel();
         self.send(Msg::Switch(Switch {
             generation: generation(n),
+            mode: bundle::Mode::Block,
             kernel: config(Path::new("/driver-test/switch-root")),
             reply,
         }));

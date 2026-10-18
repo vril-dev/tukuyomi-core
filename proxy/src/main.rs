@@ -5,8 +5,8 @@
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration
 //! file), the host checks, the configuration, the rules store (the chosen generation, the hold on it, its
-//! directory, and with them the kernel configuration), the runtime and the signal handlers, the driver thread,
-//! the wait for the kernel to be ready, bind, accept. The rules store is read here, and again when SIGUSR1
+//! directory and mode, and with them the kernel configuration), the runtime and the signal handlers, the driver
+//! thread, the wait for the kernel to be ready, bind, accept. The rules store is read here, and again when SIGUSR1
 //! comes. Handlers exist for SIGTERM, SIGINT, SIGHUP and SIGUSR1 only and are installed before the kernel starts
 //! its child process; SIGCHLD is never handled. The listener is bound only after the kernel is ready, and a
 //! connection permit is taken before every accept.
@@ -48,7 +48,7 @@ use tukuyomi_proxy::host;
 use tukuyomi_proxy::inbound::conn::{self, Ctx};
 use tukuyomi_proxy::inspect::driver::{self, Driver, End, Limits, Msg, Switch, Switched};
 use tukuyomi_proxy::log::{self, Log};
-use tukuyomi_proxy::rules::bundle::Fingerprint;
+use tukuyomi_proxy::rules::bundle::{Fingerprint, Mode};
 use tukuyomi_proxy::rules::command;
 use tukuyomi_proxy::rules::store;
 use tukuyomi_proxy::rules::switch::{Next, Switcher};
@@ -148,6 +148,13 @@ fn start(log: &Log) -> u8 {
             return EXIT_FAILED;
         }
     };
+    let mode = match rules.mode(generation) {
+        Ok(mode) => mode,
+        Err(e) => {
+            log.line(&format!("start: rules store refused: {}", e.0));
+            return EXIT_FAILED;
+        }
+    };
     let kernel = match loaded.kernel.for_generation(dir, generation) {
         Ok(kernel) => kernel,
         Err(e) => {
@@ -156,6 +163,7 @@ fn start(log: &Log) -> u8 {
         }
     };
     log.line(&format!("start: rules generation {}", generation.hex()));
+    log.line(&format!("start: rules mode {}", mode.name()));
     let switcher = Switcher::new(rules, loaded.kernel, generation, hold);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -167,7 +175,14 @@ fn start(log: &Log) -> u8 {
             return EXIT_FAILED;
         }
     };
-    runtime.block_on(run(loaded.proxy, kernel, generation, switcher, log.clone()))
+    runtime.block_on(run(
+        loaded.proxy,
+        kernel,
+        generation,
+        mode,
+        switcher,
+        log.clone(),
+    ))
 }
 
 /// The runtime part: handlers, driver, the wait for ready, serving, and the stop. The holds of the switcher live
@@ -176,6 +191,7 @@ async fn run(
     proxy: ProxyConfig,
     kernel: tukuyomi_kernel::Config,
     generation: Fingerprint,
+    mode: Mode,
     mut switcher: Switcher,
     log: Log,
 ) -> u8 {
@@ -193,7 +209,7 @@ async fn run(
         ready_wait: proxy.ready_wait,
         stop_inspect: proxy.stop_inspect,
     };
-    let driver = match driver::start(kernel, generation, limits, log.clone()) {
+    let driver = match driver::start(kernel, generation, mode, limits, log.clone()) {
         Ok(driver) => driver,
         Err(text) => {
             log.line(&format!("start: cannot start the driver: {text}"));
@@ -288,11 +304,17 @@ fn reload(waits: &mut Waits, switcher: &mut Switcher, ingress: &SyncSender<Msg>,
             generation.hex()
         )),
         Next::Refused(why) => log.line(&format!("reload: rules store refused: {why}")),
-        Next::Ready { generation, kernel } => {
+        Next::Ready {
+            generation,
+            mode,
+            kernel,
+        } => {
             log.line(&format!("reload: starting generation {}", generation.hex()));
+            log.line(&format!("reload: rules mode {}", mode.name()));
             let (reply, told) = oneshot::channel();
             let order = Msg::Switch(Switch {
                 generation,
+                mode,
                 kernel: *kernel,
                 reply,
             });

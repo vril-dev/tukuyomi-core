@@ -67,6 +67,20 @@ fn rules_only(file: PathBuf) -> Inputs {
 }
 
 #[test]
+fn the_mode_of_the_inputs_is_the_mode_of_the_bundle() {
+    let root = scratch();
+    let file = root.put("mine/a.conf", b"a\n");
+    for mode in [Mode::Block, Mode::Detect] {
+        let inputs = Inputs {
+            mode,
+            ..rules_only(file.clone())
+        };
+        let manifest = Manifest::parse(collect(&inputs).unwrap().manifest()).unwrap();
+        assert_eq!(manifest.mode(), mode);
+    }
+}
+
+#[test]
 fn the_bundle_has_the_crs_and_the_operator_files_in_the_load_order() {
     let root = scratch();
     let inputs = Inputs {
@@ -77,6 +91,7 @@ fn the_bundle_has_the_crs_and_the_operator_files_in_the_load_order() {
             root.put("mine/a.conf", b"a\n"),
         ],
         data: vec![root.put("mine/list.data", b"x\n")],
+        ..Inputs::default()
     };
     let bundle = collect(&inputs).unwrap();
     let manifest = Manifest::parse(bundle.manifest()).unwrap();

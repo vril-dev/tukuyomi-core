@@ -29,18 +29,28 @@ const (
 	maxPartBytes     = 128
 )
 
+// The versions of a manifest. A bundle of version 1 blocks. One of version 2
+// has the mode "detect", the only mode: its rules only detect, and a match
+// that would have blocked is reported with the Continue of the request.
+const (
+	versionBlock  = 1
+	versionDetect = 2
+)
+
 // bundle is a rule bundle that readBundle verified: the bytes of manifest.json,
 // its fingerprint, the rule files in the order they are loaded and the bytes of
 // every file by path.
 type bundle struct {
 	manifestBytes []byte
 	fingerprint   [32]byte // sha256 of manifestBytes
+	detect        bool     // the rules only detect (the manifest is of version 2)
 	load          []string
 	files         map[string][]byte
 }
 
 // manifest is the content of manifest.json. The fields are exported only for
-// encoding/json; the writer is encode.
+// encoding/json; the writer is encode. The mode of version 2 has no field: it
+// is "detect" or the manifest is not canonical.
 type manifest struct {
 	Version int            `json:"version"`
 	Files   []manifestFile `json:"files"`
@@ -53,14 +63,18 @@ type manifestFile struct {
 	SHA256 string `json:"sha256"` // lowercase hex
 }
 
-// encode writes the one canonical form: the keys in the order version, files,
-// load (path, size, sha256 inside a file), no white space, numbers in decimal,
-// strings between quotes without any escape, and one newline at the end. It
-// does not use encoding/json to write, so the bytes do not depend on its
-// escaping. Go only uses it to check a manifest it read.
+// encode writes the one canonical form: the keys in the order version, mode
+// (version 2 only, always "detect"), files, load (path, size, sha256 inside a
+// file), no white space, numbers in decimal, strings between quotes without any
+// escape, and one newline at the end. It does not use encoding/json to write,
+// so the bytes do not depend on its escaping. Go only uses it to check a
+// manifest it read.
 func (m manifest) encode() []byte {
 	b := append([]byte(nil), `{"version":`...)
 	b = strconv.AppendInt(b, int64(m.Version), 10)
+	if m.Version == versionDetect {
+		b = append(b, `,"mode":"detect"`...)
+	}
 	b = append(b, `,"files":[`...)
 	for i, f := range m.Files {
 		if i > 0 {
@@ -91,7 +105,10 @@ func (m manifest) encode() []byte {
 // white space, escapes and anything after the value), so the manifest is
 // decoded, written again in the canonical form and required to be the very
 // bytes that were read; one comparison closes every such spelling. The values
-// are then checked without trusting the writer. The errors are fixed
+// are then checked without trusting the writer. A key that is not a field
+// (the mode of version 2, or a mode in version 1) is dropped by the decoding
+// and so is not in the bytes that are written again: the manifest is refused,
+// as is a version 2 whose mode is not "detect". The errors are fixed
 // sentences that hold no value of the manifest.
 func parseManifest(b []byte) (manifest, error) {
 	var m manifest
@@ -101,8 +118,8 @@ func parseManifest(b []byte) (manifest, error) {
 	if !bytes.Equal(m.encode(), b) {
 		return manifest{}, errors.New("not in the canonical form")
 	}
-	if m.Version != 1 {
-		return manifest{}, errors.New("version is not 1")
+	if m.Version != versionBlock && m.Version != versionDetect {
+		return manifest{}, errors.New("version is not 1 or 2")
 	}
 	if len(m.Files) == 0 {
 		return manifest{}, errors.New("no files")
@@ -222,7 +239,7 @@ func readBundle(dir string) (*bundle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %v", manifestName, err)
 	}
-	b := &bundle{manifestBytes: mb, fingerprint: sha256.Sum256(mb), load: m.Load, files: make(map[string][]byte, len(m.Files))}
+	b := &bundle{manifestBytes: mb, fingerprint: sha256.Sum256(mb), detect: m.Version == versionDetect, load: m.Load, files: make(map[string][]byte, len(m.Files))}
 	for _, f := range m.Files {
 		data, err := readBundleFile(root, f.Path, f.Size)
 		if err != nil {

@@ -41,11 +41,15 @@ func TestParseManifest(t *testing.T) {
 	const canonical = "not in the canonical form"
 	a := "rules/a.conf"
 	base := canon(oneFile(a, 3), a)
+	detect := string(manifest{Version: versionDetect, Files: oneFile(a, 3), Load: []string{a}}.encode())
 	rows := []struct{ name, in, want string }{
 		{"white space after a colon", strings.Replace(base, `"version":1`, `"version": 1`, 1), canonical},
 		{"key case", strings.Replace(base, `"version"`, `"Version"`, 1), canonical},
 		{"repeated key", strings.Replace(base, `{"version":1,`, `{"version":1,"version":1,`, 1), canonical},
-		{"version 2", strings.Replace(base, `"version":1`, `"version":2`, 1), "version is not 1"},
+		{"version 2 without the mode", strings.Replace(base, `"version":1`, `"version":2`, 1), canonical},
+		{"version 1 with the mode", strings.Replace(detect, `"version":2`, `"version":1`, 1), canonical},
+		{"mode block", strings.Replace(detect, `"detect"`, `"block"`, 1), canonical},
+		{"version 3", strings.Replace(base, `"version":1`, `"version":3`, 1), "version is not 1 or 2"},
 		{"dot dot component", canon(oneFile("rules/../a.conf", 3), "rules/../a.conf"), "a path is malformed"},
 		{"paths out of order", canon([]manifestFile{{Path: "rules/b.conf", Size: 3, SHA256: sumABC}, {Path: a, Size: 3, SHA256: sumABC}}, a), "strictly increasing"},
 		{"size 2 MiB + 1", canon(oneFile(a, maxFileBytes+1), a), "a size is out of range"},
@@ -61,30 +65,78 @@ func TestParseManifest(t *testing.T) {
 	}
 }
 
-// The golden file is the form that the writer of a manifest has to produce: it
-// is read, written again to the same bytes, and has the sha256 of its file.
+// The golden files are the forms that the writer of a manifest has to produce:
+// each is read, written again to the same bytes, and has the sha256 of its
+// file. The one of version 2 is the one of version 1 with the mode, and a
+// variant of it is refused: another mode, or the keys in another order.
 func TestManifestGolden(t *testing.T) {
-	b, err := os.ReadFile("testdata/manifest-v1-golden.json")
+	for _, g := range []struct {
+		file    string
+		version int
+	}{
+		{"testdata/manifest-v1-golden.json", versionBlock},
+		{"testdata/manifest-v2-golden.json", versionDetect},
+	} {
+		t.Run(g.file, func(t *testing.T) {
+			b, err := os.ReadFile(g.file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := parseManifest(b)
+			if err != nil {
+				t.Fatalf("rejected: %v", err)
+			}
+			if !bytes.Equal(m.encode(), b) {
+				t.Fatalf("written again: %q", m.encode())
+			}
+			if m.Version != g.version || len(m.Files) != 10 || len(m.Load) != 7 {
+				t.Fatalf("version %d, %d files, %d in load", m.Version, len(m.Files), len(m.Load))
+			}
+			want, err := os.ReadFile(g.file + ".sha256")
+			if err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256(b)
+			if string(want) != hex.EncodeToString(sum[:])+"\n" {
+				t.Fatalf("sha256 of the golden file is %x, the file has %q", sum, want)
+			}
+		})
+	}
+	g, err := os.ReadFile("testdata/manifest-v2-golden.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := parseManifest(b)
-	if err != nil {
-		t.Fatalf("rejected: %v", err)
+	const mode = `"mode":"detect"`
+	variants := map[string]string{
+		"mode block":            strings.Replace(string(g), mode, `"mode":"block"`, 1),
+		"mode with a capital":   strings.Replace(string(g), mode, `"mode":"Detect"`, 1),
+		"mode empty":            strings.Replace(string(g), mode, `"mode":""`, 1),
+		"keys in another order": strings.Replace(string(g), `{"version":2,`+mode+`,`, `{`+mode+`,"version":2,`, 1),
 	}
-	if !bytes.Equal(m.encode(), b) {
-		t.Fatalf("written again: %q", m.encode())
+	for name, in := range variants {
+		if in == string(g) {
+			t.Fatalf("%s: the variant is the golden file", name)
+		}
+		if _, err := parseManifest([]byte(in)); err == nil || !strings.Contains(err.Error(), "not in the canonical form") {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
-	if len(m.Files) != 10 || len(m.Load) != 7 {
-		t.Fatalf("%d files, %d in load", len(m.Files), len(m.Load))
-	}
-	want, err := os.ReadFile("testdata/manifest-v1-golden.json.sha256")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(b)
-	if string(want) != hex.EncodeToString(sum[:])+"\n" {
-		t.Fatalf("sha256 of the golden file is %x, the file has %q", sum, want)
+}
+
+// The bundle knows its mode from the version of its manifest, and carries the
+// sha256 of the manifest bytes of that version.
+func TestReadBundleMode(t *testing.T) {
+	files := map[string]string{ruleFile: "SecRuleEngine On\n"}
+	for _, c := range []struct {
+		version int
+		detect  bool
+	}{{versionBlock, false}, {versionDetect, true}} {
+		dir := t.TempDir()
+		sum := writeBundleVersion(t, dir, c.version, files, ruleFile)
+		b, err := readBundle(dir)
+		if err != nil || b.detect != c.detect || b.fingerprint != sum {
+			t.Errorf("version %d: detect %v, fingerprint %x, error %v", c.version, b != nil && b.detect, sum, err)
+		}
 	}
 }
 

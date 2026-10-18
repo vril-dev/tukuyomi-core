@@ -1,6 +1,6 @@
 use super::*;
 use crate::config;
-use crate::rules::bundle::{Bundle, BundlePath};
+use crate::rules::bundle::{Bundle, BundlePath, Mode};
 use crate::rules::file_store::FileStore;
 use crate::rules::store::StoreError;
 use std::fs::{self, OpenOptions};
@@ -34,6 +34,7 @@ fn scratch() -> TestDir {
 fn bundle(name: &str) -> Bundle {
     let path = BundlePath::parse(&format!("rules/{name}.conf")).unwrap();
     Bundle::new(
+        Mode::Block,
         vec![(path.clone(), format!("SecRuleEngine {name}\n").into_bytes())],
         vec![path],
     )
@@ -84,10 +85,15 @@ fn the_chosen_generation_is_held_until_the_switch_is_finished() {
     assert!(matches!(switcher.prepare(), Next::Running(g) if g == a));
 
     commands.activate(b).unwrap();
-    let Next::Ready { generation, kernel } = switcher.prepare() else {
+    let Next::Ready {
+        generation,
+        mode,
+        kernel,
+    } = switcher.prepare()
+    else {
         panic!("the chosen generation was not prepared");
     };
-    assert_eq!(generation, b);
+    assert_eq!((generation, mode), (b, Mode::Block));
     let kernel = *kernel;
     assert_eq!(kernel.rules, root.0.join("generations").join(b.hex()));
     assert_eq!(kernel.rules_sha256, b.bytes());
@@ -107,6 +113,36 @@ fn the_chosen_generation_is_held_until_the_switch_is_finished() {
     commands.activate(b).unwrap();
     assert_eq!(commands.remove(a), Ok(()));
     assert!(matches!(switcher.prepare(), Next::Running(g) if g == b));
+}
+
+#[test]
+fn the_mode_of_the_generation_comes_with_the_switch_and_a_manifest_that_cannot_be_read_refuses_it()
+{
+    let root = scratch();
+    let (mut commands, made) = made_in(&root.0, &["a"]);
+    let path = BundlePath::parse("rules/d.conf").unwrap();
+    let files = vec![(path.clone(), b"SecRuleEngine d\n".to_vec())];
+    let detect = Bundle::new(Mode::Detect, files, vec![path]).unwrap();
+    commands.stage(&detect).unwrap();
+    commands.commit().unwrap();
+    commands.activate(detect.fingerprint()).unwrap();
+    let mut switcher = switcher(&root.0, made[0]);
+    let Next::Ready { mode, .. } = switcher.prepare() else {
+        panic!("the chosen generation was not prepared");
+    };
+    assert_eq!(mode, Mode::Detect);
+    switcher.finish(false);
+
+    let manifest = root
+        .0
+        .join("generations")
+        .join(detect.fingerprint().hex())
+        .join("manifest.json");
+    fs::remove_file(manifest).unwrap();
+    assert!(matches!(
+        switcher.prepare(),
+        Next::Refused("the manifest of the generation cannot be read")
+    ));
 }
 
 #[test]

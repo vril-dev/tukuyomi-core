@@ -90,7 +90,7 @@ func run(args []string) int {
 	if err != nil {
 		return d.startFail(exitStartup, "start: hello: %v", err)
 	}
-	return serve(conn, cfg.run, cfg.inc, h, waf.NewTransactionWithID, d, lostTimeout)
+	return serve(conn, cfg.run, cfg.inc, h, waf.NewTransactionWithID, b.detect, d, lostTimeout)
 }
 
 type config struct {

@@ -478,7 +478,7 @@ func newHarness(t *testing.T, mk func(id string) *fakeTx) *harness {
 		h.txs[id] = f
 		h.mu.Unlock()
 		return f
-	}, h.cap.send)
+	}, false, h.cap.send)
 	t.Cleanup(h.check)
 	return h
 }
@@ -613,11 +613,31 @@ func ruleBundle(text string) *bundle {
 	return testBundle(map[string]string{ruleFile: text}, ruleFile)
 }
 
+// detectBundle is ruleBundle for a manifest of version 2: its rules only
+// detect.
+func detectBundle(text string) *bundle {
+	b := ruleBundle(text)
+	m := testManifest(map[string]string{ruleFile: text}, b.load)
+	m.Version = versionDetect
+	b.manifestBytes = m.encode()
+	b.fingerprint = sha256.Sum256(b.manifestBytes)
+	b.detect = true
+	return b
+}
+
 // writeBundle writes the same bundle into the directory dir (made with mode
 // 0700 when it is not there) and returns its fingerprint.
 func writeBundle(t *testing.T, dir string, files map[string]string, load ...string) [32]byte {
 	t.Helper()
-	mb := testManifest(files, load).encode()
+	return writeBundleVersion(t, dir, versionBlock, files, load...)
+}
+
+// writeBundleVersion is writeBundle with the version of the manifest.
+func writeBundleVersion(t *testing.T, dir string, version int, files map[string]string, load ...string) [32]byte {
+	t.Helper()
+	m := testManifest(files, load)
+	m.Version = version
+	mb := m.encode()
 	put := func(name string, data []byte) {
 		p := filepath.Join(dir, name)
 		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {

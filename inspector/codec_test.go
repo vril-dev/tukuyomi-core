@@ -55,7 +55,8 @@ func TestGoldenOutbound(t *testing.T) {
 	vb, ok2 := encodeVerdict(testRun, testInc, 0x10, 2, 2, 1021, 403, "deny", "x", true)
 	v0, ok3 := encodeVerdict(testRun, testInc, 0x10, 3, 2, 0, 413, "deny", "", true)
 	vt, ok4 := encodeVerdict(testRun, testInc, 0x10, 6, 4, 1040, 403, strings.Repeat("a", 33), strings.Repeat("d", 300), true)
-	if !ok1 || !ok2 || !ok3 || !ok4 {
+	vd, ok5 := encodeDetected(testRun, testInc, 0x10, 4, 949110, 403, "deny", "")
+	if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 {
 		t.Fatal("encodeVerdict failed")
 	}
 	cases := map[string][]byte{
@@ -64,6 +65,7 @@ func TestGoldenOutbound(t *testing.T) {
 		"verdict_block":       vb,
 		"verdict_block_rule0": v0,
 		"verdict_truncated":   vt,
+		"verdict_detected":    vd,
 		"error_not_created":   encodeError(testRun, testInc, 0x11, 1, classNotCreated, codeLimit, "concurrency limit"),
 		"error_tx_failed":     encodeError(testRun, testInc, 0x10, 3, classTxFailed, codeReqTruncated, "request body shorter than declared"),
 		"closed":              encodeClosed(testRun, testInc, 0x10, 7, false),
@@ -354,6 +356,15 @@ func TestEncodeLimits(t *testing.T) {
 	o, err := parseOut(b)
 	if !ok || err != nil || o.flags != 0 || o.rule != -7 || o.stat != 65535 {
 		t.Errorf("boundary verdict: ok %v err %v %+v", ok, err, o)
+	}
+	// A detection is cut like a block, and its flag stays beside the cut flags.
+	if _, ok := encodeDetected(testRun, testInc, 1, 1, 1, 65536, "deny", ""); ok {
+		t.Error("status 65536 accepted")
+	}
+	b, ok = encodeDetected(testRun, testInc, 1, 1, 1, 403, strings.Repeat("a", 33), strings.Repeat("d", 257))
+	o, err = parseOut(b)
+	if !ok || err != nil || o.phase != 2 || o.block || o.flags != flagDetected|flagActionTruncated|flagDataTruncated || len(o.act) != maxAction || len(o.data) != maxData {
+		t.Errorf("cut detection: ok %v err %v %+v", ok, err, o)
 	}
 	e := encodeError(testRun, testInc, 1, 1, classTxFailed, codeOrder, strings.Repeat("x", 1000))
 	if o, err := parseOut(e); err != nil || len(o.text) != maxErrMsg || len(e)-headerLen > maxError {

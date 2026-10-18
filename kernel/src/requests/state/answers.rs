@@ -17,6 +17,7 @@ impl Engine {
         msg: u32,
         phase: u8,
         block: bool,
+        detected: bool,
         rule_id: i64,
         status: u16,
         payload: &[u8],
@@ -33,7 +34,7 @@ impl Engine {
             payload: payload.to_vec(),
         };
         if let Some(ti) = self.incoming(now, tx, Some(seen))? {
-            self.verdict(now, ti, msg, phase, block, rule_id, status)?;
+            self.verdict(now, ti, msg, phase, block, detected, rule_id, status)?;
         }
         self.assign(now);
         Ok(())
@@ -152,6 +153,7 @@ impl Engine {
         msg: u32,
         phase: u8,
         block: bool,
+        detected: bool,
         rule_id: i64,
         status: u16,
     ) -> Result<(), ConnFault> {
@@ -187,7 +189,12 @@ impl Engine {
                 },
             );
         } else if last == Some(msg) {
-            self.advance(now, ti);
+            let done = if detected {
+                Ending::Detected { rule_id, status }
+            } else {
+                Ending::Done
+            };
+            self.advance(now, ti, done);
         } else {
             self.end_tx(now, ti, Ending::Uninspectable(Why::Order));
         }
@@ -243,8 +250,8 @@ impl Engine {
         Ok(())
     }
 
-    /// The continue of the phase the stage waits for.
-    fn advance(&mut self, now: Instant, ti: usize) {
+    /// The continue of the phase the stage waits for; `done` is how the last phase ends.
+    fn advance(&mut self, now: Instant, ti: usize, done: Ending) {
         let l = &mut self.held[ti];
         let ri = l.req;
         match l.stage {
@@ -265,7 +272,7 @@ impl Engine {
             }
             Stage::P2 => {
                 // Phase 1 and phase 2 both continued: forward.
-                self.set_result(now, ti, Ending::Done);
+                self.set_result(now, ti, done);
                 self.close_tx(now, ti, 1);
             }
             _ => {}

@@ -99,6 +99,15 @@ fn bounded_is_due_at_once_on_overflow_and_cut_at_the_cap() {
 #[test]
 fn every_decision_has_its_verdict() {
     assert_eq!(verdict_of(Decision::Forward), Verdict::Allow);
+    let detected = Decision::Detected {
+        rule_id: 949110,
+        status: 403,
+    };
+    let want = Verdict::Detected {
+        rule_id: 949110,
+        status: 403,
+    };
+    assert_eq!(verdict_of(detected), want);
     // the status is passed on as it is, a value that is no HTTP status too
     let block = Decision::Block {
         phase: 1,
@@ -472,7 +481,7 @@ fn the_frames_of_a_body_are_written_up_to_body_end_in_one_step() {
     assert_eq!(frame_from(&mut peer).0, codec::KIND_TX_BEGIN);
     let now = Instant::now();
     s.engine
-        .on_verdict(now, tx, 1, 1, false, 0, 0, &[])
+        .on_verdict(now, tx, 1, 1, false, false, 0, 0, &[])
         .unwrap();
     assert_eq!(s.engine.queued(), 3);
     s.step(past());

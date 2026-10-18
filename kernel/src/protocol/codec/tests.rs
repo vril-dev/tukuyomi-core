@@ -17,12 +17,13 @@ const SENT: [&str; 8] = [
     "tx_end",
     "drain",
 ];
-const RECEIVED: [&str; 9] = [
+const RECEIVED: [&str; 10] = [
     "hello",
     "verdict_continue",
     "verdict_block",
     "verdict_block_rule0",
     "verdict_truncated",
+    "verdict_detected",
     "error_not_created",
     "error_tx_failed",
     "closed",
@@ -189,6 +190,11 @@ fn golden_verdicts_read_and_decode() {
             "verdict_truncated",
             hdr(KIND_VERDICT, 306, 0x10, 6),
             v(4, true, 3, 1040, 403, &[b'a'; 32], &[b'd'; 256]),
+        ),
+        (
+            "verdict_detected",
+            hdr(KIND_VERDICT, 22, 0x10, 4),
+            v(2, false, FLAG_DETECTED, 949110, 403, b"deny", b""),
         ),
     ];
     for (name, want_h, want_v) in cases {
@@ -564,6 +570,29 @@ fn verdict_accepts_the_boundaries_go_emits() {
         assert_eq!((v.flags, v.rule_id, v.status), (flags, i64::MIN, 65535));
         assert_eq!((v.action, v.data), (vec![0xff; 32], vec![0x80; 256]));
     }
+    // A detection carries the fields of a block with the same cuts at their limits; a cut flag needs the exact
+    // length here too.
+    let both = FLAG_DETECTED | FLAG_ACTION_TRUNCATED | FLAG_DATA_TRUNCATED;
+    let p = verdict(2, 0, both, 0, i64::MIN, 65535, &[0xff; 32], &[0x80; 256]);
+    let v = decode_verdict(&p).unwrap();
+    assert_eq!(
+        (v.block, v.flags, v.rule_id, v.status),
+        (false, both, i64::MIN, 65535)
+    );
+    let short = verdict(
+        2,
+        0,
+        FLAG_DETECTED | FLAG_ACTION_TRUNCATED,
+        0,
+        1,
+        403,
+        &[b'a'; 31],
+        b"",
+    );
+    assert_eq!(
+        reason(decode_verdict(&short)),
+        "verdict action cut flag needs a full-length action"
+    );
 }
 
 #[test]
@@ -574,7 +603,7 @@ fn verdict_rejects_out_of_range_values_with_the_matching_reason() {
         (0, 0, "verdict phase out of range"),
         (0, 5, "verdict phase out of range"),
         (1, 2, "verdict decision out of range"),
-        (2, 4, "verdict flags out of range"),
+        (2, 8, "verdict flags out of range"),
         (3, 1, "verdict reserved not zero"),
     ];
     for (at, value, why) in bytes {
@@ -593,6 +622,12 @@ fn verdict_rejects_out_of_range_values_with_the_matching_reason() {
         let p = verdict(1, 0, 0, 0, rule, status, action, data);
         let why = "verdict continue carries interruption fields";
         assert_eq!(reason(decode_verdict(&p)), why);
+    }
+    // The detection flag belongs to a continue of phase 2 only: not to a block, not to another phase.
+    let why = "verdict detected flag needs a continue of phase 2";
+    for (phase, decision) in [(2, 1), (1, 0), (3, 0), (4, 0)] {
+        let p = verdict(phase, decision, FLAG_DETECTED, 0, 1, 403, b"deny", b"");
+        assert_eq!(reason(decode_verdict(&p)), why, "phase {phase}");
     }
     // One byte over the limits of action (32) and data (256); a cut flag needs the exact cut length.
     let bad = |flags, action: &[u8], data: &[u8]| {

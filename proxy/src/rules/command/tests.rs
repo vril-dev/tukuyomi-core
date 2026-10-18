@@ -1,5 +1,4 @@
 use super::*;
-use crate::rules::trial::Accepted;
 
 const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -52,7 +51,20 @@ fn the_options_of_import_are_read_in_the_order_they_are_given() {
         [PathBuf::from("z.conf"), PathBuf::from("a.conf")]
     );
     assert_eq!(inputs.data, [PathBuf::from("list.data")]);
+    assert_eq!(inputs.mode, Mode::Block);
     assert!(!import(&["--rules", "a.conf"]).1);
+}
+
+#[test]
+fn detect_only_makes_a_detect_bundle_wherever_it_stands() {
+    for text in [
+        ["--detect-only", "--rules", "a.conf"],
+        ["--rules", "a.conf", "--detect-only"],
+    ] {
+        let (inputs, accept_block) = import(&text);
+        assert_eq!((inputs.mode, accept_block), (Mode::Detect, false));
+        assert_eq!(inputs.rules, [PathBuf::from("a.conf")]);
+    }
 }
 
 #[test]
@@ -178,17 +190,27 @@ fn the_end_of_a_trial_is_reported_with_the_rule_the_exit_and_the_escaped_line() 
         ]
     );
     let accepted = Finish {
-        result: Ok(vec![Accepted {
-            probe: "GET /",
-            phase: 2,
-            rule_id: 9202,
-            status: 403,
-        }]),
+        result: Ok(vec![
+            Accepted::Block {
+                probe: "GET /",
+                phase: 2,
+                rule_id: 9202,
+                status: 403,
+            },
+            Accepted::Detected {
+                probe: "POST / with a JSON body",
+                rule_id: 949110,
+                status: 403,
+            },
+        ]),
         detail: None,
         clean: true,
     };
     assert_eq!(
         reported(&accepted),
-        ["rules import: accepted a block: GET /: rule 9202 in phase 2, status 403"]
+        [
+            "rules import: accepted a block: GET /: rule 9202 in phase 2, status 403",
+            "rules import: detected: POST / with a JSON body: rule 949110, status 403",
+        ]
     );
 }

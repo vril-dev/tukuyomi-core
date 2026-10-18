@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use crate::config;
 use crate::host;
 use crate::rules::bundle::{
-    Bundle, Fingerprint, MANIFEST_NAME, MAX_MANIFEST_BYTES, Manifest, sha256,
+    Bundle, Fingerprint, MANIFEST_NAME, MAX_MANIFEST_BYTES, Manifest, Mode, sha256,
 };
 use crate::rules::store::{Committed, Generation, Hold, RuleStore, Staged, StoreError};
 
@@ -329,14 +329,7 @@ impl RuleStore for FileStore {
 
     fn verify(&self, generation: Fingerprint) -> Result<(), StoreError> {
         let dir = self.generation_dir(generation)?;
-        let bytes = read_regular(&dir.join(MANIFEST_NAME), MAX_MANIFEST_BYTES, None)
-            .map_err(|_| StoreError("the manifest of the generation cannot be read"))?;
-        if Fingerprint::of(&bytes) != generation {
-            return Err(StoreError(
-                "the manifest of the generation does not match its name",
-            ));
-        }
-        let manifest = Manifest::parse(&bytes).map_err(|e| StoreError(e.0))?;
+        let manifest = read_manifest(&dir, generation)?;
         for entry in manifest.files() {
             let data = read_regular(&dir.join(entry.path.as_str()), entry.size, None)
                 .map_err(|_| StoreError("a file of the generation cannot be read"))?;
@@ -347,6 +340,11 @@ impl RuleStore for FileStore {
             }
         }
         Ok(())
+    }
+
+    fn mode(&self, generation: Fingerprint) -> Result<Mode, StoreError> {
+        let dir = self.generation_dir(generation)?;
+        Ok(read_manifest(&dir, generation)?.mode())
     }
 
     fn hold(&self, generation: Fingerprint) -> Result<Hold, StoreError> {
@@ -391,6 +389,19 @@ impl RuleStore for FileStore {
         let _ = fs::remove_file(self.dir.join(USING).join(generation.hex()));
         Ok(())
     }
+}
+
+/// The manifest of the generation `generation` in `dir`: read as every file is read and at most 64 KiB, the very
+/// bytes that the name of the generation says, and in the form of a manifest.
+fn read_manifest(dir: &Path, generation: Fingerprint) -> Result<Manifest, StoreError> {
+    let bytes = read_regular(&dir.join(MANIFEST_NAME), MAX_MANIFEST_BYTES, None)
+        .map_err(|_| StoreError("the manifest of the generation cannot be read"))?;
+    if Fingerprint::of(&bytes) != generation {
+        return Err(StoreError(
+            "the manifest of the generation does not match its name",
+        ));
+    }
+    Manifest::parse(&bytes).map_err(|e| StoreError(e.0))
 }
 
 /// Opens the file at `path` that a lock is taken on, and makes it (empty, 0600) when it is not there. It is opened

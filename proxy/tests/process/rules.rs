@@ -51,6 +51,10 @@ fn a_start_records_the_chosen_generation() {
     let lines = proxy.records.lines();
     let chosen = format!("start: rules generation {}", generation());
     assert!(lines.contains(&chosen), "records: {lines:#?}");
+    assert!(
+        lines.iter().any(|l| l == "start: rules mode block"),
+        "records: {lines:#?}"
+    );
     proxy.finish(0);
 }
 
@@ -156,8 +160,8 @@ fn a_bundle_that_is_imported_and_chosen_is_the_generation_the_proxy_starts_with(
         let listed = rules(root, "list", &[]);
         let fields: Vec<&str> = listed.out.split_whitespace().collect();
         assert_eq!(
-            (listed.code, fields.len(), fields[0]),
-            (Some(0), 2, generation().as_str())
+            (listed.code, fields.len(), fields[0], fields[2]),
+            (Some(0), 3, generation().as_str(), "block")
         );
         let chosen = rules(root, "activate", &[OsStr::new(&generation())]);
         assert_eq!(
@@ -165,7 +169,7 @@ fn a_bundle_that_is_imported_and_chosen_is_the_generation_the_proxy_starts_with(
             (Some(0), format!("{} current\n", generation()))
         );
         let listed = rules(root, "list", &[]);
-        assert!(listed.out.ends_with(" current\n"), "{}", listed.out);
+        assert!(listed.out.ends_with(" block current\n"), "{}", listed.out);
 
         // A generation that is not there is refused, and so is a fingerprint of the wrong form.
         let missing = "f".repeat(64);
@@ -217,6 +221,123 @@ fn a_rule_file_that_the_inspector_refuses_makes_no_generation() {
         &[STORE],
         "no generation is chosen",
     );
+}
+
+/// The mode word of the generation `fingerprint` in the output of `rules list`.
+fn listed_mode(out: &str, fingerprint: &str) -> String {
+    out.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .find(|fields| fields[0] == fingerprint)
+        .unwrap_or_else(|| panic!("{fingerprint} is not listed in {out:?}"))[2]
+        .to_owned()
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_detect_only_generation_lets_a_matched_request_through_and_a_blocking_one_of_the_same_rules_stops_it()
+ {
+    let mut detect = String::new();
+    let mut proxy = Proxy::spawn_with("rules_detect", Knobs::quick(), |root| {
+        // The rules of the generation in the store, imported as a detect bundle: another manifest, so another
+        // generation, which the trial of the import lets pass.
+        let conf = rules_file();
+        let imported = rules(
+            root,
+            "import",
+            &[
+                OsStr::new("--rules"),
+                conf.as_os_str(),
+                OsStr::new("--detect-only"),
+            ],
+        );
+        assert_eq!(imported.code, Some(0), "{}", imported.err);
+        assert!(imported.err.is_empty(), "{}", imported.err);
+        detect = imported
+            .out
+            .strip_suffix(" created\n")
+            .unwrap_or_else(|| panic!("unexpected output {:?}", imported.out))
+            .to_owned();
+        assert_ne!(detect, generation());
+        let chosen = rules(root, "activate", &[OsStr::new(&detect)]);
+        assert_eq!(chosen.code, Some(0), "{}", chosen.err);
+
+        // The list gives the mode of each generation; one without a readable manifest is unknown and ends the
+        // command with 1 after the whole list.
+        let listed = rules(root, "list", &[]);
+        assert_eq!(listed.code, Some(0), "{}", listed.err);
+        assert_eq!(listed_mode(&listed.out, &generation()), "block");
+        assert_eq!(listed_mode(&listed.out, &detect), "detect");
+        assert!(
+            listed
+                .out
+                .lines()
+                .any(|l| l.starts_with(&detect) && l.ends_with(" detect current")),
+            "{}",
+            listed.out
+        );
+        let broken = "f".repeat(64);
+        let dir = root.join(STORE).join("generations").join(&broken);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("make a generation without a manifest");
+        let listed = rules(root, "list", &[]);
+        assert_eq!(listed.code, Some(1), "{}", listed.out);
+        assert_eq!(listed_mode(&listed.out, &broken), "unknown");
+        assert_eq!(listed_mode(&listed.out, &detect), "detect");
+        let sentence =
+            format!("rules list: {broken}: the manifest of the generation cannot be read");
+        assert!(listed.err.contains(&sentence), "{}", listed.err);
+        fs::remove_dir(&dir).expect("remove the generation without a manifest");
+    });
+    proxy
+        .records
+        .wait_lines("the proxy to listen", 1, |l| l == "start: listening");
+    proxy.wait_inspector(None);
+    let lines = proxy.records.lines();
+    for line in [
+        format!("start: rules generation {detect}"),
+        "start: rules mode detect".to_owned(),
+    ] {
+        assert!(lines.contains(&line), "records: {lines:#?}");
+    }
+
+    // The URI rule would block this request; in the detect generation it goes to the upstream, and the record
+    // names the rule. A request that no rule matches is recorded as before.
+    let reply = exchange(proxy.port, &get("/block-probe/x"));
+    assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
+    assert_eq!(reply.message().body, UPSTREAM_BODY.as_bytes());
+    proxy.records.conn("the detection record", |l| {
+        l.contains(": forwarded 200 detected by a rule rule 9201 ")
+    });
+    let seen = Message::parse(&proxy.upstream.requests()[0]);
+    assert_eq!(seen.start, "GET /block-probe/x HTTP/1.1");
+    assert_eq!(exchange(proxy.port, &get("/ok")).status(), 200);
+    proxy.records.conn("the forwarded record", |l| {
+        l.contains(": forwarded 200 forwarded rule - ")
+    });
+
+    // The same rules in a blocking generation stop the request that the detect generation let through.
+    let root = proxy.root().to_path_buf();
+    let chosen = rules(&root, "activate", &[OsStr::new(&generation())]);
+    assert_eq!(chosen.code, Some(0), "{}", chosen.err);
+    let before = proxy.inspector();
+    proxy.signal("USR1");
+    let switched = format!("reload: generation {} is ready, switched", generation());
+    proxy
+        .records
+        .wait_lines("the switch", 1, |l| l == switched.as_str());
+    proxy.wait_inspector(Some(before));
+    let lines = proxy.records.lines();
+    assert!(
+        lines.iter().any(|l| l == "reload: rules mode block"),
+        "records: {lines:#?}"
+    );
+    assert_empty_answer(&exchange(proxy.port, &get("/block-probe/x")), 403);
+    proxy
+        .records
+        .conn("the blocked record", |l| l.contains(&blocked_by(9201)));
+    proxy.finish(2);
 }
 
 #[test]

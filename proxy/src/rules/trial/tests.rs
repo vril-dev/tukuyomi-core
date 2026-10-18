@@ -137,11 +137,17 @@ fn limits(accept_block: bool) -> Limits {
         stop_inspect: Duration::from_secs(1),
         slice: Duration::from_millis(5),
         accept_block,
+        mode: Mode::Block,
     }
 }
 
 const BLOCK: Verdict = Verdict::Block {
     phase: 1,
+    rule_id: 949110,
+    status: 403,
+};
+
+const DETECTED: Verdict = Verdict::Detected {
     rule_id: 949110,
     status: 403,
 };
@@ -211,7 +217,7 @@ fn a_block_fails_the_trial_unless_it_is_accepted_and_an_uninspectable_request_al
     // Accepted, the blocks are reported and the trial goes on.
     let mut kernel = Fake::ready(&[BLOCK, Verdict::Allow, BLOCK]);
     let finish = go(&mut kernel, true);
-    let accepted = |probe: &Probe| Accepted {
+    let accepted = |probe: &Probe| Accepted::Block {
         probe: probe.name,
         phase: 1,
         rule_id: 949110,
@@ -232,6 +238,37 @@ fn a_block_fails_the_trial_unless_it_is_accepted_and_an_uninspectable_request_al
         reason: Reason::Unavailable,
     };
     assert_eq!(finish.result, Err(failed));
+}
+
+#[test]
+fn a_detection_of_a_bundle_that_detects_is_not_a_failure_and_is_reported() {
+    let mut kernel = Fake::ready(&[Verdict::Allow, DETECTED, Verdict::Allow]);
+    let detect = Limits {
+        mode: Mode::Detect,
+        ..limits(false)
+    };
+    let finish = run(&mut kernel, &detect, &AtomicBool::new(false));
+    let reported = Accepted::Detected {
+        probe: PROBES[1].name,
+        rule_id: 949110,
+        status: 403,
+    };
+    assert_eq!(finish.result, Ok(vec![reported]));
+    assert!(finish.passed());
+    assert_eq!((kernel.sent.len(), kernel.shutdowns), (3, 1));
+}
+
+#[test]
+fn a_detection_of_a_bundle_that_blocks_fails_the_trial_even_when_blocks_are_accepted() {
+    let mut kernel = Fake::ready(&[Verdict::Allow, DETECTED, Verdict::Allow]);
+    let finish = go(&mut kernel, true);
+    let failed = Failed::Uninspectable {
+        probe: PROBES[1].name,
+        reason: Reason::Protocol,
+    };
+    assert_eq!(finish.result, Err(failed));
+    assert!(!finish.passed());
+    assert_eq!((kernel.sent.len(), kernel.shutdowns), (2, 1));
 }
 
 #[test]

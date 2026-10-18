@@ -2,7 +2,7 @@
 //! `rules list`.
 //!
 //! ```text
-//! tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--accept-block]
+//! tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--accept-block] [--detect-only]
 //! tukuyomi-proxy rules activate <config> <fingerprint>
 //! tukuyomi-proxy rules remove <config> <fingerprint>
 //! tukuyomi-proxy rules list <config>
@@ -12,19 +12,22 @@
 //! configuration is the one of the proxy, as an absolute clean path; the paths of the options are as the operator
 //! writes them, from the working directory. `import` builds a bundle from the inputs (`collect`), stages it in the
 //! store, tries it (`trial`: an inspector is started on it, three requests are inspected) and makes it a generation
-//! only if the trial passes; it does not choose it. `activate` chooses a generation, which a proxy that starts later
+//! only if the trial passes; it does not choose it. With `--detect-only` the bundle is a detect bundle: a request that
+//! a rule matches is let through and the match is reported, and the trial passes on such a match and writes a line
+//! for each; without it the bundle blocks. `activate` chooses a generation, which a proxy that starts later
 //! uses, and a running proxy that is told to switch. `remove` deletes a generation that is not the chosen one and
 //! that no running proxy uses. `list` shows the generations.
 //!
 //! The results go to the standard output, one line each, and the first word of a line is the fingerprint: `import`
 //! says `created`, `already exists` or `recreated` after it, `activate` says `current`, `remove` says `removed`, and
-//! `list` gives the time the generation was made (seconds since the epoch) and `current` for the chosen one.
+//! `list` gives the time the generation was made (seconds since the epoch), its mode (`block` or `detect`, and
+//! `unknown` when its manifest cannot be read) and `current` for the chosen one.
 //! Everything else goes to the
 //! standard error, a line each, and starts with the name of the command. Whatever came from outside (an entry of a
 //! directory, the line an inspector left behind) is written with every byte outside 0x20 to 0x7e as `\xNN`.
 //!
 //! The exit code is 0 for success, 1 for any other end (a refused store or input, a failed trial, a store that is in
-//! use) and 2 for a wrong argument or a refused configuration.
+//! use, a listed generation whose manifest cannot be read) and 2 for a wrong argument or a refused configuration.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -40,12 +43,12 @@ use tukuyomi_kernel::Failure;
 use crate::config::{self, Loaded};
 use crate::host;
 use crate::log::escaped;
-use crate::rules::bundle::Fingerprint;
+use crate::rules::bundle::{Fingerprint, Mode};
 use crate::rules::collect::{self, CollectError, Inputs};
 use crate::rules::store::{self, Committed, RuleStore, Staged};
-use crate::rules::trial::{self, Failed, Finish, Limits};
+use crate::rules::trial::{self, Accepted, Failed, Finish, Limits};
 
-const USAGE: &str = "usage: tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--accept-block]\n       tukuyomi-proxy rules activate <config> <fingerprint>\n       tukuyomi-proxy rules remove <config> <fingerprint>\n       tukuyomi-proxy rules list <config>";
+const USAGE: &str = "usage: tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--accept-block] [--detect-only]\n       tukuyomi-proxy rules activate <config> <fingerprint>\n       tukuyomi-proxy rules remove <config> <fingerprint>\n       tukuyomi-proxy rules list <config>";
 
 /// How a command ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +167,10 @@ fn parse_import(config: PathBuf, rest: &[OsString]) -> Result<Command, &'static 
             accept_block = true;
             continue;
         }
+        if arg == "--detect-only" {
+            inputs.mode = Mode::Detect;
+            continue;
+        }
         // The value of an option is the next argument, which is not another option.
         let value = args
             .next()
@@ -244,7 +251,7 @@ fn import(config: &Path, inputs: &Inputs, accept_block: bool, term: &mut Termina
             return Exit::Failed;
         }
     };
-    if !try_staged(&loaded, &staged, accept_block, term) {
+    if !try_staged(&loaded, &staged, accept_block, inputs.mode, term) {
         if let Err(e) = store.discard() {
             term.note(&format!("{NAME}: {}", e.0));
         }
@@ -267,8 +274,14 @@ fn import(config: &Path, inputs: &Inputs, accept_block: bool, term: &mut Termina
     }
 }
 
-/// Tries the staged bundle and tells how it went. True if it passed.
-fn try_staged(loaded: &Loaded, staged: &Staged, accept_block: bool, term: &mut Terminal) -> bool {
+/// Tries the staged bundle and tells how it went. True if it passed. `mode` is the mode of the bundle.
+fn try_staged(
+    loaded: &Loaded,
+    staged: &Staged,
+    accept_block: bool,
+    mode: Mode,
+    term: &mut Terminal,
+) -> bool {
     let kernel = match loaded
         .kernel
         .for_generation(staged.dir.clone(), staged.fingerprint)
@@ -288,6 +301,7 @@ fn try_staged(loaded: &Loaded, staged: &Staged, accept_block: bool, term: &mut T
         stop_inspect: loaded.proxy.stop_inspect,
         slice: loaded.proxy.drive_slice,
         accept_block,
+        mode,
     };
     match supervised(kernel, limits) {
         Ok(finish) => {
@@ -330,11 +344,24 @@ fn supervised(kernel: tukuyomi_kernel::Config, limits: Limits) -> Result<Finish,
 /// What the end of a trial says, to the standard error.
 fn report(finish: &Finish, term: &mut Terminal) {
     if let Ok(accepted) = &finish.result {
-        for block in accepted {
-            term.note(&format!(
-                "rules import: accepted a block: {}: rule {} in phase {}, status {}",
-                block.probe, block.rule_id, block.phase, block.status
-            ));
+        for item in accepted {
+            term.note(&match item {
+                Accepted::Block {
+                    probe,
+                    phase,
+                    rule_id,
+                    status,
+                } => format!(
+                    "rules import: accepted a block: {probe}: rule {rule_id} in phase {phase}, status {status}"
+                ),
+                Accepted::Detected {
+                    probe,
+                    rule_id,
+                    status,
+                } => format!(
+                    "rules import: detected: {probe}: rule {rule_id}, status {status}"
+                ),
+            });
         }
     }
     if let Err(failed) = &finish.result {
@@ -433,32 +460,50 @@ fn list(config: &Path, term: &mut Terminal) -> Exit {
     };
     let current = store.current();
     let chosen = current.as_ref().ok().copied().flatten();
+    let mut unreadable = Vec::new();
     for generation in &generations {
+        let mode = match store.mode(generation.fingerprint) {
+            Ok(mode) => mode.name(),
+            Err(e) => {
+                unreadable.push((generation.fingerprint, e));
+                "unknown"
+            }
+        };
         let mark = if Some(generation.fingerprint) == chosen {
             " current"
         } else {
             ""
         };
         term.result(&format!(
-            "{} {}{mark}",
+            "{} {} {mode}{mark}",
             generation.fingerprint.hex(),
             generation.made
         ));
     }
-    // The list is complete either way; a current generation that a start could not use ends the command with 1.
+    // The list is complete either way; a generation whose manifest cannot be read, or a current generation that a
+    // start could not use, ends the command with 1.
+    for (fingerprint, e) in &unreadable {
+        term.note(&format!("{NAME}: {}: {}", fingerprint.hex(), e.0));
+    }
+    let mut exit = if unreadable.is_empty() {
+        Exit::Done
+    } else {
+        Exit::Failed
+    };
     match current {
         Err(e) => {
             term.note(&format!("{NAME}: {}", e.0));
-            Exit::Failed
+            exit = Exit::Failed;
         }
         Ok(Some(chosen)) if !generations.iter().any(|g| g.fingerprint == chosen) => {
             term.note(&format!(
                 "{NAME}: the current generation is not in the store"
             ));
-            Exit::Failed
+            exit = Exit::Failed;
         }
-        Ok(_) => Exit::Done,
+        Ok(_) => {}
     }
+    exit
 }
 
 #[cfg(test)]

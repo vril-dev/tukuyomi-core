@@ -58,10 +58,16 @@ pub struct Request<'a> {
 
 /// The answer for one request. `Allow` is a verdict on the bytes that were given to `submit`, inspected by the
 /// rules and the fixed trailing directives in the phases 1 and 2, and on nothing else: whatever was not inspected,
-/// or inspected in part, is `Uninspectable`.
+/// or inspected in part, is `Uninspectable`. `Detected` is an `Allow` in which a rule matched while the rules only
+/// detect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Allow,
+    Detected {
+        rule_id: i64,
+        /// The value the inspector sent, as it is: what the rule would have blocked with.
+        status: u16,
+    },
     Block {
         phase: u8,
         rule_id: i64,
@@ -300,6 +306,7 @@ fn wire_kind(k: OutKind) -> u8 {
 fn verdict_of(d: Decision) -> Verdict {
     match d {
         Decision::Forward => Verdict::Allow,
+        Decision::Detected { rule_id, status } => Verdict::Detected { rule_id, status },
         Decision::Block {
             phase,
             rule_id,

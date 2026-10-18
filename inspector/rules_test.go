@@ -149,10 +149,10 @@ func TestFailingFile(t *testing.T) {
 	files := map[string]string{"rules/a.conf": rule(1), "rules/b.conf": rule(2), "rules/c.conf": rule(1), "rules/d.conf": "SecNoSuchDirective 1\n"}
 	load := []string{"rules/a.conf", "rules/b.conf", "rules/c.conf", "rules/d.conf"}
 	b := testBundle(files, load...)
-	if p := failingFile(b.files, b.load, time.Minute); p != "rules/c.conf" {
+	if p := failingFile(b.files, b.load, false, time.Minute); p != "rules/c.conf" {
 		t.Fatalf("failing file %q", p)
 	}
-	if p := failingFile(b.files, b.load, 0); p != "" {
+	if p := failingFile(b.files, b.load, false, 0); p != "" {
 		t.Fatalf("with no time left: %q", p)
 	}
 	if _, err := newWAF(b); err == nil || !strings.HasPrefix(err.Error(), "rules/c.conf: ") {
@@ -165,11 +165,36 @@ func TestFailingFile(t *testing.T) {
 	t.Cleanup(func() { os.Chmod(ro, 0o700) })
 	t.Setenv("TMPDIR", ro)
 	b = testBundle(files, load...)
-	if _, err := buildWAF(b.files, nil); err == nil {
+	if _, err := buildWAF(b.files, nil, false); err == nil {
 		t.Fatal("the reserved directives build with an unwritable TMPDIR")
 	}
-	if p := failingFile(b.files, b.load, time.Minute); p != "" {
+	if p := failingFile(b.files, b.load, false, time.Minute); p != "" {
 		t.Fatalf("an unwritable TMPDIR blamed %q", p)
+	}
+}
+
+// The ids of the two rules around the files of a bundle that only detects are
+// taken in such a bundle only: a file of the operator that uses one stops the
+// build, and the search names that file because it builds with the same rules
+// around the files (without detectBegin the id of detectBegin is free, and
+// without detectEnd the search would not fail at all).
+func TestDetectRuleIDsAreTaken(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	files := func(id int) map[string]string {
+		return map[string]string{"rules/a.conf": "SecAction \"id:1,phase:1,pass\"\n", "rules/b.conf": fmt.Sprintf("SecAction \"id:%d,phase:1,pass\"\n", id)}
+	}
+	for _, id := range []int{4000010, 4000011} {
+		for _, detect := range []bool{false, true} {
+			b := testBundle(files(id), "rules/a.conf", "rules/b.conf")
+			b.detect = detect
+			_, err := newWAF(b)
+			switch {
+			case !detect && err != nil:
+				t.Errorf("id %d in a bundle that blocks: %v", id, err)
+			case detect && (err == nil || !strings.HasPrefix(err.Error(), "rules/b.conf: ")):
+				t.Errorf("id %d in a bundle that only detects: %v", id, err)
+			}
+		}
 	}
 }
 

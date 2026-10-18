@@ -127,6 +127,11 @@ pub enum Why {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     Forward,
+    /// Forwarded like `Forward`; a rule matched while the rules only detect. The values are the inspector's own.
+    Detected {
+        rule_id: i64,
+        status: u16,
+    },
     Block {
         phase: u8,
         rule_id: i64,
@@ -332,7 +337,8 @@ struct Req {
     delivered: bool,
 }
 
-/// How a stage ends. `Done` is the continue of the last phase (Forward).
+/// How a stage ends. `Done` is the continue of the last phase (Forward); `Detected` is that continue with a
+/// match that did not stop the request.
 #[derive(Clone, Copy)]
 enum Ending {
     Block {
@@ -343,6 +349,10 @@ enum Ending {
     Uninspectable(Why),
     Disconnect,
     Done,
+    Detected {
+        rule_id: i64,
+        status: u16,
+    },
 }
 
 pub struct Engine {

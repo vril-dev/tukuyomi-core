@@ -54,7 +54,17 @@ fn only_end(e: &mut Engine, now: Instant) -> (u32, u8) {
 }
 
 fn cont(e: &mut Engine, now: Instant, tx: u64, msg: u32, phase: u8) -> Result<(), ConnFault> {
-    e.on_verdict(now, tx, msg, phase, false, 0, 0, &[phase, 0, msg as u8])
+    e.on_verdict(
+        now,
+        tx,
+        msg,
+        phase,
+        false,
+        false,
+        0,
+        0,
+        &[phase, 0, msg as u8],
+    )
 }
 
 fn blk(e: &mut Engine, now: Instant, tx: u64, msg: u32, phase: u8) -> Result<(), ConnFault> {
@@ -64,15 +74,38 @@ fn blk(e: &mut Engine, now: Instant, tx: u64, msg: u32, phase: u8) -> Result<(),
         msg,
         phase,
         true,
+        false,
         949110,
         403,
         &[phase, 1, msg as u8],
     )
 }
 
+/// A continue of phase 2 that carries a match the rules only detected.
+fn det(e: &mut Engine, now: Instant, tx: u64, msg: u32) -> Result<(), ConnFault> {
+    e.on_verdict(
+        now,
+        tx,
+        msg,
+        2,
+        false,
+        true,
+        949110,
+        403,
+        &[2, 0, msg as u8, 4],
+    )
+}
+
 fn blocked(phase: u8) -> Decision {
     Decision::Block {
         phase,
+        rule_id: 949110,
+        status: 403,
+    }
+}
+
+fn detected() -> Decision {
+    Decision::Detected {
         rule_id: 949110,
         status: 403,
     }
@@ -391,6 +424,20 @@ fn row_phase2_wait() {
     cont(&mut e, t0, tx, 4, 2).unwrap();
     assert_eq!(out(&e, id).decision, Some(Decision::Forward));
     assert_eq!(only_end(&mut e, t0), (5, 1));
+    // a continue with a detection on BODY_END is forwarded and kept as detected, TX_END(done), and CLOSED returns
+    // the slot; on a BODY it is not the continue of phase 2
+    let Fx { mut e, t0, id, tx } = row_p2();
+    det(&mut e, t0, tx, 4).unwrap();
+    assert_eq!(out(&e, id).decision, Some(detected()));
+    assert_eq!(only_end(&mut e, t0), (5, 1));
+    closed(&mut e, t0, tx, 5).unwrap();
+    assert_eq!(e.held_slots(), 0);
+    let Fx { mut e, t0, id, tx } = row_p2();
+    det(&mut e, t0, tx, 3).unwrap();
+    assert_eq!(
+        out(&e, id).decision,
+        Some(Decision::Uninspectable(Why::Order))
+    );
     // block on BODY_END, and on a BODY
     for msg in [4, 2] {
         let Fx { mut e, t0, id, tx } = row_p2();
@@ -526,7 +573,8 @@ fn the_decision_is_made_once() {
     let Fx { mut e, t0, id, tx } = row_body();
     cont(&mut e, t0, tx, 1, 1).unwrap();
     assert_eq!((out(&e, id).decision, e.discarded()), (None, 1));
-    e.on_verdict(t0, tx, 1, 1, false, 0, 0, &[0xff]).unwrap();
+    e.on_verdict(t0, tx, 1, 1, false, false, 0, 0, &[0xff])
+        .unwrap();
     assert_eq!(
         out(&e, id).decision,
         Some(Decision::Uninspectable(Why::Order))

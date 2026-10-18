@@ -177,10 +177,20 @@ func (o *owner) run(b txBegin, msg uint32) {
 
 func (o *owner) send(b []byte) { o.t.send(b) }
 
+// verdict sends the Continue (it is nil) or the Block of a phase. In a bundle
+// that only detects, a Block of the request phases is sent only when the rule
+// before the files ran (detectBeginID): without it the transaction was never
+// switched to DetectionOnly, so a rule of the operator may have blocked it and
+// nothing says what the engine did. That request is incomplete, as for a
+// Continue (detectionOf).
 func (o *owner) verdict(msg uint32, phase uint8, it *types.Interruption) {
 	if it == nil {
 		b, _ := encodeVerdict(o.t.run, o.t.inc, o.id, msg, phase, 0, 0, "", "", false)
 		o.send(b)
+		return
+	}
+	if o.t.detect && phase <= 2 && !ruleMatched(o.tx, detectBeginID) {
+		o.fail(msg, codeIncomplete, "request inspection incomplete")
 		return
 	}
 	b, ok := encodeVerdict(o.t.run, o.t.inc, o.id, msg, phase, it.RuleID, it.Status, it.Action, it.Data, true)
@@ -427,10 +437,66 @@ func (o *owner) bodyEnd(f inFrame) {
 		o.fail(f.msg, codeReqProcess, "request body processing failed")
 	case !requestComplete(o.tx, true, o.declared, o.wantProc):
 		o.fail(f.msg, codeIncomplete, "request inspection incomplete")
+	case o.t.detect:
+		o.continueDetect(f.msg)
 	default:
 		o.state = stReqDone
 		o.verdict(f.msg, 2, nil)
 	}
+}
+
+// continueDetect sends the Continue of phase 2 of a bundle that only detects.
+// The match that DetectionOnly kept back, if there is one, goes with it
+// (encodeDetected). When detectionOf cannot say what the rules of the operator
+// did, the request is incomplete: nothing is let through on a guess.
+func (o *owner) continueDetect(msg uint32) {
+	it, ok := detectionOf(o.tx)
+	if !ok {
+		o.fail(msg, codeIncomplete, "request inspection incomplete")
+		return
+	}
+	o.state = stReqDone
+	if it == nil {
+		o.verdict(msg, 2, nil)
+		return
+	}
+	b, ok := encodeDetected(o.t.run, o.t.inc, o.id, msg, it.RuleID, it.Status, it.Action, it.Data)
+	if !ok {
+		o.fail(msg, codeBadVerdict, "interruption status out of range")
+		return
+	}
+	o.send(b)
+}
+
+// detectionOf reads what a transaction of a bundle that only detects has to say
+// before the Continue of phase 2: the first interruption that DetectionOnly
+// kept back, or nil. ok is false when it cannot be trusted: the two rules of
+// detectBegin and detectEnd must both be among the matched rules (a rule of the
+// operator may have removed or skipped one, and then the engine was On or
+// DetectionOnly where it should not be), and the transaction must have
+// DetectionOnlyInterruption. That is a method of the transaction that Coraza
+// makes and not of types.Transaction, so it is asked through an interface of
+// its own.
+func detectionOf(tx types.Transaction) (*types.Interruption, bool) {
+	d, ok := tx.(interface{ DetectionOnlyInterruption() *types.Interruption })
+	if !ok {
+		return nil, false
+	}
+	if !ruleMatched(tx, detectBeginID) || !ruleMatched(tx, detectEndID) {
+		return nil, false
+	}
+	return d.DetectionOnlyInterruption(), true
+}
+
+// ruleMatched reports whether the rule with this id is among the matched rules
+// of the transaction.
+func ruleMatched(tx types.Transaction, id int) bool {
+	for _, m := range tx.MatchedRules() {
+		if m.Rule().ID() == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *owner) respBegin(f inFrame) {
@@ -517,11 +583,12 @@ func (o *owner) close(msg uint32, connLost bool) {
 
 // table is the shared transaction table used by the single reader.
 type table struct {
-	run   uint64
-	inc   uint32
-	newTx func(id string) types.Transaction
-	send  sender
-	wg    sync.WaitGroup
+	run    uint64
+	inc    uint32
+	newTx  func(id string) types.Transaction
+	detect bool // the rules only detect: a Block of the request phases and the Continue of phase 2 are checked, and the Continue may carry a match (verdict, continueDetect)
+	send   sender
+	wg     sync.WaitGroup
 
 	mu        sync.Mutex
 	active    map[uint64]*entry
@@ -535,8 +602,8 @@ type table struct {
 	badEnds   uint64 // TX_END with an invalid reason byte (still closed)
 }
 
-func newTable(run uint64, inc uint32, newTx func(string) types.Transaction, send sender) *table {
-	return &table{run: run, inc: inc, newTx: newTx, send: send, active: make(map[uint64]*entry)}
+func newTable(run uint64, inc uint32, newTx func(string) types.Transaction, detect bool, send sender) *table {
+	return &table{run: run, inc: inc, newTx: newTx, detect: detect, send: send, active: make(map[uint64]*entry)}
 }
 
 func (t *table) txIDString(id uint64) string {

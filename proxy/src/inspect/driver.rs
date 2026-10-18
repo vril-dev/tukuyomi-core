@@ -25,6 +25,10 @@
 //! serves on. Each kernel has a table of its own for its requests (`slot`). A failure of the kernel that serves
 //! stops the proxy as ever, also in the middle of a switch. The main thread is told how a switch ended when the
 //! kernel that was stopped is gone.
+//!
+//! Each slot keeps the mode of its generation. A generation that blocks never has a request that is only detected,
+//! so a `Detected` that its kernel gives is not believed: the ticket is answered with `Uninspectable`, and the
+//! first time it happens in a slot the driver records one line.
 
 use std::mem;
 use std::net::SocketAddr;
@@ -41,7 +45,7 @@ use tukuyomi_kernel::{
 
 use crate::inspect::slot::{Retired, Retirement, Slot};
 use crate::log::{Log, escaped};
-use crate::rules::bundle::Fingerprint;
+use crate::rules::bundle::{self, Fingerprint};
 
 /// The shortest slice of one kernel step. A shorter one would end a step before it could read anything.
 const MIN_SLICE: Duration = Duration::from_millis(1);
@@ -113,6 +117,8 @@ pub enum Msg {
 /// The order to switch to another generation.
 pub struct Switch {
     pub generation: Fingerprint,
+    /// What the rules of the generation do to a request they match.
+    pub mode: bundle::Mode,
     pub kernel: tukuyomi_kernel::Config,
     /// How the switch ended. It is given once, when the kernel that was stopped is gone.
     pub reply: oneshot::Sender<Switched>,
@@ -159,10 +165,12 @@ pub struct Limits {
 
 /// Starts the driver thread and returns at once, without waiting for the kernel to be ready. `Err` means only
 /// that the thread could not be created. The kernel is created on the thread; a configuration it refuses ends
-/// the driver with `End::Fatal`. `generation` names the rules that `cfg` is for.
+/// the driver with `End::Fatal`. `generation` names the rules that `cfg` is for, and `mode` is what they do to a
+/// request they match.
 pub fn start(
     cfg: tukuyomi_kernel::Config,
     generation: Fingerprint,
+    mode: bundle::Mode,
     limits: Limits,
     log: Log,
 ) -> Result<Driver, &'static str> {
@@ -183,7 +191,7 @@ pub fn start(
                     ready: ready_tx,
                     failed: failed_tx,
                 };
-                let slot = Slot::new(generation, kernel);
+                let slot = Slot::new(generation, mode, kernel);
                 Core::new(slot, rx, signals, log, limits, tick, take).drive(end_tx);
             }
             Err(refused) => {
@@ -424,6 +432,9 @@ impl<K: Kernel> Core<K> {
         if let Some(line) = self.active.note_incarnation() {
             self.log.line(&line);
         }
+        if let Some(line) = self.active.note_turned() {
+            self.log.line(&line);
+        }
         self.advance()?;
         self.finish_if_due()
     }
@@ -476,6 +487,7 @@ impl<K: Kernel> Core<K> {
     fn begin_switch(&mut self, switch: Switch) {
         let Switch {
             generation,
+            mode,
             kernel,
             reply,
         } = switch;
@@ -486,7 +498,7 @@ impl<K: Kernel> Core<K> {
         match K::create(kernel) {
             Ok(kernel) => {
                 self.switching = Switching::Starting {
-                    next: Slot::new(generation, kernel),
+                    next: Slot::new(generation, mode, kernel),
                     ready_by: after(Instant::now(), self.limits.ready_wait),
                 };
                 self.reply = Some(reply);
@@ -551,14 +563,14 @@ impl<K: Kernel> Core<K> {
     /// HELLO of a new inspector, the verdicts of an old one.
     fn step_other(&mut self) -> Result<(), &'static str> {
         let until = after(Instant::now(), MIN_SLICE);
-        let line = match self.other() {
+        let lines = match self.other() {
             Some(other) => {
                 other.step(until)?;
-                other.note_incarnation()
+                [other.note_incarnation(), other.note_turned()]
             }
-            None => None,
+            None => [None, None],
         };
-        if let Some(line) = line {
+        for line in lines.into_iter().flatten() {
             self.log.line(&line);
         }
         Ok(())

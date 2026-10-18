@@ -168,10 +168,10 @@ func (l *link) sendWait(b []byte, final bool) bool {
 }
 
 // serve runs one session and returns the exit code.
-func serve(c conn, run uint64, inc uint32, helloFrame []byte, newTx func(string) types.Transaction, d *diag, closeDeadline time.Duration) int {
+func serve(c conn, run uint64, inc uint32, helloFrame []byte, newTx func(string) types.Transaction, detect bool, d *diag, closeDeadline time.Duration) int {
 	l := newLink(c)
 	go l.writer()
-	t := newTable(run, inc, newTx, l.send)
+	t := newTable(run, inc, newTx, detect, l.send)
 	drained := make(chan struct{})
 	var dupDrains uint64
 	var readerDone sync.WaitGroup

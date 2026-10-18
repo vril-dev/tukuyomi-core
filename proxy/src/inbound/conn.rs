@@ -4,7 +4,8 @@
 //! far then go back in front of the socket and hyper parses the request again; the service compares what hyper
 //! saw with what the head check saw and answers 400 on any difference. The body is read through hyper into a
 //! budgeted buffer, a gzip body is decoded by `represent::gunzip` (exactly one member, at most `max_body` bytes
-//! of output), the request is handed to the inspection driver as a ticket, and only an `Allow` is forwarded.
+//! of output), the request is handed to the inspection driver as a ticket, and only an `Allow` or a `Detected` is
+//! forwarded.
 //! What is inspected and what is forwarded is the same request, in the form that `represent` builds it: the
 //! decoded body, without its `Content-Encoding`, with its decoded length.
 //!
@@ -252,14 +253,8 @@ impl Conn {
     /// The service: one request per connection.
     async fn handle(&self, req: Request<Incoming>) -> Result<Response<Out>, Abort> {
         let (reply, response) = match self.exchange(req).await {
-            Ok(response) => {
-                let reply = Reply {
-                    status: response.status().as_u16(),
-                    class: Class::Forwarded,
-                    reason: "forwarded",
-                    rule: None,
-                    internal: false,
-                };
+            Ok((response, detected)) => {
+                let reply = Reply::forwarded(response.status().as_u16(), detected);
                 (reply, Ok(response.map(|body| Out::Origin(Box::pin(body)))))
             }
             Err(Stop::Reply(reply)) => (reply, Ok(answer(reply.status))),
@@ -275,8 +270,11 @@ impl Conn {
         response
     }
 
-    /// Everything up to the response of the upstream.
-    async fn exchange(&self, req: Request<Incoming>) -> Result<Response<OriginBody>, Stop> {
+    /// Everything up to the response of the upstream, and the rule of a detection if there was one.
+    async fn exchange(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<(Response<OriginBody>, Option<i64>), Stop> {
         let (parts, body) = req.into_parts();
         if !same_head(&self.head, &parts) {
             return Err(Reply::rejected(400, "the two parsers disagree").into());
@@ -298,7 +296,7 @@ impl Conn {
             return Err(Reject::UnsupportedMedia.into());
         }
         let body = Arc::new(BodyHold::new(bytes, budget));
-        self.ask(headers, field_bytes, &body).await?;
+        let detected = self.ask(headers, field_bytes, &body).await?;
         if Instant::now() >= self.times.request_by {
             return Err(Reply::failed(503, "request time used up").into());
         }
@@ -311,6 +309,7 @@ impl Conn {
         };
         origin::forward(forward, &self.ctx, self.times.request_by)
             .await
+            .map(|response| (response, detected))
             .map_err(|e| {
                 Reply::failed(
                     502,
@@ -419,14 +418,14 @@ impl Conn {
         }
     }
 
-    /// Hands the request to the driver and waits for the verdict. `Ok` is an `Allow`; everything else is the
-    /// answer to give.
+    /// Hands the request to the driver and waits for the verdict. `Ok` is an `Allow` (`None`) or a `Detected`
+    /// (the rule); everything else is the answer to give.
     async fn ask(
         &self,
         headers: Vec<(Bytes, Bytes)>,
         field_bytes: usize,
         body: &Arc<BodyHold>,
-    ) -> Result<(), Stop> {
+    ) -> Result<Option<i64>, Stop> {
         let permit = self
             .ctx
             .inspect
@@ -470,7 +469,8 @@ impl Conn {
             Ok(Ok(outcome)) => outcome,
         };
         match decide(outcome) {
-            Decision::Allow => Ok(()),
+            Decision::Allow => Ok(None),
+            Decision::Detected { rule } => Ok(Some(rule)),
             Decision::Answer(reply) => Err(reply.into()),
         }
     }

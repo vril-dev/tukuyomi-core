@@ -5,9 +5,21 @@ fn the_answer_table() {
     use Reason::*;
     let answer = |outcome| match decide(outcome) {
         Decision::Answer(reply) => reply,
-        Decision::Allow => panic!("not an answer"),
+        Decision::Allow | Decision::Detected { .. } => panic!("not an answer"),
     };
     assert_eq!(decide(Outcome::Verdict(Verdict::Allow)), Decision::Allow);
+    // A detection goes on like an allow, whatever status the rule would have blocked with.
+    for status in [0, 403, 600] {
+        let detected = Outcome::Verdict(Verdict::Detected {
+            rule_id: 9201,
+            status,
+        });
+        assert_eq!(
+            decide(detected),
+            Decision::Detected { rule: 9201 },
+            "{status}"
+        );
+    }
     let block = |status| {
         Outcome::Verdict(Verdict::Block {
             phase: 1,
@@ -97,5 +109,17 @@ fn the_record_has_numbers_and_fixed_texts_only() {
     assert_eq!(
         record(8, &Reply::NONE, Duration::from_micros(1999)),
         "conn 8: closed 0 no answer rule - 1 ms"
+    );
+    assert_eq!(
+        record(9, &Reply::forwarded(200, None), Duration::from_millis(3)),
+        "conn 9: forwarded 200 forwarded rule - 3 ms"
+    );
+    assert_eq!(
+        record(
+            10,
+            &Reply::forwarded(200, Some(9201)),
+            Duration::from_millis(3)
+        ),
+        "conn 10: forwarded 200 detected by a rule rule 9201 3 ms"
     );
 }

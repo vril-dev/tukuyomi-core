@@ -83,6 +83,21 @@ impl Reply {
         }
     }
 
+    /// The response of the upstream was sent. `detected` is the rule that matched while the rules only detect.
+    pub(super) fn forwarded(status: u16, detected: Option<i64>) -> Reply {
+        Reply {
+            status,
+            class: Class::Forwarded,
+            reason: if detected.is_some() {
+                "detected by a rule"
+            } else {
+                "forwarded"
+            },
+            rule: detected,
+            internal: false,
+        }
+    }
+
     pub(super) fn internal(status: u16, reason: &'static str) -> Reply {
         Reply {
             internal: true,
@@ -184,13 +199,18 @@ pub(super) fn record(id: u64, reply: &Reply, elapsed: Duration) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Decision {
     Allow,
+    /// Goes on to the upstream like `Allow`; the rule is for the record. The status of the verdict is not used.
+    Detected {
+        rule: i64,
+    },
     Answer(Reply),
 }
 
-/// The answer table. Only `Allow` goes on to the upstream.
+/// The answer table. Only `Allow` and `Detected` go on to the upstream.
 pub(super) fn decide(outcome: Outcome) -> Decision {
     match outcome {
         Outcome::Verdict(Verdict::Allow) => Decision::Allow,
+        Outcome::Verdict(Verdict::Detected { rule_id, .. }) => Decision::Detected { rule: rule_id },
         Outcome::Verdict(Verdict::Block {
             rule_id, status, ..
         }) => Decision::Answer(match status {

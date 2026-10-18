@@ -5,13 +5,13 @@
 //! uses (`hold`) for as long as it uses it. The commands change the store in this order: `stage` writes a bundle
 //! where the inspector can read it and takes the lock of the store, the caller tries the bundle, then `commit`
 //! makes it a generation or `discard` throws it away, and either gives the lock back. `activate` chooses a
-//! generation, `remove` deletes one that is neither chosen nor held, `list` and `verify` only read.
+//! generation, `remove` deletes one that is neither chosen nor held, `list`, `verify` and `mode` only read.
 
 use std::any::Any;
 use std::path::PathBuf;
 
 use crate::config::StoreConfig;
-use crate::rules::bundle::{Bundle, Fingerprint};
+use crate::rules::bundle::{Bundle, Fingerprint, Mode};
 use crate::rules::file_store::FileStore;
 
 /// Why the rules store refused: a fixed English sentence, never a path or a value read from the store.
@@ -80,6 +80,9 @@ pub trait RuleStore {
     fn list(&self) -> Result<Vec<Generation>, StoreError>;
     /// Checks that the manifest of a generation is as its name says and that every file is as the manifest says.
     fn verify(&self, generation: Fingerprint) -> Result<(), StoreError>;
+    /// The mode of a generation, from its manifest, which is read and checked as `verify` checks it. The files are
+    /// not read.
+    fn mode(&self, generation: Fingerprint) -> Result<Mode, StoreError>;
     /// Marks the generation as used by a running proxy until the `Hold` is dropped, without waiting. A generation
     /// that is being removed is refused. The generation itself is not looked at: the caller asks `generation_dir`
     /// after the hold is taken, which is how it learns that a removal has finished.
