@@ -25,9 +25,6 @@ use tukuyomi_kernel::{Reason, Refused, ReqId, Request, Shutdown, Status, Verdict
 use crate::inspect::driver::{InspectReq, Kernel, Outcome, Ticket};
 use crate::rules::bundle::{Fingerprint, Mode};
 
-/// The protocol of every request that is inspected.
-const PROTO: &[u8] = b"HTTP/1.1";
-
 /// A submitted ticket that waits for its result.
 pub(super) struct Pending {
     pub(super) ticket: Ticket,
@@ -110,7 +107,7 @@ pub(super) fn submit(kernel: &mut impl Kernel, req: &InspectReq) -> Result<ReqId
         server_port: req.server.port(),
         method: &req.method,
         uri: &req.uri,
-        proto: PROTO,
+        proto: req.proto,
         headers: &headers,
         body: &req.body.bytes,
     })

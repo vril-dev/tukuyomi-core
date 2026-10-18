@@ -1,4 +1,4 @@
-//! What a connection answers: its reply and class, the answer table, the empty response and the record line.
+//! What a request is answered with: its reply and class, the answer table, the empty response and the record line.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -263,12 +263,19 @@ pub(super) fn answer(status: u16) -> Response<Out> {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response = Response::new(Out::Empty);
     *response.status_mut() = status;
-    let headers = response.headers_mut();
     if status != StatusCode::NO_CONTENT && status != StatusCode::NOT_MODIFIED {
-        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
     }
-    headers.insert(CONNECTION, HeaderValue::from_static("close"));
     response
+}
+
+/// Makes the response the last one of its connection: hyper closes the connection after it.
+pub(super) fn close_after<B>(response: &mut Response<B>) {
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
 }
 
 #[cfg(test)]

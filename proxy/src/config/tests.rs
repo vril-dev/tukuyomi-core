@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","upstream":"127.0.0.1:9000","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":30000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
+const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","upstream":"127.0.0.1:9000","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":30000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
 
 /// Marks a value that must never appear in an error sentence.
 const MARK: &str = "qqmark";
@@ -66,6 +66,12 @@ fn the_base_document_loads_with_every_value_converted() {
     assert_eq!(proxy.max_buffered_bytes, 8 << 20);
     assert_eq!(proxy.drive_slice, Duration::from_millis(50));
     assert_eq!(proxy.stop_wait, Duration::from_millis(10_000));
+    assert_eq!(proxy.keepalive_timeout, Duration::from_millis(75_000));
+    assert_eq!(proxy.keepalive_requests, 1000);
+    assert_eq!(proxy.keepalive_time, Duration::from_millis(60_000));
+    assert_eq!(proxy.lingering_time, Duration::from_millis(30_000));
+    assert_eq!(proxy.lingering_timeout, Duration::from_millis(5_000));
+    assert_eq!(proxy.lingering_bytes, 262_144);
     assert_eq!(kernel.inspector, PathBuf::from("/opt/tukuyomi/inspector"));
     // The directory and the fingerprint of a generation are not in the file: the check ran with placeholders.
     assert_eq!(
@@ -241,6 +247,8 @@ fn counts_and_sizes_are_inside_their_bounds() {
     for (key, low, high) in [
         ("max_head_bytes", 1024, 32768),
         ("upstream_max_headers", 1, 1024),
+        ("keepalive_requests", 1, 1_000_000),
+        ("lingering_bytes", 1, 4 << 20),
     ] {
         pass(&[p(key, low)]);
         pass(&[p(key, high)]);
@@ -302,9 +310,11 @@ fn every_proxy_time_is_between_1_ms_and_3600_s() {
         "upstream_header_ms",
         "request_total_ms",
         "response_idle_ms",
-        "conn_total_ms",
         "stop_inspect_ms",
         "stop_wait_ms",
+        "keepalive_time_ms",
+        "lingering_time_ms",
+        "lingering_timeout_ms",
     ] {
         let sentence = format!("{key} is out of range");
         refuse(&[p(key, 0)], &sentence);
@@ -315,9 +325,32 @@ fn every_proxy_time_is_between_1_ms_and_3600_s() {
         p("ready_wait_ms", 3_600_000),
         p("inspect_wait_ms", 3_600_000),
         p("request_total_ms", 3_600_000),
-        p("conn_total_ms", 3_600_000),
+        p("conn_total_ms", 7_200_000),
         p("stop_wait_ms", 3_600_000),
+        p("keepalive_time_ms", 3_600_000),
+        p("lingering_time_ms", 3_600_000),
     ]);
+}
+
+#[test]
+fn the_connection_time_is_between_1_ms_and_24_h() {
+    let sentence = "conn_total_ms is out of range";
+    refuse(&[p("conn_total_ms", 0)], sentence);
+    pass(&[p("conn_total_ms", 86_400_000)]);
+    refuse(&[p("conn_total_ms", 86_400_001)], sentence);
+}
+
+#[test]
+fn the_keep_alive_wait_is_between_0_and_3600_s_and_0_means_no_keep_alive() {
+    let sentence = "keepalive_timeout_ms is out of range";
+    pass(&[p("keepalive_timeout_ms", 0)]);
+    pass(&[
+        p("keepalive_timeout_ms", 3_600_000),
+        p("conn_total_ms", 3_600_000),
+    ]);
+    refuse(&[p("keepalive_timeout_ms", 3_600_001)], sentence);
+    let loaded = parse(&doc(&[p("keepalive_timeout_ms", 0)])).unwrap();
+    assert_eq!(loaded.proxy.keepalive_timeout, Duration::ZERO);
 }
 
 #[test]
@@ -372,11 +405,41 @@ fn each_relation_between_the_two_objects_has_a_boundary() {
         &[p("request_total_ms", 120_001)],
         "request_total_ms is above conn_total_ms",
     );
-    pass(&[p("request_total_ms", 120_000)]);
+    pass(&[p("request_total_ms", 119_999), p("keepalive_time_ms", 1)]);
     refuse(
         &[p("response_idle_ms", 120_001)],
         "response_idle_ms is above conn_total_ms",
     );
+    // keepalive_timeout <= conn_total (120000 ms)
+    refuse(
+        &[p("keepalive_timeout_ms", 120_001)],
+        "keepalive_timeout_ms is above conn_total_ms",
+    );
+    pass(&[p("keepalive_timeout_ms", 120_000)]);
+    // keepalive_time + request_total <= conn_total (60000 + 60000 = 120000 ms): a request that starts before
+    // keepalive_time is over before the connection time is.
+    let sum = "keepalive_time_ms plus request_total_ms is above conn_total_ms";
+    refuse(&[p("keepalive_time_ms", 60_001)], sum);
+    refuse(&[p("request_total_ms", 60_001)], sum);
+    pass(&[p("keepalive_time_ms", 60_000)]);
+    // One hour of keep-alive time needs the hour and the request time.
+    pass(&[
+        p("keepalive_time_ms", 3_600_000),
+        p("conn_total_ms", 3_660_000),
+    ]);
+    refuse(
+        &[
+            p("keepalive_time_ms", 3_600_000),
+            p("conn_total_ms", 3_659_999),
+        ],
+        sum,
+    );
+    // lingering_timeout <= lingering_time (30000 ms)
+    refuse(
+        &[p("lingering_timeout_ms", 30_001)],
+        "lingering_timeout_ms is above lingering_time_ms",
+    );
+    pass(&[p("lingering_timeout_ms", 30_000)]);
     // stop_inspect < stop_wait, stop_wait > stop_inspect + kill_grace (5000 + 1000 ms)
     let below = "stop_inspect_ms is not below stop_wait_ms";
     let plus = "stop_wait_ms is not above stop_inspect_ms plus kill_grace";

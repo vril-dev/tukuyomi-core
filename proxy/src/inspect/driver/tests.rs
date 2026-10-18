@@ -84,6 +84,7 @@ impl World {
                 Bytes::from_static(b"example.test"),
             )],
             body: Arc::clone(&body),
+            proto: b"HTTP/1.1",
         };
         Made {
             ticket: Ticket { req, reply, hold },
@@ -379,6 +380,34 @@ fn the_kernel_gets_the_bytes_of_the_ticket() {
             }]
         );
     }
+}
+
+#[test]
+fn the_kernel_gets_the_protocol_of_the_request() {
+    let world = World::new();
+    let mut made = world.ticket(b"/", 0);
+    made.ticket.req.proto = b"HTTP/1.0";
+    let mut kernel = Fake::new();
+    assert_eq!(submit(&mut kernel, &made.ticket.req), Ok(0));
+    assert_eq!(kernel.seen[0].proto, b"HTTP/1.0");
+}
+
+#[test]
+fn a_closed_handle_gives_no_sender_and_the_driver_sees_the_last_sender_go() {
+    let (tx, rx) = sync_channel::<Msg>(1);
+    let ingress = Ingress::new(tx);
+    let watcher = ingress.watch();
+    let one = ingress.sender().expect("a sender before the close");
+    assert!(!ingress.is_closed() && !*watcher.borrow());
+    ingress.close();
+    assert!(ingress.sender().is_none());
+    assert!(ingress.is_closed() && *watcher.borrow());
+    // A request that started before the close still holds its sender; the driver is told when it is dropped.
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    drop(one);
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
+    // Closing again does nothing more.
+    ingress.close();
 }
 
 // ---- cancel and delivery ----

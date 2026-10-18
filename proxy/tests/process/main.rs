@@ -5,7 +5,8 @@
 //! 403; rule 9202: the urlencoded argument `probe=block`, phase 2, status 403; rule 9203: the top-level JSON
 //! member `probe` equal to `block`, phase 2, status 403). The tests also run a small upstream of their own on a
 //! loopback port, which records every connection and the bytes it received, and they talk to the proxy with a
-//! raw TCP client: the exact bytes out, everything read back until the proxy closes.
+//! raw TCP client: the exact bytes out, everything read back until the proxy closes. The keep-alive tests keep a
+//! connection open instead and read each response by its length.
 //!
 //! These tests need the environment variables `TUKUYOMI_TEST_INSPECTOR` (the built inspector),
 //! `TUKUYOMI_TEST_RULES` (the directory of the rule bundle), `TUKUYOMI_TEST_RULES_SHA256` (the SHA-256 of the
@@ -33,6 +34,7 @@ mod bodies;
 mod deadlines;
 mod forwarding;
 mod inspector;
+mod keepalive;
 mod refusals;
 mod rules;
 mod stopping;

@@ -604,6 +604,8 @@ pub(crate) struct Knobs {
     pub(crate) tick_ms: u64,
     pub(crate) max_conns: usize,
     pub(crate) head_read_ms: u64,
+    /// How long a connection waits for its next request after a response; 0: it closes after every response.
+    pub(crate) keepalive_timeout_ms: u64,
     pub(crate) restarts: u32,
     pub(crate) stop_inspect_ms: u64,
     pub(crate) stop_wait_ms: u64,
@@ -617,6 +619,8 @@ impl Knobs {
             tick_ms: 20,
             max_conns: 64,
             head_read_ms: 10_000,
+            // The tests that read until the proxy closes need a connection that closes after its response.
+            keepalive_timeout_ms: 0,
             restarts: 0,
             stop_inspect_ms: 10_000,
             stop_wait_ms: 20_000,
@@ -661,6 +665,13 @@ fn config_json(k: &Knobs, listen: SocketAddr, upstream: SocketAddr, root: &Path)
             "conn_total_ms": 120_000,
             "stop_inspect_ms": k.stop_inspect_ms,
             "stop_wait_ms": k.stop_wait_ms,
+            "keepalive_timeout_ms": k.keepalive_timeout_ms,
+            "keepalive_requests": 1000,
+            // A request that starts before this ends before conn_total_ms (this plus request_total_ms).
+            "keepalive_time_ms": 60_000,
+            "lingering_time_ms": 30_000,
+            "lingering_timeout_ms": 5_000,
+            "lingering_bytes": 262_144,
         },
         "kernel": {
             "inspector": var("TUKUYOMI_TEST_INSPECTOR"),

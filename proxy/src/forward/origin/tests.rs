@@ -11,6 +11,7 @@ use tokio::time::{sleep, timeout};
 
 use super::*;
 use crate::config::ProxyConfig;
+use crate::inspect::driver::Ingress;
 use crate::log::start_logger;
 use crate::rules::routes::{Routes, SharedRoutes};
 
@@ -44,15 +45,24 @@ fn config(upstream: SocketAddr) -> ProxyConfig {
         conn_total: secs(20),
         stop_inspect: secs(1),
         stop_wait: secs(5),
+        keepalive_timeout: secs(75),
+        keepalive_requests: 1000,
+        keepalive_time: secs(10),
+        lingering_time: secs(10),
+        lingering_timeout: secs(5),
+        lingering_bytes: 262_144,
     }
 }
 
 fn ctx(cfg: ProxyConfig) -> Ctx {
+    // The forwarding never reaches the driver: nobody receives on this channel.
+    let (to_driver, _) = std::sync::mpsc::sync_channel(1);
     Ctx {
         budget: Arc::new(Semaphore::new(cfg.max_buffered_bytes)),
         inspect: Arc::new(Semaphore::new(1)),
         routes: SharedRoutes::new(Routes::default()),
         log: start_logger().unwrap(),
+        ingress: Arc::new(Ingress::new(to_driver)),
         cfg,
     }
 }

@@ -206,6 +206,22 @@ fn lift_removes_the_cap_and_the_counting_goes_on() {
 }
 
 #[test]
+fn limit_sets_a_cap_that_counts_from_the_bytes_read_so_far() {
+    run(async {
+        let mock = Mock::default();
+        mock.feed(b"0123456789");
+        let (mut io, gauge) = guarded(&mock, b"", LONG, LONG, u64::MAX);
+        assert_eq!(read_some(&mut io, 3).await.unwrap(), b"012");
+        gauge.limit(4);
+        assert_eq!(read_some(&mut io, 16).await.unwrap(), b"3456");
+        assert_eq!((gauge.read(), gauge.over()), (7, false));
+        // The next byte is over the cap, and the end of the stream is not.
+        assert!(read_some(&mut io, 16).await.is_err());
+        assert_eq!((gauge.read(), gauge.over()), (7, true));
+    });
+}
+
+#[test]
 fn a_read_without_progress_times_out_and_a_slow_one_that_moves_does_not() {
     run(async {
         let idle = Duration::from_millis(400);

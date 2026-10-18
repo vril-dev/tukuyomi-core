@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::io;
 use std::time::Duration;
 
 use http_body_util::Empty;
@@ -7,7 +8,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::timeout;
 
@@ -55,7 +56,7 @@ fn a_plain_head_passes_and_gives_its_parts() {
     raw.extend_from_slice(b"a=b");
     let head = ok(&raw);
     assert_eq!(head.len, head_len);
-    assert_eq!(&head.buf[..], &raw[..]);
+    assert_eq!(&head.buf[..], &raw[..head_len]);
     assert_eq!(head.method(), b"POST");
     assert_eq!(head.target(), b"/a?b=1");
     let fields: Vec<(&[u8], &[u8])> = head.fields().collect();
@@ -117,15 +118,19 @@ fn the_target_is_origin_form_of_1_to_4096_bytes_that_hyper_takes_without_a_fragm
 }
 
 #[test]
-fn only_http_1_1_passes() {
-    assert_eq!(
-        refused(&with_request_line("GET / HTTP/1.0")),
-        Reject::VersionNotSupported
-    );
+fn http_1_0_and_1_1_pass_and_a_1_0_request_has_no_transfer_encoding() {
+    let old = ok(&with_request_line("GET / HTTP/1.0"));
+    assert!(old.http10());
+    assert_eq!(old.proto(), b"HTTP/1.0");
+    let new = ok(&with_request_line("GET / HTTP/1.1"));
+    assert!(!new.http10());
+    assert_eq!(new.proto(), b"HTTP/1.1");
     assert_eq!(
         refused(&with_request_line("GET / HTTP/1.2")),
         Reject::BadRequest
     );
+    let raw = b"POST / HTTP/1.0\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+    assert_eq!(refused(raw), Reject::BadRequest);
 }
 
 fn fields_numbered(count: usize) -> Vec<u8> {
@@ -304,10 +309,16 @@ fn expect_is_absent_or_exactly_100_continue() {
 
 #[test]
 fn connection_is_a_list_of_tokens_that_does_not_name_the_fixed_fields() {
-    ok(&head_with(&[
-        "Connection: close",
-        "Connection: Upgrade,  X-Hop",
-    ]));
+    assert!(
+        ok(&head_with(&[
+            "Connection: close",
+            "Connection: Upgrade,  X-Hop",
+        ]))
+        .close()
+    );
+    assert!(ok(&head_with(&["Connection: X-Hop,  CLOSE "])).close());
+    assert!(!ok(&head_with(&["Connection: keep-alive, closed"])).close());
+    assert!(!ok(&head_with(&[])).close());
     for line in [
         "Connection: close, HOST",
         "Connection: content-length",
@@ -444,11 +455,7 @@ fn a_body_needs_exactly_one_inspectable_content_type() {
 
 #[test]
 fn the_first_broken_rule_decides() {
-    // The version before the fields, a size before the Host rule.
-    assert_eq!(
-        refused(b"GET / HTTP/1.0\r\nX-A: v\r\n\r\n"),
-        Reject::VersionNotSupported
-    );
+    // A size before the Host rule.
     let big = format!("GET / HTTP/1.1\r\nX-A: {}\r\n\r\n", "x".repeat(4097));
     assert_eq!(refused(big.as_bytes()), Reject::FieldsTooLarge);
     // Content-Length over the limit is decided before Expect, Connection and the body type.
@@ -473,7 +480,6 @@ fn every_refusal_has_the_fixed_answer_of_its_status() {
         (Reject::FieldsTooLarge, 431),
         (Reject::ContentTooLarge, 413),
         (Reject::ExpectationFailed, 417),
-        (Reject::VersionNotSupported, 505),
         (Reject::UnsupportedMedia, 415),
         (Reject::Timeout, 408),
     ] {
@@ -496,15 +502,6 @@ fn runtime() -> Runtime {
     Builder::new_current_thread().enable_all().build().unwrap()
 }
 
-async fn pair() -> (TcpStream, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap())
-        .await
-        .unwrap();
-    let (server, _) = listener.accept().await.unwrap();
-    (server, client)
-}
-
 async fn put(sock: &TcpStream, mut bytes: &[u8]) {
     while !bytes.is_empty() {
         sock.writable().await.unwrap();
@@ -514,90 +511,6 @@ async fn put(sock: &TcpStream, mut bytes: &[u8]) {
             Err(e) => panic!("write failed: {e}"),
         }
     }
-}
-
-fn soon(ms: u64) -> Instant {
-    Instant::now() + Duration::from_millis(ms)
-}
-
-/// A head of exactly `size` bytes: a request line, a Host and a padding field.
-fn head_of_size(size: usize) -> Vec<u8> {
-    let fixed = "GET / HTTP/1.1\r\nHost: a\r\nX-Pad: \r\n\r\n".len();
-    let raw = format!(
-        "GET / HTTP/1.1\r\nHost: a\r\nX-Pad: {}\r\n\r\n",
-        "p".repeat(size - fixed)
-    );
-    assert_eq!(raw.len(), size);
-    raw.into_bytes()
-}
-
-#[test]
-fn read_returns_the_head_and_what_came_after_it() {
-    runtime().block_on(async {
-        let (mut server, client) = pair().await;
-        let raw = head_with(&["Content-Length: 4", FORM]);
-        let writer = tokio::spawn(async move {
-            // The head arrives in pieces; the body starts in the same write as the end of the head.
-            put(&client, &raw[..10]).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            put(&client, &raw[10..raw.len() - 2]).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            put(&client, b"\r\na=b&").await;
-            client
-        });
-        let (head, rest) = read(&mut server, &LIM, soon(10_000)).await.unwrap();
-        assert_eq!(head.content_length(), Some(4));
-        assert_eq!(&rest[..], b"a=b&");
-        assert_eq!(&head.buf[head.len..], b"a=b&");
-        drop(writer.await.unwrap());
-    });
-}
-
-#[test]
-fn read_refuses_a_head_that_does_not_fit_the_buffer() {
-    let small = Limits {
-        max_head_bytes: 1024,
-        max_body: 1 << 20,
-    };
-    runtime().block_on(async {
-        // A head of exactly the buffer size is read; one byte more is not.
-        let (mut server, client) = pair().await;
-        put(&client, &head_of_size(1024)).await;
-        let (head, rest) = read(&mut server, &small, soon(10_000)).await.unwrap();
-        assert_eq!((head.len, rest.len()), (1024, 0));
-        let (mut server, client) = pair().await;
-        put(&client, &head_of_size(1025)).await;
-        assert_eq!(
-            read(&mut server, &small, soon(10_000)).await.unwrap_err(),
-            Reject::FieldsTooLarge
-        );
-        // No line end in a full buffer: the request line is the part that is too long.
-        let (mut server, client) = pair().await;
-        put(&client, format!("GET /{}", "a".repeat(2000)).as_bytes()).await;
-        assert_eq!(
-            read(&mut server, &small, soon(10_000)).await.unwrap_err(),
-            Reject::UriTooLong
-        );
-        drop(client);
-    });
-}
-
-#[test]
-fn read_ends_with_timeout_or_closed_when_the_head_does_not_come() {
-    runtime().block_on(async {
-        let (mut server, client) = pair().await;
-        assert_eq!(
-            read(&mut server, &LIM, soon(150)).await.unwrap_err(),
-            Reject::Timeout
-        );
-        // The peer goes away with half a head.
-        put(&client, b"GET / HTTP/1.1\r\nHo").await;
-        drop(client);
-        assert_eq!(
-            read(&mut server, &LIM, soon(10_000)).await.unwrap_err(),
-            Reject::Closed
-        );
-    });
 }
 
 /// Everything that arrives on `sock` until the peer closes it.

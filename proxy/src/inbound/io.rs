@@ -17,7 +17,7 @@ use tokio::time::{Instant, Sleep, sleep_until};
 struct Shared {
     /// Bytes read from the inner stream. Only the `Guarded` writes it.
     read: AtomicU64,
-    cap: u64,
+    cap: AtomicU64,
     lifted: AtomicBool,
     over: AtomicBool,
 }
@@ -28,7 +28,9 @@ impl Shared {
         if self.lifted.load(Ordering::Acquire) {
             u64::MAX
         } else {
-            self.cap.saturating_sub(self.read.load(Ordering::Relaxed))
+            self.cap
+                .load(Ordering::Acquire)
+                .saturating_sub(self.read.load(Ordering::Relaxed))
         }
     }
 
@@ -134,7 +136,7 @@ impl<T> Guarded<T> {
     ) -> (Guarded<T>, Gauge) {
         let shared = Arc::new(Shared {
             read: AtomicU64::new(0),
-            cap: read_cap,
+            cap: AtomicU64::new(read_cap),
             lifted: AtomicBool::new(false),
             over: AtomicBool::new(false),
         });
@@ -149,6 +151,13 @@ impl<T> Guarded<T> {
             shared,
         };
         (guarded, gauge)
+    }
+}
+
+impl<T> Guarded<T> {
+    /// The inner stream, for what is done to it after the connection that used this wrapper has ended.
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.inner
     }
 }
 
@@ -253,6 +262,17 @@ impl Gauge {
     /// No cap from now on; the counting goes on. A read that was already refused stays refused.
     pub fn lift(&self) {
         self.shared.lifted.store(true, Ordering::Release);
+    }
+
+    /// A new cap: at most `more` bytes may be read from the inner stream after the ones counted so far. The bytes
+    /// counted stay counted. A read that was already refused stays refused.
+    pub fn limit(&self, more: u64) {
+        let total = self
+            .shared
+            .read
+            .load(Ordering::Relaxed)
+            .saturating_add(more);
+        self.shared.cap.store(total, Ordering::Release);
     }
 }
 

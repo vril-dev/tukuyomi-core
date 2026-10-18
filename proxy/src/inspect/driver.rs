@@ -39,13 +39,13 @@
 
 use std::mem;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tukuyomi_kernel::{
     Failure, Phase, Refused, ReqId, Request, Shutdown, Status, Supervisor, Verdict,
 };
@@ -58,7 +58,7 @@ use crate::rules::routes::{Routes, SharedRoutes};
 /// The shortest slice of one kernel step. A shorter one would end a step before it could read anything.
 const MIN_SLICE: Duration = Duration::from_millis(1);
 
-/// One request for inspection, as a connection hands it over. The protocol version is always HTTP/1.1.
+/// One request for inspection, as a connection hands it over.
 pub struct InspectReq {
     pub client: SocketAddr,
     pub server: SocketAddr,
@@ -66,6 +66,8 @@ pub struct InspectReq {
     pub uri: Bytes,
     pub headers: Vec<(Bytes, Bytes)>,
     pub body: Arc<BodyHold>,
+    /// The protocol of the request: `HTTP/1.0` or `HTTP/1.1`.
+    pub proto: &'static [u8],
 }
 
 /// The decoded body, shared by the connection and the ticket. Its share of the byte budget returns when the last
@@ -152,6 +154,72 @@ pub enum End {
         retired_clean: bool,
     },
     Fatal(&'static str),
+}
+
+/// The way from the connections to the driver. A connection takes a sender when a request starts and drops it as
+/// soon as the ticket is sent (or when the request needs none), so a connection that waits for its next request
+/// holds none, and the driver sees the last sender go when the last request that was under way is done. The main
+/// thread closes the handle when the stop begins: a request that starts after that gets no sender, and the
+/// connections that wait for a request are told. The accept side tells them too (`drain`) when a connection has
+/// to wait for a permit, so that the permits of connections that do nothing come back.
+pub struct Ingress {
+    sender: Mutex<Option<SyncSender<Msg>>>,
+    closed: watch::Sender<bool>,
+    /// Counts the calls of `drain`.
+    drained: watch::Sender<u64>,
+}
+
+impl Ingress {
+    pub fn new(sender: SyncSender<Msg>) -> Ingress {
+        Ingress {
+            sender: Mutex::new(Some(sender)),
+            closed: watch::channel(false).0,
+            drained: watch::channel(0).0,
+        }
+    }
+
+    /// A sender for one request; `None` once the handle is closed.
+    pub fn sender(&self) -> Option<SyncSender<Msg>> {
+        self.sender
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Closes the handle: no request gets a sender any more, and the receivers of `watch` see `true`. Closing it
+    /// again does nothing more.
+    pub fn close(&self) {
+        drop(
+            self.sender
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+        self.closed.send_replace(true);
+    }
+
+    /// The handle is closed.
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
+    /// A receiver that is told when the handle is closed. One that is made after the close sees no change; it
+    /// asks `is_closed` first.
+    pub fn watch(&self) -> watch::Receiver<bool> {
+        self.closed.subscribe()
+    }
+
+    /// Tells the connections that wait for a request to close. A connection that is serving a request is not
+    /// touched: each connection looks at its own state when it is told.
+    pub fn drain(&self) {
+        self.drained
+            .send_modify(|calls| *calls = calls.wrapping_add(1));
+    }
+
+    /// A receiver that sees a change at every `drain` after it was made.
+    pub fn drained(&self) -> watch::Receiver<u64> {
+        self.drained.subscribe()
+    }
 }
 
 /// The main thread's side of the driver.

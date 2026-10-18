@@ -1,20 +1,19 @@
-//! Reading and strictly checking the request head before hyper sees it.
+//! Strictly checking a request head before hyper sees it.
 //!
-//! The head is read into a buffer of fixed size and parsed with `httparse` (default settings). The end of the
-//! head is the end that `httparse` reports, not a search for a blank line. A head that parses is then held to
-//! the rules below, in this order, and the first rule that is broken decides the answer:
+//! The head is parsed with `httparse` (default settings). The end of the head is the end that `httparse`
+//! reports, not a search for a blank line. A head that parses is then held to the rules below, in this order, and
+//! the first rule that is broken decides the answer:
 //!
 //! 1. Every LF is preceded by CR and every CR is followed by LF; the head does not start with an empty line.
 //! 2. The method is 1 to 32 token bytes. The request target is origin-form: it starts with `/`, has 1 to 4096
 //!    bytes and no `#`, and none of its bytes is one that hyper's URI parser refuses in that place (path or
-//!    query), so hyper never answers for a head that passed. The version is `HTTP/1.1` (`HTTP/1.0` is answered
-//!    with 505).
+//!    query), so hyper never answers for a head that passed. The version is `HTTP/1.1` or `HTTP/1.0`.
 //! 3. At most 64 fields; a name has 1 to 256 bytes, a value (without the blanks around it) at most 4096, and the
 //!    names and values together at most 24 KiB. A value has no control byte except HTAB.
 //! 4. Exactly one non-empty `Host` without blank or control bytes.
 //! 5. `Transfer-Encoding` and `Content-Length` together are refused. `Transfer-Encoding` is one line that is
-//!    exactly `chunked`. `Content-Length` is one line of digits that fits in 64 bits and is not over the body
-//!    limit.
+//!    exactly `chunked`, and an `HTTP/1.0` request has none. `Content-Length` is one line of digits that fits in
+//!    64 bits and is not over the body limit.
 //! 6. `Expect` is absent or one line that is exactly `100-continue`.
 //! 7. `Connection` lines are comma separated lists of tokens (no empty element) that do not name `host`,
 //!    `content-length`, `content-type` or `content-encoding`.
@@ -28,12 +27,9 @@
 //!
 //! A refusal is a fixed answer with no body that closes the connection.
 
-use std::io;
 use std::ops::Range;
 
 use bytes::Bytes;
-use tokio::net::TcpStream;
-use tokio::time::{Instant, timeout_at};
 use tukuyomi_kernel::limits;
 
 /// The bounds the head rules need. Both come from the configuration.
@@ -53,7 +49,6 @@ pub enum Reject {
     FieldsTooLarge,
     ContentTooLarge,
     ExpectationFailed,
-    VersionNotSupported,
     UnsupportedMedia,
     Timeout,
     Closed,
@@ -68,7 +63,6 @@ impl Reject {
             Reject::FieldsTooLarge => Some(431),
             Reject::ContentTooLarge => Some(413),
             Reject::ExpectationFailed => Some(417),
-            Reject::VersionNotSupported => Some(505),
             Reject::UnsupportedMedia => Some(415),
             Reject::Timeout => Some(408),
             Reject::Closed => None,
@@ -90,9 +84,6 @@ impl Reject {
             Reject::ExpectationFailed => {
                 Some(b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             }
-            Reject::VersionNotSupported => {
-                Some(b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            }
             Reject::UnsupportedMedia => {
                 Some(b"HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             }
@@ -109,7 +100,6 @@ impl Reject {
             Reject::FieldsTooLarge => "request head too large",
             Reject::ContentTooLarge => "body over the limit",
             Reject::ExpectationFailed => "expectation not supported",
-            Reject::VersionNotSupported => "http version not supported",
             Reject::UnsupportedMedia => "body type not supported",
             Reject::Timeout => "head not received in time",
             Reject::Closed => "closed before the head was complete",
@@ -120,16 +110,18 @@ impl Reject {
 /// A head that passed every rule.
 #[derive(Clone, Debug)]
 pub struct Head {
-    /// Every byte that was read: the head, then whatever followed it in the same reads.
+    /// The bytes of the head, from the request line to the blank line.
     pub buf: Bytes,
-    /// Length of the head. The bytes from here on in `buf` belong to the body.
+    /// Length of the head, which is the length of `buf`.
     pub len: usize,
     method: Range<usize>,
     target: Range<usize>,
     /// Name and value of each field in the order received; the value is without the blanks around it.
     fields: Vec<(Range<usize>, Range<usize>)>,
+    http10: bool,
     content_length: Option<u64>,
     chunked: bool,
+    close: bool,
     gzip: bool,
     inspectable_type: bool,
 }
@@ -150,6 +142,20 @@ impl Head {
             .map(|(name, value)| (&self.buf[name.clone()], &self.buf[value.clone()]))
     }
 
+    /// The request is HTTP/1.0. The connection closes after its response.
+    pub fn http10(&self) -> bool {
+        self.http10
+    }
+
+    /// The protocol as the inspection is told: `HTTP/1.0` or `HTTP/1.1`.
+    pub fn proto(&self) -> &'static [u8] {
+        if self.http10 {
+            b"HTTP/1.0"
+        } else {
+            b"HTTP/1.1"
+        }
+    }
+
     /// The value of the one `Content-Length` line, if there is one.
     pub fn content_length(&self) -> Option<u64> {
         self.content_length
@@ -158,6 +164,11 @@ impl Head {
     /// The body is chunked (`Transfer-Encoding` is exactly `chunked`).
     pub fn chunked(&self) -> bool {
         self.chunked
+    }
+
+    /// A `Connection` line names `close`: the client asks for the connection to end after the response.
+    pub fn close(&self) -> bool {
+        self.close
     }
 
     /// The body is gzip coded (`Content-Encoding` is exactly `gzip`). The caller decodes it before the
@@ -173,59 +184,13 @@ impl Head {
     }
 }
 
-/// Parses the start of `buf`. `Ok(None)` means the head is not complete yet. This is pure: it reads nothing and
-/// keeps no state.
+/// Parses the start of `buf`; what follows the head is not looked at and not kept. `Ok(None)` means the head is
+/// not complete yet. This is pure: it reads nothing and keeps no state.
 pub fn parse(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
     Ok(scan(buf, lim)?.map(|head| Head {
-        buf: Bytes::copy_from_slice(buf),
+        buf: Bytes::copy_from_slice(&buf[..head.len]),
         ..head
     }))
-}
-
-/// Reads from `sock` until the head is complete. The head must end within `lim.max_head_bytes` bytes and before
-/// `by`. The second value is what was read after the head.
-pub async fn read(
-    sock: &mut TcpStream,
-    lim: &Limits,
-    by: Instant,
-) -> Result<(Head, Bytes), Reject> {
-    let mut buf = vec![0u8; lim.max_head_bytes];
-    let mut filled = 0;
-    loop {
-        if filled == buf.len() {
-            // Without a line end the request line is still incomplete.
-            return Err(if buf[..filled].contains(&b'\n') {
-                Reject::FieldsTooLarge
-            } else {
-                Reject::UriTooLong
-            });
-        }
-        match timeout_at(by, sock.readable()).await {
-            Err(_) => return Err(Reject::Timeout),
-            Ok(Err(_)) => return Err(Reject::Closed),
-            Ok(Ok(())) => {}
-        }
-        let got = match sock.try_read(&mut buf[filled..]) {
-            Ok(0) => return Err(Reject::Closed),
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(_) => return Err(Reject::Closed),
-        };
-        let before = filled;
-        filled += got;
-        // The head can only become complete by a line feed, so a read without one is not parsed again. A full
-        // buffer is parsed once more in any case.
-        let may_be_complete = filled == buf.len() || buf[before..filled].contains(&b'\n');
-        if may_be_complete && let Some(head) = scan(&buf[..filled], lim)? {
-            buf.truncate(filled);
-            let head = Head {
-                buf: Bytes::from(buf),
-                ..head
-            };
-            let rest = head.buf.slice(head.len..);
-            return Ok((head, rest));
-        }
-    }
 }
 
 /// Where `part` lies inside `whole`; `part` must be a sub-slice of `whole`.
@@ -384,11 +349,11 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
     if !origin_form(target) {
         return Err(Reject::BadRequest);
     }
-    match version {
-        1 => {}
-        0 => return Err(Reject::VersionNotSupported),
+    let http10 = match version {
+        1 => false,
+        0 => true,
         _ => return Err(Reject::BadRequest),
-    }
+    };
     let method_at = range_in(buf, method).ok_or(Reject::BadRequest)?;
     let target_at = range_in(buf, target).ok_or(Reject::BadRequest)?;
 
@@ -438,6 +403,9 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
     }
     // Rule 5.
     let transfer: Vec<&[u8]> = named(b"transfer-encoding").collect();
+    if http10 && !transfer.is_empty() {
+        return Err(Reject::BadRequest);
+    }
     let lengths: Vec<&[u8]> = named(b"content-length").collect();
     if !transfer.is_empty() && !lengths.is_empty() {
         return Err(Reject::BadRequest);
@@ -466,6 +434,11 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
     if !named(b"connection").all(connection_ok) {
         return Err(Reject::BadRequest);
     }
+    let close = named(b"connection").any(|value| {
+        value
+            .split(|&b| b == b',')
+            .any(|item| trim_ows(item).eq_ignore_ascii_case(b"close"))
+    });
     // Rule 8.
     let codings: Vec<&[u8]> = named(b"content-encoding").collect();
     let gzip = match codings.as_slice() {
@@ -489,8 +462,10 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         method: method_at,
         target: target_at,
         fields,
+        http10,
         content_length,
         chunked,
+        close,
         gzip,
         inspectable_type,
     }))

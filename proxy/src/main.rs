@@ -9,16 +9,19 @@
 //! thread, the wait for the kernel to be ready, bind, accept. The rules store is read here, and again when SIGUSR1
 //! comes. Handlers exist for SIGTERM, SIGINT, SIGHUP and SIGUSR1 only and are installed before the kernel starts
 //! its child process; SIGCHLD is never handled. The listener is bound only after the kernel is ready, and a
-//! connection permit is taken before every accept.
+//! connection permit is taken before every accept. When every permit is in use and a connection arrives, that
+//! connection is taken from the backlog to wait for a permit, and the connections that wait for their next
+//! request are told to close, so that the permits of idle connections come back.
 //!
 //! SIGUSR1 makes the proxy switch to the generation that the rules store chooses now (`rules::switch` reads the
 //! store, the driver starts the new inspector and moves the requests over when it is ready). It is a line in the
 //! records and nothing else before the listener is bound, while a switch is under way, and while the proxy stops.
 //!
 //! The first cause of a stop (a signal, or a failure of start-up or of the driver) fixes the time `t0`. The stop
-//! closes the listener, tells the driver to finish inspecting by `t0 + stop_inspect`, waits for the connections
-//! until `t0 + stop_wait` and aborts what is left, then waits for the driver's end until
-//! `t0 + stop_wait + kill_grace`. The exit code is 0 only when the stop was not caused by a failure and the driver
+//! closes the listener and the way from the connections to the driver (a request that starts from then on is
+//! refused, and a connection that waits for its next request is closed), tells the driver to finish inspecting by
+//! `t0 + stop_inspect`, waits for the connections until `t0 + stop_wait` and aborts what is left, then waits for
+//! the driver's end until `t0 + stop_wait + kill_grace`. The exit code is 0 only when the stop was not caused by a failure and the driver
 //! reports a stopped kernel whose child exit and per-start directory removal are confirmed, and the same for every
 //! kernel that was stopped before it; 1 for any other end, and for a refused rules store or generation (nothing
 //! has been started then); 2 for a wrong argument or a refused configuration. The log is flushed for at most
@@ -45,8 +48,9 @@ use tokio::time::{Instant, Sleep, sleep, timeout_at};
 use tukuyomi_kernel::{Failure, Phase};
 use tukuyomi_proxy::config::{self, ProxyConfig};
 use tukuyomi_proxy::host;
-use tukuyomi_proxy::inbound::conn::{self, Ctx};
-use tukuyomi_proxy::inspect::driver::{self, Driver, End, Limits, Msg, Switch, Switched};
+use tukuyomi_proxy::inbound::conn::Ctx;
+use tukuyomi_proxy::inbound::session;
+use tukuyomi_proxy::inspect::driver::{self, Driver, End, Ingress, Limits, Msg, Switch, Switched};
 use tukuyomi_proxy::log::{self, Log};
 use tukuyomi_proxy::rules::bundle::{Fingerprint, Mode};
 use tukuyomi_proxy::rules::command;
@@ -244,29 +248,36 @@ async fn run(
         end,
     } = driver;
     let mut waits = Waits::new(signals, ready, failed, end);
-    let cause = until_stop(
-        &mut waits,
+    // What the connections share. They take a sender from its handle for every request, and the stop closes it.
+    let ctx = Arc::new(Ctx {
+        cfg: proxy.clone(),
+        budget: Arc::new(Semaphore::new(proxy.max_buffered_bytes)),
+        inspect: Arc::new(Semaphore::new(wait_queue)),
+        routes: routes.clone(),
+        log: log.clone(),
+        ingress: Arc::new(Ingress::new(ingress.clone())),
+    });
+    let cause = until_stop(&mut waits, &ctx, &ingress, &mut switcher).await;
+    stop(
+        waits,
+        cause,
+        ingress,
+        &ctx.ingress,
         &proxy,
-        wait_queue,
-        &ingress,
-        &routes,
-        &mut switcher,
+        kill_grace,
         &log,
     )
-    .await;
-    stop(waits, cause, ingress, &proxy, kill_grace, &log).await
+    .await
 }
 
 /// Waits for the kernel, binds, and accepts until something asks for a stop. Returns that cause.
 async fn until_stop(
     waits: &mut Waits,
-    proxy: &ProxyConfig,
-    wait_queue: usize,
+    ctx: &Arc<Ctx>,
     ingress: &SyncSender<Msg>,
-    routes: &SharedRoutes,
     switcher: &mut Switcher,
-    log: &Log,
 ) -> Cause {
+    let (proxy, log) = (&ctx.cfg, &ctx.log);
     let Some(ready_by) = Instant::now().checked_add(proxy.ready_wait) else {
         return Cause::Late;
     };
@@ -287,21 +298,14 @@ async fn until_stop(
         Ok(listener) => listener,
         Err(_) => return Cause::Bind,
     };
-    let ctx = Arc::new(Ctx {
-        cfg: proxy.clone(),
-        budget: Arc::new(Semaphore::new(proxy.max_buffered_bytes)),
-        inspect: Arc::new(Semaphore::new(wait_queue)),
-        routes: routes.clone(),
-        log: log.clone(),
-    });
     let permits = Arc::new(Semaphore::new(proxy.max_conns));
-    waits.accept = Some(Acceptor::new(listener, permits));
+    waits.accept = Some(Acceptor::new(listener, permits, ctx.ingress.clone()));
     log.line("start: listening");
 
     loop {
         match waits.wait(None).await {
             Event::Conn(sock, peer, permit) => {
-                spawn_connection(&mut waits.conns, sock, peer, permit, &ctx, ingress, log);
+                spawn_connection(&mut waits.conns, sock, peer, permit, ctx, log);
             }
             Event::AcceptErr(Some(errno)) => log.line(&format!("accept: failed, errno {errno}")),
             Event::AcceptErr(None) => log.line("accept: failed"),
@@ -362,7 +366,6 @@ fn spawn_connection(
     peer: SocketAddr,
     permit: OwnedSemaphorePermit,
     ctx: &Arc<Ctx>,
-    ingress: &SyncSender<Msg>,
     log: &Log,
 ) {
     let local = match (sock.set_nodelay(true), sock.local_addr()) {
@@ -373,10 +376,9 @@ fn spawn_connection(
         }
     };
     let ctx = ctx.clone();
-    let ingress = ingress.clone();
     conns.spawn(async move {
         let _permit = permit;
-        conn::serve(sock, peer, local, ctx, ingress).await;
+        session::serve(sock, peer, local, ctx).await;
     });
 }
 
@@ -501,6 +503,7 @@ async fn stop(
     mut waits: Waits,
     cause: Cause,
     ingress: SyncSender<Msg>,
+    connections: &Ingress,
     proxy: &ProxyConfig,
     kill_grace: Duration,
     log: &Log,
@@ -509,8 +512,10 @@ async fn stop(
     let after = |d: Duration| t0.checked_add(d).unwrap_or(t0);
     let mut stop = Stop::begin(cause, log);
 
-    // The listener is closed here; a connection that was not accepted yet is never accepted.
+    // The listener is closed here; a connection that was not accepted yet is never accepted. The connections get
+    // no sender for a request that starts from now on, and the ones that wait for a request end.
     waits.accept = None;
+    connections.close();
 
     // The driver finishes what it holds by `inspect_by`. The channel has room for this message by construction;
     // if it does not take it, the driver ends when the last connection is gone.
@@ -635,22 +640,29 @@ enum Event {
 
 type Acquire = Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, AcquireError>>>>;
 
-/// The accept side: one connection permit first, then the accept it is for.
+/// The accept side: one connection permit first, then the accept it is for. While every permit is in use, one
+/// connection that arrives is accepted at once and waits for a permit, and the connections that wait for their
+/// next request are told to close.
 struct Acceptor {
     listener: TcpListener,
     permits: Arc<Semaphore>,
+    ingress: Arc<Ingress>,
     acquire: Option<Acquire>,
     permit: Option<OwnedSemaphorePermit>,
+    /// A connection that was accepted without a permit.
+    waiting: Option<(TcpStream, SocketAddr)>,
     pause: Option<Pin<Box<Sleep>>>,
 }
 
 impl Acceptor {
-    fn new(listener: TcpListener, permits: Arc<Semaphore>) -> Acceptor {
+    fn new(listener: TcpListener, permits: Arc<Semaphore>, ingress: Arc<Ingress>) -> Acceptor {
         Acceptor {
             listener,
             permits,
+            ingress,
             acquire: None,
             permit: None,
+            waiting: None,
             pause: None,
         }
     }
@@ -670,7 +682,7 @@ impl Acceptor {
                     .acquire
                     .get_or_insert_with(|| Box::pin(permits.clone().acquire_owned()));
                 match acquire.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => return self.crowded(cx),
                     Poll::Ready(Ok(permit)) => {
                         self.acquire = None;
                         permit
@@ -679,6 +691,9 @@ impl Acceptor {
                 }
             }
         };
+        if let Some((sock, peer)) = self.waiting.take() {
+            return Poll::Ready(Event::Conn(sock, peer, permit));
+        }
         match self.listener.poll_accept(cx) {
             Poll::Pending => {
                 self.permit = Some(permit);
@@ -687,13 +702,34 @@ impl Acceptor {
             Poll::Ready(Ok((sock, peer))) => Poll::Ready(Event::Conn(sock, peer, permit)),
             Poll::Ready(Err(e)) => {
                 self.permit = Some(permit);
-                let errno = e.raw_os_error();
-                if errno.is_some_and(is_resource_error) {
-                    self.pause = Some(Box::pin(sleep(ACCEPT_PAUSE)));
-                }
-                Poll::Ready(Event::AcceptErr(errno))
+                Poll::Ready(self.failed(&e))
             }
         }
+    }
+
+    /// Every permit is in use. The first connection that arrives is accepted to wait for one, and the idle
+    /// connections are told to close; the next one stays in the backlog until that one has its permit.
+    fn crowded(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
+        if self.waiting.is_none() {
+            match self.listener.poll_accept(cx) {
+                Poll::Ready(Ok(arrived)) => {
+                    self.waiting = Some(arrived);
+                    self.ingress.drain();
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(self.failed(&e)),
+                Poll::Pending => {}
+            }
+        }
+        Poll::Pending
+    }
+
+    /// The event for an accept that failed. Running out of a resource pauses the accepts for a while.
+    fn failed(&mut self, e: &io::Error) -> Event {
+        let errno = e.raw_os_error();
+        if errno.is_some_and(is_resource_error) {
+            self.pause = Some(Box::pin(sleep(ACCEPT_PAUSE)));
+        }
+        Event::AcceptErr(errno)
     }
 }
 
@@ -930,22 +966,40 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_permit_is_taken_before_accept() {
+    fn a_connection_permit_is_taken_before_accept_and_a_shortage_drains_the_idle() {
         runtime().block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let permits = Arc::new(Semaphore::new(1));
+            let (tx, _rx) = sync_channel::<Msg>(1);
+            let ingress = Arc::new(connections(&tx));
+            let mut told = ingress.drained();
             let mut f = fixture();
-            f.waits.accept = Some(Acceptor::new(listener, permits.clone()));
+            f.waits.accept = Some(Acceptor::new(listener, permits.clone(), ingress));
             let _first = TcpStream::connect(addr).await.unwrap();
             let _second = TcpStream::connect(addr).await.unwrap();
+            let _third = TcpStream::connect(addr).await.unwrap();
 
             let Event::Conn(_, _, permit) = f.waits.wait(after(5000)).await else {
                 panic!("the first connection was not accepted");
             };
             assert_eq!(permits.available_permits(), 0);
-            // The second connection waits in the backlog: no permit, no accept.
+            // A connection that is accepted with a permit tells nobody.
+            assert!(!told.has_changed().unwrap());
+            // The second connection arrives with every permit in use: it is taken in to wait, once, and the
+            // idle connections are told. It is not served before a permit is back.
             assert!(matches!(f.waits.wait(after(150)).await, Event::Late));
+            assert!(told.has_changed().unwrap());
+            let _ = told.borrow_and_update();
+            assert!(matches!(f.waits.wait(after(150)).await, Event::Late));
+            assert!(!told.has_changed().unwrap());
+            drop(permit);
+            let Event::Conn(_, _, permit) = f.waits.wait(after(5000)).await else {
+                panic!("the second connection was not given the permit");
+            };
+            // The third one arrives with every permit in use again, and tells again.
+            assert!(matches!(f.waits.wait(after(150)).await, Event::Late));
+            assert!(told.has_changed().unwrap());
             drop(permit);
             assert!(matches!(f.waits.wait(after(5000)).await, Event::Conn(..)));
         });
@@ -986,7 +1040,18 @@ mod tests {
             conn_total: ms(1),
             stop_inspect: ms(1),
             stop_wait: ms(1),
+            keepalive_timeout: ms(1),
+            keepalive_requests: 1,
+            keepalive_time: ms(1),
+            lingering_time: ms(1),
+            lingering_timeout: ms(1),
+            lingering_bytes: 1,
         }
+    }
+
+    /// The way from the connections to a stand-in driver.
+    fn connections(tx: &SyncSender<Msg>) -> Ingress {
+        Ingress::new(tx.clone())
     }
 
     /// A stand-in driver thread: takes the stop message, then ends as `end` says.
@@ -1017,17 +1082,22 @@ mod tests {
         runtime().block_on(async {
             let f = fixture();
             let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
+            let connections = connections(&tx);
             let before = std::time::Instant::now();
+            assert!(connections.sender().is_some());
             let code = stop(
                 f.waits,
                 Cause::Signal("SIGTERM"),
                 tx,
+                &connections,
                 &proxy_config(700, 2000),
                 Duration::from_millis(500),
                 &log,
             )
             .await;
             assert_eq!(code, EXIT_OK);
+            // The stop closes the way from the connections to the driver.
+            assert!(connections.sender().is_none());
             let inspect_by = driver.join().unwrap().expect("the stop message");
             assert!(inspect_by >= before + Duration::from_millis(700));
             assert!(inspect_by <= std::time::Instant::now() + Duration::from_millis(700));
@@ -1047,8 +1117,18 @@ mod tests {
             ] {
                 let f = fixture();
                 let (tx, driver) = driver_thread(Some(end), f.end);
+                let connections = connections(&tx);
                 assert_eq!(
-                    stop(f.waits, Cause::Signal("SIGINT"), tx, &cfg, grace, &log).await,
+                    stop(
+                        f.waits,
+                        Cause::Signal("SIGINT"),
+                        tx,
+                        &connections,
+                        &cfg,
+                        grace,
+                        &log
+                    )
+                    .await,
                     EXIT_FAILED
                 );
                 driver.join().unwrap();
@@ -1057,8 +1137,9 @@ mod tests {
             for cause in [Cause::Failed(Failure::BudgetExhausted), Cause::Late] {
                 let f = fixture();
                 let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
+                let connections = connections(&tx);
                 assert_eq!(
-                    stop(f.waits, cause, tx, &cfg, grace, &log).await,
+                    stop(f.waits, cause, tx, &connections, &cfg, grace, &log).await,
                     EXIT_FAILED
                 );
                 driver.join().unwrap();
@@ -1066,8 +1147,18 @@ mod tests {
             // The driver gone without an end.
             let f = fixture();
             let (tx, driver) = driver_thread(None, f.end);
+            let connections = connections(&tx);
             assert_eq!(
-                stop(f.waits, Cause::Signal("SIGHUP"), tx, &cfg, grace, &log).await,
+                stop(
+                    f.waits,
+                    Cause::Signal("SIGHUP"),
+                    tx,
+                    &connections,
+                    &cfg,
+                    grace,
+                    &log
+                )
+                .await,
                 EXIT_FAILED
             );
             driver.join().unwrap();
@@ -1081,11 +1172,13 @@ mod tests {
             let mut f = fixture();
             f.waits.conns.spawn(std::future::pending());
             let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
+            let connections = connections(&tx);
             let start = Instant::now();
             let code = stop(
                 f.waits,
                 Cause::Signal("SIGTERM"),
                 tx,
+                &connections,
                 &proxy_config(10, 150),
                 Duration::from_millis(100),
                 &log,

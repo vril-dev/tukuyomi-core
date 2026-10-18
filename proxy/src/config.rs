@@ -8,7 +8,9 @@
 //! `rules.store` values, the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's own
 //! check, and last the relations between the `proxy` and `kernel` objects.
 //!
-//! Times are whole milliseconds under keys that end in `_ms`; the `proxy` times run from 1 ms to 3600 s.
+//! Times are whole milliseconds under keys that end in `_ms`; the `proxy` times run from 1 ms to 3600 s, except
+//! `keepalive_timeout_ms`, which also takes 0 (a connection is not kept after its response), and `conn_total_ms`,
+//! which runs up to 24 h.
 //! `listen` and `upstream` are an IP literal and a port (`[..]:port` for IPv6). `rules.store.kind` is `file`, the
 //! only kind there is, and `dir` is an absolute clean path of at most 3840 bytes. The `kernel` object has no
 //! rules path and no rules fingerprint: the directory and the fingerprint of the chosen generation come from the
@@ -36,6 +38,8 @@ const MAX_FILE: u64 = 64 * 1024;
 /// against a wrong setting, not a recommendation.
 const MAX_STORE_DIR: usize = 3840;
 const MAX_MS: u64 = 3_600_000;
+/// The longest `conn_total_ms`: the connection time has room for `keepalive_time_ms` and one request after it.
+const MAX_CONN_MS: u64 = 86_400_000;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
@@ -66,6 +70,20 @@ pub struct ProxyConfig {
     pub conn_total: Duration,
     pub stop_inspect: Duration,
     pub stop_wait: Duration,
+    /// How long a connection waits for its next request after a response. Zero: the connection closes after
+    /// every response.
+    pub keepalive_timeout: Duration,
+    /// The most requests one connection serves. The answer to the last one closes it.
+    pub keepalive_requests: usize,
+    /// How long a connection may be kept, counted from the accept. A request that is answered after this time
+    /// gets the last answer of the connection. A request that starts before it gets its answer or the head of
+    /// the upstream's response before `conn_total`; a response body that streams longer is still cut there.
+    pub keepalive_time: Duration,
+    /// Before the proxy closes a connection after a response: the longest it reads and discards what the client
+    /// still sends, the longest it waits for one more read, and the most bytes it discards.
+    pub lingering_time: Duration,
+    pub lingering_timeout: Duration,
+    pub lingering_bytes: usize,
 }
 
 /// A configuration that passed every check.
@@ -141,6 +159,12 @@ struct RawProxy {
     conn_total_ms: u64,
     stop_inspect_ms: u64,
     stop_wait_ms: u64,
+    keepalive_timeout_ms: u64,
+    keepalive_requests: usize,
+    keepalive_time_ms: u64,
+    lingering_time_ms: u64,
+    lingering_timeout_ms: u64,
+    lingering_bytes: usize,
 }
 
 #[derive(Deserialize)]
@@ -357,9 +381,32 @@ fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> 
     let upstream_header = millis(p.upstream_header_ms, "upstream_header_ms is out of range")?;
     let request_total = millis(p.request_total_ms, "request_total_ms is out of range")?;
     let response_idle = millis(p.response_idle_ms, "response_idle_ms is out of range")?;
-    let conn_total = millis(p.conn_total_ms, "conn_total_ms is out of range")?;
+    ensure(
+        (1..=MAX_CONN_MS).contains(&p.conn_total_ms),
+        "conn_total_ms is out of range",
+    )?;
+    let conn_total = Duration::from_millis(p.conn_total_ms);
     let stop_inspect = millis(p.stop_inspect_ms, "stop_inspect_ms is out of range")?;
     let stop_wait = millis(p.stop_wait_ms, "stop_wait_ms is out of range")?;
+    ensure(
+        p.keepalive_timeout_ms <= MAX_MS,
+        "keepalive_timeout_ms is out of range",
+    )?;
+    let keepalive_timeout = Duration::from_millis(p.keepalive_timeout_ms);
+    ensure(
+        within(p.keepalive_requests, 1, 1_000_000),
+        "keepalive_requests is out of range",
+    )?;
+    let keepalive_time = millis(p.keepalive_time_ms, "keepalive_time_ms is out of range")?;
+    let lingering_time = millis(p.lingering_time_ms, "lingering_time_ms is out of range")?;
+    let lingering_timeout = millis(
+        p.lingering_timeout_ms,
+        "lingering_timeout_ms is out of range",
+    )?;
+    ensure(
+        within(p.lingering_bytes, 1, 4 * MIB),
+        "lingering_bytes is out of range",
+    )?;
 
     ensure(s.kind == "file", "rules store kind is not supported")?;
     let dir = PathBuf::from(s.dir);
@@ -441,6 +488,22 @@ fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> 
         "response_idle_ms is above conn_total_ms",
     )?;
     ensure(
+        keepalive_timeout <= conn_total,
+        "keepalive_timeout_ms is above conn_total_ms",
+    )?;
+    // A request that starts before `keepalive_time` gets its answer, or the upstream's response head, before
+    // the connection time is over (`request_total` bounds that part of a request, not a streamed body).
+    ensure(
+        keepalive_time
+            .checked_add(request_total)
+            .is_some_and(|n| n <= conn_total),
+        "keepalive_time_ms plus request_total_ms is above conn_total_ms",
+    )?;
+    ensure(
+        lingering_timeout <= lingering_time,
+        "lingering_timeout_ms is above lingering_time_ms",
+    )?;
+    ensure(
         stop_inspect < stop_wait,
         "stop_inspect_ms is not below stop_wait_ms",
     )?;
@@ -481,6 +544,12 @@ fn build(p: RawProxy, s: RawStore, k: RawKernel) -> Result<Loaded, ConfigError> 
             conn_total,
             stop_inspect,
             stop_wait,
+            keepalive_timeout,
+            keepalive_requests: p.keepalive_requests,
+            keepalive_time,
+            lingering_time,
+            lingering_timeout,
+            lingering_bytes: p.lingering_bytes,
         },
         kernel: KernelSettings(kernel),
         store: StoreConfig::File { dir },

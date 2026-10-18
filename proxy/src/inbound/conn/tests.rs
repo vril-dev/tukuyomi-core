@@ -1,17 +1,20 @@
+use std::future::poll_fn;
 use std::io::Write;
+use std::pin::Pin;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::{self, JoinHandle};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use tokio::net::TcpListener;
+use tokio::io::AsyncWrite;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle as Served;
 use tokio::time::{sleep, timeout};
 use tukuyomi_kernel::Verdict;
 
 use super::*;
-use crate::inbound::represent::tests::head_of;
+use crate::inbound::session::{run as run_session, serve};
 use crate::inspect::driver::Outcome;
 use crate::log::start_logger;
 use crate::rules::routes::{Route, Routes};
@@ -30,64 +33,24 @@ pub(in crate::inbound) fn gz(data: &[u8]) -> Vec<u8> {
     encoder.write_all(data).unwrap();
     encoder.finish().unwrap()
 }
-fn parts(request: Request<()>) -> http::request::Parts {
-    request.into_parts().0
-}
-
-#[test]
-fn hyper_and_the_head_check_must_see_the_same_request() {
-    let head = head_of("POST /a?b=%41 HTTP/1.1\r\nHost: h\r\nX-A: 1\r\nx-a: 2 \r\nX-B:\tv\r\n\r\n");
-    let base = || {
-        Request::builder()
-            .method("POST")
-            .uri("/a?b=%41")
-            .version(Version::HTTP_11)
-            .header("host", "h")
-            .header("x-a", "1")
-            .header("x-a", "2")
-            .header("x-b", "v")
-    };
-    assert!(same_head(&head, &parts(base().body(()).unwrap())));
-    let swapped = Request::builder()
-        .method("POST")
-        .uri("/a?b=%41")
-        .header("host", "h")
-        .header("x-a", "2")
-        .header("x-a", "1")
-        .header("x-b", "v")
-        .body(())
-        .unwrap();
-    let different = [
-        base().method("PUT").body(()).unwrap(),
-        base().uri("/a?b=%42").body(()).unwrap(),
-        base().uri("http://h/a?b=%41").body(()).unwrap(),
-        base().version(Version::HTTP_10).body(()).unwrap(),
-        base().header("x-c", "3").body(()).unwrap(),
-        swapped,
-    ];
-    for (n, request) in different.into_iter().enumerate() {
-        assert!(!same_head(&head, &parts(request)), "case {n}");
-    }
-}
-
 #[test]
 fn a_stage_ends_at_the_earlier_of_its_own_end_and_the_request_time() {
     let start = Instant::now();
-    let times = Times {
-        accept: start,
-        request_by: start + Duration::from_secs(10),
-        conn_by: start + Duration::from_secs(20),
-    };
+    let request_by = start + Duration::from_secs(10);
     assert_eq!(
-        stage(start, Duration::from_secs(11), &times),
+        stage(start, Duration::from_secs(11), request_by),
         start + Duration::from_secs(10)
+    );
+    assert_eq!(
+        stage(start, Duration::from_secs(3), request_by),
+        start + Duration::from_secs(3)
     );
     assert_eq!(after(start, Duration::MAX), start);
 }
 
 // ---- the connection, over real sockets, with a driver that is a thread in this test ----
 
-fn config() -> ProxyConfig {
+pub(in crate::inbound) fn config() -> ProxyConfig {
     let secs = Duration::from_secs;
     ProxyConfig {
         listen: "127.0.0.1:1".parse().unwrap(),
@@ -112,12 +75,19 @@ fn config() -> ProxyConfig {
         conn_total: secs(20),
         stop_inspect: secs(1),
         stop_wait: secs(5),
+        // A connection is not kept, unless a test turns it on.
+        keepalive_timeout: Duration::ZERO,
+        keepalive_requests: 1000,
+        keepalive_time: secs(10),
+        lingering_time: secs(1),
+        lingering_timeout: Duration::from_millis(100),
+        lingering_bytes: 1 << 20,
     }
 }
 
 /// What the driver of a test does with a ticket.
 #[derive(Clone, Copy)]
-enum Mode {
+pub(in crate::inbound) enum Mode {
     /// Answers every ticket with this.
     Answer(Outcome),
     /// Keeps every ticket and never answers.
@@ -129,9 +99,10 @@ enum Mode {
 }
 
 #[derive(Debug)]
-struct Seen {
-    method: String,
-    uri: String,
+pub(in crate::inbound) struct Seen {
+    pub(in crate::inbound) method: String,
+    pub(in crate::inbound) uri: String,
+    pub(in crate::inbound) proto: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     /// For a ticket that was kept: the connection had dropped its end when the driver stopped.
@@ -147,6 +118,7 @@ fn driver(rx: Receiver<Msg>, answer: Option<Outcome>) -> JoinHandle<Vec<Seen>> {
             let seen = Seen {
                 method: String::from_utf8_lossy(&req.method).into_owned(),
                 uri: String::from_utf8_lossy(&req.uri).into_owned(),
+                proto: String::from_utf8_lossy(req.proto).into_owned(),
                 headers: req
                     .headers
                     .iter()
@@ -177,8 +149,8 @@ fn driver(rx: Receiver<Msg>, answer: Option<Outcome>) -> JoinHandle<Vec<Seen>> {
     })
 }
 
-struct Rig {
-    ctx: Arc<Ctx>,
+pub(in crate::inbound) struct Rig {
+    pub(in crate::inbound) ctx: Arc<Ctx>,
     listener: TcpListener,
     tx: Option<SyncSender<Msg>>,
     driver: Option<JoinHandle<Vec<Seen>>>,
@@ -191,7 +163,7 @@ fn runtime() -> Runtime {
 }
 
 /// Runs a test body; a body that hangs fails the test instead of the run.
-fn run<F: std::future::Future>(body: F) -> F::Output {
+pub(in crate::inbound) fn run<F: std::future::Future>(body: F) -> F::Output {
     runtime().block_on(async {
         timeout(Duration::from_secs(60), body)
             .await
@@ -200,20 +172,21 @@ fn run<F: std::future::Future>(body: F) -> F::Output {
 }
 
 impl Rig {
-    async fn new(cfg: ProxyConfig, mode: Mode) -> Rig {
+    pub(in crate::inbound) async fn new(cfg: ProxyConfig, mode: Mode) -> Rig {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let budget = Arc::new(Semaphore::new(cfg.max_buffered_bytes));
+        let (tx, rx) = sync_channel(if matches!(mode, Mode::Full) {
+            1
+        } else {
+            PERMITS + 1
+        });
         let ctx = Arc::new(Ctx {
             cfg,
             budget,
             inspect: Arc::new(Semaphore::new(PERMITS)),
             routes: SharedRoutes::new(Routes::default()),
             log: start_logger().unwrap(),
-        });
-        let (tx, rx) = sync_channel(if matches!(mode, Mode::Full) {
-            1
-        } else {
-            PERMITS + 1
+            ingress: Arc::new(Ingress::new(tx.clone())),
         });
         let (driver, full) = match mode {
             Mode::Answer(outcome) => (Some(driver(rx, Some(outcome))), None),
@@ -237,28 +210,23 @@ impl Rig {
     }
 
     /// A client connects and the connection is served in the background.
-    async fn connect(&self) -> (TcpStream, Served<()>) {
+    pub(in crate::inbound) async fn connect(&self) -> (TcpStream, Served<()>) {
         let client = TcpStream::connect(self.listener.local_addr().unwrap())
             .await
             .unwrap();
         let (sock, peer) = self.listener.accept().await.unwrap();
         let local = sock.local_addr().unwrap();
-        let task = tokio::spawn(serve(
-            sock,
-            peer,
-            local,
-            self.ctx.clone(),
-            self.tx.clone().unwrap(),
-        ));
+        let task = tokio::spawn(serve(sock, peer, local, self.ctx.clone()));
         (client, task)
     }
 
     /// Waits for the connection to end and the driver to stop; checks that nothing is held any more.
-    async fn finish(mut self, served: Served<()>) -> Vec<Seen> {
+    pub(in crate::inbound) async fn finish(mut self, served: Served<()>) -> Vec<Seen> {
         timeout(Duration::from_secs(30), served)
             .await
             .expect("the connection ended")
             .unwrap();
+        self.ctx.ingress.close();
         drop(self.tx.take());
         let seen = self
             .driver
@@ -274,7 +242,7 @@ impl Rig {
     }
 }
 
-async fn put(sock: &TcpStream, mut bytes: &[u8]) {
+pub(in crate::inbound) async fn put(sock: &TcpStream, mut bytes: &[u8]) {
     while !bytes.is_empty() {
         sock.writable().await.unwrap();
         match sock.try_write(bytes) {
@@ -286,14 +254,14 @@ async fn put(sock: &TcpStream, mut bytes: &[u8]) {
 }
 
 /// Ends the sending direction of a client.
-async fn finish_sending(sock: &mut TcpStream) {
+pub(in crate::inbound) async fn finish_sending(sock: &mut TcpStream) {
     poll_fn(|cx| Pin::new(&mut *sock).poll_shutdown(cx))
         .await
         .unwrap();
 }
 
 /// Everything the server sends until it closes.
-async fn read_all(sock: &TcpStream) -> Vec<u8> {
+pub(in crate::inbound) async fn read_all(sock: &TcpStream) -> Vec<u8> {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     timeout(Duration::from_secs(30), async {
@@ -312,14 +280,14 @@ async fn read_all(sock: &TcpStream) -> Vec<u8> {
     out
 }
 
-struct Parsed {
-    status: u16,
+pub(in crate::inbound) struct Parsed {
+    pub(in crate::inbound) status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
 impl Parsed {
-    fn all(&self, name: &str) -> Vec<&str> {
+    pub(in crate::inbound) fn all(&self, name: &str) -> Vec<&str> {
         self.headers
             .iter()
             .filter(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -328,7 +296,7 @@ impl Parsed {
     }
 }
 
-fn parse_response(raw: &[u8]) -> Parsed {
+pub(in crate::inbound) fn parse_response(raw: &[u8]) -> Parsed {
     let mut storage = [httparse::EMPTY_HEADER; 32];
     let mut response = httparse::Response::new(&mut storage);
     let httparse::Status::Complete(n) = response.parse(raw).expect("a response") else {
@@ -356,6 +324,8 @@ async fn exchange(cfg: ProxyConfig, mode: Mode, request: &[u8]) -> (Vec<u8>, Vec
     let (client, task) = rig.connect().await;
     put(&client, request).await;
     let response = read_all(&client).await;
+    // A client that has closed does not keep the connection in its last wait.
+    drop(client);
     let seen = rig.finish(task).await;
     (response, seen)
 }
@@ -373,29 +343,25 @@ async fn exchange_with_reply(
         .unwrap();
     let (sock, peer) = rig.listener.accept().await.unwrap();
     let local = sock.local_addr().unwrap();
-    let accept = Instant::now();
-    let times = Times {
-        accept,
-        request_by: after(accept, rig.ctx.cfg.request_total),
-        conn_by: after(accept, rig.ctx.cfg.conn_total),
-    };
-    let (ctx, ingress) = (rig.ctx.clone(), rig.tx.clone().unwrap());
+    let ctx = rig.ctx.clone();
     let (sent, reply) = oneshot::channel();
     let task = tokio::spawn(async move {
-        let _ = sent.send(super::run(sock, peer, local, &ctx, ingress, times).await);
+        let summary = run_session(sock, peer, local, &ctx, Instant::now()).await;
+        let _ = sent.send(summary.last);
     });
     put(&client, request).await;
     let response = read_all(&client).await;
+    drop(client);
     let seen = rig.finish(task).await;
     (response, seen, reply.await.unwrap())
 }
 
-fn form_post(body_lines: &str) -> Vec<u8> {
+pub(in crate::inbound) fn form_post(body_lines: &str) -> Vec<u8> {
     format!("POST /p?q=1 HTTP/1.1\r\nHost: example.test\r\nContent-Type: {FORM}\r\n{body_lines}")
         .into_bytes()
 }
 
-const BLOCK: Outcome = Outcome::Verdict(Verdict::Block {
+pub(in crate::inbound) const BLOCK: Outcome = Outcome::Verdict(Verdict::Block {
     phase: 2,
     rule_id: 9202,
     status: 403,

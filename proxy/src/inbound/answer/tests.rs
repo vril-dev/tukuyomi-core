@@ -85,15 +85,16 @@ fn the_answer_table() {
 }
 
 #[test]
-fn an_answer_is_empty_with_a_length_of_0_and_close() {
-    let response = answer(403);
+fn an_answer_is_empty_with_a_length_of_0_and_close_after_marks_the_last_one() {
+    let mut response = answer(403);
     assert_eq!(response.status().as_u16(), 403);
     assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "0");
-    assert_eq!(response.headers().get(CONNECTION).unwrap(), "close");
+    assert!(response.headers().get(CONNECTION).is_none());
     assert!(response.body().is_end_stream());
+    close_after(&mut response);
+    assert_eq!(response.headers().get(CONNECTION).unwrap(), "close");
     let response = answer(204);
     assert!(response.headers().get(CONTENT_LENGTH).is_none());
-    assert_eq!(response.headers().get(CONNECTION).unwrap(), "close");
 }
 
 #[test]
