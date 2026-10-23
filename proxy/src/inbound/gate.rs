@@ -8,7 +8,11 @@
 //! differs, is not served. The body of a request is never looked at, so a body that looks like a request is only
 //! a body. A chunked request is the last one of its connection: the gate cannot find the end of a chunked body
 //! without a second parser, so everything after its head goes on to hyper, up to the cap of the bytes on the
-//! wire, and the connection is closed after the response.
+//! wire, and the connection is closed after the response. A request with an `Upgrade` line is the last one of its
+//! connection too, but the gate goes the other way: it hands hyper the head and the `Content-Length` bytes of the
+//! body and nothing more, looks at nothing after them and reads nothing (a read of hyper waits for ever), whether
+//! the upstream will switch protocols or not. What the client sent behind the head is therefore never taken for a
+//! request; `take_rest` gives it back, to be sent on if the upstream does switch.
 //!
 //! No more than `QUEUE_MAX` copies wait at a time; while the queue is full the gate hands on nothing and reads
 //! nothing, and the service's next `take` lets it go on.
@@ -113,6 +117,8 @@ struct Shared {
     parked: Option<Waker>,
     /// The gate waits for the first byte of a next request, and nothing is left to answer or to flush.
     waiting: bool,
+    /// The last head that was put into the queue is one with an `Upgrade` line: no head follows it.
+    last: bool,
 }
 
 /// What the gate and the service of one connection share: the queue of checked heads, and the count of the
@@ -132,6 +138,7 @@ impl Link {
                 last_done: now,
                 parked: None,
                 waiting: false,
+                last: false,
             }),
         })
     }
@@ -189,6 +196,7 @@ impl Link {
 
     fn push(&self, queued: Queued) {
         let mut shared = self.lock();
+        shared.last |= queued.head.upgrade();
         shared.queue.push_back(queued);
         shared.released = shared.released.saturating_add(1);
     }
@@ -201,6 +209,12 @@ impl Link {
     /// The connection waits for a next request: it has nothing to answer or to flush, and no byte of a next head.
     pub fn waiting(&self) -> bool {
         self.lock().waiting
+    }
+
+    /// A head with an `Upgrade` line was passed, so no more heads come: the connection ends after the response to
+    /// it, or becomes a tunnel.
+    pub fn last(&self) -> bool {
+        self.lock().last
     }
 
     /// The instant of the last answer if every request that was passed has been answered; otherwise `waker` is
@@ -285,6 +299,8 @@ pub struct Gate<T> {
     /// body. With `open`, everything goes on after them.
     pass: u64,
     open: bool,
+    /// The head that passed has an `Upgrade` line: nothing goes on to hyper after `pass`, and nothing is read.
+    halt: bool,
     /// The store may hold a complete head that has not been looked at.
     scan: bool,
     /// The stream ended.
@@ -331,6 +347,7 @@ impl<T> Gate<T> {
             hi: 0,
             pass: 0,
             open: false,
+            halt: false,
             scan: false,
             eof: false,
             began: Some(accept),
@@ -353,6 +370,16 @@ impl<T> Gate<T> {
     /// The refusal that ended the connection, if a head after the first one was refused or did not come in time.
     pub fn failure(&self) -> Option<Reject> {
         self.failed
+    }
+
+    /// The bytes behind the last head that the gate has read from the stream and not handed on. Only for a gate that
+    /// stopped at a head with an `Upgrade` line, once hyper is done with the connection; the rest of the stream is
+    /// read from `stream`, after these.
+    pub fn take_rest(&mut self) -> Bytes {
+        let rest = Bytes::copy_from_slice(&self.store[self.lo..self.hi]);
+        self.lo = 0;
+        self.hi = 0;
+        rest
     }
 }
 
@@ -487,6 +514,7 @@ impl<T: AsyncRead + Unpin> Gate<T> {
             self.pass = head_len
                 .checked_add(head.content_length().unwrap_or(0))
                 .ok_or(Reject::ContentTooLarge)?;
+            self.halt = head.upgrade();
         }
         let began = self.began.take().unwrap_or_else(Instant::now);
         self.link.push(Queued { head, began });
@@ -624,6 +652,9 @@ impl<T: AsyncRead + Unpin> AsyncRead for Gate<T> {
             }
             if this.failed.is_some() {
                 return this.surface(cx);
+            }
+            if this.halt {
+                return Poll::Pending;
             }
             match this.look(cx) {
                 Ok(Look::Released) => {}

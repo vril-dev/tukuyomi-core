@@ -97,6 +97,66 @@ fn the_method_is_a_token_of_1_to_32_bytes() {
 }
 
 #[test]
+fn connect_is_refused_whatever_its_target() {
+    for line in ["CONNECT /x HTTP/1.1", "CONNECT example.test:443 HTTP/1.1"] {
+        assert_eq!(refused(&with_request_line(line)), Reject::BadRequest);
+    }
+    // The method is case sensitive: this is another method.
+    assert_eq!(
+        ok(&with_request_line("connect /x HTTP/1.1")).method(),
+        b"connect"
+    );
+}
+
+#[test]
+fn an_upgrade_line_marks_the_head_and_only_a_plain_handshake_is_a_websocket() {
+    let head = ok(&head_with(&[
+        "Upgrade: WebSocket",
+        "Connection: keep-alive, Upgrade",
+    ]));
+    assert!(head.upgrade() && head.websocket());
+    assert!(!ok(&head_with(&[])).upgrade());
+    assert!(!ok(&head_with(&["Connection: Upgrade"])).upgrade());
+    // Each of these has an Upgrade line and is not the handshake of a WebSocket.
+    for lines in [
+        &["Upgrade: h2c", "Connection: Upgrade"][..],
+        &["Upgrade: websocket"][..],
+        &[
+            "Upgrade: websocket",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+        ][..],
+        &["Upgrade: websocket, h2c", "Connection: Upgrade"][..],
+        &["Upgrade: websocket", "Connection: Upgrade, close"][..],
+        &[
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Transfer-Encoding: chunked",
+        ][..],
+    ] {
+        let head = ok(&head_with(lines));
+        assert!(head.upgrade() && !head.websocket(), "{lines:?}");
+    }
+    // A body of length 0 is no body. The method and the version are fixed.
+    let sized = [
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        "Content-Length: 0",
+    ];
+    assert!(ok(&head_with(&sized)).websocket());
+    let rest = "Host: example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    for (line, websocket) in [
+        ("GET /ws HTTP/1.1", true),
+        ("POST /ws HTTP/1.1", false),
+        ("GET /ws HTTP/1.0", false),
+    ] {
+        let head = ok(format!("{line}\r\n{rest}").as_bytes());
+        assert!(head.upgrade(), "{line}");
+        assert_eq!(head.websocket(), websocket, "{line}");
+    }
+}
+
+#[test]
 fn the_target_is_origin_form_of_1_to_4096_bytes_that_hyper_takes_without_a_fragment() {
     let longest = format!("/{}", "a".repeat(4095));
     assert_eq!(

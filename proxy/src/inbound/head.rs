@@ -5,7 +5,8 @@
 //! the first rule that is broken decides the answer:
 //!
 //! 1. Every LF is preceded by CR and every CR is followed by LF; the head does not start with an empty line.
-//! 2. The method is 1 to 32 token bytes. The request target is origin-form: it starts with `/`, has 1 to 4096
+//! 2. The method is 1 to 32 token bytes and is not `CONNECT` (a tunnel to a host is not something this proxy
+//!    makes). The request target is origin-form: it starts with `/`, has 1 to 4096
 //!    bytes and no `#`, and none of its bytes is one that hyper's URI parser refuses in that place (path or
 //!    query), so hyper never answers for a head that passed. The version is `HTTP/1.1` or `HTTP/1.0`.
 //! 3. At most 64 fields; a name has 1 to 256 bytes, a value (without the blanks around it) at most 4096, and the
@@ -16,7 +17,8 @@
 //!    64 bits and is not over the body limit.
 //! 6. `Expect` is absent or one line that is exactly `100-continue`.
 //! 7. `Connection` lines are comma separated lists of tokens (no empty element) that do not name `host`,
-//!    `content-length`, `content-type` or `content-encoding`.
+//!    `content-length`, `content-type` or `content-encoding`. A head with an `Upgrade` line is marked `upgrade`,
+//!    and one that is a WebSocket handshake is marked `websocket` too (see `Head::websocket`).
 //! 8. `Content-Encoding` is absent, or one line that is exactly `gzip` (ASCII case ignored); any other value, a
 //!    list and a repeated line are refused with 415. A gzip body that is empty on its face (`Content-Length: 0`,
 //!    or no body framing at all) is refused with 400, for it is not a gzip stream; for a chunked body the caller
@@ -122,6 +124,8 @@ pub struct Head {
     content_length: Option<u64>,
     chunked: bool,
     close: bool,
+    upgrade: bool,
+    websocket: bool,
     gzip: bool,
     inspectable_type: bool,
 }
@@ -176,6 +180,18 @@ impl Head {
     /// A `Connection` line names `close`: the client asks for the connection to end after the response.
     pub fn close(&self) -> bool {
         self.close
+    }
+
+    /// There is an `Upgrade` line. The head is the last one of its connection: whatever the client sends behind it
+    /// is not a request, whether the upstream switches protocols or not.
+    pub fn upgrade(&self) -> bool {
+        self.upgrade
+    }
+
+    /// The head asks for a WebSocket: a `GET` of HTTP/1.1 with no body, exactly one `Upgrade` line that is
+    /// `websocket` (ASCII case ignored), a `Connection` line that lists `upgrade` and none that lists `close`.
+    pub fn websocket(&self) -> bool {
+        self.websocket
     }
 
     /// The body is gzip coded (`Content-Encoding` is exactly `gzip`). The caller decodes it before the
@@ -284,6 +300,13 @@ fn connection_ok(value: &[u8]) -> bool {
     })
 }
 
+/// A `Connection` line that lists `token`, ASCII case ignored.
+fn lists(value: &[u8], token: &[u8]) -> bool {
+    value
+        .split(|&b| b == b',')
+        .any(|item| trim_ows(item).eq_ignore_ascii_case(token))
+}
+
 /// The type of a body that the inspection reads: urlencoded, multipart or JSON. Same comparison as the kernel's:
 /// the part before the first `;` without blanks, ASCII case ignored. The first three types are equal to the whole
 /// name (so `application/jsonp` and `text/json` are not JSON). The fourth is `application/<name>+json`, see
@@ -347,7 +370,7 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         return Err(Reject::BadRequest);
     }
     // Rule 2.
-    if method.is_empty() || method.len() > limits::METHOD {
+    if method.is_empty() || method.len() > limits::METHOD || method == b"CONNECT" {
         return Err(Reject::BadRequest);
     }
     if target.len() > limits::URI {
@@ -441,11 +464,8 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
     if !named(b"connection").all(connection_ok) {
         return Err(Reject::BadRequest);
     }
-    let close = named(b"connection").any(|value| {
-        value
-            .split(|&b| b == b',')
-            .any(|item| trim_ows(item).eq_ignore_ascii_case(b"close"))
-    });
+    let close = named(b"connection").any(|value| lists(value, b"close"));
+    let upgrades: Vec<&[u8]> = named(b"upgrade").collect();
     // Rule 8.
     let codings: Vec<&[u8]> = named(b"content-encoding").collect();
     let gzip = match codings.as_slice() {
@@ -463,6 +483,14 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         return Err(Reject::UnsupportedMedia);
     }
 
+    let websocket = method == b"GET"
+        && !http10
+        && !chunked
+        && content_length.is_none_or(|n| n == 0)
+        && !close
+        && matches!(upgrades.as_slice(), [value] if value.eq_ignore_ascii_case(b"websocket"))
+        && named(b"connection").any(|value| lists(value, b"upgrade"));
+
     Ok(Some(Head {
         buf: Bytes::new(),
         len,
@@ -473,6 +501,8 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         content_length,
         chunked,
         close,
+        upgrade: !upgrades.is_empty(),
+        websocket,
         gzip,
         inspectable_type,
     }))

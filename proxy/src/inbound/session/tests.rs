@@ -1,13 +1,24 @@
+use std::future::Future;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant as StdInstant};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
+use tukuyomi_kernel::Verdict;
 
 use super::*;
+use crate::config::{ForwardConfig, RouteConfig};
 use crate::inbound::conn::tests::{
     BLOCK, Mode, Parsed, Rig, config, finish_sending, form_post, guarded, parse_response, put,
     read_all, routed_to_h_test, run,
 };
+use crate::inspect::driver::Outcome;
+use crate::log::Lines;
+use crate::route::{Rule, Table};
 
 const SEC: Duration = Duration::from_secs(1);
 
@@ -458,5 +469,652 @@ fn a_403_of_the_route_keeps_the_connection_if_the_request_had_no_body_and_ends_i
         assert_eq!(last.status, 403);
         assert_eq!(last.all("connection"), ["close"]);
         assert!(rig.finish(task).await.is_empty());
+    });
+}
+
+// ---- a stream on a route: a WebSocket through it, and the responses that take long ----
+
+const ALLOW: Outcome = Outcome::Verdict(Verdict::Allow);
+
+fn stream(idle_ms: u64, total_ms: u64, websocket: bool) -> Stream {
+    Stream {
+        idle: Duration::from_millis(idle_ms),
+        total: Duration::from_millis(total_ms),
+        websocket,
+    }
+}
+
+/// One group with the server at `upstream`. The route `/ws/` has the `stream`; the default route has none.
+fn streaming(upstream: SocketAddr, stream: Stream) -> ForwardConfig {
+    let mut forward = ForwardConfig::of(&[upstream]);
+    let route = RouteConfig {
+        stream: Some(stream),
+        ..RouteConfig::plain(0)
+    };
+    let rule = Rule::forward(None, Some("/ws/")).unwrap();
+    forward.routes = Table::new(vec![(rule, route)]).unwrap();
+    forward
+}
+
+/// The handshake of a WebSocket for `target`, with `upgrade` as the protocol.
+fn handshake(target: &str, upgrade: &str) -> Vec<u8> {
+    format!(
+        "GET {target} HTTP/1.1\r\nHost: h\r\nUpgrade: {upgrade}\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// A client with the bytes it has read and not used yet.
+struct Peer {
+    sock: TcpStream,
+    held: Vec<u8>,
+}
+
+impl Peer {
+    fn new(sock: TcpStream) -> Peer {
+        Peer {
+            sock,
+            held: Vec::new(),
+        }
+    }
+
+    async fn send(&mut self, bytes: &[u8]) {
+        self.sock.write_all(bytes).await.unwrap();
+    }
+
+    /// Reads more into `held`; false at the end of the stream (or a reset).
+    async fn more(&mut self) -> bool {
+        let mut buf = [0u8; 8192];
+        match timeout(30 * SEC, self.sock.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                self.held.extend_from_slice(&buf[..n]);
+                true
+            }
+            Ok(Ok(_) | Err(_)) => false,
+            Err(_) => panic!("nothing came"),
+        }
+    }
+
+    /// The head of a response: everything up to and including the blank line.
+    async fn head(&mut self) -> Vec<u8> {
+        loop {
+            if let Some(end) = self.held.windows(4).position(|w| w == b"\r\n\r\n") {
+                return self.held.drain(..end + 4).collect();
+            }
+            assert!(self.more().await, "the head did not come");
+        }
+    }
+
+    /// The next `n` bytes.
+    async fn take(&mut self, n: usize) -> Vec<u8> {
+        while self.held.len() < n {
+            assert!(self.more().await, "the stream ended");
+        }
+        self.held.drain(..n).collect()
+    }
+
+    /// Everything up to the end of the stream.
+    async fn rest(&mut self) -> Vec<u8> {
+        while self.more().await {}
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// A raw upstream: it serves each connection it takes with `serve`, which is also given the place where the bytes
+/// that the upstream read are kept.
+struct Raw {
+    addr: SocketAddr,
+    taken: Arc<AtomicUsize>,
+    seen: Arc<StdMutex<Vec<u8>>>,
+    accepting: JoinHandle<()>,
+}
+
+impl Raw {
+    async fn start<F, Fut>(serve: F) -> Raw
+    where
+        F: Fn(TcpStream, Arc<StdMutex<Vec<u8>>>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let taken = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<StdMutex<Vec<u8>>> = Arc::default();
+        let accepting = {
+            let (taken, seen) = (taken.clone(), seen.clone());
+            tokio::spawn(async move {
+                while let Ok((sock, _)) = listener.accept().await {
+                    taken.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(serve(sock, seen.clone()));
+                }
+            })
+        };
+        Raw {
+            addr,
+            taken,
+            seen,
+            accepting,
+        }
+    }
+
+    fn taken(&self) -> usize {
+        self.taken.load(Ordering::SeqCst)
+    }
+
+    /// The bytes read from the clients so far, as text.
+    fn seen(&self) -> String {
+        String::from_utf8_lossy(&self.seen.lock().unwrap()).into_owned()
+    }
+}
+
+impl Drop for Raw {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
+}
+
+/// Reads the head of a request from `sock`; the bytes behind it are returned too.
+async fn read_request(sock: &mut TcpStream) -> (Vec<u8>, Vec<u8>) {
+    let mut held = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        if let Some(end) = held.windows(4).position(|w| w == b"\r\n\r\n") {
+            let behind = held.split_off(end + 4);
+            return (held, behind);
+        }
+        match sock.read(&mut buf).await {
+            Ok(n) if n > 0 => held.extend_from_slice(&buf[..n]),
+            _ => return (held, Vec::new()),
+        }
+    }
+}
+
+const SWITCHING: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: accepted\r\nSec-WebSocket-Protocol: chat\r\n\r\n";
+
+/// Answers the handshake with 101 and then sends back every byte it reads.
+async fn echo(sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>) {
+    echo_after(sock, seen, Duration::ZERO).await;
+}
+
+/// The same, `wait` after the handshake was read.
+async fn echo_after(mut sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>, wait: Duration) {
+    let (head, mut behind) = read_request(&mut sock).await;
+    seen.lock().unwrap().extend_from_slice(&head);
+    sleep(wait).await;
+    if sock.write_all(SWITCHING).await.is_err() {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        if !behind.is_empty() && sock.write_all(&std::mem::take(&mut behind)).await.is_err() {
+            return;
+        }
+        match sock.read(&mut buf).await {
+            Ok(n) if n > 0 => behind.extend_from_slice(&buf[..n]),
+            _ => return,
+        }
+    }
+}
+
+/// Answers the handshake with 101 and then says nothing.
+async fn silent(mut sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>) {
+    let (head, _) = read_request(&mut sock).await;
+    seen.lock().unwrap().extend_from_slice(&head);
+    let _ = sock.write_all(SWITCHING).await;
+    let mut buf = [0u8; 64];
+    while matches!(sock.read(&mut buf).await, Ok(n) if n > 0) {}
+}
+
+/// Answers the handshake with 101 and then says nothing, and keeps the connection open whatever the peer does.
+async fn mute(mut sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>) {
+    let (head, _) = read_request(&mut sock).await;
+    seen.lock().unwrap().extend_from_slice(&head);
+    let _ = sock.write_all(SWITCHING).await;
+    sleep(30 * SEC).await;
+}
+
+/// Answers the handshake with 101 and ends its side of the connection at once.
+async fn closing(mut sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>) {
+    let (head, _) = read_request(&mut sock).await;
+    seen.lock().unwrap().extend_from_slice(&head);
+    let _ = sock.write_all(SWITCHING).await;
+}
+
+/// Answers the handshake with 101, then sends a byte every 100 ms, `n` times, and reads on to the end of the stream.
+async fn talk(mut sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>, n: usize) {
+    let (head, _) = read_request(&mut sock).await;
+    seen.lock().unwrap().extend_from_slice(&head);
+    if sock.write_all(SWITCHING).await.is_err() {
+        return;
+    }
+    for _ in 0..n {
+        sleep(Duration::from_millis(100)).await;
+        if sock.write_all(b"x").await.is_err() {
+            return;
+        }
+    }
+    let mut buf = [0u8; 64];
+    while matches!(sock.read(&mut buf).await, Ok(k) if k > 0) {}
+}
+
+/// Answers a request with `answer`, then reads on and keeps what it reads.
+async fn reply(mut sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>, answer: &'static [u8]) {
+    let (head, behind) = read_request(&mut sock).await;
+    seen.lock().unwrap().extend_from_slice(&head);
+    seen.lock().unwrap().extend_from_slice(&behind);
+    let _ = sock.write_all(answer).await;
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = sock.read(&mut buf).await {
+        if n == 0 {
+            return;
+        }
+        seen.lock().unwrap().extend_from_slice(&buf[..n]);
+    }
+}
+
+const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+#[test]
+fn a_handshake_gets_its_101_and_the_bytes_go_both_ways_in_order_also_after_the_stop_began() {
+    run(async {
+        let up = Raw::start(echo).await;
+        let forward = streaming(up.addr, stream(5_000, 20_000, true));
+        let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        // The first bytes of the tunnel are in the write of the handshake.
+        let mut first = handshake("/ws/chat", "WebSocket");
+        first.extend_from_slice(b"first");
+        peer.send(&first).await;
+        let head = parse_response(&peer.head().await);
+        assert_eq!(head.status, 101);
+        assert_eq!(head.all("connection"), ["upgrade"]);
+        assert_eq!(head.all("upgrade"), ["websocket"]);
+        assert!(head.all("content-length").is_empty() && head.all("transfer-encoding").is_empty());
+        assert_eq!(head.all("sec-websocket-accept"), ["accepted"]);
+        assert_eq!(head.all("sec-websocket-protocol"), ["chat"]);
+        assert_eq!(peer.take(5).await, b"first");
+        peer.send(b"second").await;
+        assert_eq!(peer.take(6).await, b"second");
+        // The stop does not end a tunnel.
+        rig.ctx.ingress.close();
+        let big: Vec<u8> = (0..40_000u32).map(|n| (n % 251) as u8).collect();
+        peer.send(&big).await;
+        assert_eq!(peer.take(big.len()).await, big);
+        // The client ends its side, the upstream ends its own, and the tunnel is over.
+        peer.sock.shutdown().await.unwrap();
+        assert!(peer.rest().await.is_empty());
+        let seen = rig.finish(task).await;
+        // The handshake was inspected, like any request.
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].uri, "/ws/chat");
+        // The upstream was asked with fixed fields, once each, and nothing of the client's own.
+        let asked = up.seen();
+        assert!(asked.starts_with("GET /ws/chat HTTP/1.1\r\n"), "{asked}");
+        assert!(
+            asked.contains("Connection: upgrade\r\n") && asked.contains("Upgrade: websocket\r\n")
+        );
+        assert_eq!(asked.matches("Connection:").count(), 1);
+        assert!(asked.contains("Sec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"));
+        assert!(!asked.contains("keep-alive") && !asked.contains("WebSocket"));
+    });
+}
+
+#[test]
+fn a_stop_while_the_handshake_waits_for_the_upstream_does_not_change_its_101() {
+    run(async {
+        let up = Raw::start(|sock, seen| echo_after(sock, seen, Duration::from_millis(400))).await;
+        let forward = streaming(up.addr, stream(5_000, 20_000, true));
+        let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        peer.send(&handshake("/ws/chat", "websocket")).await;
+        sleep(Duration::from_millis(100)).await;
+        // The request is under way: hyper is not told to wind the connection down, or it would add its own
+        // `Connection: close` to the 101.
+        rig.ctx.ingress.close();
+        let head = parse_response(&peer.head().await);
+        assert_eq!(head.status, 101);
+        assert_eq!(head.all("connection"), ["upgrade"]);
+        peer.send(b"ping").await;
+        assert_eq!(peer.take(4).await, b"ping");
+        peer.sock.shutdown().await.unwrap();
+        assert!(peer.rest().await.is_empty());
+        assert_eq!(rig.finish(task).await.len(), 1);
+    });
+}
+
+#[test]
+fn an_upgrade_that_is_not_a_websocket_goes_on_without_it_and_the_connection_ends_after_the_response()
+ {
+    run(async {
+        // A route that does not let a WebSocket through, and a protocol other than a WebSocket on a route that does.
+        for (allowed, upgrade) in [(false, "websocket"), (true, "h2c")] {
+            let up = Raw::start(|sock, seen| reply(sock, seen, OK)).await;
+            let forward = streaming(up.addr, stream(5_000, 20_000, allowed));
+            let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+            let (client, task) = rig.connect().await;
+            let mut peer = Peer::new(client);
+            // A second request is in the same write: it is neither inspected nor sent on.
+            let mut input = handshake("/ws/x", upgrade);
+            input.extend_from_slice(&get("/ws/smuggled"));
+            peer.send(&input).await;
+            let raw = peer.rest().await;
+            let answer = parse_response(&raw);
+            assert_eq!(answer.status, 200, "{upgrade}");
+            assert_eq!(answer.all("connection"), ["close"], "{upgrade}");
+            assert!(raw.ends_with(b"\r\n\r\nok"), "{upgrade}");
+            assert_eq!(rig.finish(task).await.len(), 1, "{upgrade}");
+            let asked = up.seen();
+            assert!(asked.starts_with("GET /ws/x HTTP/1.1\r\n"), "{asked}");
+            let lower = asked.to_ascii_lowercase();
+            assert!(
+                !lower.contains("upgrade") && !lower.contains("smuggled"),
+                "{asked}"
+            );
+        }
+    });
+}
+
+#[test]
+fn what_the_upstream_answers_to_a_handshake_other_than_a_proper_101_is_no_tunnel() {
+    run(async {
+        // 200: an answer like any other, and the connection ends after it.
+        let up = Raw::start(|sock, seen| reply(sock, seen, OK)).await;
+        let forward = streaming(up.addr, stream(5_000, 20_000, true));
+        let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        let mut input = handshake("/ws/x", "websocket");
+        input.extend_from_slice(&get("/ws/smuggled"));
+        peer.send(&input).await;
+        let raw = peer.rest().await;
+        let answer = parse_response(&raw);
+        assert_eq!(answer.status, 200);
+        assert_eq!(answer.all("connection"), ["close"]);
+        assert!(raw.ends_with(b"\r\n\r\nok"));
+        assert_eq!(rig.finish(task).await.len(), 1);
+        assert!(up.seen().contains("Upgrade: websocket\r\n") && !up.seen().contains("smuggled"));
+
+        // A 101 that was not asked for, and a 101 for another protocol, are 502.
+        const OTHER: &[u8] =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n";
+        const NO_CONNECTION: &[u8] =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        for (allowed, answer) in [(false, SWITCHING), (true, OTHER), (true, NO_CONNECTION)] {
+            let up = Raw::start(move |sock, seen| reply(sock, seen, answer)).await;
+            let forward = streaming(up.addr, stream(5_000, 20_000, allowed));
+            let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+            let (client, task) = rig.connect().await;
+            let mut peer = Peer::new(client);
+            peer.send(&handshake("/ws/x", "websocket")).await;
+            let raw = peer.rest().await;
+            assert_eq!(parse_response(&raw).status, 502, "{allowed} {answer:?}");
+            assert_eq!(rig.finish(task).await.len(), 1);
+        }
+    });
+}
+
+#[test]
+fn a_handshake_that_a_rule_blocks_or_that_has_no_budget_for_a_tunnel_sends_nothing_upstream() {
+    run(async {
+        let up = Raw::start(echo).await;
+        let forward = streaming(up.addr, stream(5_000, 20_000, true));
+        let rig = Rig::with(kept(), Mode::Answer(BLOCK), &forward).await;
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        let mut input = handshake("/ws/x", "websocket");
+        input.extend_from_slice(&get("/ws/smuggled"));
+        peer.send(&input).await;
+        let raw = peer.rest().await;
+        assert_eq!(parse_response(&raw).status, 403);
+        // Only the handshake was inspected.
+        assert_eq!(rig.finish(task).await.len(), 1);
+        assert_eq!(up.taken(), 0);
+
+        // The budget has the handshake but not the 16 KiB of a tunnel.
+        let small = ProxyConfig {
+            max_buffered_bytes: 8192,
+            ..kept()
+        };
+        let rig = Rig::with(small, Mode::Answer(ALLOW), &forward).await;
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        peer.send(&handshake("/ws/x", "websocket")).await;
+        assert_eq!(parse_response(&peer.rest().await).status, 503);
+        assert_eq!(rig.finish(task).await.len(), 1);
+        assert_eq!(up.taken(), 0);
+    });
+}
+
+#[test]
+fn a_tunnel_ends_when_the_upstream_is_silent_for_idle_and_when_total_has_passed() {
+    run(async {
+        // The upstream says nothing after the 101: idle ends it, long before total.
+        let up = Raw::start(silent).await;
+        let forward = streaming(up.addr, stream(300, 20_000, true));
+        let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        peer.send(&handshake("/ws/x", "websocket")).await;
+        assert_eq!(parse_response(&peer.head().await).status, 101);
+        let began = StdInstant::now();
+        assert!(peer.rest().await.is_empty());
+        assert!(began.elapsed() >= Duration::from_millis(250) && began.elapsed() < 5 * SEC);
+        assert_eq!(rig.finish(task).await.len(), 1);
+
+        // The client sends all the time, so the upstream is not silent for idle; total ends it.
+        let up = Raw::start(echo).await;
+        let forward = streaming(up.addr, stream(5_000, 700, true));
+        let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        peer.send(&handshake("/ws/x", "websocket")).await;
+        assert_eq!(parse_response(&peer.head().await).status, 101);
+        let began = StdInstant::now();
+        let (mut read, mut write) = peer.sock.into_split();
+        let talker = tokio::spawn(async move {
+            while write.write_all(b"x").await.is_ok() {
+                sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let mut buf = [0u8; 64];
+        while matches!(read.read(&mut buf).await, Ok(n) if n > 0) {}
+        talker.abort();
+        assert!(began.elapsed() >= Duration::from_millis(650) && began.elapsed() < 4 * SEC);
+        assert_eq!(rig.finish(task).await.len(), 1);
+    });
+}
+
+/// The lines of the record that tell how a tunnel ended.
+fn tunnel_lines(lines: &Lines) -> Vec<String> {
+    lines
+        .take()
+        .into_iter()
+        .filter(|line| line.contains(": tunnel "))
+        .collect()
+}
+
+#[test]
+fn a_client_that_says_nothing_does_not_keep_a_tunnel_after_the_upstream_has_ended() {
+    run(async {
+        // The upstream ends its side right after the 101; the client keeps its own open and sends nothing.
+        let up = Raw::start(closing).await;
+        let forward = streaming(up.addr, stream(300, 20_000, true));
+        let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+        let lines = rig.lines.clone();
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        peer.send(&handshake("/ws/x", "websocket")).await;
+        assert_eq!(parse_response(&peer.head().await).status, 101);
+        let began = StdInstant::now();
+        assert_eq!(rig.finish(task).await.len(), 1);
+        // `idle` after the end of the upstream, not `total`.
+        assert!(began.elapsed() >= Duration::from_millis(250) && began.elapsed() < 5 * SEC);
+        let ended = tunnel_lines(&lines);
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert!(ended[0].contains(": tunnel idle "), "{ended:?}");
+    });
+}
+
+#[test]
+fn an_upstream_does_not_keep_a_tunnel_after_the_client_has_ended_silent_or_not() {
+    run(async {
+        for talking in [false, true] {
+            // The upstream keeps its side open: it says nothing, or sends a byte every 100 ms (less than `idle`).
+            let up = Raw::start(move |sock, seen| async move {
+                if talking {
+                    talk(sock, seen, 1_000).await;
+                } else {
+                    mute(sock, seen).await;
+                }
+            })
+            .await;
+            let forward = streaming(up.addr, stream(300, 20_000, true));
+            let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+            let lines = rig.lines.clone();
+            let (client, task) = rig.connect().await;
+            let mut peer = Peer::new(client);
+            peer.send(&handshake("/ws/x", "websocket")).await;
+            assert_eq!(parse_response(&peer.head().await).status, 101);
+            peer.sock.shutdown().await.unwrap();
+            let began = StdInstant::now();
+            assert_eq!(rig.finish(task).await.len(), 1, "{talking}");
+            assert!(
+                began.elapsed() >= Duration::from_millis(250) && began.elapsed() < 5 * SEC,
+                "{talking}: {:?}",
+                began.elapsed()
+            );
+            let ended = tunnel_lines(&lines);
+            assert_eq!(ended.len(), 1, "{talking}: {ended:?}");
+            assert!(ended[0].contains(": tunnel idle "), "{talking}: {ended:?}");
+        }
+    });
+}
+
+#[test]
+fn a_client_that_says_nothing_is_not_cut_while_the_upstream_is_alive() {
+    run(async {
+        // The upstream sends for 1.2 s, four times `idle`, and the client sends nothing until it has them all.
+        let up = Raw::start(|sock, seen| talk(sock, seen, 12)).await;
+        let forward = streaming(up.addr, stream(300, 20_000, true));
+        let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+        let lines = rig.lines.clone();
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        peer.send(&handshake("/ws/x", "websocket")).await;
+        assert_eq!(parse_response(&peer.head().await).status, 101);
+        assert_eq!(peer.take(12).await, b"xxxxxxxxxxxx");
+        // Both sides end in turn: the client, and then the upstream, which reads on to the end of the stream.
+        peer.sock.shutdown().await.unwrap();
+        assert!(peer.rest().await.is_empty());
+        assert_eq!(rig.finish(task).await.len(), 1);
+        let ended = tunnel_lines(&lines);
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert!(
+            ended[0].contains(": tunnel closed ")
+                && ended[0].ends_with(" to-upstream 0 from-upstream 12"),
+            "{ended:?}"
+        );
+    });
+}
+
+#[test]
+fn a_tunnel_that_the_client_does_not_get_has_its_one_line_for_the_end() {
+    run(async {
+        // The upstream answers the handshake after 400 ms; the client has reset the connection by then, so the
+        // 101 cannot be written.
+        let up = Raw::start(|sock, seen| echo_after(sock, seen, Duration::from_millis(400))).await;
+        let forward = streaming(up.addr, stream(5_000, 20_000, true));
+        let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+        let lines = rig.lines.clone();
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        peer.send(&handshake("/ws/x", "websocket")).await;
+        while !up.seen().contains("\r\n\r\n") {
+            sleep(Duration::from_millis(10)).await;
+        }
+        peer.sock.set_zero_linger().unwrap();
+        drop(peer);
+        // Nothing is held after the end (`finish` checks the byte budget).
+        rig.finish(task).await;
+        let ended = tunnel_lines(&lines);
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert!(ended[0].contains(": tunnel error "), "{ended:?}");
+    });
+}
+
+/// Answers a request with the head of a chunked response and a first chunk, and the rest once `release` is told.
+async fn events(mut sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>, release: Arc<Notify>) {
+    let (head, _) = read_request(&mut sock).await;
+    seen.lock().unwrap().extend_from_slice(&head);
+    let first = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+    if sock.write_all(first).await.is_err() {
+        return;
+    }
+    release.notified().await;
+    let _ = sock.write_all(b"5\r\nworld\r\n0\r\n\r\n").await;
+}
+
+#[test]
+fn only_a_route_with_a_stream_outlives_the_connection_time_and_its_first_chunk_comes_at_once() {
+    run(async {
+        let short = ProxyConfig {
+            conn_total: Duration::from_millis(700),
+            ..kept()
+        };
+        for (target, long) in [("/ws/events", true), ("/plain", false)] {
+            let release = Arc::new(Notify::new());
+            let up = Raw::start({
+                let release = release.clone();
+                move |sock, seen| events(sock, seen, release.clone())
+            })
+            .await;
+            let forward = streaming(up.addr, stream(5_000, 20_000, false));
+            let rig = Rig::with(short.clone(), Mode::Answer(ALLOW), &forward).await;
+            let (client, task) = rig.connect().await;
+            let mut peer = Peer::new(client);
+            peer.send(&get(target)).await;
+            // The first chunk is here while the upstream has not finished.
+            let head = parse_response(&peer.head().await);
+            assert_eq!(head.status, 200);
+            assert_eq!(head.all("connection") == ["close"], long, "{target}");
+            assert_eq!(peer.take(10).await, b"5\r\nhello\r\n");
+            // Longer than the connection time.
+            sleep(Duration::from_millis(1200)).await;
+            release.notify_one();
+            let rest = peer.rest().await;
+            assert_eq!(rest.ends_with(b"0\r\n\r\n"), long, "{target}: {rest:?}");
+            assert_eq!(
+                rest.windows(5).any(|w| w == b"world"),
+                long,
+                "{target}: {rest:?}"
+            );
+            assert_eq!(rig.finish(task).await.len(), 1);
+        }
+    });
+}
+
+#[test]
+fn a_response_on_a_route_with_a_stream_ends_when_the_upstream_is_silent_for_idle() {
+    run(async {
+        let release = Arc::new(Notify::new());
+        let up = Raw::start({
+            let release = release.clone();
+            move |sock, seen| events(sock, seen, release.clone())
+        })
+        .await;
+        let forward = streaming(up.addr, stream(300, 20_000, false));
+        let rig = Rig::with(kept(), Mode::Answer(ALLOW), &forward).await;
+        let (client, task) = rig.connect().await;
+        let mut peer = Peer::new(client);
+        peer.send(&get("/ws/events")).await;
+        assert_eq!(parse_response(&peer.head().await).status, 200);
+        assert_eq!(peer.take(10).await, b"5\r\nhello\r\n");
+        let began = StdInstant::now();
+        let rest = peer.rest().await;
+        assert!(!rest.windows(5).any(|w| w == b"world") && !rest.ends_with(b"0\r\n\r\n"));
+        assert!(began.elapsed() >= Duration::from_millis(250) && began.elapsed() < 5 * SEC);
+        assert_eq!(rig.finish(task).await.len(), 1);
+        release.notify_one();
     });
 }

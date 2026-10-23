@@ -1251,3 +1251,82 @@ fn the_edits_of_a_route_are_read_and_checked_when_the_file_is_loaded() {
         Some("a rewrite path is set on a route that has no path")
     );
 }
+
+#[test]
+fn the_stream_of_a_route_has_all_its_keys_and_times_from_1_ms_to_24_h_with_idle_not_above_total() {
+    let route =
+        |stream: Value| with_route(serde_json::json!({"upstream": "api", "stream": stream}));
+    let stream_of = |bytes: &[u8]| {
+        let loaded = parse(bytes).unwrap();
+        loaded
+            .forward
+            .routes
+            .find(Some(b"h.test"), b"/")
+            .unwrap()
+            .stream
+    };
+    let times = |idle_ms: u64, total_ms: u64| serde_json::json!({"idle_ms": idle_ms, "total_ms": total_ms, "websocket": false});
+    assert_eq!(
+        stream_of(&route(serde_json::json!({
+            "idle_ms": 1000, "total_ms": 86_400_000, "websocket": true
+        }))),
+        Some(Stream {
+            idle: Duration::from_secs(1),
+            total: Duration::from_secs(86_400),
+            websocket: true,
+        })
+    );
+    assert_eq!(
+        stream_of(&with_route(serde_json::json!({"upstream": "api"}))),
+        None
+    );
+    assert_eq!(stream_of(&route(Value::Null)), None);
+
+    // The times are at the limits, and one past them.
+    for (idle, total) in [(1, 1), (5, 5), (1, 86_400_000), (86_400_000, 86_400_000)] {
+        assert_eq!(
+            refusal_of(&route(times(idle, total))),
+            None,
+            "{idle} {total}"
+        );
+    }
+    let range = "a stream idle_ms or total_ms is out of range";
+    for (idle, total) in [(0, 5), (1, 0), (1, 86_400_001)] {
+        assert_eq!(
+            refusal_of(&route(times(idle, total))),
+            Some(range),
+            "{idle} {total}"
+        );
+    }
+    assert_eq!(
+        refusal_of(&route(times(6, 5))),
+        Some("a stream idle_ms is above its total_ms")
+    );
+    // Every key is there, and nothing else.
+    let missing = "configuration has a missing key";
+    let unknown = "configuration has an unknown key";
+    let wrong = "configuration has a value of the wrong type";
+    for (stream, sentence) in [
+        (serde_json::json!({"idle_ms": 1, "total_ms": 2}), missing),
+        (
+            serde_json::json!({"total_ms": 2, "websocket": true}),
+            missing,
+        ),
+        (serde_json::json!({}), missing),
+        (
+            serde_json::json!({"idle_ms": 1, "total_ms": 2, "websocket": true, "x": 1}),
+            unknown,
+        ),
+        (
+            serde_json::json!({"idle_ms": 1, "total_ms": 2, "websocket": "yes"}),
+            wrong,
+        ),
+        (serde_json::json!([1, 2, true]), wrong),
+    ] {
+        assert_eq!(
+            refusal_of(&route(stream.clone())),
+            Some(sentence),
+            "{stream}"
+        );
+    }
+}

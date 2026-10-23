@@ -121,6 +121,36 @@ pub fn start_logger() -> Result<Log, &'static str> {
     Ok(log)
 }
 
+/// A handle whose lines wait in the queue until a test reads them, and the way to read them.
+#[cfg(test)]
+pub fn recording() -> (Log, Lines) {
+    let (log, items) = open(LOG_QUEUE);
+    (log, Lines(Arc::new(std::sync::Mutex::new(items))))
+}
+
+/// The queue of a handle that `recording` made.
+#[cfg(test)]
+#[derive(Clone)]
+pub struct Lines(Arc<std::sync::Mutex<Receiver<Item>>>);
+
+#[cfg(test)]
+impl Lines {
+    /// The lines queued since the last call.
+    pub fn take(&self) -> Vec<String> {
+        let items = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        items
+            .try_iter()
+            .filter_map(|item| match item {
+                Item::Line(text) => Some(text),
+                Item::Flush(_) => None,
+            })
+            .collect()
+    }
+}
+
 /// Sends panic messages to the record queue instead of writing them to stderr.
 pub fn install_panic_hook(log: Log) {
     std::panic::set_hook(Box::new(move |info| log.line(&format!("panic: {info}"))));

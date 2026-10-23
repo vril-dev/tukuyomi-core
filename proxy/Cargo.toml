@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 tukuyomi-kernel = { path = "../kernel" }
-tokio = { version = "1.53.3", default-features = false, features = ["rt", "net", "time", "sync", "signal"] }
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "net", "time", "sync", "signal", "io-util"] }
 hyper = { version = "1.12.0", default-features = false, features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 http = "1.5.0"

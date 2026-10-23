@@ -7,12 +7,22 @@
 //! connection that has answered all its requests waits for the next one for `keepalive_timeout` (see `gate`).
 //!
 //! The connection goes on after a response unless one of these closes it: the request was HTTP/1.0 or chunked or
-//! said `Connection: close`; `keepalive_timeout` is 0; the connection has served `keepalive_requests` requests or
-//! has lived `keepalive_time`; the body of the request was not read to its end when the answer was given; the stop
-//! has begun (an idle connection is closed at once, one with a request under way after its response). A response
-//! that closes the connection says `Connection: close`, so the client knows. A connection that waits for its
-//! next request is also closed at once when the accept side runs out of connection permits (`Ingress::drain`);
-//! one that is in a request is left alone.
+//! said `Connection: close` or has an `Upgrade` line (the gate reads nothing behind such a head); the route of the
+//! request has a `stream`, so the response may take long and is the last one; `keepalive_timeout` is 0; the
+//! connection has served `keepalive_requests` requests or has lived `keepalive_time`; the body of the request was
+//! not read to its end when the answer was given; the stop has begun (an idle connection is closed at once, one
+//! with a request under way after its response). A response that closes the connection says `Connection: close`,
+//! so the client knows. The 101 of a WebSocket does not: it ends the connection by itself, and once that head has
+//! been passed hyper is not told to wind the connection down, for it would add a `Connection: close` of its own to
+//! the 101. A connection that waits for its next request is also closed at once when the accept side runs out of
+//! connection permits (`Ingress::drain`); one that is in a request is left alone.
+//!
+//! A response from a route with a `stream` that is not a 101 may last longer than the connection time: when its
+//! head is ready, the end of the connection becomes the later of the old end and `total` after the head, and the
+//! client may be silent for that long. After a 101 hyper is done with the connection, and the connection time ends
+//! with it: the tunnel (see `tunnel`) runs over the stream of the client, with the bytes that the gate had read
+//! behind the handshake in front, for the time that the route says. The stop does not end it; the abort at the end
+//! of the time that the connections get does.
 //!
 //! The close is done here, after hyper is done with the connection: the writing direction is ended, and after a
 //! response that closed the connection, or a head that was refused with bytes behind it, the connection reads and
@@ -25,16 +35,15 @@
 //! cut off. The line has the address of the client that the inspection was told (see `conn`); a line that is
 //! written before a request has been read has the address of the peer. A request that was sent to an upstream has
 //! the group and the server in its line. A connection that never had a response, and
-//! one that was closed over a head that was refused after the first, have a line of their own when they end.
+//! one that was closed over a head that was refused after the first, have a line of their own when they end. So does
+//! a tunnel, also one that never ran (see `tunnel`).
 
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::{Pin, pin};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -46,10 +55,11 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout_at};
 use tukuyomi_kernel::limits;
 
-use crate::config::ProxyConfig;
+use crate::config::{ProxyConfig, Stream};
+use crate::forward::tunnel::Tunnel;
 use crate::inbound::answer::{Abort, Class, Noted, Out, Reply, answer, close_after, record};
 use crate::inbound::conn::{Conn, Ctx, Handled, after};
 use crate::inbound::gate::{Finish, Gate, Link, Settings, Taken};
@@ -93,8 +103,8 @@ struct Session {
     local: SocketAddr,
     id: u64,
     accept: Instant,
-    /// End of the connection.
-    conn_by: Instant,
+    /// End of the connection. A response that may take long puts it off (`lengthen`).
+    conn_by: Mutex<Instant>,
     link: Arc<Link>,
     gauge: Gauge,
     /// Requests that hyper handed to the service.
@@ -103,6 +113,9 @@ struct Session {
     recorded: AtomicU64,
     /// A response that ends the connection was given.
     closing: AtomicBool,
+    /// The tunnel that the 101 response started. It runs once hyper is done with the connection. It has the line for
+    /// its end from the start, so it is written also if the tunnel is dropped here.
+    tunnel: Mutex<Option<Tunnel>>,
     /// The reply of the response that was recorded last, for the tests of the record.
     #[cfg(test)]
     last: Mutex<Reply>,
@@ -144,8 +157,15 @@ pub(super) async fn run(
         return session.refuse(&mut gate, reject).await;
     }
     let end = session.drive(&mut gate).await;
-    session.close(&mut gate, end).await;
+    match session.take_tunnel(end) {
+        Some(tunnel) => session.run_tunnel(&mut gate, tunnel).await,
+        None => session.close(&mut gate, end).await,
+    }
     session.summary(&gate, end)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Session {
@@ -166,20 +186,28 @@ impl Session {
             local,
             id: NEXT_CONN.fetch_add(1, Ordering::Relaxed),
             accept,
-            conn_by: after(accept, cfg.conn_total),
+            conn_by: Mutex::new(after(accept, cfg.conn_total)),
             link,
             gauge,
             served: AtomicU64::new(0),
             recorded: AtomicU64::new(0),
             closing: AtomicBool::new(false),
+            tunnel: Mutex::new(None),
             #[cfg(test)]
             last: Mutex::new(Reply::NONE),
         });
         (session, gate)
     }
 
+    fn conn_by(&self) -> Instant {
+        *lock(&self.conn_by)
+    }
+
     /// Lets hyper serve the connection to its end. The stop makes hyper close the connection when it is idle, and
-    /// after the response of the request under way otherwise. A stop that began before this is seen by `then`.
+    /// after the response of the request under way otherwise, unless the last head has an `Upgrade` line: nothing
+    /// follows that, and hyper would add `Connection: close` to a 101. A stop that began before this is seen by
+    /// `then`. If a 101 was given, hyper must not have read a byte behind the handshake (the gate gives it none),
+    /// or the connection ends in an error.
     async fn drive<T>(self: &Arc<Self>, gate: &mut Gate<T>) -> End
     where
         T: AsyncRead + AsyncWrite + Unpin,
@@ -189,7 +217,8 @@ impl Session {
             let session = self.clone();
             service_fn(move |req: Request<Incoming>| {
                 let session = session.clone();
-                async move { session.request(req).await }
+                // Boxed, for a connection that is polled without its shutdown needs a future that is `Unpin`.
+                Box::pin(async move { session.request(req).await })
             })
         };
         let mut server = http1::Builder::new();
@@ -217,25 +246,45 @@ impl Session {
             }
         });
         let mut told = false;
-        let mut conn = pin!(server.serve_connection(TokioIo::new(&mut *gate), service));
-        let ended = timeout_at(
-            self.conn_by,
-            poll_fn(|cx| {
-                if !told
-                    && (changed.as_mut().poll(cx).is_ready()
-                        || drained.as_mut().poll(cx).is_ready())
-                {
-                    told = true;
-                    conn.as_mut().graceful_shutdown();
+        let mut conn = server.serve_connection(TokioIo::new(&mut *gate), service);
+        let mut by = self.conn_by();
+        let mut limit = pin!(sleep_until(by));
+        let ended = poll_fn(|cx| {
+            if !told
+                && (changed.as_mut().poll(cx).is_ready() || drained.as_mut().poll(cx).is_ready())
+            {
+                told = true;
+                if !self.link.last() {
+                    Pin::new(&mut conn).graceful_shutdown();
                 }
-                conn.as_mut().poll(cx)
-            }),
-        )
+            }
+            if let Poll::Ready(done) = conn.poll_without_shutdown(cx) {
+                return Poll::Ready(Some(done));
+            }
+            // The service may have put off the end of the connection while it was polled.
+            let now_by = self.conn_by();
+            if now_by != by {
+                limit.as_mut().reset(now_by);
+                by = now_by;
+            }
+            if limit.as_mut().poll(cx).is_ready() {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            }
+        })
         .await;
         match ended {
-            Ok(Ok(())) => End::Done,
-            Ok(Err(_)) => End::Error,
-            Err(_) => End::Limit,
+            None => End::Limit,
+            Some(Err(_)) => End::Error,
+            Some(Ok(())) => {
+                let tunnel = lock(&self.tunnel).is_some();
+                if tunnel && !conn.into_parts().read_buf.is_empty() {
+                    End::Error
+                } else {
+                    End::Done
+                }
+            }
         }
     }
 
@@ -257,16 +306,31 @@ impl Session {
         };
         let conn = Conn::new(
             &self.ctx,
+            self.id,
             head,
             self.peer,
             self.local,
             self.gauge.clone(),
             after(start, self.ctx.cfg.request_total),
         );
-        let Handled { noted, response } = conn.handle(parts, body).await;
+        let Handled {
+            noted,
+            response,
+            tunnel,
+            stream,
+        } = conn.handle(parts, body).await;
         match response {
             Ok(response) => {
-                let then = self.then(&conn, n);
+                // The 101 ends the connection by itself, so it is not marked as the last response.
+                let then = if let Some(tunnel) = tunnel {
+                    *lock(&self.tunnel) = Some(tunnel);
+                    Then::Keep
+                } else {
+                    self.then(&conn, n, stream.is_some())
+                };
+                if let Some(stream) = &stream {
+                    self.lengthen(stream);
+                }
                 let old = conn.head().http10();
                 Ok(self.respond(noted, response, then, old, start))
             }
@@ -277,8 +341,9 @@ impl Session {
         }
     }
 
-    /// What the connection does after the response to the `n`th request.
-    fn then(&self, conn: &Conn, n: u64) -> Then {
+    /// What the connection does after the response to the `n`th request. `long` is true for a response that may take
+    /// long: it is the last.
+    fn then(&self, conn: &Conn, n: u64, long: bool) -> Then {
         let cfg = &self.ctx.cfg;
         let head = conn.head();
         let spent = n >= u64::try_from(cfg.keepalive_requests).unwrap_or(u64::MAX)
@@ -287,12 +352,28 @@ impl Session {
             || head.http10()
             || head.chunked()
             || head.close()
+            || head.upgrade()
+            || long
             || cfg.keepalive_timeout.is_zero();
         if closing || spent || self.ctx.ingress.is_closed() {
             Then::Close
         } else {
             Then::Keep
         }
+    }
+
+    /// The head of a response that may take long is ready: the connection lasts until `total` after now at the
+    /// earliest, and the client may be silent for that long (and for the connection time, if that is more). The old
+    /// end has not come: the head was ready within the request time, which `keepalive_time` leaves inside the
+    /// connection time.
+    fn lengthen(&self, stream: &Stream) {
+        let by = after(Instant::now(), stream.total);
+        {
+            let mut conn_by = lock(&self.conn_by);
+            *conn_by = (*conn_by).max(by);
+        }
+        self.gauge
+            .restart(stream.total.max(self.ctx.cfg.conn_total));
     }
 
     /// The response as it goes to hyper: marked as the last one if the connection ends with it, an HTTP/1.0
@@ -329,7 +410,7 @@ impl Session {
         let reply = noted.reply;
         #[cfg(test)]
         {
-            *self.last.lock().unwrap_or_else(PoisonError::into_inner) = reply;
+            *lock(&self.last) = reply;
         }
         self.recorded.fetch_add(1, Ordering::Relaxed);
         if reply.internal {
@@ -352,11 +433,11 @@ impl Session {
     async fn refuse(&self, gate: &mut Gate<TcpStream>, reject: Reject) -> Summary {
         let cfg = &self.ctx.cfg;
         let reply = if let Some(answer) = reject.response() {
-            let by = after(Instant::now(), cfg.response_idle).min(self.conn_by);
+            let by = after(Instant::now(), cfg.response_idle).min(self.conn_by());
             let sock = gate.stream();
             let _ = timeout_at(by, send_and_close(sock, answer)).await;
             if reject != Reject::Timeout {
-                linger(sock, cfg, self.conn_by).await;
+                linger(sock, cfg, self.conn_by()).await;
             }
             Reply::of(reject)
         } else {
@@ -380,12 +461,34 @@ impl Session {
         }
         let cfg = &self.ctx.cfg;
         let lingers = self.closing.load(Ordering::Acquire) || gate.failure().is_some();
-        let by = after(Instant::now(), cfg.response_idle).min(self.conn_by);
+        let by = after(Instant::now(), cfg.response_idle).min(self.conn_by());
         let sock = gate.stream();
         let _ = timeout_at(by, close_write(sock)).await;
         if lingers {
-            linger(sock, cfg, self.conn_by).await;
+            linger(sock, cfg, self.conn_by()).await;
         }
+    }
+
+    /// The tunnel of a 101 that was given and whose connection ended well; any other is given up, which closes the
+    /// connection to the upstream and writes the line for its end.
+    fn take_tunnel(&self, end: End) -> Option<Tunnel> {
+        let tunnel = lock(&self.tunnel).take()?;
+        if end == End::Done {
+            Some(tunnel)
+        } else {
+            tunnel.failed();
+            None
+        }
+    }
+
+    /// Runs the tunnel over the stream of the client, with what the gate had read behind the handshake in front,
+    /// and ends the writing direction. The time of the connection is not asked: the tunnel has its own.
+    async fn run_tunnel(&self, gate: &mut Gate<TcpStream>, tunnel: Tunnel) {
+        let rest = gate.take_rest();
+        let sock = gate.stream();
+        tunnel.run(&mut *sock, rest, &self.ctx.cfg).await;
+        let by = after(Instant::now(), self.ctx.cfg.response_idle);
+        let _ = timeout_at(by, close_write(sock)).await;
     }
 
     /// The reply of the last request, and the line the end of the connection adds: for a head that was refused
@@ -411,7 +514,7 @@ impl Session {
         Summary {
             id: self.id,
             #[cfg(test)]
-            last: *self.last.lock().unwrap_or_else(PoisonError::into_inner),
+            last: *lock(&self.last),
             line,
         }
     }

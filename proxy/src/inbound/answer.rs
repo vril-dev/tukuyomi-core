@@ -199,6 +199,18 @@ pub(super) struct Noted {
     pub(super) via: Option<Via>,
 }
 
+/// The words of a record line that tell for whom it is: the address of the client and, for a request that was sent
+/// to an upstream, the group and the server.
+pub(super) fn who(client: IpAddr, via: Option<&Via>) -> String {
+    let upstream = via.map_or_else(String::new, |via| {
+        let server = via
+            .server
+            .map_or_else(|| "-".to_string(), |s| s.to_string());
+        format!(" upstream {}/{server}", via.group)
+    });
+    format!("client {}{upstream}", client.to_canonical())
+}
+
 /// The one record line of a request: its connection's number, class, status, reason, rule id, the time it took and
 /// the address of the client, and, for a request that was sent to an upstream, the group and the server. Only
 /// numbers, fixed texts, the name of a group from the configuration and addresses in their canonical forms, so
@@ -214,19 +226,13 @@ pub(super) fn record(
     let rule = reply
         .rule
         .map_or_else(|| "-".to_string(), |rule| rule.to_string());
-    let upstream = via.map_or_else(String::new, |via| {
-        let server = via
-            .server
-            .map_or_else(|| "-".to_string(), |s| s.to_string());
-        format!(" upstream {}/{server}", via.group)
-    });
     format!(
-        "conn {id}: {} {} {} rule {rule} {} ms client {}{upstream}",
+        "conn {id}: {} {} {} rule {rule} {} ms {}",
         reply.class.name(),
         reply.status,
         reply.reason,
         elapsed.as_millis(),
-        client.to_canonical()
+        who(client, via)
     )
 }
 

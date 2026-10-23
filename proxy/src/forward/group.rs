@@ -1,12 +1,12 @@
 //! The upstream groups, the routes that choose one, and which servers of a group can be used.
 //!
 //! A request goes to the route that is the most exact of those holding for it, or to the default route, which
-//! names the default group and turns nobody away and edits nothing; with neither it has no route
-//! (`Upstreams::find`). A route names a group, tells which clients may use it (`Access`) and how the request and the
-//! response are edited (`Rewrite`). A request may be another way to write a request for a route that it does not
-//! hold for, so the access lists of every route that it could be taken for are asked for, not only those of the
-//! route it goes to (`Upstreams::accesses`), and only if some route has a list (`Upstreams::guarded`). A group has
-//! one or more servers and one pool of waiting connections
+//! names the default group and turns nobody away, edits nothing and has no `stream`; with neither it has no route
+//! (`Upstreams::find`). A route names a group, tells which clients may use it (`Access`), how the request and the
+//! response are edited (`Rewrite`) and whether its responses may take long (`Stream`). A request may be another way
+//! to write a request for a route that it does not hold for, so the access lists of every route that it could be
+//! taken for are asked for, not only those of the route it goes to (`Upstreams::accesses`), and only if some route
+//! has a list (`Upstreams::guarded`). A group has one or more servers and one pool of waiting connections
 //! that they share, so the connections that wait are bounded for the group, not for each server. The server a
 //! request goes to is chosen by weight among the servers that can be used and that the request has not tried yet
 //! (see `select`).
@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tokio::time::Instant;
 
-use crate::config::{ForwardConfig, GroupConfig, ProxyConfig, RouteConfig, ServerConfig};
+use crate::config::{ForwardConfig, GroupConfig, ProxyConfig, RouteConfig, ServerConfig, Stream};
 use crate::forward::client_ip::Access;
 use crate::forward::pool::Pool;
 use crate::forward::rewrite::Rewrite;
@@ -44,10 +44,13 @@ pub struct Upstreams {
     guarded: bool,
 }
 
-/// The route a request takes: the group it goes to, and how it edits the request and the response.
+/// The route a request takes: the group it goes to, how it edits the request and the response, and the times of a
+/// response that may take long.
+#[derive(Clone, Copy)]
 pub struct Route<'a> {
     pub group: &'a Group,
     pub rewrite: &'a Rewrite,
+    pub stream: Option<&'a Stream>,
 }
 
 impl Upstreams {
@@ -79,6 +82,7 @@ impl Upstreams {
         Some(Route {
             group: self.groups.get(found.group)?,
             rewrite: &found.rewrite,
+            stream: found.stream.as_ref(),
         })
     }
 

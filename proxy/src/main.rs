@@ -23,12 +23,14 @@
 //! The first cause of a stop (a signal, or a failure of start-up or of the driver) fixes the time `t0`. The stop
 //! closes the listener and the way from the connections to the driver (a request that starts from then on is
 //! refused, and a connection that waits for its next request is closed), tells the driver to finish inspecting by
-//! `t0 + stop_inspect`, waits for the connections until `t0 + stop_wait` and aborts what is left, then waits for
-//! the driver's end until `t0 + stop_wait + kill_grace`. The exit code is 0 only when the stop was not caused by a failure and the driver
-//! reports a stopped kernel whose child exit and per-start directory removal are confirmed, and the same for every
-//! kernel that was stopped before it; 1 for any other end, and for names of upstream servers that cannot be looked up
-//! or a refused rules store or generation (nothing has been started then); 2 for a wrong argument or a refused
-//! configuration. The log is flushed for at most 200 ms at the end.
+//! `t0 + stop_inspect`, waits for the connections until `t0 + stop_wait` and aborts what is left (a tunnel, which is
+//! a WebSocket that the proxy copies, is not ended by the stop: it runs until it ends by itself or is aborted
+//! there), then waits for the driver's end until `t0 + stop_wait + kill_grace`. The exit code is 0 only when the
+//! stop was not caused by a failure and the driver reports a stopped kernel whose child exit and per-start
+//! directory removal are confirmed, and the same for every kernel that was stopped before it; 1 for any other end,
+//! and for names of upstream servers that cannot be looked up or a refused rules store or generation (nothing has
+//! been started then); 2 for a wrong argument or a refused configuration. The log is flushed for at most 200 ms at
+//! the end.
 
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};

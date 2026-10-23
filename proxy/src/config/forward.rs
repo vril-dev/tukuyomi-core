@@ -12,11 +12,14 @@
 //! starts with a letter (an OS takes `127.1` or `0x7f000001` for an address, not for a name); the port is 1 to 65535
 //! without a leading zero. The configuration does not look a name up: that is done once, when the proxy starts (see
 //! `forward::resolve`), and each address of a name is a server of the group.
-//! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?}`. The `host` and the
-//! `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access` and `rewrite` are
-//! the networks that may use the route and the edits it makes (see `rewrite`). `default_upstream` is the group that
-//! serves a request no route holds for, or the empty string, and then such a request is answered with 404. The
-//! default group has no `access` and no `rewrite`. The `path` of a route that has an access list is in its canonical
+//! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?}`. The `host`
+//! and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access` and
+//! `rewrite` are the networks that may use the route and the edits it makes (see `rewrite`). `stream` is `{"idle_ms",
+//! "total_ms", "websocket"}`, all three present: a response on the route may last `total_ms` from its head at the
+//! most (1 ms to 24 h) while the upstream may be silent for `idle_ms` (1 ms up to `total_ms`) and `websocket` tells
+//! whether a WebSocket handshake is let through. `default_upstream` is the group that serves a request no route
+//! holds for, or the empty string, and then such a request is answered with 404. The default group has no
+//! `access`, no `rewrite` and no `stream`. The `path` of a route that has an access list is in its canonical
 //! form (see `route`): its escapes are in uppercase and none stands for a byte that a path holds as it is, for a
 //! request is held to the list of the route that its path in canonical form meets, and would not meet this one. If
 //! any route has an access list, no route has a port in its `host`: the client writes the port, and a request that
@@ -31,7 +34,7 @@ use serde::Deserialize;
 use serde::de::{Deserializer, Error, MapAccess, Visitor};
 
 use super::rewrite::{self, RawAccess, RawRewrite};
-use super::{ConfigError, Object, ensure, millis, same};
+use super::{ConfigError, MAX_CONN_MS, Object, ensure, millis, same};
 use crate::forward::client_ip::Access;
 use crate::forward::rewrite::Rewrite;
 use crate::route::{Rule, Table, parse_port};
@@ -71,22 +74,34 @@ pub struct GroupConfig<A = SocketAddr> {
     pub servers: Vec<ServerConfig<A>>,
 }
 
-/// What a route does with a request: the group it goes to (the index of the group in `groups`), who may use it, and
-/// the edits it makes to the request and to the response.
+/// The times of a response on a route that may take long, and whether the route lets a WebSocket through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stream {
+    /// How long the upstream may be silent.
+    pub idle: Duration,
+    /// The longest a response lasts, counted from its head.
+    pub total: Duration,
+    pub websocket: bool,
+}
+
+/// What a route does with a request: the group it goes to (the index of the group in `groups`), who may use it, the
+/// edits it makes to the request and to the response, and whether its responses may take long.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteConfig {
     pub group: usize,
     pub access: Access,
     pub rewrite: Rewrite,
+    pub stream: Option<Stream>,
 }
 
 impl RouteConfig {
-    /// A route to the group at index `group` that turns nobody away and edits nothing.
+    /// A route to the group at index `group` that turns nobody away, edits nothing and has no `stream`.
     pub fn plain(group: usize) -> RouteConfig {
         RouteConfig {
             group,
             access: Access::default(),
             rewrite: Rewrite::default(),
+            stream: None,
         }
     }
 }
@@ -170,6 +185,15 @@ struct RawRoute {
     upstream: String,
     access: Option<Object<RawAccess>>,
     rewrite: Option<Object<RawRewrite>>,
+    stream: Option<Object<RawStream>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStream {
+    idle_ms: u64,
+    total_ms: u64,
+    websocket: bool,
 }
 
 /// The groups in the order of the file. A name that is repeated is a repeated key, which a map would swallow.
@@ -250,6 +274,26 @@ fn server_address(text: &str) -> Result<Address, ConfigError> {
         name: name.to_owned(),
         port,
     })
+}
+
+/// The `stream` of a route: both times from 1 ms to 24 h, and the idle time not above the total.
+fn stream(raw: Option<Object<RawStream>>) -> Result<Option<Stream>, ConfigError> {
+    let Some(Object(raw)) = raw else {
+        return Ok(None);
+    };
+    ensure(
+        (1..=MAX_CONN_MS).contains(&raw.idle_ms) && (1..=MAX_CONN_MS).contains(&raw.total_ms),
+        "a stream idle_ms or total_ms is out of range",
+    )?;
+    ensure(
+        raw.idle_ms <= raw.total_ms,
+        "a stream idle_ms is above its total_ms",
+    )?;
+    Ok(Some(Stream {
+        idle: Duration::from_millis(raw.idle_ms),
+        total: Duration::from_millis(raw.total_ms),
+        websocket: raw.websocket,
+    }))
 }
 
 fn servers(
@@ -338,6 +382,7 @@ pub(super) fn check(raw: RawForward, listen: SocketAddr) -> Result<ForwardSettin
                 group,
                 access,
                 rewrite: rewrite::rewrite(route.path.as_deref(), route.rewrite)?,
+                stream: stream(route.stream)?,
             },
         ));
     }

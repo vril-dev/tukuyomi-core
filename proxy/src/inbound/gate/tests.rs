@@ -257,6 +257,57 @@ fn a_chunked_head_is_the_last_one_and_the_bytes_after_it_are_capped() {
     });
 }
 
+const UPGRADE_GET: &str =
+    "GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+#[test]
+fn a_head_with_an_upgrade_line_is_the_last_one_and_what_follows_it_is_kept_back() {
+    run(async {
+        let (client, mut gate, link, _) = rig(settings()).await;
+        assert!(!link.last());
+        let mut input = UPGRADE_GET.as_bytes().to_vec();
+        input.extend_from_slice(&get("/after"));
+        put(&client, &input).await;
+        let (bytes, ended) = drain(&mut gate).await;
+        // Only the head goes on; the gate waits, and the second request is neither queued nor handed on.
+        assert_eq!(bytes, UPGRADE_GET.as_bytes());
+        assert!(!ended);
+        assert_eq!(queued_targets(&link), ["/ws"]);
+        assert!(link.last());
+        // More bytes are not read at all, so they are neither handed on nor kept.
+        put(&client, &get("/later")).await;
+        let (bytes, ended) = drain(&mut gate).await;
+        assert!(bytes.is_empty() && !ended);
+        assert_eq!(queued_targets(&link), ["/ws"]);
+        // What the gate had read behind the head is given back, once, for the tunnel.
+        assert_eq!(&gate.take_rest()[..], &get("/after")[..]);
+        assert!(gate.take_rest().is_empty());
+        let mut left = vec![0u8; 64];
+        let n = poll_fn(|cx| {
+            let mut buf = ReadBuf::new(&mut left);
+            ready!(Pin::new(gate.stream()).poll_read(cx, &mut buf))?;
+            Poll::Ready(Ok::<_, io::Error>(buf.filled().len()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(&left[..n], &get("/later")[..]);
+
+        // The body that a Content-Length says goes on with the head.
+        let (client, mut gate, _, _) = rig(settings()).await;
+        let with_body = format!(
+            "POST /h2c HTTP/1.1\r\nHost: h\r\nUpgrade: h2c\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\na=b{}",
+            String::from_utf8_lossy(&get("/after"))
+        );
+        put(&client, with_body.as_bytes()).await;
+        let (bytes, _) = drain(&mut gate).await;
+        assert_eq!(
+            bytes,
+            with_body.as_bytes()[..with_body.len() - get("/after").len()]
+        );
+        assert_eq!(&gate.take_rest()[..], &get("/after")[..]);
+    });
+}
+
 #[test]
 fn an_idle_connection_ends_after_the_wait_and_a_partial_head_after_its_own_time() {
     run(async {

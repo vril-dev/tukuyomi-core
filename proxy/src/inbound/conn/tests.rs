@@ -18,7 +18,7 @@ use super::*;
 use crate::config::{ForwardConfig, RouteConfig};
 use crate::inbound::session::{run as run_session, serve};
 use crate::inspect::driver::Outcome;
-use crate::log::start_logger;
+use crate::log::{Lines, recording};
 use crate::route::{Rule, Table};
 use crate::rules::routes::{Route, Routes};
 
@@ -165,6 +165,8 @@ pub(in crate::inbound) struct Rig {
     driver: Option<JoinHandle<Vec<Seen>>>,
     /// The receiving end of a way that is full, kept so that it stays open.
     _full: Option<Receiver<Msg>>,
+    /// The lines that the connections wrote to the record.
+    pub(in crate::inbound) lines: Lines,
 }
 
 fn runtime() -> Runtime {
@@ -200,13 +202,14 @@ impl Rig {
         } else {
             PERMITS + 1
         });
+        let (log, lines) = recording();
         let ctx = Arc::new(Ctx {
             upstreams: Upstreams::new(forward, &cfg),
             cfg,
             budget,
             inspect: Arc::new(Semaphore::new(PERMITS)),
             routes: SharedRoutes::new(Routes::default()),
-            log: start_logger().unwrap(),
+            log,
             ingress: Arc::new(Ingress::new(tx.clone())),
         });
         let (driver, full) = match mode {
@@ -227,6 +230,7 @@ impl Rig {
             tx: Some(tx),
             driver,
             _full: full,
+            lines,
         }
     }
 

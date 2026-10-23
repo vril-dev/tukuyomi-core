@@ -5,7 +5,9 @@
 //! connections to the upstream are not kept), the edits of the route are made (see `rewrite`), and the body is the
 //! inspected bytes. The names that the client listed in `Connection` are collected before anything is removed and
 //! are removed with the other hop-by-hop fields. The fields that are added come after the removal, so a client
-//! cannot take them away by naming them.
+//! cannot take them away by naming them. The handshake of a WebSocket that the route lets through is the one request
+//! that asks the upstream to switch protocols: it gets `Connection: upgrade` and `Upgrade: websocket` as fixed
+//! values, which neither the client nor the route can change.
 //!
 //! The forwarding fields tell the upstream who the client is. A peer that is in `trusted_proxies` is believed: its
 //! `X-Forwarded-For` lines are kept and its own address is added at the end, and its `X-Forwarded-Proto` is kept if
@@ -45,7 +47,11 @@
 //! field that is not a list of tokens or that names a field the answer must keep are refused, and the connection
 //! to the upstream is dropped with it. A refused answer is never partly passed on. The fields that belong to the
 //! connection with the upstream are removed, and the trailers of the answer are dropped. The response edits of the
-//! route are made on the head that is left, so they do not reach an answer the proxy makes itself.
+//! route are made on the head that is left, so they do not reach an answer the proxy makes itself. A 101 is such an
+//! answer that is refused, except to a handshake of a WebSocket: if its `Upgrade` is one line that is `websocket`
+//! and its `Connection` lists `upgrade`, the head goes on with those two fields as fixed values and without a
+//! length, and the connection to the upstream is not kept in the pool but handed over for a tunnel (`Switch`, see
+//! `tunnel`); any other 101 is refused. Any other answer to the handshake is an answer like that to any request.
 //!
 //! Every wait before the head of the answer ends at an absolute instant that is never extended, and a stage whose
 //! end has already been reached does not start (see `Stage`). Informational responses are read over and not passed
@@ -61,14 +67,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::{
-    CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST,
-    InvalidHeaderName, TRANSFER_ENCODING,
-};
-use http::response::Parts;
+use http::header::{CONNECTION, HOST, InvalidHeaderName, UPGRADE};
 use http::{
-    Extensions, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
-    Version,
+    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
 };
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::Full;
@@ -78,15 +79,19 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
 
+use self::head::{check_head, check_switch, lasts};
 use crate::config::ProxyConfig;
 use crate::forward::client_ip;
 use crate::forward::group::{Group, Server, Tried};
 use crate::forward::pool::{Lease, Pool};
 use crate::forward::rewrite::Rewrite;
+use crate::forward::tunnel::Switch;
 use crate::inbound::conn::Ctx;
 use crate::inbound::head::trim_ows;
 use crate::inbound::io::{Gauge, Guarded};
 use crate::inspect::driver::BodyHold;
+
+mod head;
 
 static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 static X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
@@ -141,16 +146,19 @@ pub(super) const CLIENT_CLAIMS: [&str; 13] = [
 ];
 
 /// An allowed request, as it is forwarded. `peer` is the address of the connection the request came on.
+/// `websocket` is true for the handshake of a WebSocket that the route lets through.
 pub struct Forward {
     pub method: Method,
     pub uri: Uri,
     pub fields: HeaderMap,
     pub body: Arc<BodyHold>,
     pub peer: SocketAddr,
+    pub websocket: bool,
 }
 
 /// The upstream's response body without its trailers. At its end the connection to the upstream goes back to the
-/// pool, if the exchange allows it. Dropping the body before that ends the connection.
+/// pool, if the exchange allows it. Dropping the body before that ends the connection. The body of a 101 is empty and
+/// holds the connection as a `Switch`, which is taken out before the response is passed on.
 pub struct OriginBody {
     body: Incoming,
     /// The connection, until the body has ended.
@@ -158,9 +166,23 @@ pub struct OriginBody {
     pool: Pool,
     /// Nothing in the answer ends the connection.
     reuse: bool,
+    switch: Option<Switch>,
 }
 
 impl OriginBody {
+    /// The answer may take long: the upstream may be silent for `idle` from now on, until the connection goes back
+    /// to the pool, which sets the limit of the wait there.
+    pub fn stream(&self, idle: Duration) {
+        if let Some(lease) = &self.lease {
+            lease.gauge.restart(idle);
+        }
+    }
+
+    /// The connection to the upstream, if the answer was the 101 of a handshake.
+    pub fn take_switch(&mut self) -> Option<Switch> {
+        self.switch.take()
+    }
+
     /// The body has ended: the connection goes back to the pool, or is closed if the answer ended it.
     fn end(&mut self) {
         if let Some(lease) = self.lease.take()
@@ -329,12 +351,14 @@ fn forwarded_proto(fields: &HeaderMap) -> HeaderValue {
 /// The fields the upstream gets, in this order: the names listed in `Connection` are collected from the fields as
 /// they were inspected; the hop-by-hop fields and the listed names are removed; if the peer is not `trusted`, so
 /// are the fields by which it says who the client is; then the forwarding fields are put in, and `Connection:
-/// close` if `close`. All other fields stay as they were inspected.
+/// upgrade` with `Upgrade: websocket` for a handshake, or `Connection: close` if `close`. All other fields stay as
+/// they were inspected.
 fn forwarded_fields(
     mut fields: HeaderMap,
     peer: IpAddr,
     trusted: bool,
     close: bool,
+    websocket: bool,
 ) -> Result<HeaderMap, OriginError> {
     let named: Vec<HeaderName> = fields
         .get_all(CONNECTION)
@@ -366,78 +390,13 @@ fn forwarded_fields(
         }
     }
     fields.insert(X_FORWARDED_PROTO.clone(), proto);
-    if close {
+    if websocket {
+        fields.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        fields.insert(UPGRADE, HeaderValue::from_static("websocket"));
+    } else if close {
         fields.insert(CONNECTION, HeaderValue::from_static("close"));
     }
     Ok(fields)
-}
-
-/// Digits only and a value that fits in 64 bits (a leading `+` is not a digit).
-fn is_length(value: &[u8]) -> bool {
-    !value.is_empty()
-        && value.iter().all(u8::is_ascii_digit)
-        && std::str::from_utf8(value).is_ok_and(|digits| digits.parse::<u64>().is_ok())
-}
-
-/// The only line of `name`, if there is one; more than one line is refused whatever the lines say.
-fn single<'a>(
-    headers: &'a HeaderMap,
-    name: &HeaderName,
-) -> Result<Option<&'a HeaderValue>, OriginError> {
-    let mut lines = headers.get_all(name).iter();
-    let first = lines.next();
-    if lines.next().is_some() {
-        return Err(OriginError::Invalid);
-    }
-    Ok(first)
-}
-
-/// Checks the head of the final response and takes out what belongs to the connection with the upstream.
-/// `head_request` is true when the request was a HEAD request. The checked `Content-Length` of the upstream stays
-/// in the head for a HEAD request and for a 304 only; otherwise it goes, and hyper sets the length from the body it
-/// sends. hyper's server writes a kept length only in the answer to a HEAD request: a 304 to any other request goes
-/// out without one.
-fn check_head(parts: &mut Parts, head_request: bool) -> Result<(), OriginError> {
-    if !(200..=599).contains(&parts.status.as_u16()) {
-        return Err(OriginError::Invalid);
-    }
-    let headers = &mut parts.headers;
-    match (
-        single(headers, &TRANSFER_ENCODING)?,
-        single(headers, &CONTENT_LENGTH)?,
-    ) {
-        (Some(_), Some(_)) => return Err(OriginError::Invalid),
-        (Some(coding), None) if !coding.as_bytes().eq_ignore_ascii_case(b"chunked") => {
-            return Err(OriginError::Invalid);
-        }
-        (None, Some(length)) if !is_length(length.as_bytes()) => return Err(OriginError::Invalid),
-        _ => {}
-    }
-    // The names are removed as the lines are read. An answer that is refused is not used at all, so this is the
-    // same as removing them afterwards, and no list of names is built from what the upstream sent.
-    let lines: Vec<HeaderValue> = headers.get_all(CONNECTION).iter().cloned().collect();
-    for line in &lines {
-        for name in listed(line) {
-            let name = name.map_err(|_| OriginError::Invalid)?;
-            if name == CONTENT_LENGTH
-                || name == CONTENT_TYPE
-                || name == CONTENT_ENCODING
-                || name == CONTENT_RANGE
-            {
-                return Err(OriginError::Invalid);
-            }
-            headers.remove(&name);
-        }
-    }
-    for name in RESPONSE_HOP {
-        headers.remove(name);
-    }
-    if !head_request && parts.status != StatusCode::NOT_MODIFIED {
-        headers.remove(CONTENT_LENGTH);
-    }
-    parts.version = Version::HTTP_11;
-    parts.extensions = Extensions::new();
-    Ok(())
 }
 
 /// True when the error was caused by an idle limit of the connection that ran out.
@@ -477,24 +436,6 @@ fn idempotent(method: &Method) -> bool {
         *method,
         Method::GET | Method::HEAD | Method::OPTIONS | Method::PUT | Method::DELETE | Method::TRACE
     )
-}
-
-/// True when nothing in the head of the answer ends the connection with the upstream: it is HTTP/1.1, no
-/// `Connection` line lists `close` or `upgrade`, and the body is not the bytes up to the end of the connection
-/// (the answer to a HEAD request, a 204 and a 304 have none, the others say how long they are).
-fn lasts(parts: &Parts, head_request: bool) -> bool {
-    let framed = head_request
-        || matches!(parts.status.as_u16(), 204 | 304)
-        || parts.headers.contains_key(CONTENT_LENGTH)
-        || parts.headers.contains_key(TRANSFER_ENCODING);
-    framed
-        && parts.version == Version::HTTP_11
-        && !parts
-            .headers
-            .get_all(CONNECTION)
-            .iter()
-            .flat_map(listed)
-            .any(|name| name.is_ok_and(|name| name == "close" || name == "upgrade"))
 }
 
 /// The most bytes that are read from the upstream up to the final head. A value that does not fit into 64 bits
@@ -556,20 +497,23 @@ async fn connect(
         .handshake(TokioIo::new(guarded))
         .await
         .map_err(|_| OriginError::Local)?;
+    // With upgrades, the task hands the socket over when the upstream answers a handshake with 101.
     let task = tokio::spawn(async move {
-        let _ = conn.await;
+        let _ = conn.with_upgrades().await;
     });
     Ok(Lease::new(sender, gauge, task.abort_handle()))
 }
 
 /// Sends `request` on the connection and returns the checked head of the answer; `head` bounds that. The
 /// connection is closed if this fails. It goes back to `pool` at the end of the body of the answer if nothing in
-/// the head ends it.
+/// the head ends it. If the request is the handshake of a WebSocket (`websocket`) and the answer is a 101, the
+/// connection is kept in the answer for a tunnel instead.
 async fn exchange(
     mut lease: Lease,
     request: Request<Sent>,
     head: Stage,
     head_request: bool,
+    websocket: bool,
     pool: &Pool,
 ) -> Result<Response<OriginBody>, OriginError> {
     if reached(head.end) {
@@ -577,7 +521,7 @@ async fn exchange(
     }
     let base = lease.gauge.read();
     lease.used = lease.used.saturating_add(1);
-    let response = match timeout_at(head.end, lease.sender.send_request(request)).await {
+    let mut response = match timeout_at(head.end, lease.sender.send_request(request)).await {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => return Err(failure(&e, &lease.gauge, base)),
         Err(_) => return Err(head.ran_out(OriginError::Head)),
@@ -588,6 +532,20 @@ async fn exchange(
     if lease.gauge.over() {
         return Err(OriginError::Invalid);
     }
+    if websocket && response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        // The handle is taken before the head is checked, which drops the extensions.
+        let on = hyper::upgrade::on(&mut response);
+        let (mut parts, body) = response.into_parts();
+        check_switch(&mut parts)?;
+        let body = OriginBody {
+            body,
+            lease: None,
+            pool: pool.clone(),
+            reuse: false,
+            switch: Some(Switch::new(on, lease)),
+        };
+        return Ok(Response::from_parts(parts, body));
+    }
     let (mut parts, body) = response.into_parts();
     let reuse = lasts(&parts, head_request);
     check_head(&mut parts, head_request)?;
@@ -596,6 +554,7 @@ async fn exchange(
         lease: Some(lease),
         pool: pool.clone(),
         reuse,
+        switch: None,
     };
     // An answer without a body (to a HEAD request, a 204, a 304, a length of 0) is whole with its head.
     if body.is_end_stream() {
@@ -654,6 +613,7 @@ async fn attempt(
     request: &impl Fn() -> Request<Sent>,
     method: &Method,
     head_request: bool,
+    websocket: bool,
     by: Instant,
 ) -> Result<Response<OriginBody>, Failed> {
     let pool = server.pool();
@@ -663,7 +623,7 @@ async fn attempt(
     {
         lease.gauge.rearm(head_cap(cfg), cfg.response_idle);
         let head = Stage::new(Instant::now(), cfg.upstream_header, by);
-        match exchange(lease, request(), head, head_request, pool).await {
+        match exchange(lease, request(), head, head_request, websocket, pool).await {
             // The server may have closed the connection while it waited. If nothing of an answer had arrived,
             // a request that does no harm when it is sent twice is sent on a new connection, once. The stages of
             // that go on to end by `by`. Any other request is not sent again, and the failure is not counted.
@@ -685,7 +645,7 @@ async fn attempt(
     .await
     .map_err(Failed::counted)?;
     let head = Stage::new(Instant::now(), cfg.upstream_header, by);
-    exchange(lease, request(), head, head_request, pool)
+    exchange(lease, request(), head, head_request, websocket, pool)
         .await
         .map_err(Failed::counted)
 }
@@ -708,10 +668,17 @@ pub async fn forward(
         fields,
         body,
         peer,
+        websocket,
     } = f;
     let trusted = client_ip::trusts(&cfg.trusted_proxies, peer.ip());
-    let made = forwarded_fields(fields, peer.ip(), trusted, cfg.upstream_keepalive == 0)
-        .and_then(|fields| rewrite.request(fields, uri).map_err(|_| OriginError::Send));
+    let made = forwarded_fields(
+        fields,
+        peer.ip(),
+        trusted,
+        cfg.upstream_keepalive == 0,
+        websocket,
+    )
+    .and_then(|fields| rewrite.request(fields, uri).map_err(|_| OriginError::Send));
     let (fields, uri) = match made {
         Ok(made) => made,
         Err(error) => {
@@ -746,7 +713,7 @@ pub async fn forward(
         tried.add(index);
         let chosen = group.server(index);
         server = Some(chosen.address());
-        match attempt(chosen, cfg, &request, &method, head_request, by).await {
+        match attempt(chosen, cfg, &request, &method, head_request, websocket, by).await {
             Ok(mut response) => {
                 rewrite.respond(response.headers_mut());
                 return Dispatched {

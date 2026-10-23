@@ -41,3 +41,4 @@ mod rules;
 mod stopping;
 mod support;
 mod upstreams;
+mod websocket;

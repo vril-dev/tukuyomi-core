@@ -5,3 +5,4 @@ pub mod pool;
 pub mod resolve;
 pub mod rewrite;
 mod select;
+pub mod tunnel;

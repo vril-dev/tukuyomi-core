@@ -2,14 +2,14 @@
 //! {..}}}`; every value is chosen by the operator and checked here.
 //!
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present
-//! (a route may leave out its `host`, its `path`, its `access` and its `rewrite`, and those two objects have no key
-//! that must be present, see `rewrite`); an unknown or repeated key is refused, and so is a value of the wrong type,
-//! an array in place of an object included. A refusal is one fixed sentence per kind of fault and never
-//! carries a key or a value from the file. Then the values are checked in a fixed order and the first broken rule is
-//! returned: the `proxy` bounds, the `forward` values (see `forward`; the names of the servers are not looked up
-//! here, `forward::resolve` does that when the proxy starts), the `rules.store` values, the conversion of the
-//! `kernel` object into `tukuyomi_kernel::Config` with that type's own check, and last the relations between the
-//! `proxy` and `kernel` objects.
+//! (a route may leave out its `host`, its `path`, its `access`, its `rewrite` and its `stream`; `access` and
+//! `rewrite` have no key that must be present, see `rewrite`, and a `stream` has all three); an unknown or repeated
+//! key is refused, and so is a value of the wrong type, an array in place of an object included. A refusal is one
+//! fixed sentence per kind of fault and never carries a key or a value from the file. Then the values are checked
+//! in a fixed order and the first broken rule is returned: the `proxy` bounds, the `forward` values (see `forward`;
+//! the names of the servers are not looked up here, `forward::resolve` does that when the proxy starts), the
+//! `rules.store` values, the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's own
+//! check, and last the relations between the `proxy` and `kernel` objects.
 //!
 //! Times are whole milliseconds under keys that end in `_ms`; the `proxy` times run from 1 ms to 3600 s, except
 //! `keepalive_timeout_ms`, which also takes 0 (a connection is not kept after its response), and `conn_total_ms`,
@@ -43,7 +43,7 @@ mod rewrite;
 
 pub(crate) use forward::MAX_SERVERS;
 pub use forward::{
-    Address, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig,
+    Address, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig, Stream,
 };
 
 const MAX_FILE: u64 = 256 * 1024;
@@ -91,7 +91,8 @@ pub struct ProxyConfig {
     pub keepalive_requests: usize,
     /// How long a connection may be kept, counted from the accept. A request that is answered after this time
     /// gets the last answer of the connection. A request that starts before it gets its answer or the head of
-    /// the upstream's response before `conn_total`; a response body that streams longer is still cut there.
+    /// the upstream's response before `conn_total`; a response body that streams longer is still cut there, unless
+    /// the route has a `stream`, which says how long the response may last.
     pub keepalive_time: Duration,
     /// Before the proxy closes a connection after a response: the longest it reads and discards what the client
     /// still sends, the longest it waits for one more read, and the most bytes it discards.

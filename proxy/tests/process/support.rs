@@ -476,7 +476,8 @@ pub(crate) struct Seen {
 
 /// A loopback listener on a port of its own that answers every request with `upstream_reply`. It counts every
 /// connection, also those that never send a byte. It answers once and closes the connection, or, when it keeps
-/// connections, answers one request after another until the other side closes.
+/// connections, answers one request after another until the other side closes. The handshake of a WebSocket is
+/// answered with 101, and then every byte it reads is sent back (`echo`).
 pub(crate) struct Upstream {
     addr: SocketAddr,
     pub(crate) seen: Arc<Seen>,
@@ -565,6 +566,28 @@ fn accept_loop(
     handlers
 }
 
+/// The answer to the handshake of a WebSocket.
+const SWITCHING: &str = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+
+/// Switches to the WebSocket protocol, as far as the tests need it: the upstream says 101 and then sends back every
+/// byte it reads, those that came with the handshake first, until the other side ends the connection.
+fn echo(sock: &mut TcpStream, request: &[u8]) {
+    let mut behind = request[find(request, b"\r\n\r\n").map_or(0, |end| end + 4)..].to_vec();
+    if sock.write_all(SWITCHING.as_bytes()).is_err() {
+        return;
+    }
+    let mut chunk = [0u8; 4096];
+    loop {
+        if !behind.is_empty() && sock.write_all(&std::mem::take(&mut behind)).is_err() {
+            return;
+        }
+        match sock.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => behind.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
 fn serve_upstream(mut sock: TcpStream, seen: &Seen, keeps: bool) {
     sock.set_nonblocking(false)
         .expect("make the upstream connection blocking");
@@ -574,7 +597,11 @@ fn serve_upstream(mut sock: TcpStream, seen: &Seen, keeps: bool) {
         .expect("set the upstream write timeout");
     sock.set_nodelay(true).expect("set TCP_NODELAY");
     while let Some(request) = read_request(&mut sock) {
-        lock(&seen.requests).push(request);
+        lock(&seen.requests).push(request.clone());
+        if Message::parse(&request).values("upgrade") == ["websocket"] {
+            echo(&mut sock, &request);
+            return;
+        }
         if sock.write_all(&upstream_reply(keeps)).is_err() || !keeps {
             return;
         }

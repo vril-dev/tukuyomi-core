@@ -9,9 +9,12 @@
 //! either matches a rule of the generation that serves that skips the inspection, and is forwarded without being
 //! inspected, or is handed to the inspection driver as a ticket, and only an `Allow` or a `Detected` is forwarded.
 //! It is forwarded to a server of the group of the route that was looked up, with the edits of that route (see
-//! `rewrite`). A request under a rule that skips the inspection takes no inspection permit, no byte of the kernel's
-//! copy and no place in the driver's channel, so it goes on also when the inspection is full or the inspector is
-//! down.
+//! `rewrite`). If the route has a `stream` that lets a WebSocket through and the request is the handshake of one,
+//! the share of the byte budget that a tunnel holds is taken first (and the request is answered with 503 if it
+//! cannot be had, before anything is sent), and if the upstream answers with 101 the response comes with the
+//! tunnel (see `tunnel`). Any other response on a route with a `stream` comes marked as one that may take long. A
+//! request under a rule that skips the inspection takes no inspection permit, no byte of the kernel's copy and no
+//! place in the driver's channel, so it goes on also when the inspection is full or the inspector is down.
 //! What is inspected and what is forwarded is the same request, in the form that `represent` builds it: the
 //! decoded body, without its `Content-Encoding`, with its decoded length; the edits of the route come after the
 //! inspection and are the only difference.
@@ -29,7 +32,9 @@
 //!
 //! Deadlines are absolute instants and are never extended: a stage ends at the earlier of its own start plus its
 //! length and the end of the request time, counted from the start of the request, and the whole connection ends at
-//! the connection time counted from the accept. A sum that does not fit into the clock counts as passed.
+//! the connection time counted from the accept. The one exception is the response of a route with a `stream`, which
+//! puts off the end of the connection once its head is ready (see `session`). A sum that does not fit into the
+//! clock counts as passed.
 
 use std::io;
 use std::net::SocketAddr;
@@ -45,12 +50,13 @@ use hyper::body::Incoming;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 
-use crate::config::ProxyConfig;
+use crate::config::{ProxyConfig, Stream};
 use crate::forward::client_ip;
 use crate::forward::group::{Route, Upstreams};
 use crate::forward::origin::{self, Forward, OriginBody, OriginError};
+use crate::forward::tunnel::{self, Record, Tunnel};
 use crate::inbound::answer::{
-    Abort, Decision, Noted, Out, Passed, Reply, Stop, Via, answer, decide,
+    Abort, Decision, Noted, Out, Passed, Reply, Stop, Via, answer, decide, who,
 };
 use crate::inbound::head::{Head, Reject};
 use crate::inbound::io::Gauge;
@@ -87,6 +93,8 @@ fn stage(start: Instant, len: Duration, request_by: Instant) -> Instant {
 /// The state of one request that its service reads.
 pub(super) struct Conn {
     ctx: Arc<Ctx>,
+    /// The number of the connection, for the record.
+    id: u64,
     head: Head,
     peer: SocketAddr,
     /// The address that stands for the client: the peer, or what a trusted peer says (see `client_ip`). The
@@ -108,15 +116,28 @@ pub(super) struct Conn {
     via: Mutex<Option<Via>>,
 }
 
-/// What a request came to: what the record shows of it, and the response, or the order to close without one.
+/// What a request came to: what the record shows of it, and the response, or the order to close without one. A
+/// response of the upstream comes with the tunnel it starts (the 101 of a WebSocket), or, if it is any other and the
+/// route has a `stream`, with the times of that.
 pub(super) struct Handled {
     pub(super) noted: Noted,
     pub(super) response: Result<Response<Out>, Abort>,
+    pub(super) tunnel: Option<Tunnel>,
+    pub(super) stream: Option<Stream>,
+}
+
+/// The response of the upstream and what goes with it.
+struct Answered {
+    response: Response<OriginBody>,
+    passed: Passed,
+    tunnel: Option<Tunnel>,
+    stream: Option<Stream>,
 }
 
 impl Conn {
     pub(super) fn new(
         ctx: &Arc<Ctx>,
+        id: u64,
         head: Head,
         peer: SocketAddr,
         local: SocketAddr,
@@ -131,6 +152,7 @@ impl Conn {
         let client = client_ip::effective(peer, &ctx.cfg.trusted_proxies, &lines);
         Conn {
             ctx: ctx.clone(),
+            id,
             client,
             head,
             peer,
@@ -155,18 +177,26 @@ impl Conn {
 
     /// The service: one request.
     pub(super) async fn handle(&self, parts: Parts, body: Incoming) -> Handled {
-        let (reply, response) = match self.exchange(parts, body).await {
-            Ok((response, passed)) => {
+        let (reply, response, tunnel, stream) = match self.exchange(parts, body).await {
+            Ok(Answered {
+                response,
+                passed,
+                tunnel,
+                stream,
+            }) => {
                 let reply = Reply::forwarded(response.status().as_u16(), passed);
-                (reply, Ok(response.map(|body| Out::Origin(Box::pin(body)))))
+                let response = Ok(response.map(|body| Out::Origin(Box::pin(body))));
+                (reply, response, tunnel, stream)
             }
-            Err(Stop::Reply(reply)) => (reply, Ok(answer(reply.status))),
+            Err(Stop::Reply(reply)) => (reply, Ok(answer(reply.status)), None, None),
             Err(Stop::Close(reason)) => (
                 Reply {
                     reason,
                     ..Reply::NONE
                 },
                 Err(Abort),
+                None,
+                None,
             ),
         };
         let via = self
@@ -181,15 +211,13 @@ impl Conn {
                 via,
             },
             response,
+            tunnel,
+            stream,
         }
     }
 
     /// Everything up to the response of the upstream, and how the request was let through.
-    async fn exchange(
-        &self,
-        parts: Parts,
-        body: Incoming,
-    ) -> Result<(Response<OriginBody>, Passed), Stop> {
+    async fn exchange(&self, parts: Parts, body: Incoming) -> Result<Answered, Stop> {
         let route = self.route()?;
         let (bytes, budget) = self.read_body(body).await?;
         let (bytes, budget) = if self.head.gzip() {
@@ -212,12 +240,16 @@ impl Conn {
         if Instant::now() >= self.request_by {
             return Err(Reply::failed(503, "request time used up").into());
         }
+        // A tunnel holds its share of the budget from before the handshake is sent.
+        let websocket = self.websocket(&route);
+        let hold = websocket.map(|_| self.take(tunnel::HOLD)).transpose()?;
         let forward = Forward {
             method: parts.method,
             uri: parts.uri,
             fields,
             body,
             peer: self.peer,
+            websocket: websocket.is_some(),
         };
         let sent = origin::forward(
             forward,
@@ -231,7 +263,7 @@ impl Conn {
             group: route.group.name().clone(),
             server: sent.server,
         });
-        sent.result.map(|response| (response, passed)).map_err(|e| {
+        let mut response = sent.result.map_err(|e| {
             match e {
                 OriginError::Unavailable => Reply::failed(502, "upstream unavailable"),
                 OriginError::Connect => Reply::failed(502, "upstream connection failed"),
@@ -242,7 +274,42 @@ impl Conn {
                 OriginError::Late => Reply::failed(503, "request time used up"),
                 OriginError::Local => Reply::failed(503, "local connection failure"),
             }
-            .into()
+        })?;
+        let tunnel = match (response.body_mut().take_switch(), websocket, hold) {
+            (Some(switch), Some(stream), Some(hold)) => {
+                Some(Tunnel::new(switch, *stream, hold, self.record()))
+            }
+            _ => None,
+        };
+        // A tunnel has its own times; any other response on a route with a `stream` may take long.
+        let stream = route.stream.copied().filter(|_| tunnel.is_none());
+        if let Some(stream) = &stream {
+            response.body_mut().stream(stream.idle);
+        }
+        Ok(Answered {
+            response,
+            passed,
+            tunnel,
+            stream,
+        })
+    }
+
+    /// The words of the line for the end of the tunnel of this request, which the tunnel holds from the moment it is
+    /// made.
+    fn record(&self) -> Record {
+        let via = self.via.lock().unwrap_or_else(PoisonError::into_inner);
+        Record {
+            log: self.ctx.log.clone(),
+            id: self.id,
+            who: who(self.client.ip(), via.as_ref()),
+        }
+    }
+
+    /// The `stream` of the route if the request is the handshake of a WebSocket and the route lets one through. After
+    /// the stop has begun no tunnel starts: the handshake goes on as any request does.
+    fn websocket<'a>(&self, route: &Route<'a>) -> Option<&'a Stream> {
+        route.stream.filter(|stream| {
+            stream.websocket && self.head.websocket() && !self.ctx.ingress.is_closed()
         })
     }
 
