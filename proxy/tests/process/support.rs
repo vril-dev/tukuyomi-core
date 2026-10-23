@@ -31,6 +31,8 @@ pub(crate) const UPSTREAM_BODY: &str = "hello-from-upstream";
 pub(crate) const UPSTREAM_HEAD_WIRE: usize = 64 * 1024;
 /// The time the kernel gives a process to end after it was told to stop (`kill_grace`).
 pub(crate) const KILL_GRACE_MS: u64 = 2_000;
+/// The time the proxy may take to look up the names of the upstream servers.
+pub(crate) const RESOLVE_TIMEOUT_MS: u64 = 30_000;
 /// The name of the rules store directory, in the test root.
 pub(crate) const STORE: &str = "store";
 /// What a test adds to a time it has computed, where it only needs the event to come about in reasonable time.
@@ -673,7 +675,7 @@ impl Knobs {
 }
 
 /// A server of a group: weight 1, one failure leaves it out for 30 s, not a backup.
-pub(crate) fn server(address: SocketAddr) -> Value {
+pub(crate) fn server(address: impl ToString) -> Value {
     json!({
         "address": address.to_string(),
         "weight": 1,
@@ -686,6 +688,7 @@ pub(crate) fn server(address: SocketAddr) -> Value {
 /// The `forward` object of a proxy with the first upstream only: one group, every request goes to it.
 fn only_first(addresses: &[SocketAddr]) -> Value {
     json!({
+        "resolve_timeout_ms": RESOLVE_TIMEOUT_MS,
         "upstreams": {"main": {"servers": [server(addresses[0])]}},
         "routes": [],
         "default_upstream": "main",

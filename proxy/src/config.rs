@@ -2,11 +2,13 @@
 //! {..}}}`; every value is chosen by the operator and checked here.
 //!
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present
-//! (a route may leave out its `host` and its `path`); an unknown or repeated key is refused, and so is a value of the
-//! wrong type, an array in place of an object included. A refusal is one fixed sentence per kind of fault and never
+//! (a route may leave out its `host`, its `path`, its `access` and its `rewrite`, and those two objects have no key
+//! that must be present, see `rewrite`); an unknown or repeated key is refused, and so is a value of the wrong type,
+//! an array in place of an object included. A refusal is one fixed sentence per kind of fault and never
 //! carries a key or a value from the file. Then the values are checked in a fixed order and the first broken rule is
-//! returned: the `proxy` bounds, the `forward` values (see `forward`), the `rules.store` values, the conversion of
-//! the `kernel` object into `tukuyomi_kernel::Config` with that type's own check, and last the relations between the
+//! returned: the `proxy` bounds, the `forward` values (see `forward`; the names of the servers are not looked up
+//! here, `forward::resolve` does that when the proxy starts), the `rules.store` values, the conversion of the
+//! `kernel` object into `tukuyomi_kernel::Config` with that type's own check, and last the relations between the
 //! `proxy` and `kernel` objects.
 //!
 //! Times are whole milliseconds under keys that end in `_ms`; the `proxy` times run from 1 ms to 3600 s, except
@@ -37,8 +39,12 @@ use crate::forward::client_ip::Cidr;
 use crate::rules::bundle::Fingerprint;
 
 mod forward;
+mod rewrite;
 
-pub use forward::{ForwardConfig, GroupConfig, ServerConfig};
+pub(crate) use forward::MAX_SERVERS;
+pub use forward::{
+    Address, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig,
+};
 
 const MAX_FILE: u64 = 256 * 1024;
 /// Longest accepted `rules.store.dir` in bytes: the paths below it must stay inside the Linux `PATH_MAX`. A guard
@@ -108,7 +114,7 @@ pub struct ProxyConfig {
 #[derive(Clone, Debug)]
 pub struct Loaded {
     pub proxy: ProxyConfig,
-    pub forward: ForwardConfig,
+    pub forward: ForwardSettings,
     pub kernel: KernelSettings,
     pub store: StoreConfig,
 }
@@ -325,8 +331,11 @@ fn address(text: &str, bad: &'static str, port0: &'static str) -> Result<SocketA
     Ok(addr)
 }
 
-fn same(a: SocketAddr, b: SocketAddr) -> bool {
-    a.port() == b.port() && a.ip().to_canonical() == b.ip().to_canonical()
+/// Whether a server at `b` is the proxy itself when it listens at `a`: the same address and port, or, when `a` is an
+/// unspecified address (the proxy listens at every address of the host), a loopback address at the port.
+pub(crate) fn same(a: SocketAddr, b: SocketAddr) -> bool {
+    let (listen, server) = (a.ip().to_canonical(), b.ip().to_canonical());
+    a.port() == b.port() && (listen == server || (listen.is_unspecified() && server.is_loopback()))
 }
 
 /// A path argument or a configured path must be absolute and already clean: no empty, `.` or `..` component, no

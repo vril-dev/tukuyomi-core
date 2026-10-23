@@ -15,7 +15,7 @@ use tokio::time::{sleep, timeout};
 use tukuyomi_kernel::Verdict;
 
 use super::*;
-use crate::config::ForwardConfig;
+use crate::config::{ForwardConfig, RouteConfig};
 use crate::inbound::session::{run as run_session, serve};
 use crate::inspect::driver::Outcome;
 use crate::log::start_logger;
@@ -503,7 +503,7 @@ fn a_request_under_a_route_goes_on_to_the_upstream_when_the_inspection_cannot_ta
 pub(in crate::inbound) fn routed_to_h_test() -> ForwardConfig {
     let mut forward = ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]);
     let rule = Rule::forward(Some("h.test"), None).unwrap();
-    forward.routes = Table::new(vec![(rule, 0)]).unwrap();
+    forward.routes = Table::new(vec![(rule, RouteConfig::plain(0))]).unwrap();
     forward.default = None;
     forward
 }
@@ -862,5 +862,280 @@ fn an_empty_gzip_body_is_400_whatever_its_framing() {
         assert_eq!(parse_response(&raw).status, 400);
         assert!(seen.is_empty());
         assert_eq!(reply, Reply::rejected(400, "empty gzip body"));
+    });
+}
+
+use crate::forward::client_ip::{Access, Cidr};
+
+/// A forwarding configuration whose one route holds for every request and has these access lists.
+pub(in crate::inbound) fn guarded(deny: &[&str], allow: &[&str]) -> ForwardConfig {
+    let nets = |list: &[&str]| list.iter().map(|net| Cidr::parse(net).unwrap()).collect();
+    let route = RouteConfig {
+        access: Access::new(nets(deny), nets(allow)),
+        ..RouteConfig::plain(0)
+    };
+    let mut forward = ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]);
+    forward.routes = Table::new(vec![(Rule::forward(None, None).unwrap(), route)]).unwrap();
+    forward.default = None;
+    forward
+}
+
+/// A POST from the loopback address to the route of `guarded(deny, allow)`, when `trusted` are the networks of
+/// `trusted_proxies` and the request has the extra fields `extra`: the status of the answer, and the number of
+/// tickets the driver got. The driver blocks every ticket with 403, so a request that is inspected is told from
+/// one that is turned away by its ticket.
+async fn guarded_post(
+    deny: &[&str],
+    allow: &[&str],
+    trusted: &[&str],
+    extra: &str,
+) -> (u16, usize) {
+    let cfg = ProxyConfig {
+        trusted_proxies: trusted
+            .iter()
+            .map(|net| Cidr::parse(net).unwrap())
+            .collect(),
+        ..config()
+    };
+    let rig = Rig::with(cfg, Mode::Answer(BLOCK), &guarded(deny, allow)).await;
+    let (client, task) = rig.connect().await;
+    let request = form_post(&format!("{extra}Content-Length: 3\r\n\r\na=b"));
+    put(&client, &request).await;
+    let response = parse_response(&read_all(&client).await);
+    drop(client);
+    let seen = rig.finish(task).await;
+    (response.status, seen.len())
+}
+
+#[test]
+fn a_client_that_the_route_turns_away_gets_403_before_the_body_is_read_and_is_not_inspected() {
+    run(async {
+        assert_eq!(guarded_post(&["127.0.0.0/8"], &[], &[], "").await, (403, 0));
+        assert_eq!(guarded_post(&[], &["10.0.0.0/8"], &[], "").await, (403, 0));
+        // A client that is not turned away is inspected, and the driver blocks it (403 as well, with a ticket).
+        assert_eq!(guarded_post(&["10.0.0.0/8"], &[], &[], "").await, (403, 1));
+        assert_eq!(guarded_post(&[], &["127.0.0.0/8"], &[], "").await, (403, 1));
+        // The address that a trusted peer names decides; one that a peer that is not trusted names does not.
+        let named = "X-Forwarded-For: 10.1.2.3\r\n";
+        let trusted = ["127.0.0.0/8"];
+        assert_eq!(
+            guarded_post(&["10.0.0.0/8"], &[], &trusted, named).await,
+            (403, 0)
+        );
+        assert_eq!(
+            guarded_post(&[], &["10.0.0.0/8"], &trusted, named).await,
+            (403, 1)
+        );
+        assert_eq!(
+            guarded_post(&["10.0.0.0/8"], &[], &[], named).await,
+            (403, 1)
+        );
+    });
+}
+
+/// A forwarding configuration with a default route and these routes, each `(host, path, allow)` with the networks of
+/// `allow` as its only access list.
+fn with_access(routes: &[(Option<&str>, Option<&str>, &[&str])]) -> ForwardConfig {
+    let entries = routes
+        .iter()
+        .map(|&(host, path, allow)| {
+            let allow = allow.iter().map(|net| Cidr::parse(net).unwrap()).collect();
+            let route = RouteConfig {
+                access: Access::new(Vec::new(), allow),
+                ..RouteConfig::plain(0)
+            };
+            (Rule::forward(host, path).unwrap(), route)
+        })
+        .collect();
+    let mut forward = ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]);
+    forward.routes = Table::new(entries).unwrap();
+    forward
+}
+
+/// A GET from the loopback address with this `Host` for this target: the status of the answer, and the number of
+/// tickets the driver got. The driver blocks every ticket with 403, so a request that is inspected is told from one
+/// that is turned away by its ticket.
+async fn spelled(forward: &ForwardConfig, host: &str, target: &str) -> (u16, usize) {
+    let rig = Rig::with(config(), Mode::Answer(BLOCK), forward).await;
+    let (client, task) = rig.connect().await;
+    let request = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    put(&client, request.as_bytes()).await;
+    let status = parse_response(&read_all(&client).await).status;
+    drop(client);
+    (status, rig.finish(task).await.len())
+}
+
+/// The status and the number of tickets of a GET for each target, in order.
+async fn spelled_all(forward: &ForwardConfig, host: &str, targets: &[&str]) -> Vec<(u16, usize)> {
+    let mut got = Vec::new();
+    for target in targets {
+        got.push(spelled(forward, host, target).await);
+    }
+    got
+}
+
+#[test]
+fn a_request_has_to_pass_the_access_of_every_route_its_path_could_be_taken_for() {
+    run(async {
+        // The loopback client is outside the only network the route for `/private/` allows.
+        let forward = with_access(&[
+            (None, Some("/private/"), &["10.0.0.0/8"]),
+            (None, Some("/public/"), &[]),
+        ]);
+        // Other ways to write the path of the route, the path just before it (an application may answer for
+        // `/private` with what it has for `/private/`), and paths that cannot be told apart from any path.
+        for target in [
+            "/private/x",
+            "/priv%61te/x",
+            "/private/./x",
+            "//private/x",
+            "/private/%2e%2e/private/x",
+            "/private",
+            "/private?a=1",
+            "/priv%61te",
+            "/x/%2%65",
+        ] {
+            let got = spelled(&forward, "app.test", target).await;
+            assert_eq!(got, (403, 0), "{target}");
+        }
+        // The paths of the other route, and the escapes that clients send (`%40`, `%20`, a Japanese letter), pass
+        // the lists of their own route only: they are inspected. So is a path that the lists do not hold for in
+        // another case of letters, which is another path.
+        for target in [
+            "/public/x",
+            "/public/a%20b",
+            "/public/%E3%81%82",
+            "/public/%e3%81%82",
+            "/api/users/a%40b.com",
+            "/%E3%81%82/%20",
+            "/other",
+            "/PRIV%61TE/x",
+        ] {
+            let got = spelled(&forward, "app.test", target).await;
+            assert_eq!(got, (403, 1), "{target}");
+        }
+    });
+}
+
+#[test]
+fn a_client_inside_the_allow_list_is_not_turned_away_however_the_path_is_written() {
+    run(async {
+        let forward = with_access(&[
+            (None, Some("/private/"), &["127.0.0.0/8"]),
+            (None, Some("/public/"), &[]),
+        ]);
+        let targets = [
+            "/private/x",
+            "/priv%61te/x",
+            "/private/./x",
+            "//private/x",
+            "/private",
+            "/private?a=1",
+            "/public/x",
+            "/other",
+        ];
+        let got = spelled_all(&forward, "app.test", &targets).await;
+        assert_eq!(got, vec![(403, 1); targets.len()]);
+    });
+}
+
+#[test]
+fn a_path_is_judged_by_the_most_exact_route_of_each_way_it_is_written() {
+    run(async {
+        // The route for `/` has an allow list that the loopback client is outside of, and the route for `/public/`
+        // has none: `/public/x` is the business of the second only, and `/public` and every spelling of a path
+        // that leaves `/public/` is the business of the first.
+        let forward = with_access(&[
+            (None, Some("/"), &["10.0.0.0/8"]),
+            (None, Some("/public/"), &[]),
+        ]);
+        let got = spelled_all(&forward, "app.test", &["/public/x", "/public/%E3%81%82"]).await;
+        assert_eq!(got, [(403, 1), (403, 1)]);
+        let targets = ["/public", "/other", "/pub%6Cic/x", "/public/../x"];
+        let got = spelled_all(&forward, "app.test", &targets).await;
+        assert_eq!(got, vec![(403, 0); targets.len()]);
+    });
+}
+
+#[test]
+fn a_byte_that_a_route_path_writes_as_an_escape_meets_the_route_however_the_request_writes_it() {
+    run(async {
+        // A request may hold `[` as it is, and the path of a route can only hold its escape. The loopback client is
+        // outside the only network the route allows.
+        let targets = ["/a%5Bb/x", "/a[b/x", "/a%5bb/x"];
+        let forward = with_access(&[(None, Some("/a%5Bb/"), &["10.0.0.0/8"])]);
+        let got = spelled_all(&forward, "app.test", &targets).await;
+        assert_eq!(got, vec![(403, 0); targets.len()]);
+        // The same client inside the network is inspected, however the byte is written.
+        let forward = with_access(&[(None, Some("/a%5Bb/"), &["127.0.0.0/8"])]);
+        let got = spelled_all(&forward, "app.test", &targets).await;
+        assert_eq!(got, vec![(403, 1); targets.len()]);
+    });
+}
+
+#[test]
+fn a_route_for_a_path_itself_is_not_judged_by_the_route_of_the_path_with_a_slash_after_it() {
+    run(async {
+        // The loopback client is outside the network that the route for `/` allows. The route for `/health` has no
+        // list, so the path itself is open, and the paths next to it are the business of the route for `/`.
+        let forward = with_access(&[
+            (None, Some("/"), &["10.0.0.0/8"]),
+            (None, Some("/health"), &[]),
+        ]);
+        for target in ["/health", "/health?a=1"] {
+            let got = spelled(&forward, "app.test", target).await;
+            assert_eq!(got, (403, 1), "{target}");
+        }
+        for target in ["/health/", "/health/x", "/healthz", "/he%61lth"] {
+            let got = spelled(&forward, "app.test", target).await;
+            assert_eq!(got, (403, 0), "{target}");
+        }
+        // The path just before a prefix is still judged by the route of the prefix when the route that the path goes
+        // to as received is not for that path itself.
+        let forward = with_access(&[
+            (None, Some("/private/"), &["10.0.0.0/8"]),
+            (None, Some("/health"), &[]),
+        ]);
+        assert_eq!(spelled(&forward, "app.test", "/private").await, (403, 0));
+        assert_eq!(spelled(&forward, "app.test", "/health").await, (403, 1));
+    });
+}
+
+#[test]
+fn only_the_routes_the_host_could_mean_count_and_a_host_that_cannot_be_read_could_mean_any() {
+    run(async {
+        let forward = with_access(&[
+            (Some("secure.test"), Some("/private/"), &["10.0.0.0/8"]),
+            (Some("open.test"), None, &[]),
+        ]);
+        // A request for a host whose routes have no access list is not turned away, however its target is written.
+        for target in ["//x", "/priv%61te/x", "/private/x"] {
+            let got = spelled(&forward, "open.test", target).await;
+            assert_eq!(got, (403, 1), "{target}");
+        }
+        for target in ["//x", "/private/x", "/priv%61te/x", "/private"] {
+            let got = spelled(&forward, "secure.test", target).await;
+            assert_eq!(got, (403, 0), "{target}");
+        }
+        // A `Host` with an empty label cannot be read: any route could be meant, whatever the path.
+        for target in ["//x", "/private/x", "/x"] {
+            let got = spelled(&forward, "open..test", target).await;
+            assert_eq!(got, (403, 0), "{target}");
+        }
+    });
+}
+
+#[test]
+fn a_request_is_not_judged_by_the_other_routes_when_no_route_has_an_access_list() {
+    run(async {
+        // The routes have lists that turn nobody away, so the loopback client is inspected whatever it writes.
+        let forward = with_access(&[
+            (None, Some("/private/"), &[]),
+            (None, Some("/public/"), &[]),
+        ]);
+        let targets = ["/private/x", "//private/x", "/priv%61te/x", "/private"];
+        let got = spelled_all(&forward, "app.test", &targets).await;
+        assert_eq!(got, vec![(403, 1); targets.len()]);
+        assert_eq!(spelled(&forward, "open..test", "/x").await, (403, 1));
     });
 }

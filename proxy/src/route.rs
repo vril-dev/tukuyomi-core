@@ -24,6 +24,25 @@
 //! holds for no rule that has a host. A target that is ambiguous in the sense of the path holds for no rule that has
 //! a path, so that it is inspected, and it is not routed by a path.
 //!
+//! A rule is matched on the bytes received, so a request that is another way to write a request for a rule is not
+//! taken for it: an application behind the proxy may read `/priv%61te/x` or `/private/./x` as `/private/x`, which a
+//! rule for `/private/` holds for. That does no harm where a rule only chooses an upstream or lets a request through
+//! without inspection, but it does where a rule limits who may use a path. `Table::could_hold` gives the targets of
+//! the rules that a request could be taken for. If its `Host` can be read and the path of its target has a canonical
+//! form, they are the rules that are the most exact for the path as received, for its canonical form, and for its
+//! canonical form with a `/` added at the end (unless it ends in one, or the rule for the path as received is for that
+//! path itself: the operator wrote a rule for it, and the path with a `/` after it is another one). Otherwise they
+//! are every rule whose host holds for the request, whatever its path, and every rule if the `Host` cannot be read.
+//!
+//! The canonical form of a path is the path with each escape written one way: an escape of a byte that the path of
+//! a rule holds as it is becomes that byte (`%61` is `a`), and any other escape has uppercase digits (`%e3` is
+//! `%E3`). A byte that a request may hold in its path as it is and the path of a rule may not (`"`, `[`, `]`, `^`,
+//! `{`, `|` and `}`) is written as its escape too (`[` is `%5B`), so the raw byte and its escape meet the same rule.
+//! The case of letters is not changed. A path that is ambiguous has none, and nor has one whose canonical
+//! form would change if it were made again: a `%` that is not the start of an escape can become one when the
+//! escapes after it are replaced (`%2%65` gives `%2e`). `Rule::canonical` tells whether the path of a rule is its
+//! own canonical form; the path of a rule that is not would not be found by the form that a request is looked up by.
+//!
 //! Of the rules that hold, the table gives the target of the one that is the most exact: the host decides first (a
 //! name before a wildcard, the longer wildcard before the shorter, a rule with a port before one without, a rule with
 //! a host before one without), and then the path (the path itself before a prefix, the longer prefix before the
@@ -34,6 +53,7 @@ mod path;
 mod rule;
 mod table;
 
+pub(crate) use host::parse_port;
 pub use rule::{RouteError, Rule};
 pub use table::Table;
 

@@ -15,6 +15,13 @@ pub(super) struct Rank {
     path: PathRank,
 }
 
+impl Rank {
+    /// Whether the rule holds by its path being the path of the request, and not a prefix of it or absent.
+    pub(super) fn by_exact_path(self) -> bool {
+        self.path == PathRank::Exact
+    }
+}
+
 /// A rule that has passed its checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
@@ -50,6 +57,11 @@ impl Rule {
         self.path.as_ref().map(PathRule::as_str)
     }
 
+    /// The port that the host of the rule names, if it has a host with a port.
+    pub fn port(&self) -> Option<u16> {
+        self.host.as_ref().and_then(HostRule::port)
+    }
+
     /// How well the rule holds for a request with this host (`None`: it cannot be read) and this target, or `None`
     /// if it does not hold.
     pub(super) fn rank(&self, host: Option<&RequestHost>, target: &Target) -> Option<Rank> {
@@ -62,5 +74,19 @@ impl Rule {
             None => PathRank::Any,
         };
         Some(Rank { host, path })
+    }
+
+    /// Whether the path of the rule, if it has one, is its own canonical form (see `path::canonical`).
+    pub fn canonical(&self) -> bool {
+        self.path.as_ref().is_none_or(PathRule::is_canonical)
+    }
+
+    /// Whether the host of the rule holds for a request with this host, or there is no telling because the `Host`
+    /// cannot be read (`None`). A rule without a host holds for every host. The path is not looked at.
+    pub(super) fn could_hold(&self, host: Option<&RequestHost>) -> bool {
+        match (&self.host, host) {
+            (Some(rule), Some(host)) => rule.rank(host).is_some(),
+            _ => true,
+        }
     }
 }

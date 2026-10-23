@@ -5,8 +5,8 @@ use tokio::time::{sleep, timeout};
 
 use super::*;
 use crate::inbound::conn::tests::{
-    BLOCK, Mode, Parsed, Rig, config, finish_sending, form_post, parse_response, put, read_all,
-    routed_to_h_test, run,
+    BLOCK, Mode, Parsed, Rig, config, finish_sending, form_post, guarded, parse_response, put,
+    read_all, routed_to_h_test, run,
 };
 
 const SEC: Duration = Duration::from_secs(1);
@@ -437,5 +437,26 @@ fn a_request_without_a_copy_of_its_head_is_not_served_and_closes_the_connection(
         assert_eq!(answer.all("content-length"), ["0"]);
         let served = tokio::spawn(async {});
         assert!(rig.finish(served).await.is_empty());
+    });
+}
+
+#[test]
+fn a_403_of_the_route_keeps_the_connection_if_the_request_had_no_body_and_ends_it_otherwise() {
+    run(async {
+        // The route turns the loopback address away.
+        let forward = guarded(&["127.0.0.0/8"], &[]);
+        let rig = Rig::with(kept(), Mode::Answer(BLOCK), &forward).await;
+        let (client, task) = rig.connect().await;
+        for target in ["/a", "/b"] {
+            put(&client, &get(target)).await;
+            let (answers, closed) = responses(&client, 1).await;
+            assert!(!closed && answers[0].status == 403);
+            assert!(answers[0].all("connection").is_empty());
+        }
+        put(&client, &form_post("Content-Length: 3\r\n\r\na=b")).await;
+        let last = parse_response(&read_all(&client).await);
+        assert_eq!(last.status, 403);
+        assert_eq!(last.all("connection"), ["close"]);
+        assert!(rig.finish(task).await.is_empty());
     });
 }

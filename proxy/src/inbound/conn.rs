@@ -1,17 +1,25 @@
 //! One request of a connection: the route, the body, the inspection, and then the answer or the forwarding.
 //!
 //! The head was checked by `head` and passed by `gate` before this runs, and the session hands it over with the
-//! request that hyper made of the same bytes. The upstream group for the request is looked up first, by its `Host`
-//! and its target; a request that no route holds for, with no default group, is answered with 404 before anything
-//! of its body is read and before the inspection is asked for. The body is read through hyper into a budgeted
-//! buffer, a gzip body is decoded by `represent::gunzip` (exactly one member, at most `max_body` bytes of output),
-//! and then the request either matches a route of the generation that serves, and is forwarded without being
-//! inspected, or is handed to the inspection driver as a ticket, and only an `Allow` or a `Detected` is forwarded
-//! (to a server of the group that was looked up). A request under a route takes no inspection permit, no byte of
-//! the kernel's copy and no place in the driver's channel, so it goes on also when the inspection is full or the
-//! inspector is down.
+//! request that hyper made of the same bytes. The route for the request is looked up first, by its `Host` and its
+//! target as the client sent them. A request that no route holds for, with no default group, is answered with 404,
+//! and one from a client that the access lists of its route turn away with 403, before anything of its body is read
+//! and before the inspection is asked for. The body is read through hyper into a budgeted buffer, a gzip body is
+//! decoded by `represent::gunzip` (exactly one member, at most `max_body` bytes of output), and then the request
+//! either matches a rule of the generation that serves that skips the inspection, and is forwarded without being
+//! inspected, or is handed to the inspection driver as a ticket, and only an `Allow` or a `Detected` is forwarded.
+//! It is forwarded to a server of the group of the route that was looked up, with the edits of that route (see
+//! `rewrite`). A request under a rule that skips the inspection takes no inspection permit, no byte of the kernel's
+//! copy and no place in the driver's channel, so it goes on also when the inspection is full or the inspector is
+//! down.
 //! What is inspected and what is forwarded is the same request, in the form that `represent` builds it: the
-//! decoded body, without its `Content-Encoding`, with its decoded length.
+//! decoded body, without its `Content-Encoding`, with its decoded length; the edits of the route come after the
+//! inspection and are the only difference.
+//!
+//! The route is found on the bytes received, but an application behind the proxy may read another spelling of a path
+//! as the path of a route that limits who may use it (`/priv%61te/x` for `/private/x`). So if some route has an
+//! access list, the client has to pass the lists of every route the request could be taken for, not only those of the
+//! route it goes to (see `route`).
 //!
 //! Every answer that `answer` makes, and the fixed answer that `head` holds for a refused head, has an empty
 //! body and `Content-Length: 0` (not for 204 and 304). Whether the connection goes on after the response is not
@@ -39,7 +47,7 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::config::ProxyConfig;
 use crate::forward::client_ip;
-use crate::forward::group::{Group, Upstreams};
+use crate::forward::group::{Route, Upstreams};
 use crate::forward::origin::{self, Forward, OriginBody, OriginError};
 use crate::inbound::answer::{
     Abort, Decision, Noted, Out, Passed, Reply, Stop, Via, answer, decide,
@@ -182,7 +190,7 @@ impl Conn {
         parts: Parts,
         body: Incoming,
     ) -> Result<(Response<OriginBody>, Passed), Stop> {
-        let group = self.route()?;
+        let route = self.route()?;
         let (bytes, budget) = self.read_body(body).await?;
         let (bytes, budget) = if self.head.gzip() {
             self.unpack(bytes, budget)?
@@ -211,9 +219,16 @@ impl Conn {
             body,
             peer: self.peer,
         };
-        let sent = origin::forward(forward, group, &self.ctx, self.request_by).await;
+        let sent = origin::forward(
+            forward,
+            route.group,
+            route.rewrite,
+            &self.ctx,
+            self.request_by,
+        )
+        .await;
         *self.via.lock().unwrap_or_else(PoisonError::into_inner) = Some(Via {
-            group: group.name().clone(),
+            group: route.group.name().clone(),
             server: sent.server,
         });
         sent.result.map(|response| (response, passed)).map_err(|e| {
@@ -231,19 +246,34 @@ impl Conn {
         })
     }
 
-    /// The group the request goes to. A request that no route holds for, and that has no default group, is
-    /// answered with 404 here, before its body is read; the connection goes on after that answer only if there
-    /// was no body to read.
-    fn route(&self) -> Result<&Group, Stop> {
-        self.ctx
-            .upstreams
-            .find(self.head.host(), self.head.target())
-            .ok_or_else(|| {
-                if !self.head.chunked() && self.head.content_length().unwrap_or(0) == 0 {
-                    self.read_done.store(true, Ordering::Release);
-                }
-                Reply::rejected(404, "no route matches").into()
-            })
+    /// The route the request takes. A request that no route holds for, and that has no default group, is answered
+    /// with 404 here, and one from a client that the access lists turn away with 403, before the body is read. If
+    /// some route has an access list, every route that the request could be taken for, however it is written, has to
+    /// allow the client (see `Upstreams::accesses`); if none has, nobody is turned away and that is not asked.
+    fn route(&self) -> Result<Route<'_>, Stop> {
+        let (host, target) = (self.head.host(), self.head.target());
+        let upstreams = &self.ctx.upstreams;
+        let route = upstreams
+            .find(host, target)
+            .ok_or_else(|| self.turned_away(404, "no route matches"))?;
+        let client = self.client.ip();
+        if upstreams.guarded()
+            && !upstreams
+                .accesses(host, target)
+                .all(|access| access.permits(client))
+        {
+            return Err(self.turned_away(403, "denied by route access"));
+        }
+        Ok(route)
+    }
+
+    /// The answer to a request that is turned away before its body is read. The connection goes on after it only if
+    /// there was no body to read.
+    fn turned_away(&self, status: u16, reason: &'static str) -> Stop {
+        if !self.head.chunked() && self.head.content_length().unwrap_or(0) == 0 {
+            self.read_done.store(true, Ordering::Release);
+        }
+        Reply::rejected(status, reason).into()
     }
 
     /// Takes `n` bytes of the budget.

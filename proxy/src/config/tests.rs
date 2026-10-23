@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"forward":{"upstreams":{"main":{"servers":[{"address":"127.0.0.1:9000","weight":1,"max_fails":1,"fail_timeout_ms":10000,"backup":false}]},"api":{"servers":[{"address":"127.0.0.1:9001","weight":3,"max_fails":2,"fail_timeout_ms":5000,"backup":false},{"address":"127.0.0.1:9002","weight":1,"max_fails":0,"fail_timeout_ms":5000,"backup":true}]}},"routes":[{"host":"api.example.test","path":"/v1/","upstream":"api"}],"default_upstream":"main"},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
+const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"forward":{"resolve_timeout_ms":30000,"upstreams":{"main":{"servers":[{"address":"127.0.0.1:9000","weight":1,"max_fails":1,"fail_timeout_ms":10000,"backup":false}]},"api":{"servers":[{"address":"127.0.0.1:9001","weight":3,"max_fails":2,"fail_timeout_ms":5000,"backup":false},{"address":"127.0.0.1:9002","weight":1,"max_fails":0,"fail_timeout_ms":5000,"backup":true}]}},"routes":[{"host":"api.example.test","path":"/v1/","upstream":"api"}],"default_upstream":"main"},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
 
 /// Marks a value that must never appear in an error sentence.
 const MARK: &str = "qqmark";
@@ -95,14 +95,14 @@ fn the_base_document_loads_with_every_value_converted() {
         forward.groups[1].servers,
         [
             ServerConfig {
-                address: "127.0.0.1:9001".parse().unwrap(),
+                address: Address::Literal("127.0.0.1:9001".parse().unwrap()),
                 weight: 3,
                 max_fails: 2,
                 fail_timeout: Duration::from_millis(5000),
                 backup: false,
             },
             ServerConfig {
-                address: "127.0.0.1:9002".parse().unwrap(),
+                address: Address::Literal("127.0.0.1:9002".parse().unwrap()),
                 weight: 1,
                 max_fails: 0,
                 fail_timeout: Duration::from_millis(5000),
@@ -111,15 +111,16 @@ fn the_base_document_loads_with_every_value_converted() {
         ]
     );
     // The route holds for its host in any case and with any port, and for paths below its path.
-    assert_eq!(
-        forward.routes.find(Some(b"API.example.test:80"), b"/v1/x"),
-        Some(&1)
-    );
-    assert_eq!(
-        forward.routes.find(Some(b"api.example.test"), b"/v2/x"),
-        None
-    );
-    assert_eq!(forward.routes.find(Some(b"other.test"), b"/v1/x"), None);
+    let group = |host: &[u8], target: &[u8]| {
+        forward
+            .routes
+            .find(Some(host), target)
+            .map(|route| route.group)
+    };
+    assert_eq!(group(b"API.example.test:80", b"/v1/x"), Some(1));
+    assert_eq!(group(b"api.example.test", b"/v2/x"), None);
+    assert_eq!(group(b"other.test", b"/v1/x"), None);
+    assert_eq!(forward.resolve_timeout, Duration::from_millis(30_000));
     assert_eq!(kernel.inspector, PathBuf::from("/opt/tukuyomi/inspector"));
     // The directory and the fingerprint of a generation are not in the file: the check ran with placeholders.
     assert_eq!(
@@ -176,6 +177,7 @@ fn a_missing_key_is_refused_in_every_object() {
         ("/rules", "store"),
         ("/proxy", "max_conns"),
         ("/forward", "default_upstream"),
+        ("/forward", "resolve_timeout_ms"),
         ("/forward/upstreams/api", "servers"),
         ("/forward/upstreams/api/servers/0", "weight"),
         ("/forward/routes/0", "upstream"),
@@ -223,6 +225,7 @@ fn a_value_of_the_wrong_type_is_refused_for_every_key() {
         ("/proxy", "listen", Value::from(5)),
         ("/proxy", "max_conns", Value::from("5")),
         ("/forward", "default_upstream", Value::from(5)),
+        ("/forward", "resolve_timeout_ms", Value::from("5")),
         (
             "/forward/upstreams/api/servers/0",
             "weight",
@@ -288,6 +291,8 @@ fn errors_never_carry_a_value_or_a_key_from_the_file() {
         doc(&[k("tmp_root", MARK)]),
         doc(&[f("default_upstream", MARK)]),
         doc(&[sv("address", MARK)]),
+        with_route(serde_json::json!({"upstream": "api", "access": {"deny_cidrs": [MARK]}})),
+        with_route(serde_json::json!({"upstream": "api", "rewrite": {"host": "qqmark!"}})),
         BASE.replace("\"api\"", "\"qqmark!\"").into_bytes(),
         format!("{BASE}{MARK}").into_bytes(),
         format!("{{\"{MARK}\":1,\"{MARK}\":2}}").into_bytes(),
@@ -312,8 +317,8 @@ fn addresses_are_ip_literals_with_a_port_and_differ() {
     pass(&[p("listen", "[::1]:8080")]);
     refuse(&[p("listen", "127.0.0.1:0")], "listen port is 0");
     refuse(
-        &[sv("address", "example.com:80")],
-        "a server address is not an IP address and port",
+        &[sv("address", "127.0.0.1")],
+        "a server address is not an IP address and port, or a name and port",
     );
     refuse(&[sv("address", "127.0.0.1:0")], "a server port is 0");
 
@@ -322,6 +327,79 @@ fn addresses_are_ip_literals_with_a_port_and_differ() {
     refuse(&[sv("address", "[::ffff:127.0.0.1]:8080")], same);
     pass(&[sv("address", "127.0.0.1:8081")]);
     pass(&[sv("address", "[::1]:8080")]);
+
+    // An unspecified address is every address of the host, so a server at a loopback address and the port is the
+    // proxy itself; another address, and another port, are not.
+    for listen in ["0.0.0.0:8080", "[::]:8080"] {
+        for server in ["127.0.0.1:8080", "127.0.0.2:8080", "[::1]:8080"] {
+            refuse(&[p("listen", listen), sv("address", server)], same);
+        }
+        pass(&[p("listen", listen), sv("address", "127.0.0.1:8081")]);
+        pass(&[p("listen", listen), sv("address", "192.0.2.1:8080")]);
+    }
+}
+
+/// The base document with these routes.
+fn with_routes(routes: Vec<Value>) -> Vec<u8> {
+    doc(&[f("routes", Value::Array(routes))])
+}
+
+/// A route for the group `api` at this host, with this `access` object.
+fn route_at(host: &str, access: Value) -> Value {
+    serde_json::json!({"host": host, "upstream": "api", "access": access})
+}
+
+#[test]
+fn when_a_route_has_an_access_list_no_route_has_a_port_in_its_host() {
+    let sentence = Some("a route host has a port while a route has an access list");
+    let list = serde_json::json!({"deny_cidrs": ["10.0.0.0/8"]});
+    let allow = serde_json::json!({"allow_cidrs": ["10.0.0.0/8"]});
+    // A port in the host of the route that has the list, or of another route, in either order.
+    for host in ["h.test:8080", "*.h.test:80"] {
+        for access in [list.clone(), allow.clone()] {
+            let own = vec![route_at(host, access.clone())];
+            assert_eq!(refusal_of(&with_routes(own)), sentence, "{host}");
+            let other = route_at(host, serde_json::json!({}));
+            let guarded = route_at("g.test", access.clone());
+            let both = vec![other.clone(), guarded.clone()];
+            assert_eq!(refusal_of(&with_routes(both)), sentence, "{host}");
+            let both = vec![guarded, other];
+            assert_eq!(refusal_of(&with_routes(both)), sentence, "{host}");
+        }
+    }
+    // A route without a path or a host, and a route with a port and no route with a list, are loaded; so is a port
+    // with lists that turn nobody away.
+    let bare = serde_json::json!({"upstream": "api", "access": list});
+    let both = vec![bare, route_at("g.test", serde_json::json!({}))];
+    assert_eq!(refusal_of(&with_routes(both)), None);
+    let ported = route_at("h.test:8080", serde_json::json!({}));
+    assert_eq!(refusal_of(&with_routes(vec![ported.clone()])), None);
+    let empty = route_at("g.test", serde_json::json!({"allow_cidrs": []}));
+    assert_eq!(refusal_of(&with_routes(vec![ported, empty])), None);
+}
+
+#[test]
+fn the_path_of_a_route_with_an_access_list_is_in_canonical_form() {
+    let route = |path: &str, access: Value| {
+        with_route(serde_json::json!({"path": path, "upstream": "api", "access": access}))
+    };
+    let list = serde_json::json!({"deny_cidrs": ["10.0.0.0/8"]});
+    let sentence = Some(
+        "a route with an access list has an escape in its path that is lowercase or is for a byte that needs no escape",
+    );
+    // Lowercase digits, and the escape of a byte that a path holds as it is.
+    for path in ["/%e3%81%82/", "/%61dmin/", "/a%7E/", "/a/%2c"] {
+        assert_eq!(refusal_of(&route(path, list.clone())), sentence, "{path}");
+        // The same path loads for a route that has no list, or only an empty one.
+        assert_eq!(
+            refusal_of(&route(path, serde_json::json!({}))),
+            None,
+            "{path}"
+        );
+    }
+    for path in ["/%E3%81%82/", "/a%20b/", "/admin/", "/a%7B"] {
+        assert_eq!(refusal_of(&route(path, list.clone())), None, "{path}");
+    }
 }
 
 #[test]
@@ -869,5 +947,307 @@ fn a_generation_completes_the_kernel_values_and_is_checked_again() {
     assert_eq!(
         result.err(),
         Some(ConfigError("rules path is not an absolute clean path"))
+    );
+}
+
+/// The base document with this route as the only route.
+fn with_route(route: Value) -> Vec<u8> {
+    doc(&[f("routes", Value::Array(vec![route]))])
+}
+
+/// The sentence with which the document is refused, or none if it loads.
+fn refusal_of(bytes: &[u8]) -> Option<&'static str> {
+    parse(bytes).err().map(|e| e.0)
+}
+
+#[test]
+fn the_time_to_look_up_the_names_runs_from_1_ms_to_3600_s() {
+    let key = "resolve_timeout_ms";
+    let sentence = "resolve_timeout_ms is out of range";
+    pass(&[f(key, 1)]);
+    pass(&[f(key, 3_600_000)]);
+    refuse(&[f(key, 0)], sentence);
+    refuse(&[f(key, 3_600_001)], sentence);
+}
+
+#[test]
+fn a_server_address_is_an_ip_literal_or_a_name_with_a_port() {
+    let address = |text: &str| sv("address", text);
+    let label = "a".repeat(63);
+    let longest = format!("{label}.{label}.{label}.{}", "a".repeat(61));
+    assert_eq!(longest.len(), 253);
+    // A name of 253 bytes and a label of 63 bytes are the longest.
+    let good: Vec<String> = vec![
+        "app.test:80".into(),
+        "a:1".into(),
+        "db_1.internal:65535".into(),
+        "x-y.z:8080".into(),
+        "_x.test:80".into(),
+        "localhost:8080".into(),
+        format!("{label}:80"),
+        format!("{longest}:80"),
+    ];
+    for text in &good {
+        pass(&[address(text)]);
+    }
+    // Uppercase, an empty label, a last label that does not start with a letter (an OS reads `127.1` and
+    // `0x7f000001` as addresses), and a name or a label one byte over.
+    let malformed: Vec<String> = vec![
+        "App.test:80".into(),
+        ".app.test:80".into(),
+        "app..test:80".into(),
+        "app.test.:80".into(),
+        "-:80".into(),
+        "a b:80".into(),
+        "app._test:80".into(),
+        ":80".into(),
+        "127.1:80".into(),
+        "0x7f000001:80".into(),
+        "2130706433:80".into(),
+        "0177.0.0.1:80".into(),
+        "app.1:80".into(),
+        format!("{}:80", "a".repeat(64)),
+        format!("{longest}a:80"),
+    ];
+    for text in &malformed {
+        refuse(&[address(text)], "a server name is malformed");
+    }
+    for text in [
+        "app.test:0",
+        "app.test:08",
+        "app.test:65536",
+        "app.test:",
+        "app.test:80x",
+        "app.test:-1",
+        "app.test: 80",
+        "app.test:+80",
+        "app.test:80:80",
+    ] {
+        refuse(&[address(text)], "a server port is not 1 to 65535");
+    }
+    let shape = "a server address is not an IP address and port, or a name and port";
+    for text in ["", "app.test", "127.0.0.1", MARK] {
+        refuse(&[address(text)], shape);
+    }
+    // An IP literal is not unspecified, not a multicast address and not at port 0.
+    refuse(&[address("127.0.0.1:0")], "a server port is 0");
+    let unusable = "a server address is unspecified or a multicast address";
+    for text in [
+        "0.0.0.0:80",
+        "[::]:80",
+        "224.0.0.1:80",
+        "239.255.255.255:80",
+        "[ff02::1]:80",
+        "[::ffff:0.0.0.0]:80",
+        "[::ffff:224.0.0.1]:80",
+    ] {
+        refuse(&[address(text)], unusable);
+    }
+    pass(&[address("223.255.255.255:80")]);
+    pass(&[address("[2001:db8::1]:80")]);
+    // A name is kept as it was written: nothing is looked up when the file is loaded.
+    let loaded = parse(&doc(&[address("app.test:80")])).unwrap();
+    let api = loaded
+        .forward
+        .groups
+        .iter()
+        .find(|g| g.name == "api")
+        .unwrap();
+    assert_eq!(
+        api.servers[0].address,
+        Address::Name {
+            name: "app.test".to_string(),
+            port: 80
+        }
+    );
+}
+
+#[test]
+fn the_access_of_a_route_is_two_lists_of_at_most_256_networks() {
+    let route =
+        |access: Value| with_route(serde_json::json!({"upstream": "api", "access": access}));
+    let access_of = |bytes: &[u8]| {
+        let loaded = parse(bytes).unwrap();
+        loaded
+            .forward
+            .routes
+            .find(Some(b"h.test"), b"/")
+            .unwrap()
+            .access
+            .clone()
+    };
+    let both = serde_json::json!({
+        "deny_cidrs": ["10.0.0.0/8"],
+        "allow_cidrs": ["10.1.0.0/16", "192.0.2.0/24"],
+    });
+    let access = access_of(&route(both));
+    let permits = |text: &str| access.permits(text.parse().unwrap());
+    // Deny first; then only the networks of allow.
+    assert!(!permits("10.1.2.3"));
+    assert!(permits("192.0.2.5"));
+    assert!(!permits("198.51.100.1"));
+    for none in [serde_json::json!({}), Value::Null] {
+        let access = access_of(&route(none));
+        assert!(access.permits("203.0.113.1".parse().unwrap()));
+    }
+
+    let list = |key: &str, n: usize| {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            key.to_string(),
+            Value::Array(vec![Value::from("10.0.0.0/8"); n]),
+        );
+        Value::Object(object)
+    };
+    for key in ["deny_cidrs", "allow_cidrs"] {
+        assert_eq!(refusal_of(&route(list(key, 256))), None);
+        assert_eq!(
+            refusal_of(&route(list(key, 257))),
+            Some("access has a list of more than 256 networks")
+        );
+    }
+    for bad in ["10.0.0.1/8", "10.0.0.0", "", MARK] {
+        assert_eq!(
+            refusal_of(&route(serde_json::json!({"deny_cidrs": [bad]}))),
+            Some("access has an entry that is not a network"),
+            "{bad:?}"
+        );
+    }
+    let unknown = "configuration has an unknown key";
+    let wrong = "configuration has a value of the wrong type";
+    for (access, sentence) in [
+        (serde_json::json!({"allow": []}), unknown),
+        (serde_json::json!([]), wrong),
+        (serde_json::json!({"deny_cidrs": "10.0.0.0/8"}), wrong),
+        (serde_json::json!({"deny_cidrs": null}), wrong),
+    ] {
+        assert_eq!(
+            refusal_of(&route(access.clone())),
+            Some(sentence),
+            "{access}"
+        );
+    }
+}
+
+#[test]
+fn the_edits_of_a_route_are_read_and_checked_when_the_file_is_loaded() {
+    let rewrite = |edits: Value| {
+        with_route(serde_json::json!({"path": "/api/", "upstream": "api", "rewrite": edits}))
+    };
+    let full = serde_json::json!({
+        "host": "inner.test:8080",
+        "path": "/v2/",
+        "query": {
+            "remove": ["a"],
+            "remove_prefixes": ["utm_"],
+            "set": [{"name": "s", "value": "1"}],
+            "add": [{"name": "k", "value": "v"}],
+        },
+        "request_headers": {
+            "remove": ["X-Drop"],
+            "set": [{"name": "X-Edge", "value": "1"}],
+            "add": [{"name": "X-Added", "value": "a"}],
+        },
+        "response_headers": {
+            "remove": ["Server"],
+            "set": [],
+            "add": [{"name": "X-Served-By", "value": "edge"}],
+        },
+    });
+    let mut good = vec![
+        full,
+        serde_json::json!({}),
+        Value::Null,
+        serde_json::json!({"query": {}}),
+        serde_json::json!({"response_headers": {"remove": ["Server"]}}),
+    ];
+    good.push(serde_json::json!({"request_headers": {"add": (0..32)
+        .map(|i| serde_json::json!({"name": format!("x-{i}"), "value": "v"}))
+        .collect::<Vec<_>>()}}));
+    for edits in good {
+        assert_eq!(refusal_of(&rewrite(edits.clone())), None, "{edits}");
+    }
+
+    let field = "a request field name is not allowed in the edits";
+    let value = "a field value is over 4096 bytes or has a character that is not allowed";
+    let query_name = "a query name is not 1 to 256 bytes of letters, digits and - . _ ~";
+    let unknown = "configuration has an unknown key";
+    let wrong = "configuration has a value of the wrong type";
+    let mut bad = vec![
+        (
+            serde_json::json!({"host": "*.inner.test"}),
+            "a rewrite host is malformed",
+        ),
+        (
+            serde_json::json!({"path": "/v2"}),
+            "a rewrite path for a route path that ends in / does not end in /",
+        ),
+        (
+            serde_json::json!({"path": "/a/../b/"}),
+            "a rewrite path is malformed",
+        ),
+        (
+            serde_json::json!({"request_headers": {"set": [{"name": "Host", "value": "x"}]}}),
+            field,
+        ),
+        (
+            serde_json::json!({"request_headers": {"remove": ["x_y"]}}),
+            field,
+        ),
+        (
+            serde_json::json!({"response_headers": {"add": [{"name": "Set-Cookie", "value": "a=b"}]}}),
+            "a response field name is not allowed in the edits",
+        ),
+        (
+            serde_json::json!({"request_headers": {"set": [{"name": "X-A", "value": "a\r\nX-B: b"}]}}),
+            value,
+        ),
+        (
+            serde_json::json!({"request_headers": {"remove": ["X-A"], "set": [{"name": "x-a", "value": "1"}]}}),
+            "a field name is edited more than once",
+        ),
+        (
+            serde_json::json!({"query": {"set": [{"name": "a=b", "value": "1"}]}}),
+            query_name,
+        ),
+        (
+            serde_json::json!({"query": {"add": [{"name": "a", "value": "x y"}]}}),
+            "a query value is over 4096 bytes or has a character that is not allowed",
+        ),
+        (
+            serde_json::json!({"query": {"remove": ["a"], "add": [{"name": "a", "value": "1"}]}}),
+            "a query name is edited more than once",
+        ),
+        (serde_json::json!({"unknown": 1}), unknown),
+        (serde_json::json!({"query": {"unknown": 1}}), unknown),
+        (serde_json::json!({"query": []}), wrong),
+        (
+            serde_json::json!({"request_headers": {"add": [["X-A", "1"]]}}),
+            wrong,
+        ),
+        (
+            serde_json::json!({"request_headers": {"add": [{"name": "X-A"}]}}),
+            "configuration has a missing key",
+        ),
+        (serde_json::json!({"host": 5}), wrong),
+    ];
+    bad.push((
+        serde_json::json!({"request_headers": {"add": (0..33)
+            .map(|i| serde_json::json!({"name": format!("x-{i}"), "value": "v"}))
+            .collect::<Vec<_>>()}}),
+        "the field edits have more than 32 items",
+    ));
+    for (edits, sentence) in bad {
+        assert_eq!(
+            refusal_of(&rewrite(edits.clone())),
+            Some(sentence),
+            "{edits}"
+        );
+    }
+    // A path edit needs a route that has a path.
+    let no_path = with_route(serde_json::json!({"upstream": "api", "rewrite": {"path": "/v2/"}}));
+    assert_eq!(
+        refusal_of(&no_path),
+        Some("a rewrite path is set on a route that has no path")
     );
 }

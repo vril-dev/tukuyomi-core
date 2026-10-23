@@ -6,6 +6,11 @@
 //! is not an IP literal ends the reading and leaves the peer as the client. A peer that is not trusted is the
 //! client, whatever its lines say. An address taken from the lines has no port of its own, so its port is 0.
 //! Everything here is a pure function of its arguments.
+//!
+//! `Access` is the lists of networks of a route: the client of a request, as found above, decides whether the
+//! route may be used. A request is held to the lists of every route it could be taken for, however its path is
+//! written, not only of the one it was matched to (see `route` and `inbound::conn`). The default route has no
+//! lists.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -76,6 +81,30 @@ impl Cidr {
 /// Whether `ip` is in one of the networks.
 pub fn trusts(list: &[Cidr], ip: IpAddr) -> bool {
     list.iter().any(|net| net.contains(ip))
+}
+
+/// The networks that decide who may use a route. A client in a `deny` network is turned away; so is a client in
+/// none of the `allow` networks, if there are any. Both lists empty turn nobody away.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Access {
+    deny: Vec<Cidr>,
+    allow: Vec<Cidr>,
+}
+
+impl Access {
+    pub fn new(deny: Vec<Cidr>, allow: Vec<Cidr>) -> Access {
+        Access { deny, allow }
+    }
+
+    /// Whether the client at `ip` may use the route.
+    pub fn permits(&self, ip: IpAddr) -> bool {
+        !trusts(&self.deny, ip) && (self.allow.is_empty() || trusts(&self.allow, ip))
+    }
+
+    /// Whether both lists are empty, so that nobody is turned away.
+    pub fn is_empty(&self) -> bool {
+        self.deny.is_empty() && self.allow.is_empty()
+    }
 }
 
 /// An entry of an `X-Forwarded-For` line: an IP literal, without the blanks around it.

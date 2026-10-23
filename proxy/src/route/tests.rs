@@ -1,3 +1,4 @@
+use super::path::{ambiguous, canonical};
 use super::*;
 
 fn rule(host: Option<&str>, path: Option<&str>) -> Rule {
@@ -216,4 +217,169 @@ fn two_rules_with_the_same_host_and_path_are_refused() {
         (rule(Some("h:80"), Some("/a")), 3),
     ];
     assert!(Table::new(apart).is_ok());
+}
+
+fn canonical_of(path: &str) -> Option<String> {
+    canonical(path.as_bytes()).map(|spelt| String::from_utf8(spelt.into_owned()).unwrap())
+}
+
+#[test]
+fn the_canonical_form_writes_each_escape_one_way_and_keeps_the_case_of_letters() {
+    // The escape of a byte that a rule path holds as it is becomes the byte; any other escape has uppercase digits.
+    for (path, want) in [
+        ("/priv%61te/x", "/private/x"),
+        ("/%41%5a%7E/%40%2C%3A%2b", "/AZ~/@,:+"),
+        ("/%e3%81%82/", "/%E3%81%82/"),
+        ("/a%20b/%7b/%3b/%3F", "/a%20b/%7B/%3B/%3F"),
+        // Already canonical, a `%` that is no escape, and the case of letters.
+        ("/a/%20/%E3%81%82", "/a/%20/%E3%81%82"),
+        ("/a/%zz/%4/50%", "/a/%zz/%4/50%"),
+        ("/PRIV%61TE/x", "/PRIVaTE/x"),
+        ("/", "/"),
+        // A byte that a request holds as it is and a rule path only writes as an escape: one spelling for both.
+        ("/a[b/", "/a%5Bb/"),
+        ("/a%5bb/x", "/a%5Bb/x"),
+        ("/a%5Bb/x", "/a%5Bb/x"),
+        ("/\"[]^{|}", "/%22%5B%5D%5E%7B%7C%7D"),
+        ("/{\"k\":1}|", "/%7B%22k%22:1%7D%7C"),
+        // A `%` in front of such a byte stays, and the escape of the byte starts after it.
+        ("/%[", "/%%5B"),
+    ] {
+        assert_eq!(canonical_of(path).as_deref(), Some(want), "{path}");
+    }
+    // A rule path is its own canonical form or it is not.
+    for (path, want) in [
+        ("/api/", true),
+        ("/a%20b/", true),
+        ("/%E3%81%82/", true),
+        ("/%e3%81%82/", false),
+        ("/%61dmin/", false),
+        ("/%7E/", false),
+        ("/a%5Bb/", true),
+        ("/a%5bb/", false),
+    ] {
+        assert_eq!(rule(None, Some(path)).canonical(), want, "{path}");
+    }
+    assert!(rule(None, None).canonical());
+}
+
+#[test]
+fn a_path_that_is_ambiguous_or_changes_again_when_respelled_has_no_canonical_form() {
+    for path in [
+        "//a", "/a/./b", "/a/../b", "/a;b", "/a\\b", "/%2e", "/%2F", "/%5c", "/%00", "/%25",
+    ] {
+        assert_eq!(canonical_of(path), None, "{path}");
+        assert!(ambiguous(path.as_bytes()), "{path}");
+    }
+    // Not ambiguous as received, but the escapes after a `%` that is no escape make an ambiguous path or another
+    // escape once they are replaced.
+    for path in ["/%2%65", "/%%32e", "/%5%63", "/%0%30", "/%%34%31"] {
+        assert!(!ambiguous(path.as_bytes()), "{path}");
+        assert_eq!(canonical_of(path), None, "{path}");
+    }
+}
+
+#[test]
+fn the_canonical_form_of_a_path_that_is_not_ambiguous_is_not_ambiguous_and_is_its_own() {
+    // Every string of up to 5 of these bytes, which can make the escapes of a dot, a slash and a percent sign, with
+    // a `%` in front of digits that may or may not start one, and the bytes that are written as an escape.
+    const RAW: &[u8] = b"\"[]^{|}";
+    let bytes = [b"%2e56EF/.;".as_slice(), RAW].concat();
+    let (mut seen, mut none) = (0, 0);
+    for len in 0..=5 {
+        for mut n in 0..bytes.len().pow(len) {
+            let mut path = Vec::new();
+            for _ in 0..len {
+                path.push(bytes[n % bytes.len()]);
+                n /= bytes.len();
+            }
+            seen += 1;
+            match canonical(&path) {
+                Some(spelt) => {
+                    assert!(!ambiguous(&path), "{path:?}");
+                    assert!(!ambiguous(&spelt), "{path:?}");
+                    assert!(!spelt.iter().any(|b| RAW.contains(b)), "{path:?}");
+                    assert_eq!(
+                        canonical(&spelt).as_deref(),
+                        Some(spelt.as_ref()),
+                        "{path:?}"
+                    );
+                }
+                None => none += 1,
+            }
+        }
+    }
+    assert!(none > 0 && none < seen);
+}
+
+fn could_hold(table: &Table<usize>, host: Option<&str>, target: &str) -> Vec<usize> {
+    table
+        .could_hold(host.map(str::as_bytes), target.as_bytes())
+        .copied()
+        .collect()
+}
+
+#[test]
+fn a_request_could_be_taken_for_the_rules_of_its_path_as_received_and_in_canonical_form() {
+    let t = table(&[
+        (Some("a.test"), Some("/private/")),
+        (None, Some("/pub/")),
+        (None, Some("/")),
+        (Some("a.test"), Some("/exact")),
+        (None, Some("/a%5Bb/")),
+    ]);
+    // As received, each way gives its most exact rule: a plain `/pub/x` is `/pub/` and not `/`.
+    assert_eq!(could_hold(&t, Some("a.test"), "/pub/x"), [1]);
+    assert_eq!(
+        could_hold(&t, Some("A.TEST:80"), "/private/x?a=%2e%2e/"),
+        [0]
+    );
+    assert_eq!(could_hold(&t, Some("b.test"), "/private/x"), [2]);
+    // Another spelling of a path meets the rule of the path it spells.
+    assert_eq!(could_hold(&t, Some("a.test"), "/priv%61te/x"), [0, 2]);
+    assert_eq!(could_hold(&t, Some("a.test"), "/%70ub/x"), [1, 2]);
+    // A path that ends before the `/` of a prefix: `/private` meets `/private/`.
+    assert_eq!(could_hold(&t, Some("a.test"), "/private"), [0, 2]);
+    assert_eq!(could_hold(&t, Some("a.test"), "/private?x=1"), [0, 2]);
+    // A path that a rule is for itself is not taken for the path with a `/` after it: `/exact` meets its own rule
+    // only, but `/exac%74`, which the rule for `/` holds for as received, meets `/exact` and the rule for `/`.
+    assert_eq!(could_hold(&t, Some("a.test"), "/exact"), [3]);
+    assert_eq!(could_hold(&t, Some("a.test"), "/exact?x=1"), [3]);
+    assert_eq!(could_hold(&t, Some("a.test"), "/exac%74"), [2, 3]);
+    assert_eq!(could_hold(&t, Some("a.test"), "/exact/x"), [2]);
+    // A byte that a rule path writes as an escape meets the rule whether a request writes the byte or its escape.
+    assert_eq!(could_hold(&t, Some("a.test"), "/a%5Bb/x"), [4]);
+    assert_eq!(could_hold(&t, Some("a.test"), "/a[b/x"), [2, 4]);
+    assert_eq!(could_hold(&t, Some("a.test"), "/a%5bb/x"), [2, 4]);
+    // Upper and lower case letters are different paths.
+    assert_eq!(could_hold(&t, Some("a.test"), "/PRIV%61TE/x"), [2]);
+    // A table without a rule that holds has none.
+    let t = table(&[(Some("a.test"), Some("/private/"))]);
+    assert!(could_hold(&t, Some("a.test"), "/other").is_empty());
+    assert!(could_hold(&t, Some("b.test"), "/private/x").is_empty());
+}
+
+#[test]
+fn a_request_that_cannot_be_told_by_its_path_could_be_taken_for_every_rule_its_host_holds_for() {
+    let t = table(&[
+        (Some("a.test"), Some("/private/")),
+        (Some("b.test"), None),
+        (None, Some("/pub/")),
+        (Some("*.c.test"), Some("/x")),
+    ]);
+    // An ambiguous path, or one with no canonical form: the host decides and the path does not.
+    assert_eq!(could_hold(&t, Some("a.test"), "/private/./x"), [0, 2]);
+    assert_eq!(could_hold(&t, Some("b.test"), "//x"), [1, 2]);
+    assert_eq!(could_hold(&t, Some("d.c.test"), "/a/./b"), [2, 3]);
+    assert_eq!(could_hold(&t, Some("b.test"), "/%2%65"), [1, 2]);
+    // A `Host` that cannot be read could be any: every rule, whatever the path.
+    for host in [None, Some("a..test"), Some("a b")] {
+        for target in ["/private/x", "/other", "/priv%61te/x", "//x"] {
+            assert_eq!(
+                could_hold(&t, host, target),
+                [0, 1, 2, 3],
+                "{host:?} {target}"
+            );
+        }
+    }
 }

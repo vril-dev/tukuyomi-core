@@ -2,15 +2,17 @@
 //!
 //! The request leaves in the form that was inspected, with these changes only: the fields that belong to the
 //! connection with the client are removed, the forwarding fields are added (and `Connection: close` when the
-//! connections to the upstream are not kept), and the body is the inspected bytes. The names that the client
-//! listed in `Connection` are collected before anything is removed and are removed with the other hop-by-hop
-//! fields. The fields that are added come after the removal, so a client cannot take them away by naming them.
+//! connections to the upstream are not kept), the edits of the route are made (see `rewrite`), and the body is the
+//! inspected bytes. The names that the client listed in `Connection` are collected before anything is removed and
+//! are removed with the other hop-by-hop fields. The fields that are added come after the removal, so a client
+//! cannot take them away by naming them.
 //!
 //! The forwarding fields tell the upstream who the client is. A peer that is in `trusted_proxies` is believed: its
 //! `X-Forwarded-For` lines are kept and its own address is added at the end, and its `X-Forwarded-Proto` is kept if
 //! it is exactly `http` or `https`; its other claims (see `CLIENT_CLAIMS`) pass as they are. From any other peer
 //! all of those claims are dropped, `X-Forwarded-For` is the address of the peer alone and `X-Forwarded-Proto` is
-//! `http`. `X-Forwarded-Host` is the `Host` of the request whoever the peer is.
+//! `http`. `X-Forwarded-Host` is the `Host` of the request whoever the peer is, as the client wrote it: a route that
+//! sets another `Host` does so after that.
 //!
 //! The server is chosen by the group (see `group`). The connection to it is the newest one that waits for that server
 //! in the pool of the group and is ready, or a new one. It goes back to the pool when the body of the answer has been
@@ -42,7 +44,8 @@
 //! The answer is checked before it is passed on. A status outside 200..=599, unclear framing, and a `Connection`
 //! field that is not a list of tokens or that names a field the answer must keep are refused, and the connection
 //! to the upstream is dropped with it. A refused answer is never partly passed on. The fields that belong to the
-//! connection with the upstream are removed, and the trailers of the answer are dropped.
+//! connection with the upstream are removed, and the trailers of the answer are dropped. The response edits of the
+//! route are made on the head that is left, so they do not reach an answer the proxy makes itself.
 //!
 //! Every wait before the head of the answer ends at an absolute instant that is never extended, and a stage whose
 //! end has already been reached does not start (see `Stage`). Informational responses are read over and not passed
@@ -79,6 +82,7 @@ use crate::config::ProxyConfig;
 use crate::forward::client_ip;
 use crate::forward::group::{Group, Server, Tried};
 use crate::forward::pool::{Lease, Pool};
+use crate::forward::rewrite::Rewrite;
 use crate::inbound::conn::Ctx;
 use crate::inbound::head::trim_ows;
 use crate::inbound::io::{Gauge, Guarded};
@@ -90,7 +94,7 @@ static X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-prot
 
 /// Fields of the request that belong to the connection with the client or to a single hop. `Connection` and the
 /// names it lists go as well.
-const REQUEST_HOP: [&str; 10] = [
+pub(super) const REQUEST_HOP: [&str; 10] = [
     "connection",
     "keep-alive",
     "proxy-connection",
@@ -105,7 +109,7 @@ const REQUEST_HOP: [&str; 10] = [
 
 /// Fields of the answer that belong to the connection with the upstream. `Connection` and the names it lists go
 /// as well.
-const RESPONSE_HOP: [&str; 8] = [
+pub(super) const RESPONSE_HOP: [&str; 8] = [
     "connection",
     "keep-alive",
     "proxy-connection",
@@ -120,7 +124,7 @@ const RESPONSE_HOP: [&str; 8] = [
 /// common use take for the address of the client. They are believed from a trusted peer only. `X-Forwarded-Host` is
 /// not among them: it is always made from the `Host` of the request. The names with an underscore never get here
 /// (see `represent`).
-const CLIENT_CLAIMS: [&str; 13] = [
+pub(super) const CLIENT_CLAIMS: [&str; 13] = [
     "x-forwarded-for",
     "x-real-ip",
     "forwarded",
@@ -687,8 +691,16 @@ async fn attempt(
 }
 
 /// Sends the request to a server of the group and returns its checked response head; `by` bounds the whole exchange
-/// up to the head, the tries on other servers included.
-pub async fn forward(f: Forward, group: &Group, ctx: &Ctx, by: Instant) -> Dispatched {
+/// up to the head, the tries on other servers included. The edits of `rewrite` are made once, before the first try,
+/// on the request and, when a server has answered, on the head of the response. A request whose edits cannot be made
+/// is not sent (`Send`, with no server).
+pub async fn forward(
+    f: Forward,
+    group: &Group,
+    rewrite: &Rewrite,
+    ctx: &Ctx,
+    by: Instant,
+) -> Dispatched {
     let cfg = &ctx.cfg;
     let Forward {
         method,
@@ -698,8 +710,10 @@ pub async fn forward(f: Forward, group: &Group, ctx: &Ctx, by: Instant) -> Dispa
         peer,
     } = f;
     let trusted = client_ip::trusts(&cfg.trusted_proxies, peer.ip());
-    let fields = match forwarded_fields(fields, peer.ip(), trusted, cfg.upstream_keepalive == 0) {
-        Ok(fields) => fields,
+    let made = forwarded_fields(fields, peer.ip(), trusted, cfg.upstream_keepalive == 0)
+        .and_then(|fields| rewrite.request(fields, uri).map_err(|_| OriginError::Send));
+    let (fields, uri) = match made {
+        Ok(made) => made,
         Err(error) => {
             return Dispatched {
                 server: None,
@@ -733,7 +747,8 @@ pub async fn forward(f: Forward, group: &Group, ctx: &Ctx, by: Instant) -> Dispa
         let chosen = group.server(index);
         server = Some(chosen.address());
         match attempt(chosen, cfg, &request, &method, head_request, by).await {
-            Ok(response) => {
+            Ok(mut response) => {
+                rewrite.respond(response.headers_mut());
                 return Dispatched {
                     server,
                     result: Ok(response),

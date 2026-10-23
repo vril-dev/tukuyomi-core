@@ -1,7 +1,12 @@
 //! The upstream groups, the routes that choose one, and which servers of a group can be used.
 //!
-//! A request goes to the group that the most exact route holding for it names, or to the default group; with
-//! neither it has no group (`Upstreams::find`). A group has one or more servers and one pool of waiting connections
+//! A request goes to the route that is the most exact of those holding for it, or to the default route, which
+//! names the default group and turns nobody away and edits nothing; with neither it has no route
+//! (`Upstreams::find`). A route names a group, tells which clients may use it (`Access`) and how the request and the
+//! response are edited (`Rewrite`). A request may be another way to write a request for a route that it does not
+//! hold for, so the access lists of every route that it could be taken for are asked for, not only those of the
+//! route it goes to (`Upstreams::accesses`), and only if some route has a list (`Upstreams::guarded`). A group has
+//! one or more servers and one pool of waiting connections
 //! that they share, so the connections that wait are bounded for the group, not for each server. The server a
 //! request goes to is chosen by weight among the servers that can be used and that the request has not tried yet
 //! (see `select`).
@@ -22,17 +27,27 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tokio::time::Instant;
 
-use crate::config::{ForwardConfig, GroupConfig, ProxyConfig, ServerConfig};
+use crate::config::{ForwardConfig, GroupConfig, ProxyConfig, RouteConfig, ServerConfig};
+use crate::forward::client_ip::Access;
 use crate::forward::pool::Pool;
+use crate::forward::rewrite::Rewrite;
 use crate::forward::select::Turn;
 use crate::route::Table;
 
 /// The groups of the configuration, and the routes to them.
 pub struct Upstreams {
     groups: Vec<Group>,
-    /// The target of a route is the index of its group.
-    routes: Table<usize>,
-    default: Option<usize>,
+    routes: Table<RouteConfig>,
+    /// The route for a request that no other route holds for.
+    default: Option<RouteConfig>,
+    /// Some route has an access list.
+    guarded: bool,
+}
+
+/// The route a request takes: the group it goes to, and how it edits the request and the response.
+pub struct Route<'a> {
+    pub group: &'a Group,
+    pub rewrite: &'a Rewrite,
 }
 
 impl Upstreams {
@@ -46,15 +61,38 @@ impl Upstreams {
                 .map(|group| Group::new(group, proxy, born))
                 .collect(),
             routes: cfg.routes.clone(),
-            default: cfg.default,
+            default: cfg.default.map(RouteConfig::plain),
+            guarded: cfg.routes.targets().any(|route| !route.access.is_empty()),
         }
     }
 
-    /// The group for a request with this `Host` value and this request target: that of the most exact route that
-    /// holds for it, or else the default group.
-    pub fn find(&self, host: Option<&[u8]>, target: &[u8]) -> Option<&Group> {
-        let index = self.routes.find(host, target).copied().or(self.default)?;
-        self.groups.get(index)
+    /// Whether some route has an access list. If none has, no request is turned away by one, and `accesses` need
+    /// not be asked.
+    pub fn guarded(&self) -> bool {
+        self.guarded
+    }
+
+    /// The route for a request with this `Host` value and this request target: the most exact one that holds for it,
+    /// or else the default route.
+    pub fn find(&self, host: Option<&[u8]>, target: &[u8]) -> Option<Route<'_>> {
+        let found = self.routes.find(host, target).or(self.default.as_ref())?;
+        Some(Route {
+            group: self.groups.get(found.group)?,
+            rewrite: &found.rewrite,
+        })
+    }
+
+    /// The access lists that a request with this `Host` value and this request target has to pass: those of the routes
+    /// it could be taken for, however it is written, the route it goes to among them (see `Table::could_hold`). The
+    /// default route has none.
+    pub fn accesses<'a>(
+        &'a self,
+        host: Option<&'a [u8]>,
+        target: &'a [u8],
+    ) -> impl Iterator<Item = &'a Access> {
+        self.routes
+            .could_hold(host, target)
+            .map(|route| &route.access)
     }
 
     /// The group at `index`, for the tests.

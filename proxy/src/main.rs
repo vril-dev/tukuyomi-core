@@ -4,17 +4,17 @@
 //! starts.
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration
-//! file), the host checks, the configuration, the rules store (the chosen generation, the hold on it, its directory,
-//! mode and routes, and with them the kernel configuration), the runtime and the signal handlers, the driver
-//! thread, the wait for the kernel to be ready, bind, accept. The rules store is read here, and again when SIGUSR1
-//! comes. Handlers exist for SIGTERM, SIGINT, SIGHUP and SIGUSR1 only and are installed before the kernel starts
-//! its child process; SIGCHLD is never handled. The listener is bound only after the kernel is ready, and a
-//! connection permit is taken before every accept. When every permit is in use and a connection arrives, that
-//! connection is taken from the backlog to wait for a permit, and the connections that wait for their next
-//! request are told to close, so that the permits of idle connections come back.
+//! file), the host checks, the configuration, the lookup of the names of the upstream servers, the rules store (the
+//! chosen generation, the hold on it, its directory, mode and routes, and with them the kernel configuration), the
+//! runtime and the signal handlers, the driver thread, the wait for the kernel to be ready, bind, accept. The rules
+//! store is read here, and again when SIGUSR1 comes. Handlers exist for SIGTERM, SIGINT, SIGHUP and SIGUSR1 only and
+//! are installed before the kernel starts its child process; SIGCHLD is never handled. The listener is bound only
+//! after the kernel is ready, and a connection permit is taken before every accept. When every permit is in use and a
+//! connection arrives, that connection is taken from the backlog to wait for a permit, and the connections that wait
+//! for their next request are told to close, so that the permits of idle connections come back.
 //!
 //! The upstream groups and the routes to them are read from the configuration file when the proxy starts, and stay
-//! as they are until it is started again.
+//! as they are until it is started again; so do the addresses that the names of the servers have then.
 //!
 //! SIGUSR1 makes the proxy switch to the generation that the rules store chooses now (`rules::switch` reads the
 //! store, the driver starts the new inspector and moves the requests over when it is ready). It is a line in the
@@ -26,9 +26,9 @@
 //! `t0 + stop_inspect`, waits for the connections until `t0 + stop_wait` and aborts what is left, then waits for
 //! the driver's end until `t0 + stop_wait + kill_grace`. The exit code is 0 only when the stop was not caused by a failure and the driver
 //! reports a stopped kernel whose child exit and per-start directory removal are confirmed, and the same for every
-//! kernel that was stopped before it; 1 for any other end, and for a refused rules store or generation (nothing
-//! has been started then); 2 for a wrong argument or a refused configuration. The log is flushed for at most
-//! 200 ms at the end.
+//! kernel that was stopped before it; 1 for any other end, and for names of upstream servers that cannot be looked up
+//! or a refused rules store or generation (nothing has been started then); 2 for a wrong argument or a refused
+//! configuration. The log is flushed for at most 200 ms at the end.
 
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
@@ -51,6 +51,7 @@ use tokio::time::{Instant, Sleep, sleep, timeout_at};
 use tukuyomi_kernel::{Failure, Phase};
 use tukuyomi_proxy::config::{self, ForwardConfig, ProxyConfig};
 use tukuyomi_proxy::forward::group::Upstreams;
+use tukuyomi_proxy::forward::resolve;
 use tukuyomi_proxy::host;
 use tukuyomi_proxy::inbound::conn::Ctx;
 use tukuyomi_proxy::inbound::session;
@@ -123,6 +124,18 @@ fn start(log: &Log) -> u8 {
         }
     };
     log.line("start: configuration accepted");
+    let forward = match resolve::complete(loaded.forward, loaded.proxy.listen, resolve::system) {
+        Ok(done) => {
+            for line in &done.lines {
+                log.line(line);
+            }
+            done.forward
+        }
+        Err(refusal) => {
+            log.line(&format!("start: upstream refused: {refusal}"));
+            return EXIT_FAILED;
+        }
+    };
     let rules = match store::open(&loaded.store) {
         Ok(rules) => rules,
         Err(e) => {
@@ -194,7 +207,7 @@ fn start(log: &Log) -> u8 {
     };
     runtime.block_on(run(
         loaded.proxy,
-        loaded.forward,
+        forward,
         kernel,
         generation,
         mode,

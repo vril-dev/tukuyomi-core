@@ -12,6 +12,7 @@ fn get_for(host: &str, path: &str) -> Vec<u8> {
 /// the paths below `/files/` of `example.test`. There is no default group.
 fn three_groups(addresses: &[SocketAddr]) -> Value {
     json!({
+        "resolve_timeout_ms": RESOLVE_TIMEOUT_MS,
         "upstreams": {
             "web": {"servers": [server(addresses[0])]},
             "api": {"servers": [server(addresses[1])]},
@@ -29,6 +30,7 @@ fn three_groups(addresses: &[SocketAddr]) -> Value {
 /// One group of two servers, the second the first upstream; the first is the one that the test stops.
 fn two_servers(addresses: &[SocketAddr]) -> Value {
     json!({
+        "resolve_timeout_ms": RESOLVE_TIMEOUT_MS,
         "upstreams": {"main": {"servers": [server(addresses[1]), server(addresses[0])]}},
         "routes": [],
         "default_upstream": "main",

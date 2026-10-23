@@ -94,7 +94,9 @@ pub(in crate::forward) fn run<F: Future>(body: F) -> F::Output {
 
 /// Forwards to the one group of `ctx`, and returns what came of it.
 pub(in crate::forward) async fn send(f: Forward, ctx: &Ctx, by: Instant) -> Outcome {
-    forward(f, ctx.upstreams.group(0), ctx, by).await.result
+    forward(f, ctx.upstreams.group(0), &Rewrite::default(), ctx, by)
+        .await
+        .result
 }
 
 /// Far enough away to play no part.
@@ -843,7 +845,14 @@ fn a_connection_that_cannot_be_made_goes_on_to_the_next_server_for_any_method() 
             let dead = nobody().await;
             let (live, up) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
             let ctx = ctx_of(&ForwardConfig::of(&[dead, live]), config());
-            let sent = forward(bare(&ctx, method), ctx.upstreams.group(0), &ctx, far()).await;
+            let sent = forward(
+                bare(&ctx, method),
+                ctx.upstreams.group(0),
+                &Rewrite::default(),
+                &ctx,
+                far(),
+            )
+            .await;
             assert_eq!(sent.server, Some(live), "{method}");
             assert_eq!(sent.result.unwrap().status(), 200, "{method}");
             up.await.unwrap();
@@ -858,7 +867,14 @@ fn a_request_that_was_sent_goes_on_only_if_it_does_no_harm_when_sent_twice() {
             let (silent, seen) = silent().await;
             let (live, up) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
             let ctx = ctx_of(&ForwardConfig::of(&[silent, live]), config());
-            let sent = forward(bare(&ctx, method), ctx.upstreams.group(0), &ctx, far()).await;
+            let sent = forward(
+                bare(&ctx, method),
+                ctx.upstreams.group(0),
+                &Rewrite::default(),
+                &ctx,
+                far(),
+            )
+            .await;
             assert_eq!(seen.load(Ordering::SeqCst), 1, "{method}");
             if goes_on {
                 assert_eq!(sent.server, Some(live));
@@ -890,11 +906,11 @@ fn each_server_is_tried_once_and_a_group_with_none_to_try_is_unavailable() {
         let tried = |counts: &[Arc<AtomicUsize>]| -> Vec<usize> {
             counts.iter().map(|c| c.load(Ordering::SeqCst)).collect()
         };
-        let sent = forward(bare(&ctx, "GET"), group, &ctx, far()).await;
+        let sent = forward(bare(&ctx, "GET"), group, &Rewrite::default(), &ctx, far()).await;
         assert_eq!(refused(sent.result), OriginError::Send);
         assert_eq!(tried(&counts), [1, 1, 1]);
         // Each one failed once, and one failure leaves a server out: the next request has none to try.
-        let sent = forward(bare(&ctx, "GET"), group, &ctx, far()).await;
+        let sent = forward(bare(&ctx, "GET"), group, &Rewrite::default(), &ctx, far()).await;
         assert_eq!(sent.server, None);
         assert_eq!(refused(sent.result), OriginError::Unavailable);
         assert_eq!(tried(&counts), [1, 1, 1]);
@@ -951,7 +967,7 @@ async fn held_up(slow: SocketAddr, cfg: ProxyConfig, by: Instant, own: bool) {
     let (live, up) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
     let ctx = ctx_of(&ForwardConfig::of(&[slow, live]), cfg);
     let group = ctx.upstreams.group(0);
-    let sent = forward(bare(&ctx, "GET"), group, &ctx, by).await;
+    let sent = forward(bare(&ctx, "GET"), group, &Rewrite::default(), &ctx, by).await;
     if own {
         assert_eq!(sent.server, Some(live));
         assert_eq!(sent.result.unwrap().status(), 200);
@@ -1001,7 +1017,14 @@ fn a_request_time_that_is_used_up_before_the_first_try_asks_no_server_and_is_lat
         let (mute, seen) = mute().await;
         let ctx = ctx_of(&ForwardConfig::of(&[mute]), config());
         let group = ctx.upstreams.group(0);
-        let sent = forward(bare(&ctx, "GET"), group, &ctx, Instant::now()).await;
+        let sent = forward(
+            bare(&ctx, "GET"),
+            group,
+            &Rewrite::default(),
+            &ctx,
+            Instant::now(),
+        )
+        .await;
         assert_eq!(sent.server, None);
         assert_eq!(refused(sent.result), OriginError::Late);
         sleep(Duration::from_millis(100)).await;
@@ -1056,7 +1079,7 @@ where
     let (second, _) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
     let ctx = ctx_of(&ForwardConfig::of(&[first, second]), cfg);
     let group = ctx.upstreams.group(0);
-    let sent = forward(bare(&ctx, "GET"), group, &ctx, far()).await;
+    let sent = forward(bare(&ctx, "GET"), group, &Rewrite::default(), &ctx, far()).await;
     let went_on = sent.server == Some(second);
     let result = sent.result.map(|response| response.status().as_u16());
     (result, went_on, !gives(group).contains(&0))
@@ -1114,5 +1137,129 @@ fn a_connection_reset_in_the_middle_of_a_head_is_the_fault_of_the_server() {
         assert_eq!(result, Ok(200));
         assert!(went_on, "it was not tried on the second server");
         assert!(left_out, "the server is not left out");
+    });
+}
+
+// ---- the edits of a route ----
+
+use crate::forward::rewrite::{Headers, Query};
+
+fn strings(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_string()).collect()
+}
+
+fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    list.iter()
+        .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+        .collect()
+}
+
+/// The edits of a route for `/api/` that has every kind.
+fn edits() -> Rewrite {
+    let query = Query::new(
+        strings(&["debug"]),
+        vec![],
+        pairs(&[("src", "edge")]),
+        vec![],
+    )
+    .unwrap();
+    let request = Headers::request(
+        strings(&["x-drop"]),
+        pairs(&[("x-set", "new")]),
+        pairs(&[("x-added", "a")]),
+    )
+    .unwrap();
+    let response = Headers::response(
+        strings(&["x-up"]),
+        vec![],
+        pairs(&[("x-served-by", "edge")]),
+    )
+    .unwrap();
+    Rewrite::new(
+        Some("/api/"),
+        Some("inner.test:8080"),
+        Some("/v2/"),
+        query,
+        request,
+        response,
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_forwarded_request_differs_from_the_inspected_one_only_by_the_edits_of_the_route() {
+    let peer: IpAddr = "203.0.113.9".parse().unwrap();
+    let inspected = fields(&[
+        ("Host", "app.test"),
+        ("Cookie", "c=1"),
+        ("X-Keep", "k"),
+        ("X-Drop", "d"),
+        ("X-Set", "old"),
+    ]);
+    let plain = forwarded_fields(inspected, peer, false, false).unwrap();
+    let uri = "/api/x/y?debug=1&keep=%41".parse().unwrap();
+    let (edited, uri) = edits().request(plain.clone(), uri).unwrap();
+    // `X-Forwarded-Host` is made from the `Host` that the client sent, before the route sets another one.
+    assert_eq!(only(&edited, "x-forwarded-host"), [b"app.test"]);
+    let mut expected = plain;
+    expected.insert(HOST, HeaderValue::from_static("inner.test:8080"));
+    expected.remove("x-drop");
+    expected.insert("x-set", HeaderValue::from_static("new"));
+    expected.append("x-added", HeaderValue::from_static("a"));
+    assert_eq!(edited, expected);
+    assert_eq!(uri.to_string(), "/v2/x/y?keep=%41&src=edge");
+}
+
+#[test]
+fn a_route_with_edits_sends_the_edited_request_and_edits_the_head_of_the_response() {
+    run(async {
+        let (addr, up) = upstream(|sock| async move {
+            let seen = read_request(&sock).await;
+            let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Up: 1\r\n\r\nok";
+            put(&sock, reply).await.unwrap();
+            seen
+        })
+        .await;
+        let ctx = ctx(addr, config());
+        let mut f = request(&ctx, "GET", &[("Host", "app.test"), ("X-Drop", "d")], b"");
+        f.uri = "/api/x?debug=1&keep=1".parse().unwrap();
+        let group = ctx.upstreams.group(0);
+        let sent = forward(f, group, &edits(), &ctx, far()).await;
+        let response = sent.result.unwrap();
+        assert_eq!(only(response.headers(), "x-served-by"), [b"edge"]);
+        assert!(response.headers().get("x-up").is_none());
+        let seen = up.await.unwrap();
+        assert_eq!(seen.line, "GET /v2/x?keep=1&src=edge HTTP/1.1");
+        assert_eq!(seen.all("host"), ["inner.test:8080"]);
+        assert_eq!(seen.all("x-forwarded-host"), ["app.test"]);
+        assert_eq!(seen.all("x-added"), ["a"]);
+        assert!(seen.all("x-drop").is_empty());
+    });
+}
+
+#[test]
+fn a_request_whose_edits_cannot_be_made_is_not_sent_and_no_server_is_blamed() {
+    run(async {
+        let (dead, _) = silent().await;
+        let ctx = ctx(dead, config());
+        let value = pairs(&[("k", &"v".repeat(200))]);
+        let query = Query::new(vec![], vec![], vec![], value).unwrap();
+        let rewrite = Rewrite::new(
+            None,
+            None,
+            None,
+            query,
+            Headers::default(),
+            Headers::default(),
+        )
+        .unwrap();
+        let mut f = bare(&ctx, "GET");
+        f.uri = format!("/{}", "a".repeat(tukuyomi_kernel::limits::URI - 11))
+            .parse()
+            .unwrap();
+        let group = ctx.upstreams.group(0);
+        let sent = forward(f, group, &rewrite, &ctx, far()).await;
+        assert_eq!(sent.server, None);
+        assert_eq!(refused(sent.result), OriginError::Send);
     });
 }

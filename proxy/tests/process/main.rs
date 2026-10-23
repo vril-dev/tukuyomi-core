@@ -36,6 +36,7 @@ mod forwarding;
 mod inspector;
 mod keepalive;
 mod refusals;
+mod rewrite;
 mod rules;
 mod stopping;
 mod support;

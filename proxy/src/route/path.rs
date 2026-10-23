@@ -1,5 +1,7 @@
 //! The path of a rule, and the target of a request.
 
+use std::borrow::Cow;
+
 use super::rule::RouteError;
 
 const MAX_PATH_BYTES: usize = 255;
@@ -8,7 +10,7 @@ const MAX_PATH_BYTES: usize = 255;
 /// can if it has a backslash or a semicolon, `//`, a segment that is `.` or `..`, or the escape of a dot, a slash,
 /// a backslash, a NUL byte or a percent sign (`%2e`, `%2f`, `%5c`, `%00`, `%25`, in any case). The escape of a
 /// percent sign is there because an application that decodes the path twice turns `%252e` into a dot.
-fn ambiguous(path: &[u8]) -> bool {
+pub(super) fn ambiguous(path: &[u8]) -> bool {
     path.iter().any(|&b| b == b'\\' || b == b';')
         || path.windows(2).any(|pair| pair == b"//")
         || path.windows(3).any(|w| {
@@ -48,6 +50,85 @@ fn path_byte(b: u8) -> bool {
         )
 }
 
+/// The value of a hexadecimal digit.
+fn hex(digit: u8) -> Option<u8> {
+    char::from(digit)
+        .to_digit(16)
+        .and_then(|value| u8::try_from(value).ok())
+}
+
+/// A byte that the canonical form writes as it is when the path has its escape: one that the path of a rule holds as
+/// it is, except `%`, whose escape is ambiguous.
+fn literal(b: u8) -> bool {
+    b != b'%' && path_byte(b)
+}
+
+/// A byte that a request may hold in its path as it is and that the path of a rule may not (a backslash and a
+/// semicolon are the others, and they make a path ambiguous): the only spelling of it in a rule is its escape.
+fn only_escaped(b: u8) -> bool {
+    matches!(b, b'"' | b'[' | b']' | b'^' | b'{' | b'|' | b'}')
+}
+
+/// The escape of a byte, with uppercase digits.
+fn escape(b: u8) -> [u8; 3] {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    [
+        b'%',
+        DIGITS[usize::from(b >> 4)],
+        DIGITS[usize::from(b & 0x0f)],
+    ]
+}
+
+/// `path` with each `%` that is followed by two hexadecimal digits written one way: as the byte it stands for if
+/// that is a `literal` one (`%61` is `a`), and otherwise with uppercase digits (`%e3` is `%E3`), and each byte that is
+/// `only_escaped` written as its escape (`[` is `%5B`). A `%` that is not followed by two digits and every other byte
+/// are kept, and so is the case of letters. `None` if `path` is ambiguous.
+fn respell(path: &[u8]) -> Option<Cow<'_, [u8]>> {
+    if ambiguous(path) {
+        return None;
+    }
+    if !path.iter().any(|&b| b == b'%' || only_escaped(b)) {
+        return Some(Cow::Borrowed(path));
+    }
+    let mut out = Vec::with_capacity(path.len());
+    let mut rest = path;
+    while let Some((&b, tail)) = rest.split_first() {
+        if let (b'%', [high, low, after @ ..]) = (b, tail)
+            && let (Some(h), Some(l)) = (hex(*high), hex(*low))
+        {
+            let value = (h << 4) | l;
+            if literal(value) {
+                out.push(value);
+            } else {
+                out.extend([b'%', high.to_ascii_uppercase(), low.to_ascii_uppercase()]);
+            }
+            rest = after;
+        } else {
+            if only_escaped(b) {
+                out.extend(escape(b));
+            } else {
+                out.push(b);
+            }
+            rest = tail;
+        }
+    }
+    Some(Cow::Owned(out))
+}
+
+/// The canonical form of `path` (a target up to the first `?`, or the path of a rule): the one spelling for all the
+/// spellings that an application behind the proxy may read as the same path (see `respell`). It is not ambiguous,
+/// it holds no byte that is `only_escaped`, and it is its own canonical form. There is none for a path that is
+/// ambiguous, nor for one whose respelling is not final: a `%` that is not the start of an escape can become one when
+/// the escapes after it are replaced (`%2%65` gives `%2e`, `%%34%31` gives `%41`), and an application that decodes
+/// twice reads those as another path.
+pub(super) fn canonical(path: &[u8]) -> Option<Cow<'_, [u8]>> {
+    let once = respell(path)?;
+    if once.as_ref() != path && respell(&once)?.as_ref() != once.as_ref() {
+        return None;
+    }
+    Some(once)
+}
+
 /// The target of a request as it is matched: the path (up to the first `?`), and whether the path is ambiguous.
 pub(super) struct Target<'a> {
     path: &'a [u8],
@@ -64,6 +145,16 @@ impl<'a> Target<'a> {
             path,
             ambiguous: ambiguous(path),
         }
+    }
+
+    /// The canonical form of the path, if it has one.
+    pub(super) fn canonical(&self) -> Option<Cow<'a, [u8]>> {
+        canonical(self.path)
+    }
+
+    /// Whether the path is `other`.
+    pub(super) fn path_is(&self, other: &[u8]) -> bool {
+        self.path == other
     }
 }
 
@@ -122,6 +213,11 @@ impl PathRule {
 
     pub(super) fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether the path is its own canonical form.
+    pub(super) fn is_canonical(&self) -> bool {
+        canonical(self.0.as_bytes()).is_some_and(|spelt| spelt.as_ref() == self.0.as_bytes())
     }
 
     /// How well the rule holds for the target; `None` if it does not, and for every ambiguous target.

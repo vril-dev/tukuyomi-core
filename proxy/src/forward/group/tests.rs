@@ -102,3 +102,72 @@ fn a_server_that_was_tried_is_not_given_again_and_a_backup_serves_when_the_other
     assert_eq!(group.pick(Tried::default(), at(4)), None);
     assert!(group.pick(Tried::default(), at(10_004)).is_some());
 }
+
+use http::{HeaderMap, Uri};
+
+use crate::config::RouteConfig;
+use crate::forward::rewrite::{Headers, Query, Rewrite};
+use crate::route::{Rule, Table};
+
+#[test]
+fn a_target_read_in_more_than_one_way_takes_no_route_with_a_path_and_so_no_edit() {
+    let mut forward = ForwardConfig::of(&["127.0.0.1:9000".parse().unwrap()]);
+    let rewrite = Rewrite::new(
+        Some("/api/"),
+        None,
+        Some("/v2/"),
+        Query::default(),
+        Headers::default(),
+        Headers::default(),
+    )
+    .unwrap();
+    let route = RouteConfig {
+        rewrite,
+        ..RouteConfig::plain(0)
+    };
+    let rule = Rule::forward(None, Some("/api/")).unwrap();
+    forward.routes = Table::new(vec![(rule, route)]).unwrap();
+    let upstreams = Upstreams::new(&forward, &config());
+    // The default route holds for what the route with the path does not, and it edits nothing.
+    let sent = |target: &str| {
+        let route = upstreams.find(None, target.as_bytes()).unwrap();
+        let (_, uri) = route
+            .rewrite
+            .request(HeaderMap::new(), target.parse::<Uri>().unwrap())
+            .unwrap();
+        uri.to_string()
+    };
+    assert_eq!(sent("/api/x?a=1"), "/v2/x?a=1");
+    for target in ["/api/../x", "/api//x", "/api/%2e/x", "/api/a;b", "/api/%2F"] {
+        assert_eq!(sent(target), target);
+    }
+}
+
+#[test]
+fn the_upstreams_are_guarded_only_when_some_route_has_an_access_list() {
+    use crate::forward::client_ip::{Access, Cidr};
+    let guarded = |lists: &[(&[&str], &[&str])]| {
+        let mut forward = ForwardConfig::of(&["127.0.0.1:9000".parse().unwrap()]);
+        let nets = |list: &[&str]| list.iter().map(|net| Cidr::parse(net).unwrap()).collect();
+        let entries = lists
+            .iter()
+            .enumerate()
+            .map(|(i, &(deny, allow))| {
+                let route = RouteConfig {
+                    access: Access::new(nets(deny), nets(allow)),
+                    ..RouteConfig::plain(0)
+                };
+                (
+                    Rule::forward(None, Some(&format!("/r{i}/"))).unwrap(),
+                    route,
+                )
+            })
+            .collect();
+        forward.routes = Table::new(entries).unwrap();
+        Upstreams::new(&forward, &config()).guarded()
+    };
+    assert!(!guarded(&[]));
+    assert!(!guarded(&[(&[], &[]), (&[], &[])]));
+    assert!(guarded(&[(&[], &[]), (&["10.0.0.0/8"], &[])]));
+    assert!(guarded(&[(&[], &["10.0.0.0/8"])]));
+}

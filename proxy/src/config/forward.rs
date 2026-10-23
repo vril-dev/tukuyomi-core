@@ -1,13 +1,26 @@
 //! The `forward` object of the configuration: the upstream groups, and the routes that choose a group for a request.
 //!
-//! `upstreams` is an object from the name of a group to `{"servers": [..]}`. A name is 1 to 64 letters, digits, `-`
-//! and `_`, and there are 1 to 64 groups. A group has 1 to 64 servers, each `{"address", "weight", "max_fails",
-//! "fail_timeout_ms", "backup"}` with every key present: the address is an IP literal and a port (not the address of
-//! `listen`), the weight is 1 to 100, `max_fails` is 0 to 100 (0: failures are not counted), `fail_timeout_ms` is the
-//! time a failing server is left out, and `backup` tells that the server is used only when no other one can be.
-//! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream"}` that follow the rules of `route` for a forwarding
-//! rule, and each names a group. `default_upstream` is the group that serves a request no route holds for, or the
-//! empty string, and then such a request is answered with 404.
+//! `resolve_timeout_ms` is the time the proxy may take, when it starts, to look up the names of the servers (1 ms to
+//! 3600 s). `upstreams` is an object from the name of a group to `{"servers": [..]}`. A name is 1 to 64 letters,
+//! digits, `-` and `_`, and there are 1 to 64 groups. A group has 1 to 64 servers, each `{"address", "weight",
+//! "max_fails", "fail_timeout_ms", "backup"}` with every key present: the address is an IP literal and a port
+//! (`[..]:port` for IPv6) or a name and a port (`name:port`), the weight is 1 to 100, `max_fails` is 0 to 100 (0:
+//! failures are not counted), `fail_timeout_ms` is the time a failing server is left out, and `backup` tells that the
+//! server is used only when no other one can be. An IP literal is not the address of `listen` (nor a loopback address
+//! at the port of `listen`, if that is an unspecified address), and is not unspecified or a multicast address. A name
+//! is 1 to 253 bytes of lowercase letters, digits, `-`, `_` and `.`, in labels of 1 to 63 bytes of which the last
+//! starts with a letter (an OS takes `127.1` or `0x7f000001` for an address, not for a name); the port is 1 to 65535
+//! without a leading zero. The configuration does not look a name up: that is done once, when the proxy starts (see
+//! `forward::resolve`), and each address of a name is a server of the group.
+//! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?}`. The `host` and the
+//! `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access` and `rewrite` are
+//! the networks that may use the route and the edits it makes (see `rewrite`). `default_upstream` is the group that
+//! serves a request no route holds for, or the empty string, and then such a request is answered with 404. The
+//! default group has no `access` and no `rewrite`. The `path` of a route that has an access list is in its canonical
+//! form (see `route`): its escapes are in uppercase and none stands for a byte that a path holds as it is, for a
+//! request is held to the list of the route that its path in canonical form meets, and would not meet this one. If
+//! any route has an access list, no route has a port in its `host`: the client writes the port, and a request that
+//! writes a port that a route names would meet that route and not the one with the list.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -17,18 +30,34 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::{Deserializer, Error, MapAccess, Visitor};
 
-use super::{ConfigError, Object, address, ensure, millis, same};
-use crate::route::{Rule, Table};
+use super::rewrite::{self, RawAccess, RawRewrite};
+use super::{ConfigError, Object, ensure, millis, same};
+use crate::forward::client_ip::Access;
+use crate::forward::rewrite::Rewrite;
+use crate::route::{Rule, Table, parse_port};
 
 const MAX_GROUPS: usize = 64;
-const MAX_SERVERS: usize = 64;
+/// The most servers a group has, as the file writes them and once the names are looked up.
+pub(crate) const MAX_SERVERS: usize = 64;
 const MAX_ROUTES: usize = 1024;
 const MAX_NAME: usize = 64;
 
-/// One server of a group, checked.
+/// Where a server is, as the file writes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ServerConfig {
-    pub address: SocketAddr,
+pub enum Address {
+    Literal(SocketAddr),
+    /// A name, which is looked up when the proxy starts, and a port.
+    Name {
+        name: String,
+        port: u16,
+    },
+}
+
+/// One server of a group, checked. `A` is where the server is: an `Address` as the file writes it, or the
+/// `SocketAddr` it comes to once the names are looked up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerConfig<A = SocketAddr> {
+    pub address: A,
     pub weight: u32,
     pub max_fails: u32,
     pub fail_timeout: Duration,
@@ -37,18 +66,47 @@ pub struct ServerConfig {
 
 /// One group, checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GroupConfig {
+pub struct GroupConfig<A = SocketAddr> {
     pub name: String,
-    pub servers: Vec<ServerConfig>,
+    pub servers: Vec<ServerConfig<A>>,
 }
 
-/// The `forward` object, checked: the groups in the order of the file, the routes, and the group for a request that
-/// no route holds for.
+/// What a route does with a request: the group it goes to (the index of the group in `groups`), who may use it, and
+/// the edits it makes to the request and to the response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteConfig {
+    pub group: usize,
+    pub access: Access,
+    pub rewrite: Rewrite,
+}
+
+impl RouteConfig {
+    /// A route to the group at index `group` that turns nobody away and edits nothing.
+    pub fn plain(group: usize) -> RouteConfig {
+        RouteConfig {
+            group,
+            access: Access::default(),
+            rewrite: Rewrite::default(),
+        }
+    }
+}
+
+/// The `forward` object, checked, with the names of the servers not yet looked up: how long the lookup may take,
+/// the groups in the order of the file, the routes, and the group for a request that no route holds for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardSettings {
+    pub resolve_timeout: Duration,
+    pub groups: Vec<GroupConfig<Address>>,
+    pub routes: Table<RouteConfig>,
+    /// The index of the group for a request that no route holds for.
+    pub default: Option<usize>,
+}
+
+/// The `forward` object once every name is looked up (see `forward::resolve`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForwardConfig {
     pub groups: Vec<GroupConfig>,
-    /// The target of a route is the index of its group in `groups`.
-    pub routes: Table<usize>,
+    pub routes: Table<RouteConfig>,
     /// The index of the group for a request that no route holds for.
     pub default: Option<usize>,
 }
@@ -82,6 +140,7 @@ impl ForwardConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawForward {
+    resolve_timeout_ms: u64,
     upstreams: Groups,
     routes: Vec<Object<RawRoute>>,
     default_upstream: String,
@@ -109,6 +168,8 @@ struct RawRoute {
     host: Option<String>,
     path: Option<String>,
     upstream: String,
+    access: Option<Object<RawAccess>>,
+    rewrite: Option<Object<RawRewrite>>,
 }
 
 /// The groups in the order of the file. A name that is repeated is a repeated key, which a map would swallow.
@@ -150,25 +211,64 @@ fn name_ok(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// A label of a server name: 1 to 63 bytes.
+fn host_label_ok(label: &str) -> bool {
+    (1..=63).contains(&label.len())
+}
+
+/// A server name: 1 to 253 bytes of lowercase letters, digits, `-`, `_` and `.` in labels of 1 to 63 bytes, the last
+/// of which starts with a letter.
+fn host_ok(name: &str) -> bool {
+    name.len() <= 253
+        && name.split('.').all(host_label_ok)
+        && name
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
+        && name
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| last.starts_with(|c: char| c.is_ascii_lowercase()))
+}
+
+/// The address of a server: an IP literal and a port, or a name and a port.
+fn server_address(text: &str) -> Result<Address, ConfigError> {
+    if let Ok(literal) = text.parse::<SocketAddr>() {
+        ensure(literal.port() != 0, "a server port is 0")?;
+        let ip = literal.ip().to_canonical();
+        ensure(
+            !ip.is_unspecified() && !ip.is_multicast(),
+            "a server address is unspecified or a multicast address",
+        )?;
+        return Ok(Address::Literal(literal));
+    }
+    let (name, port) = text.split_once(':').ok_or(ConfigError(
+        "a server address is not an IP address and port, or a name and port",
+    ))?;
+    ensure(host_ok(name), "a server name is malformed")?;
+    let port = parse_port(port.as_bytes()).ok_or(ConfigError("a server port is not 1 to 65535"))?;
+    Ok(Address::Name {
+        name: name.to_owned(),
+        port,
+    })
+}
+
 fn servers(
     raw: Vec<Object<RawServer>>,
     listen: SocketAddr,
-) -> Result<Vec<ServerConfig>, ConfigError> {
+) -> Result<Vec<ServerConfig<Address>>, ConfigError> {
     ensure(
         (1..=MAX_SERVERS).contains(&raw.len()),
         "an upstream has no server or more than 64 servers",
     )?;
     raw.into_iter()
         .map(|Object(server)| {
-            let address = address(
-                &server.address,
-                "a server address is not an IP address and port",
-                "a server port is 0",
-            )?;
-            ensure(
-                !same(listen, address),
-                "listen and a server are the same address",
-            )?;
+            let address = server_address(&server.address)?;
+            if let Address::Literal(literal) = address {
+                ensure(
+                    !same(listen, literal),
+                    "listen and a server are the same address",
+                )?;
+            }
             ensure(
                 (1..=100).contains(&server.weight),
                 "a server weight is out of range",
@@ -192,7 +292,8 @@ fn servers(
 }
 
 /// Checks the `forward` object. `listen` is the address the proxy listens on.
-pub(super) fn check(raw: RawForward, listen: SocketAddr) -> Result<ForwardConfig, ConfigError> {
+pub(super) fn check(raw: RawForward, listen: SocketAddr) -> Result<ForwardSettings, ConfigError> {
+    let resolve_timeout = millis(raw.resolve_timeout_ms, "resolve_timeout_ms is out of range")?;
     ensure(
         (1..=MAX_GROUPS).contains(&raw.upstreams.0.len()),
         "upstreams has no group or more than 64 groups",
@@ -226,8 +327,25 @@ pub(super) fn check(raw: RawForward, listen: SocketAddr) -> Result<ForwardConfig
             &route.upstream,
             "a route names an upstream that is not defined",
         )?;
-        entries.push((rule, group));
+        let access = rewrite::access(route.access)?;
+        ensure(
+            access.is_empty() || rule.canonical(),
+            "a route with an access list has an escape in its path that is lowercase or is for a byte that needs no escape",
+        )?;
+        entries.push((
+            rule,
+            RouteConfig {
+                group,
+                access,
+                rewrite: rewrite::rewrite(route.path.as_deref(), route.rewrite)?,
+            },
+        ));
     }
+    ensure(
+        entries.iter().all(|(_, route)| route.access.is_empty())
+            || entries.iter().all(|(rule, _)| rule.port().is_none()),
+        "a route host has a port while a route has an access list",
+    )?;
     let routes = Table::new(entries).map_err(|e| ConfigError(e.0))?;
     let default = match raw.default_upstream.as_str() {
         "" => None,
@@ -236,7 +354,8 @@ pub(super) fn check(raw: RawForward, listen: SocketAddr) -> Result<ForwardConfig
             "default_upstream names an upstream that is not defined",
         )?),
     };
-    Ok(ForwardConfig {
+    Ok(ForwardSettings {
+        resolve_timeout,
         groups,
         routes,
         default,

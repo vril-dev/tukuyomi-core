@@ -5,7 +5,7 @@ use super::rule::RouteError;
 const MAX_HOST_BYTES: usize = 253;
 
 /// A port as the text of a host holds it: 1 to 5 digits without a leading zero, from 1 to 65535.
-fn parse_port(text: &[u8]) -> Option<u16> {
+pub(crate) fn parse_port(text: &[u8]) -> Option<u16> {
     if text.is_empty() || text.len() > 5 || text[0] == b'0' || !text.iter().all(u8::is_ascii_digit)
     {
         return None;
@@ -138,6 +138,10 @@ impl HostRule {
 
     pub(super) fn as_str(&self) -> &str {
         &self.text
+    }
+
+    pub(super) fn port(&self) -> Option<u16> {
+        self.port
     }
 
     /// How well the rule holds for the host; `None` if it does not.

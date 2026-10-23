@@ -197,3 +197,30 @@ fn ipv6_is_read_the_same_way_and_a_mapped_address_is_the_ipv4_address() {
         sock("[::ffff:203.0.113.9]:5555")
     );
 }
+
+fn access(deny: &[&str], allow: &[&str]) -> Access {
+    Access::new(
+        deny.iter().map(|text| net(text)).collect(),
+        allow.iter().map(|text| net(text)).collect(),
+    )
+}
+
+#[test]
+fn a_denied_network_is_turned_away_and_an_allow_list_turns_away_all_outside_it() {
+    let anyone = Access::default();
+    assert!(anyone.permits(ip("203.0.113.5")) && anyone.permits(ip("2001:db8::1")));
+    // The edge of a /24, and one past it on each side.
+    let deny = access(&["192.0.2.0/24"], &[]);
+    assert!(!deny.permits(ip("192.0.2.0")) && !deny.permits(ip("192.0.2.255")));
+    assert!(deny.permits(ip("192.0.1.255")) && deny.permits(ip("192.0.3.0")));
+    let allow = access(&[], &["192.0.2.0/24"]);
+    assert!(allow.permits(ip("192.0.2.0")) && allow.permits(ip("192.0.2.255")));
+    assert!(!allow.permits(ip("192.0.1.255")) && !allow.permits(ip("192.0.3.0")));
+    assert!(!allow.permits(ip("2001:db8::1")));
+    // Deny is looked at first, and an IPv4 address that is mapped is the IPv4 address.
+    let both = access(&["192.0.2.128/25"], &["192.0.2.0/24"]);
+    assert!(both.permits(ip("192.0.2.127")));
+    assert!(!both.permits(ip("192.0.2.128")));
+    assert!(!deny.permits(ip("::ffff:192.0.2.9")));
+    assert!(allow.permits(ip("::ffff:192.0.2.9")));
+}
