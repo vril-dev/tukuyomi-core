@@ -53,7 +53,7 @@ mod path;
 mod rule;
 mod table;
 
-pub(crate) use host::parse_port;
+pub(crate) use host::{RequestHost, parse_port};
 pub use rule::{RouteError, Rule};
 pub use table::Table;
 

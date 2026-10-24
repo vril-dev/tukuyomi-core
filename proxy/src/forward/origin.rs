@@ -11,9 +11,10 @@
 //!
 //! The forwarding fields tell the upstream who the client is. A peer that is in `trusted_proxies` is believed: its
 //! `X-Forwarded-For` lines are kept and its own address is added at the end, and its `X-Forwarded-Proto` is kept if
-//! it is exactly `http` or `https`; its other claims (see `CLIENT_CLAIMS`) pass as they are. From any other peer
-//! all of those claims are dropped, `X-Forwarded-For` is the address of the peer alone and `X-Forwarded-Proto` is
-//! `http`. `X-Forwarded-Host` is the `Host` of the request whoever the peer is, as the client wrote it: a route that
+//! it is exactly `http` or `https`, and otherwise it is the scheme of the listener the request came in on; its other
+//! claims (see `CLIENT_CLAIMS`) pass as they are. From any other peer all of those claims are dropped,
+//! `X-Forwarded-For` is the address of the peer alone and `X-Forwarded-Proto` is the scheme of the listener: `https`
+//! on a listener that ends TLS, `http` on any other. `X-Forwarded-Host` is the `Host` of the request whoever the peer is, as the client wrote it: a route that
 //! sets another `Host` does so after that.
 //!
 //! The server is chosen by the group (see `group`). The connection to it is the newest one that waits for that server
@@ -145,14 +146,16 @@ pub(super) const CLIENT_CLAIMS: [&str; 13] = [
     "x-original-forwarded-for",
 ];
 
-/// An allowed request, as it is forwarded. `peer` is the address of the connection the request came on.
-/// `websocket` is true for the handshake of a WebSocket that the route lets through.
+/// An allowed request, as it is forwarded. `peer` is the address of the connection the request came on. `https` is
+/// true when the listener ended TLS. `websocket` is true for the handshake of a WebSocket that the route lets
+/// through.
 pub struct Forward {
     pub method: Method,
     pub uri: Uri,
     pub fields: HeaderMap,
     pub body: Arc<BodyHold>,
     pub peer: SocketAddr,
+    pub https: bool,
     pub websocket: bool,
 }
 
@@ -339,11 +342,13 @@ fn forwarded_for(fields: &HeaderMap, peer: IpAddr) -> Result<HeaderValue, Origin
     HeaderValue::from_bytes(&chain).map_err(|_| OriginError::Send)
 }
 
-/// The `X-Forwarded-Proto` value: the one line the request has if it is exactly `http` or `https`, `http` otherwise.
-fn forwarded_proto(fields: &HeaderMap) -> HeaderValue {
+/// The `X-Forwarded-Proto` value: the one line the request has if it is exactly `http` or `https`, the scheme of the
+/// listener (`https` if `https`) otherwise.
+fn forwarded_proto(fields: &HeaderMap, https: bool) -> HeaderValue {
     let mut lines = fields.get_all(&X_FORWARDED_PROTO).iter();
     match (lines.next(), lines.next()) {
         (Some(line), None) if matches!(line.as_bytes(), b"http" | b"https") => line.clone(),
+        _ if https => HeaderValue::from_static("https"),
         _ => HeaderValue::from_static("http"),
     }
 }
@@ -352,13 +357,14 @@ fn forwarded_proto(fields: &HeaderMap) -> HeaderValue {
 /// they were inspected; the hop-by-hop fields and the listed names are removed; if the peer is not `trusted`, so
 /// are the fields by which it says who the client is; then the forwarding fields are put in, and `Connection:
 /// upgrade` with `Upgrade: websocket` for a handshake, or `Connection: close` if `close`. All other fields stay as
-/// they were inspected.
+/// they were inspected. `https` is whether the listener ended TLS.
 fn forwarded_fields(
     mut fields: HeaderMap,
     peer: IpAddr,
     trusted: bool,
     close: bool,
     websocket: bool,
+    https: bool,
 ) -> Result<HeaderMap, OriginError> {
     let named: Vec<HeaderName> = fields
         .get_all(CONNECTION)
@@ -378,7 +384,7 @@ fn forwarded_fields(
         }
     }
     let chain = forwarded_for(&fields, peer)?;
-    let proto = forwarded_proto(&fields);
+    let proto = forwarded_proto(&fields, https);
     let host = fields.get(HOST).cloned();
     fields.insert(X_FORWARDED_FOR.clone(), chain);
     match host {
@@ -668,6 +674,7 @@ pub async fn forward(
         fields,
         body,
         peer,
+        https,
         websocket,
     } = f;
     let trusted = client_ip::trusts(&cfg.trusted_proxies, peer.ip());
@@ -677,6 +684,7 @@ pub async fn forward(
         trusted,
         cfg.upstream_keepalive == 0,
         websocket,
+        https,
     )
     .and_then(|fields| rewrite.request(fields, uri).map_err(|_| OriginError::Send));
     let (fields, uri) = match made {

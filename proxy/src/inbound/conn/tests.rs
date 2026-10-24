@@ -16,7 +16,8 @@ use tukuyomi_kernel::Verdict;
 
 use super::*;
 use crate::config::{ForwardConfig, RouteConfig};
-use crate::inbound::session::{run as run_session, serve};
+use crate::inbound::session::{run as run_session, serve, serve_on};
+use crate::inbound::tls::Tls;
 use crate::inspect::driver::Outcome;
 use crate::log::{Lines, recording};
 use crate::route::{Rule, Table};
@@ -56,7 +57,7 @@ fn a_stage_ends_at_the_earlier_of_its_own_end_and_the_request_time() {
 pub(in crate::inbound) fn config() -> ProxyConfig {
     let secs = Duration::from_secs;
     ProxyConfig {
-        listen: "127.0.0.1:1".parse().unwrap(),
+        listeners: Vec::new(),
         max_conns: 16,
         max_head_bytes: 8192,
         max_body: 1024,
@@ -195,6 +196,16 @@ impl Rig {
         mode: Mode,
         forward: &ForwardConfig,
     ) -> Rig {
+        Rig::with_tls(cfg, mode, forward, Tls::none()).await
+    }
+
+    /// The same, for a proxy with the listeners of `cfg`, of which `tls` holds the TLS ones.
+    pub(in crate::inbound) async fn with_tls(
+        cfg: ProxyConfig,
+        mode: Mode,
+        forward: &ForwardConfig,
+        tls: Tls,
+    ) -> Rig {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let budget = Arc::new(Semaphore::new(cfg.max_buffered_bytes));
         let (tx, rx) = sync_channel(if matches!(mode, Mode::Full) {
@@ -211,6 +222,7 @@ impl Rig {
             routes: SharedRoutes::new(Routes::default()),
             log,
             ingress: Arc::new(Ingress::new(tx.clone())),
+            tls,
         });
         let (driver, full) = match mode {
             Mode::Answer(outcome) => (Some(driver(rx, Some(outcome))), None),
@@ -242,6 +254,17 @@ impl Rig {
         let (sock, peer) = self.listener.accept().await.unwrap();
         let local = sock.local_addr().unwrap();
         let task = tokio::spawn(serve(sock, peer, local, self.ctx.clone()));
+        (client, task)
+    }
+
+    /// A client connects and the connection is served in the background as the listener at `listener` serves it.
+    pub(in crate::inbound) async fn connect_on(&self, listener: usize) -> (TcpStream, Served<()>) {
+        let client = TcpStream::connect(self.listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (sock, peer) = self.listener.accept().await.unwrap();
+        let local = sock.local_addr().unwrap();
+        let task = tokio::spawn(serve_on(sock, peer, local, self.ctx.clone(), listener));
         (client, task)
     }
 
@@ -371,7 +394,7 @@ async fn exchange_with_reply(
     let ctx = rig.ctx.clone();
     let (sent, reply) = oneshot::channel();
     let task = tokio::spawn(async move {
-        let summary = run_session(sock, peer, local, &ctx, Instant::now()).await;
+        let summary = run_session(sock, peer, local, &ctx, Instant::now(), Scheme::Http).await;
         let _ = sent.send(summary.last);
     });
     put(&client, request).await;

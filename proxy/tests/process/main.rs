@@ -40,5 +40,6 @@ mod rewrite;
 mod rules;
 mod stopping;
 mod support;
+mod tls;
 mod upstreams;
 mod websocket;

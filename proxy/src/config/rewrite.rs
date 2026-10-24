@@ -30,10 +30,15 @@ pub(super) struct RawAccess {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawRewrite {
+    #[serde(default, deserialize_with = "super::present")]
     host: Option<String>,
+    #[serde(default, deserialize_with = "super::present")]
     path: Option<String>,
+    #[serde(default, deserialize_with = "super::present")]
     query: Option<Object<RawQuery>>,
+    #[serde(default, deserialize_with = "super::present")]
     request_headers: Option<Object<RawHeaders>>,
+    #[serde(default, deserialize_with = "super::present")]
     response_headers: Option<Object<RawHeaders>>,
 }
 

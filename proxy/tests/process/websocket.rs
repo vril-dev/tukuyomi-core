@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use crate::support::*;
 
 /// One group, `main`, and one route that holds for every request and lets a WebSocket through.
-fn open_route(addresses: &[SocketAddr]) -> Value {
+pub(crate) fn open_route(addresses: &[SocketAddr]) -> Value {
     json!({
         "resolve_timeout_ms": RESOLVE_TIMEOUT_MS,
         "upstreams": {"main": {"servers": [server(addresses[0])]}},

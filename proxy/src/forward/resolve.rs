@@ -13,10 +13,10 @@
 //! written with the same IP literal.
 //!
 //! The proxy does not start if a name cannot be looked up, has no address, or has one that is unspecified, a
-//! multicast address, or the address of `listen` (or a loopback address at its port, if `listen` is unspecified), if
-//! the lookups are not done in time, or if a group has more than 64 servers once the names are looked up. The
-//! sentences of the refusals are fixed: the error of the system is not kept, and each tells the group and the place
-//! of the server (from 1) it is about.
+//! multicast address, or the address of a listener (or a loopback address at its port, if the listener is
+//! unspecified), if the lookups are not done in time, or if a group has more than 64 servers once the names are
+//! looked up. The sentences of the refusals are fixed: the error of the system is not kept, and each tells the group
+//! and the place of the server (from 1) it is about.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -101,7 +101,10 @@ fn wanted(groups: &[GroupConfig<Address>]) -> Vec<Wanted> {
 }
 
 /// The addresses a lookup found: each one once, and none that a server must not have.
-fn accepted(found: Vec<SocketAddr>, listen: SocketAddr) -> Result<Vec<SocketAddr>, &'static str> {
+fn accepted(
+    found: Vec<SocketAddr>,
+    listeners: &[SocketAddr],
+) -> Result<Vec<SocketAddr>, &'static str> {
     let mut seen = BTreeSet::new();
     let mut once = Vec::new();
     for address in found {
@@ -109,8 +112,8 @@ fn accepted(found: Vec<SocketAddr>, listen: SocketAddr) -> Result<Vec<SocketAddr
         if ip.is_unspecified() || ip.is_multicast() {
             return Err("a server name has an address that is unspecified or a multicast address");
         }
-        if same(listen, address) {
-            return Err("a server name has the address of listen");
+        if listeners.iter().any(|listener| same(*listener, address)) {
+            return Err("a server name has the address of a listener");
         }
         if seen.insert(address) {
             once.push(address);
@@ -126,7 +129,7 @@ fn accepted(found: Vec<SocketAddr>, listen: SocketAddr) -> Result<Vec<SocketAddr
 fn look_up<L>(
     wanted: &[Wanted],
     wait: Duration,
-    listen: SocketAddr,
+    listeners: &[SocketAddr],
     lookup: L,
 ) -> Result<BTreeMap<(String, u16), Vec<SocketAddr>>, Refusal>
 where
@@ -164,17 +167,17 @@ where
                 return Err(at.refusal("the lookup of the names stopped"));
             }
         };
-        let addresses = accepted(addresses, listen).map_err(|why| at.refusal(why))?;
+        let addresses = accepted(addresses, listeners).map_err(|why| at.refusal(why))?;
         found.insert((at.name.clone(), at.port), addresses);
     }
     Ok(found)
 }
 
-/// Looks the names of the servers up with `lookup`, and returns the groups with a server for each address. `listen`
-/// is the address the proxy listens on.
+/// Looks the names of the servers up with `lookup`, and returns the groups with a server for each address.
+/// `listeners` are the addresses the proxy listens on.
 pub fn complete<L>(
     settings: ForwardSettings,
-    listen: SocketAddr,
+    listeners: &[SocketAddr],
     lookup: L,
 ) -> Result<Completed, Refusal>
 where
@@ -186,7 +189,7 @@ where
         routes,
         default,
     } = settings;
-    let found = look_up(&wanted(&groups), resolve_timeout, listen, lookup)?;
+    let found = look_up(&wanted(&groups), resolve_timeout, listeners, lookup)?;
     let mut lines = Vec::new();
     let mut done = Vec::with_capacity(groups.len());
     for group in groups {

@@ -1,5 +1,13 @@
 //! One client connection, from the accept to the close.
 //!
+//! What the connection is depends on the listener that took it (`serve_on`). On a plain listener it is as described
+//! below. On a TLS listener the handshake runs first, within the time that the first head has (it counts from the
+//! accept), and the rest is the same over the TLS stream; a handshake that fails or is not done in time ends the
+//! connection with one line in the record and no more. On a listener that redirects to https the first head is read
+//! as everywhere else, and then it is answered with the redirect, or with 404, without hyper, the inspection or the
+//! upstream, and without reading its body (see `redirect`); the connection is closed as below, with the same
+//! `lingering` after the answer.
+//!
 //! The first head is read through the gate before hyper starts, so that a refused one can be answered with the
 //! fixed answer of `head`. Then hyper serves the connection for as long as it lasts, with the gate as its input
 //! and `Session::request` as its service: every request that hyper makes is matched with the head the gate passed,
@@ -24,12 +32,12 @@
 //! behind the handshake in front, for the time that the route says. The stop does not end it; the abort at the end
 //! of the time that the connections get does.
 //!
-//! The close is done here, after hyper is done with the connection: the writing direction is ended, and after a
-//! response that closed the connection, or a head that was refused with bytes behind it, the connection reads and
-//! discards what the client still sends for a while (`linger`). A close with unread bytes in the socket resets the
-//! connection, and the reset can take the response away from a client that is still sending, or whose next
-//! request crossed the response. A connection that ends because nothing came for `keepalive_timeout` does not
-//! linger: there is no response to protect.
+//! The close is done here, after hyper is done with the connection: the writing direction is ended (on TLS that
+//! sends the closing alert of TLS first), and after a response that closed the connection, or a head that was
+//! refused with bytes behind it, the connection reads and discards what the client still sends for a while
+//! (`linger`). A close with unread bytes in the socket resets the connection, and the reset can take the response
+//! away from a client that is still sending, or whose next request crossed the response. A connection that ends
+//! because nothing came for `keepalive_timeout` does not linger: there is no response to protect.
 //!
 //! Every response has one line in the record, written when the response has been given to the connection or was
 //! cut off. The line has the address of the client that the inspection was told (see `conn`); a line that is
@@ -39,7 +47,6 @@
 //! a tunnel, also one that never ran (see `tunnel`).
 
 use std::future::{Future, poll_fn};
-use std::io;
 use std::net::SocketAddr;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,18 +60,21 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tukuyomi_kernel::limits;
 
-use crate::config::{ProxyConfig, Stream};
+use crate::config::{ListenerKind, ProxyConfig, Stream};
 use crate::forward::tunnel::Tunnel;
-use crate::inbound::answer::{Abort, Class, Noted, Out, Reply, answer, close_after, record};
-use crate::inbound::conn::{Conn, Ctx, Handled, after};
+use crate::inbound::answer::{
+    Abort, Class, NOT_REDIRECTED, Noted, Out, Reply, answer, close_after, record, redirect,
+};
+use crate::inbound::conn::{Conn, Ctx, Handled, Scheme, after};
 use crate::inbound::gate::{Finish, Gate, Link, Settings, Taken};
 use crate::inbound::head::Reject;
 use crate::inbound::io::Gauge;
+use crate::inbound::tls::host_name;
 
 /// Numbers the connections for the records. They say nothing else.
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
@@ -96,11 +106,36 @@ pub(super) struct Summary {
     line: Option<Reply>,
 }
 
+impl Summary {
+    /// A connection whose one line in the record is `reply`.
+    fn of(id: u64, reply: Reply) -> Summary {
+        Summary {
+            id,
+            #[cfg(test)]
+            last: reply,
+            line: Some(reply),
+        }
+    }
+
+    /// A connection that never got as far as a request, for `reason`.
+    fn unserved(reason: &'static str) -> Summary {
+        let id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
+        Summary::of(
+            id,
+            Reply {
+                reason,
+                ..Reply::NONE
+            },
+        )
+    }
+}
+
 /// The state of one client connection that its service and its responses share.
 struct Session {
     ctx: Arc<Ctx>,
     peer: SocketAddr,
     local: SocketAddr,
+    scheme: Scheme,
     id: u64,
     accept: Instant,
     /// End of the connection. A response that may take long puts it off (`lengthen`).
@@ -121,10 +156,71 @@ struct Session {
     last: Mutex<Reply>,
 }
 
-/// Serves one accepted connection to its end.
+/// Serves one accepted connection of the listener at `listener` to its end, as that listener says.
+pub async fn serve_on(
+    sock: TcpStream,
+    peer: SocketAddr,
+    local: SocketAddr,
+    ctx: Arc<Ctx>,
+    listener: usize,
+) {
+    match ctx.cfg.listeners.get(listener).map(|l| &l.kind) {
+        Some(ListenerKind::Plain) => serve(sock, peer, local, ctx).await,
+        Some(ListenerKind::Tls(_)) => serve_tls(sock, peer, local, ctx, listener).await,
+        Some(&ListenerKind::Redirect { https_port }) => {
+            serve_redirect(sock, peer, local, ctx, https_port).await;
+        }
+        None => {}
+    }
+}
+
+/// Serves one accepted connection of a plain listener to its end.
 pub async fn serve(sock: TcpStream, peer: SocketAddr, local: SocketAddr, ctx: Arc<Ctx>) {
     let accept = Instant::now();
-    let summary = run(sock, peer, local, &ctx, accept).await;
+    let summary = run(sock, peer, local, &ctx, accept, Scheme::Http).await;
+    finish(&ctx, summary, accept, peer);
+}
+
+/// Serves one accepted connection of the TLS listener at `listener` to its end. The handshake has the time that the
+/// first head has, and the head the time that is left.
+async fn serve_tls(
+    sock: TcpStream,
+    peer: SocketAddr,
+    local: SocketAddr,
+    ctx: Arc<Ctx>,
+    listener: usize,
+) {
+    let accept = Instant::now();
+    let summary = match ctx.tls.handshake(listener) {
+        Some(handshake) => {
+            match timeout_at(first_head_by(&ctx.cfg, accept), handshake.accept(sock)).await {
+                Ok(Ok((stream, hosts))) => {
+                    run(stream, peer, local, &ctx, accept, Scheme::Https(hosts)).await
+                }
+                Ok(Err(_)) => Summary::unserved("tls handshake failed"),
+                Err(_) => Summary::unserved("tls handshake not finished in time"),
+            }
+        }
+        None => Summary::unserved("no tls for the listener"),
+    };
+    finish(&ctx, summary, accept, peer);
+}
+
+/// Serves one accepted connection of a listener that redirects to https at `https_port` to its end.
+async fn serve_redirect(
+    sock: TcpStream,
+    peer: SocketAddr,
+    local: SocketAddr,
+    ctx: Arc<Ctx>,
+    https_port: u16,
+) {
+    let accept = Instant::now();
+    let summary = redirect_to(sock, peer, local, &ctx, accept, https_port).await;
+    finish(&ctx, summary, accept, peer);
+}
+
+/// The line in the record that the end of a connection adds, if it has to.
+fn finish(ctx: &Ctx, summary: Summary, accept: Instant, peer: SocketAddr) {
     if let Some(reply) = summary.line {
         if reply.internal {
             ctx.log.line(&format!(
@@ -142,18 +238,25 @@ pub async fn serve(sock: TcpStream, peer: SocketAddr, local: SocketAddr, ctx: Ar
     }
 }
 
+/// When the first head of a connection that was accepted at `accept` has to be complete.
+fn first_head_by(cfg: &ProxyConfig, accept: Instant) -> Instant {
+    after(accept, cfg.head_read).min(after(accept, cfg.request_total))
+}
+
 /// Reads the first head, serves the requests, closes. `accept` is the instant of the accept.
-pub(super) async fn run(
-    sock: TcpStream,
+pub(super) async fn run<T>(
+    stream: T,
     peer: SocketAddr,
     local: SocketAddr,
     ctx: &Arc<Ctx>,
     accept: Instant,
-) -> Summary {
-    let cfg = &ctx.cfg;
-    let (session, mut gate) = Session::start(sock, peer, local, ctx, accept);
-    let head_by = after(accept, cfg.head_read).min(after(accept, cfg.request_total));
-    if let Err(reject) = gate.first_head(head_by).await {
+    scheme: Scheme,
+) -> Summary
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let (session, mut gate) = Session::start(stream, peer, local, ctx, accept, scheme);
+    if let Err(reject) = gate.first_head(first_head_by(&ctx.cfg, accept)).await {
         return session.refuse(&mut gate, reject).await;
     }
     let end = session.drive(&mut gate).await;
@@ -162,6 +265,45 @@ pub(super) async fn run(
         None => session.close(&mut gate, end).await,
     }
     session.summary(&gate, end)
+}
+
+/// The listener redirects: its first head is answered with a redirect to https, or with 404, and the connection is
+/// closed. The redirect is for a `Host` that a certificate of some TLS listener has among its hosts, when some route
+/// (or the default group) holds for the request; the address is that name and the target as it was received. A
+/// `Host` that is an IP literal, cannot be read, or is not served that way gets 404. The body is not read.
+async fn redirect_to(
+    sock: TcpStream,
+    peer: SocketAddr,
+    local: SocketAddr,
+    ctx: &Arc<Ctx>,
+    accept: Instant,
+    https_port: u16,
+) -> Summary {
+    let cfg = &ctx.cfg;
+    let (session, mut gate) = Session::start(sock, peer, local, ctx, accept, Scheme::Http);
+    if let Err(reject) = gate.first_head(first_head_by(cfg, accept)).await {
+        return session.refuse(&mut gate, reject).await;
+    }
+    let Some(Taken { head, .. }) = session.link.take_first() else {
+        return session.refuse(&mut gate, Reject::BadRequest).await;
+    };
+    let name = host_name(head.host()).filter(|name| ctx.tls.serves(name));
+    let routed = ctx.upstreams.find(head.host(), head.target()).is_some();
+    let (reply, bytes) = match name {
+        Some(name) if routed => (
+            Reply::redirected(),
+            redirect(&name, https_port, head.target()),
+        ),
+        _ => (
+            Reply::rejected(404, "no redirect for the host"),
+            NOT_REDIRECTED.to_vec(),
+        ),
+    };
+    let by = after(Instant::now(), cfg.response_idle).min(session.conn_by());
+    let sock = gate.stream();
+    let _ = timeout_at(by, send_and_close(sock, &bytes)).await;
+    linger(sock, cfg, session.conn_by()).await;
+    Summary::of(session.id, reply)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -176,6 +318,7 @@ impl Session {
         local: SocketAddr,
         ctx: &Arc<Ctx>,
         accept: Instant,
+        scheme: Scheme,
     ) -> (Arc<Session>, Gate<T>) {
         let cfg = &ctx.cfg;
         let link = Link::new(accept);
@@ -184,6 +327,7 @@ impl Session {
             ctx: ctx.clone(),
             peer,
             local,
+            scheme,
             id: NEXT_CONN.fetch_add(1, Ordering::Relaxed),
             accept,
             conn_by: Mutex::new(after(accept, cfg.conn_total)),
@@ -310,6 +454,7 @@ impl Session {
             head,
             self.peer,
             self.local,
+            self.scheme.clone(),
             self.gauge.clone(),
             after(start, self.ctx.cfg.request_total),
         );
@@ -430,7 +575,10 @@ impl Session {
 
     /// Answers a first head that was refused, and closes. A head that did not come in time gets its answer and
     /// no more; any other has bytes behind it that the client may still be sending.
-    async fn refuse(&self, gate: &mut Gate<TcpStream>, reject: Reject) -> Summary {
+    async fn refuse<T>(&self, gate: &mut Gate<T>, reject: Reject) -> Summary
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
         let cfg = &self.ctx.cfg;
         let reply = if let Some(answer) = reject.response() {
             let by = after(Instant::now(), cfg.response_idle).min(self.conn_by());
@@ -446,16 +594,14 @@ impl Session {
                 ..Reply::NONE
             }
         };
-        Summary {
-            id: self.id,
-            #[cfg(test)]
-            last: reply,
-            line: Some(reply),
-        }
+        Summary::of(self.id, reply)
     }
 
     /// Ends the writing direction, and lingers if a response closed the connection or a head was refused.
-    async fn close(&self, gate: &mut Gate<TcpStream>, end: End) {
+    async fn close<T>(&self, gate: &mut Gate<T>, end: End)
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
         if end == End::Limit {
             return;
         }
@@ -483,7 +629,10 @@ impl Session {
 
     /// Runs the tunnel over the stream of the client, with what the gate had read behind the handshake in front,
     /// and ends the writing direction. The time of the connection is not asked: the tunnel has its own.
-    async fn run_tunnel(&self, gate: &mut Gate<TcpStream>, tunnel: Tunnel) {
+    async fn run_tunnel<T>(&self, gate: &mut Gate<T>, tunnel: Tunnel)
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
         let rest = gate.take_rest();
         let sock = gate.stream();
         tunnel.run(&mut *sock, rest, &self.ctx.cfg).await;
@@ -493,7 +642,7 @@ impl Session {
 
     /// The reply of the last request, and the line the end of the connection adds: for a head that was refused
     /// after the first, and for a connection that had no response to show for itself.
-    fn summary(&self, gate: &Gate<TcpStream>, end: End) -> Summary {
+    fn summary<T>(&self, gate: &Gate<T>, end: End) -> Summary {
         let line = if let Some(reject) = gate.failure() {
             Some(Reply {
                 reason: reject.reason(),
@@ -571,46 +720,41 @@ impl Drop for Tracked {
 }
 
 /// Writes all of `bytes`, then ends the sending direction.
-async fn send_and_close(sock: &mut TcpStream, mut bytes: &[u8]) {
-    while !bytes.is_empty() {
-        if sock.writable().await.is_err() {
-            return;
-        }
-        match sock.try_write(bytes) {
-            Ok(0) => return,
-            Ok(n) => bytes = &bytes[n..],
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(_) => return,
-        }
+async fn send_and_close<T>(stream: &mut T, bytes: &[u8])
+where
+    T: AsyncWrite + Unpin,
+{
+    if stream.write_all(bytes).await.is_err() {
+        return;
     }
-    close_write(sock).await;
+    close_write(stream).await;
 }
 
 /// Ends the sending direction: the client reads the end of the response.
-async fn close_write(sock: &mut TcpStream) {
-    let _ = poll_fn(|cx| Pin::new(&mut *sock).poll_shutdown(cx)).await;
+async fn close_write<T>(stream: &mut T)
+where
+    T: AsyncWrite + Unpin,
+{
+    let _ = poll_fn(|cx| Pin::new(&mut *stream).poll_shutdown(cx)).await;
 }
 
 /// Reads and discards what the client still sends, until the end of its stream (a client that has closed its side
 /// ends it at once), `lingering_bytes` bytes, a read that waits for `lingering_timeout`, `lingering_time` after the
 /// start or the end of the connection time.
-async fn linger(sock: &mut TcpStream, cfg: &ProxyConfig, conn_by: Instant) {
+async fn linger<T>(stream: &mut T, cfg: &ProxyConfig, conn_by: Instant)
+where
+    T: AsyncRead + Unpin,
+{
     let end = after(Instant::now(), cfg.lingering_time).min(conn_by);
     let mut left = cfg.lingering_bytes;
     let mut buf = [0u8; 4096];
     while left > 0 {
         let by = after(Instant::now(), cfg.lingering_timeout).min(end);
-        match timeout_at(by, sock.readable()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(_) => return,
-        }
         // Not a byte over the limit is read.
         let room = left.min(buf.len());
-        match sock.try_read(&mut buf[..room]) {
-            Ok(0) => return,
-            Ok(n) => left = left.saturating_sub(n),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(_) => return,
+        match timeout_at(by, stream.read(&mut buf[..room])).await {
+            Ok(Ok(0) | Err(_)) | Err(_) => return,
+            Ok(Ok(n)) => left = left.saturating_sub(n),
         }
     }
 }

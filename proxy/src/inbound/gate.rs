@@ -166,6 +166,18 @@ impl Link {
         taken
     }
 
+    /// Takes the head of the oldest request that is waiting, whatever hyper makes of it: for a connection that hyper
+    /// does not serve.
+    pub fn take_first(&self) -> Option<Taken> {
+        let mut shared = self.lock();
+        let queued = shared.queue.pop_front()?;
+        let start = queued.began.max(shared.last_done);
+        Some(Taken {
+            head: queued.head,
+            start,
+        })
+    }
+
     /// The response of one request is complete, or it was cut off and the connection ends with it.
     fn done(&self, now: Instant) {
         let waker = {

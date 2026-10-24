@@ -1,41 +1,45 @@
 #![forbid(unsafe_code)]
-//! The proxy process: start-up, the wait for the kernel, the accept loop and the stop. When the first argument is
+//! The proxy process: start-up, the wait for the kernel, the listeners and the stop. When the first argument is
 //! `rules` the process is a short command on the rules store instead (`rules::command`), and nothing of the proxy
 //! starts.
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration
-//! file), the host checks, the configuration, the lookup of the names of the upstream servers, the rules store (the
-//! chosen generation, the hold on it, its directory, mode and routes, and with them the kernel configuration), the
-//! runtime and the signal handlers, the driver thread, the wait for the kernel to be ready, bind, accept. The rules
-//! store is read here, and again when SIGUSR1 comes. Handlers exist for SIGTERM, SIGINT, SIGHUP and SIGUSR1 only and
-//! are installed before the kernel starts its child process; SIGCHLD is never handled. The listener is bound only
-//! after the kernel is ready, and a connection permit is taken before every accept. When every permit is in use and a
-//! connection arrives, that connection is taken from the backlog to wait for a permit, and the connections that wait
-//! for their next request are told to close, so that the permits of idle connections come back.
+//! file), the host checks, the configuration, the lookup of the names of the upstream servers, the certificate and
+//! key files of the TLS listeners, the rules store (the chosen generation, the hold on it, its directory, mode and
+//! routes, and with them the kernel configuration), the runtime and the signal handlers, the driver thread, the wait
+//! for the kernel to be ready, bind, accept. The rules store is read here, and again when SIGUSR1 comes; the
+//! certificate and key files are read here, and again when SIGUSR2 comes. Handlers exist for SIGTERM, SIGINT,
+//! SIGHUP, SIGUSR1 and SIGUSR2 only and are installed before the kernel starts its child process; SIGCHLD is never
+//! handled. The listeners are bound only after the kernel is ready, all of them or none, and the accept side takes a
+//! connection permit before every accept (see `inbound::accept`).
 //!
 //! The upstream groups and the routes to them are read from the configuration file when the proxy starts, and stay
-//! as they are until it is started again; so do the addresses that the names of the servers have then.
+//! as they are until it is started again; so do the addresses that the names of the servers have then, and the
+//! listeners with the hosts of their certificates.
 //!
 //! SIGUSR1 makes the proxy switch to the generation that the rules store chooses now (`rules::switch` reads the
 //! store, the driver starts the new inspector and moves the requests over when it is ready). It is a line in the
-//! records and nothing else before the listener is bound, while a switch is under way, and while the proxy stops.
+//! records and nothing else before the listeners are bound, while a switch is under way, and while the proxy stops.
+//! SIGUSR2 reads every certificate and key file of every TLS listener again. If all of them pass the checks, they
+//! replace the old ones for the handshakes that start from then on (a connection that is open keeps what it has);
+//! if one does not, none is replaced and a line says which. It is a line and nothing else before the listeners are
+//! bound and while the proxy stops, and it has nothing to do with SIGUSR1.
 //!
 //! The first cause of a stop (a signal, or a failure of start-up or of the driver) fixes the time `t0`. The stop
-//! closes the listener and the way from the connections to the driver (a request that starts from then on is
+//! closes the listeners and the way from the connections to the driver (a request that starts from then on is
 //! refused, and a connection that waits for its next request is closed), tells the driver to finish inspecting by
 //! `t0 + stop_inspect`, waits for the connections until `t0 + stop_wait` and aborts what is left (a tunnel, which is
 //! a WebSocket that the proxy copies, is not ended by the stop: it runs until it ends by itself or is aborted
 //! there), then waits for the driver's end until `t0 + stop_wait + kill_grace`. The exit code is 0 only when the
 //! stop was not caused by a failure and the driver reports a stopped kernel whose child exit and per-start
 //! directory removal are confirmed, and the same for every kernel that was stopped before it; 1 for any other end,
-//! and for names of upstream servers that cannot be looked up or a refused rules store or generation (nothing has
-//! been started then); 2 for a wrong argument or a refused configuration. The log is flushed for at most 200 ms at
-//! the end.
+//! and for names of upstream servers that cannot be looked up, a refused certificate or key file, or a refused rules
+//! store or generation (nothing has been started then); 2 for a wrong argument or a refused configuration. The log
+//! is flushed for at most 200 ms at the end.
 
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
-use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -45,18 +49,19 @@ use std::sync::mpsc::SyncSender;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::{JoinError, JoinSet};
-use tokio::time::{Instant, Sleep, sleep, timeout_at};
+use tokio::time::{Instant, timeout_at};
 use tukuyomi_kernel::{Failure, Phase};
-use tukuyomi_proxy::config::{self, ForwardConfig, ProxyConfig};
+use tukuyomi_proxy::config::{self, ForwardConfig, ProxyConfig, addresses};
 use tukuyomi_proxy::forward::group::Upstreams;
 use tukuyomi_proxy::forward::resolve;
 use tukuyomi_proxy::host;
+use tukuyomi_proxy::inbound::accept::{Accepted, Acceptor, Arrival};
 use tukuyomi_proxy::inbound::conn::Ctx;
 use tukuyomi_proxy::inbound::session;
+use tukuyomi_proxy::inbound::tls::{Files, Tls};
 use tukuyomi_proxy::inspect::driver::{self, Driver, End, Ingress, Limits, Msg, Switch, Switched};
 use tukuyomi_proxy::log::{self, Log};
 use tukuyomi_proxy::rules::bundle::{Fingerprint, Mode};
@@ -70,13 +75,6 @@ const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 /// The longest the end of the process waits for the logger.
 const FLUSH_WAIT: Duration = Duration::from_millis(200);
-/// The pause of the accept loop after the system ran out of a resource.
-const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
-/// Linux errno values (the same on x86_64 and aarch64).
-const ENOMEM: i32 = 12;
-const ENFILE: i32 = 23;
-const EMFILE: i32 = 24;
-const ENOBUFS: i32 = 105;
 
 fn main() -> ExitCode {
     let log = match log::start_logger() {
@@ -126,7 +124,8 @@ fn start(log: &Log) -> u8 {
         }
     };
     log.line("start: configuration accepted");
-    let forward = match resolve::complete(loaded.forward, loaded.proxy.listen, resolve::system) {
+    let listening = addresses(&loaded.proxy.listeners);
+    let forward = match resolve::complete(loaded.forward, &listening, resolve::system) {
         Ok(done) => {
             for line in &done.lines {
                 log.line(line);
@@ -135,6 +134,13 @@ fn start(log: &Log) -> u8 {
         }
         Err(refusal) => {
             log.line(&format!("start: upstream refused: {refusal}"));
+            return EXIT_FAILED;
+        }
+    };
+    let tls = match Tls::load(&loaded.proxy.listeners, &Files) {
+        Ok(tls) => tls,
+        Err(refusal) => {
+            log.line(&format!("start: tls refused: {refusal}"));
             return EXIT_FAILED;
         }
     };
@@ -210,6 +216,7 @@ fn start(log: &Log) -> u8 {
     runtime.block_on(run(
         loaded.proxy,
         forward,
+        tls,
         kernel,
         generation,
         mode,
@@ -227,6 +234,7 @@ fn start(log: &Log) -> u8 {
 async fn run(
     proxy: ProxyConfig,
     forward: ForwardConfig,
+    tls: Tls,
     kernel: tukuyomi_kernel::Config,
     generation: Fingerprint,
     mode: Mode,
@@ -281,6 +289,7 @@ async fn run(
         upstreams: Upstreams::new(&forward, &proxy),
         log: log.clone(),
         ingress: Arc::new(Ingress::new(ingress.clone())),
+        tls,
     });
     let cause = until_stop(&mut waits, &ctx, &ingress, &mut switcher).await;
     stop(
@@ -310,6 +319,7 @@ async fn until_stop(
         match waits.wait(Some(ready_by)).await {
             Event::Ready(Ok(())) => break,
             Event::Reload => log.line("reload: ignored while starting"),
+            Event::Certificates => log.line("reload: certificates ignored while starting"),
             event => {
                 if let Some(cause) = Cause::of(event) {
                     return cause;
@@ -319,23 +329,23 @@ async fn until_stop(
     }
     log.line("start: the kernel is ready");
 
-    let listener = match TcpListener::bind(proxy.listen).await {
-        Ok(listener) => listener,
-        Err(_) => return Cause::Bind,
-    };
     let permits = Arc::new(Semaphore::new(proxy.max_conns));
-    waits.accept = Some(Acceptor::new(listener, permits, ctx.ingress.clone()));
+    let acceptor =
+        match Acceptor::bind(&addresses(&proxy.listeners), permits, ctx.ingress.clone()).await {
+            Ok(acceptor) => acceptor,
+            Err(_) => return Cause::Bind,
+        };
+    waits.accept = Some(acceptor);
     log.line("start: listening");
 
     loop {
         match waits.wait(None).await {
-            Event::Conn(sock, peer, permit) => {
-                spawn_connection(&mut waits.conns, sock, peer, permit, ctx, log);
-            }
+            Event::Conn(arrival) => spawn_connection(&mut waits.conns, arrival, ctx, log),
             Event::AcceptErr(Some(errno)) => log.line(&format!("accept: failed, errno {errno}")),
             Event::AcceptErr(None) => log.line("accept: failed"),
             Event::Joined(done) => note_joined(done, log),
             Event::Reload => reload(waits, switcher, ingress, log),
+            Event::Certificates => reload_certificates(ctx),
             Event::Switched(switched) => switcher.finish(switched),
             event => {
                 if let Some(cause) = Cause::of(event) {
@@ -384,15 +394,26 @@ fn reload(waits: &mut Waits, switcher: &mut Switcher, ingress: &SyncSender<Msg>,
     }
 }
 
+/// SIGUSR2: reads the certificate and key files of the TLS listeners again. They all replace the ones in use, or none
+/// does; the result is a record line, and the proxy goes on as it is.
+fn reload_certificates(ctx: &Ctx) {
+    ctx.log.line("reload: SIGUSR2");
+    match ctx.tls.reload(&ctx.cfg.listeners, &Files) {
+        Ok(()) => ctx.log.line("reload: certificates replaced"),
+        Err(refusal) => ctx
+            .log
+            .line(&format!("reload: certificates refused: {refusal}")),
+    }
+}
+
 /// Starts one connection. The permit lives as long as the connection and goes back when it ends or is aborted.
-fn spawn_connection(
-    conns: &mut JoinSet<()>,
-    sock: TcpStream,
-    peer: SocketAddr,
-    permit: OwnedSemaphorePermit,
-    ctx: &Arc<Ctx>,
-    log: &Log,
-) {
+fn spawn_connection(conns: &mut JoinSet<()>, arrival: Arrival, ctx: &Arc<Ctx>, log: &Log) {
+    let Arrival {
+        sock,
+        peer,
+        permit,
+        listener,
+    } = arrival;
     let local = match (sock.set_nodelay(true), sock.local_addr()) {
         (Ok(()), Ok(local)) => local,
         _ => {
@@ -403,7 +424,7 @@ fn spawn_connection(
     let ctx = ctx.clone();
     conns.spawn(async move {
         let _permit = permit;
-        session::serve(sock, peer, local, ctx).await;
+        session::serve_on(sock, peer, local, ctx, listener).await;
     });
 }
 
@@ -413,11 +434,6 @@ fn note_joined(done: Result<(), JoinError>, log: &Log) {
     {
         log.line("connection: a connection panicked");
     }
-}
-
-/// Whether the accept error means the system is out of descriptors, memory or buffers.
-fn is_resource_error(errno: i32) -> bool {
-    matches!(errno, ENOMEM | ENFILE | EMFILE | ENOBUFS)
 }
 
 /// The driver's end counts as clean only for a stopped kernel whose child exit and directory removal are
@@ -452,8 +468,9 @@ impl Cause {
             Event::Late => Some(Cause::Late),
             Event::Ready(Ok(()))
             | Event::Reload
+            | Event::Certificates
             | Event::Switched(_)
-            | Event::Conn(..)
+            | Event::Conn(_)
             | Event::AcceptErr(_)
             | Event::Joined(_) => None,
         }
@@ -493,7 +510,7 @@ impl Stop {
                 stop.end_lost = source == Source::End;
             }
             Cause::Late => log.line("stop: the kernel was not ready in time"),
-            Cause::Bind => log.line("stop: the listen address cannot be bound"),
+            Cause::Bind => log.line("stop: a listen address cannot be bound"),
         }
         stop
     }
@@ -509,11 +526,12 @@ impl Stop {
             }
             Event::Joined(done) => note_joined(done, log),
             Event::Reload => log.line("reload: ignored while stopping"),
+            Event::Certificates => log.line("reload: certificates ignored while stopping"),
             Event::Lost(_)
             | Event::Ready(_)
             | Event::Switched(_)
             | Event::Late
-            | Event::Conn(..)
+            | Event::Conn(_)
             | Event::AcceptErr(_) => {}
         }
     }
@@ -537,7 +555,7 @@ async fn stop(
     let after = |d: Duration| t0.checked_add(d).unwrap_or(t0);
     let mut stop = Stop::begin(cause, log);
 
-    // The listener is closed here; a connection that was not accepted yet is never accepted. The connections get
+    // The listeners are closed here; a connection that was not accepted yet is never accepted. The connections get
     // no sender for a request that starts from now on, and the ones that wait for a request end.
     waits.accept = None;
     connections.close();
@@ -604,12 +622,13 @@ async fn stop(
     }
 }
 
-/// The four signal streams. They are created before the driver starts.
+/// The five signal streams. They are created before the driver starts.
 struct Signals {
     term: Signal,
     int: Signal,
     hup: Signal,
     usr1: Signal,
+    usr2: Signal,
 }
 
 impl Signals {
@@ -619,6 +638,7 @@ impl Signals {
             int: signal(SignalKind::interrupt())?,
             hup: signal(SignalKind::hangup())?,
             usr1: signal(SignalKind::user_defined1())?,
+            usr2: signal(SignalKind::user_defined2())?,
         })
     }
 }
@@ -651,6 +671,8 @@ enum Event {
     Signal(&'static str),
     /// SIGUSR1.
     Reload,
+    /// SIGUSR2.
+    Certificates,
     /// The driver answered a switch: whether the new generation serves.
     Switched(bool),
     Failed(Failure),
@@ -658,104 +680,9 @@ enum Event {
     Lost(Source),
     /// The deadline of the wait passed.
     Late,
-    Conn(TcpStream, SocketAddr, OwnedSemaphorePermit),
+    Conn(Arrival),
     AcceptErr(Option<i32>),
     Joined(Result<(), JoinError>),
-}
-
-type Acquire = Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, AcquireError>>>>;
-
-/// The accept side: one connection permit first, then the accept it is for. While every permit is in use, one
-/// connection that arrives is accepted at once and waits for a permit, and the connections that wait for their
-/// next request are told to close.
-struct Acceptor {
-    listener: TcpListener,
-    permits: Arc<Semaphore>,
-    ingress: Arc<Ingress>,
-    acquire: Option<Acquire>,
-    permit: Option<OwnedSemaphorePermit>,
-    /// A connection that was accepted without a permit.
-    waiting: Option<(TcpStream, SocketAddr)>,
-    pause: Option<Pin<Box<Sleep>>>,
-}
-
-impl Acceptor {
-    fn new(listener: TcpListener, permits: Arc<Semaphore>, ingress: Arc<Ingress>) -> Acceptor {
-        Acceptor {
-            listener,
-            permits,
-            ingress,
-            acquire: None,
-            permit: None,
-            waiting: None,
-            pause: None,
-        }
-    }
-
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
-        if let Some(pause) = self.pause.as_mut() {
-            if pause.as_mut().poll(cx).is_pending() {
-                return Poll::Pending;
-            }
-            self.pause = None;
-        }
-        let permit = match self.permit.take() {
-            Some(permit) => permit,
-            None => {
-                let permits = &self.permits;
-                let acquire = self
-                    .acquire
-                    .get_or_insert_with(|| Box::pin(permits.clone().acquire_owned()));
-                match acquire.as_mut().poll(cx) {
-                    Poll::Pending => return self.crowded(cx),
-                    Poll::Ready(Ok(permit)) => {
-                        self.acquire = None;
-                        permit
-                    }
-                    Poll::Ready(Err(_)) => return Poll::Ready(Event::Lost(Source::Permits)),
-                }
-            }
-        };
-        if let Some((sock, peer)) = self.waiting.take() {
-            return Poll::Ready(Event::Conn(sock, peer, permit));
-        }
-        match self.listener.poll_accept(cx) {
-            Poll::Pending => {
-                self.permit = Some(permit);
-                Poll::Pending
-            }
-            Poll::Ready(Ok((sock, peer))) => Poll::Ready(Event::Conn(sock, peer, permit)),
-            Poll::Ready(Err(e)) => {
-                self.permit = Some(permit);
-                Poll::Ready(self.failed(&e))
-            }
-        }
-    }
-
-    /// Every permit is in use. The first connection that arrives is accepted to wait for one, and the idle
-    /// connections are told to close; the next one stays in the backlog until that one has its permit.
-    fn crowded(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
-        if self.waiting.is_none() {
-            match self.listener.poll_accept(cx) {
-                Poll::Ready(Ok(arrived)) => {
-                    self.waiting = Some(arrived);
-                    self.ingress.drain();
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(self.failed(&e)),
-                Poll::Pending => {}
-            }
-        }
-        Poll::Pending
-    }
-
-    /// The event for an accept that failed. Running out of a resource pauses the accepts for a while.
-    fn failed(&mut self, e: &io::Error) -> Event {
-        let errno = e.raw_os_error();
-        if errno.is_some_and(is_resource_error) {
-            self.pause = Some(Box::pin(sleep(ACCEPT_PAUSE)));
-        }
-        Event::AcceptErr(errno)
-    }
 }
 
 /// Everything main waits for, behind one poll. The order of the polls is the order of precedence: the driver's
@@ -765,6 +692,7 @@ struct Waits {
     int: Signal,
     hup: Signal,
     usr1: Signal,
+    usr2: Signal,
     ready: Option<oneshot::Receiver<Result<(), Failure>>>,
     failed: Option<oneshot::Receiver<Failure>>,
     /// The answer to the switch that is under way, if there is one.
@@ -786,6 +714,7 @@ impl Waits {
             int: signals.int,
             hup: signals.hup,
             usr1: signals.usr1,
+            usr2: signals.usr2,
             ready: Some(ready),
             failed: Some(failed),
             switch: None,
@@ -823,6 +752,9 @@ impl Waits {
         if self.usr1.poll_recv(cx).is_ready() {
             return Poll::Ready(Event::Reload);
         }
+        if self.usr2.poll_recv(cx).is_ready() {
+            return Poll::Ready(Event::Certificates);
+        }
         if let Some(failed) = self.failed.as_mut()
             && let Poll::Ready(answer) = Pin::new(failed).poll(cx)
         {
@@ -846,9 +778,11 @@ impl Waits {
         if let Poll::Ready(Some(done)) = self.conns.poll_join_next(cx) {
             return Poll::Ready(Event::Joined(done));
         }
-        match self.accept.as_mut() {
-            Some(accept) => accept.poll(cx),
-            None => Poll::Pending,
+        match self.accept.as_mut().map(|accept| accept.poll(cx)) {
+            Some(Poll::Ready(Accepted::Conn(arrival))) => Poll::Ready(Event::Conn(arrival)),
+            Some(Poll::Ready(Accepted::Failed(errno))) => Poll::Ready(Event::AcceptErr(errno)),
+            Some(Poll::Ready(Accepted::PermitsGone)) => Poll::Ready(Event::Lost(Source::Permits)),
+            Some(Poll::Pending) | None => Poll::Pending,
         }
     }
 }
@@ -929,17 +863,6 @@ mod tests {
     }
 
     #[test]
-    fn only_running_out_of_a_resource_pauses_the_accept_loop() {
-        for errno in [12, 23, 24, 105] {
-            assert!(is_resource_error(errno), "{errno}");
-        }
-        // EAGAIN, EINTR, ECONNABORTED
-        for errno in [11, 4, 103] {
-            assert!(!is_resource_error(errno), "{errno}");
-        }
-    }
-
-    #[test]
     fn a_wait_returns_what_the_driver_answered_once() {
         runtime().block_on(async {
             let mut f = fixture();
@@ -990,46 +913,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn a_connection_permit_is_taken_before_accept_and_a_shortage_drains_the_idle() {
-        runtime().block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let permits = Arc::new(Semaphore::new(1));
-            let (tx, _rx) = sync_channel::<Msg>(1);
-            let ingress = Arc::new(connections(&tx));
-            let mut told = ingress.drained();
-            let mut f = fixture();
-            f.waits.accept = Some(Acceptor::new(listener, permits.clone(), ingress));
-            let _first = TcpStream::connect(addr).await.unwrap();
-            let _second = TcpStream::connect(addr).await.unwrap();
-            let _third = TcpStream::connect(addr).await.unwrap();
-
-            let Event::Conn(_, _, permit) = f.waits.wait(after(5000)).await else {
-                panic!("the first connection was not accepted");
-            };
-            assert_eq!(permits.available_permits(), 0);
-            // A connection that is accepted with a permit tells nobody.
-            assert!(!told.has_changed().unwrap());
-            // The second connection arrives with every permit in use: it is taken in to wait, once, and the
-            // idle connections are told. It is not served before a permit is back.
-            assert!(matches!(f.waits.wait(after(150)).await, Event::Late));
-            assert!(told.has_changed().unwrap());
-            let _ = told.borrow_and_update();
-            assert!(matches!(f.waits.wait(after(150)).await, Event::Late));
-            assert!(!told.has_changed().unwrap());
-            drop(permit);
-            let Event::Conn(_, _, permit) = f.waits.wait(after(5000)).await else {
-                panic!("the second connection was not given the permit");
-            };
-            // The third one arrives with every permit in use again, and tells again.
-            assert!(matches!(f.waits.wait(after(150)).await, Event::Late));
-            assert!(told.has_changed().unwrap());
-            drop(permit);
-            assert!(matches!(f.waits.wait(after(5000)).await, Event::Conn(..)));
-        });
-    }
-
     fn proxy_config(stop_inspect_ms: u64, stop_wait_ms: u64) -> ProxyConfig {
         let loaded = config_for_tests();
         ProxyConfig {
@@ -1040,10 +923,9 @@ mod tests {
     }
 
     fn config_for_tests() -> ProxyConfig {
-        let any: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let ms = Duration::from_millis;
         ProxyConfig {
-            listen: any,
+            listeners: Vec::new(),
             max_conns: 1,
             max_head_bytes: 1024,
             max_body: 0,

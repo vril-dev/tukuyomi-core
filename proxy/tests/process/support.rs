@@ -438,7 +438,7 @@ pub(crate) fn exchange(port: u16, request: &[u8]) -> Reply {
     collect(&mut sock, start)
 }
 
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .expect("bind a free port")
         .local_addr()
@@ -725,7 +725,7 @@ fn only_first(addresses: &[SocketAddr]) -> Value {
 fn config_json(k: &Knobs, listen: SocketAddr, upstreams: &[SocketAddr], root: &Path) -> String {
     json!({
         "proxy": {
-            "listen": listen.to_string(),
+            "listeners": [{"address": listen.to_string()}],
             "max_conns": k.max_conns,
             "max_head_bytes": 8192,
             "max_body": MAX_BODY,
@@ -882,7 +882,12 @@ pub(crate) struct Proxy {
 impl Proxy {
     /// Starts the proxy and waits until it listens and its inspector is there.
     pub(crate) fn start(test: &str, knobs: Knobs) -> Proxy {
-        let mut proxy = Proxy::spawn(test, knobs);
+        Proxy::start_with(test, knobs, |_| {})
+    }
+
+    /// The same, with a change to the test root as `spawn_with` makes it.
+    pub(crate) fn start_with(test: &str, knobs: Knobs, edit: impl FnOnce(&Path)) -> Proxy {
+        let mut proxy = Proxy::spawn_with(test, knobs, edit);
         proxy
             .records
             .wait_lines("the proxy to listen", 1, |l| l == "start: listening");

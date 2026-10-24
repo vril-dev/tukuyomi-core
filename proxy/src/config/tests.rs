@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const BASE: &str = r#"{"proxy":{"listen":"127.0.0.1:8080","max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"forward":{"resolve_timeout_ms":30000,"upstreams":{"main":{"servers":[{"address":"127.0.0.1:9000","weight":1,"max_fails":1,"fail_timeout_ms":10000,"backup":false}]},"api":{"servers":[{"address":"127.0.0.1:9001","weight":3,"max_fails":2,"fail_timeout_ms":5000,"backup":false},{"address":"127.0.0.1:9002","weight":1,"max_fails":0,"fail_timeout_ms":5000,"backup":true}]}},"routes":[{"host":"api.example.test","path":"/v1/","upstream":"api"}],"default_upstream":"main"},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
+const BASE: &str = r#"{"proxy":{"listeners":[{"address":"127.0.0.1:8080"}],"max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"forward":{"resolve_timeout_ms":30000,"upstreams":{"main":{"servers":[{"address":"127.0.0.1:9000","weight":1,"max_fails":1,"fail_timeout_ms":10000,"backup":false}]},"api":{"servers":[{"address":"127.0.0.1:9001","weight":3,"max_fails":2,"fail_timeout_ms":5000,"backup":false},{"address":"127.0.0.1:9002","weight":1,"max_fails":0,"fail_timeout_ms":5000,"backup":true}]}},"routes":[{"host":"api.example.test","path":"/v1/","upstream":"api"}],"default_upstream":"main"},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
 
 /// Marks a value that must never appear in an error sentence.
 const MARK: &str = "qqmark";
@@ -30,6 +30,35 @@ fn f(key: &'static str, value: impl Into<Value>) -> Edit {
 /// A key of the first server of the group `api`.
 fn sv(key: &'static str, value: impl Into<Value>) -> Edit {
     ("/forward/upstreams/api/servers/0", key, value.into())
+}
+
+/// The `listeners` of the `proxy` object.
+fn listeners(value: Value) -> Edit {
+    p("listeners", value)
+}
+
+/// One plain listener at `address`.
+fn at(address: &str) -> Edit {
+    listeners(serde_json::json!([{ "address": address }]))
+}
+
+/// A listener at `address` that ends TLS with one certificate for `hosts`.
+fn tls_listener(address: &str, hosts: &[&str]) -> Value {
+    serde_json::json!({
+        "address": address,
+        "tls": {
+            "min_version": "1.2",
+            "certificates": [{
+                "cert_file": "/etc/tukuyomi/tls/a.pem",
+                "key_file": "/etc/tukuyomi/tls/a.key",
+                "hosts": hosts,
+            }],
+        },
+    })
+}
+
+fn tls_listeners(address: &str, hosts: &[&str]) -> Value {
+    serde_json::json!([tls_listener(address, hosts)])
 }
 
 fn base() -> Value {
@@ -70,7 +99,13 @@ fn refuse_text(text: &str, sentence: &str) {
 fn the_base_document_loads_with_every_value_converted() {
     let loaded = parse(BASE.as_bytes()).unwrap();
     let (proxy, kernel) = (&loaded.proxy, &loaded.kernel.0);
-    assert_eq!(proxy.listen, "127.0.0.1:8080".parse().unwrap());
+    assert_eq!(
+        proxy.listeners,
+        [ListenerConfig {
+            address: "127.0.0.1:8080".parse().unwrap(),
+            kind: ListenerKind::Plain,
+        }]
+    );
     assert_eq!(proxy.max_buffered_bytes, 8 << 20);
     assert_eq!(proxy.drive_slice, Duration::from_millis(50));
     assert_eq!(proxy.stop_wait, Duration::from_millis(10_000));
@@ -222,7 +257,7 @@ fn a_repeated_key_is_refused_even_with_the_same_value() {
 fn a_value_of_the_wrong_type_is_refused_for_every_key() {
     let sentence = "configuration has a value of the wrong type";
     for (path, key, wrong) in [
-        ("/proxy", "listen", Value::from(5)),
+        ("/proxy", "listeners", Value::from(5)),
         ("/proxy", "max_conns", Value::from("5")),
         ("/forward", "default_upstream", Value::from(5)),
         ("/forward", "resolve_timeout_ms", Value::from("5")),
@@ -284,7 +319,11 @@ fn an_array_never_stands_in_for_an_object() {
 #[test]
 fn errors_never_carry_a_value_or_a_key_from_the_file() {
     let mut cases: Vec<Vec<u8>> = vec![
-        doc(&[p("listen", MARK)]),
+        doc(&[listeners(serde_json::json!([{"address": MARK}]))]),
+        doc(&[listeners(
+            serde_json::json!([{"address": "127.0.0.1:1", "redirect": {"https_port": MARK}}]),
+        )]),
+        doc(&[listeners(tls_listeners("127.0.0.1:1", &["qqmark!"]))]),
         doc(&[p("max_conns", MARK)]),
         doc(&[p(MARK, 1)]),
         doc(&[k("inspector", MARK)]),
@@ -309,20 +348,20 @@ fn errors_never_carry_a_value_or_a_key_from_the_file() {
 
 #[test]
 fn addresses_are_ip_literals_with_a_port_and_differ() {
-    let bad = "listen is not an IP address and port";
+    let bad = "a listener address is not an IP address and port";
     for text in ["localhost:8080", "127.0.0.1", "127.0.0.1:65536"] {
-        refuse(&[p("listen", text)], bad);
+        refuse(&[at(text)], bad);
     }
-    pass(&[p("listen", "127.0.0.1:65535")]);
-    pass(&[p("listen", "[::1]:8080")]);
-    refuse(&[p("listen", "127.0.0.1:0")], "listen port is 0");
+    pass(&[at("127.0.0.1:65535")]);
+    pass(&[at("[::1]:8080")]);
+    refuse(&[at("127.0.0.1:0")], "a listener port is 0");
     refuse(
         &[sv("address", "127.0.0.1")],
         "a server address is not an IP address and port, or a name and port",
     );
     refuse(&[sv("address", "127.0.0.1:0")], "a server port is 0");
 
-    let same = "listen and a server are the same address";
+    let same = "a listener and a server are the same address";
     refuse(&[sv("address", "127.0.0.1:8080")], same);
     refuse(&[sv("address", "[::ffff:127.0.0.1]:8080")], same);
     pass(&[sv("address", "127.0.0.1:8081")]);
@@ -332,10 +371,167 @@ fn addresses_are_ip_literals_with_a_port_and_differ() {
     // proxy itself; another address, and another port, are not.
     for listen in ["0.0.0.0:8080", "[::]:8080"] {
         for server in ["127.0.0.1:8080", "127.0.0.2:8080", "[::1]:8080"] {
-            refuse(&[p("listen", listen), sv("address", server)], same);
+            refuse(&[at(listen), sv("address", server)], same);
         }
-        pass(&[p("listen", listen), sv("address", "127.0.0.1:8081")]);
-        pass(&[p("listen", listen), sv("address", "192.0.2.1:8080")]);
+        pass(&[at(listen), sv("address", "127.0.0.1:8081")]);
+        pass(&[at(listen), sv("address", "192.0.2.1:8080")]);
+    }
+    // A server may not be any of the listeners.
+    let two = listeners(
+        serde_json::json!([{"address": "127.0.0.1:8080"}, {"address": "127.0.0.1:8081"}]),
+    );
+    refuse(&[two.clone(), sv("address", "127.0.0.1:8081")], same);
+    pass(&[two, sv("address", "127.0.0.1:8082")]);
+}
+
+#[test]
+fn listeners_are_one_to_eight_and_differ() {
+    let count = |n: u16| {
+        let list: Vec<Value> = (0..n)
+            .map(|i| serde_json::json!({ "address": format!("127.0.0.1:{}", 7000 + i) }))
+            .collect();
+        listeners(Value::Array(list))
+    };
+    pass(&[count(1)]);
+    pass(&[count(8)]);
+    let sentence = "listeners has no listener or more than 8";
+    refuse(&[count(0)], sentence);
+    refuse(&[count(9)], sentence);
+    let same = "two listeners have the same address, or one is an unspecified address at the port of the other";
+    let pair =
+        |a: &str, b: &str| listeners(serde_json::json!([{ "address": a }, { "address": b }]));
+    refuse(&[pair("127.0.0.1:7000", "127.0.0.1:7000")], same);
+    refuse(&[pair("127.0.0.1:7000", "[::ffff:127.0.0.1]:7000")], same);
+    refuse(&[pair("0.0.0.0:7000", "127.0.0.1:7000")], same);
+    refuse(&[pair("[::1]:7000", "[::]:7000")], same);
+    pass(&[pair("127.0.0.1:7000", "127.0.0.1:7001")]);
+    pass(&[pair("127.0.0.1:7000", "127.0.0.2:7000")]);
+}
+
+#[test]
+fn a_listener_is_plain_tls_or_a_redirect_and_a_redirect_needs_tls() {
+    let tls = tls_listener("127.0.0.1:9443", &["a.example"]);
+    let redirect = |port: u64| serde_json::json!({"address": "127.0.0.1:9080", "redirect": {"https_port": port}});
+    pass(&[listeners(Value::Array(vec![redirect(443), tls.clone()]))]);
+    let both = serde_json::json!({
+        "address": "127.0.0.1:9080",
+        "redirect": {"https_port": 443},
+        "tls": tls["tls"].clone(),
+    });
+    refuse(
+        &[listeners(Value::Array(vec![both, tls.clone()]))],
+        "a listener has both tls and redirect",
+    );
+    // A redirect needs a listener with tls to point at, and some listener has to serve requests.
+    refuse(
+        &[listeners(Value::Array(vec![redirect(443)]))],
+        "no listener is plain or has tls",
+    );
+    refuse(
+        &[listeners(serde_json::json!([
+            {"address": "127.0.0.1:9000"},
+            redirect(443),
+        ]))],
+        "a redirect listener needs a listener with tls",
+    );
+    for port in [0, 65536] {
+        refuse(
+            &[listeners(Value::Array(vec![redirect(port), tls.clone()]))],
+            "a redirect https_port is not 1 to 65535",
+        );
+    }
+    pass(&[listeners(Value::Array(vec![redirect(65535), tls]))]);
+}
+
+#[test]
+fn the_tls_settings_are_checked_in_form_only() {
+    let one = |hosts: &[&str]| listeners(tls_listeners("127.0.0.1:9443", hosts));
+    pass(&[one(&["a.example", "*.a.example", "localhost"])]);
+    let host = "a tls host is not a name, or * and a name";
+    for bad in [
+        "192.0.2.1",
+        "[::1]",
+        "127.1",
+        "*",
+        "*.",
+        "a.*.example",
+        "*a.example",
+        "**.example",
+        "A.example",
+        "a_b.example",
+        "a..example",
+        "a.example.",
+        "a.example:443",
+    ] {
+        refuse(&[one(&[bad])], host);
+    }
+    refuse(
+        &[one(&["a.example", "a.example"])],
+        "a tls host is written twice in a listener",
+    );
+    refuse(&[one(&[])], "a certificate has no host or more than 64");
+    let many: Vec<String> = (0..65).map(|i| format!("h{i}.example")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    refuse(&[one(&many)], "a certificate has no host or more than 64");
+    pass(&[one(&many[..64])]);
+    // The same host may be written in two listeners.
+    pass(&[listeners(serde_json::json!([
+        tls_listener("127.0.0.1:9443", &["a.example"]),
+        tls_listener("127.0.0.1:9444", &["a.example"]),
+    ]))]);
+
+    let with = |change: &dyn Fn(&mut Value)| {
+        let mut list = tls_listeners("127.0.0.1:9443", &["a.example"]);
+        change(&mut list[0]["tls"]);
+        listeners(list)
+    };
+    let min = "tls min_version is not 1.2 or 1.3";
+    pass(&[with(&|tls| tls["min_version"] = Value::from("1.3"))]);
+    for bad in ["1.1", "1.0", "TLS1.2", "1.2 ", ""] {
+        refuse(&[with(&|tls| tls["min_version"] = Value::from(bad))], min);
+    }
+    let certificate = |n: usize| {
+        with(&|tls| {
+            let one = tls["certificates"][0].clone();
+            let mut all = Vec::new();
+            for i in 0..n {
+                let mut next = one.clone();
+                next["hosts"] = serde_json::json!([format!("c{i}.example")]);
+                all.push(next);
+            }
+            tls["certificates"] = Value::Array(all);
+        })
+    };
+    pass(&[certificate(16)]);
+    let count = "tls has no certificate or more than 16";
+    refuse(&[certificate(17)], count);
+    refuse(&[certificate(0)], count);
+    // The files are absolute clean paths of at most 3840 bytes.
+    let path = "a tls cert_file or key_file is not an absolute clean path of at most 3840 bytes";
+    let long = format!("/{}", "a".repeat(3839));
+    pass(&[with(&|tls| {
+        tls["certificates"][0]["key_file"] = Value::from(long.clone())
+    })]);
+    for bad in [
+        "a.pem",
+        "/etc/../a.pem",
+        "/etc//a.pem",
+        "/etc/a.pem/",
+        "",
+        &format!("/{}", "a".repeat(3840)),
+    ] {
+        refuse(
+            &[with(&|tls| {
+                tls["certificates"][0]["cert_file"] = Value::from(bad)
+            })],
+            path,
+        );
+        refuse(
+            &[with(&|tls| {
+                tls["certificates"][0]["key_file"] = Value::from(bad)
+            })],
+            path,
+        );
     }
 }
 
@@ -679,7 +875,6 @@ fn a_route_names_a_group_that_is_there_and_is_a_rule_that_holds() {
         serde_json::json!({"upstream": "api"}),
         serde_json::json!({"path": "/", "upstream": "api"}),
         serde_json::json!({"host": "*.example.test:8080", "upstream": "api"}),
-        serde_json::json!({"host": null, "path": null, "upstream": "api"}),
     ] {
         pass(&[route(good)]);
     }
@@ -1086,10 +1281,8 @@ fn the_access_of_a_route_is_two_lists_of_at_most_256_networks() {
     assert!(!permits("10.1.2.3"));
     assert!(permits("192.0.2.5"));
     assert!(!permits("198.51.100.1"));
-    for none in [serde_json::json!({}), Value::Null] {
-        let access = access_of(&route(none));
-        assert!(access.permits("203.0.113.1".parse().unwrap()));
-    }
+    let empty = access_of(&route(serde_json::json!({})));
+    assert!(empty.permits("203.0.113.1".parse().unwrap()));
 
     let list = |key: &str, n: usize| {
         let mut object = serde_json::Map::new();
@@ -1157,7 +1350,6 @@ fn the_edits_of_a_route_are_read_and_checked_when_the_file_is_loaded() {
     let mut good = vec![
         full,
         serde_json::json!({}),
-        Value::Null,
         serde_json::json!({"query": {}}),
         serde_json::json!({"response_headers": {"remove": ["Server"]}}),
     ];
@@ -1280,7 +1472,6 @@ fn the_stream_of_a_route_has_all_its_keys_and_times_from_1_ms_to_24_h_with_idle_
         stream_of(&with_route(serde_json::json!({"upstream": "api"}))),
         None
     );
-    assert_eq!(stream_of(&route(Value::Null)), None);
 
     // The times are at the limits, and one past them.
     for (idle, total) in [(1, 1), (5, 5), (1, 86_400_000), (86_400_000, 86_400_000)] {
@@ -1329,4 +1520,36 @@ fn the_stream_of_a_route_has_all_its_keys_and_times_from_1_ms_to_24_h_with_idle_
             "{stream}"
         );
     }
+}
+
+#[test]
+fn a_key_that_may_be_left_out_is_refused_when_it_is_null() {
+    let wrong = "configuration has a value of the wrong type";
+    // serde would read null as a key that is left out: TLS would be off, or the host or the access list gone.
+    for key in ["tls", "redirect"] {
+        let mut listener = serde_json::json!({"address": "127.0.0.1:9100"});
+        listener[key] = Value::Null;
+        refuse(&[listeners(Value::Array(vec![listener]))], wrong);
+    }
+    for key in ["host", "path", "access", "rewrite", "stream"] {
+        let mut route = serde_json::json!({"upstream": "api"});
+        route[key] = Value::Null;
+        assert_eq!(refusal_of(&with_route(route)), Some(wrong), "{key}");
+    }
+    for key in [
+        "host",
+        "path",
+        "query",
+        "request_headers",
+        "response_headers",
+    ] {
+        let mut edits = serde_json::json!({});
+        edits[key] = Value::Null;
+        let route = serde_json::json!({"path": "/api/", "upstream": "api", "rewrite": edits});
+        assert_eq!(refusal_of(&with_route(route)), Some(wrong), "{key}");
+    }
+    // Left out, the same keys are fine.
+    pass(&[at("127.0.0.1:9100")]);
+    let route = serde_json::json!({"upstream": "api", "rewrite": {}});
+    assert_eq!(refusal_of(&with_route(route)), None);
 }

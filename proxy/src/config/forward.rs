@@ -6,9 +6,9 @@
 //! "max_fails", "fail_timeout_ms", "backup"}` with every key present: the address is an IP literal and a port
 //! (`[..]:port` for IPv6) or a name and a port (`name:port`), the weight is 1 to 100, `max_fails` is 0 to 100 (0:
 //! failures are not counted), `fail_timeout_ms` is the time a failing server is left out, and `backup` tells that the
-//! server is used only when no other one can be. An IP literal is not the address of `listen` (nor a loopback address
-//! at the port of `listen`, if that is an unspecified address), and is not unspecified or a multicast address. A name
-//! is 1 to 253 bytes of lowercase letters, digits, `-`, `_` and `.`, in labels of 1 to 63 bytes of which the last
+//! server is used only when no other one can be. An IP literal is not the address of a listener (nor a loopback
+//! address at the port of one, if that is an unspecified address), and is not unspecified or a multicast address. A
+//! name is 1 to 253 bytes of lowercase letters, digits, `-`, `_` and `.`, in labels of 1 to 63 bytes of which the last
 //! starts with a letter (an OS takes `127.1` or `0x7f000001` for an address, not for a name); the port is 1 to 65535
 //! without a leading zero. The configuration does not look a name up: that is done once, when the proxy starts (see
 //! `forward::resolve`), and each address of a name is a server of the group.
@@ -180,11 +180,16 @@ struct RawServer {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRoute {
+    #[serde(default, deserialize_with = "super::present")]
     host: Option<String>,
+    #[serde(default, deserialize_with = "super::present")]
     path: Option<String>,
     upstream: String,
+    #[serde(default, deserialize_with = "super::present")]
     access: Option<Object<RawAccess>>,
+    #[serde(default, deserialize_with = "super::present")]
     rewrite: Option<Object<RawRewrite>>,
+    #[serde(default, deserialize_with = "super::present")]
     stream: Option<Object<RawStream>>,
 }
 
@@ -242,7 +247,7 @@ fn host_label_ok(label: &str) -> bool {
 
 /// A server name: 1 to 253 bytes of lowercase letters, digits, `-`, `_` and `.` in labels of 1 to 63 bytes, the last
 /// of which starts with a letter.
-fn host_ok(name: &str) -> bool {
+pub(super) fn host_ok(name: &str) -> bool {
     name.len() <= 253
         && name.split('.').all(host_label_ok)
         && name
@@ -298,7 +303,7 @@ fn stream(raw: Option<Object<RawStream>>) -> Result<Option<Stream>, ConfigError>
 
 fn servers(
     raw: Vec<Object<RawServer>>,
-    listen: SocketAddr,
+    listeners: &[SocketAddr],
 ) -> Result<Vec<ServerConfig<Address>>, ConfigError> {
     ensure(
         (1..=MAX_SERVERS).contains(&raw.len()),
@@ -309,8 +314,8 @@ fn servers(
             let address = server_address(&server.address)?;
             if let Address::Literal(literal) = address {
                 ensure(
-                    !same(listen, literal),
-                    "listen and a server are the same address",
+                    !listeners.iter().any(|listener| same(*listener, literal)),
+                    "a listener and a server are the same address",
                 )?;
             }
             ensure(
@@ -335,8 +340,11 @@ fn servers(
         .collect()
 }
 
-/// Checks the `forward` object. `listen` is the address the proxy listens on.
-pub(super) fn check(raw: RawForward, listen: SocketAddr) -> Result<ForwardSettings, ConfigError> {
+/// Checks the `forward` object. `listeners` are the addresses the proxy listens on.
+pub(super) fn check(
+    raw: RawForward,
+    listeners: &[SocketAddr],
+) -> Result<ForwardSettings, ConfigError> {
     let resolve_timeout = millis(raw.resolve_timeout_ms, "resolve_timeout_ms is out of range")?;
     ensure(
         (1..=MAX_GROUPS).contains(&raw.upstreams.0.len()),
@@ -350,7 +358,7 @@ pub(super) fn check(raw: RawForward, listen: SocketAddr) -> Result<ForwardSettin
         )?;
         groups.push(GroupConfig {
             name,
-            servers: servers(group.servers, listen)?,
+            servers: servers(group.servers, listeners)?,
         });
     }
     ensure(

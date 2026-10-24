@@ -43,7 +43,9 @@ const O_NOFOLLOW: i32 = 0o100_000;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("O_NOFOLLOW is only known for x86_64 and aarch64 Linux");
 /// `O_NONBLOCK` of Linux, the same on x86_64 and aarch64 (the same sources as for `O_NOFOLLOW`).
-const O_NONBLOCK: i32 = 0o4_000;
+pub(crate) const O_NONBLOCK: i32 = 0o4_000;
+/// `O_NOCTTY` of Linux, the same on x86_64 and aarch64 (the same sources as for `O_NOFOLLOW`).
+pub(crate) const O_NOCTTY: i32 = 0o400;
 
 /// The size of `current`: 64 hexadecimal digits and a newline.
 const CURRENT_LEN: u64 = 65;
@@ -411,8 +413,8 @@ fn read_manifest(dir: &Path, generation: Fingerprint) -> Result<Manifest, StoreE
 }
 
 /// Opens the file at `path` that a lock is taken on, and makes it (empty, 0600) when it is not there. It is opened
-/// like every file that is read: a link is not followed, a FIFO does not make the open wait, and what is not a
-/// regular file is refused. `cannot_open` and `not_regular` are the two sentences of the refusal.
+/// like every file that is read: a link is not followed, a FIFO does not make the open wait, a terminal does not
+/// become the controlling terminal, and what is not a regular file is refused. `cannot_open` and `not_regular` are the two sentences of the refusal.
 fn open_lock_file(
     path: &Path,
     cannot_open: StoreError,
@@ -423,7 +425,7 @@ fn open_lock_file(
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
         .open(path)
         .map_err(|_| cannot_open)?;
     if !file.metadata().is_ok_and(|meta| meta.is_file()) {
@@ -516,10 +518,11 @@ pub(super) fn read_regular(
     same_as: Option<(u64, u64)>,
 ) -> io::Result<Vec<u8>> {
     // O_NONBLOCK: opening a FIFO must not wait for a writer; the check of the file type below then refuses it.
-    // It does not affect reads of a regular file. std adds close-on-exec.
+    // It does not affect reads of a regular file. O_NOCTTY: a terminal that is opened before that check is never
+    // made the controlling terminal of the process. std adds close-on-exec.
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
         .open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {

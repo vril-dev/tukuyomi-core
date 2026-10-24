@@ -260,6 +260,7 @@ fn the_file_of_an_import_is_a_json_array_of_routes_and_the_order_is_kept() {
         "[]",
         "[1]",
         r#"[{"path":"/a/"}]"#,
+        r#"[{"host":null,"path":"/a/","action":"bypass"}]"#,
         r#"[{"action":"bypass"}]"#,
         r#"[{"path":"/a/","action":"allow"}]"#,
         r#"[{"path":"/a/","action":"Bypass"}]"#,

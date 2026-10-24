@@ -14,7 +14,7 @@ pub(crate) fn parse_port(text: &[u8]) -> Option<u16> {
 }
 
 /// The `Host` value of a request, split into its name and its port.
-pub(super) struct RequestHost<'a> {
+pub(crate) struct RequestHost<'a> {
     name: &'a [u8],
     port: Option<u16>,
     /// The name ended in a `.`, which is not part of `name`.
@@ -25,7 +25,7 @@ impl<'a> RequestHost<'a> {
     /// The name is letters, digits, `-` and `.`, or an IPv6 address in brackets; the port, if there is one, is as
     /// `parse_port` takes it. One `.` at the end of a name is dropped (`dotted` tells that it was there), and no
     /// label of the name may be empty. `None` for any other `Host` value: it holds for no rule that has a host.
-    pub(super) fn parse(host: &'a [u8]) -> Option<RequestHost<'a>> {
+    pub(crate) fn parse(host: &'a [u8]) -> Option<RequestHost<'a>> {
         let (name, port, dotted) = if host.first() == Some(&b'[') {
             let end = host.iter().position(|&b| b == b']')?;
             let literal = &host[1..end];
@@ -54,6 +54,11 @@ impl<'a> RequestHost<'a> {
             (ok.then_some(name)?, port, dotted)
         };
         Some(RequestHost { name, port, dotted })
+    }
+
+    /// The name as the request wrote it, without its port and without the `.` at its end.
+    pub(crate) fn name(&self) -> &'a [u8] {
+        self.name
     }
 }
 

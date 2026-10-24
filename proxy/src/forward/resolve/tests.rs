@@ -69,7 +69,7 @@ fn refused(
     settings: ForwardSettings,
     lookup: impl Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + 'static,
 ) -> Refusal {
-    complete(settings, addr(LISTEN), lookup).expect_err("the start is refused")
+    complete(settings, &[addr(LISTEN)], lookup).expect_err("the start is refused")
 }
 
 fn calls() -> Arc<AtomicUsize> {
@@ -102,7 +102,7 @@ fn every_address_of_a_name_is_a_server_in_its_place_with_the_terms_of_the_server
             ],
             5_000,
         ),
-        addr(LISTEN),
+        &[addr(LISTEN)],
         lookup,
     )
     .unwrap();
@@ -156,7 +156,7 @@ fn an_ip_literal_is_not_looked_up() {
             &[("main", vec![Address::Literal(addr("192.0.2.1:80"))])],
             5_000,
         ),
-        addr(LISTEN),
+        &[addr(LISTEN)],
         table(&[], count.clone()),
     )
     .unwrap();
@@ -199,12 +199,12 @@ fn a_name_that_cannot_be_used_refuses_the_start_and_says_which_server_it_is() {
         assert_eq!(start(ips), place(unusable), "{ips:?}");
     }
     // The address of listen, as an IPv4 address or mapped; the same address at another port is another one.
-    let own = place("a server name has the address of listen");
+    let own = place("a server name has the address of a listener");
     assert_eq!(start(&["192.0.2.5", "127.0.0.1"]), own);
     assert_eq!(start(&["::ffff:127.0.0.1"]), own);
     let other_port = settings(&[("g", vec![name("app.test", 8081)])], 5_000);
     let lookup = table(&[("app.test", &["127.0.0.1"])], calls());
-    assert!(complete(other_port, addr(LISTEN), lookup).is_ok());
+    assert!(complete(other_port, &[addr(LISTEN)], lookup).is_ok());
 }
 
 #[test]
@@ -220,7 +220,12 @@ fn a_group_may_have_64_servers_once_the_names_are_looked_up_and_not_65() {
         }
     };
     let group = |servers: Vec<Address>| settings(&[("g", servers)], 5_000);
-    let done = complete(group(vec![name("app.test", 80)]), addr(LISTEN), lookup(64)).unwrap();
+    let done = complete(
+        group(vec![name("app.test", 80)]),
+        &[addr(LISTEN)],
+        lookup(64),
+    )
+    .unwrap();
     assert_eq!(done.forward.groups[0].servers.len(), 64);
     let too_many = "an upstream has more than 64 servers once the names are looked up";
     let r = refused(group(vec![name("app.test", 80)]), lookup(65));
@@ -229,7 +234,7 @@ fn a_group_may_have_64_servers_once_the_names_are_looked_up_and_not_65() {
     let literal = Address::Literal(addr("198.51.100.1:80"));
     let done = complete(
         group(vec![literal.clone(), name("app.test", 80)]),
-        addr(LISTEN),
+        &[addr(LISTEN)],
         lookup(63),
     )
     .unwrap();
@@ -288,13 +293,13 @@ fn a_loopback_address_at_the_port_of_an_unspecified_listen_is_the_proxy_itself()
     let start = |listen: &str, port: u16, ips: &'static [&'static str]| {
         complete(
             group(port),
-            addr(listen),
+            &[addr(listen)],
             table(&[("app.test", ips)], calls()),
         )
         .err()
         .map(|r| r.why)
     };
-    let own = Some("a server name has the address of listen");
+    let own = Some("a server name has the address of a listener");
     for listen in ["0.0.0.0:8080", "[::]:8080"] {
         for ips in [
             &["127.0.0.1"][..],
@@ -310,4 +315,11 @@ fn a_loopback_address_at_the_port_of_an_unspecified_listen_is_the_proxy_itself()
     }
     // A listen address that is not unspecified is itself only.
     assert_eq!(start("192.0.2.1:8080", 8080, &["127.0.0.1"]), None);
+    // Every listener counts, not the first one only.
+    let two = [addr("127.0.0.1:8081"), addr("192.0.2.1:8080")];
+    let lookup = table(&[("app.test", &["192.0.2.1"])], calls());
+    assert_eq!(
+        complete(group(8080), &two, lookup).err().map(|r| r.why),
+        own
+    );
 }

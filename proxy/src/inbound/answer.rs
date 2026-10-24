@@ -25,6 +25,8 @@ pub(super) enum Class {
     Blocked,
     /// The request was refused as malformed, too large or not supported.
     Rejected,
+    /// A listener that redirects to https sent the client there.
+    Redirected,
     /// The request was not served for a reason on our side: busy, unavailable, an upstream failure.
     Failed,
     /// No answer was written.
@@ -37,6 +39,7 @@ impl Class {
             Class::Forwarded => "forwarded",
             Class::Blocked => "blocked",
             Class::Rejected => "rejected",
+            Class::Redirected => "redirected",
             Class::Failed => "failed",
             Class::Closed => "closed",
         }
@@ -70,6 +73,17 @@ impl Reply {
             status,
             class: Class::Rejected,
             reason,
+            rule: None,
+            internal: false,
+        }
+    }
+
+    /// The client was sent to the https address of its request.
+    pub(super) fn redirected() -> Reply {
+        Reply {
+            status: 308,
+            class: Class::Redirected,
+            reason: "redirected",
             rule: None,
             internal: false,
         }
@@ -296,6 +310,28 @@ pub(super) fn decide(outcome: Outcome) -> Decision {
         }),
         Outcome::Unavailable => Decision::Answer(Reply::failed(503, "inspection unavailable")),
     }
+}
+
+/// The whole answer of a listener that redirects to https to a request it does not redirect, as it is written to the
+/// socket (like the answers of `head::Reject`).
+pub(super) const NOT_REDIRECTED: &[u8] =
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// The whole answer of a listener that redirects to https, as it is written to the socket: 308 to the name and the
+/// target of the request at `https_port`, which is left out of the address if it is 443. `name` is a name that the
+/// request's `Host` held, in lowercase; `target` is the origin-form target that the head check passed, so it starts
+/// with `/`, which keeps the address on the host of the name, and holds no byte that ends a line.
+pub(super) fn redirect(name: &str, https_port: u16, target: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(160 + name.len() + target.len());
+    out.extend_from_slice(b"HTTP/1.1 308 Permanent Redirect\r\nLocation: https://");
+    out.extend_from_slice(name.as_bytes());
+    if https_port != 443 {
+        out.push(b':');
+        out.extend_from_slice(https_port.to_string().as_bytes());
+    }
+    out.extend_from_slice(target);
+    out.extend_from_slice(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    out
 }
 
 /// An answer with an empty body. 204 and 304 carry no `Content-Length`.

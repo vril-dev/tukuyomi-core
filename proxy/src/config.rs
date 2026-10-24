@@ -4,7 +4,8 @@
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present
 //! (a route may leave out its `host`, its `path`, its `access`, its `rewrite` and its `stream`; `access` and
 //! `rewrite` have no key that must be present, see `rewrite`, and a `stream` has all three); an unknown or repeated
-//! key is refused, and so is a value of the wrong type, an array in place of an object included. A refusal is one
+//! key is refused, and so is a value of the wrong type, an array in place of an object and `null` for a key that may
+//! be left out included (such a key is either left out or has a value). A refusal is one
 //! fixed sentence per kind of fault and never carries a key or a value from the file. Then the values are checked
 //! in a fixed order and the first broken rule is returned: the `proxy` bounds, the `forward` values (see `forward`;
 //! the names of the servers are not looked up here, `forward::resolve` does that when the proxy starts), the
@@ -15,7 +16,7 @@
 //! `keepalive_timeout_ms`, which also takes 0 (a connection is not kept after its response), and `conn_total_ms`,
 //! which runs up to 24 h.
 //! `trusted_proxies` is a list of networks, `address/prefix` in the form `Cidr::parse` takes, and may be empty.
-//! `listen` is an IP literal and a port (`[..]:port` for IPv6). `rules.store.kind` is `file`, the
+//! `listeners` is a list of 1 to 8 listeners (see `listeners`). `rules.store.kind` is `file`, the
 //! only kind there is, and `dir` is an absolute clean path of at most 3840 bytes. The `kernel` object has no
 //! rules path and no rules fingerprint: the directory and the fingerprint of the chosen generation come from the
 //! rules store when the proxy starts (`KernelSettings::for_generation`).
@@ -39,11 +40,15 @@ use crate::forward::client_ip::Cidr;
 use crate::rules::bundle::Fingerprint;
 
 mod forward;
+mod listeners;
 mod rewrite;
 
 pub(crate) use forward::MAX_SERVERS;
 pub use forward::{
     Address, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig, Stream,
+};
+pub use listeners::{
+    CertificateConfig, ListenerConfig, ListenerKind, MinVersion, TlsConfig, addresses,
 };
 
 const MAX_FILE: u64 = 256 * 1024;
@@ -61,7 +66,7 @@ const GIB: u64 = 1 << 30;
 /// The HTTP side of the configuration. No `Default`: every value comes from the file.
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
-    pub listen: SocketAddr,
+    pub listeners: Vec<ListenerConfig>,
     pub max_conns: usize,
     pub max_head_bytes: usize,
     pub max_body: usize,
@@ -164,7 +169,7 @@ struct RawFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProxy {
-    listen: String,
+    listeners: Vec<Object<listeners::RawListener>>,
     max_conns: usize,
     max_head_bytes: usize,
     max_body: usize,
@@ -233,6 +238,15 @@ struct RawRules {
 struct RawStore {
     kind: String,
     dir: String,
+}
+
+/// For a key that may be left out: the value when the key is there, and never `null`. serde reads `null` as a key
+/// that is left out, which would turn TLS off, or drop an access list or a host, without a word. Used as
+/// `#[serde(default, deserialize_with = "super::present")]`, where `default` is what a key that is left out gives.
+pub(crate) fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
 }
 
 /// Accepts only a JSON object. A derived struct alone would also take an array of its values in field order,
@@ -332,11 +346,11 @@ fn address(text: &str, bad: &'static str, port0: &'static str) -> Result<SocketA
     Ok(addr)
 }
 
-/// Whether a server at `b` is the proxy itself when it listens at `a`: the same address and port, or, when `a` is an
-/// unspecified address (the proxy listens at every address of the host), a loopback address at the port.
+/// Whether a server at `b` is the proxy itself when a listener is at `a`: the same address and port, or, when `a` is
+/// an unspecified address (the proxy listens at every address of the host), a loopback address at the port.
 pub(crate) fn same(a: SocketAddr, b: SocketAddr) -> bool {
-    let (listen, server) = (a.ip().to_canonical(), b.ip().to_canonical());
-    a.port() == b.port() && (listen == server || (listen.is_unspecified() && server.is_loopback()))
+    let (own, server) = (a.ip().to_canonical(), b.ip().to_canonical());
+    a.port() == b.port() && (own == server || (own.is_unspecified() && server.is_loopback()))
 }
 
 /// A path argument or a configured path must be absolute and already clean: no empty, `.` or `..` component, no
@@ -368,11 +382,7 @@ fn build(
     s: RawStore,
     k: RawKernel,
 ) -> Result<Loaded, ConfigError> {
-    let listen = address(
-        &p.listen,
-        "listen is not an IP address and port",
-        "listen port is 0",
-    )?;
+    let listeners = listeners::check(p.listeners)?;
     ensure(within(p.max_conns, 1, 65536), "max_conns is out of range")?;
     ensure(
         within(p.max_head_bytes, 1024, 32768),
@@ -466,7 +476,7 @@ fn build(
         "upstream_keepalive_requests is out of range",
     )?;
 
-    let forward = forward::check(f, listen)?;
+    let forward = forward::check(f, &addresses(&listeners))?;
 
     ensure(s.kind == "file", "rules store kind is not supported")?;
     let dir = PathBuf::from(s.dir);
@@ -590,7 +600,7 @@ fn build(
 
     Ok(Loaded {
         proxy: ProxyConfig {
-            listen,
+            listeners,
             max_conns: p.max_conns,
             max_head_bytes: p.max_head_bytes,
             max_body: p.max_body,

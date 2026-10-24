@@ -1,8 +1,10 @@
 use std::future::Future;
+use std::io;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant as StdInstant};
 
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -11,11 +13,13 @@ use tokio::time::{sleep, timeout};
 use tukuyomi_kernel::Verdict;
 
 use super::*;
-use crate::config::{ForwardConfig, RouteConfig};
+use crate::config::{ForwardConfig, ListenerConfig, MinVersion, RouteConfig};
 use crate::inbound::conn::tests::{
-    BLOCK, Mode, Parsed, Rig, config, finish_sending, form_post, guarded, parse_response, put,
-    read_all, routed_to_h_test, run,
+    BLOCK, FORM, Mode, Parsed, Rig, config, finish_sending, form_post, guarded, parse_response,
+    put, read_all, routed_to_h_test, run,
 };
+use crate::inbound::tls::tests::{Pki, listener as tls_listener};
+use crate::inbound::tls::{Files, Tls};
 use crate::inspect::driver::Outcome;
 use crate::log::Lines;
 use crate::route::{Rule, Table};
@@ -429,7 +433,8 @@ fn a_request_without_a_copy_of_its_head_is_not_served_and_closes_the_connection(
             .unwrap();
         let (server, peer) = listener.accept().await.unwrap();
         let local = server.local_addr().unwrap();
-        let (session, mut gate) = Session::start(server, peer, local, &rig.ctx, Instant::now());
+        let (session, mut gate) =
+            Session::start(server, peer, local, &rig.ctx, Instant::now(), Scheme::Http);
         put(&client, &get("/a")).await;
         gate.first_head(Instant::now() + 10 * SEC).await.unwrap();
         // The copy the gate made is lost, as it would be if hyper and the gate disagreed about the bytes.
@@ -1116,5 +1121,305 @@ fn a_response_on_a_route_with_a_stream_ends_when_the_upstream_is_silent_for_idle
         assert!(began.elapsed() >= Duration::from_millis(250) && began.elapsed() < 5 * SEC);
         assert_eq!(rig.finish(task).await.len(), 1);
         release.notify_one();
+    });
+}
+
+// ---- listeners that end TLS and listeners that redirect ----
+
+type TlsClient = tokio_rustls::client::TlsStream<TcpStream>;
+
+/// A rig whose listeners are, in this order: one that ends TLS with a certificate for `a.example` and its
+/// subdomains, a plain one, and one that redirects to https at `https_port`.
+async fn over_tls(
+    pki: &Pki,
+    cfg: ProxyConfig,
+    mode: Mode,
+    forward: &ForwardConfig,
+    https_port: u16,
+) -> Rig {
+    let pair = pki.issue("a", &["a.example", "*.a.example"]);
+    let listeners = vec![
+        tls_listener(MinVersion::Tls12, &[(&pair, &["a.example", "*.a.example"])]),
+        ListenerConfig {
+            address: "127.0.0.1:2".parse().unwrap(),
+            kind: ListenerKind::Plain,
+        },
+        ListenerConfig {
+            address: "127.0.0.1:3".parse().unwrap(),
+            kind: ListenerKind::Redirect { https_port },
+        },
+    ];
+    let tls = Tls::load(&listeners, &Files).unwrap();
+    Rig::with_tls(ProxyConfig { listeners, ..cfg }, mode, forward, tls).await
+}
+
+/// The client side of the handshake with the name `a.example`.
+async fn shake(pki: &Pki, tcp: TcpStream) -> TlsClient {
+    let name = ServerName::try_from("a.example".to_owned()).unwrap();
+    pki.any_client().connect(name, tcp).await.unwrap()
+}
+
+/// One response on a TLS connection: its head, and the body its length says.
+async fn tls_response(stream: &mut TlsClient) -> Option<(Parsed, Vec<u8>)> {
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    while !raw.ends_with(b"\r\n\r\n") {
+        let n = timeout(30 * SEC, stream.read(&mut byte))
+            .await
+            .unwrap()
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        raw.push(byte[0]);
+    }
+    let head = parse_response(&raw);
+    let length: usize = head.all("content-length")[0].parse().unwrap();
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await.unwrap();
+    Some((head, body))
+}
+
+fn get_for(target: &str, host: &str) -> Vec<u8> {
+    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
+}
+
+#[test]
+fn a_request_over_tls_is_forwarded_with_https_as_its_scheme_and_a_plain_one_with_http() {
+    run(async {
+        let pki = Pki::new();
+        let up = Raw::start(|sock, seen| reply(sock, seen, OK)).await;
+        let forward = ForwardConfig::of(&[up.addr]);
+        let rig = over_tls(&pki, kept(), Mode::Answer(ALLOW), &forward, 443).await;
+        let (client, task) = rig.connect_on(0).await;
+        let mut stream = shake(&pki, client).await;
+        stream
+            .write_all(&get_for("/x", "www.a.example"))
+            .await
+            .unwrap();
+        let (head, body) = tls_response(&mut stream).await.unwrap();
+        assert_eq!((head.status, body.as_slice()), (200, &b"ok"[..]));
+        // The end of the connection is the closing alert of TLS.
+        stream.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).await.unwrap(), 0);
+        let seen = up.seen().to_ascii_lowercase();
+        assert_eq!(
+            seen.matches("x-forwarded-proto: https\r\n").count(),
+            1,
+            "{seen}"
+        );
+        timeout(30 * SEC, task).await.unwrap().unwrap();
+
+        let (client, task) = rig.connect_on(1).await;
+        put(&client, &get_for("/y", "h.test")).await;
+        assert_eq!(parse_response(&read_all(&client).await).status, 200);
+        timeout(30 * SEC, task).await.unwrap().unwrap();
+        let seen = up.seen().to_ascii_lowercase();
+        assert_eq!(
+            seen.matches("x-forwarded-proto: http\r\n").count(),
+            1,
+            "{seen}"
+        );
+        assert_eq!(rig.finish(tokio::spawn(async {})).await.len(), 2);
+    });
+}
+
+#[test]
+fn a_host_the_certificate_does_not_cover_is_answered_with_421_before_the_inspection() {
+    run(async {
+        let pki = Pki::new();
+        let rig = over_tls(&pki, kept(), Mode::Answer(BLOCK), &routed_to_h_test(), 443).await;
+        let (client, task) = rig.connect_on(0).await;
+        let mut stream = shake(&pki, client).await;
+        // A request whose Host the certificate does not stand for, or that has none that can be read, is answered
+        // with 421 and the connection goes on (there is no body to be read).
+        for host in [
+            "other.example",
+            "a.example.net",
+            "192.0.2.1",
+            "[::1]",
+            "a..example",
+            "a.example:0",
+        ] {
+            stream.write_all(&get_for("/", host)).await.unwrap();
+            let (head, _) = tls_response(&mut stream).await.expect(host);
+            assert_eq!(head.status, 421, "{host}");
+            assert!(head.all("connection").is_empty(), "{host}");
+        }
+        // The hosts of the certificate go to the route and the inspection (which blocks all in this rig), in any
+        // case, with a port or a dot at the end.
+        for host in ["a.example", "WWW.A.example:8443", "x.a.example."] {
+            stream.write_all(&get_for("/", host)).await.unwrap();
+            let (head, _) = tls_response(&mut stream).await.expect(host);
+            assert_eq!(head.status, 404, "{host}");
+        }
+        // A request with a body ends the connection after the 421, like a 404.
+        let post = format!(
+            "POST /p HTTP/1.1\r\nHost: other.example\r\nContent-Type: {FORM}\r\nContent-Length: 3\r\n\r\na=b"
+        );
+        stream.write_all(post.as_bytes()).await.unwrap();
+        let (head, _) = tls_response(&mut stream).await.unwrap();
+        assert_eq!((head.status, head.all("connection")), (421, vec!["close"]));
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).await.unwrap(), 0);
+        // Nothing of this was inspected; the lines in the record say what was answered.
+        let lines = rig.lines.clone();
+        assert!(rig.finish(task).await.is_empty());
+        let lines = lines.take();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("rejected 421 host not covered by the certificate"))
+                .count(),
+            7,
+            "{lines:?}"
+        );
+    });
+}
+
+#[test]
+fn a_request_that_is_inspected_over_tls_is_blocked_like_any_other() {
+    run(async {
+        let pki = Pki::new();
+        let rig = over_tls(
+            &pki,
+            kept(),
+            Mode::Answer(BLOCK),
+            &ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]),
+            443,
+        )
+        .await;
+        let (client, task) = rig.connect_on(0).await;
+        let mut stream = shake(&pki, client).await;
+        let post = form_post("Content-Length: 3\r\n\r\na=b");
+        let post = String::from_utf8(post)
+            .unwrap()
+            .replace("example.test", "a.example");
+        stream.write_all(post.as_bytes()).await.unwrap();
+        let (head, _) = tls_response(&mut stream).await.unwrap();
+        assert_eq!(head.status, 403);
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).await.unwrap(), 0);
+        assert_eq!(rig.finish(task).await.len(), 1);
+    });
+}
+
+#[test]
+fn a_client_that_is_silent_or_does_not_speak_tls_is_closed_with_one_line_in_the_record() {
+    run(async {
+        let pki = Pki::new();
+        let cfg = ProxyConfig {
+            head_read: Duration::from_millis(300),
+            ..kept()
+        };
+        for (sent, reason) in [
+            (&b""[..], "tls handshake not finished in time"),
+            (
+                &b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"[..],
+                "tls handshake failed",
+            ),
+        ] {
+            let rig = over_tls(
+                &pki,
+                cfg.clone(),
+                Mode::Answer(BLOCK),
+                &routed_to_h_test(),
+                443,
+            )
+            .await;
+            let (client, task) = rig.connect_on(0).await;
+            put(&client, sent).await;
+            let began = StdInstant::now();
+            let _ = read_all(&client).await;
+            assert!(began.elapsed() < 10 * SEC);
+            let lines = rig.lines.clone();
+            assert!(rig.finish(task).await.is_empty());
+            let lines = lines.take();
+            let ours: Vec<&String> = lines.iter().filter(|l| l.contains(reason)).collect();
+            assert_eq!(ours.len(), 1, "{lines:?}");
+            assert!(ours[0].contains(": closed 0 "), "{ours:?}");
+            if sent.is_empty() {
+                assert!(began.elapsed() >= Duration::from_millis(250));
+            }
+        }
+    });
+}
+
+/// The routes of a redirect test: only the subdomains of `a.example` have a route.
+fn subdomains_only() -> ForwardConfig {
+    let mut forward = ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]);
+    let rule = Rule::forward(Some("*.a.example"), None).unwrap();
+    forward.routes = Table::new(vec![(rule, RouteConfig::plain(0))]).unwrap();
+    forward.default = None;
+    forward
+}
+
+/// Sends `request` to the redirect listener of the rig on a new connection, and gives the answer.
+async fn redirected(rig: &Rig, request: &str) -> Parsed {
+    let (client, task) = rig.connect_on(2).await;
+    put(&client, request.as_bytes()).await;
+    let raw = read_all(&client).await;
+    timeout(30 * SEC, task).await.unwrap().unwrap();
+    parse_response(&raw)
+}
+
+#[test]
+fn a_redirect_listener_sends_a_served_host_with_a_route_to_https_and_answers_any_other_with_404() {
+    run(async {
+        let pki = Pki::new();
+        for (port, at) in [(443, ""), (8443, ":8443")] {
+            let rig = over_tls(&pki, kept(), Mode::Answer(BLOCK), &subdomains_only(), port).await;
+            for (request, location) in [
+                (
+                    "GET /a/b?x=1&y=%41 HTTP/1.1\r\nHost: www.a.example\r\n\r\n",
+                    format!("https://www.a.example{at}/a/b?x=1&y=%41"),
+                ),
+                (
+                    "GET //evil.example/x HTTP/1.1\r\nHost: WWW.A.Example.:80\r\n\r\n",
+                    format!("https://www.a.example{at}//evil.example/x"),
+                ),
+                (
+                    "GET / HTTP/1.0\r\nHost: x.a.example\r\n\r\n",
+                    format!("https://x.a.example{at}/"),
+                ),
+            ] {
+                let answer = redirected(&rig, request).await;
+                assert_eq!(answer.status, 308, "{request}");
+                assert_eq!(answer.all("location"), vec![location.as_str()], "{request}");
+                assert_eq!(answer.all("content-length"), ["0"]);
+                assert_eq!(answer.all("connection"), ["close"]);
+            }
+            // A host that a certificate has but no route holds for, a host no certificate has, a literal, and a
+            // host that cannot be read.
+            for host in [
+                "a.example",
+                "www.other.example",
+                "192.0.2.1",
+                "[::1]:80",
+                "a..example",
+                "x.a.example:0",
+            ] {
+                let answer =
+                    redirected(&rig, &format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n")).await;
+                assert_eq!(answer.status, 404, "{host}");
+                assert!(answer.all("location").is_empty(), "{host}");
+                assert_eq!(answer.all("connection"), ["close"]);
+            }
+            // The body is not read, and nothing is inspected.
+            let post = format!(
+                "POST /p HTTP/1.1\r\nHost: x.a.example\r\nContent-Type: {FORM}\r\nContent-Length: 1000\r\n\r\n0123456789"
+            );
+            assert_eq!(redirected(&rig, &post).await.status, 308);
+            let lines = rig.lines.take();
+            let count = |text: &str| lines.iter().filter(|l| l.contains(text)).count();
+            assert_eq!(count(": redirected 308 redirected rule - "), 4, "{lines:?}");
+            assert_eq!(
+                count(": rejected 404 no redirect for the host rule - "),
+                6,
+                "{lines:?}"
+            );
+            assert!(rig.finish(tokio::spawn(async {})).await.is_empty());
+        }
     });
 }

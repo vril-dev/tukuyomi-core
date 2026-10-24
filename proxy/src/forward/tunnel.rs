@@ -7,7 +7,9 @@
 //! side of the copy is the stream of the client itself with the bytes that the gate had already read behind the
 //! handshake in front, so they reach the upstream first and in order; the upstream side is the connection that hyper
 //! gives back after the upgrade. The frames are not looked at: the handshake was inspected like any request, and what
-//! follows it is copied.
+//! follows it is copied. Each direction flushes its writer whenever its reader has nothing ready (see `pump`), so that
+//! the end of a message does not wait for the next one in a stream that holds written bytes back, as a TLS stream
+//! does.
 //!
 //! Each direction is copied through a buffer of 8 KiB, and the tunnel holds the share of the byte budget that these
 //! two buffers take for as long as it lives. It ends when:
@@ -32,13 +34,13 @@
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::{Pin, pin};
-use std::task::Poll;
+use std::task::{Poll, ready};
 use std::time::Duration;
 
 use bytes::Bytes;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, copy_buf, split};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, split};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{Instant, Sleep, sleep, timeout, timeout_at};
 
@@ -278,13 +280,45 @@ fn late() -> io::Error {
     )
 }
 
-/// Copies `from` to `to` through a buffer of `BUFFER` bytes, flushes at the end of `from`, and ends the writing
-/// direction of `to`.
+/// Copies `from` to `to` through a buffer of `BUFFER` bytes and ends the writing direction of `to`. `to` is flushed
+/// whenever `from` has nothing ready to read, and at the end of `from`: a stream may keep what it was given until it
+/// is flushed (a TLS stream does when its socket cannot take more), and what was written must not wait for a reader
+/// that stays quiet.
 async fn pump<R, W>(from: R, mut to: W) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    copy_buf(&mut BufReader::with_capacity(BUFFER, from), &mut to).await?;
+    let mut from = BufReader::with_capacity(BUFFER, from);
+    // Something was written since the last flush.
+    let mut unflushed = false;
+    poll_fn(|cx| -> Poll<io::Result<()>> {
+        loop {
+            let chunk = match Pin::new(&mut from).poll_fill_buf(cx) {
+                Poll::Ready(read) => read?,
+                Poll::Pending => {
+                    if unflushed {
+                        ready!(Pin::new(&mut to).poll_flush(cx))?;
+                        unflushed = false;
+                    }
+                    return Poll::Pending;
+                }
+            };
+            if chunk.is_empty() {
+                ready!(Pin::new(&mut to).poll_flush(cx))?;
+                return Poll::Ready(Ok(()));
+            }
+            let n = ready!(Pin::new(&mut to).poll_write(cx, chunk))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            unflushed = true;
+            Pin::new(&mut from).consume(n);
+        }
+    })
+    .await?;
     to.shutdown().await
 }
+
+#[cfg(test)]
+mod tests;

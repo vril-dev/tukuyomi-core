@@ -55,6 +55,7 @@ impl Route {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawRoute {
+    #[serde(default, deserialize_with = "crate::config::present")]
     host: Option<String>,
     path: String,
     action: String,

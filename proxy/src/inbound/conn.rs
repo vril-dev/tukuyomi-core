@@ -4,7 +4,9 @@
 //! request that hyper made of the same bytes. The route for the request is looked up first, by its `Host` and its
 //! target as the client sent them. A request that no route holds for, with no default group, is answered with 404,
 //! and one from a client that the access lists of its route turn away with 403, before anything of its body is read
-//! and before the inspection is asked for. The body is read through hyper into a budgeted buffer, a gzip body is
+//! and before the inspection is asked for. So is a request on a connection that ended TLS, whose `Host` is not one
+//! of the hosts of the certificate that the handshake used, or cannot be read (421; it comes before the route is
+//! looked up). The body is read through hyper into a budgeted buffer, a gzip body is
 //! decoded by `represent::gunzip` (exactly one member, at most `max_body` bytes of output), and then the request
 //! either matches a rule of the generation that serves that skips the inspection, and is forwarded without being
 //! inspected, or is handed to the inspection driver as a ticket, and only an `Allow` or a `Detected` is forwarded.
@@ -61,14 +63,15 @@ use crate::inbound::answer::{
 use crate::inbound::head::{Head, Reject};
 use crate::inbound::io::Gauge;
 use crate::inbound::represent::{Represented, gunzip, represent};
+use crate::inbound::tls::{Hosts, Tls};
 use crate::inspect::driver::{BodyHold, Hold, Ingress, InspectReq, Msg, Ticket};
 use crate::log::Log;
 use crate::rules::routes::SharedRoutes;
 
 /// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
 /// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, the
-/// upstream groups with the routes to them and the connections that wait to be used again, and the way to the
-/// driver.
+/// upstream groups with the routes to them and the connections that wait to be used again, the way to the driver,
+/// and the TLS of the listeners that end it.
 pub struct Ctx {
     pub cfg: ProxyConfig,
     pub budget: Arc<Semaphore>,
@@ -77,6 +80,15 @@ pub struct Ctx {
     pub upstreams: Upstreams,
     pub log: Log,
     pub ingress: Arc<Ingress>,
+    pub tls: Tls,
+}
+
+/// How the listener that took a connection carries its requests: over plain HTTP, or over TLS, with the hosts of the
+/// certificate that the handshake used.
+#[derive(Clone)]
+pub enum Scheme {
+    Http,
+    Https(Arc<Hosts>),
 }
 
 /// `start + len`; a sum that does not fit into the clock is a deadline that has passed.
@@ -101,6 +113,7 @@ pub(super) struct Conn {
     /// inspection and the record use it.
     client: SocketAddr,
     local: SocketAddr,
+    scheme: Scheme,
     gauge: Gauge,
     /// End of the request time: the last instant for the answer, or for the upstream's response head.
     request_by: Instant,
@@ -135,12 +148,16 @@ struct Answered {
 }
 
 impl Conn {
+    // One argument for each part of the connection and of the request that the state is made of; a struct of them
+    // would only repeat their names.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         ctx: &Arc<Ctx>,
         id: u64,
         head: Head,
         peer: SocketAddr,
         local: SocketAddr,
+        scheme: Scheme,
         gauge: Gauge,
         request_by: Instant,
     ) -> Conn {
@@ -157,6 +174,7 @@ impl Conn {
             head,
             peer,
             local,
+            scheme,
             gauge,
             request_by,
             head_end: Instant::now(),
@@ -249,6 +267,7 @@ impl Conn {
             fields,
             body,
             peer: self.peer,
+            https: matches!(self.scheme, Scheme::Https(_)),
             websocket: websocket.is_some(),
         };
         let sent = origin::forward(
@@ -316,9 +335,16 @@ impl Conn {
     /// The route the request takes. A request that no route holds for, and that has no default group, is answered
     /// with 404 here, and one from a client that the access lists turn away with 403, before the body is read. If
     /// some route has an access list, every route that the request could be taken for, however it is written, has to
-    /// allow the client (see `Upstreams::accesses`); if none has, nobody is turned away and that is not asked.
+    /// allow the client (see `Upstreams::accesses`); if none has, nobody is turned away and that is not asked. On a
+    /// connection that ended TLS the `Host` has to be covered by the certificate of the handshake first, or the
+    /// answer is 421: the client may not use a connection for a site that its certificate does not stand for.
     fn route(&self) -> Result<Route<'_>, Stop> {
         let (host, target) = (self.head.host(), self.head.target());
+        if let Scheme::Https(hosts) = &self.scheme
+            && !hosts.covers_host(host)
+        {
+            return Err(self.turned_away(421, "host not covered by the certificate"));
+        }
         let upstreams = &self.ctx.upstreams;
         let route = upstreams
             .find(host, target)
