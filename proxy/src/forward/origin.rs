@@ -18,14 +18,17 @@
 //! sets another `Host` does so after that.
 //!
 //! The server is chosen by the group (see `group`). The connection to it is the newest one that waits for that server
-//! in the pool of the group and is ready, or a new one. It goes back to the pool when the body of the answer has been
-//! read to its end and nothing in the exchange ended it; a body that is dropped before its end ends the connection.
+//! in the pool of the group and is ready, or a new one (see `connect`; over TLS if the group has `tls`). It goes back
+//! to the pool when the body of the answer has been read to its end and nothing in the exchange ended it; a body that
+//! is dropped before its end ends the connection.
 //! A pooled connection that fails before any byte of an answer was read may have been closed by the server while it
 //! waited: a request that does no harm when it is sent twice (GET, HEAD, OPTIONS, PUT, DELETE, TRACE) is then sent
 //! once more on a new connection to the same server, and any other is not.
 //!
 //! A server fails a request when the connection to it is refused or reset, the server cannot be reached, or the
-//! connection is not made within `upstream_connect` (`Connect`), when the request cannot be sent, or the head of
+//! connection is not made within `upstream_connect` (`Connect`; over TLS the handshake is part of making the
+//! connection, and a handshake that fails in any way, a certificate that is not trusted or is for another name
+//! included, is such a failure), when the request cannot be sent, or the head of
 //! the answer is not read within `upstream_header` or is cut off (`Send`, `Head`). The group counts such a failure
 //! against the server, except one on a waiting connection that was not sent again: the server may only have closed
 //! that connection while it waited. An answer whose head cannot be parsed, is longer than the limits for a head, or
@@ -75,21 +78,19 @@ use http::{
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::Full;
 use hyper::body::Incoming;
-use hyper::client::conn::http1;
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
 
 use self::head::{check_head, check_switch, lasts};
 use crate::config::ProxyConfig;
 use crate::forward::client_ip;
+use crate::forward::connect::{connect, connect_stage};
 use crate::forward::group::{Group, Server, Tried};
 use crate::forward::pool::{Lease, Pool};
 use crate::forward::rewrite::Rewrite;
 use crate::forward::tunnel::Switch;
 use crate::inbound::conn::Ctx;
 use crate::inbound::head::trim_ows;
-use crate::inbound::io::{Gauge, Guarded};
+use crate::inbound::transport::io::Gauge;
 use crate::inspect::driver::BodyHold;
 
 mod head;
@@ -293,8 +294,8 @@ impl Body for Sent {
 /// A stage of the exchange with the upstream: the instant it ends at, and who set it, the stage itself (the time the
 /// server may take) or the end of the request time.
 #[derive(Clone, Copy)]
-struct Stage {
-    end: Instant,
+pub(super) struct Stage {
+    pub(super) end: Instant,
     /// The limit of the stage comes before the end of the request time. When they are the same instant, the end of
     /// the request time is the one that counts.
     own: bool,
@@ -303,7 +304,7 @@ struct Stage {
 impl Stage {
     /// The stage that starts at `start` and lasts `len`, within `by`. A sum that does not fit into the clock counts
     /// as passed, and is not the fault of the server.
-    fn new(start: Instant, len: Duration, by: Instant) -> Stage {
+    pub(super) fn new(start: Instant, len: Duration, by: Instant) -> Stage {
         let own = start.checked_add(len);
         Stage {
             end: own.unwrap_or(start).min(by),
@@ -313,13 +314,13 @@ impl Stage {
 
     /// What it comes to when the time of the stage has run out: `error` if the limit of the stage ended it, `Late`
     /// if the end of the request time did.
-    fn ran_out(self, error: OriginError) -> OriginError {
+    pub(super) fn ran_out(self, error: OriginError) -> OriginError {
         if self.own { error } else { OriginError::Late }
     }
 }
 
 /// True once `by` has been reached: a stage whose end is already here does not start.
-fn reached(by: Instant) -> bool {
+pub(super) fn reached(by: Instant) -> bool {
     Instant::now() >= by
 }
 
@@ -446,68 +447,8 @@ fn idempotent(method: &Method) -> bool {
 
 /// The most bytes that are read from the upstream up to the final head. A value that does not fit into 64 bits
 /// cannot happen; if it did, nothing could be read.
-fn head_cap(cfg: &ProxyConfig) -> u64 {
+pub(super) fn head_cap(cfg: &ProxyConfig) -> u64 {
     u64::try_from(cfg.upstream_head_wire).unwrap_or(0)
-}
-
-/// The stage in which a connection to the upstream is taken or made; the error if its end is already past.
-fn connect_stage(cfg: &ProxyConfig, by: Instant) -> Result<Stage, OriginError> {
-    let stage = Stage::new(Instant::now(), cfg.upstream_connect, by);
-    if reached(stage.end) {
-        return Err(stage.ran_out(OriginError::Connect));
-    }
-    Ok(stage)
-}
-
-/// Where a failed attempt to connect belongs. The server refusing the connection, resetting it, not being reachable
-/// or not answering is its fault (`Connect`). Anything else is an error of the proxy itself (`Local`): no
-/// descriptor, buffer, memory or port is left, or the system does not allow the connection.
-fn connect_error(e: &io::Error) -> OriginError {
-    match e.kind() {
-        io::ErrorKind::ConnectionRefused
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::HostUnreachable
-        | io::ErrorKind::NetworkUnreachable
-        | io::ErrorKind::TimedOut => OriginError::Connect,
-        _ => OriginError::Local,
-    }
-}
-
-/// Makes a connection to the server at `address` within `stage`.
-async fn connect(
-    address: SocketAddr,
-    cfg: &ProxyConfig,
-    stage: Stage,
-) -> Result<Lease, OriginError> {
-    let stream = match timeout_at(stage.end, TcpStream::connect(address)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => return Err(connect_error(&e)),
-        Err(_) => return Err(stage.ran_out(OriginError::Connect)),
-    };
-    stream.set_nodelay(true).map_err(|_| OriginError::Local)?;
-    // Up to the final head the reads are capped as a whole; the cap is lifted as soon as the head is here.
-    let (guarded, gauge) = Guarded::new(
-        stream,
-        Bytes::new(),
-        cfg.response_idle,
-        cfg.response_idle,
-        head_cap(cfg),
-    );
-    let mut client = http1::Builder::new();
-    client
-        .max_headers(cfg.upstream_max_headers)
-        .max_header_size(cfg.upstream_max_head_bytes)
-        .max_buf_size(cfg.upstream_max_head_bytes.max(8192))
-        .title_case_headers(true);
-    let (sender, conn) = client
-        .handshake(TokioIo::new(guarded))
-        .await
-        .map_err(|_| OriginError::Local)?;
-    // With upgrades, the task hands the socket over when the upstream answers a handshake with 101.
-    let task = tokio::spawn(async move {
-        let _ = conn.with_upgrades().await;
-    });
-    Ok(Lease::new(sender, gauge, task.abort_handle()))
 }
 
 /// Sends `request` on the connection and returns the checked head of the answer; `head` bounds that. The
@@ -645,6 +586,7 @@ async fn attempt(
     }
     let lease = connect(
         server.address(),
+        server.secure(),
         cfg,
         connect_stage(cfg, by).map_err(Failed::counted)?,
     )

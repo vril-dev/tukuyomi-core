@@ -1,7 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rustls::pki_types::ServerName;
+
 use super::*;
+use crate::forward::tls::tests::Pki;
 use crate::route::Table;
 
 const LISTEN: &str = "127.0.0.1:8080";
@@ -35,6 +39,7 @@ fn settings(groups: &[(&str, Vec<Address>)], wait_ms: u64) -> ForwardSettings {
             .map(|(group, servers)| GroupConfig {
                 name: group.to_string(),
                 servers: servers.iter().cloned().map(terms).collect(),
+                tls: None,
             })
             .collect(),
         routes: Table::default(),
@@ -180,7 +185,7 @@ fn a_name_that_cannot_be_used_refuses_the_start_and_says_which_server_it_is() {
     let place = |why: &'static str| Refusal {
         why,
         group: "g".to_string(),
-        position: 2,
+        position: Some(2),
     };
     assert_eq!(
         refused(group(), table(&[], calls())),
@@ -229,7 +234,7 @@ fn a_group_may_have_64_servers_once_the_names_are_looked_up_and_not_65() {
     assert_eq!(done.forward.groups[0].servers.len(), 64);
     let too_many = "an upstream has more than 64 servers once the names are looked up";
     let r = refused(group(vec![name("app.test", 80)]), lookup(65));
-    assert_eq!((r.why, r.position), (too_many, 1));
+    assert_eq!((r.why, r.position), (too_many, Some(1)));
     // One server is written before the name, so the name may bring 63.
     let literal = Address::Literal(addr("198.51.100.1:80"));
     let done = complete(
@@ -240,7 +245,7 @@ fn a_group_may_have_64_servers_once_the_names_are_looked_up_and_not_65() {
     .unwrap();
     assert_eq!(done.forward.groups[0].servers.len(), 64);
     let r = refused(group(vec![literal, name("app.test", 80)]), lookup(64));
-    assert_eq!((r.why, r.position), (too_many, 2));
+    assert_eq!((r.why, r.position), (too_many, Some(2)));
 }
 
 #[test]
@@ -271,7 +276,7 @@ fn names_not_looked_up_by_the_deadline_refuse_the_start_at_the_first_name_that_i
         (
             "the names were not looked up within resolve_timeout_ms",
             "g",
-            2
+            Some(2)
         )
     );
     // The caller did not wait for the lookup that is still going on.
@@ -322,4 +327,112 @@ fn a_loopback_address_at_the_port_of_an_unspecified_listen_is_the_proxy_itself()
         complete(group(8080), &two, lookup).err().map(|r| r.why),
         own
     );
+}
+
+/// The groups of `settings` named in `with` have these `tls`.
+fn with_tls(mut settings: ForwardSettings, with: &[(usize, Settings)]) -> ForwardSettings {
+    for (group, tls) in with {
+        settings.groups[*group].tls = Some(tls.clone());
+    }
+    settings
+}
+
+#[test]
+fn a_group_with_tls_gets_one_name_for_each_server_and_each_address_of_a_name() {
+    let pki = Pki::new();
+    let by = |server_name: Option<&str>| Settings {
+        ca_file: pki.ca(),
+        server_name: server_name.map(str::to_string),
+    };
+    let groups = |server_name: Option<&str>| {
+        with_tls(
+            settings(
+                &[
+                    (
+                        "main",
+                        vec![
+                            Address::Literal(addr("192.0.2.1:443")),
+                            name("app.test", 443),
+                            Address::Literal(addr("[2001:db8::1]:443")),
+                        ],
+                    ),
+                    ("plain", vec![name("app.test", 80)]),
+                ],
+                5_000,
+            ),
+            &[(0, by(server_name))],
+        )
+    };
+    let lookup = || table(&[("app.test", &["192.0.2.10", "192.0.2.11"])], calls());
+    let done = complete(groups(None), &[addr(LISTEN)], lookup()).unwrap();
+    // A group without `tls` has none; the group with it has a name for each server, the name of the server for
+    // each address that it comes to.
+    assert!(done.forward.groups[1].tls.is_none());
+    let ip = |text: &str| ServerName::IpAddress(text.parse::<std::net::IpAddr>().unwrap().into());
+    let app = tls::dns_name("app.test").unwrap();
+    let main = &done.forward.groups[0];
+    assert_eq!(main.servers.len(), 4);
+    assert_eq!(
+        main.tls.as_ref().unwrap().names(),
+        [ip("192.0.2.1"), app.clone(), app, ip("2001:db8::1")]
+    );
+    // With a `server_name` it is the name of every server.
+    let done = complete(groups(Some("api.test")), &[addr(LISTEN)], lookup()).unwrap();
+    let api = tls::dns_name("api.test").unwrap();
+    assert_eq!(
+        done.forward.groups[0].tls.as_ref().unwrap().names(),
+        [api.clone(), api.clone(), api.clone(), api]
+    );
+}
+
+#[test]
+fn a_file_of_authorities_or_a_name_that_cannot_be_used_refuses_the_start() {
+    let pki = Pki::new();
+    let by = |ca_file: PathBuf, server_name: Option<&str>| Settings {
+        ca_file,
+        server_name: server_name.map(str::to_string),
+    };
+    // The second group is the one with `tls`; the first is plain and has a server before it.
+    let start = |tls: Settings, servers: Vec<Address>| {
+        let groups = settings(
+            &[
+                ("first", vec![Address::Literal(addr("192.0.2.1:80"))]),
+                ("second", servers),
+            ],
+            5_000,
+        );
+        let lookup = table(&[("a-.test", &["192.0.2.9"])], calls());
+        refused(with_tls(groups, &[(1, tls)]), lookup)
+    };
+    let literal = || vec![Address::Literal(addr("192.0.2.2:443"))];
+    let group_only = |fault: Fault| Refusal {
+        why: fault.text(),
+        group: "second".to_string(),
+        position: None,
+    };
+    // The file is missing, holds no certificate, or is no more than a certificate that cannot be used.
+    let missing = by(PathBuf::from("/nonexistent/ca.pem"), None);
+    assert_eq!(start(missing, literal()), group_only(Fault::Unreadable));
+    let empty = by(pki.file("empty.pem", b""), None);
+    assert_eq!(start(empty, literal()), group_only(Fault::NotCertificates));
+    let junk = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    let junk = by(pki.file("junk.pem", junk.as_bytes()), None);
+    assert_eq!(start(junk, literal()), group_only(Fault::NotAnchor));
+    // The sentence tells the group and no server.
+    assert_eq!(
+        group_only(Fault::Unreadable).to_string(),
+        "an upstream ca_file cannot be read (upstream second)"
+    );
+    // A name that TLS cannot use, as a `server_name` or as the name of a server, says which server it is.
+    let place = |position| Refusal {
+        why: Fault::Name.text(),
+        group: "second".to_string(),
+        position: Some(position),
+    };
+    let servers = vec![
+        Address::Literal(addr("192.0.2.2:443")),
+        name("a-.test", 443),
+    ];
+    assert_eq!(start(by(pki.ca(), None), servers.clone()), place(2));
+    assert_eq!(start(by(pki.ca(), Some("a-.test")), servers), place(1));
 }

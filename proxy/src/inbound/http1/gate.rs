@@ -52,7 +52,7 @@ use tokio::time::{Instant, Sleep, sleep_until, timeout_at};
 use crate::config::ProxyConfig;
 use crate::inbound::conn::after;
 use crate::inbound::head::{self, Head, Limits, Reject, trim_ows};
-use crate::inbound::io::{Gauge, Guarded};
+use crate::inbound::transport::io::{Gauge, Guarded};
 
 /// The most checked heads that wait for hyper to ask for their requests.
 pub const QUEUE_MAX: usize = 16;

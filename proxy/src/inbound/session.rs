@@ -1,124 +1,85 @@
-//! One client connection, from the accept to the close.
+//! One client connection, from the accept to the close: what every connection has in common, and where it goes
+//! from there.
 //!
-//! What the connection is depends on the listener that took it (`serve_on`). On a plain listener it is as described
-//! below. On a TLS listener the handshake runs first, within the time that the first head has (it counts from the
-//! accept), and the rest is the same over the TLS stream; a handshake that fails or is not done in time ends the
-//! connection with one line in the record and no more. On a listener that redirects to https the first head is read
-//! as everywhere else, and then it is answered with the redirect, or with 404, without hyper, the inspection or the
-//! upstream, and without reading its body (see `redirect`); the connection is closed as below, with the same
-//! `lingering` after the answer.
-//!
-//! The first head is read through the gate before hyper starts, so that a refused one can be answered with the
-//! fixed answer of `head`. Then hyper serves the connection for as long as it lasts, with the gate as its input
-//! and `Session::request` as its service: every request that hyper makes is matched with the head the gate passed,
-//! handled by `conn`, and answered. The time of a request counts from its own start (`gate::Taken`), and a
-//! connection that has answered all its requests waits for the next one for `keepalive_timeout` (see `gate`).
-//!
-//! The connection goes on after a response unless one of these closes it: the request was HTTP/1.0 or chunked or
-//! said `Connection: close` or has an `Upgrade` line (the gate reads nothing behind such a head); the route of the
-//! request has a `stream`, so the response may take long and is the last one; `keepalive_timeout` is 0; the
-//! connection has served `keepalive_requests` requests or has lived `keepalive_time`; the body of the request was
-//! not read to its end when the answer was given; the stop has begun (an idle connection is closed at once, one
-//! with a request under way after its response). A response that closes the connection says `Connection: close`,
-//! so the client knows. The 101 of a WebSocket does not: it ends the connection by itself, and once that head has
-//! been passed hyper is not told to wind the connection down, for it would add a `Connection: close` of its own to
-//! the 101. A connection that waits for its next request is also closed at once when the accept side runs out of
-//! connection permits (`Ingress::drain`); one that is in a request is left alone.
-//!
-//! A response from a route with a `stream` that is not a 101 may last longer than the connection time: when its
-//! head is ready, the end of the connection becomes the later of the old end and `total` after the head, and the
-//! client may be silent for that long. After a 101 hyper is done with the connection, and the connection time ends
-//! with it: the tunnel (see `tunnel`) runs over the stream of the client, with the bytes that the gate had read
-//! behind the handshake in front, for the time that the route says. The stop does not end it; the abort at the end
-//! of the time that the connections get does.
-//!
-//! The close is done here, after hyper is done with the connection: the writing direction is ended (on TLS that
-//! sends the closing alert of TLS first), and after a response that closed the connection, or a head that was
-//! refused with bytes behind it, the connection reads and discards what the client still sends for a while
-//! (`linger`). A close with unread bytes in the socket resets the connection, and the reset can take the response
-//! away from a client that is still sending, or whose next request crossed the response. A connection that ends
-//! because nothing came for `keepalive_timeout` does not linger: there is no response to protect.
+//! What the connection is depends on the listener that took it (`serve_on`). On a plain listener it speaks
+//! HTTP/1.1 (see `http1`). On a TLS listener the handshake runs first, within the time that the first head has (it
+//! counts from the accept), and the rest is the same over the TLS stream, unless the handshake chose `h2` as the
+//! protocol, which is then spoken (see `http2`); a handshake that fails or is not done in time ends the connection
+//! with one line in the record and no more. On a listener that redirects to https the first head is read as
+//! everywhere else, and then it is answered with the redirect, or with 404, without hyper, the inspection or the
+//! upstream, and without reading its body (see `http1::redirect_to`).
 //!
 //! Every response has one line in the record, written when the response has been given to the connection or was
 //! cut off. The line has the address of the client that the inspection was told (see `conn`); a line that is
 //! written before a request has been read has the address of the peer. A request that was sent to an upstream has
-//! the group and the server in its line. A connection that never had a response, and
-//! one that was closed over a head that was refused after the first, have a line of their own when they end. So does
-//! a tunnel, also one that never ran (see `tunnel`).
+//! the group and the server in its line. A connection that never had a response, and one that was closed over a head
+//! that was refused after the first, have a line of their own when they end. So does a tunnel, also one that never
+//! ran (see `tunnel`), and a connection that speaks HTTP/2, which has one at its end in any case.
+//!
+//! A connection is closed by whoever served it, after hyper is done with it: the writing direction is ended (on TLS
+//! that sends the closing alert of TLS first), and after a response that closed the connection, or a head that was
+//! refused with bytes behind it, the connection reads and discards what the client still sends for a while
+//! (`linger`). A close with unread bytes in the socket resets the connection, and the reset can take the response
+//! away from a client that is still sending, or whose next request crossed the response.
 
-use std::future::{Future, poll_fn};
+use std::future::poll_fn;
 use std::net::SocketAddr;
-use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http::{Request, Response, Version};
+use http::Response;
 use http_body::{Body, Frame, SizeHint};
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{Instant, sleep_until, timeout_at};
-use tukuyomi_kernel::limits;
+use tokio::time::{Instant, timeout_at};
 
-use crate::config::{ListenerKind, ProxyConfig, Stream};
-use crate::forward::tunnel::Tunnel;
-use crate::inbound::answer::{
-    Abort, Class, NOT_REDIRECTED, Noted, Out, Reply, answer, close_after, record, redirect,
-};
-use crate::inbound::conn::{Conn, Ctx, Handled, Scheme, after};
-use crate::inbound::gate::{Finish, Gate, Link, Settings, Taken};
-use crate::inbound::head::Reject;
-use crate::inbound::io::Gauge;
-use crate::inbound::tls::host_name;
+use crate::config::{Http2Config, ListenerKind, ProxyConfig, Stream};
+use crate::inbound::answer::{Class, Noted, Out, Reply, record};
+use crate::inbound::conn::{Conn, Ctx, Scheme, after};
+use crate::inbound::head::Head;
+use crate::inbound::transport::io::Gauge;
+use crate::inbound::{http1, http2};
 
 /// Numbers the connections for the records. They say nothing else.
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
 /// How the hyper connection ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum End {
+pub(super) enum End {
     Done,
     Error,
     Limit,
 }
 
-/// What the connection does after the response of a request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Then {
-    /// Waits for the next request.
-    Keep,
-    /// Closes after the response, and reads and discards what the client still sends.
-    Close,
-}
-
 /// What came of a connection: the reply of its last request, and the line that its end adds to the record if it
 /// has to.
 pub(super) struct Summary {
-    id: u64,
+    pub(super) id: u64,
     /// For the tests of the record.
     #[cfg(test)]
     pub(super) last: Reply,
-    line: Option<Reply>,
+    pub(super) line: Option<Reply>,
+    /// The streams of an HTTP/2 connection, for its line.
+    streams: Option<u64>,
 }
 
 impl Summary {
     /// A connection whose one line in the record is `reply`.
-    fn of(id: u64, reply: Reply) -> Summary {
+    pub(super) fn of(id: u64, reply: Reply) -> Summary {
         Summary {
             id,
             #[cfg(test)]
             last: reply,
             line: Some(reply),
+            streams: None,
         }
     }
 
     /// A connection that never got as far as a request, for `reason`.
-    fn unserved(reason: &'static str) -> Summary {
+    pub(super) fn unserved(reason: &'static str) -> Summary {
         let id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
         Summary::of(
             id,
@@ -128,32 +89,32 @@ impl Summary {
             },
         )
     }
+
+    /// The same, with the number of streams that the connection carried.
+    pub(super) fn counted(self, streams: u64) -> Summary {
+        Summary {
+            streams: Some(streams),
+            ..self
+        }
+    }
 }
 
-/// The state of one client connection that its service and its responses share.
-struct Session {
-    ctx: Arc<Ctx>,
-    peer: SocketAddr,
+/// The state of one client connection that its service and its responses share, whatever the connection speaks.
+pub(super) struct Session {
+    pub(super) ctx: Arc<Ctx>,
+    pub(super) peer: SocketAddr,
     local: SocketAddr,
     scheme: Scheme,
-    id: u64,
-    accept: Instant,
+    pub(super) id: u64,
+    pub(super) accept: Instant,
     /// End of the connection. A response that may take long puts it off (`lengthen`).
     conn_by: Mutex<Instant>,
-    link: Arc<Link>,
-    gauge: Gauge,
-    /// Requests that hyper handed to the service.
-    served: AtomicU64,
+    pub(super) gauge: Gauge,
     /// Lines written for responses.
-    recorded: AtomicU64,
-    /// A response that ends the connection was given.
-    closing: AtomicBool,
-    /// The tunnel that the 101 response started. It runs once hyper is done with the connection. It has the line for
-    /// its end from the start, so it is written also if the tunnel is dropped here.
-    tunnel: Mutex<Option<Tunnel>>,
+    pub(super) recorded: AtomicU64,
     /// The reply of the response that was recorded last, for the tests of the record.
     #[cfg(test)]
-    last: Mutex<Reply>,
+    pub(super) last: Mutex<Reply>,
 }
 
 /// Serves one accepted connection of the listener at `listener` to its end, as that listener says.
@@ -166,7 +127,10 @@ pub async fn serve_on(
 ) {
     match ctx.cfg.listeners.get(listener).map(|l| &l.kind) {
         Some(ListenerKind::Plain) => serve(sock, peer, local, ctx).await,
-        Some(ListenerKind::Tls(_)) => serve_tls(sock, peer, local, ctx, listener).await,
+        Some(ListenerKind::Tls(tls)) => {
+            let http2 = tls.http2;
+            serve_tls(sock, peer, local, ctx, listener, http2).await;
+        }
         Some(&ListenerKind::Redirect { https_port }) => {
             serve_redirect(sock, peer, local, ctx, https_port).await;
         }
@@ -177,25 +141,37 @@ pub async fn serve_on(
 /// Serves one accepted connection of a plain listener to its end.
 pub async fn serve(sock: TcpStream, peer: SocketAddr, local: SocketAddr, ctx: Arc<Ctx>) {
     let accept = Instant::now();
-    let summary = run(sock, peer, local, &ctx, accept, Scheme::Http).await;
+    let summary = http1::run(sock, peer, local, &ctx, accept, Scheme::Http).await;
     finish(&ctx, summary, accept, peer);
 }
 
 /// Serves one accepted connection of the TLS listener at `listener` to its end. The handshake has the time that the
-/// first head has, and the head the time that is left.
+/// first head has, and the head the time that is left. `http2` holds the settings of the listener for HTTP/2, if it
+/// speaks it.
 async fn serve_tls(
     sock: TcpStream,
     peer: SocketAddr,
     local: SocketAddr,
     ctx: Arc<Ctx>,
     listener: usize,
+    http2: Option<Http2Config>,
 ) {
     let accept = Instant::now();
     let summary = match ctx.tls.handshake(listener) {
         Some(handshake) => {
             match timeout_at(first_head_by(&ctx.cfg, accept), handshake.accept(sock)).await {
                 Ok(Ok((stream, hosts))) => {
-                    run(stream, peer, local, &ctx, accept, Scheme::Https(hosts)).await
+                    let h2 = stream.get_ref().1.alpn_protocol() == Some(&b"h2"[..]);
+                    match (h2, http2) {
+                        (true, Some(settings)) => {
+                            http2::run(stream, peer, local, &ctx, accept, hosts, settings).await
+                        }
+                        (true, None) => Summary::unserved("no http2 for the listener"),
+                        (false, _) => {
+                            http1::run(stream, peer, local, &ctx, accept, Scheme::Https(hosts))
+                                .await
+                        }
+                    }
                 }
                 Ok(Err(_)) => Summary::unserved("tls handshake failed"),
                 Err(_) => Summary::unserved("tls handshake not finished in time"),
@@ -215,7 +191,7 @@ async fn serve_redirect(
     https_port: u16,
 ) {
     let accept = Instant::now();
-    let summary = redirect_to(sock, peer, local, &ctx, accept, https_port).await;
+    let summary = http1::redirect_to(sock, peer, local, &ctx, accept, https_port).await;
     finish(&ctx, summary, accept, peer);
 }
 
@@ -228,227 +204,55 @@ fn finish(ctx: &Ctx, summary: Summary, accept: Instant, peer: SocketAddr) {
                 summary.id, reply.reason
             ));
         }
-        ctx.log.line(&record(
-            summary.id,
-            &reply,
-            accept.elapsed(),
-            peer.ip(),
-            None,
-        ));
+        let line = record(summary.id, &reply, accept.elapsed(), peer.ip(), None);
+        match summary.streams {
+            Some(streams) => ctx.log.line(&format!("{line} streams {streams}")),
+            None => ctx.log.line(&line),
+        }
     }
 }
 
 /// When the first head of a connection that was accepted at `accept` has to be complete.
-fn first_head_by(cfg: &ProxyConfig, accept: Instant) -> Instant {
+pub(super) fn first_head_by(cfg: &ProxyConfig, accept: Instant) -> Instant {
     after(accept, cfg.head_read).min(after(accept, cfg.request_total))
 }
 
-/// Reads the first head, serves the requests, closes. `accept` is the instant of the accept.
-pub(super) async fn run<T>(
-    stream: T,
-    peer: SocketAddr,
-    local: SocketAddr,
-    ctx: &Arc<Ctx>,
-    accept: Instant,
-    scheme: Scheme,
-) -> Summary
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    let (session, mut gate) = Session::start(stream, peer, local, ctx, accept, scheme);
-    if let Err(reject) = gate.first_head(first_head_by(&ctx.cfg, accept)).await {
-        return session.refuse(&mut gate, reject).await;
-    }
-    let end = session.drive(&mut gate).await;
-    match session.take_tunnel(end) {
-        Some(tunnel) => session.run_tunnel(&mut gate, tunnel).await,
-        None => session.close(&mut gate, end).await,
-    }
-    session.summary(&gate, end)
-}
-
-/// The listener redirects: its first head is answered with a redirect to https, or with 404, and the connection is
-/// closed. The redirect is for a `Host` that a certificate of some TLS listener has among its hosts, when some route
-/// (or the default group) holds for the request; the address is that name and the target as it was received. A
-/// `Host` that is an IP literal, cannot be read, or is not served that way gets 404. The body is not read.
-async fn redirect_to(
-    sock: TcpStream,
-    peer: SocketAddr,
-    local: SocketAddr,
-    ctx: &Arc<Ctx>,
-    accept: Instant,
-    https_port: u16,
-) -> Summary {
-    let cfg = &ctx.cfg;
-    let (session, mut gate) = Session::start(sock, peer, local, ctx, accept, Scheme::Http);
-    if let Err(reject) = gate.first_head(first_head_by(cfg, accept)).await {
-        return session.refuse(&mut gate, reject).await;
-    }
-    let Some(Taken { head, .. }) = session.link.take_first() else {
-        return session.refuse(&mut gate, Reject::BadRequest).await;
-    };
-    let name = host_name(head.host()).filter(|name| ctx.tls.serves(name));
-    let routed = ctx.upstreams.find(head.host(), head.target()).is_some();
-    let (reply, bytes) = match name {
-        Some(name) if routed => (
-            Reply::redirected(),
-            redirect(&name, https_port, head.target()),
-        ),
-        _ => (
-            Reply::rejected(404, "no redirect for the host"),
-            NOT_REDIRECTED.to_vec(),
-        ),
-    };
-    let by = after(Instant::now(), cfg.response_idle).min(session.conn_by());
-    let sock = gate.stream();
-    let _ = timeout_at(by, send_and_close(sock, &bytes)).await;
-    linger(sock, cfg, session.conn_by()).await;
-    Summary::of(session.id, reply)
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Session {
-    /// The state of a connection, and the gate over its stream.
-    fn start<T>(
-        stream: T,
+    /// The state of a connection. `gauge` counts the bytes read from its stream.
+    pub(super) fn new(
+        ctx: &Arc<Ctx>,
         peer: SocketAddr,
         local: SocketAddr,
-        ctx: &Arc<Ctx>,
         accept: Instant,
         scheme: Scheme,
-    ) -> (Arc<Session>, Gate<T>) {
-        let cfg = &ctx.cfg;
-        let link = Link::new(accept);
-        let (gate, gauge) = Gate::new(stream, Settings::new(cfg), link.clone(), accept);
-        let session = Arc::new(Session {
+        gauge: Gauge,
+    ) -> Arc<Session> {
+        Arc::new(Session {
             ctx: ctx.clone(),
             peer,
             local,
             scheme,
             id: NEXT_CONN.fetch_add(1, Ordering::Relaxed),
             accept,
-            conn_by: Mutex::new(after(accept, cfg.conn_total)),
-            link,
+            conn_by: Mutex::new(after(accept, ctx.cfg.conn_total)),
             gauge,
-            served: AtomicU64::new(0),
             recorded: AtomicU64::new(0),
-            closing: AtomicBool::new(false),
-            tunnel: Mutex::new(None),
             #[cfg(test)]
             last: Mutex::new(Reply::NONE),
-        });
-        (session, gate)
+        })
     }
 
-    fn conn_by(&self) -> Instant {
+    pub(super) fn conn_by(&self) -> Instant {
         *lock(&self.conn_by)
     }
 
-    /// Lets hyper serve the connection to its end. The stop makes hyper close the connection when it is idle, and
-    /// after the response of the request under way otherwise, unless the last head has an `Upgrade` line: nothing
-    /// follows that, and hyper would add `Connection: close` to a 101. A stop that began before this is seen by
-    /// `then`. If a 101 was given, hyper must not have read a byte behind the handshake (the gate gives it none),
-    /// or the connection ends in an error.
-    async fn drive<T>(self: &Arc<Self>, gate: &mut Gate<T>) -> End
-    where
-        T: AsyncRead + AsyncWrite + Unpin,
-    {
-        let cfg = &self.ctx.cfg;
-        let service = {
-            let session = self.clone();
-            service_fn(move |req: Request<Incoming>| {
-                let session = session.clone();
-                // Boxed, for a connection that is polled without its shutdown needs a future that is `Unpin`.
-                Box::pin(async move { session.request(req).await })
-            })
-        };
-        let mut server = http1::Builder::new();
-        server
-            .keep_alive(true)
-            .half_close(false)
-            .timer(TokioTimer::new())
-            .header_read_timeout(None)
-            .max_headers(limits::HEADERS)
-            .max_header_size(cfg.max_head_bytes)
-            .max_buf_size(cfg.max_head_bytes.max(8192))
-            .title_case_headers(true);
-        let mut stop = self.ctx.ingress.watch();
-        let mut changed = pin!(stop.changed());
-        // A call to drain the connections that wait for a request: it counts only if this one waits for one.
-        let mut calls = self.ctx.ingress.drained();
-        let link = self.link.clone();
-        let mut drained = pin!(async move {
-            loop {
-                if calls.changed().await.is_err() {
-                    std::future::pending::<()>().await;
-                } else if link.waiting() {
-                    return;
-                }
-            }
-        });
-        let mut told = false;
-        let mut conn = server.serve_connection(TokioIo::new(&mut *gate), service);
-        let mut by = self.conn_by();
-        let mut limit = pin!(sleep_until(by));
-        let ended = poll_fn(|cx| {
-            if !told
-                && (changed.as_mut().poll(cx).is_ready() || drained.as_mut().poll(cx).is_ready())
-            {
-                told = true;
-                if !self.link.last() {
-                    Pin::new(&mut conn).graceful_shutdown();
-                }
-            }
-            if let Poll::Ready(done) = conn.poll_without_shutdown(cx) {
-                return Poll::Ready(Some(done));
-            }
-            // The service may have put off the end of the connection while it was polled.
-            let now_by = self.conn_by();
-            if now_by != by {
-                limit.as_mut().reset(now_by);
-                by = now_by;
-            }
-            if limit.as_mut().poll(cx).is_ready() {
-                Poll::Ready(None)
-            } else {
-                Poll::Pending
-            }
-        })
-        .await;
-        match ended {
-            None => End::Limit,
-            Some(Err(_)) => End::Error,
-            Some(Ok(())) => {
-                let tunnel = lock(&self.tunnel).is_some();
-                if tunnel && !conn.into_parts().read_buf.is_empty() {
-                    End::Error
-                } else {
-                    End::Done
-                }
-            }
-        }
-    }
-
-    /// The service: one request that hyper made of the bytes the gate passed.
-    async fn request(self: &Arc<Self>, req: Request<Incoming>) -> Result<Response<Tracked>, Abort> {
-        let n = self
-            .served
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        let (parts, body) = req.into_parts();
-        let Some(Taken { head, start }) = self.link.take_for(&parts) else {
-            // Hyper made a request of bytes that the head check did not pass as that request.
-            let noted = Noted {
-                reply: Reply::rejected(400, "the two parsers disagree"),
-                client: self.peer.ip(),
-                via: None,
-            };
-            return Ok(self.respond(noted, answer(400), Then::Close, false, Instant::now()));
-        };
-        let conn = Conn::new(
+    /// The state of the request whose checked head is `head` and whose time counts from `start`.
+    pub(super) fn conn(&self, head: Head, start: Instant) -> Conn {
+        Conn::new(
             &self.ctx,
             self.id,
             head,
@@ -457,61 +261,14 @@ impl Session {
             self.scheme.clone(),
             self.gauge.clone(),
             after(start, self.ctx.cfg.request_total),
-        );
-        let Handled {
-            noted,
-            response,
-            tunnel,
-            stream,
-        } = conn.handle(parts, body).await;
-        match response {
-            Ok(response) => {
-                // The 101 ends the connection by itself, so it is not marked as the last response.
-                let then = if let Some(tunnel) = tunnel {
-                    *lock(&self.tunnel) = Some(tunnel);
-                    Then::Keep
-                } else {
-                    self.then(&conn, n, stream.is_some())
-                };
-                if let Some(stream) = &stream {
-                    self.lengthen(stream);
-                }
-                let old = conn.head().http10();
-                Ok(self.respond(noted, response, then, old, start))
-            }
-            Err(abort) => {
-                self.note(&noted, start);
-                Err(abort)
-            }
-        }
-    }
-
-    /// What the connection does after the response to the `n`th request. `long` is true for a response that may take
-    /// long: it is the last.
-    fn then(&self, conn: &Conn, n: u64, long: bool) -> Then {
-        let cfg = &self.ctx.cfg;
-        let head = conn.head();
-        let spent = n >= u64::try_from(cfg.keepalive_requests).unwrap_or(u64::MAX)
-            || self.accept.elapsed() >= cfg.keepalive_time;
-        let closing = !conn.body_read()
-            || head.http10()
-            || head.chunked()
-            || head.close()
-            || head.upgrade()
-            || long
-            || cfg.keepalive_timeout.is_zero();
-        if closing || spent || self.ctx.ingress.is_closed() {
-            Then::Close
-        } else {
-            Then::Keep
-        }
+        )
     }
 
     /// The head of a response that may take long is ready: the connection lasts until `total` after now at the
     /// earliest, and the client may be silent for that long (and for the connection time, if that is more). The old
     /// end has not come: the head was ready within the request time, which `keepalive_time` leaves inside the
     /// connection time.
-    fn lengthen(&self, stream: &Stream) {
+    pub(super) fn lengthen(&self, stream: &Stream) {
         let by = after(Instant::now(), stream.total);
         {
             let mut conn_by = lock(&self.conn_by);
@@ -521,37 +278,27 @@ impl Session {
             .restart(stream.total.max(self.ctx.cfg.conn_total));
     }
 
-    /// The response as it goes to hyper: marked as the last one if the connection ends with it, an HTTP/1.0
-    /// response to an HTTP/1.0 request (hyper then does not add `keep-alive` to the `Connection` field of a
-    /// request that asked for it), and followed by the line in the record and the note to the gate once it is
-    /// complete.
-    fn respond(
+    /// The response as it goes to hyper, followed by the line in the record and the drop of `guard` once it is
+    /// complete (see `Tracked`).
+    pub(super) fn track<G>(
         self: &Arc<Self>,
         noted: Noted,
-        mut response: Response<Out>,
-        then: Then,
-        old: bool,
+        response: Response<Out>,
         start: Instant,
-    ) -> Response<Tracked> {
-        if then == Then::Close {
-            close_after(&mut response);
-            self.closing.store(true, Ordering::Release);
-        }
-        if old {
-            *response.version_mut() = Version::HTTP_10;
-        }
+        guard: G,
+    ) -> Response<Tracked<G>> {
         response.map(|body| Tracked {
             body,
             session: self.clone(),
             noted,
             start,
             ended: false,
-            _finish: self.link.finish(),
+            guard,
         })
     }
 
     /// Writes the line of a request in the record, under the client address that `noted` has.
-    fn note(&self, noted: &Noted, start: Instant) {
+    pub(super) fn note(&self, noted: &Noted, start: Instant) {
         let reply = noted.reply;
         #[cfg(test)]
         {
@@ -573,117 +320,45 @@ impl Session {
         ));
     }
 
-    /// Answers a first head that was refused, and closes. A head that did not come in time gets its answer and
-    /// no more; any other has bytes behind it that the client may still be sending.
-    async fn refuse<T>(&self, gate: &mut Gate<T>, reject: Reject) -> Summary
-    where
-        T: AsyncRead + AsyncWrite + Unpin,
-    {
-        let cfg = &self.ctx.cfg;
-        let reply = if let Some(answer) = reject.response() {
-            let by = after(Instant::now(), cfg.response_idle).min(self.conn_by());
-            let sock = gate.stream();
-            let _ = timeout_at(by, send_and_close(sock, answer)).await;
-            if reject != Reject::Timeout {
-                linger(sock, cfg, self.conn_by()).await;
-            }
-            Reply::of(reject)
-        } else {
-            Reply {
-                reason: reject.reason(),
-                ..Reply::NONE
-            }
-        };
-        Summary::of(self.id, reply)
-    }
-
-    /// Ends the writing direction, and lingers if a response closed the connection or a head was refused.
-    async fn close<T>(&self, gate: &mut Gate<T>, end: End)
-    where
-        T: AsyncRead + AsyncWrite + Unpin,
-    {
-        if end == End::Limit {
-            return;
-        }
-        let cfg = &self.ctx.cfg;
-        let lingers = self.closing.load(Ordering::Acquire) || gate.failure().is_some();
-        let by = after(Instant::now(), cfg.response_idle).min(self.conn_by());
-        let sock = gate.stream();
-        let _ = timeout_at(by, close_write(sock)).await;
-        if lingers {
-            linger(sock, cfg, self.conn_by()).await;
-        }
-    }
-
-    /// The tunnel of a 101 that was given and whose connection ended well; any other is given up, which closes the
-    /// connection to the upstream and writes the line for its end.
-    fn take_tunnel(&self, end: End) -> Option<Tunnel> {
-        let tunnel = lock(&self.tunnel).take()?;
-        if end == End::Done {
-            Some(tunnel)
-        } else {
-            tunnel.failed();
-            None
-        }
-    }
-
-    /// Runs the tunnel over the stream of the client, with what the gate had read behind the handshake in front,
-    /// and ends the writing direction. The time of the connection is not asked: the tunnel has its own.
-    async fn run_tunnel<T>(&self, gate: &mut Gate<T>, tunnel: Tunnel)
-    where
-        T: AsyncRead + AsyncWrite + Unpin,
-    {
-        let rest = gate.take_rest();
-        let sock = gate.stream();
-        tunnel.run(&mut *sock, rest, &self.ctx.cfg).await;
-        let by = after(Instant::now(), self.ctx.cfg.response_idle);
-        let _ = timeout_at(by, close_write(sock)).await;
-    }
-
-    /// The reply of the last request, and the line the end of the connection adds: for a head that was refused
-    /// after the first, and for a connection that had no response to show for itself.
-    fn summary<T>(&self, gate: &Gate<T>, end: End) -> Summary {
-        let line = if let Some(reject) = gate.failure() {
-            Some(Reply {
-                reason: reject.reason(),
-                ..Reply::NONE
-            })
-        } else if self.recorded.load(Ordering::Relaxed) == 0 {
-            Some(Reply {
-                reason: match end {
-                    End::Done => Reply::NONE.reason,
-                    End::Error => "connection error",
-                    End::Limit => "connection time limit",
-                },
-                ..Reply::NONE
-            })
-        } else {
-            None
-        };
+    /// What came of the connection: the reply of the last response, and `line` for its end.
+    pub(super) fn summary(&self, line: Option<Reply>) -> Summary {
         Summary {
             id: self.id,
             #[cfg(test)]
             last: *lock(&self.last),
             line,
+            streams: None,
         }
     }
 }
 
-/// The body of a response, and the end of its request. The line in the record is written, and the gate is told
-/// that the request is answered, when this is dropped: hyper drops it when it has encoded the last frame of the
-/// body, which can be before the bytes are out (the gate also waits for the flush), and when the connection goes
-/// away.
-struct Tracked {
+/// What a response tells its guard while it is sent. The guard of a stream of HTTP/2 keeps from it how long a chunk of
+/// the response has waited for the client (see `http2`). The gate of HTTP/1.1 has no use for it: the writes to the
+/// client have their own limit (see `Guarded`).
+pub(super) trait Progress {
+    /// The body is asked for its next frame, which hyper does when it has handed the last chunk to h2: that chunk
+    /// does not wait for the client any more.
+    fn taken(&mut self) {}
+
+    /// The body handed a chunk on: it waits for the client from now on.
+    fn held(&mut self) {}
+}
+
+/// The body of a response, and the end of its request. The line in the record is written, and `guard` (the gate of
+/// HTTP/1.1 is told that the request is answered, a stream of HTTP/2 that it is done) is dropped, when this is
+/// dropped: hyper drops it when it has encoded the last frame of the body, which can be before the bytes are out,
+/// and when the connection goes away.
+pub(super) struct Tracked<G> {
     body: Out,
     session: Arc<Session>,
     noted: Noted,
     start: Instant,
     /// The body gave its end.
     ended: bool,
-    _finish: Finish,
+    guard: G,
 }
 
-impl Body for Tracked {
+impl<G: Unpin + Progress> Body for Tracked<G> {
     type Data = Bytes;
     type Error = hyper::Error;
 
@@ -692,9 +367,12 @@ impl Body for Tracked {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
         let this = self.get_mut();
+        this.guard.taken();
         let polled = Pin::new(&mut this.body).poll_frame(cx);
-        if matches!(polled, Poll::Ready(None)) {
-            this.ended = true;
+        match &polled {
+            Poll::Ready(None) => this.ended = true,
+            Poll::Ready(Some(Ok(frame))) if frame.is_data() => this.guard.held(),
+            _ => {}
         }
         polled
     }
@@ -708,7 +386,7 @@ impl Body for Tracked {
     }
 }
 
-impl Drop for Tracked {
+impl<G> Drop for Tracked<G> {
     fn drop(&mut self) {
         // A body whose length is known is not asked for its end, only for its last frame.
         let whole = self.ended || self.body.is_end_stream();
@@ -720,7 +398,7 @@ impl Drop for Tracked {
 }
 
 /// Writes all of `bytes`, then ends the sending direction.
-async fn send_and_close<T>(stream: &mut T, bytes: &[u8])
+pub(super) async fn send_and_close<T>(stream: &mut T, bytes: &[u8])
 where
     T: AsyncWrite + Unpin,
 {
@@ -731,7 +409,7 @@ where
 }
 
 /// Ends the sending direction: the client reads the end of the response.
-async fn close_write<T>(stream: &mut T)
+pub(super) async fn close_write<T>(stream: &mut T)
 where
     T: AsyncWrite + Unpin,
 {
@@ -741,7 +419,7 @@ where
 /// Reads and discards what the client still sends, until the end of its stream (a client that has closed its side
 /// ends it at once), `lingering_bytes` bytes, a read that waits for `lingering_timeout`, `lingering_time` after the
 /// start or the end of the connection time.
-async fn linger<T>(stream: &mut T, cfg: &ProxyConfig, conn_by: Instant)
+pub(super) async fn linger<T>(stream: &mut T, cfg: &ProxyConfig, conn_by: Instant)
 where
     T: AsyncRead + Unpin,
 {
@@ -760,4 +438,4 @@ where
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

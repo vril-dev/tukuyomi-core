@@ -18,8 +18,8 @@ use crate::inbound::conn::tests::{
     BLOCK, FORM, Mode, Parsed, Rig, config, finish_sending, form_post, guarded, parse_response,
     put, read_all, routed_to_h_test, run,
 };
-use crate::inbound::tls::tests::{Pki, listener as tls_listener};
-use crate::inbound::tls::{Files, Tls};
+use crate::inbound::transport::tls::tests::{Pki, listener as tls_listener};
+use crate::inbound::transport::tls::{Files, Tls};
 use crate::inspect::driver::Outcome;
 use crate::log::Lines;
 use crate::route::{Rule, Table};
@@ -27,7 +27,7 @@ use crate::route::{Rule, Table};
 const SEC: Duration = Duration::from_secs(1);
 
 /// A configuration that keeps a connection for a while after a response.
-fn kept() -> ProxyConfig {
+pub(in crate::inbound) fn kept() -> ProxyConfig {
     ProxyConfig {
         keepalive_timeout: 10 * SEC,
         lingering_timeout: Duration::from_millis(300),
@@ -35,7 +35,7 @@ fn kept() -> ProxyConfig {
     }
 }
 
-fn get(target: &str) -> Vec<u8> {
+pub(in crate::inbound) fn get(target: &str) -> Vec<u8> {
     format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n").into_bytes()
 }
 
@@ -424,39 +424,6 @@ fn a_drain_closes_the_connection_that_waits_for_a_request_and_leaves_one_that_is
 }
 
 #[test]
-fn a_request_without_a_copy_of_its_head_is_not_served_and_closes_the_connection() {
-    run(async {
-        let rig = Rig::new(kept(), Mode::Answer(BLOCK)).await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (server, peer) = listener.accept().await.unwrap();
-        let local = server.local_addr().unwrap();
-        let (session, mut gate) =
-            Session::start(server, peer, local, &rig.ctx, Instant::now(), Scheme::Http);
-        put(&client, &get("/a")).await;
-        gate.first_head(Instant::now() + 10 * SEC).await.unwrap();
-        // The copy the gate made is lost, as it would be if hyper and the gate disagreed about the bytes.
-        let other = http::Request::get("/other")
-            .header("host", "h")
-            .body(())
-            .unwrap()
-            .into_parts()
-            .0;
-        assert!(session.link.take_for(&other).is_none());
-        assert_eq!(session.drive(&mut gate).await, End::Done);
-        drop(gate);
-        let answer = parse_response(&read_all(&client).await);
-        assert_eq!(answer.status, 400);
-        assert_eq!(answer.all("connection"), ["close"]);
-        assert_eq!(answer.all("content-length"), ["0"]);
-        let served = tokio::spawn(async {});
-        assert!(rig.finish(served).await.is_empty());
-    });
-}
-
-#[test]
 fn a_403_of_the_route_keeps_the_connection_if_the_request_had_no_body_and_ends_it_otherwise() {
     run(async {
         // The route turns the loopback address away.
@@ -479,7 +446,7 @@ fn a_403_of_the_route_keeps_the_connection_if_the_request_had_no_body_and_ends_i
 
 // ---- a stream on a route: a WebSocket through it, and the responses that take long ----
 
-const ALLOW: Outcome = Outcome::Verdict(Verdict::Allow);
+pub(in crate::inbound) const ALLOW: Outcome = Outcome::Verdict(Verdict::Allow);
 
 fn stream(idle_ms: u64, total_ms: u64, websocket: bool) -> Stream {
     Stream {
@@ -567,15 +534,15 @@ impl Peer {
 
 /// A raw upstream: it serves each connection it takes with `serve`, which is also given the place where the bytes
 /// that the upstream read are kept.
-struct Raw {
-    addr: SocketAddr,
+pub(in crate::inbound) struct Raw {
+    pub(in crate::inbound) addr: SocketAddr,
     taken: Arc<AtomicUsize>,
     seen: Arc<StdMutex<Vec<u8>>>,
     accepting: JoinHandle<()>,
 }
 
 impl Raw {
-    async fn start<F, Fut>(serve: F) -> Raw
+    pub(in crate::inbound) async fn start<F, Fut>(serve: F) -> Raw
     where
         F: Fn(TcpStream, Arc<StdMutex<Vec<u8>>>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -606,7 +573,7 @@ impl Raw {
     }
 
     /// The bytes read from the clients so far, as text.
-    fn seen(&self) -> String {
+    pub(in crate::inbound) fn seen(&self) -> String {
         String::from_utf8_lossy(&self.seen.lock().unwrap()).into_owned()
     }
 }
@@ -702,7 +669,11 @@ async fn talk(mut sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>, n: usize) {
 }
 
 /// Answers a request with `answer`, then reads on and keeps what it reads.
-async fn reply(mut sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>, answer: &'static [u8]) {
+pub(in crate::inbound) async fn reply(
+    mut sock: TcpStream,
+    seen: Arc<StdMutex<Vec<u8>>>,
+    answer: &'static [u8],
+) {
     let (head, behind) = read_request(&mut sock).await;
     seen.lock().unwrap().extend_from_slice(&head);
     seen.lock().unwrap().extend_from_slice(&behind);
@@ -716,7 +687,7 @@ async fn reply(mut sock: TcpStream, seen: Arc<StdMutex<Vec<u8>>>, answer: &'stat
     }
 }
 
-const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+pub(in crate::inbound) const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
 #[test]
 fn a_handshake_gets_its_101_and_the_bytes_go_both_ways_in_order_also_after_the_stop_began() {

@@ -7,9 +7,11 @@
 //! to write a request for a route that it does not hold for, so the access lists of every route that it could be
 //! taken for are asked for, not only those of the route it goes to (`Upstreams::accesses`), and only if some route
 //! has a list (`Upstreams::guarded`). A group has one or more servers and one pool of waiting connections
-//! that they share, so the connections that wait are bounded for the group, not for each server. The server a
-//! request goes to is chosen by weight among the servers that can be used and that the request has not tried yet
-//! (see `select`).
+//! that they share, so the connections that wait are bounded for the group, not for each server. A group with `tls`
+//! is reached over TLS at every server, and a group without it never is (see `tls`); as a waiting connection is
+//! taken only for the server it is connected to, a plain connection is never used where TLS is wanted, nor the other
+//! way round. The server a request goes to is chosen by weight among the servers that can be used and that the
+//! request has not tried yet (see `select`).
 //!
 //! A server counts the failures of its requests (`Group::fail`; what a failure is, is said at `origin`). When
 //! `max_fails` of them come within `fail_timeout`, counted from the first, the server is left out for
@@ -32,6 +34,7 @@ use crate::forward::client_ip::Access;
 use crate::forward::pool::Pool;
 use crate::forward::rewrite::Rewrite;
 use crate::forward::select::Turn;
+use crate::forward::tls::Secure;
 use crate::route::Table;
 
 /// The groups of the configuration, and the routes to them.
@@ -129,12 +132,14 @@ impl Tried {
     }
 }
 
-/// A server of a group: where it is, how it counts, its view of the pool of the group, and what has failed.
+/// A server of a group: where it is, how it counts, its view of the pool of the group, how it is spoken to if the
+/// group has `tls`, and what has failed.
 pub struct Server {
     address: SocketAddr,
     max_fails: u32,
     fail_timeout_ms: u64,
     pool: Pool,
+    secure: Option<Secure>,
     /// Failures in the window that began at `window`.
     fails: AtomicU32,
     window: AtomicU64,
@@ -143,13 +148,14 @@ pub struct Server {
 }
 
 impl Server {
-    fn new(cfg: &ServerConfig, pool: Pool) -> Server {
+    fn new(cfg: &ServerConfig, pool: Pool, secure: Option<Secure>) -> Server {
         Server {
             address: cfg.address,
             max_fails: cfg.max_fails,
             // The configuration bounds it to an hour, so this is exact.
             fail_timeout_ms: u64::try_from(cfg.fail_timeout.as_millis()).unwrap_or(u64::MAX),
             pool,
+            secure,
             fails: AtomicU32::new(0),
             window: AtomicU64::new(0),
             down_until: AtomicU64::new(0),
@@ -162,6 +168,11 @@ impl Server {
 
     pub(super) fn pool(&self) -> &Pool {
         &self.pool
+    }
+
+    /// How to speak TLS to the server, if the group has `tls`; `None`: the connection is plain.
+    pub(super) fn secure(&self) -> Option<&Secure> {
+        self.secure.as_ref()
     }
 
     /// Counts a failure that came `now` milliseconds after the start of the group.
@@ -206,7 +217,10 @@ impl Group {
                 .servers
                 .iter()
                 .enumerate()
-                .map(|(index, server)| Server::new(server, pool.of(index)))
+                .map(|(index, server)| {
+                    let secure = cfg.tls.as_ref().map(|tls| tls.secure(index));
+                    Server::new(server, pool.of(index), secure)
+                })
                 .collect(),
             turn: Turn::new(&cfg.servers),
             born,

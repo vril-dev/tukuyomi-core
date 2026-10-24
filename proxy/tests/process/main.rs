@@ -33,6 +33,7 @@
 mod bodies;
 mod deadlines;
 mod forwarding;
+mod http2;
 mod inspector;
 mod keepalive;
 mod refusals;
@@ -41,5 +42,6 @@ mod rules;
 mod stopping;
 mod support;
 mod tls;
+mod upstream_tls;
 mod upstreams;
 mod websocket;

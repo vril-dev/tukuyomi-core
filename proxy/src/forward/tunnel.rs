@@ -46,7 +46,7 @@ use tokio::time::{Instant, Sleep, sleep, timeout, timeout_at};
 
 use crate::config::{ProxyConfig, Stream};
 use crate::forward::pool::Lease;
-use crate::inbound::io::{Gauge, Guarded};
+use crate::inbound::transport::io::{Gauge, Guarded};
 use crate::log::Log;
 
 /// The buffer of each of the two directions.

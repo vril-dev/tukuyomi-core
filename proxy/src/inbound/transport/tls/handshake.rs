@@ -3,8 +3,9 @@
 //! The configuration is made with the crypto provider named outright, TLS 1.3 and, if the listener allows it, TLS
 //! 1.2, the suites and key exchanges the provider has by default, no client certificate, no early data, tickets from
 //! the provider's ticketer (its keys change as the provider says), and the session cache that rustls has by default.
-//! The only protocol of ALPN is `http/1.1`: a client that offers protocols and not that one is refused, and a
-//! client that offers none is taken to speak HTTP/1.1.
+//! The protocols of ALPN are `http/1.1`, and `h2` before it if the listener has `http2` in its settings: a client
+//! that offers protocols and none of these is refused, and a client that offers none is taken to speak HTTP/1.1.
+//! A client that offers both gets `h2` from a listener that has it.
 //!
 //! The certificate is chosen by the server name of the client (see `sni`). A client that sends no name, or a name
 //! that no host of the listener has, gets no certificate and the handshake fails: there is no default certificate.
@@ -27,6 +28,7 @@ use super::sni::{Hosts, Names};
 use crate::config::{MinVersion, TlsConfig};
 
 const ALPN: &[u8] = b"http/1.1";
+const ALPN_H2: &[u8] = b"h2";
 
 /// The certificate for a handshake: the one the name of the client finds among the hosts of the listener.
 #[derive(Debug)]
@@ -71,7 +73,11 @@ impl Handshake {
             .map_err(|_| Fault::Build)?
             .with_no_client_auth()
             .with_cert_resolver(resolver);
-        config.alpn_protocols = vec![ALPN.to_vec()];
+        config.alpn_protocols = if tls.http2.is_some() {
+            vec![ALPN_H2.to_vec(), ALPN.to_vec()]
+        } else {
+            vec![ALPN.to_vec()]
+        };
         config.ticketer = Ticketer::new().map_err(|_| Fault::Build)?;
         Ok(Handshake {
             acceptor: TlsAcceptor::from(Arc::new(config)),

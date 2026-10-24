@@ -5,7 +5,7 @@ use std::time::Instant as StdInstant;
 
 use http::response::Parts;
 use http_body_util::BodyExt;
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::runtime::Builder;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -13,8 +13,9 @@ use tokio::time::{sleep, timeout};
 
 use super::*;
 use crate::config::{ForwardConfig, ProxyConfig};
+use crate::forward::connect::connect_error;
 use crate::forward::group::Upstreams;
-use crate::inbound::tls::Tls;
+use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::Ingress;
 use crate::log::start_logger;
 use crate::rules::routes::{Routes, SharedRoutes};

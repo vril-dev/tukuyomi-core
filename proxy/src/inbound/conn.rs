@@ -1,23 +1,23 @@
 //! One request of a connection: the route, the body, the inspection, and then the answer or the forwarding.
 //!
-//! The head was checked by `head` and passed by `gate` before this runs, and the session hands it over with the
-//! request that hyper made of the same bytes. The route for the request is looked up first, by its `Host` and its
-//! target as the client sent them. A request that no route holds for, with no default group, is answered with 404,
-//! and one from a client that the access lists of its route turn away with 403, before anything of its body is read
-//! and before the inspection is asked for. So is a request on a connection that ended TLS, whose `Host` is not one
-//! of the hosts of the certificate that the handshake used, or cannot be read (421; it comes before the route is
-//! looked up). The body is read through hyper into a budgeted buffer, a gzip body is
-//! decoded by `represent::gunzip` (exactly one member, at most `max_body` bytes of output), and then the request
-//! either matches a rule of the generation that serves that skips the inspection, and is forwarded without being
-//! inspected, or is handed to the inspection driver as a ticket, and only an `Allow` or a `Detected` is forwarded.
-//! It is forwarded to a server of the group of the route that was looked up, with the edits of that route (see
-//! `rewrite`). If the route has a `stream` that lets a WebSocket through and the request is the handshake of one,
-//! the share of the byte budget that a tunnel holds is taken first (and the request is answered with 503 if it
-//! cannot be had, before anything is sent), and if the upstream answers with 101 the response comes with the
-//! tunnel (see `tunnel`). Any other response on a route with a `stream` comes marked as one that may take long. A
-//! request under a rule that skips the inspection takes no inspection permit, no byte of the kernel's copy and no
-//! place in the driver's channel, so it goes on also when the inspection is full or the inspector is down.
-//! What is inspected and what is forwarded is the same request, in the form that `represent` builds it: the
+//! The head was checked by `head` before this runs. On an HTTP/1.1 connection `http1::gate` passed it, and the session
+//! hands it over with the request that hyper made of the same bytes; on an HTTP/2 connection it was made from the
+//! fields of the stream (see `http2::head`). The route for the request is looked up first, by its `Host` and its target
+//! as the client sent them. A request that no route holds for, with no default group, is answered with 404, and one
+//! from a client that the access lists of its route turn away with 403, before anything of its body is read and before
+//! the inspection is asked for. So is a request on a connection that ended TLS, whose `Host` is not one of the hosts of
+//! the certificate that the handshake used, or cannot be read (421; it comes before the route is looked up). The body
+//! is read through hyper into a budgeted buffer, a gzip body is decoded by `represent::gunzip` (exactly one member, at
+//! most `max_body` bytes of output), and then the request either matches a rule of the generation that serves that
+//! skips the inspection, and is forwarded without being inspected, or is handed to the inspection driver as a ticket,
+//! and only an `Allow` or a `Detected` is forwarded. It is forwarded to a server of the group of the route that was
+//! looked up, with the edits of that route (see `rewrite`). If the route has a `stream` that lets a WebSocket through
+//! and the request is the handshake of one, the share of the byte budget that a tunnel holds is taken first (and the
+//! request is answered with 503 if it cannot be had, before anything is sent), and if the upstream answers with 101 the
+//! response comes with the tunnel (see `tunnel`). Any other response on a route with a `stream` comes marked as one
+//! that may take long. A request under a rule that skips the inspection takes no inspection permit, no byte of the
+//! kernel's copy and no place in the driver's channel, so it goes on also when the inspection is full or the inspector
+//! is down. What is inspected and what is forwarded is the same request, in the form that `represent` builds it: the
 //! decoded body, without its `Content-Encoding`, with its decoded length; the edits of the route come after the
 //! inspection and are the only difference.
 //!
@@ -61,9 +61,9 @@ use crate::inbound::answer::{
     Abort, Decision, Noted, Out, Passed, Reply, Stop, Via, answer, decide, who,
 };
 use crate::inbound::head::{Head, Reject};
-use crate::inbound::io::Gauge;
 use crate::inbound::represent::{Represented, gunzip, represent};
-use crate::inbound::tls::{Hosts, Tls};
+use crate::inbound::transport::io::Gauge;
+use crate::inbound::transport::tls::{Hosts, Tls};
 use crate::inspect::driver::{BodyHold, Hold, Ingress, InspectReq, Msg, Ticket};
 use crate::log::Log;
 use crate::rules::routes::SharedRoutes;
@@ -541,7 +541,7 @@ impl Conn {
 }
 
 /// Whether the body failed because the peer went away, not because of what it sent.
-fn peer_gone(e: &hyper::Error) -> bool {
+pub(super) fn peer_gone(e: &hyper::Error) -> bool {
     if e.is_incomplete_message() {
         return true;
     }

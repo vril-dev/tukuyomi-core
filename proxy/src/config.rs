@@ -1,16 +1,17 @@
 //! The configuration file: one JSON object `{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store":
 //! {..}}}`; every value is chosen by the operator and checked here.
 //!
-//! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present
-//! (a route may leave out its `host`, its `path`, its `access`, its `rewrite` and its `stream`; `access` and
-//! `rewrite` have no key that must be present, see `rewrite`, and a `stream` has all three); an unknown or repeated
-//! key is refused, and so is a value of the wrong type, an array in place of an object and `null` for a key that may
-//! be left out included (such a key is either left out or has a value). A refusal is one
-//! fixed sentence per kind of fault and never carries a key or a value from the file. Then the values are checked
-//! in a fixed order and the first broken rule is returned: the `proxy` bounds, the `forward` values (see `forward`;
-//! the names of the servers are not looked up here, `forward::resolve` does that when the proxy starts), the
-//! `rules.store` values, the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's own
-//! check, and last the relations between the `proxy` and `kernel` objects.
+//! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present (a
+//! route may leave out its `host`, its `path`, its `access`, its `rewrite` and its `stream`; `access` and `rewrite`
+//! have no key that must be present, see `rewrite`, and a `stream` has all three; an upstream group may leave out its
+//! `tls`, which may leave out its `server_name`; a listener may leave out its `tls` and its `redirect`, and the `tls`
+//! of a listener may leave out its `http2`); an unknown or repeated key is refused, and so is a value of the wrong
+//! type, an array in place of an object and `null` for a key that may be left out included (such a key is either left
+//! out or has a value). A refusal is one fixed sentence per kind of fault and never carries a key or a value from the
+//! file. Then the values are checked in a fixed order and the first broken rule is returned: the `proxy` bounds, the
+//! `forward` values (see `forward`; the names of the servers are not looked up here, `forward::resolve` does that when
+//! the proxy starts), the `rules.store` values, the conversion of the `kernel` object into `tukuyomi_kernel::Config`
+//! with that type's own check, and last the relations between the `proxy` and `kernel` objects.
 //!
 //! Times are whole milliseconds under keys that end in `_ms`; the `proxy` times run from 1 ms to 3600 s, except
 //! `keepalive_timeout_ms`, which also takes 0 (a connection is not kept after its response), and `conn_total_ms`,
@@ -48,7 +49,7 @@ pub use forward::{
     Address, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig, Stream,
 };
 pub use listeners::{
-    CertificateConfig, ListenerConfig, ListenerKind, MinVersion, TlsConfig, addresses,
+    CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion, TlsConfig, addresses,
 };
 
 const MAX_FILE: u64 = 256 * 1024;
@@ -389,6 +390,10 @@ fn build(
         "max_head_bytes is out of range",
     )?;
     ensure(
+        listeners::header_lists_fit(&listeners, p.max_head_bytes),
+        "http2 max_header_list is above four times max_head_bytes",
+    )?;
+    ensure(
         bytes(p.max_body) <= BODY,
         "max_body is above the body limit",
     )?;
@@ -410,6 +415,10 @@ fn build(
     ensure(
         within(p.upstream_max_head_bytes, 8192, MIB),
         "upstream_max_head_bytes is out of range",
+    )?;
+    ensure(
+        listeners::holds_fit(&listeners, p.upstream_max_head_bytes),
+        "http2 streams with their fields and a response chunk can hold more than 16 MiB",
     )?;
     let head_wire_low = bytes(p.upstream_max_head_bytes.max(8192)).checked_mul(2);
     ensure(

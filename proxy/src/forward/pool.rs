@@ -28,7 +28,7 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::config::ProxyConfig;
 use crate::forward::origin::Sent;
-use crate::inbound::io::Gauge;
+use crate::inbound::transport::io::Gauge;
 
 /// Aborts the spawned future that drives the connection to the upstream when it is dropped.
 struct Abort(AbortHandle);

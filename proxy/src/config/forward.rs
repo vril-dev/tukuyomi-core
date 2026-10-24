@@ -1,8 +1,8 @@
 //! The `forward` object of the configuration: the upstream groups, and the routes that choose a group for a request.
 //!
 //! `resolve_timeout_ms` is the time the proxy may take, when it starts, to look up the names of the servers (1 ms to
-//! 3600 s). `upstreams` is an object from the name of a group to `{"servers": [..]}`. A name is 1 to 64 letters,
-//! digits, `-` and `_`, and there are 1 to 64 groups. A group has 1 to 64 servers, each `{"address", "weight",
+//! 3600 s). `upstreams` is an object from the name of a group to `{"servers": [..], "tls"?}`. A name is 1 to 64
+//! letters, digits, `-` and `_`, and there are 1 to 64 groups. A group has 1 to 64 servers, each `{"address", "weight",
 //! "max_fails", "fail_timeout_ms", "backup"}` with every key present: the address is an IP literal and a port
 //! (`[..]:port` for IPv6) or a name and a port (`name:port`), the weight is 1 to 100, `max_fails` is 0 to 100 (0:
 //! failures are not counted), `fail_timeout_ms` is the time a failing server is left out, and `backup` tells that the
@@ -12,6 +12,11 @@
 //! starts with a letter (an OS takes `127.1` or `0x7f000001` for an address, not for a name); the port is 1 to 65535
 //! without a leading zero. The configuration does not look a name up: that is done once, when the proxy starts (see
 //! `forward::resolve`), and each address of a name is a server of the group.
+//! `tls` of a group is `{"ca_file", "server_name"?}`: every server of the group is then reached over TLS, and its
+//! certificate is checked against the authorities in `ca_file` (see `forward::tls`). `ca_file` is an absolute clean
+//! path of at most 3840 bytes; the file is not read here. `server_name` is a name of the form of a server name, and
+//! TLS has to be able to use it; without it each server is checked for its own name (so every name of a server of such
+//! a group must be one TLS can use), or, written as an IP literal, for its address.
 //! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?}`. The `host`
 //! and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access` and
 //! `rewrite` are the networks that may use the route and the edits it makes (see `rewrite`). `stream` is `{"idle_ms",
@@ -28,15 +33,18 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::{Deserializer, Error, MapAccess, Visitor};
 
 use super::rewrite::{self, RawAccess, RawRewrite};
-use super::{ConfigError, MAX_CONN_MS, Object, ensure, millis, same};
+use super::{ConfigError, MAX_CONN_MS, MAX_STORE_DIR, Object, clean_abs, ensure, millis, same};
 use crate::forward::client_ip::Access;
 use crate::forward::rewrite::Rewrite;
+use crate::forward::tls::{self, Client, Settings};
 use crate::route::{Rule, Table, parse_port};
 
 const MAX_GROUPS: usize = 64;
@@ -67,11 +75,13 @@ pub struct ServerConfig<A = SocketAddr> {
     pub backup: bool,
 }
 
-/// One group, checked.
+/// One group, checked. `A` is where the servers are (see `ServerConfig`). `T` is the TLS to the servers if the group
+/// has any: the `Settings` as the file writes them, or the `Client` they come to once the names are looked up.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GroupConfig<A = SocketAddr> {
+pub struct GroupConfig<A = SocketAddr, T = Client> {
     pub name: String,
     pub servers: Vec<ServerConfig<A>>,
+    pub tls: Option<T>,
 }
 
 /// The times of a response on a route that may take long, and whether the route lets a WebSocket through.
@@ -111,14 +121,14 @@ impl RouteConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForwardSettings {
     pub resolve_timeout: Duration,
-    pub groups: Vec<GroupConfig<Address>>,
+    pub groups: Vec<GroupConfig<Address, Settings>>,
     pub routes: Table<RouteConfig>,
     /// The index of the group for a request that no route holds for.
     pub default: Option<usize>,
 }
 
 /// The `forward` object once every name is looked up (see `forward::resolve`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ForwardConfig {
     pub groups: Vec<GroupConfig>,
     pub routes: Table<RouteConfig>,
@@ -145,6 +155,7 @@ impl ForwardConfig {
             groups: vec![GroupConfig {
                 name: "main".to_string(),
                 servers,
+                tls: None,
             }],
             routes: Table::default(),
             default: Some(0),
@@ -165,6 +176,16 @@ pub(super) struct RawForward {
 #[serde(deny_unknown_fields)]
 struct RawGroup {
     servers: Vec<Object<RawServer>>,
+    #[serde(default, deserialize_with = "super::present")]
+    tls: Option<Object<RawTls>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTls {
+    ca_file: String,
+    #[serde(default, deserialize_with = "super::present")]
+    server_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -340,6 +361,40 @@ fn servers(
         .collect()
 }
 
+/// The `tls` of a group whose servers are `servers`: the path is absolute, clean and at most 3840 bytes, and every
+/// name that a server is checked for (the `server_name`, or else the name of each server written with a name) is one
+/// that TLS can use.
+fn tls(
+    raw: Option<Object<RawTls>>,
+    servers: &[ServerConfig<Address>],
+) -> Result<Option<Settings>, ConfigError> {
+    let Some(Object(raw)) = raw else {
+        return Ok(None);
+    };
+    let ca_file = PathBuf::from(raw.ca_file);
+    ensure(
+        clean_abs(&ca_file) && ca_file.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
+        "an upstream tls ca_file is not an absolute clean path of at most 3840 bytes",
+    )?;
+    match &raw.server_name {
+        Some(name) => ensure(
+            host_ok(name) && tls::dns_name(name).is_some(),
+            "an upstream tls server_name is not a name that TLS can use",
+        )?,
+        None => ensure(
+            servers.iter().all(|server| match &server.address {
+                Address::Name { name, .. } => tls::dns_name(name).is_some(),
+                Address::Literal(_) => true,
+            }),
+            "a server name of an upstream with tls is not a name that TLS can use",
+        )?,
+    }
+    Ok(Some(Settings {
+        ca_file,
+        server_name: raw.server_name,
+    }))
+}
+
 /// Checks the `forward` object. `listeners` are the addresses the proxy listens on.
 pub(super) fn check(
     raw: RawForward,
@@ -356,10 +411,9 @@ pub(super) fn check(
             name_ok(&name),
             "an upstream name is not 1 to 64 letters, digits, - and _",
         )?;
-        groups.push(GroupConfig {
-            name,
-            servers: servers(group.servers, listeners)?,
-        });
+        let servers = servers(group.servers, listeners)?;
+        let tls = tls(group.tls, &servers)?;
+        groups.push(GroupConfig { name, servers, tls });
     }
     ensure(
         raw.routes.len() <= MAX_ROUTES,
@@ -414,3 +468,6 @@ pub(super) fn check(
         default,
     })
 }
+
+#[cfg(test)]
+mod tests;

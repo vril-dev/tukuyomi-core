@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
-//! HTTP/1.1 front of the inspection kernel: the listeners (plain, TLS, or a redirect to https), the upstream groups
-//! that its routes choose from, and every request inspected before it is forwarded.
+//! HTTP front of the inspection kernel: the listeners (plain, TLS, or a redirect to https), HTTP/1.1 on every one of
+//! them and HTTP/2 on the TLS listeners that turn it on, the upstream groups that its routes choose from, and every
+//! request inspected before it is forwarded.
 
 pub mod config;
 pub mod forward;

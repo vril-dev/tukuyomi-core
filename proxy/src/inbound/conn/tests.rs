@@ -16,8 +16,9 @@ use tukuyomi_kernel::Verdict;
 
 use super::*;
 use crate::config::{ForwardConfig, RouteConfig};
-use crate::inbound::session::{run as run_session, serve, serve_on};
-use crate::inbound::tls::Tls;
+use crate::inbound::http1::run as run_session;
+use crate::inbound::session::{serve, serve_on};
+use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::Outcome;
 use crate::log::{Lines, recording};
 use crate::route::{Rule, Table};
@@ -276,11 +277,21 @@ impl Rig {
             .unwrap();
         self.ctx.ingress.close();
         drop(self.tx.take());
-        let seen = self
-            .driver
-            .take()
-            .map(|d| d.join().unwrap())
-            .unwrap_or_default();
+        // The driver stops when the last sender is gone. The streams of an HTTP/2 connection are tasks of their own
+        // that drop theirs when they next run, so the runtime must not be blocked while it waits.
+        let seen = match self.driver.take() {
+            Some(driver) => {
+                timeout(Duration::from_secs(30), async {
+                    while !driver.is_finished() {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the driver stopped");
+                driver.join().unwrap()
+            }
+            None => Vec::new(),
+        };
         assert_eq!(
             self.ctx.budget.available_permits(),
             self.ctx.cfg.max_buffered_bytes

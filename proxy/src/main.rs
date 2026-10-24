@@ -3,19 +3,21 @@
 //! `rules` the process is a short command on the rules store instead (`rules::command`), and nothing of the proxy
 //! starts.
 //!
-//! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration
-//! file), the host checks, the configuration, the lookup of the names of the upstream servers, the certificate and
-//! key files of the TLS listeners, the rules store (the chosen generation, the hold on it, its directory, mode and
-//! routes, and with them the kernel configuration), the runtime and the signal handlers, the driver thread, the wait
-//! for the kernel to be ready, bind, accept. The rules store is read here, and again when SIGUSR1 comes; the
-//! certificate and key files are read here, and again when SIGUSR2 comes. Handlers exist for SIGTERM, SIGINT,
-//! SIGHUP, SIGUSR1 and SIGUSR2 only and are installed before the kernel starts its child process; SIGCHLD is never
-//! handled. The listeners are bound only after the kernel is ready, all of them or none, and the accept side takes a
-//! connection permit before every accept (see `inbound::accept`).
+//! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration file),
+//! the host checks, the configuration, the lookup of the names of the upstream servers (in the same step, the CA file
+//! of each upstream group that has `tls` is read), the certificate and key files of the TLS listeners, the rules store
+//! (the chosen generation, the hold on it, its directory, mode and routes, and with them the kernel configuration), the
+//! runtime and the signal handlers, the driver thread, the wait for the kernel to be ready, bind, accept. The rules
+//! store is read here, and again when SIGUSR1 comes; the certificate and key files are read here, and again when
+//! SIGUSR2 comes. Handlers exist for SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2 only and are installed before the
+//! kernel starts its child process; SIGCHLD is never handled. The listeners are bound only after the kernel is ready,
+//! all of them or none, and the accept side takes a connection permit before every accept (see
+//! `inbound::transport::accept`).
 //!
 //! The upstream groups and the routes to them are read from the configuration file when the proxy starts, and stay
-//! as they are until it is started again; so do the addresses that the names of the servers have then, and the
-//! listeners with the hosts of their certificates.
+//! as they are until it is started again; so do the addresses that the names of the servers have then, the
+//! authorities in the CA files of the groups that have `tls` (SIGUSR2 does not read them again), and the listeners
+//! with the hosts of their certificates.
 //!
 //! SIGUSR1 makes the proxy switch to the generation that the rules store chooses now (`rules::switch` reads the
 //! store, the driver starts the new inspector and moves the requests over when it is ready). It is a line in the
@@ -33,9 +35,9 @@
 //! there), then waits for the driver's end until `t0 + stop_wait + kill_grace`. The exit code is 0 only when the
 //! stop was not caused by a failure and the driver reports a stopped kernel whose child exit and per-start
 //! directory removal are confirmed, and the same for every kernel that was stopped before it; 1 for any other end,
-//! and for names of upstream servers that cannot be looked up, a refused certificate or key file, or a refused rules
-//! store or generation (nothing has been started then); 2 for a wrong argument or a refused configuration. The log
-//! is flushed for at most 200 ms at the end.
+//! and for names of upstream servers that cannot be looked up, a CA file of an upstream group that cannot be used, a
+//! refused certificate or key file, or a refused rules store or generation (nothing has been started then); 2 for a
+//! wrong argument or a refused configuration. The log is flushed for at most 200 ms at the end.
 
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
@@ -58,10 +60,10 @@ use tukuyomi_proxy::config::{self, ForwardConfig, ProxyConfig, addresses};
 use tukuyomi_proxy::forward::group::Upstreams;
 use tukuyomi_proxy::forward::resolve;
 use tukuyomi_proxy::host;
-use tukuyomi_proxy::inbound::accept::{Accepted, Acceptor, Arrival};
 use tukuyomi_proxy::inbound::conn::Ctx;
 use tukuyomi_proxy::inbound::session;
-use tukuyomi_proxy::inbound::tls::{Files, Tls};
+use tukuyomi_proxy::inbound::transport::accept::{Accepted, Acceptor, Arrival};
+use tukuyomi_proxy::inbound::transport::tls::{Files, Tls};
 use tukuyomi_proxy::inspect::driver::{self, Driver, End, Ingress, Limits, Msg, Switch, Switched};
 use tukuyomi_proxy::log::{self, Log};
 use tukuyomi_proxy::rules::bundle::{Fingerprint, Mode};

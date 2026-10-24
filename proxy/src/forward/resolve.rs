@@ -12,11 +12,16 @@
 //! is one server. Another server that comes to the same address is a server of its own, as it is when two servers are
 //! written with the same IP literal.
 //!
+//! The TLS of the groups that have `tls` is made here as well, after the lookups (see `tls`): the file of the
+//! authorities is read, and each server of the group, each address of a name included, gets the name it is checked
+//! for. The proxy does not start if the file cannot be used, or if a name cannot be used for TLS.
+//!
 //! The proxy does not start if a name cannot be looked up, has no address, or has one that is unspecified, a
 //! multicast address, or the address of a listener (or a loopback address at its port, if the listener is
 //! unspecified), if the lookups are not done in time, or if a group has more than 64 servers once the names are
 //! looked up. The sentences of the refusals are fixed: the error of the system is not kept, and each tells the group
-//! and the place of the server (from 1) it is about.
+//! and the place of the server (from 1) it is about, except one about the file of the authorities of a group, which
+//! tells the group only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -29,23 +34,24 @@ use std::time::{Duration, Instant};
 use crate::config::{
     Address, ForwardConfig, ForwardSettings, GroupConfig, MAX_SERVERS, ServerConfig, same,
 };
+use crate::forward::tls::{self, Client, Fault, Settings};
 
-/// Why the names were not made into addresses: a fixed sentence, and the group and the place of the server (from 1)
-/// it is about.
+/// Why the groups were not made whole: a fixed sentence, and the group and the place of the server (from 1) it is
+/// about, if it is about a server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
     pub why: &'static str,
     pub group: String,
-    pub position: usize,
+    pub position: Option<usize>,
 }
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} (upstream {}, server {})",
-            self.why, self.group, self.position
-        )
+        write!(f, "{} (upstream {}", self.why, self.group)?;
+        match self.position {
+            Some(position) => write!(f, ", server {position})"),
+            None => f.write_str(")"),
+        }
     }
 }
 
@@ -74,13 +80,13 @@ impl Wanted {
         Refusal {
             why,
             group: self.group.clone(),
-            position: self.position,
+            position: Some(self.position),
         }
     }
 }
 
 /// The names with their ports in the order they are first written.
-fn wanted(groups: &[GroupConfig<Address>]) -> Vec<Wanted> {
+fn wanted(groups: &[GroupConfig<Address, Settings>]) -> Vec<Wanted> {
     let mut seen = BTreeSet::new();
     let mut names = Vec::new();
     for group in groups {
@@ -193,13 +199,32 @@ where
     let mut lines = Vec::new();
     let mut done = Vec::with_capacity(groups.len());
     for group in groups {
+        let config = group
+            .tls
+            .as_ref()
+            .map(tls::config)
+            .transpose()
+            .map_err(|fault| Refusal {
+                why: fault.text(),
+                group: group.name.clone(),
+                position: None,
+            })?;
         let mut servers = Vec::with_capacity(group.servers.len());
+        let mut names = Vec::new();
         for (place, server) in group.servers.into_iter().enumerate() {
             let refusal = |why| Refusal {
                 why,
                 group: group.name.clone(),
-                position: place + 1,
+                position: Some(place + 1),
             };
+            let name = group
+                .tls
+                .as_ref()
+                .map(|settings| {
+                    tls::name_of(settings, &server.address)
+                        .ok_or_else(|| refusal(Fault::Name.text()))
+                })
+                .transpose()?;
             let addresses = match server.address {
                 Address::Literal(address) => vec![address],
                 Address::Name { name, port } => {
@@ -224,6 +249,9 @@ where
                         "an upstream has more than 64 servers once the names are looked up",
                     ));
                 }
+                if let Some(name) = &name {
+                    names.push(name.clone());
+                }
                 servers.push(ServerConfig {
                     address,
                     weight: server.weight,
@@ -236,6 +264,7 @@ where
         done.push(GroupConfig {
             name: group.name,
             servers,
+            tls: config.map(|config| Client::new(config, names)),
         });
     }
     Ok(Completed {

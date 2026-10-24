@@ -28,6 +28,9 @@
 //!    applies the same rule once the body has been read.
 //!
 //! A refusal is a fixed answer with no body that closes the connection.
+//!
+//! The fields of a request of an HTTP/2 stream are first written as the bytes of an HTTP/1.1 head (see
+//! `http2::head`) and then checked by the same rules; the `Head` that results is marked as made from HTTP/2.
 
 use std::ops::Range;
 
@@ -128,6 +131,7 @@ pub struct Head {
     websocket: bool,
     gzip: bool,
     inspectable_type: bool,
+    http2: bool,
 }
 
 impl Head {
@@ -158,12 +162,22 @@ impl Head {
         self.http10
     }
 
-    /// The protocol as the inspection is told: `HTTP/1.0` or `HTTP/1.1`.
+    /// The protocol as the inspection is told: `HTTP/1.0`, `HTTP/1.1`, or `HTTP/2.0` for the head of a stream.
     pub fn proto(&self) -> &'static [u8] {
-        if self.http10 {
+        if self.http2 {
+            b"HTTP/2.0"
+        } else if self.http10 {
             b"HTTP/1.0"
         } else {
             b"HTTP/1.1"
+        }
+    }
+
+    /// The head was made from the fields of an HTTP/2 stream.
+    pub fn into_http2(self) -> Head {
+        Head {
+            http2: true,
+            ..self
         }
     }
 
@@ -505,6 +519,7 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         websocket,
         gzip,
         inspectable_type,
+        http2: false,
     }))
 }
 

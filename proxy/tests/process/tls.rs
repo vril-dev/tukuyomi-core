@@ -23,7 +23,7 @@ use crate::support::*;
 use crate::websocket::open_route;
 
 /// A certificate authority and what it issued, in a directory that is removed when it is dropped.
-struct Pki {
+pub(crate) struct Pki {
     dir: PathBuf,
     serial: u32,
 }
@@ -42,7 +42,7 @@ fn openssl(dir: &Path, args: &[&str]) {
 }
 
 impl Pki {
-    fn new(test: &str) -> Pki {
+    pub(crate) fn new(test: &str) -> Pki {
         let parent = std::env::var("TUKUYOMI_TEST_TMP").expect("TUKUYOMI_TEST_TMP is set");
         let dir = PathBuf::from(parent).join(format!("{test}-pki-{}", std::process::id()));
         DirBuilder::new()
@@ -78,7 +78,7 @@ impl Pki {
 
     /// A certificate for the names, and its key, as `a.pem` and `a.key` for the stem `a`. Issuing again with the
     /// same stem replaces the files.
-    fn issue(&mut self, stem: &str, names: &[&str]) -> (PathBuf, PathBuf) {
+    pub(crate) fn issue(&mut self, stem: &str, names: &[&str]) -> (PathBuf, PathBuf) {
         self.serial += 1;
         let serial = self.serial.to_string();
         let (key, csr, ext, cert) = (
@@ -137,16 +137,21 @@ impl Pki {
         (self.dir.join(cert), self.dir.join(key))
     }
 
-    /// A client that trusts the authority, for the server named `name`.
-    fn client(&self, name: &str, port: u16) -> StreamOwned<ClientConnection, TcpStream> {
+    /// The authority as the roots of a client.
+    pub(crate) fn roots(&self) -> RootCertStore {
         let mut roots = RootCertStore::empty();
         roots
             .add(CertificateDer::from_pem_file(self.dir.join("ca.pem")).unwrap())
             .unwrap();
+        roots
+    }
+
+    /// A client that trusts the authority, for the server named `name`.
+    fn client(&self, name: &str, port: u16) -> StreamOwned<ClientConnection, TcpStream> {
         let config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
             .with_safe_default_protocol_versions()
             .unwrap()
-            .with_root_certificates(roots)
+            .with_root_certificates(self.roots())
             .with_no_client_auth();
         let name = ServerName::try_from(name.to_owned()).unwrap();
         let conn = ClientConnection::new(Arc::new(config), name).unwrap();

@@ -22,7 +22,9 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream as ClientStream;
 
 use super::*;
-use crate::config::{CertificateConfig, ListenerConfig, ListenerKind, MinVersion, TlsConfig};
+use crate::config::{
+    CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion, TlsConfig,
+};
 
 static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
 
@@ -219,8 +221,23 @@ pub(in crate::inbound) fn listener(
                     hosts: hosts.iter().map(|host| host.to_string()).collect(),
                 })
                 .collect(),
+            http2: None,
         }),
     }
+}
+
+/// The same listener, speaking HTTP/2 as well, with settings that no test of the handshake looks at.
+pub(in crate::inbound) fn with_http2(mut listener: ListenerConfig) -> ListenerConfig {
+    if let ListenerKind::Tls(tls) = &mut listener.kind {
+        tls.http2 = Some(Http2Config {
+            max_streams: 128,
+            stream_window: 65535,
+            connection_window: 262_144,
+            max_header_list: 32768,
+            send_buffer: 16384,
+        });
+    }
+    listener
 }
 
 fn runtime() -> Runtime {
@@ -556,6 +573,51 @@ fn the_oldest_version_is_the_setting_and_the_only_protocol_is_http_1_1() {
         let none = shake(&old, pki.any_client(), name("a.example")).await;
         assert_eq!(none.client.unwrap().get_ref().1.alpn_protocol(), None);
         assert!(none.server.is_ok());
+    });
+}
+
+#[test]
+fn h2_is_offered_before_http_1_1_by_a_listener_that_has_http2_and_by_no_other() {
+    runtime().block_on(async {
+        let pki = Pki::new();
+        let a = pki.issue("a", &["a.example"]);
+        let on = Arc::new(
+            Tls::load(
+                &[with_http2(listener(
+                    MinVersion::Tls12,
+                    &[(&a, &["a.example"])],
+                ))],
+                &Files,
+            )
+            .unwrap(),
+        );
+        let both = &[&version::TLS13, &version::TLS12][..];
+        let chosen = |offered: &'static [&'static [u8]]| {
+            let (on, pki) = (on.clone(), &pki);
+            async move {
+                let outcome = shake(&on, pki.client(both, offered), name("a.example")).await;
+                outcome
+                    .client
+                    .ok()
+                    .map(|stream| stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec))
+            }
+        };
+        // The listener prefers `h2`, whatever the order of the client; a client that offers only `http/1.1` or
+        // nothing is served as before; one that offers neither is refused.
+        assert_eq!(
+            chosen(&[b"h2", b"http/1.1"]).await,
+            Some(Some(b"h2".to_vec()))
+        );
+        assert_eq!(
+            chosen(&[b"http/1.1", b"h2"]).await,
+            Some(Some(b"h2".to_vec()))
+        );
+        assert_eq!(
+            chosen(&[b"http/1.1"]).await,
+            Some(Some(b"http/1.1".to_vec()))
+        );
+        assert_eq!(chosen(&[]).await, Some(None));
+        assert_eq!(chosen(&[b"spdy/3"]).await, None);
     });
 }
 
