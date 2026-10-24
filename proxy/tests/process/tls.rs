@@ -137,6 +137,11 @@ impl Pki {
         (self.dir.join(cert), self.dir.join(key))
     }
 
+    /// A file of the directory of the certificates, by its name.
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+
     /// The authority as the roots of a client.
     pub(crate) fn roots(&self) -> RootCertStore {
         let mut roots = RootCertStore::empty();
@@ -147,7 +152,7 @@ impl Pki {
     }
 
     /// A client that trusts the authority, for the server named `name`.
-    fn client(&self, name: &str, port: u16) -> StreamOwned<ClientConnection, TcpStream> {
+    pub(crate) fn client(&self, name: &str, port: u16) -> StreamOwned<ClientConnection, TcpStream> {
         let config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
             .with_safe_default_protocol_versions()
             .unwrap()

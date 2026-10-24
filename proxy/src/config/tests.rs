@@ -1553,3 +1553,322 @@ fn a_key_that_may_be_left_out_is_refused_when_it_is_null() {
     let route = serde_json::json!({"upstream": "api", "rewrite": {}});
     assert_eq!(refusal_of(&with_route(route)), None);
 }
+
+// ---- acme ----
+
+fn acme_object() -> Value {
+    serde_json::json!({
+        "directory_url": "https://ca.example/directory",
+        "contact_email": "ops@example.test",
+        "account_key_file": "/etc/tukuyomi/acme/account.key",
+        "challenge_dir": "/var/lib/tukuyomi/challenges",
+        "ca_file": "/etc/tukuyomi/acme/ca.pem",
+        "timeout_ms": 60000,
+    })
+}
+
+/// A listener that ends TLS with one certificate that has `acme`, for `hosts`.
+fn acme_tls(hosts: &[&str], acme: Value) -> Value {
+    serde_json::json!({
+        "address": "127.0.0.1:443",
+        "tls": {
+            "min_version": "1.2",
+            "certificates": [{
+                "cert_file": "/etc/tukuyomi/tls/a.pem",
+                "key_file": "/etc/tukuyomi/tls/a.key",
+                "hosts": hosts,
+                "acme": acme,
+            }],
+        },
+    })
+}
+
+/// A plain listener, a listener with a certificate that has `acme`, and the `acme` object `object`.
+fn with_acme(object: Value) -> [Edit; 2] {
+    let renew = serde_json::json!({"renew_before_days": 30});
+    [
+        listeners(serde_json::json!([
+            {"address": "127.0.0.1:80"},
+            acme_tls(&["a.example", "b.example"], renew),
+        ])),
+        ("", "acme", object),
+    ]
+}
+
+#[test]
+fn the_acme_object_and_the_certificates_with_acme_go_together_and_need_a_listener_for_the_challenge()
+ {
+    let loaded = parse(&doc(&with_acme(acme_object()))).unwrap();
+    let acme = loaded.acme.unwrap();
+    assert_eq!(acme.directory_url, "https://ca.example/directory");
+    assert_eq!(acme.contact_email, "ops@example.test");
+    assert_eq!(
+        acme.account_key_file,
+        Path::new("/etc/tukuyomi/acme/account.key")
+    );
+    assert_eq!(
+        acme.challenge_dir,
+        Path::new("/var/lib/tukuyomi/challenges")
+    );
+    assert_eq!(acme.ca_file, Path::new("/etc/tukuyomi/acme/ca.pem"));
+    assert_eq!(acme.timeout, Duration::from_millis(60_000));
+    let ListenerKind::Tls(tls) = &loaded.proxy.listeners[1].kind else {
+        panic!("not a TLS listener");
+    };
+    assert_eq!(
+        tls.certificates[0].acme,
+        Some(CertificateAcme {
+            renew_before_days: 30
+        })
+    );
+    // No acme anywhere: none in the result.
+    assert!(parse(BASE.as_bytes()).unwrap().acme.is_none());
+
+    // A certificate with acme and no object; an object and no certificate with acme.
+    let [only_listeners, _] = with_acme(acme_object());
+    refuse(
+        &[only_listeners],
+        "a certificate has acme but the configuration has no acme object",
+    );
+    refuse(
+        &[("", "acme", acme_object())],
+        "the configuration has an acme object but no certificate has acme",
+    );
+    refuse(
+        &[
+            tls_listener_edit(&["a.example"]),
+            ("", "acme", acme_object()),
+        ],
+        "the configuration has an acme object but no certificate has acme",
+    );
+    // The CA asks over plain HTTP, so a listener has to take that: a plain one, or one that redirects.
+    let renew = serde_json::json!({"renew_before_days": 30});
+    let only_tls = || listeners(serde_json::json!([acme_tls(&["a.example"], renew.clone())]));
+    refuse(
+        &[only_tls(), ("", "acme", acme_object())],
+        "a certificate with acme needs a plain or a redirect listener for the challenge",
+    );
+    let redirecting = serde_json::json!([
+        acme_tls(&["a.example"], renew.clone()),
+        {"address": "127.0.0.1:80", "redirect": {"https_port": 443}},
+    ]);
+    pass(&[listeners(redirecting), ("", "acme", acme_object())]);
+
+    // The files that the command writes and reads are all different files.
+    let not_all_different = "the account key file, the ca_file and the cert and key files of the certificates with acme are not all different";
+    for (key, file) in [
+        ("account_key_file", "/etc/tukuyomi/tls/a.key"),
+        ("ca_file", "/etc/tukuyomi/tls/a.pem"),
+        ("ca_file", "/etc/tukuyomi/acme/account.key"),
+    ] {
+        let mut object = acme_object();
+        object[key] = file.into();
+        refuse(&with_acme(object), not_all_different);
+    }
+}
+
+#[test]
+fn no_file_of_the_command_or_of_a_certificate_is_directly_inside_the_challenge_directory() {
+    let refused = "the account key file, the ca_file or a cert or key file of a certificate is directly inside challenge_dir";
+    let dir = "/var/lib/tukuyomi/challenges";
+    // The six files, in the order of the account key, the CA, then the cert and key of a certificate with acme and of
+    // one without.
+    let outside = [
+        "/etc/tukuyomi/acme/account.key",
+        "/etc/tukuyomi/acme/ca.pem",
+        "/etc/tukuyomi/tls/a.pem",
+        "/etc/tukuyomi/tls/a.key",
+        "/etc/tukuyomi/tls/m.pem",
+        "/etc/tukuyomi/tls/m.key",
+    ];
+    let edits = |files: [String; 6]| {
+        let [account, ca, a_cert, a_key, m_cert, m_key] = files;
+        let mut object = acme_object();
+        object["account_key_file"] = account.into();
+        object["ca_file"] = ca.into();
+        let certificates = serde_json::json!([
+            {"cert_file": a_cert, "key_file": a_key, "hosts": ["a.example"], "acme": {"renew_before_days": 30}},
+            {"cert_file": m_cert, "key_file": m_key, "hosts": ["m.example"]},
+        ]);
+        [
+            listeners(serde_json::json!([
+                {"address": "127.0.0.1:80"},
+                {"address": "127.0.0.1:443", "tls": {"min_version": "1.2", "certificates": certificates}},
+            ])),
+            ("", "acme", object),
+        ]
+    };
+    pass(&edits(outside.map(String::from)));
+    for at in 0..outside.len() {
+        let mut files = outside.map(String::from);
+        files[at] = format!("{dir}/f");
+        refuse(&edits(files), refused);
+    }
+    // Only the files of the directory itself are answered with: one in a directory below it is fine.
+    pass(&edits(std::array::from_fn(|i| format!("{dir}/below/{i}"))));
+}
+
+#[test]
+fn every_value_of_the_acme_object_is_checked_and_the_first_one_past_a_bound_is_refused() {
+    let mut cases: Vec<(&str, Value, Option<&str>)> = Vec::new();
+    let url = |tail: usize| Value::from(format!("https://ca.example/{}", "x".repeat(tail)));
+    let longest = 2048 - "https://ca.example/".len();
+    let wrong_url = "acme directory_url is not an https URL of at most 2048 bytes";
+    cases.push(("directory_url", url(longest), None));
+    cases.push(("directory_url", url(longest + 1), Some(wrong_url)));
+    for bad in [
+        "http://ca.example/dir",
+        "https://",
+        "https://ca.example/a b",
+        "ca.example/dir",
+        "https://ca.example/\u{e9}",
+    ] {
+        cases.push(("directory_url", bad.into(), Some(wrong_url)));
+    }
+    let wrong_email = "acme contact_email is not an address of at most 254 bytes";
+    let email_of = |len: usize| Value::from(format!("{}@{}.test", "a".repeat(len), "d".repeat(60)));
+    cases.push(("contact_email", "ops@example.test".into(), None));
+    cases.push(("contact_email", "a.b-c_d+e@mail.example.test".into(), None));
+    cases.push(("contact_email", email_of(64), None));
+    cases.push(("contact_email", email_of(65), Some(wrong_email)));
+    for bad in [
+        "",
+        "ops",
+        "ops@",
+        "@example.test",
+        "ops@example",
+        "ops@@example.test",
+        "ops@exa mple.test",
+        "ops@example.test?cc=x",
+        "ops,x@example.test",
+        "o ps@example.test",
+        "ops@-example.test",
+        "ops@example..test",
+        "ops@.example.test",
+        "ops@example.test.",
+        "ops@exa_mple.test",
+    ] {
+        cases.push(("contact_email", bad.into(), Some(wrong_email)));
+    }
+    let wrong_path = "an acme account_key_file, challenge_dir or ca_file is not an absolute clean path of at most 3840 bytes";
+    for key in ["account_key_file", "challenge_dir", "ca_file"] {
+        cases.push((key, "/etc/tukuyomi/x".into(), None));
+        cases.push((key, format!("/{}", "x".repeat(3839)).into(), None));
+        cases.push((
+            key,
+            format!("/{}", "x".repeat(3840)).into(),
+            Some(wrong_path),
+        ));
+        for bad in ["x", "/", "/a/../b", "/a//b", "/a/", "/a/./b", ""] {
+            cases.push((key, bad.into(), Some(wrong_path)));
+        }
+    }
+    let wrong_time = "acme timeout_ms is not 1 to 600000";
+    for (ms, ok) in [(1, true), (600_000, true), (0, false), (600_001, false)] {
+        cases.push(("timeout_ms", ms.into(), (!ok).then_some(wrong_time)));
+    }
+    for (key, value, sentence) in cases {
+        let mut object = acme_object();
+        object[key] = value.clone();
+        let edits = with_acme(object);
+        match sentence {
+            None => pass(&edits),
+            Some(sentence) => refuse(&edits, sentence),
+        }
+    }
+    // A key that is left out, one that is not known, and null.
+    let mut object = acme_object();
+    object.as_object_mut().unwrap().remove("timeout_ms");
+    refuse(&with_acme(object), "configuration has a missing key");
+    let mut object = acme_object();
+    object["extra"] = 1.into();
+    refuse(&with_acme(object), "configuration has an unknown key");
+    refuse(
+        &with_acme(Value::Null),
+        "configuration has a value of the wrong type",
+    );
+}
+
+#[test]
+fn a_certificate_with_acme_has_names_only_and_renews_1_to_60_days_before_the_end() {
+    let renew = |days: Value| serde_json::json!({"renew_before_days": days});
+    let tls = |hosts: &[&str], acme: Value| {
+        [
+            listeners(serde_json::json!([{"address": "127.0.0.1:80"}, acme_tls(hosts, acme)])),
+            ("", "acme", acme_object()),
+        ]
+    };
+    for days in [1, 30, 60] {
+        pass(&tls(&["a.example"], renew(days.into())));
+    }
+    for days in [0, 61] {
+        refuse(
+            &tls(&["a.example"], renew(days.into())),
+            "acme renew_before_days is not 1 to 60",
+        );
+    }
+    refuse(
+        &tls(&["a.example"], renew((-1).into())),
+        "configuration has a value of the wrong type",
+    );
+    refuse(
+        &tls(&["a.example"], renew("30".into())),
+        "configuration has a value of the wrong type",
+    );
+    // HTTP-01 proves a name, not a wildcard and not an address.
+    refuse(
+        &tls(&["a.example", "*.a.example"], renew(30.into())),
+        "a certificate with acme has a wildcard host",
+    );
+    refuse(
+        &tls(&["192.0.2.1"], renew(30.into())),
+        "a tls host is not a name, or * and a name",
+    );
+    // The same wildcard is fine in a certificate that is put in place by hand.
+    pass(&[tls_listener_edit(&["*.a.example"])]);
+    // The key of the object, left out or unknown, and null (which would make the certificate a manual one).
+    refuse(
+        &tls(&["a.example"], serde_json::json!({})),
+        "configuration has a missing key",
+    );
+    refuse(
+        &tls(
+            &["a.example"],
+            serde_json::json!({"renew_before_days": 30, "mode": "auto"}),
+        ),
+        "configuration has an unknown key",
+    );
+    refuse(
+        &tls(&["a.example"], Value::Null),
+        "configuration has a value of the wrong type",
+    );
+    refuse(
+        &[("", "acme", Value::Null)],
+        "configuration has a value of the wrong type",
+    );
+}
+
+fn tls_listener_edit(hosts: &[&str]) -> Edit {
+    listeners(tls_listeners("127.0.0.1:443", hosts))
+}
+
+#[test]
+fn a_file_of_a_certificate_without_acme_is_no_file_of_the_command() {
+    let refused = "a cert or key file of a certificate without acme is a file of the command or of a certificate with acme";
+    let config = |manual_key: &str| {
+        let certificates = serde_json::json!([
+            {"cert_file": "/etc/tukuyomi/tls/a.pem", "key_file": "/etc/tukuyomi/tls/a.key", "hosts": ["a.example"], "acme": {"renew_before_days": 30}},
+            {"cert_file": "/etc/tukuyomi/tls/m.pem", "key_file": manual_key, "hosts": ["m.example"]},
+        ]);
+        [
+            listeners(serde_json::json!([
+                {"address": "127.0.0.1:80"},
+                {"address": "127.0.0.1:443", "tls": {"min_version": "1.2", "certificates": certificates}},
+            ])),
+            ("", "acme", acme_object()),
+        ]
+    };
+    pass(&config("/etc/tukuyomi/tls/m.key"));
+    refuse(&config("/etc/tukuyomi/acme/account.key"), refused);
+    refuse(&config("/etc/tukuyomi/tls/a.key"), refused);
+}

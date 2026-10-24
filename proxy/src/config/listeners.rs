@@ -13,7 +13,10 @@
 //! certificate has 1 to 64 hosts, each a name (lowercase letters, digits, `-` and `.`, in labels of 1 to 63 bytes of
 //! which the last starts with a letter, 253 bytes at most, so no IP literal) or `*.` and a name, which stands for any
 //! one label in front of the name. A host is written once in a listener. The files are not read here:
-//! `inbound::transport::tls` reads them when the proxy starts. `tls` may also have `http2`, an object that turns
+//! `inbound::transport::tls` reads them when the proxy starts. A certificate may also have `acme`,
+//! `{"renew_before_days"}` (1 to 60): the command `acme renew` issues it and keeps it renewed (see `acme`, and
+//! `acme` of the configuration), so its hosts are names only (no `*.`), and its files may not exist yet when the proxy
+//! starts. `tls` may also have `http2`, an object that turns
 //! HTTP/2 on for the listener and has five keys, all of them required: `max_streams` (1 to 256, the streams a client
 //! may have open at once), `stream_window` (65535 to 1 MiB, the receive window of a stream), `connection_window`
 //! (65535 to 4 MiB, the receive window of the connection), `max_header_list` (1 KiB to four times `max_head_bytes`,
@@ -34,6 +37,9 @@ use serde::Deserialize;
 
 use super::forward::host_ok;
 use super::{ConfigError, MAX_STORE_DIR, Object, address, clean_abs, ensure};
+
+/// The most days before the end of a certificate with `acme` at which it is renewed.
+const MAX_RENEW_DAYS: u64 = 60;
 
 /// The most listeners.
 const MAX_LISTENERS: usize = 8;
@@ -104,12 +110,20 @@ pub enum MinVersion {
 }
 
 /// A certificate chain file, its private key file, and the hosts that the certificate serves, in the form the file
-/// writes them: a lowercase name, or `*.` and a name.
+/// writes them: a lowercase name, or `*.` and a name. With `acme` the command `acme renew` writes the two files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertificateConfig {
     pub cert_file: PathBuf,
     pub key_file: PathBuf,
     pub hosts: Vec<String>,
+    pub acme: Option<CertificateAcme>,
+}
+
+/// The `acme` object of a certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CertificateAcme {
+    /// The certificate is renewed when less than this many days are left of its time of validity.
+    pub renew_before_days: u32,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +161,14 @@ struct RawCertificate {
     cert_file: String,
     key_file: String,
     hosts: Vec<String>,
+    #[serde(default, deserialize_with = "super::present")]
+    acme: Option<Object<RawCertificateAcme>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCertificateAcme {
+    renew_before_days: u64,
 }
 
 #[derive(Deserialize)]
@@ -260,6 +282,24 @@ pub(super) fn holds_fit(listeners: &[ListenerConfig], upstream_max_head_bytes: u
     })
 }
 
+/// The `acme` object of a certificate with these hosts. HTTP-01 cannot prove a wildcard name, so there is none.
+fn certificate_acme(
+    raw: RawCertificateAcme,
+    hosts: &[String],
+) -> Result<CertificateAcme, ConfigError> {
+    ensure(
+        (1..=MAX_RENEW_DAYS).contains(&raw.renew_before_days),
+        "acme renew_before_days is not 1 to 60",
+    )?;
+    ensure(
+        hosts.iter().all(|host| !host.starts_with("*.")),
+        "a certificate with acme has a wildcard host",
+    )?;
+    Ok(CertificateAcme {
+        renew_before_days: u32::try_from(raw.renew_before_days).unwrap_or(u32::MAX),
+    })
+}
+
 fn tls(raw: RawTls) -> Result<TlsConfig, ConfigError> {
     let min_version = match raw.min_version.as_str() {
         "1.2" => MinVersion::Tls12,
@@ -282,10 +322,15 @@ fn tls(raw: RawTls) -> Result<TlsConfig, ConfigError> {
                 "a tls host is not a name, or * and a name",
             )?;
         }
+        let acme = raw
+            .acme
+            .map(|Object(acme)| certificate_acme(acme, &raw.hosts))
+            .transpose()?;
         certificates.push(CertificateConfig {
             cert_file: file(raw.cert_file)?,
             key_file: file(raw.key_file)?,
             hosts: raw.hosts,
+            acme,
         });
     }
     let mut seen: Vec<&String> = certificates.iter().flat_map(|c| &c.hosts).collect();

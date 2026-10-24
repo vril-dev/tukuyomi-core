@@ -79,6 +79,7 @@ pub(in crate::forward) fn ctx_of(forward: &ForwardConfig, cfg: ProxyConfig) -> C
         log: start_logger().unwrap(),
         ingress: Arc::new(Ingress::new(to_driver)),
         tls: Tls::none(),
+        challenge: None,
         cfg,
     }
 }

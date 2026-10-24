@@ -512,7 +512,7 @@ fn remove_entry(path: &Path) -> io::Result<()> {
 /// one. The kind of fault is `InvalidData` for a file that is not regular, is another one than `same_as`, is over
 /// the limit or changed its size while it was read; the faults of the file system keep their own kind (`NotFound`
 /// for an absent file).
-pub(super) fn read_regular(
+pub(crate) fn read_regular(
     path: &Path,
     limit: u64,
     same_as: Option<(u64, u64)>,

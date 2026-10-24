@@ -8,7 +8,8 @@
 //! A client that offers both gets `h2` from a listener that has it.
 //!
 //! The certificate is chosen by the server name of the client (see `sni`). A client that sends no name, or a name
-//! that no host of the listener has, gets no certificate and the handshake fails: there is no default certificate.
+//! that no host of the listener has, or a name of a certificate with `acme` that has not been issued yet, gets no
+//! certificate and the handshake fails: there is no default certificate.
 //! The keys come from the material in use when the handshake starts (see `certs`). A handshake that has finished
 //! tells which hosts the certificate it used covers.
 
@@ -41,7 +42,7 @@ struct Resolver {
 impl ResolvesServerCert for Resolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let index = self.names.find(hello.server_name()?)?;
-        self.store.current().get(self.listener)?.get(index).cloned()
+        self.store.current().get(self.listener)?.get(index)?.clone()
     }
 }
 

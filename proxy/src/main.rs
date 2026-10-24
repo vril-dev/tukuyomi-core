@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 //! The proxy process: start-up, the wait for the kernel, the listeners and the stop. When the first argument is
-//! `rules` the process is a short command on the rules store instead (`rules::command`), and nothing of the proxy
-//! starts.
+//! `rules` the process is a short command on the rules store instead (`rules::command`), and when it is `acme` it is
+//! the short command that issues and renews the certificates that have `acme` (`acme::command`); nothing of the proxy
+//! starts in either.
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration file),
 //! the host checks, the configuration, the lookup of the names of the upstream servers (in the same step, the CA file
@@ -25,7 +26,9 @@
 //! SIGUSR2 reads every certificate and key file of every TLS listener again. If all of them pass the checks, they
 //! replace the old ones for the handshakes that start from then on (a connection that is open keeps what it has);
 //! if one does not, none is replaced and a line says which. It is a line and nothing else before the listeners are
-//! bound and while the proxy stops, and it has nothing to do with SIGUSR1.
+//! bound and while the proxy stops, and it has nothing to do with SIGUSR1. A certificate with `acme` whose files do
+//! not exist yet is not a refusal, at the start or at SIGUSR2: a line names it, and it is left out of the handshakes
+//! until a SIGUSR2 finds its files (the command `acme renew` makes them).
 //!
 //! The first cause of a stop (a signal, or a failure of start-up or of the driver) fixes the time `t0`. The stop
 //! closes the listeners and the way from the connections to the driver (a request that starts from then on is
@@ -56,10 +59,12 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, timeout_at};
 use tukuyomi_kernel::{Failure, Phase};
+use tukuyomi_proxy::acme;
 use tukuyomi_proxy::config::{self, ForwardConfig, ProxyConfig, addresses};
 use tukuyomi_proxy::forward::group::Upstreams;
 use tukuyomi_proxy::forward::resolve;
 use tukuyomi_proxy::host;
+use tukuyomi_proxy::inbound::challenge::Challenge;
 use tukuyomi_proxy::inbound::conn::Ctx;
 use tukuyomi_proxy::inbound::session;
 use tukuyomi_proxy::inbound::transport::accept::{Accepted, Acceptor, Arrival};
@@ -105,6 +110,15 @@ fn start(log: &Log) -> u8 {
             command::Exit::Usage => EXIT_USAGE,
         };
     }
+    if args.peek().is_some_and(|arg| arg == "acme") {
+        args.next();
+        let args: Vec<OsString> = args.collect();
+        return match acme::command::run(&args, &mut io::stdout(), &mut io::stderr()) {
+            acme::command::Exit::Done => EXIT_OK,
+            acme::command::Exit::Failed => EXIT_FAILED,
+            acme::command::Exit::Usage => EXIT_USAGE,
+        };
+    }
     let path = match (args.next(), args.next()) {
         (Some(path), None) if config::clean_abs(Path::new(&path)) => PathBuf::from(path),
         _ => {
@@ -146,6 +160,10 @@ fn start(log: &Log) -> u8 {
             return EXIT_FAILED;
         }
     };
+    for place in tls.waiting() {
+        log.line(&format!("start: tls certificate not issued yet ({place})"));
+    }
+    let challenge = Challenge::new(loaded.acme.as_ref(), &loaded.proxy.listeners);
     let rules = match store::open(&loaded.store) {
         Ok(rules) => rules,
         Err(e) => {
@@ -219,6 +237,7 @@ fn start(log: &Log) -> u8 {
         loaded.proxy,
         forward,
         tls,
+        challenge,
         kernel,
         generation,
         mode,
@@ -237,6 +256,7 @@ async fn run(
     proxy: ProxyConfig,
     forward: ForwardConfig,
     tls: Tls,
+    challenge: Option<Challenge>,
     kernel: tukuyomi_kernel::Config,
     generation: Fingerprint,
     mode: Mode,
@@ -292,6 +312,7 @@ async fn run(
         log: log.clone(),
         ingress: Arc::new(Ingress::new(ingress.clone())),
         tls,
+        challenge,
     });
     let cause = until_stop(&mut waits, &ctx, &ingress, &mut switcher).await;
     stop(
@@ -401,7 +422,13 @@ fn reload(waits: &mut Waits, switcher: &mut Switcher, ingress: &SyncSender<Msg>,
 fn reload_certificates(ctx: &Ctx) {
     ctx.log.line("reload: SIGUSR2");
     match ctx.tls.reload(&ctx.cfg.listeners, &Files) {
-        Ok(()) => ctx.log.line("reload: certificates replaced"),
+        Ok(()) => {
+            ctx.log.line("reload: certificates replaced");
+            for place in ctx.tls.waiting() {
+                ctx.log
+                    .line(&format!("reload: tls certificate not issued yet ({place})"));
+            }
+        }
         Err(refusal) => ctx
             .log
             .line(&format!("reload: certificates refused: {refusal}")),

@@ -1,5 +1,7 @@
+use std::fs;
 use std::future::Future;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant as StdInstant};
@@ -13,7 +15,12 @@ use tokio::time::{sleep, timeout};
 use tukuyomi_kernel::Verdict;
 
 use super::*;
-use crate::config::{ForwardConfig, ListenerConfig, MinVersion, RouteConfig};
+use crate::config::{
+    AcmeConfig, CertificateAcme, CertificateConfig, ForwardConfig, ListenerConfig, MinVersion,
+    RouteConfig, TlsConfig,
+};
+use crate::inbound::challenge::Challenge;
+use crate::inbound::challenge::tests::Dir;
 use crate::inbound::conn::tests::{
     BLOCK, FORM, Mode, Parsed, Rig, config, finish_sending, form_post, guarded, parse_response,
     put, read_all, routed_to_h_test, run,
@@ -1392,5 +1399,135 @@ fn a_redirect_listener_sends_a_served_host_with_a_route_to_https_and_answers_any
             );
             assert!(rig.finish(tokio::spawn(async {})).await.is_empty());
         }
+    });
+}
+
+// ---- the challenge of the CA that issues the certificates with acme ----
+
+/// The challenge for the host `a.example` with its files in `dir`.
+fn challenge_in(dir: &Path) -> Challenge {
+    let acme = AcmeConfig {
+        directory_url: "https://ca.example/dir".to_owned(),
+        contact_email: "ops@example.test".to_owned(),
+        account_key_file: PathBuf::from("/a"),
+        challenge_dir: dir.to_path_buf(),
+        ca_file: PathBuf::from("/ca"),
+        timeout: SEC,
+    };
+    let listeners = [ListenerConfig {
+        address: "127.0.0.1:1".parse().unwrap(),
+        kind: ListenerKind::Tls(TlsConfig {
+            min_version: MinVersion::Tls12,
+            certificates: vec![CertificateConfig {
+                cert_file: PathBuf::from("/c"),
+                key_file: PathBuf::from("/k"),
+                hosts: vec!["a.example".to_owned()],
+                acme: Some(CertificateAcme {
+                    renew_before_days: 30,
+                }),
+            }],
+            http2: None,
+        }),
+    }];
+    Challenge::new(Some(&acme), &listeners).unwrap()
+}
+
+/// One request on a new connection to the listener at `listener`, and the answer, whole: its head and its body.
+async fn answered(rig: &Rig, listener: usize, request: &str) -> (Parsed, Vec<u8>) {
+    let (client, task) = rig.connect_on(listener).await;
+    put(&client, request.as_bytes()).await;
+    let raw = read_all(&client).await;
+    timeout(30 * SEC, task).await.unwrap().unwrap();
+    let end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    (parse_response(&raw[..end]), raw[end..].to_vec())
+}
+
+#[test]
+fn the_challenge_is_answered_before_all_else_on_a_plain_and_a_redirect_listener_and_never_on_tls() {
+    run(async {
+        let pki = Pki::new();
+        let proofs = Dir::new();
+        fs::write(proofs.0.join("Tok_-1"), b"abc.def").unwrap();
+        let rig = over_tls(&pki, kept(), Mode::Answer(BLOCK), &subdomains_only(), 443)
+            .await
+            .with_challenge(challenge_in(&proofs.0));
+        let path = "/.well-known/acme-challenge/Tok_-1";
+        let request = |method: &str, target: &str, host: &str| {
+            format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+        };
+        // Listener 1 is plain and listener 2 redirects; neither has a route for `a.example`.
+        for listener in [1, 2] {
+            let (head, body) =
+                answered(&rig, listener, &request("GET", path, "A.Example:80")).await;
+            assert_eq!(head.status, 200, "{listener}");
+            assert_eq!(head.all("content-type"), ["text/plain"]);
+            assert_eq!(head.all("content-length"), ["7"]);
+            assert_eq!(body, b"abc.def");
+            // A HEAD has the length and no body.
+            let (head, body) = answered(&rig, listener, &request("HEAD", path, "a.example")).await;
+            assert_eq!((head.status, head.all("content-length")), (200, vec!["7"]));
+            assert!(body.is_empty());
+            // A token with no file is 404.
+            let missing = "/.well-known/acme-challenge/Tok_-2";
+            let (head, body) =
+                answered(&rig, listener, &request("GET", missing, "a.example")).await;
+            assert_eq!((head.status, head.all("content-length")), (404, vec!["0"]));
+            assert!(body.is_empty());
+            // A host that is no acme host, a query and an escape are not the challenge.
+            let query = format!("{path}?x=1");
+            for (target, host) in [
+                (path, "x.a.example"),
+                (query.as_str(), "a.example"),
+                ("/.well-known/acme-challenge/%54ok_-1", "a.example"),
+            ] {
+                let (head, body) = answered(&rig, listener, &request("GET", target, host)).await;
+                assert_ne!(head.status, 200, "{listener} {target} {host}");
+                assert_ne!(body, b"abc.def");
+            }
+        }
+        // A connection goes on after the answer, and the next request is served as any other.
+        let (client, task) = rig.connect_on(1).await;
+        let pipelined = [
+            get_for(path, "a.example"),
+            request("GET", "/other", "x.a.example").into_bytes(),
+        ]
+        .concat();
+        put(&client, &pipelined).await;
+        let raw = read_all(&client).await;
+        timeout(30 * SEC, task).await.unwrap().unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK\r\n")
+                && text.contains("\r\n\r\nabc.defHTTP/1.1 403 "),
+            "{text}"
+        );
+
+        // A TLS listener does not answer it: the request is routed (and has no route), whatever the file says.
+        let (client, task) = rig.connect_on(0).await;
+        let mut stream = shake(&pki, client).await;
+        stream.write_all(&get_for(path, "a.example")).await.unwrap();
+        let (head, body) = tls_response(&mut stream).await.unwrap();
+        assert_eq!(head.status, 404);
+        assert!(body.is_empty());
+        stream.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).await.unwrap(), 0);
+        timeout(30 * SEC, task).await.unwrap().unwrap();
+
+        let lines = rig.lines.clone();
+        // Only the two requests of the plain listener for `x.a.example` were inspected; no challenge ever was.
+        assert_eq!(rig.finish(tokio::spawn(async {})).await.len(), 2);
+        let lines = lines.take();
+        let count = |text: &str| lines.iter().filter(|l| l.contains(text)).count();
+        assert_eq!(
+            count(": answered 200 acme challenge rule - "),
+            5,
+            "{lines:?}"
+        );
+        assert_eq!(
+            count(": answered 404 acme challenge rule - "),
+            2,
+            "{lines:?}"
+        );
     });
 }

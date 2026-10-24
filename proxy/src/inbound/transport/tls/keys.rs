@@ -1,13 +1,14 @@
 //! Where a certificate and its private key come from.
 //!
 //! `KeySource` is the one way in: it gives the chain and a key that can sign. `Files` reads two PEM files. A file
-//! is a regular file of at most 1 MiB. The certificate file holds 1 to 10 certificates, the first of which is the
-//! one for the host. The key file holds exactly one private key, in a form (PKCS#8, SEC1 or PKCS#1) of a type that
-//! the crypto provider can load. The bytes of the key file and the key in the form of the file are overwritten with
-//! zeros as soon as the provider has made its own key of them, or the load has failed.
+//! is a regular file of at most 1 MiB (`read_file` opens a file so, with the size as a parameter, for the account key
+//! too). The certificate file holds 1 to 10 certificates, the first of which is the one for the host. The key file
+//! holds exactly one private key, in a form (PKCS#8, SEC1 or PKCS#1) of a type that the crypto provider can load. The
+//! bytes of the key file and the key in the form of the file are overwritten with zeros as soon as the provider has
+//! made its own key of them, or the load has failed.
 
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -37,8 +38,8 @@ pub trait KeySource {
 #[derive(Clone, Copy, Debug)]
 pub struct Files;
 
-/// A whole file, zeroed when it is dropped.
-fn read(path: &Path) -> Result<Zeroizing<Vec<u8>>, Fault> {
+/// A whole file of at most `limit` bytes, zeroed when it is dropped. A file that does not exist is `Fault::Missing`.
+pub(crate) fn read_file(path: &Path, limit: u64) -> Result<Zeroizing<Vec<u8>>, Fault> {
     // O_NONBLOCK: opening a FIFO must not wait for a writer; the check of the file type below then refuses it. It
     // does not affect reads of a regular file. O_NOCTTY: a terminal that is opened before that check is never made
     // the controlling terminal of the process. A link is followed (there is no O_NOFOLLOW): the path of a certificate
@@ -48,21 +49,27 @@ fn read(path: &Path) -> Result<Zeroizing<Vec<u8>>, Fault> {
         .read(true)
         .custom_flags(O_NONBLOCK | O_NOCTTY)
         .open(path)
-        .map_err(|_| Fault::Unreadable)?;
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                Fault::Missing
+            } else {
+                Fault::Unreadable
+            }
+        })?;
     let meta = file.metadata().map_err(|_| Fault::Unreadable)?;
     if !meta.is_file() {
         return Err(Fault::Unreadable);
     }
-    if meta.len() > MAX_FILE {
+    if meta.len() > limit {
         return Err(Fault::TooLarge);
     }
     // Room for the byte that shows the end, so that the bytes already read are not moved to a new place.
     let room = usize::try_from(meta.len()).map_or(0, |n| n.saturating_add(1));
     let mut bytes = Zeroizing::new(Vec::with_capacity(room));
-    file.take(MAX_FILE + 1)
+    file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|_| Fault::Unreadable)?;
-    if u64::try_from(bytes.len()).is_ok_and(|n| n > MAX_FILE) {
+    if u64::try_from(bytes.len()).is_ok_and(|n| n > limit) {
         return Err(Fault::TooLarge);
     }
     Ok(bytes)
@@ -71,7 +78,7 @@ fn read(path: &Path) -> Result<Zeroizing<Vec<u8>>, Fault> {
 impl KeySource for Files {
     fn load(&self, cert_file: &Path, key_file: &Path) -> Result<CertifiedKey, Fault> {
         let chain = {
-            let bytes = read(cert_file)?;
+            let bytes = read_file(cert_file, MAX_FILE)?;
             CertificateDer::pem_slice_iter(&bytes)
                 .take(MAX_CHAIN + 1)
                 .collect::<Result<Vec<_>, _>>()
@@ -80,7 +87,7 @@ impl KeySource for Files {
         if chain.is_empty() || chain.len() > MAX_CHAIN {
             return Err(Fault::NotCertificates);
         }
-        let bytes = read(key_file)?;
+        let bytes = read_file(key_file, MAX_FILE)?;
         let mut keys = PrivateKeyDer::pem_slice_iter(&bytes)
             .take(2)
             .map(|key| key.map(Zeroizing::new))

@@ -2,7 +2,9 @@
 //!
 //! The head was checked by `head` before this runs. On an HTTP/1.1 connection `http1::gate` passed it, and the session
 //! hands it over with the request that hyper made of the same bytes; on an HTTP/2 connection it was made from the
-//! fields of the stream (see `http2::head`). The route for the request is looked up first, by its `Host` and its target
+//! fields of the stream (see `http2::head`). A request for the challenge of the CA that issues the certificates with
+//! `acme`, on a plain listener, is answered before all that follows (see `challenge`). The route for the request is
+//! looked up first, by its `Host` and its target
 //! as the client sent them. A request that no route holds for, with no default group, is answered with 404, and one
 //! from a client that the access lists of its route turn away with 403, before anything of its body is read and before
 //! the inspection is asked for. So is a request on a connection that ended TLS, whose `Host` is not one of the hosts of
@@ -27,7 +29,8 @@
 //! route it goes to (see `route`).
 //!
 //! Every answer that `answer` makes, and the fixed answer that `head` holds for a refused head, has an empty
-//! body and `Content-Length: 0` (not for 204 and 304). Whether the connection goes on after the response is not
+//! body and `Content-Length: 0` (not for 204 and 304); the answer to the challenge of the CA has the file for its body,
+//! or is the 404 of `answer`. Whether the connection goes on after the response is not
 //! decided here (see `session`); this only tells whether the body of the request was read to its end. A request
 //! whose peer went away is closed without an answer, and a response that fails after its head was sent is cut off
 //! without its terminator.
@@ -58,8 +61,9 @@ use crate::forward::group::{Route, Upstreams};
 use crate::forward::origin::{self, Forward, OriginBody, OriginError};
 use crate::forward::tunnel::{self, Record, Tunnel};
 use crate::inbound::answer::{
-    Abort, Decision, Noted, Out, Passed, Reply, Stop, Via, answer, decide, who,
+    Abort, Decision, Noted, Out, Passed, Reply, Stop, Via, answer, decide, text, who,
 };
+use crate::inbound::challenge::{Challenge, Proof};
 use crate::inbound::head::{Head, Reject};
 use crate::inbound::represent::{Represented, gunzip, represent};
 use crate::inbound::transport::io::Gauge;
@@ -71,7 +75,7 @@ use crate::rules::routes::SharedRoutes;
 /// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
 /// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, the
 /// upstream groups with the routes to them and the connections that wait to be used again, the way to the driver,
-/// and the TLS of the listeners that end it.
+/// the TLS of the listeners that end it, and the answer to the challenge of the CA, if the configuration has `acme`.
 pub struct Ctx {
     pub cfg: ProxyConfig,
     pub budget: Arc<Semaphore>,
@@ -81,6 +85,7 @@ pub struct Ctx {
     pub log: Log,
     pub ingress: Arc<Ingress>,
     pub tls: Tls,
+    pub challenge: Option<Challenge>,
 }
 
 /// How the listener that took a connection carries its requests: over plain HTTP, or over TLS, with the hosts of the
@@ -195,6 +200,9 @@ impl Conn {
 
     /// The service: one request.
     pub(super) async fn handle(&self, parts: Parts, body: Incoming) -> Handled {
+        if let Some(handled) = self.challenge() {
+            return handled;
+        }
         let (reply, response, tunnel, stream) = match self.exchange(parts, body).await {
             Ok(Answered {
                 response,
@@ -232,6 +240,34 @@ impl Conn {
             tunnel,
             stream,
         }
+    }
+
+    /// The answer to the challenge of the CA if the request is one and the listener is a plain one: nothing of it is
+    /// read or checked besides its head, and it takes no inspection and no route. The connection goes on only if
+    /// there is no body to read, as after an answer that turns a request away.
+    fn challenge(&self) -> Option<Handled> {
+        if !matches!(self.scheme, Scheme::Http) {
+            return None;
+        }
+        let proof = self.ctx.challenge.as_ref()?.proof(&self.head)?;
+        self.note_empty_body();
+        let (reply, response) = match proof {
+            Proof::Found(body) => (
+                Reply::answered(200),
+                text(Bytes::from(body), self.head.method() == b"HEAD"),
+            ),
+            Proof::Missing => (Reply::answered(404), answer(404)),
+        };
+        Some(Handled {
+            noted: Noted {
+                reply,
+                client: self.client.ip(),
+                via: None,
+            },
+            response: Ok(response),
+            tunnel: None,
+            stream: None,
+        })
     }
 
     /// Everything up to the response of the upstream, and how the request was let through.
@@ -363,10 +399,15 @@ impl Conn {
     /// The answer to a request that is turned away before its body is read. The connection goes on after it only if
     /// there was no body to read.
     fn turned_away(&self, status: u16, reason: &'static str) -> Stop {
+        self.note_empty_body();
+        Reply::rejected(status, reason).into()
+    }
+
+    /// A request with no body has been read to its end, whatever the answer is.
+    fn note_empty_body(&self) {
         if !self.head.chunked() && self.head.content_length().unwrap_or(0) == 0 {
             self.read_done.store(true, Ordering::Release);
         }
-        Reply::rejected(status, reason).into()
     }
 
     /// Takes `n` bytes of the budget.

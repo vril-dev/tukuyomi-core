@@ -2,13 +2,14 @@
 //! and what SIGUSR2 replaces.
 //!
 //! `Tls::load` reads and checks every certificate of every TLS listener and makes the handshake of each; one that
-//! fails refuses the start. `Tls::reload` reads and checks them all again, and puts the new certificates in use only
+//! fails refuses the start, except a certificate with `acme` whose files do not exist yet, which waits (`waiting`).
+//! `Tls::reload` reads and checks them all again, and puts the new certificates in use only
 //! if every one passes; the hosts of the certificates are those of the settings and do not change, so a connection
 //! keeps what it has and only the handshakes that start afterwards use the new ones.
 
 use std::sync::Arc;
 
-use super::certs::{Fault, Refusal, Store, read_all};
+use super::certs::{Fault, Place, Refusal, Store, read_all};
 use super::handshake::Handshake;
 use super::keys::KeySource;
 use crate::config::{ListenerConfig, ListenerKind};
@@ -61,6 +62,24 @@ impl Tls {
     ) -> Result<(), Refusal> {
         self.store.replace(read_all(listeners, source)?);
         Ok(())
+    }
+
+    /// The certificates with `acme` whose files did not exist when the certificates were last read: they are not in
+    /// use, and the handshakes for their hosts are refused.
+    pub fn waiting(&self) -> Vec<Place> {
+        let material = self.store.current();
+        let mut places = Vec::new();
+        for (listener, keys) in material.iter().enumerate() {
+            for (certificate, key) in keys.iter().enumerate() {
+                if key.is_none() {
+                    places.push(Place {
+                        listener: listener + 1,
+                        certificate: certificate + 1,
+                    });
+                }
+            }
+        }
+        places
     }
 
     /// The handshake of the listener at `listener`, if it ends TLS.

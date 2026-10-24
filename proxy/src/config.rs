@@ -1,16 +1,19 @@
 //! The configuration file: one JSON object `{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store":
-//! {..}}}`; every value is chosen by the operator and checked here.
+//! {..}}, "acme": {..}}`; every value is chosen by the operator and checked here.
 //!
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present (a
 //! route may leave out its `host`, its `path`, its `access`, its `rewrite` and its `stream`; `access` and `rewrite`
 //! have no key that must be present, see `rewrite`, and a `stream` has all three; an upstream group may leave out its
 //! `tls`, which may leave out its `server_name`; a listener may leave out its `tls` and its `redirect`, and the `tls`
-//! of a listener may leave out its `http2`); an unknown or repeated key is refused, and so is a value of the wrong
+//! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
+//! may leave out `acme`, which it must have if and only if a certificate has one, see `acme`); an unknown or repeated
+//! key is refused, and so is a value of the wrong
 //! type, an array in place of an object and `null` for a key that may be left out included (such a key is either left
 //! out or has a value). A refusal is one fixed sentence per kind of fault and never carries a key or a value from the
 //! file. Then the values are checked in a fixed order and the first broken rule is returned: the `proxy` bounds, the
 //! `forward` values (see `forward`; the names of the servers are not looked up here, `forward::resolve` does that when
-//! the proxy starts), the `rules.store` values, the conversion of the `kernel` object into `tukuyomi_kernel::Config`
+//! the proxy starts), the `rules.store` values, the `acme` object with the certificates that have `acme`, the
+//! conversion of the `kernel` object into `tukuyomi_kernel::Config`
 //! with that type's own check, and last the relations between the `proxy` and `kernel` objects.
 //!
 //! Times are whole milliseconds under keys that end in `_ms`; the `proxy` times run from 1 ms to 3600 s, except
@@ -40,16 +43,19 @@ use tukuyomi_kernel::limits::{BODY, HEADER_TOTAL};
 use crate::forward::client_ip::Cidr;
 use crate::rules::bundle::Fingerprint;
 
+mod acme;
 mod forward;
 mod listeners;
 mod rewrite;
 
+pub use acme::AcmeConfig;
 pub(crate) use forward::MAX_SERVERS;
 pub use forward::{
     Address, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig, Stream,
 };
 pub use listeners::{
-    CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion, TlsConfig, addresses,
+    CertificateAcme, CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion,
+    TlsConfig, addresses,
 };
 
 const MAX_FILE: u64 = 256 * 1024;
@@ -124,6 +130,8 @@ pub struct Loaded {
     pub forward: ForwardSettings,
     pub kernel: KernelSettings,
     pub store: StoreConfig,
+    /// There if and only if a certificate has `acme`.
+    pub acme: Option<AcmeConfig>,
 }
 
 /// Where the rule generations are kept, as the file names it.
@@ -165,6 +173,8 @@ struct RawFile {
     forward: Object<forward::RawForward>,
     kernel: Object<RawKernel>,
     rules: Object<RawRules>,
+    #[serde(default, deserialize_with = "present")]
+    acme: Option<Object<acme::RawAcme>>,
 }
 
 #[derive(Deserialize)]
@@ -302,6 +312,7 @@ fn parse(bytes: &[u8]) -> Result<Loaded, ConfigError> {
         file.forward.0,
         file.rules.0.store.0,
         file.kernel.0,
+        file.acme,
     )
 }
 
@@ -382,6 +393,7 @@ fn build(
     f: forward::RawForward,
     s: RawStore,
     k: RawKernel,
+    a: Option<Object<acme::RawAcme>>,
 ) -> Result<Loaded, ConfigError> {
     let listeners = listeners::check(p.listeners)?;
     ensure(within(p.max_conns, 1, 65536), "max_conns is out of range")?;
@@ -497,6 +509,8 @@ fn build(
         dir.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
         "rules store dir is over 3840 bytes",
     )?;
+
+    let acme = acme::check(a, &listeners)?;
 
     let kernel = tukuyomi_kernel::Config {
         inspector: PathBuf::from(k.inspector),
@@ -644,6 +658,7 @@ fn build(
         forward,
         kernel: KernelSettings(kernel),
         store: StoreConfig::File { dir },
+        acme,
     })
 }
 

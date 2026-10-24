@@ -23,7 +23,8 @@ use tokio_rustls::client::TlsStream as ClientStream;
 
 use super::*;
 use crate::config::{
-    CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion, TlsConfig,
+    CertificateAcme, CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion,
+    TlsConfig,
 };
 
 static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
@@ -219,6 +220,7 @@ pub(in crate::inbound) fn listener(
                     cert_file: pair.cert.clone(),
                     key_file: pair.key.clone(),
                     hosts: hosts.iter().map(|host| host.to_string()).collect(),
+                    acme: None,
                 })
                 .collect(),
             http2: None,
@@ -252,6 +254,7 @@ fn a_host_is_found_exactly_or_by_one_label_in_front_of_a_wildcard_and_the_exact_
         cert_file: PathBuf::from("/a"),
         key_file: PathBuf::from("/b"),
         hosts: hosts.iter().map(|host| host.to_string()).collect(),
+        acme: None,
     };
     let names = Names::new(&[
         certificate(&["*.a.example", "other.example"]),
@@ -365,11 +368,8 @@ fn a_file_that_is_missing_too_large_or_not_what_it_should_be_refuses_the_start()
     let with = |cert: PathBuf, key: PathBuf| one(&Pair { cert, key });
 
     let missing = pki.dir.join("missing.pem");
-    assert_eq!(
-        with(missing.clone(), a.key.clone()),
-        Fault::Unreadable.text()
-    );
-    assert_eq!(with(a.cert.clone(), missing), Fault::Unreadable.text());
+    assert_eq!(with(missing.clone(), a.key.clone()), Fault::Missing.text());
+    assert_eq!(with(a.cert.clone(), missing), Fault::Missing.text());
     // A directory is not a file.
     assert_eq!(
         with(pki.dir.clone(), a.key.clone()),
@@ -428,6 +428,129 @@ fn a_file_that_is_missing_too_large_or_not_what_it_should_be_refuses_the_start()
         b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
     );
     assert_eq!(with(a.cert.clone(), broken), Fault::KeyType.text());
+}
+
+/// The listener of `listener` with the certificate at `place` (from 0) made one that has `acme`.
+fn with_acme(mut listener: ListenerConfig, place: usize) -> ListenerConfig {
+    if let ListenerKind::Tls(tls) = &mut listener.kind {
+        tls.certificates[place].acme = Some(CertificateAcme {
+            renew_before_days: 30,
+        });
+    }
+    listener
+}
+
+#[test]
+fn only_a_file_that_does_not_exist_is_no_refusal_and_only_for_a_certificate_with_acme() {
+    let pki = Pki::new();
+    let a = pki.issue("a", &["a.example"]);
+    let b = pki.issue("b", &["b.example"]);
+    let nowhere = |name: &str| pki.dir.join(name);
+    let torn = |cert: &Pair| {
+        load(with_acme(
+            listener(MinVersion::Tls12, &[(cert, &["a.example"])]),
+            0,
+        ))
+    };
+    // The certificate file, the key file, or both are not there: the certificate waits, and the start goes on.
+    for (cert, key) in [
+        (nowhere("none.pem"), a.key.clone()),
+        (a.cert.clone(), nowhere("none.key")),
+        (nowhere("none.pem"), nowhere("none.key")),
+    ] {
+        let tls = torn(&Pair { cert, key }).unwrap();
+        assert_eq!(
+            tls.waiting(),
+            [Place {
+                listener: 1,
+                certificate: 1
+            }]
+        );
+    }
+    // A file that is there and is wrong is a refusal as for any certificate: not a certificate, not its key, not
+    // its hosts, a directory in place of a file.
+    let wrong = pki.file("wrong.pem", b"not a certificate");
+    for (cert, key, why) in [
+        (wrong, a.key.clone(), Fault::NotCertificates),
+        (a.cert.clone(), b.key.clone(), Fault::NotPair),
+        (b.cert.clone(), b.key.clone(), Fault::NotCovered),
+        (pki.dir.clone(), a.key.clone(), Fault::Unreadable),
+    ] {
+        let refused = torn(&Pair { cert, key }).err().expect("refused");
+        assert_eq!(
+            (refused.why, refused.listener, refused.certificate),
+            (why.text(), 1, Some(1))
+        );
+    }
+    // The same missing file of a certificate that is put in place by hand ends the start, naming the place.
+    let manual = listener(
+        MinVersion::Tls12,
+        &[
+            (&a, &["a.example"]),
+            (
+                &Pair {
+                    cert: nowhere("none.pem"),
+                    key: a.key.clone(),
+                },
+                &["a.example"],
+            ),
+        ],
+    );
+    let refused = load(manual).err().expect("refused");
+    assert_eq!(
+        (refused.why, refused.listener, refused.certificate),
+        (Fault::Missing.text(), 1, Some(2))
+    );
+}
+
+#[test]
+fn a_certificate_that_waits_is_left_out_of_the_handshakes_until_a_reload_finds_its_files() {
+    runtime().block_on(async {
+        let pki = Pki::new();
+        let manual = pki.issue("manual", &["a.example"]);
+        let later = Pair {
+            cert: pki.dir.join("later.pem"),
+            key: pki.dir.join("later.key"),
+        };
+        let listeners = [with_acme(
+            listener(
+                MinVersion::Tls12,
+                &[(&manual, &["a.example"]), (&later, &["b.example"])],
+            ),
+            1,
+        )];
+        let tls = Arc::new(Tls::load(&listeners, &Files).unwrap());
+        assert_eq!(
+            tls.waiting(),
+            [Place {
+                listener: 1,
+                certificate: 2
+            }]
+        );
+        // The other certificate is served; the waiting one is refused like a name that nobody has.
+        let outcome = shake(&tls, pki.any_client(), name("a.example")).await;
+        assert!(outcome.client.is_ok() && outcome.server.is_ok());
+        let outcome = shake(&tls, pki.any_client(), name("b.example")).await;
+        assert!(outcome.server.is_err() && outcome.client.is_err());
+        // A reload that still finds nothing keeps things as they are.
+        tls.reload(&listeners, &Files).unwrap();
+        assert_eq!(tls.waiting().len(), 1);
+        // The files appear (the command made them), and the reload takes them: all or nothing, as with any reload.
+        let made = pki.issue("later", &["b.example"]);
+        assert_eq!(made.cert, later.cert);
+        fs::write(&later.key, b"torn").unwrap();
+        assert!(tls.reload(&listeners, &Files).is_err());
+        assert_eq!(tls.waiting().len(), 1);
+        let made = pki.issue("later", &["b.example"]);
+        tls.reload(&listeners, &Files).unwrap();
+        assert!(tls.waiting().is_empty());
+        let outcome = shake(&tls, pki.any_client(), name("b.example")).await;
+        assert_eq!(served(&outcome), der(&made.cert).to_vec());
+        // And if the files go away again, the next reload leaves the certificate out.
+        fs::remove_file(&later.cert).unwrap();
+        tls.reload(&listeners, &Files).unwrap();
+        assert_eq!(tls.waiting().len(), 1);
+    });
 }
 
 // ---- the handshake ----

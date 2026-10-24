@@ -7,7 +7,8 @@
 //! protocol, which is then spoken (see `http2`); a handshake that fails or is not done in time ends the connection
 //! with one line in the record and no more. On a listener that redirects to https the first head is read as
 //! everywhere else, and then it is answered with the redirect, or with 404, without hyper, the inspection or the
-//! upstream, and without reading its body (see `http1::redirect_to`).
+//! upstream, and without reading its body (see `http1::redirect_to`). A plain listener and a listener that redirects
+//! first answer a request for the challenge of the CA that issues the certificates with `acme` (see `challenge`).
 //!
 //! Every response has one line in the record, written when the response has been given to the connection or was
 //! cut off. The line has the address of the client that the inspection was told (see `conn`); a line that is

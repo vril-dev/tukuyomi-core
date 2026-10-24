@@ -1,4 +1,5 @@
-//! What a request is answered with: its reply and class, the answer table, the empty response and the record line.
+//! What a request is answered with: its reply and class, the answer table, the empty response, the response that holds
+//! the file of a challenge of the CA, and the record line.
 
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -7,7 +8,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::{CONNECTION, CONTENT_LENGTH};
+use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderValue, Response, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use tukuyomi_kernel::{Reason, Refused, Verdict};
@@ -27,6 +28,8 @@ pub(super) enum Class {
     Rejected,
     /// A listener that redirects to https sent the client there.
     Redirected,
+    /// The proxy answered the request itself: the challenge of the CA that issues the certificates with `acme`.
+    Answered,
     /// The request was not served for a reason on our side: busy, unavailable, an upstream failure.
     Failed,
     /// No answer was written.
@@ -40,6 +43,7 @@ impl Class {
             Class::Blocked => "blocked",
             Class::Rejected => "rejected",
             Class::Redirected => "redirected",
+            Class::Answered => "answered",
             Class::Failed => "failed",
             Class::Closed => "closed",
         }
@@ -84,6 +88,17 @@ impl Reply {
             status: 308,
             class: Class::Redirected,
             reason: "redirected",
+            rule: None,
+            internal: false,
+        }
+    }
+
+    /// The challenge of the CA was answered with `status`: 200 with the file, or 404.
+    pub(super) fn answered(status: u16) -> Reply {
+        Reply {
+            status,
+            class: Class::Answered,
+            reason: "acme challenge",
             rule: None,
             internal: false,
         }
@@ -162,9 +177,12 @@ impl std::fmt::Display for Abort {
 
 impl std::error::Error for Abort {}
 
-/// The response body: empty for our own answers, the upstream's for a forwarded request.
+/// The response body: empty for our own answers, the upstream's for a forwarded request, and the bytes of the file
+/// that answers the challenge of the CA.
 pub(super) enum Out {
     Empty,
+    /// One piece of data, which is gone once it is taken.
+    Bytes(Option<Bytes>),
     Origin(Pin<Box<OriginBody>>),
 }
 
@@ -178,6 +196,7 @@ impl Body for Out {
     ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
         match self.get_mut() {
             Out::Empty => Poll::Ready(None),
+            Out::Bytes(data) => Poll::Ready(data.take().map(|data| Ok(Frame::data(data)))),
             Out::Origin(body) => body.as_mut().poll_frame(cx),
         }
     }
@@ -185,6 +204,7 @@ impl Body for Out {
     fn is_end_stream(&self) -> bool {
         match self {
             Out::Empty => true,
+            Out::Bytes(data) => data.is_none(),
             Out::Origin(body) => body.is_end_stream(),
         }
     }
@@ -192,6 +212,10 @@ impl Body for Out {
     fn size_hint(&self) -> SizeHint {
         match self {
             Out::Empty => SizeHint::with_exact(0),
+            Out::Bytes(data) => SizeHint::with_exact(
+                data.as_ref()
+                    .map_or(0, |data| u64::try_from(data.len()).unwrap_or(u64::MAX)),
+            ),
             Out::Origin(body) => body.size_hint(),
         }
     }
@@ -344,6 +368,21 @@ pub(super) fn answer(status: u16) -> Response<Out> {
             .headers_mut()
             .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
     }
+    response
+}
+
+/// The `200` answer to the challenge of the CA: `body` as `text/plain`. The answer to a `HEAD` has no body and the
+/// length that the body would have.
+pub(super) fn text(body: Bytes, head_only: bool) -> Response<Out> {
+    let length = HeaderValue::from(body.len());
+    let mut response = if head_only {
+        Response::new(Out::Empty)
+    } else {
+        Response::new(Out::Bytes(Some(body)))
+    };
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    headers.insert(CONTENT_LENGTH, length);
     response
 }
 

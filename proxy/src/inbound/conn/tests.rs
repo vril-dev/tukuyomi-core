@@ -16,6 +16,7 @@ use tukuyomi_kernel::Verdict;
 
 use super::*;
 use crate::config::{ForwardConfig, RouteConfig};
+use crate::inbound::challenge::Challenge;
 use crate::inbound::http1::run as run_session;
 use crate::inbound::session::{serve, serve_on};
 use crate::inbound::transport::tls::Tls;
@@ -224,6 +225,7 @@ impl Rig {
             log,
             ingress: Arc::new(Ingress::new(tx.clone())),
             tls,
+            challenge: None,
         });
         let (driver, full) = match mode {
             Mode::Answer(outcome) => (Some(driver(rx, Some(outcome))), None),
@@ -245,6 +247,14 @@ impl Rig {
             _full: full,
             lines,
         }
+    }
+
+    /// The same rig, answering the challenge of the CA as `challenge` says.
+    pub(in crate::inbound) fn with_challenge(mut self, challenge: Challenge) -> Rig {
+        Arc::get_mut(&mut self.ctx)
+            .expect("no connection has started")
+            .challenge = Some(challenge);
+        self
     }
 
     /// A client connects and the connection is served in the background.

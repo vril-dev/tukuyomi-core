@@ -30,6 +30,7 @@
 //! - A gzip body is built in the test with `flate2`: a plain body that is much longer than its coded form (so the
 //!   length that reaches the upstream cannot be the coded one), or one that decodes to just over the limit.
 
+mod acme;
 mod bodies;
 mod deadlines;
 mod forwarding;

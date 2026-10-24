@@ -5,7 +5,11 @@
 //! every host that the settings give it (a `*.` host is checked with one fixed label in front of its name). The
 //! first one that fails ends the pass and is named by the number of its listener and its place in the listener. The
 //! time of validity is not looked at. Nothing is in use until the whole pass has succeeded: the result is one
-//! `Material`, and `Store` replaces the one in use with it in a single step.
+//! `Material`, and `Store` replaces the one in use with it in a single step. A certificate with `acme` whose
+//! certificate file or key file does not exist is not a failure: it has not been issued yet, so its place in the
+//! material is empty and a handshake for its hosts is refused like one for a name that nobody has (`Tls::waiting`
+//! lists such certificates). Any other fault of such a certificate, and a missing file of any other certificate,
+//! fails the pass as before.
 
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -24,7 +28,9 @@ const WILDCARD_PROBE: &str = "wildcard-check";
 /// Why a certificate or a key was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
-    /// A file is missing, not a regular file, or cannot be read.
+    /// A file does not exist.
+    Missing,
+    /// A file is not a regular file, or cannot be read.
     Unreadable,
     TooLarge,
     NotCertificates,
@@ -40,6 +46,7 @@ impl Fault {
     /// A fixed sentence: it names no file and no value from a file.
     pub fn text(self) -> &'static str {
         match self {
+            Fault::Missing => "a certificate or key file does not exist",
             Fault::Unreadable => "a certificate or key file cannot be read",
             Fault::TooLarge => "a certificate or key file is over 1 MiB",
             Fault::NotCertificates => {
@@ -72,9 +79,27 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// The certified keys, by the position of the listener and then of the certificate. A listener that does not end TLS
-/// has none.
-pub(super) type Material = Vec<Vec<Arc<CertifiedKey>>>;
+/// A certificate by the number of its listener and its place in the listener (both from 1), in the words of a line of
+/// the record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub listener: usize,
+    pub certificate: usize,
+}
+
+impl fmt::Display for Place {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "listener {}, certificate {}",
+            self.listener, self.certificate
+        )
+    }
+}
+
+/// The certified keys, by the position of the listener and then of the certificate; `None` for a certificate with
+/// `acme` that has not been issued yet. A listener that does not end TLS has none.
+pub(super) type Material = Vec<Vec<Option<Arc<CertifiedKey>>>>;
 
 /// The material in use. A handshake takes it once and keeps that one, whatever replaces it afterwards.
 #[derive(Debug)]
@@ -109,11 +134,16 @@ pub(super) fn read_all(
                     listener: at + 1,
                     certificate: Some(place + 1),
                 };
-                let key = source
-                    .load(&certificate.cert_file, &certificate.key_file)
-                    .map_err(refuse)?;
+                let key = match source.load(&certificate.cert_file, &certificate.key_file) {
+                    Ok(key) => key,
+                    Err(Fault::Missing) if certificate.acme.is_some() => {
+                        keys.push(None);
+                        continue;
+                    }
+                    Err(fault) => return Err(refuse(fault)),
+                };
                 check(&key, &certificate.hosts).map_err(refuse)?;
-                keys.push(Arc::new(key));
+                keys.push(Some(Arc::new(key)));
             }
         }
         material.push(keys);
@@ -121,8 +151,9 @@ pub(super) fn read_all(
     Ok(material)
 }
 
-/// The key goes with the first certificate, and that certificate covers every host.
-fn check(key: &CertifiedKey, hosts: &[String]) -> Result<(), Fault> {
+/// The key goes with the first certificate, and that certificate covers every host. The `acme` command makes the same
+/// check of the chain it gets and of the files it finds.
+pub(crate) fn check(key: &CertifiedKey, hosts: &[String]) -> Result<(), Fault> {
     key.keys_match().map_err(|_| Fault::NotPair)?;
     let leaf = key.end_entity_cert().map_err(|_| Fault::NotPair)?;
     let leaf = ParsedCertificate::try_from(leaf).map_err(|_| Fault::NotPair)?;
