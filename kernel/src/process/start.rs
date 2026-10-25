@@ -45,9 +45,9 @@ const FAILURE_FILE: &str = "start-failure";
 /// The most bytes read from it; a longer file leaves no detail.
 const FAILURE_MAX: u64 = 512;
 
-/// The exit code of a refusal that is final (inspector/main.go: 10 the peer, 11 the rules, 14 the start-up input),
-/// or `None` for any other end, a signal included. The supervisor does not restart after a refusal, and the
-/// inspector may have left `start-failure`.
+/// The exit code of a refusal that is final (inspector/main.go: 10 the peer, 11 the rules, 14 the start-up input or a
+/// sandbox that cannot be set up), or `None` for any other end, a signal included. The supervisor does not restart
+/// after a refusal, and the inspector may have left `start-failure`.
 pub(crate) fn refusal(exit: &Exit) -> Option<i32> {
     match exit.status.code() {
         code @ Some(10 | 11 | 14) => code,

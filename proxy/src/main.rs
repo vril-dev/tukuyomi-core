@@ -1,19 +1,32 @@
 #![forbid(unsafe_code)]
 //! The proxy process: start-up, the wait for the kernel, the listeners and the stop. When the first argument is
-//! `rules` the process is a short command on the rules store instead (`rules::command`), and when it is `acme` it is
-//! the short command that issues and renews the certificates that have `acme` (`acme::command`); nothing of the proxy
-//! starts in either.
+//! `rules` the process is a short command on the rules store instead (`rules::command`), when it is `acme` it is
+//! the short command that issues and renews the certificates that have `acme` (`acme::command`), and when it is
+//! `config` it is the short command `config check <config>`; nothing of the proxy starts in any of them.
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration file),
 //! the host checks, the configuration, the lookup of the names of the upstream servers (in the same step, the CA file
 //! of each upstream group that has `tls` is read), the certificate and key files of the TLS listeners, the rules store
 //! (the chosen generation, the hold on it, its directory, mode and routes, and with them the kernel configuration), the
-//! runtime and the signal handlers, the driver thread, the wait for the kernel to be ready, bind, accept. The rules
+//! runtime and the signal handlers, the driver thread, the wait for the kernel to be ready, bind, accept. The steps
+//! from the configuration to the kernel configuration are `prepare`, which `config check` runs as well. The rules
 //! store is read here, and again when SIGUSR1 comes; the certificate and key files are read here, and again when
 //! SIGUSR2 comes. Handlers exist for SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2 only and are installed before the
 //! kernel starts its child process; SIGCHLD is never handled. The listeners are bound only after the kernel is ready,
 //! all of them or none, and the accept side takes a connection permit before every accept (see
 //! `inbound::transport::accept`).
+//!
+//! `config check <config>` refuses a process that runs as root and then takes the steps of `prepare`, and writes the
+//! lines of the start headed `config check:` where the start heads them `start:`. It builds no runtime, starts no
+//! kernel and no inspector, binds nothing, installs no signal handler, and looks at neither SIGCHLD nor the
+//! descriptors. The hold on the generation is taken as at the start, and ends with the command; like the start, it
+//! makes the directory `using` of the store and the file of the generation in it when they are not there yet, which
+//! is the one thing the command writes. When all the steps pass, the standard output gets one line, `accepted`, and
+//! the exit code is 0. Every other line goes to the standard error and starts with `config check:`, except after a
+//! wrong argument, where the line starts with `config:` and the usage line follows (as with `rules` and `acme`).
+//! The exit codes are those of the start. The command does not check what comes after `prepare`: that the
+//! inspector can be started and the rules can be built (the start does that, and `rules import` has tried the rules
+//! before they are a generation), and that the listeners can be bound.
 //!
 //! The upstream groups and the routes to them are read from the configuration file when the proxy starts, and stay
 //! as they are until it is started again; so do the addresses that the names of the servers have then, the
@@ -38,9 +51,10 @@
 //! there), then waits for the driver's end until `t0 + stop_wait + kill_grace`. The exit code is 0 only when the
 //! stop was not caused by a failure and the driver reports a stopped kernel whose child exit and per-start
 //! directory removal are confirmed, and the same for every kernel that was stopped before it; 1 for any other end,
-//! and for names of upstream servers that cannot be looked up, a CA file of an upstream group that cannot be used, a
-//! refused certificate or key file, or a refused rules store or generation (nothing has been started then); 2 for a
-//! wrong argument or a refused configuration. The log is flushed for at most 200 ms at the end.
+//! and for a process that runs as root or fails another host check, names of upstream servers that cannot be looked
+//! up, a CA file of an upstream group that cannot be used, a refused certificate or key file, or a refused rules
+//! store or generation (nothing has been started then); 2 for a wrong argument or a refused configuration. The log
+//! is flushed for at most 200 ms at the end.
 
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
@@ -82,6 +96,7 @@ const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 /// The longest the end of the process waits for the logger.
 const FLUSH_WAIT: Duration = Duration::from_millis(200);
+const CHECK_USAGE: &str = "usage: tukuyomi-proxy config check <config>";
 
 fn main() -> ExitCode {
     let log = match log::start_logger() {
@@ -119,6 +134,11 @@ fn start(log: &Log) -> u8 {
             acme::command::Exit::Usage => EXIT_USAGE,
         };
     }
+    if args.peek().is_some_and(|arg| arg == "config") {
+        args.next();
+        let args: Vec<OsString> = args.collect();
+        return config_check(&args, log);
+    }
     let path = match (args.next(), args.next()) {
         (Some(path), None) if config::clean_abs(Path::new(&path)) => PathBuf::from(path),
         _ => {
@@ -132,97 +152,20 @@ fn start(log: &Log) -> u8 {
         log.line(&format!("start: host check refused: {text}"));
         return EXIT_FAILED;
     }
-    let loaded = match config::load(&path) {
-        Ok(loaded) => loaded,
-        Err(e) => {
-            log.line(&format!("start: configuration refused: {}", e.0));
-            return EXIT_USAGE;
-        }
+    let Prepared {
+        proxy,
+        forward,
+        tls,
+        challenge,
+        kernel,
+        generation,
+        mode,
+        routes,
+        switcher,
+    } = match prepare(&path, "start", log) {
+        Ok(prepared) => prepared,
+        Err(code) => return code,
     };
-    log.line("start: configuration accepted");
-    let listening = addresses(&loaded.proxy.listeners);
-    let forward = match resolve::complete(loaded.forward, &listening, resolve::system) {
-        Ok(done) => {
-            for line in &done.lines {
-                log.line(line);
-            }
-            done.forward
-        }
-        Err(refusal) => {
-            log.line(&format!("start: upstream refused: {refusal}"));
-            return EXIT_FAILED;
-        }
-    };
-    let tls = match Tls::load(&loaded.proxy.listeners, &Files) {
-        Ok(tls) => tls,
-        Err(refusal) => {
-            log.line(&format!("start: tls refused: {refusal}"));
-            return EXIT_FAILED;
-        }
-    };
-    for place in tls.waiting() {
-        log.line(&format!("start: tls certificate not issued yet ({place})"));
-    }
-    let challenge = Challenge::new(loaded.acme.as_ref(), &loaded.proxy.listeners);
-    let rules = match store::open(&loaded.store) {
-        Ok(rules) => rules,
-        Err(e) => {
-            log.line(&format!("start: rules store refused: {}", e.0));
-            return EXIT_FAILED;
-        }
-    };
-    let generation = match rules.current() {
-        Ok(Some(generation)) => generation,
-        Ok(None) => {
-            log.line("start: rules store refused: no generation is chosen");
-            return EXIT_FAILED;
-        }
-        Err(e) => {
-            log.line(&format!("start: rules store refused: {}", e.0));
-            return EXIT_FAILED;
-        }
-    };
-    // The hold comes before the directory is looked at: a removal that has finished is found there, and one that
-    // is going on keeps the hold from being taken.
-    let hold = match rules.hold(generation) {
-        Ok(hold) => hold,
-        Err(e) => {
-            log.line(&format!("start: rules store refused: {}", e.0));
-            return EXIT_FAILED;
-        }
-    };
-    let dir = match rules.generation_dir(generation) {
-        Ok(dir) => dir,
-        Err(e) => {
-            log.line(&format!("start: rules store refused: {}", e.0));
-            return EXIT_FAILED;
-        }
-    };
-    let mode = match rules.mode(generation) {
-        Ok(mode) => mode,
-        Err(e) => {
-            log.line(&format!("start: rules store refused: {}", e.0));
-            return EXIT_FAILED;
-        }
-    };
-    let routes = match rules.routes(generation) {
-        Ok(routes) => routes,
-        Err(e) => {
-            log.line(&format!("start: rules store refused: {}", e.0));
-            return EXIT_FAILED;
-        }
-    };
-    let kernel = match loaded.kernel.for_generation(dir, generation) {
-        Ok(kernel) => kernel,
-        Err(e) => {
-            log.line(&format!("start: rules generation refused: {}", e.0));
-            return EXIT_FAILED;
-        }
-    };
-    log.line(&format!("start: rules generation {}", generation.hex()));
-    log.line(&format!("start: rules mode {}", mode.name()));
-    log.line(&format!("start: rules routes {}", routes.len()));
-    let switcher = Switcher::new(rules, loaded.kernel, generation, hold);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -234,7 +177,7 @@ fn start(log: &Log) -> u8 {
         }
     };
     runtime.block_on(run(
-        loaded.proxy,
+        proxy,
         forward,
         tls,
         challenge,
@@ -245,6 +188,167 @@ fn start(log: &Log) -> u8 {
         switcher,
         log.clone(),
     ))
+}
+
+/// What the steps of start-up before the runtime give.
+struct Prepared {
+    proxy: ProxyConfig,
+    forward: ForwardConfig,
+    tls: Tls,
+    challenge: Option<Challenge>,
+    kernel: tukuyomi_kernel::Config,
+    generation: Fingerprint,
+    mode: Mode,
+    routes: Routes,
+    /// Keeps the hold on `generation`, and the store for the switches.
+    switcher: Switcher,
+}
+
+/// The steps of start-up from the configuration to the kernel configuration of the chosen generation, the hold on it
+/// included. `name` is at the head of each line: `start` for the start, `config check` for the command of that name.
+/// A refusal is a line, and its exit code is the error.
+fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
+    let loaded = match config::load(path) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            log.line(&format!("{name}: configuration refused: {}", e.0));
+            return Err(EXIT_USAGE);
+        }
+    };
+    log.line(&format!("{name}: configuration accepted"));
+    let listening = addresses(&loaded.proxy.listeners);
+    let forward = match resolve::complete(loaded.forward, &listening, resolve::system) {
+        Ok(done) => {
+            for line in &done.lines {
+                log.line(&format!("{name}: {line}"));
+            }
+            done.forward
+        }
+        Err(refusal) => {
+            log.line(&format!("{name}: upstream refused: {refusal}"));
+            return Err(EXIT_FAILED);
+        }
+    };
+    let tls = match Tls::load(&loaded.proxy.listeners, &Files) {
+        Ok(tls) => tls,
+        Err(refusal) => {
+            log.line(&format!("{name}: tls refused: {refusal}"));
+            return Err(EXIT_FAILED);
+        }
+    };
+    for place in tls.waiting() {
+        log.line(&format!("{name}: tls certificate not issued yet ({place})"));
+    }
+    let challenge = Challenge::new(loaded.acme.as_ref(), &loaded.proxy.listeners);
+    let rules = match store::open(&loaded.store) {
+        Ok(rules) => rules,
+        Err(e) => {
+            log.line(&format!("{name}: rules store refused: {}", e.0));
+            return Err(EXIT_FAILED);
+        }
+    };
+    let generation = match rules.current() {
+        Ok(Some(generation)) => generation,
+        Ok(None) => {
+            log.line(&format!(
+                "{name}: rules store refused: no generation is chosen"
+            ));
+            return Err(EXIT_FAILED);
+        }
+        Err(e) => {
+            log.line(&format!("{name}: rules store refused: {}", e.0));
+            return Err(EXIT_FAILED);
+        }
+    };
+    // The hold comes before the directory is looked at: a removal that has finished is found there, and one that
+    // is going on keeps the hold from being taken.
+    let hold = match rules.hold(generation) {
+        Ok(hold) => hold,
+        Err(e) => {
+            log.line(&format!("{name}: rules store refused: {}", e.0));
+            return Err(EXIT_FAILED);
+        }
+    };
+    let dir = match rules.generation_dir(generation) {
+        Ok(dir) => dir,
+        Err(e) => {
+            log.line(&format!("{name}: rules store refused: {}", e.0));
+            return Err(EXIT_FAILED);
+        }
+    };
+    let mode = match rules.mode(generation) {
+        Ok(mode) => mode,
+        Err(e) => {
+            log.line(&format!("{name}: rules store refused: {}", e.0));
+            return Err(EXIT_FAILED);
+        }
+    };
+    let routes = match rules.routes(generation) {
+        Ok(routes) => routes,
+        Err(e) => {
+            log.line(&format!("{name}: rules store refused: {}", e.0));
+            return Err(EXIT_FAILED);
+        }
+    };
+    let kernel = match loaded.kernel.for_generation(dir, generation) {
+        Ok(kernel) => kernel,
+        Err(e) => {
+            log.line(&format!("{name}: rules generation refused: {}", e.0));
+            return Err(EXIT_FAILED);
+        }
+    };
+    log.line(&format!("{name}: rules generation {}", generation.hex()));
+    log.line(&format!("{name}: rules mode {}", mode.name()));
+    log.line(&format!("{name}: rules routes {}", routes.len()));
+    Ok(Prepared {
+        proxy: loaded.proxy,
+        forward,
+        tls,
+        challenge,
+        kernel,
+        generation,
+        mode,
+        routes,
+        switcher: Switcher::new(rules, loaded.kernel, generation, hold),
+    })
+}
+
+/// The command `config check`: the host check against root and `prepare`, and nothing of what follows them. `args`
+/// is what follows `config`. Returns the exit code.
+fn config_check(args: &[OsString], log: &Log) -> u8 {
+    const NAME: &str = "config check";
+    let path = match check_path(args) {
+        Ok(path) => path,
+        Err(why) => {
+            log.line(&format!("config: {why}"));
+            log.line(CHECK_USAGE);
+            return EXIT_USAGE;
+        }
+    };
+    if let Err(text) = host::not_root() {
+        log.line(&format!("{NAME}: host check refused: {text}"));
+        return EXIT_FAILED;
+    }
+    // What `prepare` gives is dropped at once, and with it the hold on the generation.
+    if let Err(code) = prepare(&path, NAME, log) {
+        return code;
+    }
+    let _ = writeln!(io::stdout(), "accepted");
+    EXIT_OK
+}
+
+/// The configuration file that `args` (what follows `config`) name: `check` and one absolute clean path.
+fn check_path(args: &[OsString]) -> Result<PathBuf, &'static str> {
+    let (name, rest) = args.split_first().ok_or("a command is missing")?;
+    if name != "check" {
+        return Err("unknown command");
+    }
+    match rest {
+        [] => Err("the configuration file is missing"),
+        [path] if config::clean_abs(Path::new(path)) => Ok(PathBuf::from(path)),
+        [_] => Err("the configuration file is not an absolute clean path"),
+        _ => Err("check takes one argument, the configuration file"),
+    }
 }
 
 /// The runtime part: handlers, driver, the wait for ready, serving, and the stop. The holds of the switcher live
@@ -865,6 +969,29 @@ mod tests {
             },
             retired_clean: true,
         }
+    }
+
+    fn os_args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn config_check_refuses_a_wrong_argument_with_exit_code_2() {
+        let log = log::start_logger().unwrap();
+        let wrong: [&[&str]; 5] = [
+            &[],
+            &["check"],
+            &["check", "/etc/a.json", "/etc/b.json"],
+            &["check", "etc/a.json"],
+            &["verify", "/etc/a.json"],
+        ];
+        for list in wrong {
+            assert_eq!(config_check(&os_args(list), &log), EXIT_USAGE, "{list:?}");
+        }
+        assert_eq!(
+            check_path(&os_args(&["check", "/etc/a.json"])),
+            Ok(PathBuf::from("/etc/a.json"))
+        );
     }
 
     #[test]

@@ -55,7 +55,8 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// The groups with every name made into addresses, and a line for each name to put in the record.
+/// The groups with every name made into addresses, and a line for each name to put in the record. A line has no
+/// head: the caller puts the name of the command that it writes for before it.
 #[derive(Debug)]
 pub struct Completed {
     pub forward: ForwardConfig,
@@ -234,7 +235,7 @@ where
                         .ok_or_else(|| refusal("a server name was not looked up"))?;
                     let list: Vec<String> = addresses.iter().map(SocketAddr::to_string).collect();
                     lines.push(format!(
-                        "start: upstream {} {}:{} resolved to {}",
+                        "upstream {} {}:{} resolved to {}",
                         group.name,
                         key.0,
                         key.1,

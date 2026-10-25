@@ -31,8 +31,13 @@
 //! standard error, a line each, and starts with the name of the command. Whatever came from outside (an entry of a
 //! directory, the line an inspector left behind) is written with every byte outside 0x20 to 0x7e as `\xNN`.
 //!
+//! No command runs as root: when any user id of the process is 0, the command writes a `host check refused` line and
+//! ends before it reads the configuration. `import` makes the other checks that the proxy makes before it starts too,
+//! because it starts an inspector (see `host`).
+//!
 //! The exit code is 0 for success, 1 for any other end (a refused store or input, a failed trial, a store that is in
-//! use, a listed generation whose manifest cannot be read) and 2 for a wrong argument or a refused configuration.
+//! use, a listed generation whose manifest cannot be read, a process that runs as root) and 2 for a wrong argument or
+//! a refused configuration.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -213,6 +218,14 @@ fn parse_import(config: PathBuf, rest: &[OsString]) -> Result<Command, &'static 
 fn subject_of(subject: &Option<OsString>) -> String {
     subject.as_ref().map_or_else(String::new, |subject| {
         format!(": \"{}\"", escaped(subject.as_bytes()))
+    })
+}
+
+/// Refuses a process that runs as root, with a line that names `command`.
+fn not_root(command: &str, term: &mut Terminal) -> Result<(), Exit> {
+    host::not_root().map_err(|text| {
+        term.note(&format!("{command}: host check refused: {text}"));
+        Exit::Failed
     })
 }
 
@@ -420,6 +433,9 @@ fn describe(failed: &Failed) -> String {
 
 fn activate(config: &Path, generation: Fingerprint, term: &mut Terminal) -> Exit {
     const NAME: &str = "rules activate";
+    if let Err(exit) = not_root(NAME, term) {
+        return exit;
+    }
     let (_, mut store) = match open_store(NAME, config, term) {
         Ok(opened) => opened,
         Err(exit) => return exit,
@@ -438,6 +454,9 @@ fn activate(config: &Path, generation: Fingerprint, term: &mut Terminal) -> Exit
 
 fn remove(config: &Path, generation: Fingerprint, term: &mut Terminal) -> Exit {
     const NAME: &str = "rules remove";
+    if let Err(exit) = not_root(NAME, term) {
+        return exit;
+    }
     let (_, mut store) = match open_store(NAME, config, term) {
         Ok(opened) => opened,
         Err(exit) => return exit,
@@ -456,6 +475,9 @@ fn remove(config: &Path, generation: Fingerprint, term: &mut Terminal) -> Exit {
 
 fn list(config: &Path, term: &mut Terminal) -> Exit {
     const NAME: &str = "rules list";
+    if let Err(exit) = not_root(NAME, term) {
+        return exit;
+    }
     let (_, store) = match open_store(NAME, config, term) {
         Ok(opened) => opened,
         Err(exit) => return exit,

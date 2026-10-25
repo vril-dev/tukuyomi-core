@@ -62,11 +62,47 @@ fn descriptor_names_are_plain_decimal_numbers() {
     assert_eq!(fd_number(""), None);
 }
 
+fn uids(ids: &str) -> String {
+    format!("Name:\tproxy\nUmask:\t0022\nUid:\t{ids}\nGid:\t1\t2\t3\t4\n")
+}
+
 #[test]
-fn the_file_system_user_id_is_the_fourth_of_four_numbers() {
-    let uids = |ids: &str| format!("Name:\tproxy\nUmask:\t0022\nUid:\t{ids}\nGid:\t1\t2\t3\t4\n");
-    assert_eq!(fs_uid_of(&uids("1000\t1001\t1002\t1003")), Ok(1003));
+fn the_user_ids_are_exactly_four_numbers_in_the_order_of_the_status_file() {
+    assert_eq!(
+        user_ids_of(&uids("1000\t1001\t1002\t1003")),
+        Ok([1000, 1001, 1002, 1003])
+    );
     let bad = "the user ids are missing or malformed";
-    assert_eq!(fs_uid_of(&uids("1\t2\t3")), Err(bad));
-    assert_eq!(fs_uid_of(&uids("a\t2\t3\t4")), Err(bad));
+    assert_eq!(user_ids_of(&uids("1\t2\t3")), Err(bad));
+    assert_eq!(user_ids_of(&uids("1\t2\t3\t4\t5")), Err(bad));
+    assert_eq!(user_ids_of(&uids("a\t2\t3\t4")), Err(bad));
+    assert_eq!(user_ids_of("Name:\tproxy\n"), Err(bad));
+}
+
+#[test]
+fn a_zero_in_any_of_the_four_user_ids_is_refused() {
+    let root = "the process runs as root";
+    // Each place alone, then all of them: the saved id lets a process return to root, the file system id owns
+    // what it creates.
+    for ids in [
+        "0\t1\t2\t3",
+        "1\t0\t2\t3",
+        "1\t2\t0\t3",
+        "1\t2\t3\t0",
+        "0\t0\t0\t0",
+    ] {
+        assert_eq!(not_root_in(&uids(ids)), Err(root), "{ids}");
+    }
+}
+
+#[test]
+fn user_ids_that_are_all_above_zero_pass_and_ids_that_cannot_be_read_do_not() {
+    // 1 passes in every place, and so does the largest id.
+    assert_eq!(not_root_in(&uids("1\t1\t1\t1")), Ok(()));
+    assert_eq!(not_root_in(&uids("1000\t1001\t1002\t4294967295")), Ok(()));
+    let bad = "the user ids are missing or malformed";
+    // One past the largest id does not fit.
+    assert_eq!(not_root_in(&uids("1000\t1001\t1002\t4294967296")), Err(bad));
+    assert_eq!(not_root_in("Name:\tproxy\n"), Err(bad));
+    assert_eq!(not_root_in(&uids("0\t1\t2")), Err(bad));
 }

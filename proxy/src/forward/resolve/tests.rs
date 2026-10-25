@@ -145,9 +145,9 @@ fn every_address_of_a_name_is_a_server_in_its_place_with_the_terms_of_the_server
     assert_eq!(
         done.lines,
         [
-            "start: upstream main app.test:80 resolved to 192.0.2.10:80, 192.0.2.11:80, [2001:db8::1]:80",
-            "start: upstream api app.test:80 resolved to 192.0.2.10:80, 192.0.2.11:80, [2001:db8::1]:80",
-            "start: upstream api app.test:81 resolved to 192.0.2.10:81, 192.0.2.11:81, [2001:db8::1]:81",
+            "upstream main app.test:80 resolved to 192.0.2.10:80, 192.0.2.11:80, [2001:db8::1]:80",
+            "upstream api app.test:80 resolved to 192.0.2.10:80, 192.0.2.11:80, [2001:db8::1]:80",
+            "upstream api app.test:81 resolved to 192.0.2.10:81, 192.0.2.11:81, [2001:db8::1]:81",
         ]
     );
     assert_eq!(done.forward.default, Some(0));

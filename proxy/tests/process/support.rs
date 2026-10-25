@@ -859,6 +859,37 @@ fn stop_counts(lines: &[String]) -> [u64; 3] {
         .unwrap_or_else(|_| panic!("cannot read the stop line {line:?}"))
 }
 
+/// The root of a test that runs a command on the configuration of a proxy that is not started: the configuration and
+/// the rules store as `Proxy::spawn_with` makes them. The upstream is at a port where nothing listens, and `port` is
+/// the one that the configuration listens on; no process holds either.
+pub(crate) struct Idle {
+    pub(crate) port: u16,
+    root: TestDir,
+}
+
+impl Idle {
+    /// Writes the configuration and the store, then lets `edit` change the root, as `Proxy::spawn_with` does.
+    pub(crate) fn new(test: &str, knobs: &Knobs, edit: impl FnOnce(&Path)) -> Idle {
+        let root = make_root(test);
+        let port = free_port();
+        let listen = SocketAddr::from(([127, 0, 0, 1], port));
+        let upstream = SocketAddr::from(([127, 0, 0, 1], free_port()));
+        fs::write(
+            root.path().join("config.json"),
+            config_json(knobs, listen, &[upstream], root.path()),
+        )
+        .expect("write the configuration");
+        make_store(root.path());
+        edit(root.path());
+        Idle { port, root }
+    }
+
+    /// The root of the test: the configuration, the store, and what the test adds.
+    pub(crate) fn root(&self) -> &Path {
+        self.root.path()
+    }
+}
+
 pub(crate) struct Proxy {
     pub(crate) port: u16,
     pub(crate) pid: u32,

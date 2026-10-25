@@ -17,8 +17,9 @@ import (
 	"time"
 )
 
-// TestMain doubles as the inspector (and a spawner) for the process tests:
-// the test binary re-executes itself with TKV0_TEST_MODE set.
+// TestMain doubles as the inspector (and a spawner, and the child of the
+// sandbox test) for the process tests: the test binary re-executes itself with
+// TKV0_TEST_MODE set.
 func TestMain(m *testing.M) {
 	switch os.Getenv("TKV0_TEST_MODE") {
 	case "inspector":
@@ -45,6 +46,8 @@ func TestMain(m *testing.M) {
 			os.Exit(99)
 		}
 		os.Exit(0)
+	case "sandbox":
+		os.Exit(sandboxProbe())
 	}
 	os.Exit(m.Run())
 }

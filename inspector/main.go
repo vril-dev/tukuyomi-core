@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// Exit codes (14: invalid start-up input).
+// Exit codes (14: invalid start-up input, or the sandbox cannot be set up).
 const (
 	exitOK          = 0
 	exitPeer        = 10
@@ -61,6 +61,11 @@ func run(args []string) int {
 	b, err := readBundle(cfg.bundleDir)
 	if err != nil {
 		return d.startFail(exitRules, "start: rules: %v", withoutPath(err))
+	}
+	// The rules are in memory: restrict the process before it parses them or
+	// reads a request (see sandbox).
+	if err := sandbox(cfg.tmpDir); err != nil {
+		return d.startFail(exitStartup, "start: sandbox: %v", err)
 	}
 	for _, p := range b.load {
 		if err := checkRules(string(b.files[p])); err != nil {

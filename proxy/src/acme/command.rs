@@ -24,9 +24,13 @@
 //! Everything else goes to the standard error, a line each, and starts with the name of the command. What the CA sent
 //! is written only as the `type` of its problem document, with every byte outside 0x20 to 0x7e as `\xNN`.
 //!
-//! The exit code is 0 if every certificate is `renewed` or `valid`, 1 if one is `failed` (or the command was stopped or
-//! cannot run), and 2 for a wrong argument, a refused configuration, or a configuration with no certificate that
-//! has `acme`.
+//! The command does not run as root: when any user id of the process is 0, it writes a `host check refused` line and
+//! ends before it reads the configuration. A key and a certificate that root wrote would not be read by the proxy
+//! that runs as another user.
+//!
+//! The exit code is 0 if every certificate is `renewed` or `valid`, 1 if one is `failed` (or the command was stopped,
+//! cannot run, or runs as root), and 2 for a wrong argument, a refused configuration, or a configuration with no
+//! certificate that has `acme`.
 
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
@@ -49,6 +53,7 @@ use super::key::Key;
 use super::order::Session;
 use super::{Failure, base64, der};
 use crate::config::{self, AcmeConfig, CertificateConfig, ListenerConfig, ListenerKind};
+use crate::host;
 use crate::inbound::transport::tls::{Files, KeySource, check};
 
 const USAGE: &str = "usage: tukuyomi-proxy acme renew <config>";
@@ -162,6 +167,10 @@ fn due(target: &Target<'_>, now: i64) -> bool {
 }
 
 fn renew(config: &Path, term: &mut Terminal<'_>) -> Exit {
+    if let Err(text) = host::not_root() {
+        term.note(&format!("{NAME}: host check refused: {text}"));
+        return Exit::Failed;
+    }
     let loaded = match config::load(config) {
         Ok(loaded) => loaded,
         Err(e) => {
