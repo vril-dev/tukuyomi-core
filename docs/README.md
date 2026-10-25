@@ -2,7 +2,7 @@
 
 tukuyomi-core の設計文書を置くディレクトリ。tukuyomi-core は、tukuyomi（tukuyomi WAF）から派生し、WAF 機能に特化したシステムを目指す。
 
-現時点で実装しているのは、初回の検査核と、HTTP/1.1 の最小の受付・転送だけである。Rust のライブラリ [`kernel/`](../kernel/)、Go の検査プロセス [`inspector/`](../inspector/)、HTTP の実行体 [`proxy/`](../proxy/) のソースがあり、管理UI、配布物はまだない。ここにある文書は初期草案で、目標・前提・候補・未決事項を記録している。実装済みの範囲は [システム概要](detailed-design/00_overview/system-overview.md) の「現在の状態」に書く。
+現時点で実装しているのは、初回の検査核と、HTTP・HTTPS の受付と転送である。Rust のライブラリ [`kernel/`](../kernel/)、Go の検査プロセス [`inspector/`](../inspector/)、HTTP の実行体 [`proxy/`](../proxy/) のソースがあり、管理UI、配布物はまだない。`detailed-design/` の文書は初期草案で、目標・前提・候補・未決事項を記録している。実装済みの範囲は [システム概要](detailed-design/00_overview/system-overview.md) の「現在の状態」に書く。`build/` と `operations/` の文書は、今の実装の動かし方を書く。
 
 ## 作成済みの文書
 
@@ -11,15 +11,23 @@ tukuyomi-core の設計文書を置くディレクトリ。tukuyomi-core は、t
 | [システム概要](detailed-design/00_overview/system-overview.md) | 目的、現在の状態、前提・候補・未決定の区別、検討の対象とする範囲、用語 |
 | [アーキテクチャ概要](detailed-design/00_overview/architecture.md) | 構成の候補、責務の分担、障害の影響範囲、要求処理の流れの例、設計上の義務、状態 × 操作、採用判断に必要な検証の候補 |
 | [設計方針・制約](detailed-design/00_overview/design-principles.md) | 設計原則とその適用、検査モードと技術障害の区別、fail-closed の適用範囲、記録と管理機能の扱い、移植と前例、版の方針 |
+| [実行ファイルの build と配置](build/binary-deployment.md) | 要るもの、build、CRS の取得、利用者と置き場、初めて起動する手順、systemd の例、検査プロセスの絞り |
+| [運用リファレンス](operations/operator-reference.md) | 命令、合図、停止、設定ファイルの鍵と値どうしの関係、本文と予算、ルールセットと世代、要求の扱い、記録の行、ACME |
 
-未決事項は各文書の末尾に表でまとめ、文書をまたいで一意な ID を付けている（システム概要は OV-、アーキテクチャ概要は AR-、設計方針・制約は DP-）。
+未決事項は設計文書の末尾に表でまとめ、文書をまたいで一意な ID を付けている（システム概要は OV-、アーキテクチャ概要は AR-、設計方針・制約は DP-）。
 
 ## 文書の構成（予定）
 
-次のツリーは、予定している文書の構成である。作成済みの文書は、`00_overview/` の3つ（上の表）だけで、ツリーのほかのファイルとディレクトリ（`detailed-design/README.md` を含む）は、まだ作成していない。内容を書く時点で作成する。
+次のツリーは、予定している文書の構成である。作成済みの文書は上の表の5つだけで、ツリーのほかのファイルとディレクトリ（`detailed-design/README.md` を含む）は、まだ作成していない。内容を書く時点で作成する。
 
 ```text
 docs/
+├── build/                              # build と配置
+│   └── binary-deployment.md            # 実行ファイルの build と配置
+│
+├── operations/                         # 運用
+│   └── operator-reference.md           # 運用リファレンス
+│
 └── detailed-design/                    # 詳細設計書ルート
     ├── 00_overview/                    # 概要・全体方針
     │   ├── system-overview.md          # システム概要
