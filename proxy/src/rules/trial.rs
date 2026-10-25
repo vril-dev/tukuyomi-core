@@ -317,6 +317,7 @@ fn inspect(
             proto: PROTO,
             headers: &headers,
             body: probe.body.map_or(&[][..], |(_, body)| body),
+            body_cut: false,
         })
         .map_err(|refused| Failed::Refused {
             probe: probe.name,

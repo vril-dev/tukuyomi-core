@@ -58,6 +58,7 @@ fn with<'a>(uri: &'a [u8], headers: &'a [(&'a [u8], &'a [u8])], body: &'a [u8]) 
         proto: b"HTTP/1.1",
         headers,
         body,
+        body_cut: false,
     }
 }
 
@@ -282,6 +283,7 @@ fn faulted() -> (Engine, Instant, ReqId, ReqId) {
     let request = || state::Request {
         begin: vec![1, 2, 3],
         body: Vec::new(),
+        cut: false,
     };
     let held = e.submit(t0, request()).unwrap();
     let waiting = e.submit(t0, request()).unwrap();

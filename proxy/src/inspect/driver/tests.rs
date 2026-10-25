@@ -84,6 +84,7 @@ impl World {
                 Bytes::from_static(b"example.test"),
             )],
             body: Arc::clone(&body),
+            cut: false,
             proto: b"HTTP/1.1",
         };
         Made {

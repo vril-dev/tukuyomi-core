@@ -24,7 +24,7 @@ fn forward(group: Value) -> Value {
 
 fn load(value: Value) -> Result<ForwardSettings, ConfigError> {
     let raw: RawForward = serde_json::from_value(value).map_err(|e| super::super::refusal(&e))?;
-    check(raw, &[])
+    check(raw, &[], 1 << 20)
 }
 
 /// The group `g` with a server at `address` and this `tls`.
@@ -151,4 +151,30 @@ fn a_name_that_a_server_is_checked_for_must_be_one_that_tls_can_use() {
     assert!(servers("a-.test:443", named).is_ok());
     // A group without `tls` takes such a name as it always did.
     assert!(load(forward(json!({"servers": [server("a-.test:443")]}))).is_ok());
+}
+
+#[test]
+fn a_route_may_lower_the_limit_on_the_body_and_not_raise_it() {
+    // The limit of the proxy is 1 MiB in `load`.
+    let with = |max_body: Value| {
+        let mut object = forward(json!({"servers": [server("192.0.2.1:80")]}));
+        object["routes"] = json!([{"path": "/login/", "upstream": "g", "max_body": max_body}]);
+        load(object)
+    };
+    let limit =
+        |loaded: ForwardSettings| loaded.routes.targets().map(|route| route.max_body).next();
+    assert_eq!(limit(with(json!(1u64 << 20)).unwrap()), Some(Some(1 << 20)));
+    assert_eq!(limit(with(json!(0)).unwrap()), Some(Some(0)));
+    assert_eq!(
+        refusal(with(json!((1u64 << 20) + 1))),
+        "a route max_body is above the max_body of the proxy"
+    );
+    // A route that says nothing has no limit of its own; a value of another type or `null` is no limit either.
+    let mut object = forward(json!({"servers": [server("192.0.2.1:80")]}));
+    object["routes"] = json!([{"path": "/login/", "upstream": "g"}]);
+    assert_eq!(limit(load(object).unwrap()), Some(None));
+    let wrong = "configuration has a value of the wrong type";
+    for bad in [Value::Null, json!("1024"), json!(-1)] {
+        assert_eq!(refusal(with(bad.clone())), wrong, "{bad:?}");
+    }
 }

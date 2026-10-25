@@ -73,6 +73,7 @@ fn slot_with_a_request(mode: Mode, done: Shutdown) -> (Slot<Stub>, oneshot::Rece
             uri: Default::default(),
             headers: Vec::new(),
             body: Arc::new(BodyHold::new(Default::default(), take())),
+            cut: false,
             proto: b"HTTP/1.1",
         },
         reply,

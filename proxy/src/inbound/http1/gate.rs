@@ -68,7 +68,7 @@ pub struct Settings {
     pub head_read: Duration,
     /// How long a connection that has nothing to do waits for the first byte of its next request.
     pub keepalive_timeout: Duration,
-    /// The most bytes after the head of a chunked request that are read from the stream.
+    /// The most bytes after the head of a chunked request that are read from the stream: its body and its framing.
     pub max_body_wire: u64,
     /// The idle limits of the stream (see `Guarded`). A read that waits is bounded by the connection time alone:
     /// while a request is inspected or its response is sent, hyper may wait for the peer for as long as the

@@ -229,6 +229,7 @@ impl Serving {
                 reply: Reply::rejected(400, "the two parsers disagree"),
                 client: self.session.peer.ip(),
                 via: None,
+                body: None,
             };
             return Ok(self.respond(noted, answer(400), Then::Close, false, Instant::now()));
         };

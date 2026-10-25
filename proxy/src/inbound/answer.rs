@@ -15,6 +15,7 @@ use tukuyomi_kernel::{Reason, Refused, Verdict};
 
 use crate::forward::origin::OriginBody;
 use crate::inbound::head::Reject;
+use crate::inbound::upload::Fate;
 use crate::inspect::driver::Outcome;
 
 /// How a connection ended, for the record.
@@ -229,12 +230,66 @@ pub(super) struct Via {
     pub(super) server: Option<SocketAddr>,
 }
 
+/// The size of the body of a request, for the record: its `Content-Length` if it has one, the bytes that were held,
+/// and the body that followed them when it was passed on while it was read.
+pub(super) struct Sizes {
+    declared: Option<u64>,
+    held: u64,
+    rest: Option<Arc<Fate>>,
+    /// The held bytes were inspected and the body goes on behind them.
+    cut: bool,
+}
+
+impl Sizes {
+    /// A body that was held whole: `held` bytes were read.
+    pub(super) fn whole(declared: Option<u64>, held: usize) -> Sizes {
+        Sizes {
+            declared,
+            held: u64::try_from(held).unwrap_or(u64::MAX),
+            rest: None,
+            cut: false,
+        }
+    }
+
+    /// A body that was passed on behind the `held` bytes. `inspected` tells whether those bytes were inspected.
+    pub(super) fn passed(
+        declared: Option<u64>,
+        held: usize,
+        rest: Arc<Fate>,
+        inspected: bool,
+    ) -> Sizes {
+        Sizes {
+            declared,
+            held: u64::try_from(held).unwrap_or(u64::MAX),
+            rest: Some(rest),
+            cut: inspected,
+        }
+    }
+
+    /// The words that the record adds for the body: its length, which is the `Content-Length` if the request has
+    /// one and otherwise what was read so far, and for a body that was cut the length that was inspected. Nothing
+    /// for a request with no body.
+    pub(super) fn words(&self) -> Option<String> {
+        let length = self
+            .declared
+            .unwrap_or_else(|| self.rest.as_ref().map_or(self.held, |rest| rest.seen()));
+        if length == 0 {
+            None
+        } else if self.cut {
+            Some(format!("body {length} inspected {} cut", self.held))
+        } else {
+            Some(format!("body {length}"))
+        }
+    }
+}
+
 /// What the record shows of a request besides the time it took: its reply, the address of the client it is recorded
-/// under, and the upstream it went to, if it got as far as that.
+/// under, the upstream it went to, if it got as far as that, and the size of its body, if it has one.
 pub(super) struct Noted {
     pub(super) reply: Reply,
     pub(super) client: IpAddr,
     pub(super) via: Option<Via>,
+    pub(super) body: Option<Sizes>,
 }
 
 /// The words of a record line that tell for whom it is: the address of the client and, for a request that was sent

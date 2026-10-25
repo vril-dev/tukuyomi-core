@@ -162,3 +162,37 @@ fn a_request_over_h2_is_inspected_and_reaches_the_upstream_as_http_1_1() {
         .conn("the block by the body", |l| l.contains(&blocked_by(9202)));
     proxy.finish(2);
 }
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_long_upload_over_h2_is_inspected_cut_and_streams_to_the_upstream_whole() {
+    let mut pki = Pki::new("h2_upload");
+    let files = pki.issue("a", &["a.example", "*.a.example"]);
+    let port = free_port();
+    let knobs = Knobs {
+        keepalive_timeout_ms: 5_000,
+        ..Knobs::long_bodies()
+    };
+    let proxy = Proxy::start_with("h2_upload", knobs, |root| add_listener(root, port, &files));
+    let mut client = Client::connect(&pki, port);
+    // The attack is in the inspected bytes: 403.
+    assert_eq!(
+        client.post_form("/up", &padded_form("block", 100_000)).0,
+        403
+    );
+    // 6 MiB cross the windows of the connection and reach the upstream whole, with the length the client gave.
+    let big = padded_form("fine", 6 << 20);
+    assert_eq!(client.post_form("/up", &big).0, 200);
+    let requests = proxy.upstream.requests();
+    assert_eq!(requests.len(), 1);
+    let seen = Message::parse(&requests[0]);
+    let length = big.len().to_string();
+    assert_eq!(seen.values("content-length"), [length.as_str()]);
+    assert!(seen.body == big);
+    drop(client);
+    proxy.records.conn("the cut record", |l| {
+        l.contains(": forwarded 200 forwarded ")
+            && l.ends_with(&format!(" body {} inspected 16384 cut", big.len()))
+    });
+    proxy.finish(1);
+}

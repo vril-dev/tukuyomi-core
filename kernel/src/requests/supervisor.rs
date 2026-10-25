@@ -41,7 +41,8 @@ pub type ReqId = u64;
 
 /// One request to inspect. Allow is a verdict on these bytes only; the host forwards these bytes and nothing
 /// else, except the changes its own contract lists (removed hop-by-hop fields, added forwarding fields, the framing
-/// it writes).
+/// it writes). When `body_cut` is set, the body is only the first bytes of the request body and the rest follows
+/// after them: the verdict says nothing of the rest, and the host must forward it as it came.
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
     pub client_addr: &'a [u8],
@@ -52,8 +53,12 @@ pub struct Request<'a> {
     pub uri: &'a [u8],
     pub proto: &'a [u8],
     pub headers: &'a [(&'a [u8], &'a [u8])],
-    /// The whole decoded body (no transfer coding).
+    /// The decoded body (no transfer coding): the whole body, or its first bytes if `body_cut`.
     pub body: &'a [u8],
+    /// The body goes on after `body` (at most `limits::BODY` bytes, at least one). A `Content-Length` field then
+    /// names more bytes than `body` has. The inspector does not take a failure to parse the body for a fault of the
+    /// request, since the parser met the end of the bytes before the end of the body.
+    pub body_cut: bool,
 }
 
 /// The answer for one request. `Allow` is a verdict on the bytes that were given to `submit`, inspected by the

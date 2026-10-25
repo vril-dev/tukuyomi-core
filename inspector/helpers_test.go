@@ -516,7 +516,14 @@ func (h *harness) fake(tx uint64) *fakeTx {
 
 func (h *harness) in(kind uint8, tx uint64, msg uint32, payload []byte) {
 	h.t.Helper()
+	h.inFlags(0, kind, tx, msg, payload)
+}
+
+// inFlags is in with the flags of the header.
+func (h *harness) inFlags(flags, kind uint8, tx uint64, msg uint32, payload []byte) {
+	h.t.Helper()
 	b := tFrame(kind, tx, msg, payload)
+	b[5] = flags
 	var hb [headerLen]byte
 	copy(hb[:], b)
 	hd, err := checkHeader(&hb, testRun, testInc)

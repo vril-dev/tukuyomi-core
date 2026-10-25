@@ -57,6 +57,10 @@ impl Supervisor {
         else {
             return Err(Refused::Unsupported("body over the protocol limit"));
         };
+        // A body that goes on needs bytes to stand on: the inspector refuses a cut body that has none.
+        if req.body_cut && req.body.is_empty() {
+            return Err(Refused::Invalid("cut body without bytes"));
+        }
         // Every field of TX_BEGIN is bounded first; for the headers that is their number, the length of each name
         // and value, and their total. What passes is small, so the header rules below read no more than that.
         let begin = codec::encode_tx_begin(&codec::TxBegin {
@@ -86,12 +90,19 @@ impl Supervisor {
         let mut lengths = header(b"content-length");
         if let Some(first) = lengths.next() {
             let value = first.1;
+            // The length of a body that goes on is more than the bytes given.
             let same = !value.is_empty()
                 && value.iter().all(u8::is_ascii_digit)
                 && std::str::from_utf8(value)
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
-                    == Some(declared);
+                    .is_some_and(|n| {
+                        if req.body_cut {
+                            n > declared
+                        } else {
+                            n == declared
+                        }
+                    });
             if lengths.next().is_some() || !same {
                 return Err(Refused::Unsupported("content-length"));
             }
@@ -123,10 +134,14 @@ impl Supervisor {
             .chunks(codec::MAX_BODY)
             .map(<[u8]>::to_vec)
             .collect();
-        match self
-            .engine
-            .submit(Instant::now(), state::Request { begin, body })
-        {
+        match self.engine.submit(
+            Instant::now(),
+            state::Request {
+                begin,
+                body,
+                cut: req.body_cut,
+            },
+        ) {
             Ok(id) => Ok(id),
             Err(SubmitError::Full) => Err(Refused::Full),
             Err(SubmitError::IdsExhausted) => Err(Refused::IdsExhausted),

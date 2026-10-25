@@ -3,7 +3,9 @@
 //! The request leaves in the form that was inspected, with these changes only: the fields that belong to the
 //! connection with the client are removed, the forwarding fields are added (and `Connection: close` when the
 //! connections to the upstream are not kept), the edits of the route are made (see `rewrite`), and the body is the
-//! inspected bytes. The names that the client listed in `Connection` are collected before anything is removed and
+//! inspected bytes, followed by the rest of the body, if it is longer, as the client sends it: with the framing the
+//! client used (the length it announced, or chunked), and not held (see `upload`). The names that the client listed
+//! in `Connection` are collected before anything is removed and
 //! are removed with the other hop-by-hop fields. The fields that are added come after the removal, so a client
 //! cannot take them away by naming them. The handshake of a WebSocket that the route lets through is the one request
 //! that asks the upstream to switch protocols: it gets `Connection: upgrade` and `Upgrade: websocket` as fixed
@@ -23,7 +25,15 @@
 //! is dropped before its end ends the connection.
 //! A pooled connection that fails before any byte of an answer was read may have been closed by the server while it
 //! waited: a request that does no harm when it is sent twice (GET, HEAD, OPTIONS, PUT, DELETE, TRACE) is then sent
-//! once more on a new connection to the same server, and any other is not.
+//! once more on a new connection to the same server, and any other is not. A request whose body is read from the
+//! client as it is sent is sent once, on a connection made for it, and after a failure goes on to the next server only
+//! if the connection could not be made, for nothing was sent then. The server answers such a request after it has
+//! read the body, so until the last piece of the body has been handed to the connection (see `upload`) the head of
+//! the answer is due by the end of the request time only, and the connection is not held to `response_idle`, which
+//! the pauses of a slow client in the body would use up: the client is held to `body_read` between two reads. A
+//! server that is waited for in that time counts against no server. From the moment the last piece has been handed
+//! on, the head is due `upstream_header` later, as for a request whose body is held, within the end of the request
+//! time; a server that does not answer in that time fails the request (`Head`).
 //!
 //! A server fails a request when the connection to it is refused or reset, the server cannot be reached, or the
 //! connection is not made within `upstream_connect` (`Connect`; over TLS the handshake is part of making the
@@ -61,12 +71,12 @@
 //! end has already been reached does not start (see `Stage`). Informational responses are read over and not passed
 //! on; the bytes read from the upstream up to the final head, they included, are capped as a whole.
 
-use std::convert::Infallible;
 use std::error::Error;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
+use std::pin::{Pin, pin};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -78,7 +88,9 @@ use http::{
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::Full;
 use hyper::body::Incoming;
-use tokio::time::{Instant, timeout_at};
+use hyper::client::conn::http1::SendRequest;
+use tokio::sync::watch;
+use tokio::time::{Instant, sleep_until};
 
 use self::head::{check_head, check_switch, lasts};
 use crate::config::ProxyConfig;
@@ -91,6 +103,7 @@ use crate::forward::tunnel::Switch;
 use crate::inbound::conn::Ctx;
 use crate::inbound::head::trim_ows;
 use crate::inbound::transport::io::Gauge;
+use crate::inbound::upload::{Cut, Upload};
 use crate::inspect::driver::BodyHold;
 
 mod head;
@@ -147,14 +160,16 @@ pub(super) const CLIENT_CLAIMS: [&str; 13] = [
     "x-original-forwarded-for",
 ];
 
-/// An allowed request, as it is forwarded. `peer` is the address of the connection the request came on. `https` is
-/// true when the listener ended TLS. `websocket` is true for the handshake of a WebSocket that the route lets
+/// An allowed request, as it is forwarded. `body` is the body, or its first bytes if it goes on in `upload`, which is
+/// read from the client as the upstream takes it. `peer` is the address of the connection the request came on. `https`
+/// is true when the listener ended TLS. `websocket` is true for the handshake of a WebSocket that the route lets
 /// through.
 pub struct Forward {
     pub method: Method,
     pub uri: Uri,
     pub fields: HeaderMap,
     pub body: Arc<BodyHold>,
+    pub upload: Option<Upload>,
     pub peer: SocketAddr,
     pub https: bool,
     pub websocket: bool,
@@ -253,19 +268,30 @@ pub enum OriginError {
     Late,
     /// The proxy could not make the connection for a reason of its own. No server is at fault.
     Local,
+    /// The body of the request, which was read from the client as it was sent, failed on the client's side. The
+    /// reason is with the caller (see `upload`).
+    Body,
 }
 
-/// The request body: the inspected bytes. It keeps the share of the byte budget until hyper drops it, which is
-/// when the bytes are written or the connection is gone.
+/// The request body: the inspected bytes, and, if the body goes on, the rest of it as the client sends it. It keeps
+/// the share of the byte budget until hyper drops it, which is when the bytes are written or the connection is gone.
 pub(super) struct Sent {
     bytes: Full<Bytes>,
+    upload: Option<Upload>,
+    /// The rest of the body was meant to go, and is not here: the body fails at once, rather than end as if it were
+    /// whole.
+    lost: bool,
     _hold: Arc<BodyHold>,
 }
 
 impl Sent {
-    fn new(hold: Arc<BodyHold>) -> Sent {
+    /// The body of one send. `streamed` tells that the rest of the body goes in `upload`, which only one send can
+    /// have.
+    fn new(hold: Arc<BodyHold>, upload: Option<Upload>, streamed: bool) -> Sent {
         Sent {
             bytes: Full::new(hold.bytes.clone()),
+            lost: streamed && upload.is_none(),
+            upload,
             _hold: hold,
         }
     }
@@ -273,21 +299,38 @@ impl Sent {
 
 impl Body for Sent {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = Cut;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        Pin::new(&mut self.get_mut().bytes).poll_frame(cx)
+    ) -> Poll<Option<Result<Frame<Bytes>, Cut>>> {
+        let this = self.get_mut();
+        if this.lost {
+            return Poll::Ready(Some(Err(Cut)));
+        }
+        if let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut this.bytes).poll_frame(cx) {
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        let Some(upload) = this.upload.as_mut() else {
+            return Poll::Ready(None);
+        };
+        upload.poll_frame(cx)
     }
 
     fn is_end_stream(&self) -> bool {
-        self.bytes.is_end_stream()
+        !self.lost
+            && self.bytes.is_end_stream()
+            && self.upload.as_ref().is_none_or(Upload::is_end_stream)
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.bytes.size_hint()
+        match &self.upload {
+            None => self.bytes.size_hint(),
+            Some(upload) => upload
+                .length()
+                .map_or_else(SizeHint::default, SizeHint::with_exact),
+        }
     }
 }
 
@@ -309,6 +352,14 @@ impl Stage {
         Stage {
             end: own.unwrap_or(start).min(by),
             own: own.is_some_and(|own| own < by),
+        }
+    }
+
+    /// The stage that has no limit of its own and ends with the request time.
+    pub(super) fn until(by: Instant) -> Stage {
+        Stage {
+            end: by,
+            own: false,
         }
     }
 
@@ -420,15 +471,30 @@ fn idle_timeout(e: &hyper::Error) -> bool {
     false
 }
 
-/// Where a failure of the exchange belongs: `Invalid` when the head of the answer cannot be parsed or is too long
+/// True when the error was caused by the body of the request failing on the client's side.
+fn from_body(e: &hyper::Error) -> bool {
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        if c.downcast_ref::<Cut>().is_some() {
+            return true;
+        }
+        cause = c.source();
+    }
+    false
+}
+
+/// Where a failure of the exchange belongs: `Body` when the body of the request failed on the client's side;
+/// `Invalid` when the head of the answer cannot be parsed or is too long
 /// (hyper reports a head with too many bytes or fields as a parse error) or when the cap for the head was hit; the
 /// server answered, and what it answers can follow from the request. `Head` once any byte of an answer has been
 /// read (`base` is what had been read from the connection before the exchange), or when the connection made no
 /// progress for the idle limit; `Send` when nothing of an answer had arrived and the connection failed in another
 /// way.
 fn failure(e: &hyper::Error, gauge: &Gauge, base: u64) -> OriginError {
-    // The cap fails the read, so hyper reports it as an I/O error and not as a parse error.
-    if e.is_parse() || gauge.over() {
+    if from_body(e) {
+        OriginError::Body
+    } else if e.is_parse() || gauge.over() {
+        // The cap fails the read, so hyper reports it as an I/O error and not as a parse error.
         OriginError::Invalid
     } else if gauge.read() > base || idle_timeout(e) {
         OriginError::Head
@@ -451,10 +517,52 @@ pub(super) fn head_cap(cfg: &ProxyConfig) -> u64 {
     u64::try_from(cfg.upstream_head_wire).unwrap_or(0)
 }
 
-/// Sends `request` on the connection and returns the checked head of the answer; `head` bounds that. The
-/// connection is closed if this fails. It goes back to `pool` at the end of the body of the answer if nothing in
-/// the head ends it. If the request is the handshake of a WebSocket (`websocket`) and the answer is a 101, the
-/// connection is kept in the answer for a tunnel instead.
+/// Sends `request` on `sender` and waits for the head of the answer, which is due at the end of `head`. If the rest
+/// of the body is read from the client as it is sent, `handed` sees `true` when the last piece of it has been handed
+/// to the connection: the server answers only after it has read all of it, so until then the head is due at the end
+/// of `head`, which is the end of the request time, and from then on `header` later, or at the end of the request
+/// time if that comes first. `Err` is the stage that ran out.
+async fn await_head(
+    sender: &mut SendRequest<Sent>,
+    request: Request<Sent>,
+    mut head: Stage,
+    header: Duration,
+    handed: Option<watch::Receiver<bool>>,
+) -> Result<Result<Response<Incoming>, hyper::Error>, Stage> {
+    let by = head.end;
+    let mut sending = pin!(sender.send_request(request));
+    let mut limit = pin!(sleep_until(by));
+    let mut told =
+        handed.map(|mut rx| Box::pin(async move { rx.wait_for(|handed| *handed).await.is_ok() }));
+    poll_fn(|cx| {
+        if let Poll::Ready(done) = sending.as_mut().poll(cx) {
+            return Poll::Ready(Ok(done));
+        }
+        if let Some(wait) = told.as_mut()
+            && let Poll::Ready(is_told) = wait.as_mut().poll(cx)
+        {
+            // A sender that is gone without telling means the body will not be handed on: the end stays.
+            told = None;
+            if is_told {
+                head = Stage::new(Instant::now(), header, by);
+                limit.as_mut().reset(head.end);
+            }
+        }
+        if limit.as_mut().poll(cx).is_ready() {
+            Poll::Ready(Err(head))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// Sends `request` on the connection and returns the checked head of the answer; `head` bounds that (see
+/// `await_head`). The connection is closed if this fails. It goes back to `pool` at the end of the body of the answer
+/// if nothing in the head ends it. If the request is the handshake of a WebSocket (`websocket`) and the answer is a
+/// 101, the connection is kept in the answer for a tunnel instead. If the rest of the body is read from the client
+/// as it is sent, the server answers only after it has read all of it, so the connection has no limit on its
+/// silence until the head is here, and is held to `response_idle` from then on.
 async fn exchange(
     mut lease: Lease,
     request: Request<Sent>,
@@ -462,18 +570,35 @@ async fn exchange(
     head_request: bool,
     websocket: bool,
     pool: &Pool,
+    cfg: &ProxyConfig,
 ) -> Result<Response<OriginBody>, OriginError> {
     if reached(head.end) {
         return Err(head.ran_out(OriginError::Head));
     }
+    let handed = request.body().upload.as_ref().map(Upload::watch);
+    let streamed = handed.is_some();
+    if streamed {
+        lease.gauge.pause();
+    }
     let base = lease.gauge.read();
     lease.used = lease.used.saturating_add(1);
-    let mut response = match timeout_at(head.end, lease.sender.send_request(request)).await {
+    let sent = await_head(
+        &mut lease.sender,
+        request,
+        head,
+        cfg.upstream_header,
+        handed,
+    )
+    .await;
+    let mut response = match sent {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => return Err(failure(&e, &lease.gauge, base)),
-        Err(_) => return Err(head.ran_out(OriginError::Head)),
+        Err(stage) => return Err(stage.ran_out(OriginError::Head)),
     };
     lease.gauge.lift();
+    if streamed {
+        lease.gauge.restart(cfg.response_idle);
+    }
     // The connection may have started reading the body before the cap was lifted. A read that was refused
     // has cut the answer off, so it is not passed on; as in `failure`, the cap is not the fault of the server.
     if lease.gauge.over() {
@@ -517,6 +642,22 @@ pub struct Dispatched {
     pub result: Result<Response<OriginBody>, OriginError>,
 }
 
+/// How the body of a request is sent, which says what can be done again after a failure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Payload {
+    /// All the bytes are held. `again`: the method does no harm when it reaches a server twice.
+    Held { again: bool },
+    /// The rest of the body is read from the client as it is sent, so it can be sent once.
+    Streamed,
+}
+
+impl Payload {
+    /// Whether the request may be sent once more after a failure that came when it was on its way.
+    fn again(self) -> bool {
+        matches!(self, Payload::Held { again: true })
+    }
+}
+
 /// Whether `error` is a failure of the server: the group counts it, and the request may go to another one.
 fn failure_of_server(error: OriginError) -> bool {
     matches!(
@@ -526,15 +667,17 @@ fn failure_of_server(error: OriginError) -> bool {
 }
 
 /// Whether a request may go to another server after `error`: always if the connection could not be made, for
-/// nothing was sent then, and otherwise only if it does no harm when it reaches a server twice.
-fn may_go_on(error: OriginError, method: &Method) -> bool {
+/// nothing was sent then, and otherwise only if all of its body is held and it does no harm when it reaches a server
+/// twice.
+fn may_go_on(error: OriginError, payload: Payload) -> bool {
     match error {
         OriginError::Connect => true,
-        OriginError::Send | OriginError::Head => idempotent(method),
+        OriginError::Send | OriginError::Head => payload.again(),
         OriginError::Invalid
         | OriginError::Unavailable
         | OriginError::Late
-        | OriginError::Local => false,
+        | OriginError::Local
+        | OriginError::Body => false,
     }
 }
 
@@ -553,28 +696,34 @@ impl Failed {
     }
 }
 
-/// One try on one server. `request` makes the request for each send.
+/// One try on one server. `request` makes the request for each send. A request whose body is read from the client
+/// as it is sent is sent once, on a connection that is made for it: a waiting connection may have been closed by the
+/// server, which is found out only when the request is on its way, and then it cannot be sent again. Its server
+/// answers after it has read the body, so the head is due by `by` until the body has been handed on, and
+/// `upstream_header` after that (see `await_head`).
 async fn attempt(
     server: &Server,
     cfg: &ProxyConfig,
     request: &impl Fn() -> Request<Sent>,
-    method: &Method,
+    payload: Payload,
     head_request: bool,
     websocket: bool,
     by: Instant,
 ) -> Result<Response<OriginBody>, Failed> {
     let pool = server.pool();
-    if let Some(lease) = pool
-        .take(connect_stage(cfg, by).map_err(Failed::counted)?.end)
-        .await
+    let streamed = payload == Payload::Streamed;
+    if !streamed
+        && let Some(lease) = pool
+            .take(connect_stage(cfg, by).map_err(Failed::counted)?.end)
+            .await
     {
         lease.gauge.rearm(head_cap(cfg), cfg.response_idle);
         let head = Stage::new(Instant::now(), cfg.upstream_header, by);
-        match exchange(lease, request(), head, head_request, websocket, pool).await {
+        match exchange(lease, request(), head, head_request, websocket, pool, cfg).await {
             // The server may have closed the connection while it waited. If nothing of an answer had arrived,
             // a request that does no harm when it is sent twice is sent on a new connection, once. The stages of
             // that go on to end by `by`. Any other request is not sent again, and the failure is not counted.
-            Err(OriginError::Send) if idempotent(method) => {}
+            Err(OriginError::Send) if payload.again() => {}
             Err(OriginError::Send) => {
                 return Err(Failed {
                     error: OriginError::Send,
@@ -592,8 +741,12 @@ async fn attempt(
     )
     .await
     .map_err(Failed::counted)?;
-    let head = Stage::new(Instant::now(), cfg.upstream_header, by);
-    exchange(lease, request(), head, head_request, websocket, pool)
+    let head = if streamed {
+        Stage::until(by)
+    } else {
+        Stage::new(Instant::now(), cfg.upstream_header, by)
+    };
+    exchange(lease, request(), head, head_request, websocket, pool, cfg)
         .await
         .map_err(Failed::counted)
 }
@@ -615,6 +768,7 @@ pub async fn forward(
         uri,
         fields,
         body,
+        upload,
         peer,
         https,
         websocket,
@@ -639,8 +793,19 @@ pub async fn forward(
         }
     };
     let head_request = method == Method::HEAD;
+    let payload = if upload.is_some() {
+        Payload::Streamed
+    } else {
+        Payload::Held {
+            again: idempotent(&method),
+        }
+    };
+    let streamed = payload == Payload::Streamed;
+    // The rest of the body is in one request only; `Sent` fails a request made without it.
+    let upload = Mutex::new(upload);
     let request = || {
-        let mut request = Request::new(Sent::new(body.clone()));
+        let upload = upload.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let mut request = Request::new(Sent::new(body.clone(), upload, streamed));
         *request.method_mut() = method.clone();
         *request.uri_mut() = uri.clone();
         *request.version_mut() = Version::HTTP_11;
@@ -663,7 +828,7 @@ pub async fn forward(
         tried.add(index);
         let chosen = group.server(index);
         server = Some(chosen.address());
-        match attempt(chosen, cfg, &request, &method, head_request, websocket, by).await {
+        match attempt(chosen, cfg, &request, payload, head_request, websocket, by).await {
             Ok(mut response) => {
                 rewrite.respond(response.headers_mut());
                 return Dispatched {
@@ -676,7 +841,7 @@ pub async fn forward(
                 if failed.counted {
                     group.fail(index, Instant::now());
                 }
-                if !failure_of_server(error) || !may_go_on(error, &method) {
+                if !failure_of_server(error) || !may_go_on(error, payload) {
                     break;
                 }
             }

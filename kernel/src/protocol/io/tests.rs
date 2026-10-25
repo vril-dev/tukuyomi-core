@@ -57,7 +57,7 @@ fn a_frame_arrives_whole_and_checked() {
 #[test]
 fn send_writes_the_encoded_frame_bytes() {
     let (a, b) = pair();
-    let f = encode_frame(KIND_BODY, RUN, INC, 3, 4, b"abc").unwrap();
+    let f = encode_frame(KIND_BODY, 0, RUN, INC, 3, 4, b"abc").unwrap();
     send(&a, &f, Instant::now() + SEC).unwrap();
     let mut got = vec![0u8; f.len()];
     (&b).read_exact(&mut got).unwrap();
@@ -67,7 +67,7 @@ fn send_writes_the_encoded_frame_bytes() {
 #[test]
 fn send_refuses_a_frame_whose_length_field_does_not_match() {
     let (a, _b) = pair();
-    let mut f = encode_frame(KIND_BODY, RUN, INC, 3, 4, b"abc").unwrap();
+    let mut f = encode_frame(KIND_BODY, 0, RUN, INC, 3, 4, b"abc").unwrap();
     let bad = Err(ConnError::Io(ErrorKind::InvalidInput));
     assert_eq!(send(&a, &f[..HEADER_LEN - 1], Instant::now() + SEC), bad);
     assert_eq!(send(&a, &f[..f.len() - 1], Instant::now() + SEC), bad);
@@ -112,7 +112,7 @@ fn a_deadline_already_over_fails_without_reading() {
     );
     // nothing was read: the frame is still there
     assert!(rx_ok(&a).is_ok());
-    let f = encode_frame(KIND_BODY, RUN, INC, 3, 4, b"abc").unwrap();
+    let f = encode_frame(KIND_BODY, 0, RUN, INC, 3, 4, b"abc").unwrap();
     assert_eq!(
         send(&a, &f, Instant::now()),
         Err(ConnError::Io(ErrorKind::TimedOut))
@@ -185,7 +185,7 @@ fn hard_cuts_before_idle_and_before_frame_io() {
 #[test]
 fn a_full_socket_times_out_on_send() {
     let (a, _b) = pair();
-    let f = encode_frame(KIND_BODY, RUN, INC, 3, 4, &vec![0u8; MAX_BODY]).unwrap();
+    let f = encode_frame(KIND_BODY, 0, RUN, INC, 3, 4, &vec![0u8; MAX_BODY]).unwrap();
     let t = Instant::now();
     let mut r = Ok(());
     // nobody reads: the socket buffer fills within a few frames
@@ -204,7 +204,7 @@ fn a_closed_peer_is_reported() {
     let (a, b) = pair();
     drop(b);
     assert_eq!(rx_ok(&a), Err(ConnError::PeerClosed));
-    let f = encode_frame(KIND_BODY, RUN, INC, 3, 4, b"abc").unwrap();
+    let f = encode_frame(KIND_BODY, 0, RUN, INC, 3, 4, b"abc").unwrap();
     assert_eq!(
         send(&a, &f, Instant::now() + SEC),
         Err(ConnError::Io(ErrorKind::BrokenPipe))

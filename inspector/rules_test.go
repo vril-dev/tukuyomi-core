@@ -34,6 +34,8 @@ func TestCheckRules(t *testing.T) {
 		{"setenv", act + "setenv:A=B\"\n"},
 		{"setenv split by a continuation", act + "set\\\nenv:A=B\"\n"},
 		{"ctl requestBodyLimit", act + "ctl:requestBodyLimit=1\"\n"},
+		{"setvar of the cut variable", act + "setvar:tx.reserved_body_cut=1\"\n"},
+		{"the cut variable as a target, in capitals", `SecRule TX:Reserved_Body_Cut "@eq 0" "id:5,phase:2,pass"` + "\n"},
 		{"open continuation", "SecRuleEngine On\nSecAction \"id:1,phase:1,pass\" \\"},
 		{"open backtick", "SecDataset x `\na\n"},
 		{"line over 64 KiB", act + "msg:'" + strings.Repeat("a", 70000) + "'\"\n"},

@@ -17,14 +17,15 @@
 //! path of at most 3840 bytes; the file is not read here. `server_name` is a name of the form of a server name, and
 //! TLS has to be able to use it; without it each server is checked for its own name (so every name of a server of such
 //! a group must be one TLS can use), or, written as an IP literal, for its address.
-//! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?}`. The `host`
-//! and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access` and
+//! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?}`.
+//! The `host` and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access` and
 //! `rewrite` are the networks that may use the route and the edits it makes (see `rewrite`). `stream` is `{"idle_ms",
 //! "total_ms", "websocket"}`, all three present: a response on the route may last `total_ms` from its head at the
 //! most (1 ms to 24 h) while the upstream may be silent for `idle_ms` (1 ms up to `total_ms`) and `websocket` tells
-//! whether a WebSocket handshake is let through. `default_upstream` is the group that serves a request no route
+//! whether a WebSocket handshake is let through. `max_body` is the most bytes a request body may have on the route
+//! (0: none); it is not above the `max_body` of the proxy, which the route can only lower. `default_upstream` is the group that serves a request no route
 //! holds for, or the empty string, and then such a request is answered with 404. The default group has no
-//! `access`, no `rewrite` and no `stream`. The `path` of a route that has an access list is in its canonical
+//! `access`, no `rewrite`, no `stream` and no `max_body`. The `path` of a route that has an access list is in its canonical
 //! form (see `route`): its escapes are in uppercase and none stands for a byte that a path holds as it is, for a
 //! request is held to the list of the route that its path in canonical form meets, and would not meet this one. If
 //! any route has an access list, no route has a port in its `host`: the client writes the port, and a request that
@@ -102,16 +103,20 @@ pub struct RouteConfig {
     pub access: Access,
     pub rewrite: Rewrite,
     pub stream: Option<Stream>,
+    /// The most bytes a request body on this route may have, if that is less than `max_body` of the proxy.
+    pub max_body: Option<usize>,
 }
 
 impl RouteConfig {
-    /// A route to the group at index `group` that turns nobody away, edits nothing and has no `stream`.
+    /// A route to the group at index `group` that turns nobody away, edits nothing, has no `stream` and no limit
+    /// of its own on the body.
     pub fn plain(group: usize) -> RouteConfig {
         RouteConfig {
             group,
             access: Access::default(),
             rewrite: Rewrite::default(),
             stream: None,
+            max_body: None,
         }
     }
 }
@@ -212,6 +217,8 @@ struct RawRoute {
     rewrite: Option<Object<RawRewrite>>,
     #[serde(default, deserialize_with = "super::present")]
     stream: Option<Object<RawStream>>,
+    #[serde(default, deserialize_with = "super::present")]
+    max_body: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -395,10 +402,12 @@ fn tls(
     }))
 }
 
-/// Checks the `forward` object. `listeners` are the addresses the proxy listens on.
+/// Checks the `forward` object. `listeners` are the addresses the proxy listens on, and `max_body` is the limit on a
+/// request body that the proxy has: a route may lower it, not raise it.
 pub(super) fn check(
     raw: RawForward,
     listeners: &[SocketAddr],
+    max_body: usize,
 ) -> Result<ForwardSettings, ConfigError> {
     let resolve_timeout = millis(raw.resolve_timeout_ms, "resolve_timeout_ms is out of range")?;
     ensure(
@@ -433,6 +442,10 @@ pub(super) fn check(
             &route.upstream,
             "a route names an upstream that is not defined",
         )?;
+        ensure(
+            route.max_body.is_none_or(|limit| limit <= max_body),
+            "a route max_body is above the max_body of the proxy",
+        )?;
         let access = rewrite::access(route.access)?;
         ensure(
             access.is_empty() || rule.canonical(),
@@ -445,6 +458,7 @@ pub(super) fn check(
                 access,
                 rewrite: rewrite::rewrite(route.path.as_deref(), route.rewrite)?,
                 stream: stream(route.stream)?,
+                max_body: route.max_body,
             },
         ));
     }

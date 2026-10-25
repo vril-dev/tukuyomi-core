@@ -145,6 +145,7 @@ type owner struct {
 	state    txState
 	lastMsg  uint32
 	declared uint64
+	cut      bool   // the body goes on past the declared bytes: its parse failures are no reason to block
 	wantProc string // request body processor that the first Content-Type selects (urlencoded and multipart: Coraza; JSON: begin); empty: none
 	recv     uint64
 	rDecl    uint64
@@ -219,6 +220,7 @@ func (o *owner) fail(msg uint32, code uint16, text string) {
 func (o *owner) begin(b txBegin, msg uint32) {
 	o.tx = o.t.newTx(o.t.txIDString(o.id))
 	o.declared = b.declared
+	o.cut = b.cut
 	o.tx.ProcessConnection(b.clientAddr, int(b.clientPort), b.serverAddr, int(b.serverPort))
 	o.tx.ProcessURI(b.uri, b.method, b.proto)
 	host, hasHost, hasType := "", false, false
@@ -258,7 +260,7 @@ func (o *owner) begin(b txBegin, msg uint32) {
 	}
 	o.state = stHeaders
 	it := o.tx.ProcessRequestHeaders()
-	if it == nil && !requestComplete(o.tx, false, o.declared, o.wantProc) {
+	if it == nil && !requestComplete(o.tx, false, o.declared, o.wantProc, o.cut) {
 		o.fail(msg, codeIncomplete, "request inspection incomplete")
 		return
 	}
@@ -280,7 +282,29 @@ func (o *owner) begin(b txBegin, msg uint32) {
 		}
 		p.Set("JSON")
 	}
+	// The variable that rule 4000001 reads is put here as well, after the rules
+	// of phase 1 and before the body is read.
+	if it == nil && o.cut && !markCut(o.tx) {
+		o.fail(msg, codeIncomplete, "request inspection incomplete")
+		return
+	}
 	o.verdict(msg, 1, it)
+}
+
+// markCut puts bodyCutVar on the transaction of a body that was cut, which tells
+// rule 4000001 that the parse failure of the body is no reason to block. A
+// transaction or collection that is not of the expected type is not marked.
+func markCut(tx types.Transaction) bool {
+	ts, ok := tx.(plugintypes.TransactionState)
+	if !ok {
+		return false
+	}
+	m, ok := ts.Collection(variables.TX).(collection.Map)
+	if !ok {
+		return false
+	}
+	m.Set(bodyCutVar, []string{"1"})
+	return true
 }
 
 // requestComplete is the guard before a Continue of phase 1 or 2: the rules
@@ -290,7 +314,12 @@ func (o *owner) begin(b txBegin, msg uint32) {
 // dropped, so nothing is assumed from the rules. A rule engine Off or a body
 // that is not accessible make the inspection incomplete. Before the Continue
 // of phase 2 the raw value of each flag that the reserved rules test must be
-// empty or "0"; and for a request with a body (declared > 0) the request body
+// empty or "0", except the parse failure of the body (REQBODY_ERROR) when the
+// body was cut (cut): the cut causes it, and rule 4000001 lets it pass then. For
+// a body that was not cut it stays a flag whatever bodyCutVar says, so a rule
+// that sets the variable on such a transaction by a key that a macro builds
+// (which checkRules cannot see) does not turn the block into a Continue.
+// For a request with a body (declared > 0) the request body
 // processor must equal wantProc, the one that the first Content-Type selects
 // (URLENCODED and MULTIPART: Coraza picks them; JSON, for application/json
 // and application/<name>+json: begin sets it; empty when it is none of these,
@@ -305,7 +334,7 @@ func (o *owner) begin(b txBegin, msg uint32) {
 // The assertions use the experimental plugin interface of the pinned Coraza
 // version; the Transaction that its WAF returns implements it. The callers
 // ask only for a Continue: a Block keeps its VERDICT.
-func requestComplete(tx types.Transaction, phase2 bool, declared uint64, wantProc string) bool {
+func requestComplete(tx types.Transaction, phase2 bool, declared uint64, wantProc string, cut bool) bool {
 	if tx.IsRuleEngineOff() || !tx.IsRequestBodyAccessible() {
 		return false
 	}
@@ -322,6 +351,9 @@ func requestComplete(tx types.Transaction, phase2 bool, declared uint64, wantPro
 		s, ok := ts.Collection(v).(collection.Single)
 		if !ok {
 			return false
+		}
+		if cut && v == variables.ReqbodyError {
+			continue
 		}
 		if g := s.Get(); g != "" && g != "0" {
 			return false
@@ -435,7 +467,7 @@ func (o *owner) bodyEnd(f inFrame) {
 		o.verdict(f.msg, 2, it)
 	case err != nil:
 		o.fail(f.msg, codeReqProcess, "request body processing failed")
-	case !requestComplete(o.tx, true, o.declared, o.wantProc):
+	case !requestComplete(o.tx, true, o.declared, o.wantProc, o.cut):
 		o.fail(f.msg, codeIncomplete, "request inspection incomplete")
 	case o.t.detect:
 		o.continueDetect(f.msg)
@@ -676,9 +708,10 @@ func (t *table) dispatch(h header, p []byte) {
 		case h.msg != 1:
 			code, text = codeBadBegin, "TX_BEGIN message number is not 1"
 		default:
-			if b, err = decodeTxBegin(p); err != nil {
+			if b, err = decodeTxBegin(p); err != nil || h.cut && b.declared == 0 { // a cut body has declared bytes
 				code, text = codeBadBegin, "invalid TX_BEGIN payload"
 			}
+			b.cut = h.cut
 		}
 		if code != 0 {
 			t.mu.Unlock()

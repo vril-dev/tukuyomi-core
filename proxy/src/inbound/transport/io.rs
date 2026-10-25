@@ -23,7 +23,7 @@ struct Shared {
     /// The read idle period starts again, with the limit in `read_limit`, at the next read call. Only the `Guarded`
     /// clears it.
     restart: AtomicBool,
-    /// The read idle limit of a restarted period, in nanoseconds.
+    /// The read idle limit of a restarted period, in nanoseconds, or `OFF`.
     read_limit: AtomicU64,
     /// The task that reads, to be woken when the period is restarted, so that a read that is pending does not
     /// wait for the end of the old period.
@@ -71,16 +71,19 @@ impl Shared {
     }
 }
 
-/// A limit in nanoseconds, cut at the most that fits in 64 bits (some 584 years).
+/// The value of `read_limit` that stands for no read idle limit at all (see `Gauge::pause`).
+const OFF: u64 = u64::MAX;
+
+/// A limit in nanoseconds, cut at the most that fits in 64 bits short of `OFF` (some 584 years).
 fn nanos(limit: Duration) -> u64 {
-    u64::try_from(limit.as_nanos()).unwrap_or(u64::MAX)
+    u64::try_from(limit.as_nanos()).unwrap_or(OFF).min(OFF - 1)
 }
 
 /// The idle limit of one direction. The timer starts at the first call that cannot go on and stops as soon as
 /// something moved, so a call that is pending for longer than the limit without any progress fails, and a slow
-/// call that keeps moving does not.
+/// call that keeps moving does not. Without a limit nothing fails.
 struct Idle {
-    limit: Duration,
+    limit: Option<Duration>,
     sleep: Option<Pin<Box<Sleep>>>,
     armed: bool,
 }
@@ -88,7 +91,7 @@ struct Idle {
 impl Idle {
     fn new(limit: Duration) -> Idle {
         Idle {
-            limit,
+            limit: Some(limit),
             sleep: None,
             armed: false,
         }
@@ -99,17 +102,20 @@ impl Idle {
         self.armed = false;
     }
 
-    /// The limit is `limit` from now on, and the next stall starts a new period.
-    fn restart(&mut self, limit: Duration) {
+    /// The limit is `limit` from now on (`None`: there is none), and the next stall starts a new period.
+    fn restart(&mut self, limit: Option<Duration>) {
         self.limit = limit;
         self.armed = false;
     }
 
     /// The call is pending. True when it has been without progress for the whole limit. A limit that does not
-    /// fit into the clock never ends.
+    /// fit into the clock never ends, and without a limit the call never fails.
     fn stalled(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(limit) = self.limit else {
+            return false;
+        };
         if !self.armed {
-            let Some(deadline) = Instant::now().checked_add(self.limit) else {
+            let Some(deadline) = Instant::now().checked_add(limit) else {
                 return false;
             };
             match self.sleep.as_mut() {
@@ -223,8 +229,9 @@ impl<T: AsyncRead + Unpin> AsyncRead for Guarded<T> {
         // The task is noted before the flag is looked at, so a restart that comes after the look wakes it.
         this.shared.park(cx.waker());
         if this.shared.restart.swap(false, Ordering::AcqRel) {
-            let limit = Duration::from_nanos(this.shared.read_limit.load(Ordering::Acquire));
-            this.read_idle.restart(limit);
+            let limit = this.shared.read_limit.load(Ordering::Acquire);
+            this.read_idle
+                .restart((limit != OFF).then(|| Duration::from_nanos(limit)));
         }
         if !this.prefix.is_empty() {
             let n = this.prefix.len().min(buf.remaining());
@@ -339,9 +346,18 @@ impl Gauge {
     /// stream went quiet. This holds for a read that is pending as well as for the next one: the task that reads
     /// is woken. A stream that waits for another exchange is kept to a shorter limit this way.
     pub fn restart(&self, limit: Duration) {
-        self.shared
-            .read_limit
-            .store(nanos(limit), Ordering::Release);
+        self.set_limit(nanos(limit));
+    }
+
+    /// There is no read idle limit from now on, until `restart` or `rearm` gives one: a read that is pending waits
+    /// as long as it takes (the task that reads is woken, as for `restart`). For an exchange whose wait for the
+    /// stream is bounded by something else.
+    pub fn pause(&self) {
+        self.set_limit(OFF);
+    }
+
+    fn set_limit(&self, limit: u64) {
+        self.shared.read_limit.store(limit, Ordering::Release);
         self.shared.restart.store(true, Ordering::Release);
         self.shared.wake();
     }

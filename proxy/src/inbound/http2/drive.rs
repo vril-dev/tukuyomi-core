@@ -448,6 +448,7 @@ async fn request(
                 reply,
                 client: session.peer.ip(),
                 via: None,
+                body: None,
             };
             return Ok(session.track(noted, answer(reply.status), start, guard));
         }

@@ -116,6 +116,9 @@ const (
 	codeRespTruncated  uint16 = 31 // RESP_END with total != declared
 )
 
+// Header flags. Only a TX_BEGIN header may carry one, and only this one.
+const flagBodyCut uint8 = 1 << 0 // the request body goes on past the declared bytes
+
 const (
 	decisionContinue uint8 = 0
 	decisionBlock    uint8 = 1
@@ -128,6 +131,7 @@ const (
 // header is the fixed 36-byte frame header.
 type header struct {
 	kind   uint8
+	cut    bool // flagBodyCut is set
 	length uint32
 	run    uint64
 	inc    uint32
@@ -150,6 +154,7 @@ var errContent = errors.New("invalid payload content")
 func isControl(kind uint8) bool { return kind == kindDrain || kind == kindHello || kind == kindBye }
 
 // checkHeader validates an inbound header before the payload is allocated.
+// The flags are zero, except flagBodyCut on a TX_BEGIN.
 func checkHeader(b *[headerLen]byte, run uint64, inc uint32) (header, error) {
 	var h header
 	if b[0] != magic[0] || b[1] != magic[1] || b[2] != magic[2] || b[3] != magic[3] {
@@ -157,7 +162,10 @@ func checkHeader(b *[headerLen]byte, run uint64, inc uint32) (header, error) {
 	}
 	h.kind = b[4]
 	if b[5] != 0 {
-		return h, connErr("flags not zero")
+		if b[5] != flagBodyCut || h.kind != kindTxBegin {
+			return h, connErr("flags 0x%02x not allowed for kind 0x%02x", b[5], h.kind)
+		}
+		h.cut = true
 	}
 	if binary.BigEndian.Uint16(b[6:8]) != 0 {
 		return h, connErr("reserved not zero")
@@ -395,6 +403,7 @@ type txBegin struct {
 	proto      string
 	declared   uint64
 	headers    []httpHeader
+	cut        bool // the body goes on past the declared bytes; the header flag, set by the caller of decodeTxBegin
 }
 
 func decodeTxBegin(p []byte) (txBegin, error) {

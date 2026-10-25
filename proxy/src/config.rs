@@ -2,8 +2,8 @@
 //! {..}}, "acme": {..}}`; every value is chosen by the operator and checked here.
 //!
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present (a
-//! route may leave out its `host`, its `path`, its `access`, its `rewrite` and its `stream`; `access` and `rewrite`
-//! have no key that must be present, see `rewrite`, and a `stream` has all three; an upstream group may leave out its
+//! route may leave out its `host`, its `path`, its `access`, its `rewrite`, its `stream` and its `max_body`; `access`
+//! and `rewrite` have no key that must be present, see `rewrite`, and a `stream` has all three; an upstream group may leave out its
 //! `tls`, which may leave out its `server_name`; a listener may leave out its `tls` and its `redirect`, and the `tls`
 //! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
 //! may leave out `acme`, which it must have if and only if a certificate has one, see `acme`); an unknown or repeated
@@ -15,6 +15,18 @@
 //! the proxy starts), the `rules.store` values, the `acme` object with the certificates that have `acme`, the
 //! conversion of the `kernel` object into `tukuyomi_kernel::Config`
 //! with that type's own check, and last the relations between the `proxy` and `kernel` objects.
+//!
+//! `max_body` (1 KiB to 4 GiB) is the most bytes a request body may have once decoded (a gzip body under a route
+//! that skips the inspection is not decoded, so the limit counts its coded bytes), and `inspect_body` (1 KiB up to
+//! the body limit of the kernel, 1 MiB, and not above `max_body`) is how many of its first bytes are inspected: a
+//! longer body is passed on without being inspected behind those bytes. `max_body_wire` runs from `max_body` to twice
+//! `max_body` and 4 MiB, for the framing of a chunked body is on the wire too, and `max_buffered_bytes` from twice
+//! `inspect_body`, the most bytes of the fields of a request and the piece that a request holds while the rest of its
+//! body is passed on (`STREAM_HOLD`, 32 KiB), up to 4 GiB: that is what one request whose body goes on past the
+//! inspected bytes holds at most. Every request that is under way at once holds its share, so the budget is to be
+//! sized for the most of them that are expected. The budget does not count the buffer of the connection to the
+//! upstream, which is sized by `upstream_max_head_bytes` and holds bytes of a body that goes on as well: that is up
+//! to `upstream_max_head_bytes` more for each request under way whose body goes on, whatever the length of the body.
 //!
 //! Times are whole milliseconds under keys that end in `_ms`; the `proxy` times run from 1 ms to 3600 s, except
 //! `keepalive_timeout_ms`, which also takes 0 (a connection is not kept after its response), and `conn_total_ms`,
@@ -67,8 +79,14 @@ const MAX_MS: u64 = 3_600_000;
 const MAX_CONN_MS: u64 = 86_400_000;
 /// The most networks in `trusted_proxies`.
 const MAX_TRUSTED: usize = 256;
+const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
+
+/// The share of the byte budget that a request holds while the rest of its body is passed on: one piece of it as it
+/// is handed from the client to the upstream. A piece is no longer than the read buffer of the connection, which
+/// is at most 32 KiB (`max_head_bytes` is no more than that).
+pub(crate) const STREAM_HOLD: usize = 32 * 1024;
 
 /// The HTTP side of the configuration. No `Default`: every value comes from the file.
 #[derive(Clone, Debug)]
@@ -76,7 +94,12 @@ pub struct ProxyConfig {
     pub listeners: Vec<ListenerConfig>,
     pub max_conns: usize,
     pub max_head_bytes: usize,
+    /// The most bytes a request body may have, once decoded. A longer one is refused with 413. A gzip body under a
+    /// route that skips the inspection is not decoded, and counts as it is sent.
     pub max_body: usize,
+    /// The first bytes of a request body that are inspected. The bytes behind them are passed on without being
+    /// inspected.
+    pub inspect_body: usize,
     pub max_body_wire: usize,
     pub max_buffered_bytes: usize,
     pub upstream_max_headers: usize,
@@ -184,6 +207,7 @@ struct RawProxy {
     max_conns: usize,
     max_head_bytes: usize,
     max_body: usize,
+    inspect_body: usize,
     max_body_wire: usize,
     max_buffered_bytes: usize,
     upstream_max_headers: usize,
@@ -405,17 +429,29 @@ fn build(
         listeners::header_lists_fit(&listeners, p.max_head_bytes),
         "http2 max_header_list is above four times max_head_bytes",
     )?;
+    ensure(within(p.max_body, KIB, 4 * GIB), "max_body is out of range")?;
     ensure(
-        bytes(p.max_body) <= BODY,
-        "max_body is above the body limit",
+        within(p.inspect_body, KIB, BODY),
+        "inspect_body is out of range",
     )?;
     ensure(
-        within(p.max_body_wire, bytes(p.max_body), 4 * MIB),
+        p.inspect_body <= p.max_body,
+        "inspect_body is above max_body",
+    )?;
+    // The wire holds the framing of a chunked body besides the body.
+    let wire_high = bytes(p.max_body)
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(4 * MIB));
+    ensure(
+        wire_high.is_some_and(|high| within(p.max_body_wire, bytes(p.max_body), high)),
         "max_body_wire is out of range",
     )?;
-    let one_request = bytes(p.max_body)
+    // One request holds the inspected bytes, the kernel's copy of them with the fields, and the piece of the rest of
+    // the body that is on its way.
+    let one_request = bytes(p.inspect_body)
         .checked_mul(2)
-        .and_then(|n| n.checked_add(bytes(HEADER_TOTAL)));
+        .and_then(|n| n.checked_add(bytes(HEADER_TOTAL)))
+        .and_then(|n| n.checked_add(bytes(STREAM_HOLD)));
     ensure(
         one_request.is_some_and(|low| within(p.max_buffered_bytes, low, 4 * GIB)),
         "max_buffered_bytes is out of range",
@@ -497,7 +533,7 @@ fn build(
         "upstream_keepalive_requests is out of range",
     )?;
 
-    let forward = forward::check(f, &addresses(&listeners))?;
+    let forward = forward::check(f, &addresses(&listeners), p.max_body)?;
 
     ensure(s.kind == "file", "rules store kind is not supported")?;
     let dir = PathBuf::from(s.dir);
@@ -627,6 +663,7 @@ fn build(
             max_conns: p.max_conns,
             max_head_bytes: p.max_head_bytes,
             max_body: p.max_body,
+            inspect_body: p.inspect_body,
             max_body_wire: p.max_body_wire,
             max_buffered_bytes: p.max_buffered_bytes,
             upstream_max_headers: p.upstream_max_headers,

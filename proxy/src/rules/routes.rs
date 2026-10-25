@@ -2,8 +2,10 @@
 //!
 //! A route has a path and, if it is to hold for one host only, a host. Its action is always `bypass`: a request
 //! that a route matches is not handed to the inspector, and goes on to the upstream. What the proxy itself checks
-//! (the head, the type and the size of the body, the decoding of a gzip body) has been done before the request
-//! gets here. The routes are in the manifest of the bundle, so they are part of its fingerprint, and a running proxy
+//! (the head, the type of the body and the limit on its size) is done before the request goes on. Its body is held
+//! only if it ends within the bytes that are inspected on other routes; a longer one is passed on as the client sends
+//! it, with the framing the client used. A gzip body is never decoded, whatever its length. The routes
+//! are in the manifest of the bundle, so they are part of its fingerprint, and a running proxy
 //! changes them only by switching to another generation.
 //!
 //! A route is checked when it is made, whether it comes from the file of `rules import` or from a manifest, so the

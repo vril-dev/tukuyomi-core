@@ -608,12 +608,13 @@ fn serve_upstream(mut sock: TcpStream, seen: &Seen, keeps: bool) {
     }
 }
 
-/// A request read to its end: the head, and as many body bytes as its `Content-Length` says. `None` if the
-/// peer closes first.
+/// A request read to its end: the head, and as many body bytes as its `Content-Length` says, or, for a chunked body,
+/// up to its last chunk. `None` if the peer closes first.
 fn read_request(sock: &mut TcpStream) -> Option<Vec<u8>> {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     let mut total = None;
+    let mut chunked = false;
     loop {
         if total.is_none()
             && let Some(end) = find(&raw, b"\r\n\r\n")
@@ -624,9 +625,10 @@ fn read_request(sock: &mut TcpStream) -> Option<Vec<u8>> {
                 .first()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(0);
+            chunked = head.values("transfer-encoding") == ["chunked"];
             total = Some(end + 4 + length);
         }
-        if total.is_some_and(|n| raw.len() >= n) {
+        if total.is_some_and(|n| raw.len() >= n) && (!chunked || raw.ends_with(b"\r\n0\r\n\r\n")) {
             return Some(raw);
         }
         match sock.read(&mut chunk) {
@@ -664,6 +666,9 @@ pub(crate) struct Knobs {
     pub(crate) restarts: u32,
     pub(crate) stop_inspect_ms: u64,
     pub(crate) stop_wait_ms: u64,
+    /// The most bytes a body may have, and how many of its first bytes are inspected.
+    pub(crate) max_body: usize,
+    pub(crate) inspect_body: usize,
 }
 
 impl Knobs {
@@ -685,6 +690,18 @@ impl Knobs {
             restarts: 0,
             stop_inspect_ms: 10_000,
             stop_wait_ms: 20_000,
+            // A body is inspected whole, up to the most the kernel takes.
+            max_body: MAX_BODY,
+            inspect_body: MAX_BODY,
+        }
+    }
+
+    /// Bodies of up to 32 MiB, of which the first 16 KiB are inspected.
+    pub(crate) fn long_bodies() -> Knobs {
+        Knobs {
+            max_body: 32 << 20,
+            inspect_body: 16 << 10,
+            ..Knobs::quick()
         }
     }
 
@@ -728,8 +745,9 @@ fn config_json(k: &Knobs, listen: SocketAddr, upstreams: &[SocketAddr], root: &P
             "listeners": [{"address": listen.to_string()}],
             "max_conns": k.max_conns,
             "max_head_bytes": 8192,
-            "max_body": MAX_BODY,
-            "max_body_wire": 2 * MAX_BODY,
+            "max_body": k.max_body,
+            "inspect_body": k.inspect_body,
+            "max_body_wire": 2 * k.max_body,
             "max_buffered_bytes": 8 << 20,
             "upstream_max_headers": 100,
             "upstream_max_head_bytes": 16384,

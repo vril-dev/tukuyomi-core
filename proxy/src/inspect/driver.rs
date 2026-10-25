@@ -66,11 +66,13 @@ pub struct InspectReq {
     pub uri: Bytes,
     pub headers: Vec<(Bytes, Bytes)>,
     pub body: Arc<BodyHold>,
+    /// The body goes on after the bytes in `body`, which are only inspected.
+    pub cut: bool,
     /// The protocol of the request: `HTTP/1.0` or `HTTP/1.1`.
     pub proto: &'static [u8],
 }
 
-/// The decoded body, shared by the connection and the ticket. Its share of the byte budget returns when the last
+/// The decoded body, or its first bytes if it is cut, shared by the connection and the ticket. Its share of the byte budget returns when the last
 /// holder drops it.
 pub struct BodyHold {
     pub bytes: Bytes,

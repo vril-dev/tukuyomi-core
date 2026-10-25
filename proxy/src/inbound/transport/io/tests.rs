@@ -288,6 +288,32 @@ fn restart_changes_the_limit_of_a_read_that_is_already_pending() {
 }
 
 #[test]
+fn pause_takes_the_read_limit_from_a_read_that_is_already_pending_and_restart_gives_one_again() {
+    run(async {
+        let mock = Mock::default();
+        let (mut io, gauge) = guarded(&mock, b"", Duration::from_millis(300), LONG, 100);
+        let reading = tokio::spawn(async move {
+            let got = read_some(&mut io, 8).await;
+            (io, got)
+        });
+        sleep(Duration::from_millis(100)).await;
+        gauge.pause();
+        // Twice the limit it had passes, and the read still waits.
+        sleep(Duration::from_millis(600)).await;
+        assert!(!reading.is_finished());
+        mock.feed(b"a");
+        let (mut io, got) = reading.await.unwrap();
+        assert_eq!(got.unwrap(), b"a");
+        gauge.restart(Duration::from_millis(200));
+        let start = StdInstant::now();
+        let err = read_some(&mut io, 8).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        assert!(start.elapsed() < Duration::from_secs(10));
+    });
+}
+
+#[test]
 fn a_read_without_progress_times_out_and_a_slow_one_that_moves_does_not() {
     run(async {
         let idle = Duration::from_millis(400);

@@ -8,20 +8,30 @@
 //! as the client sent them. A request that no route holds for, with no default group, is answered with 404, and one
 //! from a client that the access lists of its route turn away with 403, before anything of its body is read and before
 //! the inspection is asked for. So is a request on a connection that ended TLS, whose `Host` is not one of the hosts of
-//! the certificate that the handshake used, or cannot be read (421; it comes before the route is looked up). The body
-//! is read through hyper into a budgeted buffer, a gzip body is decoded by `represent::gunzip` (exactly one member, at
-//! most `max_body` bytes of output), and then the request either matches a rule of the generation that serves that
-//! skips the inspection, and is forwarded without being inspected, or is handed to the inspection driver as a ticket,
-//! and only an `Allow` or a `Detected` is forwarded. It is forwarded to a server of the group of the route that was
-//! looked up, with the edits of that route (see `rewrite`). If the route has a `stream` that lets a WebSocket through
+//! the certificate that the handshake used, or cannot be read (421; it comes before the route is looked up), and so is
+//! a request with a `Content-Length` over the `max_body` of its route (413). Then the request either matches a rule of
+//! the generation that serves that skips the inspection, and is forwarded without being inspected, or its first
+//! `inspect_body` bytes are read through hyper into a budgeted buffer and handed to the inspection driver as a
+//! ticket, and only an `Allow` or a `Detected` is forwarded. A body that ends within those bytes is held whole and is
+//! forwarded as it was inspected (or, under a route that skips the inspection, as it was read). A longer one goes on
+//! past them: the ticket says that the body is cut, and once the request is let through the rest is passed on to the
+//! upstream as the client sends it (see `upload`), so what the request holds does not grow with the length of the
+//! body. The part of the body behind the inspected bytes is not inspected. A gzip body that is to be inspected is
+//! held whole and decoded by `represent::gunzip` (exactly one member), and the coded and the decoded body are each
+//! at most `inspect_body` bytes; a longer one is refused with 413. A gzip body under a route that skips the
+//! inspection is never decoded: it is held or passed on as it came, like any other body, and the limit of the body
+//! counts the coded bytes. The request is forwarded to a server of the group of the route that was looked up, with the
+//! edits of that route (see `rewrite`). If the route has a `stream` that lets a WebSocket through
 //! and the request is the handshake of one, the share of the byte budget that a tunnel holds is taken first (and the
 //! request is answered with 503 if it cannot be had, before anything is sent), and if the upstream answers with 101 the
 //! response comes with the tunnel (see `tunnel`). Any other response on a route with a `stream` comes marked as one
 //! that may take long. A request under a rule that skips the inspection takes no inspection permit, no byte of the
 //! kernel's copy and no place in the driver's channel, so it goes on also when the inspection is full or the inspector
 //! is down. What is inspected and what is forwarded is the same request, in the form that `represent` builds it: the
-//! decoded body, without its `Content-Encoding`, with its decoded length; the edits of the route come after the
-//! inspection and are the only difference.
+//! decoded body, without its `Content-Encoding`, with its decoded length, or, for a body that goes on past the
+//! inspected bytes or is not decoded, the body as the client sent it with its own framing; the edits of the route
+//! come after the inspection and are the only difference. The record line gives the length of the body: its
+//! `Content-Length` if it has one, and otherwise the bytes read so far.
 //!
 //! The route is found on the bytes received, but an application behind the proxy may read another spelling of a path
 //! as the path of a route that limits who may use it (`/priv%61te/x` for `/private/x`). So if some route has an
@@ -55,19 +65,20 @@ use hyper::body::Incoming;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 
-use crate::config::{ProxyConfig, Stream};
+use crate::config::{ProxyConfig, STREAM_HOLD, Stream};
 use crate::forward::client_ip;
 use crate::forward::group::{Route, Upstreams};
 use crate::forward::origin::{self, Forward, OriginBody, OriginError};
 use crate::forward::tunnel::{self, Record, Tunnel};
 use crate::inbound::answer::{
-    Abort, Decision, Noted, Out, Passed, Reply, Stop, Via, answer, decide, text, who,
+    Abort, Decision, Noted, Out, Passed, Reply, Sizes, Stop, Via, answer, decide, text, who,
 };
 use crate::inbound::challenge::{Challenge, Proof};
 use crate::inbound::head::{Head, Reject};
 use crate::inbound::represent::{Represented, gunzip, represent};
 use crate::inbound::transport::io::Gauge;
 use crate::inbound::transport::tls::{Hosts, Tls};
+use crate::inbound::upload::{Cause, Fate, Terms, Upload};
 use crate::inspect::driver::{BodyHold, Hold, Ingress, InspectReq, Msg, Ticket};
 use crate::log::Log;
 use crate::rules::routes::SharedRoutes;
@@ -129,9 +140,18 @@ pub(super) struct Conn {
     /// from seeing that no sender is left. A request that starts after the stop has none.
     ingress: Mutex<Option<SyncSender<Msg>>>,
     /// The body of the request was read to its end.
-    read_done: AtomicBool,
+    read_done: Arc<AtomicBool>,
     /// Where the request was sent, set when it is.
     via: Mutex<Option<Via>>,
+    /// The size of the body, set when it has been read (or, if it goes on, as far as it has).
+    sizes: Mutex<Option<Sizes>>,
+}
+
+/// The first bytes of a body, which `read_body` holds, and the rest of it if the body goes on.
+struct Taken {
+    bytes: Bytes,
+    budget: OwnedSemaphorePermit,
+    upload: Option<(Upload, Arc<Fate>)>,
 }
 
 /// What a request came to: what the record shows of it, and the response, or the order to close without one. A
@@ -184,8 +204,9 @@ impl Conn {
             request_by,
             head_end: Instant::now(),
             ingress: Mutex::new(ctx.ingress.sender()),
-            read_done: AtomicBool::new(false),
+            read_done: Arc::new(AtomicBool::new(false)),
             via: Mutex::new(None),
+            sizes: Mutex::new(None),
         }
     }
 
@@ -230,11 +251,17 @@ impl Conn {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        let body = self
+            .sizes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         Handled {
             noted: Noted {
                 reply,
                 client: self.client.ip(),
                 via,
+                body,
             },
             response,
             tunnel,
@@ -263,6 +290,7 @@ impl Conn {
                 reply,
                 client: self.client.ip(),
                 via: None,
+                body: None,
             },
             response: Ok(response),
             tunnel: None,
@@ -273,9 +301,35 @@ impl Conn {
     /// Everything up to the response of the upstream, and how the request was let through.
     async fn exchange(&self, parts: Parts, body: Incoming) -> Result<Answered, Stop> {
         let route = self.route()?;
-        let (bytes, budget) = self.read_body(body).await?;
-        let (bytes, budget) = if self.head.gzip() {
-            self.unpack(bytes, budget)?
+        let cfg = &self.ctx.cfg;
+        let bypass = self
+            .ctx
+            .routes
+            .current()
+            .matches(self.head.host(), self.head.target());
+        // A gzip body that is inspected is held whole to be decoded, and what it decodes to is held too, so neither
+        // may be longer than the bytes that are inspected: a longer one is refused. One that is not inspected is
+        // never decoded: it is held or goes on as it came, as does any other body.
+        let limit = route.max_body.unwrap_or(cfg.max_body);
+        let held_max = limit.min(cfg.inspect_body);
+        let decode = self.head.gzip() && !bypass;
+        let (keep, limit) = if decode {
+            (held_max, held_max)
+        } else {
+            (cfg.inspect_body, limit)
+        };
+        let Taken {
+            bytes,
+            budget,
+            upload,
+        } = self.read_body(body, keep, limit).await?;
+        let read = bytes.len();
+        // An empty chunked body is not a gzip stream (a body with a length of 0 is refused by the head check).
+        if self.head.gzip() && bytes.is_empty() {
+            return Err(Reply::rejected(400, "empty gzip body").into());
+        }
+        let (bytes, budget) = if decode {
+            self.unpack(bytes, budget, held_max)?
         } else {
             (bytes, budget)
         };
@@ -283,14 +337,31 @@ impl Conn {
             fields,
             headers,
             field_bytes,
-        } = represent(&self.head, bytes.len())?;
+        } = represent(&self.head, upload.is_none().then_some(bytes.len()), decode)?;
         // The head check cannot tell whether a chunked body is empty, so its rule on the body type is applied
-        // here, with the same test (on the decoded body, when it was gzip).
-        if self.head.chunked() && !bytes.is_empty() && !self.head.inspectable_type() {
+        // here, with the same test (on the decoded body, when it was decoded).
+        if self.head.chunked()
+            && (!bytes.is_empty() || upload.is_some())
+            && !self.head.inspectable_type()
+        {
             return Err(Reject::UnsupportedMedia.into());
         }
+        let cut = upload.is_some() && !bypass;
+        let (upload, fate) = match upload {
+            Some((upload, fate)) => (Some(upload), Some(fate)),
+            None => (None, None),
+        };
+        let declared = self.head.content_length();
+        *self.sizes.lock().unwrap_or_else(PoisonError::into_inner) = Some(match &fate {
+            Some(fate) => Sizes::passed(declared, bytes.len(), fate.clone(), cut),
+            None => Sizes::whole(declared, read),
+        });
         let body = Arc::new(BodyHold::new(bytes, budget));
-        let passed = self.ask(headers, field_bytes, &body).await?;
+        let passed = if bypass {
+            self.bypassed()
+        } else {
+            self.ask(headers, field_bytes, &body, cut).await?
+        };
         if Instant::now() >= self.request_by {
             return Err(Reply::failed(503, "request time used up").into());
         }
@@ -302,6 +373,7 @@ impl Conn {
             uri: parts.uri,
             fields,
             body,
+            upload,
             peer: self.peer,
             https: matches!(self.scheme, Scheme::Https(_)),
             websocket: websocket.is_some(),
@@ -318,18 +390,7 @@ impl Conn {
             group: route.group.name().clone(),
             server: sent.server,
         });
-        let mut response = sent.result.map_err(|e| {
-            match e {
-                OriginError::Unavailable => Reply::failed(502, "upstream unavailable"),
-                OriginError::Connect => Reply::failed(502, "upstream connection failed"),
-                OriginError::Send => Reply::failed(502, "upstream send failed"),
-                OriginError::Head => Reply::failed(502, "upstream response head failed"),
-                OriginError::Invalid => Reply::failed(502, "upstream response invalid"),
-                // Not the fault of the upstream: the answers of the proxy's own limits are 503.
-                OriginError::Late => Reply::failed(503, "request time used up"),
-                OriginError::Local => Reply::failed(503, "local connection failure"),
-            }
-        })?;
+        let mut response = sent.result.map_err(|e| upstream_stop(e, fate.as_deref()))?;
         let tunnel = match (response.body_mut().take_switch(), websocket, hold) {
             (Some(switch), Some(stream), Some(hold)) => {
                 Some(Tunnel::new(switch, *stream, hold, self.record()))
@@ -393,6 +454,15 @@ impl Conn {
         {
             return Err(self.turned_away(403, "denied by route access"));
         }
+        // The limit of the route is looked at before the body is read, as the other limits that turn a request away.
+        if let Some(max) = route.max_body
+            && self
+                .head
+                .content_length()
+                .is_some_and(|length| length > u64::try_from(max).unwrap_or(u64::MAX))
+        {
+            return Err(self.turned_away(413, "body over the limit of the route"));
+        }
         Ok(route)
     }
 
@@ -418,10 +488,18 @@ impl Conn {
             .ok_or_else(|| Reply::failed(503, "byte budget exhausted").into())
     }
 
-    /// Reads the whole decoded body. The budget of a body with a length is taken before the first byte is read
-    /// (so no `100 Continue` is sent for a body that cannot be held), the budget of a chunked body frame by frame.
-    async fn read_body(&self, mut body: Incoming) -> Result<(Bytes, OwnedSemaphorePermit), Stop> {
-        let max = self.ctx.cfg.max_body;
+    /// Reads the first `keep` bytes of the decoded body, or all of it if it ends sooner. A body that goes on past
+    /// them is passed on while the client sends it (see `upload`): the bytes read behind the first ones are the
+    /// start of the rest, and the request holds `STREAM_HOLD` more of the budget while that goes on. A body that
+    /// is longer than `limit` is refused with 413. The budget of the bytes held is taken before the first byte is
+    /// read (so no `100 Continue` is sent for a body that cannot be held), the budget of a chunked body frame by
+    /// frame.
+    async fn read_body(
+        &self,
+        mut body: Incoming,
+        keep: usize,
+        limit: usize,
+    ) -> Result<Taken, Stop> {
         let chunked = self.head.chunked();
         let declared = match self.head.content_length() {
             Some(n) => usize::try_from(n).map_err(|_| Reject::ContentTooLarge)?,
@@ -429,34 +507,62 @@ impl Conn {
         };
         if !chunked && declared == 0 {
             self.read_done.store(true, Ordering::Release);
-            return Ok((Bytes::new(), self.take(0)?));
+            return Ok(Taken {
+                bytes: Bytes::new(),
+                budget: self.take(0)?,
+                upload: None,
+            });
         }
-        if declared > max {
+        if declared > limit {
             return Err(Reject::ContentTooLarge.into());
         }
-        let mut budget = self.take(declared)?;
-        let mut data = BytesMut::with_capacity(declared);
+        // A body with a length that is longer than `keep` goes on past the bytes held.
+        let goes_on = declared > keep;
+        let mut budget = self.take(declared.min(keep))?;
+        if goes_on {
+            budget.merge(self.take(STREAM_HOLD)?);
+        }
+        let mut data = BytesMut::with_capacity(declared.min(keep));
+        let mut rest = Bytes::new();
+        let mut ended = false;
         let by = stage(self.head_end, self.ctx.cfg.body_read, self.request_by);
         loop {
+            if goes_on && data.len() == keep {
+                break;
+            }
             let frame = match timeout_at(by, body.frame()).await {
                 Err(_) => return Err(Reply::rejected(408, "body not received in time").into()),
-                Ok(None) => break,
+                Ok(None) => {
+                    ended = true;
+                    break;
+                }
                 Ok(Some(Err(e))) => return Err(self.body_fault(&e)),
                 Ok(Some(Ok(frame))) => frame,
             };
             match frame.into_data() {
-                Ok(chunk) => {
+                Ok(mut chunk) => {
                     if data
                         .len()
                         .checked_add(chunk.len())
-                        .is_none_or(|total| total > max)
+                        .is_none_or(|total| total > limit)
                     {
                         return Err(Reply::rejected(413, "body over the limit").into());
+                    }
+                    // The bytes of this chunk behind the first `keep` are the start of the rest.
+                    let room = keep - data.len();
+                    if chunk.len() > room {
+                        rest = chunk.split_off(room);
                     }
                     if chunked {
                         budget.merge(self.take(chunk.len())?);
                     }
                     data.extend_from_slice(&chunk);
+                    if !rest.is_empty() {
+                        if chunked {
+                            budget.merge(self.take(STREAM_HOLD)?);
+                        }
+                        break;
+                    }
                 }
                 Err(frame) => {
                     if frame
@@ -468,27 +574,53 @@ impl Conn {
                 }
             }
         }
-        self.read_done.store(true, Ordering::Release);
-        if !chunked && data.len() != declared {
-            return Err(Reply::rejected(400, "body length differs from the declared one").into());
+        if ended {
+            self.read_done.store(true, Ordering::Release);
+            if !chunked && data.len() != declared {
+                return Err(
+                    Reply::rejected(400, "body length differs from the declared one").into(),
+                );
+            }
+            return Ok(Taken {
+                bytes: data.freeze(),
+                budget,
+                upload: None,
+            });
         }
-        Ok((data.freeze(), budget))
+        let terms = Terms {
+            length: self.head.content_length(),
+            max: u64::try_from(limit).unwrap_or(u64::MAX),
+            gap: self.ctx.cfg.body_read,
+            by: self.request_by,
+        };
+        let held = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let upload = Upload::new(
+            body,
+            rest,
+            held,
+            terms,
+            self.read_done.clone(),
+            self.gauge.clone(),
+        );
+        Ok(Taken {
+            bytes: data.freeze(),
+            budget,
+            upload: Some(upload),
+        })
     }
 
-    /// Replaces a gzip body and its share of the byte budget by the decoded body and the share of its length.
-    /// The new share is taken before the old one is given back, so both are held at once: at most twice
-    /// `max_body`, which the lower bound of `max_buffered_bytes` covers. There is no await between the decoding
-    /// and the taking, so a decoded body that the budget cannot hold is dropped at once.
+    /// Replaces a gzip body and its share of the byte budget by the decoded body and the share of its length. The
+    /// coded body is at most `inspect_body` bytes, and the decoded one at most `max`, which is no more: the new
+    /// share is taken before the old one is given back, and the two together are within what the lower bound of
+    /// `max_buffered_bytes` covers. There is no await between the decoding and the taking, so a decoded body that
+    /// the budget cannot hold is dropped at once.
     fn unpack(
         &self,
         coded: Bytes,
         held: OwnedSemaphorePermit,
+        max: usize,
     ) -> Result<(Bytes, OwnedSemaphorePermit), Stop> {
-        // An empty chunked body is not a gzip stream (a body with a length of 0 is refused by the head check).
-        if coded.is_empty() {
-            return Err(Reply::rejected(400, "empty gzip body").into());
-        }
-        let plain = gunzip(&coded, self.ctx.cfg.max_body)?;
+        let plain = gunzip(&coded, max)?;
         let budget = self.take(plain.len())?;
         drop(coded);
         drop(held);
@@ -506,31 +638,30 @@ impl Conn {
         }
     }
 
-    /// Lets the request through at once if a route of the generation that serves matches it; otherwise hands it to
-    /// the driver and waits for the verdict. `Ok` is how the request is let through (a bypass by a route, an
-    /// `Allow` or a `Detected`); everything else is the answer to give. The routes are read before the permit and
-    /// the budget are taken, so that a request under a route does not depend on the inspection.
+    /// The request is let through at once by a route of the generation that serves: no ticket will be sent, so the
+    /// way to the driver is let go as it is after a ticket. The route is looked up before the body is read, so that
+    /// a request under a route does not depend on the inspection, and a body that is longer than the bytes that
+    /// are inspected is not held.
+    fn bypassed(&self) -> Passed {
+        drop(
+            self.ingress
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+        Passed::Bypassed
+    }
+
+    /// Hands the request to the driver and waits for the verdict. `cut` tells that the body goes on after the
+    /// bytes in `body`. `Ok` is how the request is let through (an `Allow` or a `Detected`); everything else is
+    /// the answer to give.
     async fn ask(
         &self,
         headers: Vec<(Bytes, Bytes)>,
         field_bytes: usize,
         body: &Arc<BodyHold>,
+        cut: bool,
     ) -> Result<Passed, Stop> {
-        if self
-            .ctx
-            .routes
-            .current()
-            .matches(self.head.host(), self.head.target())
-        {
-            // No ticket will be sent, so the way to the driver is let go as it is after a ticket.
-            drop(
-                self.ingress
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take(),
-            );
-            return Ok(Passed::Bypassed);
-        }
         let permit = self
             .ctx
             .inspect
@@ -547,6 +678,7 @@ impl Conn {
                 uri: Bytes::copy_from_slice(self.head.target()),
                 headers,
                 body: body.clone(),
+                cut,
                 proto: self.head.proto(),
             },
             reply,
@@ -578,6 +710,45 @@ impl Conn {
             Decision::Pass(passed) => Ok(passed),
             Decision::Answer(reply) => Err(reply.into()),
         }
+    }
+}
+
+/// What the failure of the exchange with the upstream means for the client. `fate` is there if the body of the request
+/// was passed on while the client sent it: part of it may have gone to the upstream already, so a failure that comes
+/// after the request was sent says so, unless all of the body had been handed on by then: the failure is then the
+/// one of a request whose body was held.
+fn upstream_stop(error: OriginError, fate: Option<&Fate>) -> Stop {
+    Stop::Reply(match error {
+        OriginError::Unavailable => Reply::failed(502, "upstream unavailable"),
+        OriginError::Connect => Reply::failed(502, "upstream connection failed"),
+        OriginError::Send | OriginError::Head if fate.is_some_and(|fate| !fate.handed()) => {
+            Reply::failed(502, "upstream failed while the body was sent on")
+        }
+        OriginError::Send => Reply::failed(502, "upstream send failed"),
+        OriginError::Head => Reply::failed(502, "upstream response head failed"),
+        OriginError::Invalid => Reply::failed(502, "upstream response invalid"),
+        // Not the fault of the upstream: the answers of the proxy's own limits are 503.
+        OriginError::Late => Reply::failed(503, "request time used up"),
+        OriginError::Local => Reply::failed(503, "local connection failure"),
+        // The client's side of the body failed. Without a reason in the fate this is a fault of ours.
+        OriginError::Body => match fate.and_then(Fate::cause) {
+            Some(cause) => return cause_stop(cause),
+            None => Reply::failed(502, "upstream send failed"),
+        },
+    })
+}
+
+/// The answer to a client whose body failed while it was passed on to the upstream. A chunked body that passes the
+/// limit, and a client that is gone, get none: the connection is closed.
+fn cause_stop(cause: Cause) -> Stop {
+    match cause {
+        Cause::Idle => Reply::rejected(408, "body not received in time").into(),
+        Cause::Late => Reply::failed(503, "request time used up").into(),
+        Cause::Over => Stop::Close("body over the limit while it was sent on"),
+        Cause::Trailers => Reply::rejected(400, "request trailers not supported").into(),
+        Cause::Wire => Reply::rejected(413, "body over the limit on the wire").into(),
+        Cause::Gone => Stop::Close("peer closed during the body"),
+        Cause::Malformed => Reply::rejected(400, "malformed body").into(),
     }
 }
 

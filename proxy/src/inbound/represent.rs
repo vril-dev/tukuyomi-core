@@ -67,14 +67,21 @@ fn title_case(name: &str) -> Bytes {
     Bytes::from(out)
 }
 
-/// Builds the inspected and forwarded form of the request, whose body is `body_len` bytes once decoded. A field
-/// with an underscore in its name is left out. The changes to the framing: a chunked request loses its
-/// `Transfer-Encoding` and gets a `Content-Length` of the decoded length; a gzip request loses its
-/// `Content-Encoding` and its `Content-Length` (if it has one) and gets one `Content-Length` of the decoded
-/// length, last like a chunked one; a POST, PUT or PATCH with neither gets `Content-Length: 0`. The limits of the
-/// kernel are checked on the result, so a request that fit before the change and not after it is refused here and
-/// never reaches the kernel.
-pub(super) fn represent(head: &Head, body_len: usize) -> Result<Represented, Reject> {
+/// Builds the inspected and forwarded form of the request, whose body is `body_len` bytes as it is held, or `None`
+/// if the body is not held and goes on as the client sent it. `decoded` tells that a gzip body was decoded. A field
+/// with an underscore in its name is left out. The changes to the framing of a body that is held: a chunked request
+/// loses its `Transfer-Encoding` and gets a `Content-Length` of the length it is held at; a gzip request that was
+/// decoded loses its `Content-Encoding` and its `Content-Length` (if it has one) and gets one `Content-Length` of the
+/// decoded length, last like a chunked one; a POST, PUT or PATCH with neither gets `Content-Length: 0`. A body that
+/// goes on keeps its `Content-Length` and its `Content-Encoding` as the client sent them, and a chunked one has no
+/// length: the upstream gets it chunked. A gzip body that is held and not decoded keeps its `Content-Encoding` and
+/// its `Content-Length` as well. The limits of the kernel are checked on the result, so a request that fit before the
+/// change and not after it is refused here and never reaches the kernel.
+pub(super) fn represent(
+    head: &Head,
+    body_len: Option<usize>,
+    decoded: bool,
+) -> Result<Represented, Reject> {
     let mut fields = HeaderMap::with_capacity(head.fields().len() + 1);
     let mut host = None;
     let mut others = Vec::with_capacity(head.fields().len() + 1);
@@ -86,7 +93,7 @@ pub(super) fn represent(head: &Head, body_len: usize) -> Result<Represented, Rej
         if head.chunked() && name == TRANSFER_ENCODING {
             continue;
         }
-        if head.gzip() && (name == CONTENT_ENCODING || name == CONTENT_LENGTH) {
+        if body_len.is_some() && decoded && (name == CONTENT_ENCODING || name == CONTENT_LENGTH) {
             continue;
         }
         let entry = (title_case(name.as_str()), Bytes::copy_from_slice(value));
@@ -100,15 +107,17 @@ pub(super) fn represent(head: &Head, body_len: usize) -> Result<Represented, Rej
             others.push(entry);
         }
     }
-    let length = if head.chunked() || head.gzip() {
-        Some(body_len)
-    } else if head.content_length().is_none()
-        && matches!(head.method(), b"POST" | b"PUT" | b"PATCH")
-    {
-        Some(0)
-    } else {
-        None
-    };
+    let length = body_len.and_then(|body_len| {
+        if head.chunked() || decoded {
+            Some(body_len)
+        } else if head.content_length().is_none()
+            && matches!(head.method(), b"POST" | b"PUT" | b"PATCH")
+        {
+            Some(0)
+        } else {
+            None
+        }
+    });
     if let Some(length) = length {
         let value = HeaderValue::from(u64::try_from(length).map_err(|_| Reject::FieldsTooLarge)?);
         others.push((

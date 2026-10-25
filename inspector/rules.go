@@ -22,6 +22,12 @@ func withoutPath(err error) error {
 	return err
 }
 
+// bodyCutVar is the TX variable that the owner puts on the transaction of a
+// body that was cut and that rule 4000001 reads (see reservedDirectives). It
+// is in lower case: the TX collection folds the case of its keys, and
+// checkRules looks for the name in lower case text.
+const bodyCutVar = "reserved_body_cut"
+
 // reservedDirectives follow the operator's rules in a separate WithDirectives
 // call. Coraza parses every call apart from the others (no continuation
 // or backtick state is carried over), and a later SecRuleEngine,
@@ -36,19 +42,28 @@ func withoutPath(err error) error {
 // ProcessPartial that NewWAF makes for DetectionOnly. A parse failure of the
 // body (a JSON body nested deeper than the limit is one), a dropped argument
 // and an unparsable URI become a block of phase 2.
+// A body that was cut ends inside what the client sent, so its parser can fail
+// on a body that is fine up to the cut. The owner puts bodyCutVar on the
+// transaction of such a body (markCut), and rule 4000001 is a chain that
+// blocks a parse failure only when the variable is absent. The other two rules
+// block whatever the variable says.
 // Ids 4000001 to 4000003 are reserved for these rules (4000010 and 4000011 for
 // the rules of detectBegin and detectEnd). The start path rejects
 // SecIgnoreRuleCompilationErrors (checkRules) before newWAF, so a rule of the
 // operator with one of these ids stops NewWAF instead of displacing a reserved rule
-// silently. The rules can still be skipped at run time (allow, skipAfter,
-// ctl:ruleRemoveById), so the owner reads the flags itself before a phase 2
-// Continue (requestComplete). t:none keeps the rules independent of a default
-// transformation (v3.8.1 refuses one in SecDefaultAction anyway).
+// silently. The same guard rejects a rule that names bodyCutVar. The rules can
+// still be skipped at run time (allow, skipAfter, ctl:ruleRemoveById), and a
+// key that a macro builds at run time escapes the guard, so the owner reads the
+// flags itself before a phase 2 Continue (requestComplete): a parse failure
+// of a body that was not cut is no Continue, whatever the variable says.
+// t:none keeps the rules independent of a default transformation (v3.8.1
+// refuses one in SecDefaultAction anyway).
 const reservedDirectives = `SecRuleEngine On
 SecRequestBodyAccess On
 SecRequestBodyLimitAction Reject
 SecRequestBodyJsonDepthLimit 64
-SecRule REQBODY_ERROR "!@eq 0" "id:4000001,phase:2,t:none,deny"
+SecRule REQBODY_ERROR "!@eq 0" "id:4000001,phase:2,t:none,deny,chain"
+SecRule &TX:` + bodyCutVar + ` "@eq 0" "t:none"
 SecRule ARGUMENTS_LIMIT_REACHED "!@eq 0" "id:4000002,phase:2,t:none,deny"
 SecRule URI_PARSE_ERROR "!@eq 0" "id:4000003,phase:2,t:none,deny"
 `
@@ -161,10 +176,12 @@ func failingFile(files map[string][]byte, load []string, detect bool, budget tim
 // audit log to a remote server or changes where uploads are kept.
 // @inspectFile starts a program, @rbl asks a DNS server, setenv changes the
 // environment of the whole process, and ctl:requestBodyLimit sets the body
-// limit of one transaction. The operators that read a file (@pmFromFile,
-// @pmf, @ipMatchFromFile, @ipMatchF and @validateSchema) are not rejected
-// here: newWAF gives the rules a root that holds the files of the bundle only,
-// so a rule that names any other file fails NewWAF.
+// limit of one transaction. A rule that names bodyCutVar could set it on the
+// transaction of a body that was not cut, or remove it from one that was, and
+// so turn the block of rule 4000001 off or on. The operators that read a file
+// (@pmFromFile, @pmf, @ipMatchFromFile, @ipMatchF and @validateSchema) are not
+// rejected here: newWAF gives the rules a root that holds the files of the
+// bundle only, so a rule that names any other file fails NewWAF.
 //
 // It is a textual over-approximation, not a SecLang parser. False rejects are
 // accepted: a rejected text may be harmless in Coraza, for example the ctl
@@ -176,10 +193,10 @@ func failingFile(files map[string][]byte, load []string, detect bool, budget tim
 // guard independent of how the argument is read and of the directive order.
 // A directive name is matched by its start whatever its argument, so
 // SecDebugLogLevel, SecUploadFileMode and SecUploadFileLimit, which have no
-// effect of their own, are rejected too. The words @inspectFile, @rbl, setenv:
-// and ctl:requestBodyLimit are looked for in the whole reduced text with the
-// case folded, while Coraza reads operator and ctl names with their case, so
-// a word that stands only in an argument or in a string such as msg is
+// effect of their own, are rejected too. The words @inspectFile, @rbl, setenv:,
+// ctl:requestBodyLimit and bodyCutVar are looked for in the whole reduced text
+// with the case folded, while Coraza reads operator and ctl names with their
+// case, so a word that stands only in an argument or in a string such as msg is
 // rejected too.
 //
 // The text is first reduced to its logical directives (logicalDirectives).
@@ -224,6 +241,9 @@ func checkRules(rules string) error {
 	if strings.Contains(text, "@inspectfile") || strings.Contains(text, "@rbl") ||
 		strings.Contains(text, "setenv:") || strings.Contains(text, "ctl:requestbodylimit") {
 		return errors.New("@inspectFile, @rbl, setenv and ctl of requestBodyLimit are not allowed")
+	}
+	if strings.Contains(text, bodyCutVar) {
+		return errors.New("the name " + bodyCutVar + " is reserved")
 	}
 	return nil
 }

@@ -32,6 +32,7 @@ pub(in crate::forward) fn config() -> ProxyConfig {
         max_conns: 16,
         max_head_bytes: 8192,
         max_body: 1 << 20,
+        inspect_body: 1 << 20,
         max_body_wire: 2 << 20,
         max_buffered_bytes: BUDGET,
         upstream_max_headers: 64,
@@ -140,6 +141,7 @@ pub(in crate::forward) fn request(
         uri: "/p?q=1".parse().unwrap(),
         fields: fields(pairs),
         body: hold(ctx, body),
+        upload: None,
         peer: PEER.parse().unwrap(),
         https: false,
         websocket: false,
@@ -1147,7 +1149,24 @@ fn only_a_refusal_a_reset_or_an_unreachable_server_fails_a_connect_other_errors_
     // Such an error and a time that ran out are counted against no server, and are not tried on another.
     for error in [OriginError::Local, OriginError::Late] {
         assert!(!failure_of_server(error), "{error:?}");
-        assert!(!may_go_on(error, &Method::GET), "{error:?}");
+        assert!(
+            !may_go_on(error, Payload::Held { again: true }),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_body_that_is_read_from_the_client_as_it_is_sent_goes_on_to_another_server_only_if_nothing_was_sent()
+ {
+    assert!(may_go_on(OriginError::Connect, Payload::Streamed));
+    for error in [OriginError::Send, OriginError::Head, OriginError::Body] {
+        assert!(!may_go_on(error, Payload::Streamed), "{error:?}");
+    }
+    // A body that is held goes on after a failure on its way only if the method does no harm twice.
+    for (again, want) in [(true, true), (false, false)] {
+        assert_eq!(may_go_on(OriginError::Send, Payload::Held { again }), want);
+        assert_eq!(may_go_on(OriginError::Head, Payload::Held { again }), want);
     }
 }
 
@@ -1349,5 +1368,25 @@ fn a_request_whose_edits_cannot_be_made_is_not_sent_and_no_server_is_blamed() {
         let sent = forward(f, group, &rewrite, &ctx, far()).await;
         assert_eq!(sent.server, None);
         assert_eq!(refused(sent.result), OriginError::Send);
+    });
+}
+
+#[test]
+fn the_body_of_a_send_that_lost_the_rest_fails_and_does_not_end_as_if_it_were_whole() {
+    run(async {
+        let ctx = ctx_of(
+            &ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]),
+            config(),
+        );
+        let mut lost = Sent::new(hold(&ctx, b"ab"), None, true);
+        assert!(lost.frame().await.expect("a frame").is_err());
+        assert!(!lost.is_end_stream());
+        // A body that is held whole gives its bytes and then its end.
+        let mut whole = Sent::new(hold(&ctx, b"ab"), None, false);
+        assert_eq!(
+            whole.frame().await.unwrap().unwrap().into_data().unwrap(),
+            "ab"
+        );
+        assert!(whole.frame().await.is_none());
     });
 }

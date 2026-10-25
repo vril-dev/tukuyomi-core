@@ -110,7 +110,7 @@ impl Supervisor {
         let Some((start, run)) = self.conn() else {
             return Continue(());
         };
-        let frame = match codec::encode_frame(codec::KIND_DRAIN, run, start.inc, 0, 0, &[]) {
+        let frame = match codec::encode_frame(codec::KIND_DRAIN, 0, run, start.inc, 0, 0, &[]) {
             Ok(f) => f,
             Err(_) => return self.stopped(now, End::Fail(Failure::Internal("encode"))),
         };
@@ -150,8 +150,10 @@ impl Supervisor {
         let Some((start, run)) = self.conn() else {
             return Continue(());
         };
+        let flags = if out.cut { codec::FLAG_BODY_CUT } else { 0 };
         let frame = match codec::encode_frame(
             wire_kind(out.kind),
+            flags,
             run,
             start.inc,
             out.tx,

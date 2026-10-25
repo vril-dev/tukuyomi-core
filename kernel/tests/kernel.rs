@@ -87,6 +87,7 @@ fn request<'a>(
         proto: b"HTTP/1.1",
         headers,
         body,
+        body_cut: false,
     }
 }
 
@@ -289,6 +290,37 @@ fn refused_content_length() {
     run.submit(&request(b"GET", b"/", &zero, b""));
     let hs = [header(b"Content-Length", b"3"), ct];
     run.submit(&request(b"POST", b"/", &hs, b"a=b"));
+    run.finish();
+}
+
+#[test]
+fn a_cut_body_has_bytes_and_a_content_length_that_is_longer_than_them() {
+    let mut run = Run::new(fake_config(), None);
+    let ct = header(b"Content-Type", URLENCODED);
+    fn cut<'a>(hs: &'a [(&'a [u8], &'a [u8])], body: &'a [u8]) -> Request<'a> {
+        Request {
+            body_cut: true,
+            ..request(b"POST", b"/", hs, body)
+        }
+    }
+    // The body goes on, so a cut body without bytes has nothing to stand on.
+    assert_eq!(
+        run.refused(&cut(&[ct], b"")),
+        Refused::Invalid("cut body without bytes")
+    );
+    // The length is more than the 3 bytes given; the same length or less is not a cut body. A cut body with no
+    // length (a chunked one) is taken.
+    let why = Refused::Unsupported("content-length");
+    for wrong in [b"3".as_slice(), b"2"] {
+        let hs = [header(b"Content-Length", wrong), ct];
+        assert_eq!(run.refused(&cut(&hs, b"a=b")), why, "{wrong:?}");
+    }
+    let hs = [header(b"Content-Length", b"4"), ct];
+    run.submit(&cut(&hs, b"a=b"));
+    run.submit(&cut(&[ct], b"a=b"));
+    // A length that is not cut must still be the length of the body.
+    let hs = [header(b"Content-Length", b"4"), ct];
+    assert_eq!(run.refused(&request(b"POST", b"/", &hs, b"a=b")), why);
     run.finish();
 }
 
@@ -755,6 +787,58 @@ fn the_body_rules_block_in_phase_2_for_the_types_submit_accepts() {
         assert_eq!(run.verdict(blocked), want);
         assert_eq!(run.verdict(passed), Verdict::Allow);
     }
+    finish_stopped(run);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_cut_body_is_not_blocked_for_failing_to_parse_but_its_bytes_are_still_inspected() {
+    let sha = parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256"));
+    let root = make_root("body_cut");
+    let mut cfg = real_config(root.path(), sha);
+    (cfg.wait_queue, cfg.records) = (8, 16);
+    let mut run = Run::new(cfg, Some(root));
+    let mut post = |body: &'static [u8], cut: bool| {
+        let cl = (body.len() + 100).to_string();
+        let hs = [
+            header(b"Host", b"example.test"),
+            header(b"Content-Type", b"application/json"),
+            header(b"Content-Length", cl.as_bytes()),
+        ];
+        let sent = Request {
+            body_cut: cut,
+            ..request(b"POST", b"/submit", &hs, body)
+        };
+        if cut {
+            run.submit(&sent)
+        } else {
+            // An uncut body must have the length it says.
+            let hs = [
+                header(b"Host", b"example.test"),
+                header(b"Content-Type", b"application/json"),
+            ];
+            run.submit(&request(b"POST", b"/submit", &hs, body))
+        }
+    };
+    // The same bytes end in the middle of a string: a body that was cut is passed, one that was not is a broken
+    // body and is blocked by the rule for a body that cannot be read.
+    let broken: &[u8] = br#"{"probe":"pass","pad":"xx"#;
+    let attack: &[u8] = br#"{"probe":"block","pad":"xx"#;
+    let (cut_ok, whole, cut_attack) = (post(broken, true), post(broken, false), post(attack, true));
+    run.wait_results(3);
+    assert_eq!(run.verdict(cut_ok), Verdict::Allow);
+    let unreadable = Verdict::Block {
+        phase: 2,
+        rule_id: 4000001,
+        status: 403,
+    };
+    assert_eq!(run.verdict(whole), unreadable);
+    let attack_verdict = Verdict::Block {
+        phase: 2,
+        rule_id: 9203,
+        status: 403,
+    };
+    assert_eq!(run.verdict(cut_attack), attack_verdict);
     finish_stopped(run);
 }
 

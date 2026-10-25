@@ -19,7 +19,8 @@ pub(in crate::inbound) fn head_of(raw: &str) -> Head {
 }
 
 fn represented(raw: &str, body_len: usize) -> Represented {
-    represent(&head_of(raw), body_len).expect("represented")
+    let head = head_of(raw);
+    represent(&head, Some(body_len), head.gzip()).expect("represented")
 }
 
 fn pairs(rep: &Represented) -> Vec<(String, String)> {
@@ -273,17 +274,20 @@ pub(in crate::inbound) fn numbered(count: usize, method: &str) -> String {
 fn a_64_field_request_that_gets_content_length_0_is_65_fields_and_refused() {
     let head = head_of(&numbered(64, "POST"));
     assert_eq!(head.fields().len(), 64);
-    assert_eq!(represent(&head, 0).err(), Some(Reject::FieldsTooLarge));
+    assert_eq!(
+        represent(&head, Some(0), false).err(),
+        Some(Reject::FieldsTooLarge)
+    );
     // The same head with a method that gets nothing added, and 63 fields plus the added one, pass.
     assert_eq!(
-        represent(&head_of(&numbered(64, "GET")), 0)
+        represent(&head_of(&numbered(64, "GET")), Some(0), false)
             .unwrap()
             .headers
             .len(),
         64
     );
     assert_eq!(
-        represent(&head_of(&numbered(63, "POST")), 0)
+        represent(&head_of(&numbered(63, "POST")), Some(0), false)
             .unwrap()
             .headers
             .len(),
@@ -302,10 +306,10 @@ fn the_size_limits_are_checked_after_the_framing_is_added() {
         raw.push_str(&format!("F006: {}\r\n\r\n", "a".repeat(last)));
         raw
     };
-    let rep = represent(&head_of(&with_last(4041)), 0).unwrap();
+    let rep = represent(&head_of(&with_last(4041)), Some(0), false).unwrap();
     assert_eq!(rep.field_bytes, limits::HEADER_TOTAL);
     assert_eq!(
-        represent(&head_of(&with_last(4042)), 0).err(),
+        represent(&head_of(&with_last(4042)), Some(0), false).err(),
         Some(Reject::FieldsTooLarge)
     );
     // The head itself was within the limits; only the added field is over.

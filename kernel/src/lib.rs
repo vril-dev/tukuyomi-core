@@ -10,7 +10,7 @@ pub use requests::supervisor::{
 
 /// The upper limits that `submit` enforces, for a host that checks its input before submitting.
 pub mod limits {
-    pub const BODY: u64 = crate::protocol::codec::MAX_DECLARED; // body bytes
+    pub const BODY: u64 = crate::protocol::codec::MAX_DECLARED; // body bytes inspected
     pub const ADDR: usize = crate::protocol::codec::MAX_ADDR; // client and server address bytes, each
     pub const METHOD: usize = crate::protocol::codec::MAX_METHOD;
     pub const URI: usize = crate::protocol::codec::MAX_URI;

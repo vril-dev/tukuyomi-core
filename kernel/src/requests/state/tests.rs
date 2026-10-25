@@ -17,6 +17,7 @@ fn request() -> Request {
     Request {
         begin: vec![1, 2, 3],
         body: vec![vec![b'a'; 4], vec![b'b'; 5]],
+        cut: false,
     }
 }
 
@@ -171,6 +172,30 @@ fn row_body() -> Fx {
         (2, OutKind::Body, vec![b'a'; 4])
     );
     f
+}
+
+/// Only the TX_BEGIN of a request whose body is cut says so; the frames after it do not.
+#[test]
+fn only_the_begin_frame_of_a_cut_request_is_marked_cut() {
+    let (mut e, t0) = start();
+    e.submit(
+        t0,
+        Request {
+            cut: true,
+            ..request()
+        },
+    )
+    .unwrap();
+    let begin = take(&mut e, t0);
+    assert_eq!((begin.kind, begin.cut), (OutKind::TxBegin, true));
+    cont(&mut e, t0, 100, 1, 1).unwrap();
+    for _ in 0..3 {
+        assert!(!take(&mut e, t0).cut);
+    }
+    // A request that is not cut has no mark on its TX_BEGIN.
+    let (mut e, t0) = start();
+    e.submit(t0, request()).unwrap();
+    assert!(!take(&mut e, t0).cut);
 }
 
 /// Row "phase 2 wait": BODY 2, 3 and BODY_END 4 taken at t0.
@@ -630,6 +655,7 @@ fn requests_that_fail_the_checks_are_not_sent() {
     let edge = Request {
         begin: frag(MAX_BEGIN),
         body: vec![frag(MAX_FRAG); MAX_FRAGS],
+        cut: false,
     };
     let id = e.submit(t0, edge).unwrap();
     assert_eq!(out(&e, id).decision, None);

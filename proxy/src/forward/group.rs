@@ -3,7 +3,8 @@
 //! A request goes to the route that is the most exact of those holding for it, or to the default route, which
 //! names the default group and turns nobody away, edits nothing and has no `stream`; with neither it has no route
 //! (`Upstreams::find`). A route names a group, tells which clients may use it (`Access`), how the request and the
-//! response are edited (`Rewrite`) and whether its responses may take long (`Stream`). A request may be another way
+//! response are edited (`Rewrite`), whether its responses may take long (`Stream`) and, if it is to take less than the
+//! proxy does, how long a request body may be. A request may be another way
 //! to write a request for a route that it does not hold for, so the access lists of every route that it could be
 //! taken for are asked for, not only those of the route it goes to (`Upstreams::accesses`), and only if some route
 //! has a list (`Upstreams::guarded`). A group has one or more servers and one pool of waiting connections
@@ -47,13 +48,14 @@ pub struct Upstreams {
     guarded: bool,
 }
 
-/// The route a request takes: the group it goes to, how it edits the request and the response, and the times of a
-/// response that may take long.
+/// The route a request takes: the group it goes to, how it edits the request and the response, the times of a
+/// response that may take long, and the limit on the body of a request that is lower than the proxy's.
 #[derive(Clone, Copy)]
 pub struct Route<'a> {
     pub group: &'a Group,
     pub rewrite: &'a Rewrite,
     pub stream: Option<&'a Stream>,
+    pub max_body: Option<usize>,
 }
 
 impl Upstreams {
@@ -86,6 +88,7 @@ impl Upstreams {
             group: self.groups.get(found.group)?,
             rewrite: &found.rewrite,
             stream: found.stream.as_ref(),
+            max_body: found.max_body,
         })
     }
 
@@ -261,6 +264,12 @@ impl Group {
     /// Counts a failure of the server at `index`, at `now`.
     pub(super) fn fail(&self, index: usize, now: Instant) {
         self.servers[index].fail(self.since(now));
+    }
+
+    /// Whether the server at `index` is left out at the moment, for the tests.
+    #[cfg(test)]
+    pub(crate) fn left_out(&self, index: usize) -> bool {
+        !self.servers[index].up(self.since(Instant::now()))
     }
 }
 

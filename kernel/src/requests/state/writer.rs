@@ -61,29 +61,30 @@ impl Engine {
             };
             l.next_msg = msg.checked_add(1);
             let r = rec(&mut self.reqs, l.req);
-            let (kind, payload) = match q.kind {
+            let (kind, payload, cut) = match q.kind {
                 QKind::Begin => {
                     l.stage = Stage::P1;
                     l.begin_msg = Some(msg);
                     l.verdict_due = due;
-                    (OutKind::TxBegin, mem::take(&mut r.req.begin))
+                    (OutKind::TxBegin, mem::take(&mut r.req.begin), r.req.cut)
                 }
                 QKind::Body(i) => {
                     l.body_msgs.push(msg);
                     (
                         OutKind::Body,
                         r.req.body.get_mut(i).map(mem::take).unwrap_or_default(),
+                        false,
                     )
                 }
                 QKind::BodyEnd => {
                     l.stage = Stage::P2;
                     l.body_end_msg = Some(msg);
                     l.verdict_due = due;
-                    (OutKind::BodyEnd, Vec::new())
+                    (OutKind::BodyEnd, Vec::new(), false)
                 }
                 QKind::End(reason) => {
                     l.end_msg.get_or_insert(msg);
-                    (OutKind::TxEnd(reason), vec![reason])
+                    (OutKind::TxEnd(reason), vec![reason], false)
                 }
             };
             return Some(Outgoing {
@@ -91,6 +92,7 @@ impl Engine {
                 msg,
                 kind,
                 payload,
+                cut,
             });
         }
     }

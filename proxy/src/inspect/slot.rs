@@ -110,6 +110,7 @@ pub(super) fn submit(kernel: &mut impl Kernel, req: &InspectReq) -> Result<ReqId
         proto: req.proto,
         headers: &headers,
         body: &req.body.bytes,
+        body_cut: req.cut,
     })
 }
 

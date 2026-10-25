@@ -3,6 +3,7 @@
 //! The same bytes as the Go inspector's `codec.go` and `testdata/v0-golden.txt`. Every integer is big-endian; a `str`
 //! is a u16 length and the bytes. Strings stay `&[u8]` / `Vec<u8>`: no UTF-8 conversion, normalisation or trimming.
 //! Rust receives HELLO, BYE, VERDICT, ERROR and CLOSED and sends DRAIN, TX_BEGIN, BODY, BODY_END and TX_END. The
+//! header flags of a frame Rust receives are zero. The only flag Rust sends is `FLAG_BODY_CUT`, on TX_BEGIN. The
 //! response kinds (RESP_BEGIN, RESP_BODY, RESP_END) are v0 kinds that Rust never sends: `encode_frame` refuses them and
 //! `check_header` reports one received as a wrong direction.
 //!
@@ -64,6 +65,9 @@ pub(crate) const QUEUE_DEPTH: u16 = 17;
 const MAX_GO_VERSION: usize = 64;
 const MAX_CORAZA_VERSION: usize = 64;
 const MAX_CORAZA_SUM: usize = 128;
+
+// Header flags of a frame Rust sends: the body that follows TX_BEGIN is only the first bytes of the request body.
+pub(crate) const FLAG_BODY_CUT: u8 = 1 << 0;
 
 // VERDICT flags (the two cuts and the detection) and ERROR classes.
 pub(crate) const FLAG_ACTION_TRUNCATED: u8 = 1 << 0;
@@ -266,7 +270,8 @@ pub(crate) fn read_frame<R: Read>(
 }
 
 /// Builds one frame Rust sends. Only the kinds Rust sends are accepted; control (DRAIN) has tx = msg = 0 and the others
-/// both nonzero; the payload length is within the kind's range (BODY 1..=64 KiB, the empty kinds 0). The content of
+/// both nonzero; the payload length is within the kind's range (BODY 1..=64 KiB, the empty kinds 0). The header
+/// flags are 0, or `FLAG_BODY_CUT` on a TX_BEGIN: no other flag and no other kind is built. The content of
 /// TX_BEGIN and TX_END comes from `encode_tx_begin` and `encode_tx_end`, and is checked here with the rules of Go's
 /// `decodeTxBegin` and `decodeTxEnd`, so no frame Go rejects is built. A TX_BEGIN also needs msg 1: Go does not create a
 /// transaction for another number (ERROR class 1, code 3).
@@ -275,6 +280,7 @@ pub(crate) fn read_frame<R: Read>(
 /// mistakes, not an invalid request content; they are reported first, before the payload is looked at.
 pub(crate) fn encode_frame(
     kind: u8,
+    flags: u8,
     run: u64,
     inc: u32,
     tx: u64,
@@ -297,6 +303,9 @@ pub(crate) fn encode_frame(
     } else if tx == 0 || msg == 0 {
         return Err(ContentError("transaction frame with zero tx or msg"));
     }
+    if flags != 0 && !(flags == FLAG_BODY_CUT && kind == KIND_TX_BEGIN) {
+        return Err(ContentError("frame flags out of range"));
+    }
     if payload.len() < min || payload.len() > max {
         return Err(ContentError("payload length out of range"));
     }
@@ -314,7 +323,7 @@ pub(crate) fn encode_frame(
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(&MAGIC);
     out.push(kind);
-    out.push(0); // flags
+    out.push(flags);
     out.extend_from_slice(&[0, 0]); // reserved
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(&run.to_be_bytes());

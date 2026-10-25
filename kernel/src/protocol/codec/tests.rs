@@ -85,18 +85,25 @@ fn rust_to_go_frames_are_byte_identical_to_the_golden_vectors() {
     let cases = [
         (
             "tx_begin",
-            encode_frame(KIND_TX_BEGIN, RUN, INC, 0x10, 1, &tx_begin),
+            encode_frame(KIND_TX_BEGIN, 0, RUN, INC, 0x10, 1, &tx_begin),
         ),
-        ("body", encode_frame(KIND_BODY, RUN, INC, 0x10, 2, b"a=b&c")),
+        (
+            "tx_begin_cut",
+            encode_frame(KIND_TX_BEGIN, FLAG_BODY_CUT, RUN, INC, 0x10, 1, &tx_begin),
+        ),
+        (
+            "body",
+            encode_frame(KIND_BODY, 0, RUN, INC, 0x10, 2, b"a=b&c"),
+        ),
         (
             "body_end",
-            encode_frame(KIND_BODY_END, RUN, INC, 0x10, 3, &[]),
+            encode_frame(KIND_BODY_END, 0, RUN, INC, 0x10, 3, &[]),
         ),
         (
             "tx_end",
-            encode_frame(KIND_TX_END, RUN, INC, 0x10, 7, &tx_end),
+            encode_frame(KIND_TX_END, 0, RUN, INC, 0x10, 7, &tx_end),
         ),
-        ("drain", encode_frame(KIND_DRAIN, RUN, INC, 0, 0, &[])),
+        ("drain", encode_frame(KIND_DRAIN, 0, RUN, INC, 0, 0, &[])),
     ];
     for (name, got) in cases {
         assert_eq!(got.unwrap(), golden(name), "{name}");
@@ -276,6 +283,26 @@ fn sent_goldens_are_wrong_direction_for_check_header() {
 }
 
 #[test]
+fn the_cut_flag_is_sent_on_tx_begin_only_and_is_not_accepted_when_received() {
+    let begin = encode_tx_begin(&begin()).unwrap();
+    let flags = |kind, flags, payload: &[u8]| {
+        encode_frame(kind, flags, RUN, INC, 0x10, 1, payload).map_err(|e| e.0)
+    };
+    assert!(flags(KIND_TX_BEGIN, FLAG_BODY_CUT, &begin).is_ok());
+    // Any other bit, and the flag on any other kind, is refused before the payload is looked at.
+    let refused = Err("frame flags out of range");
+    assert_eq!(flags(KIND_TX_BEGIN, 0x02, &begin), refused);
+    assert_eq!(flags(KIND_TX_BEGIN, 0x03, &begin), refused);
+    assert_eq!(flags(KIND_BODY, FLAG_BODY_CUT, b"x"), refused);
+    assert_eq!(flags(KIND_BODY_END, FLAG_BODY_CUT, b""), refused);
+    assert_eq!(flags(KIND_TX_END, FLAG_BODY_CUT, &[1]), refused);
+    // What Rust receives has no flags: the frame with the flag is not a frame it takes.
+    let b = golden("tx_begin_cut");
+    let head: [u8; HEADER_LEN] = b[..HEADER_LEN].try_into().unwrap();
+    assert_eq!(check_header(&head, RUN, INC), Err(ConnError::Flags(1)));
+}
+
+#[test]
 fn encode_frame_accepts_only_the_kinds_rust_sends() {
     // The kind alone decides: before the ids and the payload are looked at.
     let received = Err(ContentError(
@@ -285,14 +312,14 @@ fn encode_frame_accepts_only_the_kinds_rust_sends() {
     let unknown = Err(ContentError("unknown frame kind"));
     let big = vec![0u8; MAX_BODY + 1];
     for (kind, _) in RECV {
-        assert_eq!(encode_frame(kind, RUN, INC, 0, 1, &big), received);
+        assert_eq!(encode_frame(kind, 0, RUN, INC, 0, 1, &big), received);
     }
     for kind in [KIND_RESP_BEGIN, KIND_RESP_BODY, KIND_RESP_END] {
-        assert_eq!(encode_frame(kind, RUN, INC, 0x10, 1, b"x"), response);
-        assert_eq!(encode_frame(kind, RUN, INC, 0, 1, &big), response);
+        assert_eq!(encode_frame(kind, 0, RUN, INC, 0x10, 1, b"x"), response);
+        assert_eq!(encode_frame(kind, 0, RUN, INC, 0, 1, &big), response);
     }
     for kind in [0x00, 0x17, 0x7f] {
-        assert_eq!(encode_frame(kind, RUN, INC, 0x10, 1, b""), unknown);
+        assert_eq!(encode_frame(kind, 0, RUN, INC, 0x10, 1, b""), unknown);
     }
 }
 
@@ -742,7 +769,8 @@ fn with_item<'a>(field: &str, bytes: &'a [u8]) -> TxBegin<'a> {
 /// Accepted by the encoder and then by the frame check that repeats Go's rules (`encode_frame`).
 fn accept_begin(t: &TxBegin) {
     let p = encode_tx_begin(t).unwrap_or_else(|e| panic!("{e:?}: {t:?}"));
-    encode_frame(KIND_TX_BEGIN, RUN, INC, 0x10, 1, &p).unwrap_or_else(|e| panic!("{e:?}: {t:?}"));
+    encode_frame(KIND_TX_BEGIN, 0, RUN, INC, 0x10, 1, &p)
+        .unwrap_or_else(|e| panic!("{e:?}: {t:?}"));
 }
 
 fn reject_begin(t: &TxBegin, why: &str) {
@@ -837,7 +865,7 @@ fn tx_begin_header_boundaries() {
 #[test]
 fn encode_frame_length_and_id_boundaries() {
     let f = |kind, tx, msg, payload: &[u8]| {
-        encode_frame(kind, RUN, INC, tx, msg, payload).map_err(|e| e.0)
+        encode_frame(kind, 0, RUN, INC, tx, msg, payload).map_err(|e| e.0)
     };
     let length = Err("payload length out of range");
     // BODY: 1..=64 KiB; the empty kinds take no payload.
@@ -871,7 +899,7 @@ fn encode_frame_length_and_id_boundaries() {
 #[test]
 fn begin_payloads_go_would_reject_are_rejected() {
     let send = |msg, payload: &[u8]| {
-        encode_frame(KIND_TX_BEGIN, RUN, INC, 0x10, msg, payload).map_err(|e| e.0)
+        encode_frame(KIND_TX_BEGIN, 0, RUN, INC, 0x10, msg, payload).map_err(|e| e.0)
     };
     let good = encode_tx_begin(&begin()).unwrap();
     assert!(send(1, &good).is_ok());

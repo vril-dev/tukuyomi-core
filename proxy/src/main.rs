@@ -1085,6 +1085,7 @@ mod tests {
             max_conns: 1,
             max_head_bytes: 1024,
             max_body: 0,
+            inspect_body: 0,
             max_body_wire: 0,
             max_buffered_bytes: 0,
             upstream_max_headers: 1,

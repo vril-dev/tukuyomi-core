@@ -81,7 +81,7 @@ func TestGoldenOutbound(t *testing.T) {
 func TestGoldenInbound(t *testing.T) {
 	g := loadGolden(t)
 	// Every inbound golden frame passes the header check of this build.
-	for _, name := range []string{"tx_begin", "body", "body_end", "resp_begin", "resp_body", "resp_end", "tx_end", "drain"} {
+	for _, name := range []string{"tx_begin", "tx_begin_cut", "body", "body_end", "resp_begin", "resp_body", "resp_end", "tx_end", "drain"} {
 		b := g[name]
 		var hb [headerLen]byte
 		copy(hb[:], b)
@@ -99,6 +99,21 @@ func TestGoldenInbound(t *testing.T) {
 		tb.headers[0] != (httpHeader{"Host", "example.test"}) ||
 		tb.headers[1] != (httpHeader{"Content-Type", "application/x-www-form-urlencoded"}) {
 		t.Fatalf("decoded tx_begin %+v", tb)
+	}
+	// tx_begin_cut is tx_begin with the header flag of a body that goes on past
+	// the declared bytes: the flag is read from the header, the payload is the
+	// same.
+	var hb, hc [headerLen]byte
+	copy(hb[:], g["tx_begin"])
+	copy(hc[:], g["tx_begin_cut"])
+	h, _ := checkHeader(&hb, testRun, testInc)
+	hCut, _ := checkHeader(&hc, testRun, testInc)
+	if h.cut || !hCut.cut || !bytes.Equal(g["tx_begin"][headerLen:], g["tx_begin_cut"][headerLen:]) {
+		t.Fatalf("tx_begin cut %v, tx_begin_cut cut %v, same payload %v", h.cut, hCut.cut,
+			bytes.Equal(g["tx_begin"][headerLen:], g["tx_begin_cut"][headerLen:]))
+	}
+	if cb, err := decodeTxBegin(g["tx_begin_cut"][headerLen:]); err != nil || cb.declared != tb.declared || cb.uri != tb.uri {
+		t.Fatalf("decode tx_begin_cut: %v %+v", err, cb)
 	}
 }
 
@@ -130,6 +145,9 @@ func TestCheckHeaderRejects(t *testing.T) {
 		"hello in":      func(b []byte) { b[4] = kindHello },
 		"verdict in":    func(b []byte) { b[4] = kindVerdict },
 		"flags":         func(b []byte) { b[5] = 1 },
+		"flags 2 begin": func(b []byte) { b[4], b[5] = kindTxBegin, 2 },
+		"flags 3 begin": func(b []byte) { b[4], b[5] = kindTxBegin, 3 },
+		"flags tx end":  func(b []byte) { setLen(kindTxEnd, 1)(b); b[5] = 1 },
 		"reserved":      func(b []byte) { b[7] = 1 },
 		"body len+1":    setLen(kindBody, maxBody+1),
 		"bodyend len 1": setLen(kindBodyEnd, 1),
@@ -156,6 +174,7 @@ func TestCheckHeaderRejects(t *testing.T) {
 		"txend len 8":   setLen(kindTxEnd, 8),
 		"drain":         control(func([]byte) {}),
 		"tx max":        func(b []byte) { binary.BigEndian.PutUint64(b[24:], ^uint64(0)) },
+		"flags 1 begin": func(b []byte) { b[4], b[5] = kindTxBegin, 1 },
 	}
 	for name, f := range accept {
 		if err := check(f); err != nil {

@@ -63,6 +63,7 @@ pub(in crate::inbound) fn config() -> ProxyConfig {
         max_conns: 16,
         max_head_bytes: 8192,
         max_body: 1024,
+        inspect_body: 1024,
         max_body_wire: 4096,
         max_buffered_bytes: BUDGET,
         upstream_max_headers: 64,
@@ -115,7 +116,9 @@ pub(in crate::inbound) struct Seen {
     /// The address the inspection was told is the client's.
     pub(in crate::inbound) client: SocketAddr,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    pub(in crate::inbound) body: Vec<u8>,
+    /// The body goes on after the bytes in `body`.
+    pub(in crate::inbound) cut: bool,
     /// For a ticket that was kept: the connection had dropped its end when the driver stopped.
     abandoned: bool,
 }
@@ -142,6 +145,7 @@ fn driver(rx: Receiver<Msg>, answer: Option<Outcome>) -> JoinHandle<Vec<Seen>> {
                     })
                     .collect(),
                 body: req.body.bytes.to_vec(),
+                cut: req.cut,
                 abandoned: false,
             };
             match answer {

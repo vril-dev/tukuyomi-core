@@ -38,7 +38,7 @@ use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
 
 use crate::config::{Http2Config, ListenerKind, ProxyConfig, Stream};
-use crate::inbound::answer::{Class, Noted, Out, Reply, record};
+use crate::inbound::answer::{Class, Noted, Out, Reply, Sizes, record};
 use crate::inbound::conn::{Conn, Ctx, Scheme, after};
 use crate::inbound::head::Head;
 use crate::inbound::transport::io::Gauge;
@@ -312,13 +312,17 @@ impl Session {
                 self.id, reply.reason
             ));
         }
-        self.ctx.log.line(&record(
+        let line = record(
             self.id,
             &reply,
             start.elapsed(),
             noted.client,
             noted.via.as_ref(),
-        ));
+        );
+        match noted.body.as_ref().and_then(Sizes::words) {
+            Some(words) => self.ctx.log.line(&format!("{line} {words}")),
+            None => self.ctx.log.line(&line),
+        }
     }
 
     /// What came of the connection: the reply of the last response, and `line` for its end.

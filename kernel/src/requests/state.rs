@@ -54,6 +54,8 @@ pub struct Request {
     pub begin: Vec<u8>,
     /// Body fragments, each 1..=65536 bytes, at most 16.
     pub body: Vec<Vec<u8>>,
+    /// The fragments are only the first bytes of the request body: the TX_BEGIN frame carries the cut flag.
+    pub cut: bool,
 }
 
 /// Why `submit` made no record and sent nothing.
@@ -75,13 +77,15 @@ pub enum OutKind {
 }
 
 /// One frame for the writer. `payload` is the frame's payload bytes as they go on the wire: the encoded
-/// TX_BEGIN, a body fragment, empty for BODY_END, and `[reason]` for TX_END.
+/// TX_BEGIN, a body fragment, empty for BODY_END, and `[reason]` for TX_END. `cut` is true for the TX_BEGIN of a
+/// request whose body is cut, and for no other frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outgoing {
     pub tx: u64,
     pub msg: u32,
     pub kind: OutKind,
     pub payload: Vec<u8>,
+    pub cut: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,6 +397,7 @@ fn free(r: &mut Req) {
     r.req = Request {
         begin: Vec::new(),
         body: Vec::new(),
+        cut: false,
     };
 }
 

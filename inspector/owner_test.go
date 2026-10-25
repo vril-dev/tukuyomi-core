@@ -428,7 +428,8 @@ type flagCase struct {
 	rules string // appended to the operator's rules
 	begin tBegin
 	body  string
-	rule  int // the reserved rule that blocks it
+	rule  int  // the reserved rule that blocks it
+	cut   bool // the TX_BEGIN has the flag of a body that goes on past the declared bytes
 }
 
 func flagCases() []flagCase {
@@ -437,10 +438,10 @@ func flagCases() []flagCase {
 	multipart := defaultBegin(7)
 	multipart.headers = [][2]string{{"Host", "example.test"}, {"Content-Type", "multipart/form-data; boundary=xx"}}
 	return []flagCase{
-		{"uri", "", uri, "", 4000003},
-		{"arguments", "SecArgumentsLimit 2\n", defaultBegin(11), "a=1&b=2&c=3", 4000002},
-		{"body", "", multipart, "garbage", 4000001},
-		{"json body", "", jsonBegin(1), "{", 4000001},
+		{"uri", "", uri, "", 4000003, false},
+		{"arguments", "SecArgumentsLimit 2\n", defaultBegin(11), "a=1&b=2&c=3", 4000002, false},
+		{"body", "", multipart, "garbage", 4000001, false},
+		{"json body", "", jsonBegin(1), "{", 4000001, false},
 	}
 }
 
@@ -449,7 +450,11 @@ func flagCases() []flagCase {
 // checked on the way).
 func (c flagCase) send(t *testing.T, h *harness) (out, uint32) {
 	t.Helper()
-	h.in(kindTxBegin, 1, 1, c.begin.payload())
+	flags := uint8(0)
+	if c.cut {
+		flags = flagBodyCut
+	}
+	h.inFlags(flags, kindTxBegin, 1, 1, c.begin.payload())
 	expectVerdict(t, h.cap.next(t), 1, 1, 1, false)
 	msg := uint32(2)
 	if c.body != "" {
@@ -567,24 +572,40 @@ func TestRequestComplete(t *testing.T) {
 			t.Fatalf("%s is %q on a fresh transaction", v.Name(), g)
 		}
 	}
-	if !requestComplete(tx, true, 0, "") || requestComplete(tx, true, 1, "URLENCODED") {
+	if !requestComplete(tx, true, 0, "", false) || requestComplete(tx, true, 1, "URLENCODED", false) {
 		t.Fatal("a fresh transaction is complete without a body only: it has no body processor")
 	}
 	tx.ProcessConnection("127.0.0.1", 1, "127.0.0.1", 2)
 	tx.ProcessURI("/%zz", "GET", "HTTP/1.1")
-	if !requestComplete(tx, false, 0, "") || requestComplete(tx, true, 0, "") {
+	if !requestComplete(tx, false, 0, "", false) || requestComplete(tx, true, 0, "", false) {
 		t.Fatal("the flags are read before phase 2 only, and a set flag is incomplete")
 	}
 	// Empty and "0" are no flag; anything else is one.
 	for val, want := range map[string]bool{"": true, "0": true, "1": false} {
 		f := &fakeTx{reqAccess: true, flags: map[variables.RuleVariable]string{variables.ArgumentsLimitReached: val}}
-		if got := requestComplete(f, true, 1, "URLENCODED"); got != want {
+		if got := requestComplete(f, true, 1, "URLENCODED", false); got != want {
 			t.Errorf("flag %q: complete %v, want %v", val, got, want)
 		}
 	}
+	// The parse failure of a body that was cut is no flag; the other two stay.
+	for _, c := range []struct {
+		v    variables.RuleVariable
+		cut  bool
+		want bool
+	}{
+		{variables.ReqbodyError, true, true},
+		{variables.ReqbodyError, false, false},
+		{variables.ArgumentsLimitReached, true, false},
+		{variables.URIParseError, true, false},
+	} {
+		f := &fakeTx{reqAccess: true, flags: map[variables.RuleVariable]string{c.v: "1"}}
+		if got := requestComplete(f, true, 1, "URLENCODED", c.cut); got != c.want {
+			t.Errorf("%s set, cut %v: complete %v, want %v", c.v.Name(), c.cut, got, c.want)
+		}
+	}
 	// A type that is not the expected one is incomplete.
-	if requestComplete(plainTx{tx}, true, 1, "URLENCODED") || requestComplete(noFlags{tx.(realTx)}, true, 1, "URLENCODED") ||
-		requestComplete(noProcessor{&fakeTx{reqAccess: true}}, true, 1, "URLENCODED") {
+	if requestComplete(plainTx{tx}, true, 1, "URLENCODED", false) || requestComplete(noFlags{tx.(realTx)}, true, 1, "URLENCODED", true) ||
+		requestComplete(noProcessor{&fakeTx{reqAccess: true}}, true, 1, "URLENCODED", false) {
 		t.Error("a transaction or collection of another type is complete")
 	}
 }
@@ -597,9 +618,16 @@ const probeRule = `SecRule ARGS_POST:probe "@streq block" "id:9202,phase:2,deny,
 // product WAF up to the reply to BODY_END.
 func bodyReply(t *testing.T, rules string, headers [][2]string, body string) (out, uint32) {
 	t.Helper()
+	return cutReply(t, false, rules, headers, body)
+}
+
+// cutReply is bodyReply for a body that goes on past the bytes given when cut
+// is set: the TX_BEGIN has the flag.
+func cutReply(t *testing.T, cut bool, rules string, headers [][2]string, body string) (out, uint32) {
+	t.Helper()
 	b := defaultBegin(uint64(len(body)))
 	b.headers = headers
-	return flagCase{begin: b, body: body}.send(t, productHarness(t, baseRules+"SecRequestBodyLimit 1024\n"+rules))
+	return flagCase{begin: b, body: body, cut: cut}.send(t, productHarness(t, baseRules+"SecRequestBodyLimit 1024\n"+rules))
 }
 
 // A rule of the operator that replaces or forces the request body processor,
@@ -667,8 +695,9 @@ func expectRule(t *testing.T, o out, msg uint32, rule int64) {
 }
 
 // beginOn runs begin of an owner on tx, on this goroutine, for the request b
-// and returns the owner and the one frame that begin sent.
-func beginOn(t *testing.T, tx types.Transaction, b tBegin) (*owner, out) {
+// (its body is cut when cut is set) and returns the owner and the one frame
+// that begin sent.
+func beginOn(t *testing.T, tx types.Transaction, b tBegin, cut bool) (*owner, out) {
 	t.Helper()
 	c := newCapture()
 	tab := newTable(testRun, testInc, func(string) types.Transaction { return tx }, false, c.send)
@@ -676,6 +705,7 @@ func beginOn(t *testing.T, tx types.Transaction, b tBegin) (*owner, out) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tb.cut = cut
 	o := &owner{t: tab, e: newEntry(), id: 1}
 	o.begin(tb, 1)
 	return o, c.next(t)
@@ -722,7 +752,7 @@ func TestBeginSetsJSONProcessor(t *testing.T) {
 			for _, v := range c.ctypes {
 				b.headers = append(b.headers, [2]string{"Content-Type", v})
 			}
-			o, rep := beginOn(t, tx, b)
+			o, rep := beginOn(t, tx, b, false)
 			if o.wantProc != c.wantProc {
 				t.Errorf("expected processor %q, want %q", o.wantProc, c.wantProc)
 			}
@@ -792,6 +822,110 @@ func TestRealJSONBodyLimits(t *testing.T) {
 		o, msg := bodyReply(t, jsonProbeRule, jsonHeaders("application/vnd.api+json"), jsonBody("block"))
 		expectRule(t, o, msg, 9203)
 	})
+}
+
+// ---- bodies that are cut ----
+
+// A body that is cut (the TX_BEGIN has the flag) ends inside what the client
+// sent, so a parse failure that the cut causes is no reason to block, while
+// its first bytes are inspected as before. The same bytes without the flag are
+// blocked by rule 4000001, and a dropped argument or a URI that does not parse
+// block with the flag too. A bundle that only detects does not report the
+// parse failure of a cut body either.
+func TestCutBody(t *testing.T) {
+	const (
+		cutJSON      = `{"probe":"fine","list":[1,2,`
+		cutMultipart = "--xx\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nvalue\r\n--xx"
+	)
+	js, mp := jsonHeaders("application/json"), jsonHeaders("multipart/form-data; boundary=xx")
+	for _, c := range []struct {
+		name, rules, body string
+		headers           [][2]string
+		cut               bool
+		rule              int64
+	}{
+		{"json", "", cutJSON, js, true, 0},
+		{"json, the same bytes without the flag", "", cutJSON, js, false, 4000001},
+		{"json, an attack in the first bytes", jsonProbeRule, `{"probe":"block","list":[1,`, js, true, 9203},
+		{"multipart", "", cutMultipart, mp, true, 0},
+		{"multipart, the same bytes without the flag", "", cutMultipart, mp, false, 4000001},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			o, msg := cutReply(t, c.cut, c.rules, c.headers, c.body)
+			expectRule(t, o, msg, c.rule)
+		})
+	}
+	for _, c := range flagCases() {
+		if c.rule == 4000001 {
+			continue
+		}
+		c.cut = true
+		if c.body == "" { // the flag needs declared bytes
+			c.begin.declared, c.body = 5, "a=b&c"
+		}
+		t.Run("the flag does not stop rule "+c.name, func(t *testing.T) {
+			o, msg := c.send(t, productHarness(t, baseRules+c.rules))
+			expectVerdict(t, o, 1, msg, 2, true)
+			if o.rule != int64(c.rule) {
+				t.Fatalf("%+v", o)
+			}
+		})
+	}
+	t.Run("detect only", func(t *testing.T) {
+		c := flagCase{begin: jsonBegin(uint64(len(cutJSON))), body: cutJSON, cut: true}
+		o, msg := c.send(t, detectHarness(t, baseRules+"SecRequestBodyLimit 1024\n"))
+		expectVerdict(t, o, 1, msg, 2, false)
+		if o.flags != 0 || o.rule != 0 {
+			t.Fatalf("%+v", o)
+		}
+	})
+}
+
+// The flag needs declared bytes: a TX_BEGIN with it and none is refused as a
+// payload that is not valid, and one with bytes is taken.
+func TestCutNeedsDeclaredBytes(t *testing.T) {
+	h := productHarness(t, baseRules)
+	h.inFlags(flagBodyCut, kindTxBegin, 1, 1, defaultBegin(0).payload())
+	expectError(t, h.cap.next(t), 1, 1, classNotCreated, codeBadBegin)
+	h.inFlags(flagBodyCut, kindTxBegin, 2, 1, defaultBegin(1).payload())
+	expectVerdict(t, h.cap.next(t), 2, 1, 1, false)
+}
+
+// begin puts bodyCutVar on the transaction of a body that was cut, and on that
+// one only. A transaction or collection that cannot take it is no Continue.
+func TestBeginMarksCut(t *testing.T) {
+	waf := productWAFFor(t, baseRules)
+	for _, c := range []struct {
+		name   string
+		cut    bool
+		wrap   func(realTx) types.Transaction // nil: the transaction itself
+		marked bool
+		reply  string // "continue" or "error"
+	}{
+		{"cut", true, nil, true, "continue"},
+		{"not cut", false, nil, false, "continue"},
+		{"cut, no collections", true, func(r realTx) types.Transaction { return noFlags{r} }, false, "error"},
+		{"cut, not a TransactionState", true, func(r realTx) types.Transaction { return plainTx{r} }, false, "error"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			real := waf.NewTransaction().(realTx)
+			defer func() { real.ProcessLogging(); real.Close() }()
+			var tx types.Transaction = real
+			if c.wrap != nil {
+				tx = c.wrap(real)
+			}
+			_, rep := beginOn(t, tx, defaultBegin(5), c.cut)
+			if c.reply == "continue" {
+				expectVerdict(t, rep, 1, 1, 1, false)
+			} else {
+				expectError(t, rep, 1, 1, classTxFailed, codeIncomplete)
+			}
+			got := real.Collection(variables.TX).(collection.Map).Get(bodyCutVar)
+			if marked := len(got) == 1 && got[0] == "1"; marked != c.marked {
+				t.Errorf("%s is %q, want it set: %v", bodyCutVar, got, c.marked)
+			}
+		})
+	}
 }
 
 // ---- a bundle that only detects ----
