@@ -51,12 +51,12 @@ use tokio::signal::unix::{SignalKind, signal};
 use tukuyomi_kernel::Failure;
 
 use crate::config::{self, Loaded};
-use crate::host;
 use crate::log::escaped;
 use crate::rules::bundle::{Fingerprint, Mode};
 use crate::rules::collect::{self, CollectError, Inputs};
 use crate::rules::store::{self, Committed, RuleStore, Staged};
 use crate::rules::trial::{self, Accepted, Failed, Finish, Limits};
+use crate::run::host;
 
 const USAGE: &str = "usage: tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--accept-block] [--detect-only]\n       tukuyomi-proxy rules activate <config> <fingerprint>\n       tukuyomi-proxy rules remove <config> <fingerprint>\n       tukuyomi-proxy rules list <config>";
 

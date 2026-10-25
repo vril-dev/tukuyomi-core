@@ -27,12 +27,12 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::config;
-use crate::host;
 use crate::rules::bundle::{
     Bundle, Fingerprint, MANIFEST_NAME, MAX_MANIFEST_BYTES, Manifest, Mode, sha256,
 };
 use crate::rules::routes::Routes;
 use crate::rules::store::{Committed, Generation, Hold, RuleStore, Staged, StoreError};
+use crate::run::host;
 
 /// `O_NOFOLLOW` of Linux, which std has no name for. x86_64: the UAPI header `asm-generic/fcntl.h` (and Go's
 /// `syscall/zerrors_linux_amd64.go`). aarch64: Go's `syscall/zerrors_linux_arm64.go`, where the value differs.

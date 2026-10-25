@@ -1,9 +1,12 @@
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant as StdInstant;
 
+use http::header::HOST;
 use http::response::Parts;
+use http::{HeaderName, HeaderValue, Response};
 use http_body_util::BodyExt;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::runtime::Builder;
@@ -11,6 +14,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
+use super::head::{check_head, check_switch};
 use super::*;
 use crate::config::{ForwardConfig, ProxyConfig};
 use crate::forward::connect::connect_error;

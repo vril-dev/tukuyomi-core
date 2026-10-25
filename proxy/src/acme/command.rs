@@ -53,8 +53,8 @@ use super::key::Key;
 use super::order::Session;
 use super::{Failure, base64, der};
 use crate::config::{self, AcmeConfig, CertificateConfig, ListenerConfig, ListenerKind};
-use crate::host;
 use crate::inbound::transport::tls::{Files, KeySource, check};
+use crate::run::host;
 
 const USAGE: &str = "usage: tukuyomi-proxy acme renew <config>";
 const NAME: &str = "acme renew";

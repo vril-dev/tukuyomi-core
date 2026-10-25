@@ -12,7 +12,8 @@ use http::header::{
 use http::response::Parts;
 use http::{Extensions, HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
 
-use super::{OriginError, RESPONSE_HOP, listed};
+use super::OriginError;
+use super::fields::{RESPONSE_HOP, listed};
 use crate::inbound::head::trim_ows;
 
 /// Digits only and a value that fits in 64 bits (a leading `+` is not a digit).
