@@ -36,6 +36,23 @@ fn pairs(rep: &Represented) -> Vec<(String, String)> {
 }
 
 #[test]
+fn expect_is_neither_inspected_nor_forwarded() {
+    let raw = format!(
+        "POST /x HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Type: {FORM}\r\nContent-Length: 3\r\n\r\n"
+    );
+    let rep = represented(&raw, 3);
+    assert_eq!(
+        pairs(&rep),
+        [
+            pair("Host", "h"),
+            pair("Content-Type", FORM),
+            pair("Content-Length", "3"),
+        ]
+    );
+    assert!(rep.fields.get(EXPECT).is_none());
+}
+
+#[test]
 fn a_chunked_request_loses_its_encoding_and_gets_the_decoded_length() {
     let raw = format!(
         "POST /x HTTP/1.1\r\nContent-Type: {FORM}\r\nHost: h\r\nTransfer-Encoding: chunked\r\nx-forwarded-for: 1.2.3.4\r\n\r\n"

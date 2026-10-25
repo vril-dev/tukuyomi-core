@@ -10,7 +10,7 @@ use std::io::Read;
 
 use bytes::Bytes;
 use flate2::bufread::GzDecoder;
-use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, EXPECT, HOST, TRANSFER_ENCODING};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use tukuyomi_kernel::limits;
 
@@ -69,7 +69,9 @@ fn title_case(name: &str) -> Bytes {
 
 /// Builds the inspected and forwarded form of the request, whose body is `body_len` bytes as it is held, or `None`
 /// if the body is not held and goes on as the client sent it. `decoded` tells that a gzip body was decoded. A field
-/// with an underscore in its name is left out. The changes to the framing of a body that is held: a chunked request
+/// with an underscore in its name is left out, and so is `Expect`: the head allows only `100-continue`, which the
+/// proxy answers itself when it starts to read the body, so it belongs to the exchange with the client and is neither
+/// inspected nor sent to the upstream. The changes to the framing of a body that is held: a chunked request
 /// loses its `Transfer-Encoding` and gets a `Content-Length` of the length it is held at; a gzip request that was
 /// decoded loses its `Content-Encoding` and its `Content-Length` (if it has one) and gets one `Content-Length` of the
 /// decoded length, last like a chunked one; a POST, PUT or PATCH with neither gets `Content-Length: 0`. A body that
@@ -90,7 +92,7 @@ pub(super) fn represent(
             continue;
         }
         let name = HeaderName::from_bytes(name).map_err(|_| Reject::BadRequest)?;
-        if head.chunked() && name == TRANSFER_ENCODING {
+        if name == EXPECT || (head.chunked() && name == TRANSFER_ENCODING) {
             continue;
         }
         if body_len.is_some() && decoded && (name == CONTENT_ENCODING || name == CONTENT_LENGTH) {
