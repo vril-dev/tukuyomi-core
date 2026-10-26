@@ -150,7 +150,7 @@ fn driver(rx: Receiver<Msg>, answer: Option<Outcome>) -> JoinHandle<Vec<Seen>> {
             };
             match answer {
                 Some(outcome) => {
-                    let _ = ticket.reply.send(outcome);
+                    let _ = ticket.reply.send(outcome.into());
                     kept.push((seen, None));
                 }
                 None => kept.push((seen, Some(ticket))),
@@ -230,6 +230,7 @@ impl Rig {
             ingress: Arc::new(Ingress::new(tx.clone())),
             tls,
             challenge: None,
+            ids: RequestIds::new().unwrap(),
         });
         let (driver, full) = match mode {
             Mode::Answer(outcome) => (Some(driver(rx, Some(outcome))), None),
@@ -268,7 +269,7 @@ impl Rig {
             .unwrap();
         let (sock, peer) = self.listener.accept().await.unwrap();
         let local = sock.local_addr().unwrap();
-        let task = tokio::spawn(serve(sock, peer, local, self.ctx.clone()));
+        let task = tokio::spawn(serve(sock, peer, local, self.ctx.clone(), 0));
         (client, task)
     }
 
@@ -419,7 +420,7 @@ async fn exchange_with_reply(
     let ctx = rig.ctx.clone();
     let (sent, reply) = oneshot::channel();
     let task = tokio::spawn(async move {
-        let summary = run_session(sock, peer, local, &ctx, Instant::now(), Scheme::Http).await;
+        let summary = run_session(sock, peer, local, &ctx, 0, Instant::now(), Scheme::Http).await;
         let _ = sent.send(summary.last);
     });
     put(&client, request).await;
@@ -721,6 +722,22 @@ fn a_decoded_body_over_the_limit_is_413_and_one_at_the_limit_is_inspected() {
     });
 }
 
+/// Whether `raw` is the fixed answer of `reject`, with a request number of the form that the proxy makes.
+fn is_fixed(raw: &[u8], reject: Reject) -> bool {
+    let text = String::from_utf8_lossy(raw);
+    let Some(id) = text
+        .split("\r\nX-Request-ID: ")
+        .nth(1)
+        .and_then(|rest| rest.split("\r\n").next())
+    else {
+        return false;
+    };
+    let shaped = id.split_once('-').is_some_and(|(random, count)| {
+        random.len() == 16 && random.bytes().all(|b| b.is_ascii_hexdigit()) && !count.is_empty()
+    });
+    shaped && reject.response(id).as_deref() == Some(raw)
+}
+
 #[test]
 fn a_length_over_the_limit_is_refused_with_the_fixed_answer_before_any_body() {
     run(async {
@@ -730,7 +747,7 @@ fn a_length_over_the_limit_is_refused_with_the_fixed_answer_before_any_body() {
             &form_post("Content-Length: 1025\r\n\r\n"),
         )
         .await;
-        assert_eq!(raw, Reject::ContentTooLarge.response().unwrap());
+        assert!(is_fixed(&raw, Reject::ContentTooLarge), "{raw:?}");
         assert!(seen.is_empty());
     });
 }
@@ -744,7 +761,7 @@ fn a_refusal_reaches_a_client_that_is_still_sending() {
         request.extend_from_slice(&vec![b'a'; 200_000]);
         put(&client, &request).await;
         let raw = read_all(&client).await;
-        assert_eq!(raw, Reject::ContentTooLarge.response().unwrap());
+        assert!(is_fixed(&raw, Reject::ContentTooLarge), "{raw:?}");
         assert!(rig.finish(task).await.is_empty());
     });
 }
@@ -902,7 +919,7 @@ fn an_empty_gzip_body_is_400_whatever_its_framing() {
             &form_post("Content-Encoding: gzip\r\nContent-Length: 0\r\n\r\n"),
         )
         .await;
-        assert_eq!(raw, Reject::BadRequest.response().unwrap());
+        assert!(is_fixed(&raw, Reject::BadRequest), "{raw:?}");
         assert!(seen.is_empty());
         // A chunked body is empty only once it has been read.
         let (raw, seen, reply) = exchange_with_reply(

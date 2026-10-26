@@ -8,10 +8,10 @@
 //! the host checks, the configuration, the lookup of the names of the upstream servers (in the same step, the CA file
 //! of each upstream group that has `tls` is read), the certificate and key files of the TLS listeners, the rules store
 //! (the chosen generation, the hold on it, its directory, mode and routes, and with them the kernel configuration), the
-//! runtime and the signal handlers, the driver thread, the wait for the kernel to be ready, bind, accept. The steps
-//! from the configuration to the kernel configuration are `prepare`, which `config check` runs as well. The rules
-//! store is read here, and again when SIGUSR1 comes; the certificate and key files are read here, and again when
-//! SIGUSR2 comes. Handlers exist for SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2 only and are installed before the
+//! random part of the numbers of the requests, the runtime and the signal handlers, the driver thread, the wait for
+//! the kernel to be ready, bind, accept. The steps from the configuration to the kernel configuration are `prepare`,
+//! which `config check` runs as well. The rules store is read here, and again when SIGUSR1 comes; the certificate
+//! and key files are read here, and again when SIGUSR2 comes. Handlers exist for SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2 only and are installed before the
 //! kernel starts its child process; SIGCHLD is never handled. The listeners are bound only after the kernel is ready,
 //! all of them or none, and the accept side takes a connection permit before every accept (see
 //! `inbound::transport::accept`).
@@ -52,9 +52,9 @@
 //! stop was not caused by a failure and the driver reports a stopped kernel whose child exit and per-start
 //! directory removal are confirmed, and the same for every kernel that was stopped before it; 1 for any other end,
 //! and for a process that runs as root or fails another host check, names of upstream servers that cannot be looked
-//! up, a CA file of an upstream group that cannot be used, a refused certificate or key file, or a refused rules
-//! store or generation (nothing has been started then); 2 for a wrong argument or a refused configuration. The log
-//! is flushed for at most 200 ms at the end.
+//! up, a CA file of an upstream group that cannot be used, a refused certificate or key file, a refused rules
+//! store or generation, or no random number for the numbers of the requests (nothing has been started then); 2 for
+//! a wrong argument or a refused configuration. The log is flushed for at most 200 ms at the end.
 
 pub(crate) mod host;
 mod reload;

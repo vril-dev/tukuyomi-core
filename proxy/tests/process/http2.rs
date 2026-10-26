@@ -25,7 +25,7 @@ use crate::tls::Pki;
 
 /// Adds to the configuration in `root` a listener at `port` that ends TLS with the certificate `files` for `a.example`
 /// and its subdomains, and speaks HTTP/2.
-fn add_listener(root: &Path, port: u16, files: &(PathBuf, PathBuf)) {
+pub(crate) fn add_listener(root: &Path, port: u16, files: &(PathBuf, PathBuf)) {
     let (cert, key) = files;
     let path = root.join("config.json");
     let mut config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -52,13 +52,13 @@ fn add_listener(root: &Path, port: u16, files: &(PathBuf, PathBuf)) {
 }
 
 /// One connection of an HTTP/2 client, with the runtime that drives it.
-struct Client {
+pub(crate) struct Client {
     runtime: Runtime,
     send: SendRequest<Full<Bytes>>,
 }
 
 impl Client {
-    fn connect(pki: &Pki, port: u16) -> Client {
+    pub(crate) fn connect(pki: &Pki, port: u16) -> Client {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         let mut config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
             .with_safe_default_protocol_versions()
@@ -94,6 +94,21 @@ impl Client {
             let status = response.status().as_u16();
             let body = response.into_body().collect().await.expect("the body");
             (status, body.to_bytes().to_vec())
+        })
+    }
+
+    /// The status and the fields of the response to a GET of `path`.
+    pub(crate) fn get_fields(&mut self, path: &str) -> (u16, http::HeaderMap) {
+        let request = Request::get(format!("https://www.a.example{path}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let send = &mut self.send;
+        self.runtime.block_on(async {
+            send.ready().await.expect("the connection takes a request");
+            let response = send.send_request(request).await.expect("a response");
+            let (parts, body) = response.into_parts();
+            body.collect().await.expect("the body");
+            (parts.status.as_u16(), parts.headers)
         })
     }
 
@@ -152,14 +167,14 @@ fn a_request_over_h2_is_inspected_and_reaches_the_upstream_as_http_1_1() {
 
     drop(client);
     proxy.records.conns("the forwarded records", 2, |l| {
-        l.contains(": forwarded 200 forwarded rule - ")
+        is_answer(l, "forwarded", 200, "forwarded") && no(l, "rule")
     });
     proxy
         .records
-        .conn("the block by the target", |l| l.contains(&blocked_by(9201)));
+        .conn("the block by the target", |l| blocked_by(l, 9201));
     proxy
         .records
-        .conn("the block by the body", |l| l.contains(&blocked_by(9202)));
+        .conn("the block by the body", |l| blocked_by(l, 9202));
     proxy.finish(2);
 }
 
@@ -191,8 +206,9 @@ fn a_long_upload_over_h2_is_inspected_cut_and_streams_to_the_upstream_whole() {
     assert!(seen.body == big);
     drop(client);
     proxy.records.conn("the cut record", |l| {
-        l.contains(": forwarded 200 forwarded ")
-            && l.ends_with(&format!(" body {} inspected 16384 cut", big.len()))
+        is_answer(l, "forwarded", 200, "forwarded")
+            && l["body"] == big.len()
+            && l["inspected"] == 16384
     });
     proxy.finish(1);
 }

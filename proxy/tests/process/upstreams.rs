@@ -75,9 +75,12 @@ fn two_hosts_and_two_paths_go_to_different_upstreams_and_an_unknown_host_gets_40
         ("api", &proxy.others[0]),
         ("files", &proxy.others[1]),
     ] {
-        let want = format!(" upstream {group}/{}", up.addr());
+        let server = up.addr().to_string();
         proxy.records.conn(&format!("the record of {group}"), |l| {
-            l.contains(": forwarded 200 forwarded rule - ") && l.ends_with(&want)
+            is_answer(l, "forwarded", 200, "forwarded")
+                && no(l, "rule")
+                && l["upstream"] == group
+                && l["server"] == server.as_str()
         });
     }
 
@@ -85,7 +88,7 @@ fn two_hosts_and_two_paths_go_to_different_upstreams_and_an_unknown_host_gets_40
     let stranger = exchange(proxy.port, &get_for("stranger.test", "/files/a.txt"));
     assert_empty_answer(&stranger, 404);
     proxy.records.conn("the record of the 404", |l| {
-        l.contains(": rejected 404 no route matches ") && !l.contains(" upstream ")
+        is_answer(l, "rejected", 404, "no route matches") && no(l, "upstream")
     });
     assert_eq!(proxy.upstream.requests().len(), 1);
     assert_eq!(proxy.others[0].requests().len(), 1);
@@ -112,9 +115,12 @@ fn with_one_server_of_a_group_stopped_the_requests_go_to_the_other() {
     assert_eq!(proxy.upstream.requests().len(), 4);
     assert!(proxy.others[0].requests().is_empty());
     // The first request found the stopped server first and went on, so every record names the other server.
-    let want = format!(" upstream main/{}", proxy.upstream.addr());
+    let server = proxy.upstream.addr().to_string();
     proxy.records.conns("four forwarded records", 4, |l| {
-        l.contains(": forwarded 200 forwarded rule - ") && l.ends_with(&want)
+        is_answer(l, "forwarded", 200, "forwarded")
+            && no(l, "rule")
+            && l["upstream"] == "main"
+            && l["server"] == server.as_str()
     });
     proxy.finish(4);
 }

@@ -12,6 +12,7 @@ use crate::acme;
 use crate::config::{self, ForwardConfig, ProxyConfig, addresses};
 use crate::forward::resolve;
 use crate::inbound::challenge::Challenge;
+use crate::inbound::session::RequestIds;
 use crate::inbound::transport::tls::{Files, Tls};
 use crate::log::Log;
 use crate::rules::bundle::{Fingerprint, Mode};
@@ -78,6 +79,10 @@ pub fn start(log: &Log) -> u8 {
         Ok(prepared) => prepared,
         Err(code) => return code,
     };
+    let Some(ids) = RequestIds::new() else {
+        log.line("start: no random number is available for the request numbers");
+        return EXIT_FAILED;
+    };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -98,6 +103,7 @@ pub fn start(log: &Log) -> u8 {
         mode,
         routes,
         switcher,
+        ids,
         log.clone(),
     ))
 }

@@ -121,7 +121,7 @@ fn driver_thread(
 
 #[test]
 fn the_stop_gives_the_driver_its_deadline_and_exits_zero_after_a_clean_end() {
-    let log = log::start_logger().unwrap();
+    let log = log::start_logger(log::Format::Json).unwrap();
     runtime().block_on(async {
         let f = fixture();
         let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
@@ -149,7 +149,7 @@ fn the_stop_gives_the_driver_its_deadline_and_exits_zero_after_a_clean_end() {
 
 #[test]
 fn the_stop_exits_one_unless_the_end_is_clean_and_the_cause_is_not_a_failure() {
-    let log = log::start_logger().unwrap();
+    let log = log::start_logger(log::Format::Json).unwrap();
     let cfg = proxy_config(10, 100);
     let grace = Duration::from_millis(50);
     runtime().block_on(async {
@@ -210,7 +210,7 @@ fn the_stop_exits_one_unless_the_end_is_clean_and_the_cause_is_not_a_failure() {
 
 #[test]
 fn the_stop_aborts_connections_that_outlive_it() {
-    let log = log::start_logger().unwrap();
+    let log = log::start_logger(log::Format::Json).unwrap();
     runtime().block_on(async {
         let mut f = fixture();
         f.waits.conns.spawn(std::future::pending());

@@ -108,7 +108,7 @@ fn a_certificate_with_acme_not_issued_yet_waits_and_the_challenge_is_answered_un
         );
     }
     proxy.records.conn("the record of the challenge", |l| {
-        l.contains(": answered 200 acme challenge rule - ")
+        is_answer(l, "answered", 200, "acme challenge") && no(l, "rule")
     });
 
     // The command cannot reach the CA: the certificate is `failed`, nothing of it is written, the account key is

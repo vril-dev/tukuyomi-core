@@ -1,11 +1,11 @@
 //! What a request is answered with: its reply and class, the answer table, the empty response, the response that holds
-//! the file of a challenge of the CA, and the record line.
+//! the file of a challenge of the CA, the answers that are written to the socket as bytes, and what the record of the
+//! request is made of.
 
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE};
@@ -14,9 +14,10 @@ use http_body::{Body, Frame, SizeHint};
 use tukuyomi_kernel::{Reason, Refused, Verdict};
 
 use crate::forward::origin::OriginBody;
-use crate::inbound::head::Reject;
+use crate::inbound::head::{Head, Reject};
 use crate::inbound::upload::Fate;
-use crate::inspect::driver::Outcome;
+use crate::inspect::driver::{Judge, Outcome};
+use crate::log::record::Seen;
 
 /// How a connection ended, for the record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +39,7 @@ pub(super) enum Class {
 }
 
 impl Class {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Class::Forwarded => "forwarded",
             Class::Blocked => "blocked",
@@ -266,67 +267,53 @@ impl Sizes {
         }
     }
 
-    /// The words that the record adds for the body: its length, which is the `Content-Length` if the request has
-    /// one and otherwise what was read so far, and for a body that was cut the length that was inspected. Nothing
-    /// for a request with no body.
-    pub(super) fn words(&self) -> Option<String> {
+    /// What the record adds for the body: its length, which is the `Content-Length` if the request has one and
+    /// otherwise what was read so far, and for a body that was cut the length that was inspected. Nothing for a
+    /// request with no body.
+    pub(super) fn lengths(&self) -> Option<(u64, Option<u64>)> {
         let length = self
             .declared
             .unwrap_or_else(|| self.rest.as_ref().map_or(self.held, |rest| rest.seen()));
-        if length == 0 {
-            None
-        } else if self.cut {
-            Some(format!("body {length} inspected {} cut", self.held))
-        } else {
-            Some(format!("body {length}"))
-        }
+        (length != 0).then_some((length, self.cut.then_some(self.held)))
     }
 }
 
-/// What the record shows of a request besides the time it took: its reply, the address of the client it is recorded
-/// under, the upstream it went to, if it got as far as that, and the size of its body, if it has one.
+/// What the record shows of a request besides the time it took: its number, its reply, the address of the client it
+/// is recorded under, its method, `Host` and path if its head passed the check, the upstream it went to, if it got as
+/// far as that, the size of its body, if it has one, and the generation whose rules gave a verdict, if any did. Only
+/// numbers, fixed texts, the name of a group from the configuration, addresses in their canonical forms and the
+/// request's own text as the record writes it (see `log::record`), so nothing the peer sent gets in as it is.
 pub(super) struct Noted {
+    pub(super) id: String,
     pub(super) reply: Reply,
     pub(super) client: IpAddr,
+    pub(super) seen: Option<Seen>,
     pub(super) via: Option<Via>,
     pub(super) body: Option<Sizes>,
+    pub(super) judged: Option<Judge>,
 }
 
-/// The words of a record line that tell for whom it is: the address of the client and, for a request that was sent
-/// to an upstream, the group and the server.
-pub(super) fn who(client: IpAddr, via: Option<&Via>) -> String {
-    let upstream = via.map_or_else(String::new, |via| {
-        let server = via
-            .server
-            .map_or_else(|| "-".to_string(), |s| s.to_string());
-        format!(" upstream {}/{server}", via.group)
-    });
-    format!("client {}{upstream}", client.to_canonical())
-}
+impl Noted {
+    /// The answer `reply`, with the number `id`, for a client that sent no head that passed the check.
+    pub(super) fn new(id: String, reply: Reply, client: IpAddr) -> Noted {
+        Noted {
+            id,
+            reply,
+            client,
+            seen: None,
+            via: None,
+            body: None,
+            judged: None,
+        }
+    }
 
-/// The one record line of a request: its connection's number, class, status, reason, rule id, the time it took and
-/// the address of the client, and, for a request that was sent to an upstream, the group and the server. Only
-/// numbers, fixed texts, the name of a group from the configuration and addresses in their canonical forms, so
-/// nothing the peer sent can get in: an address that a trusted peer put in a field is an IP literal before it is
-/// written, and the text of the field is not.
-pub(super) fn record(
-    id: u64,
-    reply: &Reply,
-    elapsed: Duration,
-    client: IpAddr,
-    via: Option<&Via>,
-) -> String {
-    let rule = reply
-        .rule
-        .map_or_else(|| "-".to_string(), |rule| rule.to_string());
-    format!(
-        "conn {id}: {} {} {} rule {rule} {} ms {}",
-        reply.class.name(),
-        reply.status,
-        reply.reason,
-        elapsed.as_millis(),
-        who(client, via)
-    )
+    /// The same, for a request whose head passed the check.
+    pub(super) fn of(self, head: &Head) -> Noted {
+        Noted {
+            seen: Some(Seen::of(head.method(), head.host(), head.target())),
+            ..self
+        }
+    }
 }
 
 /// How a request that goes on to the upstream was let through, for the record.
@@ -392,16 +379,21 @@ pub(super) fn decide(outcome: Outcome) -> Decision {
 }
 
 /// The whole answer of a listener that redirects to https to a request it does not redirect, as it is written to the
-/// socket (like the answers of `head::Reject`).
-pub(super) const NOT_REDIRECTED: &[u8] =
-    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// socket (like the answers of `head::Reject`), with the number `id` of the request.
+pub(super) fn not_redirected(id: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 404 Not Found\r\nX-Request-ID: {id}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
 
 /// The whole answer of a listener that redirects to https, as it is written to the socket: 308 to the name and the
 /// target of the request at `https_port`, which is left out of the address if it is 443. `name` is a name that the
 /// request's `Host` held, in lowercase; `target` is the origin-form target that the head check passed, so it starts
-/// with `/`, which keeps the address on the host of the name, and holds no byte that ends a line.
-pub(super) fn redirect(name: &str, https_port: u16, target: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(160 + name.len() + target.len());
+/// with `/`, which keeps the address on the host of the name, and holds no byte that ends a line. `id` is the number
+/// of the request.
+pub(super) fn redirect(name: &str, https_port: u16, target: &[u8], id: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(190 + name.len() + target.len());
     out.extend_from_slice(b"HTTP/1.1 308 Permanent Redirect\r\nLocation: https://");
     out.extend_from_slice(name.as_bytes());
     if https_port != 443 {
@@ -409,6 +401,8 @@ pub(super) fn redirect(name: &str, https_port: u16, target: &[u8]) -> Vec<u8> {
         out.extend_from_slice(https_port.to_string().as_bytes());
     }
     out.extend_from_slice(target);
+    out.extend_from_slice(b"\r\nX-Request-ID: ");
+    out.extend_from_slice(id.as_bytes());
     out.extend_from_slice(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     out
 }

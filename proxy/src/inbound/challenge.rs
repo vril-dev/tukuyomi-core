@@ -95,10 +95,10 @@ impl Challenge {
 }
 
 /// The whole `200` answer of a listener that writes its answers to the socket itself, as the one that redirects does:
-/// without the body for a `HEAD`.
-pub(super) fn found(body: &[u8], head_only: bool) -> Vec<u8> {
+/// without the body for a `HEAD`, and with the number `id` of the request.
+pub(super) fn found(body: &[u8], head_only: bool, id: &str) -> Vec<u8> {
     let mut out = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nX-Request-ID: {id}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();

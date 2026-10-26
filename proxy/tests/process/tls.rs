@@ -298,7 +298,7 @@ fn a_request_over_tls_is_inspected_and_forwarded_and_sigusr2_replaces_the_certif
     assert_ne!(shown, first);
 
     proxy.records.conn("the forwarded record", |l| {
-        l.contains(": forwarded 200 forwarded rule - ")
+        is_answer(l, "forwarded", 200, "forwarded") && no(l, "rule")
     });
     proxy.finish(1);
 }
@@ -315,7 +315,7 @@ fn a_host_the_certificate_does_not_cover_gets_421_and_nothing_reaches_the_upstre
         assert_eq!(answer.values("content-length"), ["0"]);
     }
     proxy.records.conns("the 421 records", 3, |l| {
-        l.contains(": rejected 421 host not covered by the certificate rule - ")
+        is_answer(l, "rejected", 421, "host not covered by the certificate") && no(l, "rule")
     });
     assert_eq!(proxy.upstream.connections(), 0);
     proxy.finish(0);
@@ -342,7 +342,7 @@ fn a_redirect_listener_sends_a_served_host_to_https_and_answers_any_other_with_4
         assert_empty_answer(&reply, 404);
     }
     proxy.records.conns("the redirect records", 1, |l| {
-        l.contains(": redirected 308 redirected rule - ")
+        is_answer(l, "redirected", 308, "redirected") && no(l, "rule")
     });
     assert_eq!(proxy.upstream.connections(), 0);
     proxy.finish(0);
@@ -411,8 +411,10 @@ fn a_websocket_echoes_over_tls_in_pieces_of_several_records_and_ends_with_the_cl
         .expect("the proxy ended the connection with the closing alert");
     assert!(rest.is_empty());
     proxy.records.conn("the record of the tunnel", |l| {
-        l.contains(": tunnel closed ")
-            && l.ends_with(&format!(" to-upstream {total} from-upstream {total}"))
+        l["type"] == "tunnel"
+            && l["end"] == "closed"
+            && l["to_upstream"] == total
+            && l["from_upstream"] == total
     });
     proxy.finish(1);
 }

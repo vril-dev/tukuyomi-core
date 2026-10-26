@@ -8,7 +8,7 @@ use tokio::sync::oneshot::error::TryRecvError as SlotError;
 use tukuyomi_kernel::{Config, Reason};
 
 use crate::inspect::slot::{Pending, deliver, restart_line, submit};
-use crate::log::start_logger;
+use crate::log::{Format, start_logger};
 use crate::rules::routes::Route;
 
 const MS: Duration = Duration::from_millis(1);
@@ -17,6 +17,19 @@ const HOUR: Duration = Duration::from_secs(3600);
 /// Permits of the inspection pool and bytes of the byte budget in these tests.
 const INSPECT: usize = 16;
 const BUDGET: usize = 10_000;
+
+/// The generation and the mode that a verdict of `mode` is told to come from.
+fn judge(mode: bundle::Mode) -> Judge {
+    Judge {
+        generation: Fingerprint::from_hex(&[b'7'; 64]).unwrap(),
+        mode,
+    }
+}
+
+/// The outcome of the answer on `slot`.
+fn outcome(slot: &mut oneshot::Receiver<Answer>) -> Outcome {
+    answer(slot).outcome
+}
 
 /// Waits for the answer in a reply slot; fails when the sender goes without one or nothing comes in time.
 fn answer<T>(slot: &mut oneshot::Receiver<T>) -> T {
@@ -54,7 +67,7 @@ struct World {
 /// A ticket, and what its connection keeps: the reply slot and its share of the body.
 struct Made {
     ticket: Ticket,
-    answer: oneshot::Receiver<Outcome>,
+    answer: oneshot::Receiver<Answer>,
     body: Arc<BodyHold>,
 }
 
@@ -273,7 +286,7 @@ impl Rig {
             SharedRoutes::new(Routes::default()),
             rx,
             Signals::Told { _failed: None },
-            start_logger().unwrap(),
+            start_logger(Format::Json).unwrap(),
             limits(20 * MS),
             30 * MS,
             wait_queue + 1,
@@ -479,8 +492,8 @@ fn a_result_goes_to_the_ticket_it_belongs_to() {
         .polls
         .push_back(vec![(2, blocked), (5, Verdict::Allow)]);
     r.core.round().unwrap();
-    assert_eq!(answer(&mut a.answer), Outcome::Verdict(Verdict::Allow));
-    assert_eq!(answer(&mut b.answer), Outcome::Verdict(blocked));
+    assert_eq!(outcome(&mut a.answer), Outcome::Verdict(Verdict::Allow));
+    assert_eq!(outcome(&mut b.answer), Outcome::Verdict(blocked));
     assert!(r.core.active.pending.is_empty());
 }
 
@@ -505,8 +518,8 @@ fn a_detection_from_a_generation_that_blocks_is_not_inspectable_and_one_that_det
         .push_back(vec![(0, DETECTED), (1, Verdict::Allow)]);
     r.core.active.step(Instant::now()).unwrap();
     let not_inspectable = Verdict::Uninspectable(Reason::Protocol);
-    assert_eq!(answer(&mut a.answer), Outcome::Verdict(not_inspectable));
-    assert_eq!(answer(&mut b.answer), Outcome::Verdict(Verdict::Allow));
+    assert_eq!(outcome(&mut a.answer), Outcome::Verdict(not_inspectable));
+    assert_eq!(outcome(&mut b.answer), Outcome::Verdict(Verdict::Allow));
     let line = r.core.active.note_turned().expect("the line is made");
     assert!(line.contains(&generation(1).hex()), "{line}");
     assert_eq!(r.core.active.note_turned(), None);
@@ -519,7 +532,7 @@ fn a_detection_from_a_generation_that_blocks_is_not_inspectable_and_one_that_det
     r.core.intake(None).unwrap();
     r.core.active.kernel.polls.push_back(vec![(0, DETECTED)]);
     r.core.active.step(Instant::now()).unwrap();
-    assert_eq!(answer(&mut a.answer), Outcome::Verdict(DETECTED));
+    assert_eq!(outcome(&mut a.answer), Outcome::Verdict(DETECTED));
     assert_eq!(r.core.active.note_turned(), None);
 
     // What `shutdown` decides is checked the same way.
@@ -532,7 +545,7 @@ fn a_detection_from_a_generation_that_blocks_is_not_inspectable_and_one_that_det
         inspect_by: Instant::now(),
     });
     r.core.round().unwrap().expect("the deadline is reached");
-    assert_eq!(answer(&mut a.answer), Outcome::Verdict(not_inspectable));
+    assert_eq!(outcome(&mut a.answer), Outcome::Verdict(not_inspectable));
 }
 
 #[test]
@@ -553,17 +566,31 @@ fn a_result_for_an_unknown_request_is_fatal() {
         deliver(
             &mut pending,
             &[(1, Verdict::Allow), (2, Verdict::Allow)],
-            bundle::Mode::Block
+            judge(bundle::Mode::Block)
         ),
         unknown
     );
-    assert_eq!(answer(&mut made.answer), Outcome::Verdict(Verdict::Allow));
+    // the verdict comes with the generation and the mode of the rules that gave it
+    assert_eq!(
+        answer(&mut made.answer),
+        Answer {
+            outcome: Outcome::Verdict(Verdict::Allow),
+            by: Some(judge(bundle::Mode::Block)),
+        }
+    );
     // a result comes out once: the same id again is unknown
     assert_eq!(
-        deliver(&mut pending, &[(1, Verdict::Allow)], bundle::Mode::Block),
+        deliver(
+            &mut pending,
+            &[(1, Verdict::Allow)],
+            judge(bundle::Mode::Block)
+        ),
         unknown
     );
-    assert_eq!(deliver(&mut pending, &[], bundle::Mode::Block), Ok(false));
+    assert_eq!(
+        deliver(&mut pending, &[], judge(bundle::Mode::Block)),
+        Ok(false)
+    );
 }
 
 #[test]
@@ -730,8 +757,8 @@ fn after_a_stop_tickets_are_still_submitted_and_shutdown_waits_for_the_ingress_t
     }
     assert!(r.core.active.pending.is_empty());
     assert_eq!(r.core.active.kernel.shutdowns(), vec![]);
-    assert_eq!(answer(&mut a.answer), Outcome::Verdict(Verdict::Allow));
-    assert_eq!(answer(&mut b.answer), Outcome::Verdict(Verdict::Allow));
+    assert_eq!(outcome(&mut a.answer), Outcome::Verdict(Verdict::Allow));
+    assert_eq!(outcome(&mut b.answer), Outcome::Verdict(Verdict::Allow));
 
     // the last sender goes: shutdown is called once, with the earliest deadline
     r.close();
@@ -754,7 +781,7 @@ fn at_the_stop_deadline_shutdown_is_called_and_a_late_ticket_is_unavailable() {
     r.send(Msg::Stop { inspect_by: by });
     let done = r.core.round().unwrap().expect("the deadline is reached");
     // the result of shutdown is delivered like any other, and the main thread still sees it counted
-    assert_eq!(answer(&mut a.answer), Outcome::Verdict(unavailable));
+    assert_eq!(outcome(&mut a.answer), Outcome::Verdict(unavailable));
     assert_eq!(done.results, vec![(0, unavailable)]);
     assert_eq!(r.world.free().0, INSPECT);
 
@@ -763,7 +790,8 @@ fn at_the_stop_deadline_shutdown_is_called_and_a_late_ticket_is_unavailable() {
     r.send(Msg::Ticket(late.ticket));
     r.close();
     r.core.quiesce().unwrap();
-    assert_eq!(answer(&mut late.answer), Outcome::Unavailable);
+    // No kernel judged it.
+    assert_eq!(answer(&mut late.answer), Answer::from(Outcome::Unavailable));
     assert_eq!(r.core.active.kernel.seen.len(), 1);
     assert_eq!(r.core.active.kernel.shutdowns(), vec![by]);
     assert!(matches!(
@@ -831,7 +859,7 @@ fn a_kernel_that_cannot_start_says_so_once_through_ready_and_still_answers() {
         bundle::Mode::Block,
         SharedRoutes::new(Routes::default()),
         limits,
-        start_logger().unwrap(),
+        start_logger(Format::Json).unwrap(),
     )
     .unwrap();
     let told = answer(&mut d.ready);
@@ -843,7 +871,7 @@ fn a_kernel_that_cannot_start_says_so_once_through_ready_and_still_answers() {
     let mut made = world.ticket(b"/", 0);
     assert!(d.ingress.try_send(Msg::Ticket(made.ticket)).is_ok());
     assert_eq!(
-        answer(&mut made.answer),
+        outcome(&mut made.answer),
         Outcome::Verdict(Verdict::Uninspectable(Reason::Unavailable))
     );
     eventually("the ticket gave its permits back", || {
@@ -955,10 +983,19 @@ fn a_ready_generation_gets_the_new_tickets_and_the_old_one_finishes_and_is_stopp
     r.send(Msg::Ticket(c.ticket));
     r.core.round().unwrap();
     assert_eq!(uris(&r.core.active.kernel), [b"/c".to_vec()]);
-    // Every result went to the request of its own kernel, although two requests have the id 0.
-    assert_eq!(answer(&mut a.answer), Outcome::Verdict(Verdict::Allow));
-    assert_eq!(answer(&mut b.answer), Outcome::Verdict(Verdict::Allow));
-    assert_eq!(answer(&mut c.answer), Outcome::Verdict(blocked));
+    // Every result went to the request of its own kernel, although two requests have the id 0, and names the
+    // generation of that kernel.
+    let judged = |slot: &mut oneshot::Receiver<Answer>| {
+        let Answer { outcome, by } = answer(slot);
+        (outcome, by.map(|judge| judge.generation))
+    };
+    let allowed = Outcome::Verdict(Verdict::Allow);
+    assert_eq!(judged(&mut a.answer), (allowed, Some(generation(1))));
+    assert_eq!(judged(&mut b.answer), (allowed, Some(generation(1))));
+    assert_eq!(
+        judged(&mut c.answer),
+        (Outcome::Verdict(blocked), Some(generation(2)))
+    );
 
     // The old kernel holds nothing now: it is stopped, and the main thread is told when it is gone.
     assert_eq!(settle(&mut r, &mut told), Switched::Yes);
@@ -983,7 +1020,7 @@ fn an_old_kernel_that_is_out_of_time_is_stopped_at_once_with_its_requests_decide
     let unavailable = Verdict::Uninspectable(Reason::Unavailable);
     r.other().at_shutdown = vec![(0, unavailable)];
     assert_eq!(settle(&mut r, &mut told), Switched::Yes);
-    assert_eq!(answer(&mut a.answer), Outcome::Verdict(unavailable));
+    assert_eq!(outcome(&mut a.answer), Outcome::Verdict(unavailable));
     let deadlines = old_shut.lock().unwrap().clone();
     assert!(deadlines.len() == 1 && deadlines[0] <= Instant::now());
 }
@@ -1036,7 +1073,7 @@ fn a_generation_that_fails_or_is_late_is_stopped_and_the_old_one_serves_on() {
         .polls
         .push_back(vec![(0, Verdict::Allow)]);
     r.core.round().unwrap();
-    assert_eq!(answer(&mut a.answer), Outcome::Verdict(Verdict::Allow));
+    assert_eq!(outcome(&mut a.answer), Outcome::Verdict(Verdict::Allow));
 }
 
 #[test]
@@ -1090,7 +1127,7 @@ fn a_stop_during_a_switch_stops_the_new_kernel_at_once_and_lets_the_old_one_fini
     };
     assert_eq!(done.phase, Phase::Stopped);
     assert_eq!(*old_shut.lock().unwrap(), [by]);
-    assert_eq!(answer(&mut a.answer), Outcome::Verdict(unavailable));
+    assert_eq!(outcome(&mut a.answer), Outcome::Verdict(unavailable));
     assert_eq!(told.try_recv(), Ok(Switched::Yes));
     assert!(r.core.retired_clean);
 }

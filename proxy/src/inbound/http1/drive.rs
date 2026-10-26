@@ -51,7 +51,7 @@ use crate::inbound::answer::{Abort, Noted, Out, Reply, answer, close_after};
 use crate::inbound::conn::{Conn, Ctx, Handled, Scheme, after};
 use crate::inbound::head::Reject;
 use crate::inbound::session::{
-    End, Progress, Session, Summary, Tracked, close_write, first_head_by, linger, lock,
+    End, Progress, Proto, Session, Summary, Tracked, close_write, first_head_by, linger, lock,
     send_and_close,
 };
 
@@ -73,7 +73,7 @@ pub(super) struct Serving {
     served: AtomicU64,
     /// A response that ends the connection was given.
     closing: AtomicBool,
-    /// The tunnel that the 101 response started. It runs once hyper is done with the connection. It has the line for
+    /// The tunnel that the 101 response started. It runs once hyper is done with the connection. It has the record for
     /// its end from the start, so it is written also if the tunnel is dropped here.
     tunnel: Mutex<Option<Tunnel>>,
 }
@@ -81,19 +81,21 @@ pub(super) struct Serving {
 /// The gate has nothing to do while the body of a response is sent.
 impl Progress for Finish {}
 
-/// Reads the first head, serves the requests, closes. `accept` is the instant of the accept.
+/// Reads the first head, serves the requests, closes. `listener` is the place of the listener that took the
+/// connection, and `accept` the instant of the accept.
 pub(in crate::inbound) async fn run<T>(
     stream: T,
     peer: SocketAddr,
     local: SocketAddr,
     ctx: &Arc<Ctx>,
+    listener: usize,
     accept: Instant,
     scheme: Scheme,
 ) -> Summary
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let (serving, mut gate) = Serving::start(stream, peer, local, ctx, accept, scheme);
+    let (serving, mut gate) = Serving::start(stream, peer, local, ctx, listener, accept, scheme);
     if let Err(reject) = gate.first_head(first_head_by(&ctx.cfg, accept)).await {
         return serving.refuse(&mut gate, reject).await;
     }
@@ -112,13 +114,14 @@ impl Serving {
         peer: SocketAddr,
         local: SocketAddr,
         ctx: &Arc<Ctx>,
+        listener: usize,
         accept: Instant,
         scheme: Scheme,
     ) -> (Arc<Serving>, Gate<T>) {
         let link = Link::new(accept);
         let (gate, gauge) = Gate::new(stream, Settings::new(&ctx.cfg), link.clone(), accept);
         let serving = Arc::new(Serving {
-            session: Session::new(ctx, peer, local, accept, scheme, gauge),
+            session: Session::new(ctx, peer, local, listener, Proto::H1, accept, scheme, gauge),
             link,
             served: AtomicU64::new(0),
             closing: AtomicBool::new(false),
@@ -225,12 +228,11 @@ impl Serving {
         let (parts, body) = req.into_parts();
         let Some(Taken { head, start }) = self.link.take_for(&parts) else {
             // Hyper made a request of bytes that the head check did not pass as that request.
-            let noted = Noted {
-                reply: Reply::rejected(400, "the two parsers disagree"),
-                client: self.session.peer.ip(),
-                via: None,
-                body: None,
-            };
+            let noted = Noted::new(
+                self.session.ctx.ids.mint(),
+                Reply::rejected(400, "the two parsers disagree"),
+                self.session.peer.ip(),
+            );
             return Ok(self.respond(noted, answer(400), Then::Close, false, Instant::now()));
         };
         let conn = self.session.conn(head, start);
@@ -256,7 +258,8 @@ impl Serving {
                 Ok(self.respond(noted, response, then, old, start))
             }
             Err(abort) => {
-                self.session.note(&noted, start);
+                let mut noted = noted;
+                self.session.note(&mut noted, start, 0);
                 Err(abort)
             }
         }
@@ -286,7 +289,7 @@ impl Serving {
 
     /// The response as it goes to hyper: marked as the last one if the connection ends with it, an HTTP/1.0
     /// response to an HTTP/1.0 request (hyper then does not add `keep-alive` to the `Connection` field of a
-    /// request that asked for it), and followed by the line in the record and the note to the gate once it is
+    /// request that asked for it), and followed by the record of the request and the note to the gate once it is
     /// complete.
     fn respond(
         self: &Arc<Self>,
@@ -315,21 +318,24 @@ impl Serving {
     {
         let session = &self.session;
         let cfg = &session.ctx.cfg;
-        let reply = if let Some(answer) = reject.response() {
-            let by = after(Instant::now(), cfg.response_idle).min(session.conn_by());
-            let sock = gate.stream();
-            let _ = timeout_at(by, send_and_close(sock, answer)).await;
-            if reject != Reject::Timeout {
-                linger(sock, cfg, session.conn_by()).await;
-            }
-            Reply::of(reject)
-        } else {
-            Reply {
+        let id = session.ctx.ids.mint();
+        let Some(answer) = reject.response(&id) else {
+            let reply = Reply {
                 reason: reject.reason(),
                 ..Reply::NONE
-            }
+            };
+            return Summary::of(session.id, reply);
         };
-        Summary::of(session.id, reply)
+        let by = after(Instant::now(), cfg.response_idle).min(session.conn_by());
+        let sock = gate.stream();
+        let _ = timeout_at(by, send_and_close(sock, &answer)).await;
+        // The record of the answer comes before the wait for the client to stop sending.
+        let mut noted = Noted::new(id, Reply::of(reject), session.peer.ip());
+        session.note(&mut noted, session.accept, 0);
+        if reject != Reject::Timeout {
+            linger(sock, cfg, session.conn_by()).await;
+        }
+        session.summary(None)
     }
 
     /// Ends the writing direction, and lingers if a response closed the connection or a head was refused.
@@ -352,7 +358,7 @@ impl Serving {
     }
 
     /// The tunnel of a 101 that was given and whose connection ended well; any other is given up, which closes the
-    /// connection to the upstream and writes the line for its end.
+    /// connection to the upstream and writes the record for its end.
     fn take_tunnel(&self, end: End) -> Option<Tunnel> {
         let tunnel = lock(&self.tunnel).take()?;
         if end == End::Done {
@@ -376,8 +382,9 @@ impl Serving {
         let _ = timeout_at(by, close_write(sock)).await;
     }
 
-    /// The reply of the last request, and the line the end of the connection adds: for a head that was refused
-    /// after the first, and for a connection that had no response to show for itself.
+    /// The reply of the last request, and the reply that the record of the type `connection` shows at the end of the
+    /// connection: for a head that was refused after the first, and for a connection that had no response to show for
+    /// itself.
     fn summary<T>(&self, gate: &Gate<T>, end: End) -> Summary {
         let line = if let Some(reject) = gate.failure() {
             Some(Reply {

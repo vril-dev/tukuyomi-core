@@ -18,8 +18,15 @@ fn a_request_without_a_copy_of_its_head_is_not_served_and_closes_the_connection(
             .unwrap();
         let (server, peer) = listener.accept().await.unwrap();
         let local = server.local_addr().unwrap();
-        let (serving, mut gate) =
-            Serving::start(server, peer, local, &rig.ctx, Instant::now(), Scheme::Http);
+        let (serving, mut gate) = Serving::start(
+            server,
+            peer,
+            local,
+            &rig.ctx,
+            0,
+            Instant::now(),
+            Scheme::Http,
+        );
         put(&client, &get("/a")).await;
         gate.first_head(Instant::now() + 10 * SEC).await.unwrap();
         // The copy the gate made is lost, as it would be if hyper and the gate disagreed about the bytes.

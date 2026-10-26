@@ -16,7 +16,7 @@ use crate::config::{ForwardConfig, ProxyConfig, addresses};
 use crate::forward::group::Upstreams;
 use crate::inbound::challenge::Challenge;
 use crate::inbound::conn::Ctx;
-use crate::inbound::session;
+use crate::inbound::session::{self, RequestIds};
 use crate::inbound::transport::accept::{Acceptor, Arrival};
 use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::{self, Driver, Ingress, Limits, Msg};
@@ -40,6 +40,7 @@ pub(super) async fn run(
     mode: Mode,
     routes: Routes,
     mut switcher: Switcher,
+    ids: RequestIds,
     log: Log,
 ) -> u8 {
     let signals = match Signals::install() {
@@ -91,6 +92,7 @@ pub(super) async fn run(
         ingress: Arc::new(Ingress::new(ingress.clone())),
         tls,
         challenge,
+        ids,
     });
     let cause = until_stop(&mut waits, &ctx, &ingress, &mut switcher).await;
     stop(

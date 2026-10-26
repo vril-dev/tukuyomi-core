@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use tukuyomi_kernel::{Reason, Refused, ReqId, Request, Shutdown, Status, Verdict};
 
-use crate::inspect::driver::{InspectReq, Kernel, Outcome, Ticket};
+use crate::inspect::driver::{Answer, InspectReq, Judge, Kernel, Outcome, Ticket};
 use crate::rules::bundle::{Fingerprint, Mode};
 
 /// A submitted ticket that waits for its result.
@@ -63,7 +63,7 @@ fn turned_line(generation: Fingerprint) -> String {
 pub(super) fn deliver(
     pending: &mut BTreeMap<ReqId, Pending>,
     results: &[(ReqId, Verdict)],
-    mode: Mode,
+    judge: Judge,
 ) -> Result<bool, &'static str> {
     let mut turned = false;
     for &(id, verdict) in results {
@@ -71,7 +71,7 @@ pub(super) fn deliver(
             return Err("result for an unknown request");
         };
         let verdict = match verdict {
-            Verdict::Detected { .. } if mode == Mode::Block => {
+            Verdict::Detected { .. } if judge.mode == Mode::Block => {
                 turned = true;
                 Verdict::Uninspectable(Reason::Protocol)
             }
@@ -85,7 +85,10 @@ pub(super) fn deliver(
         } = ticket;
         if !cancelled {
             // Err only says that the connection is gone already.
-            let _ = reply.send(Outcome::Verdict(verdict));
+            let _ = reply.send(Answer {
+                outcome: Outcome::Verdict(verdict),
+                by: Some(judge),
+            });
         }
     }
     Ok(turned)
@@ -161,7 +164,7 @@ impl<K: Kernel> Slot<K> {
                 }
             },
             Err(refused) => {
-                let _ = ticket.reply.send(Outcome::Refused(refused));
+                let _ = ticket.reply.send(Outcome::Refused(refused).into());
                 Ok(())
             }
         }
@@ -181,8 +184,17 @@ impl<K: Kernel> Slot<K> {
     /// Steps the kernel until a result is ready or `until`, and delivers the results.
     pub(super) fn step(&mut self, until: Instant) -> Result<(), &'static str> {
         let results = self.kernel.poll(until);
-        self.turned |= deliver(&mut self.pending, &results, self.mode)?;
+        let judge = self.judge();
+        self.turned |= deliver(&mut self.pending, &results, judge)?;
         Ok(())
+    }
+
+    /// The generation of the slot and the mode of its rules, as a verdict of its kernel names them.
+    fn judge(&self) -> Judge {
+        Judge {
+            generation: self.generation,
+            mode: self.mode,
+        }
     }
 
     pub(super) fn status(&self) -> Status {
@@ -213,7 +225,8 @@ impl<K: Kernel> Slot<K> {
     /// left in the table breaks the promise that every result comes out once.
     pub(super) fn shutdown(&mut self, deadline: Instant) -> Result<Shutdown, &'static str> {
         let done = self.kernel.shutdown(deadline);
-        deliver(&mut self.pending, &done.results, self.mode)?;
+        let judge = self.judge();
+        deliver(&mut self.pending, &done.results, judge)?;
         if !self.pending.is_empty() {
             return Err("request left after shutdown");
         }
@@ -305,7 +318,11 @@ impl Retirement {
                 clean: false,
             });
         };
-        deliver(&mut self.pending, &done.results, self.mode)?;
+        let judge = Judge {
+            generation: self.generation,
+            mode: self.mode,
+        };
+        deliver(&mut self.pending, &done.results, judge)?;
         if !self.pending.is_empty() {
             return Err("request left after shutdown");
         }

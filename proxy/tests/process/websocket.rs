@@ -60,7 +60,7 @@ fn a_websocket_goes_through_and_a_handshake_that_a_rule_blocks_does_not() {
     assert_empty_answer(&blocked, 403);
     proxy
         .records
-        .conn("the blocked record", |l| l.contains(&blocked_by(9201)));
+        .conn("the blocked record", |l| blocked_by(l, 9201));
     assert_eq!(proxy.upstream.connections(), 0);
 
     // Another handshake gets its 101, and then whatever either side sends reaches the other.
@@ -91,7 +91,7 @@ fn a_websocket_goes_through_and_a_handshake_that_a_rule_blocks_does_not() {
     });
     assert_eq!(held, b"hello, upstream");
     proxy.records.conn("the record of the 101", |l| {
-        l.contains(": forwarded 101 forwarded rule - ")
+        is_answer(l, "forwarded", 101, "forwarded") && no(l, "rule")
     });
 
     // The client ends its side; the upstream ends its own, and the proxy writes a line for the tunnel.
@@ -99,9 +99,13 @@ fn a_websocket_goes_through_and_a_handshake_that_a_rule_blocks_does_not() {
         .expect("end the writing side");
     assert!(read_to_close(&mut sock).is_empty());
     proxy.records.conn("the record of the tunnel", |l| {
-        l.contains(": tunnel closed ")
-            && l.contains(" client 127.0.0.1 upstream main/")
-            && l.ends_with(" to-upstream 15 from-upstream 15")
+        l["type"] == "tunnel"
+            && l["end"] == "closed"
+            && l["client"] == "127.0.0.1"
+            && l["upstream"] == "main"
+            && l.get("server").is_some()
+            && l["to_upstream"] == 15
+            && l["from_upstream"] == 15
     });
 
     let requests = proxy.upstream.requests();
@@ -148,15 +152,19 @@ fn a_tunnel_is_not_ended_by_the_stop_and_is_cut_when_the_time_to_finish_ends() {
     assert!(read_to_close(&mut sock).is_empty());
     let (status, took) = proxy.wait_exit(since, 60 * SEC);
     let lines = proxy.records.lines();
+    let records = proxy.records.all();
     assert_eq!(status.code(), Some(0), "records: {lines:#?}");
     assert!(
         took >= Duration::from_millis(3_900),
         "the proxy stopped after {took:?}"
     );
     assert!(
-        lines.iter().any(
-            |l| l.contains(": tunnel stop ") && l.ends_with(" to-upstream 16 from-upstream 16")
-        ),
+        records.iter().any(|r| {
+            r["type"] == "tunnel"
+                && r["end"] == "stop"
+                && r["to_upstream"] == 16
+                && r["from_upstream"] == 16
+        }),
         "records: {lines:#?}"
     );
     assert!(

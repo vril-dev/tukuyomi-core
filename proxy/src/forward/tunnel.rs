@@ -3,7 +3,7 @@
 //!
 //! `origin` sends the handshake of a WebSocket and, when the upstream answers it with 101, hands over what it holds
 //! of the upstream connection (`Switch`). `conn` adds the share of the byte budget, the route's times and the words
-//! of the record line (`Tunnel`), and the session runs it once the 101 has been written to the client. The client
+//! of the record (`Tunnel`), and the session runs it once the 101 has been written to the client. The client
 //! side of the copy is the stream of the client itself with the bytes that the gate had already read behind the
 //! handshake in front, so they reach the upstream first and in order; the upstream side is the connection that hyper
 //! gives back after the upgrade. The frames are not looked at: the handshake was inspected like any request, and what
@@ -25,15 +25,19 @@
 //! - the proxy is stopped: the stop does not end a tunnel, the end of the time that the connections get to finish
 //!   aborts it like any other (`stop`).
 //!
-//! The end is one line in the record, written when the tunnel is dropped, whatever became of it: it has the record
-//! from the moment it is made, so a tunnel that is dropped before it ran (the 101 could not be given: `error`) or
-//! aborted has its line like one that ran. The line has the connection, the reason as one of those words, the seconds
-//! it lasted, who it was for and the bytes read from each side after the handshake. Only numbers, fixed words and
-//! the words that `answer::who` makes.
+//! The end is one record of the type `tunnel`, written when the tunnel is dropped, whatever became of it: it has the
+//! record from the moment it is made, so a tunnel that is dropped before it ran (the 101 could not be given:
+//! `error`) or aborted has its record like one that ran. The record has the number of the request that opened the
+//! tunnel, the connection, who it was for (the client, the upstream group and the server), the reason as one of those
+//! words, the milliseconds it lasted and the bytes read from each side after the handshake. Only numbers, fixed words,
+//! addresses and the name of a group from the configuration.
 
 use std::future::{Future, poll_fn};
 use std::io;
+use std::mem;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::{Pin, pin};
+use std::sync::Arc;
 use std::task::{Poll, ready};
 use std::time::Duration;
 
@@ -48,6 +52,7 @@ use crate::config::{ProxyConfig, Stream};
 use crate::forward::pool::Lease;
 use crate::inbound::transport::io::{Gauge, Guarded};
 use crate::log::Log;
+use crate::log::record::{self, millis};
 
 /// The buffer of each of the two directions.
 const BUFFER: usize = 8 * 1024;
@@ -67,13 +72,17 @@ impl Switch {
     }
 }
 
-/// What the line for the end of a tunnel says besides how it ended.
+/// What the record for the end of a tunnel says besides how it ended.
 pub struct Record {
     pub log: Log,
+    /// The number of the request that opened the tunnel.
+    pub id: String,
     /// The number of the connection.
-    pub id: u64,
-    /// For whom the line is (see `answer::who`).
-    pub who: String,
+    pub conn: u64,
+    /// For whom the record is: the client, and the group and the server the request was sent to.
+    pub client: IpAddr,
+    pub upstream: Option<Arc<str>>,
+    pub server: Option<SocketAddr>,
 }
 
 /// A tunnel that has not been run yet.
@@ -82,7 +91,7 @@ pub struct Tunnel {
     stream: Stream,
     /// The end of the tunnel, from the 101.
     until: Instant,
-    /// Writes the line for the end of the tunnel when the tunnel is dropped.
+    /// Writes the record for the end of the tunnel when the tunnel is dropped.
     report: Report,
     _hold: OwnedSemaphorePermit,
 }
@@ -109,7 +118,7 @@ impl Reason {
     }
 }
 
-/// Writes the line for the end of a tunnel when it is dropped. The reason is `stop` until something sets another.
+/// Writes the record for the end of a tunnel when it is dropped. The reason is `stop` until something sets another.
 struct Report {
     record: Record,
     began: Instant,
@@ -127,18 +136,23 @@ impl Drop for Report {
         let read = self.client.as_ref().map_or(0, Gauge::read);
         let sent = read.saturating_add(self.kept);
         let got = self.upstream.read().saturating_sub(self.base);
-        self.record.log.line(&format!(
-            "conn {}: tunnel {} {} s {} to-upstream {sent} from-upstream {got}",
-            self.record.id,
-            self.reason.word(),
-            self.began.elapsed().as_secs(),
-            self.record.who,
-        ));
+        let record = &mut self.record;
+        record.log.record(record::Record::Tunnel(record::Tunnel {
+            id: mem::take(&mut record.id),
+            conn: record.conn,
+            client: record.client,
+            upstream: record.upstream.take(),
+            server: record.server,
+            end: self.reason.word(),
+            ms: millis(self.began.elapsed()),
+            to_upstream: sent,
+            from_upstream: got,
+        }));
     }
 }
 
 impl Tunnel {
-    /// `hold` is the share of the byte budget of `HOLD` bytes, and `record` the words of the line for the end. The
+    /// `hold` is the share of the byte budget of `HOLD` bytes, and `record` what the record for the end says. The
     /// time of the tunnel runs from now.
     pub fn new(
         switch: Switch,
@@ -165,7 +179,7 @@ impl Tunnel {
         }
     }
 
-    /// The tunnel is given up before it ran: the 101 did not get to the client. Its line says `error`.
+    /// The tunnel is given up before it ran: the 101 did not get to the client. Its record says `error`.
     pub fn failed(mut self) {
         self.report.reason = Reason::Error;
     }

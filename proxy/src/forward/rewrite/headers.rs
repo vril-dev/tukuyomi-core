@@ -27,10 +27,11 @@ enum Side {
 
 impl Side {
     /// Whether a route may not edit the field. For the request: the fields that belong to the connection or to a
-    /// single hop, the fields by which a peer says who the client is, `Host` and `X-Forwarded-Host`, the fields that
-    /// tell how the body is coded or how long it is (the body that was inspected is the body that is sent), and any
-    /// name with an underscore (such a field is never inspected nor sent). For the response: the fields of the
-    /// connection or of a single hop, `Set-Cookie`, and the fields that tell how the body is coded or how long it is.
+    /// single hop, the fields by which a peer says who the client is, `Host`, `X-Forwarded-Host` and `X-Request-ID`
+    /// (the proxy makes it), the fields that tell how the body is coded or how long it is (the body that was inspected
+    /// is the body that is sent), and any name with an underscore (such a field is never inspected nor sent). For
+    /// the response: the fields of the connection or of a single hop, `Set-Cookie`, `X-Request-ID` (the proxy makes
+    /// it), and the fields that tell how the body is coded or how long it is.
     fn refuses(self, name: &HeaderName) -> bool {
         let name = name.as_str();
         match self {
@@ -42,6 +43,7 @@ impl Side {
                         name,
                         "host"
                             | "x-forwarded-host"
+                            | "x-request-id"
                             | "content-length"
                             | "content-type"
                             | "content-encoding"
@@ -52,6 +54,7 @@ impl Side {
                     || matches!(
                         name,
                         "set-cookie"
+                            | "x-request-id"
                             | "content-length"
                             | "content-encoding"
                             | "content-range"

@@ -16,9 +16,14 @@ fn killing_the_inspector_during_an_inspection_gives_503_and_no_upstream_connecti
     run_kill("KILL", victim);
     let answer = collect(&mut sock, Instant::now());
     assert_empty_answer(&answer, 503);
-    proxy
-        .records
-        .conn("the 503 record", |l| l.contains(": failed 503 inspector "));
+    proxy.records.conn("the 503 record", |l| {
+        l["type"] == "request"
+            && l["class"] == "failed"
+            && l["status"] == 503
+            && l["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("inspector "))
+    });
     assert_eq!(proxy.upstream.connections(), 0);
 
     // The kernel started a new inspector, and a normal request passes through it.

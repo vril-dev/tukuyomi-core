@@ -27,7 +27,8 @@
 //!    `application/<name>+json` (the name is described at `inspectable_essence`); for a chunked body the caller
 //!    applies the same rule once the body has been read.
 //!
-//! A refusal is a fixed answer with no body that closes the connection.
+//! A refusal is a fixed answer with no body that closes the connection. It has the number of the request in an
+//! `X-Request-ID` field, so a client that was refused can name it.
 //!
 //! The fields of a request of an HTTP/2 stream are first written as the bytes of an HTTP/1.1 head (see
 //! `http2::head`) and then checked by the same rules; the `Head` that results is marked as made from HTTP/2.
@@ -74,27 +75,25 @@ impl Reject {
         }
     }
 
-    /// The whole answer as it is written to the socket: the status line, `Content-Length: 0` and
-    /// `Connection: close`, no body.
-    pub fn response(self) -> Option<&'static [u8]> {
-        match self {
-            Reject::BadRequest => Some(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-            Reject::UriTooLong => Some(b"HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-            Reject::FieldsTooLarge => Some(
-                b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            ),
-            Reject::ContentTooLarge => {
-                Some(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            }
-            Reject::ExpectationFailed => {
-                Some(b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            }
-            Reject::UnsupportedMedia => {
-                Some(b"HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            }
-            Reject::Timeout => Some(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-            Reject::Closed => None,
-        }
+    /// The whole answer as it is written to the socket: the status line, the number `id` of the request in an
+    /// `X-Request-ID` field, `Content-Length: 0` and `Connection: close`, no body.
+    pub fn response(self, id: &str) -> Option<Vec<u8>> {
+        let status = match self {
+            Reject::BadRequest => "400 Bad Request",
+            Reject::UriTooLong => "414 URI Too Long",
+            Reject::FieldsTooLarge => "431 Request Header Fields Too Large",
+            Reject::ContentTooLarge => "413 Payload Too Large",
+            Reject::ExpectationFailed => "417 Expectation Failed",
+            Reject::UnsupportedMedia => "415 Unsupported Media Type",
+            Reject::Timeout => "408 Request Timeout",
+            Reject::Closed => return None,
+        };
+        Some(
+            format!(
+                "HTTP/1.1 {status}\r\nX-Request-ID: {id}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+        )
     }
 
     /// A fixed short text for the record.

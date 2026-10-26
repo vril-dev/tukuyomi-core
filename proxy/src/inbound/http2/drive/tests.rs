@@ -21,7 +21,7 @@ use crate::inbound::conn::tests::{BLOCK, FORM, Mode, Rig, routed_to_h_test, run}
 use crate::inbound::session::tests::{ALLOW, OK, Raw, kept, reply};
 use crate::inbound::transport::tls::tests::{Pki, listener as tls_listener, with_http2};
 use crate::inbound::transport::tls::{Files, Tls};
-use crate::log::recording;
+use crate::log::{is_answer, recording};
 use crate::route::{Rule, Table};
 
 const SEC: Duration = Duration::from_secs(1);
@@ -175,15 +175,26 @@ fn every_request_of_a_connection_has_its_name_checked_against_the_certificate_an
         let lines = rig.lines.clone();
         assert!(rig.finish(task).await.is_empty());
         let lines = lines.take();
-        let count = |text: &str| lines.iter().filter(|l| l.contains(text)).count();
+        let count = |class: &str, status: u16, reason: &str| {
+            lines
+                .iter()
+                .filter(|l| is_answer(l, class, status, reason))
+                .count()
+        };
         assert_eq!(
-            count("rejected 421 host not covered by the certificate"),
+            count("rejected", 421, "host not covered by the certificate"),
             2,
             "{lines:?}"
         );
-        assert_eq!(count("rejected 400 malformed request head"), 1, "{lines:?}");
-        // The one line of the end of the connection says how many streams it carried.
-        assert_eq!(count(" streams 5"), 1, "{lines:?}");
+        assert_eq!(
+            count("rejected", 400, "malformed request head"),
+            1,
+            "{lines:?}"
+        );
+        // The one record of the end of the connection says how many streams it carried.
+        let ended: Vec<_> = lines.iter().filter(|l| l["type"] == "connection").collect();
+        assert_eq!(ended.len(), 1, "{lines:?}");
+        assert_eq!(ended[0]["streams"], 5, "{lines:?}");
     });
 }
 
@@ -395,10 +406,11 @@ fn the_connection_is_wound_down_by_the_number_of_streams_and_by_idleness() {
         let lines = rig.lines.clone();
         rig.finish(task).await;
         let lines = lines.take();
-        let ended: Vec<&String> = lines.iter().filter(|l| l.contains(" streams ")).collect();
+        let ended: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["type"] == "connection").collect();
         assert_eq!(ended.len(), 1, "{lines:?}");
         assert!(
-            ended[0].contains("h2 goaway not answered") && ended[0].ends_with(" streams 2"),
+            ended[0]["reason"] == "h2 goaway not answered" && ended[0]["streams"] == 2,
             "{ended:?}"
         );
 
@@ -500,7 +512,7 @@ fn a_flood_of_resets_ends_the_connection_with_a_goaway() {
         rig.finish(task).await;
         let lines = lines.take();
         assert_eq!(
-            lines.iter().filter(|l| l.contains(" streams ")).count(),
+            lines.iter().filter(|l| l["type"] == "connection").count(),
             1,
             "{lines:?}"
         );
@@ -557,12 +569,15 @@ fn a_preface_or_a_header_block_that_does_not_come_in_time_closes_the_connection_
             let lines = rig.lines.clone();
             rig.finish(task).await;
             let lines = lines.take();
-            let ours: Vec<&String> = lines
+            let ours: Vec<&serde_json::Value> = lines
                 .iter()
-                .filter(|l| l.contains("head not received in time"))
+                .filter(|l| l["reason"] == "head not received in time")
                 .collect();
             assert_eq!(ours.len(), 1, "{lines:?}");
-            assert!(ours[0].ends_with(" streams 0"), "{ours:?}");
+            assert!(
+                ours[0]["type"] == "connection" && ours[0]["streams"] == 0,
+                "{ours:?}"
+            );
         }
     });
 }
@@ -614,11 +629,12 @@ fn a_client_that_ignores_the_ping_of_a_goaway_takes_no_stream_after_the_linger_t
         let lines = rig.lines.clone();
         rig.finish(task).await;
         let lines = lines.take();
-        let ended: Vec<&String> = lines.iter().filter(|l| l.contains(" streams ")).collect();
+        let ended: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["type"] == "connection").collect();
         assert_eq!(ended.len(), 1, "{lines:?}");
         // The stream that was turned away is not counted.
         assert!(
-            ended[0].contains("h2 goaway not answered") && ended[0].ends_with(" streams 2"),
+            ended[0]["reason"] == "h2 goaway not answered" && ended[0]["streams"] == 2,
             "{ended:?}"
         );
     });
@@ -659,10 +675,11 @@ fn more_late_streams_than_max_streams_drop_the_connection_at_once() {
         let lines = rig.lines.clone();
         rig.finish(task).await;
         let lines = lines.take();
-        let ended: Vec<&String> = lines.iter().filter(|l| l.contains(" streams ")).collect();
+        let ended: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["type"] == "connection").collect();
         assert_eq!(ended.len(), 1, "{lines:?}");
         assert!(
-            ended[0].contains("h2 goaway not answered") && ended[0].ends_with(" streams 1"),
+            ended[0]["reason"] == "h2 goaway not answered" && ended[0]["streams"] == 1,
             "{ended:?}"
         );
     });
@@ -763,11 +780,12 @@ fn a_response_that_the_client_takes_no_more_of_ends_the_connection_at_the_time_i
             let lines = rig.lines.clone();
             rig.finish(task).await;
             let lines = lines.take();
-            let ended: Vec<&String> = lines.iter().filter(|l| l.contains(" streams ")).collect();
+            let ended: Vec<&serde_json::Value> =
+                lines.iter().filter(|l| l["type"] == "connection").collect();
             assert_eq!(ended.len(), 1, "{lines:?}");
             assert!(
-                ended[0].contains("closed while the response was sent")
-                    && ended[0].ends_with(" streams 1"),
+                ended[0]["reason"] == "closed while the response was sent"
+                    && ended[0]["streams"] == 1,
                 "{ended:?}"
             );
         }
@@ -856,10 +874,11 @@ fn a_response_that_began_before_a_goaway_and_outlasts_the_linger_time_reaches_a_
         assert!(read.elapsed() < linger, "{:?}", read.elapsed());
         drop(send);
         let lines = lines.take();
-        let ended: Vec<&String> = lines.iter().filter(|l| l.contains(" streams ")).collect();
+        let ended: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["type"] == "connection").collect();
         assert_eq!(ended.len(), 1, "{lines:?}");
         assert!(
-            ended[0].contains("h2 connection ended") && ended[0].ends_with(" streams 1"),
+            ended[0]["reason"] == "h2 connection ended" && ended[0]["streams"] == 1,
             "{ended:?}"
         );
     });
@@ -904,11 +923,11 @@ fn an_upstream_that_is_silent_in_the_middle_of_a_body_fails_that_stream_and_not_
         drop(send);
         rig.finish(task).await;
         let lines = lines.take();
-        let ended: Vec<&String> = lines.iter().filter(|l| l.contains(" streams ")).collect();
+        let ended: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["type"] == "connection").collect();
         assert_eq!(ended.len(), 1, "{lines:?}");
         assert!(
-            !ended[0].contains("closed while the response was sent")
-                && ended[0].ends_with(" streams 3"),
+            ended[0]["reason"] != "closed while the response was sent" && ended[0]["streams"] == 3,
             "{ended:?}"
         );
     });
@@ -928,5 +947,5 @@ fn a_panic_of_a_stream_has_a_line_in_the_record_and_goes_on() {
     let runtime = Builder::new_current_thread().enable_all().build().unwrap();
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on(watched)));
     assert!(outcome.is_err());
-    assert_eq!(lines.take(), ["conn 7: h2 stream panicked"]);
+    assert_eq!(lines.texts(), ["conn 7: h2 stream panicked"]);
 }

@@ -7,7 +7,7 @@ fn os_args(list: &[&str]) -> Vec<OsString> {
 
 #[test]
 fn config_check_refuses_a_wrong_argument_with_exit_code_2() {
-    let log = log::start_logger().unwrap();
+    let log = log::start_logger(log::Format::Json).unwrap();
     let wrong: [&[&str]; 5] = [
         &[],
         &["check"],

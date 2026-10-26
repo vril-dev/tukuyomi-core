@@ -13,7 +13,7 @@ use tokio::time::{Instant, timeout_at};
 
 use super::drive::Serving;
 use super::gate::Taken;
-use crate::inbound::answer::{NOT_REDIRECTED, Reply, redirect};
+use crate::inbound::answer::{Noted, Reply, not_redirected, redirect};
 use crate::inbound::challenge::{Proof, found};
 use crate::inbound::conn::{Ctx, Scheme, after};
 use crate::inbound::head::Reject;
@@ -30,11 +30,13 @@ pub(in crate::inbound) async fn redirect_to(
     peer: SocketAddr,
     local: SocketAddr,
     ctx: &Arc<Ctx>,
+    listener: usize,
     accept: Instant,
     https_port: u16,
 ) -> Summary {
     let cfg = &ctx.cfg;
-    let (serving, mut gate) = Serving::start(sock, peer, local, ctx, accept, Scheme::Http);
+    let (serving, mut gate) =
+        Serving::start(sock, peer, local, ctx, listener, accept, Scheme::Http);
     let session = &serving.session;
     if let Err(reject) = gate.first_head(first_head_by(cfg, accept)).await {
         return serving.refuse(&mut gate, reject).await;
@@ -42,24 +44,32 @@ pub(in crate::inbound) async fn redirect_to(
     let Some(Taken { head, .. }) = serving.link.take_first() else {
         return serving.refuse(&mut gate, Reject::BadRequest).await;
     };
-    let (reply, bytes) = match ctx
+    let id = ctx.ids.mint();
+    // The bytes that are written, and how many of them are the body.
+    let (reply, bytes, sent) = match ctx
         .challenge
         .as_ref()
         .and_then(|challenge| challenge.proof(&head))
     {
-        Some(Proof::Found(body)) => (Reply::answered(200), found(&body, head.method() == b"HEAD")),
-        Some(Proof::Missing) => (Reply::answered(404), NOT_REDIRECTED.to_vec()),
+        Some(Proof::Found(body)) => {
+            let head_only = head.method() == b"HEAD";
+            let sent = if head_only { 0 } else { body.len() };
+            (Reply::answered(200), found(&body, head_only, &id), sent)
+        }
+        Some(Proof::Missing) => (Reply::answered(404), not_redirected(&id), 0),
         None => {
             let name = host_name(head.host()).filter(|name| ctx.tls.serves(name));
             let routed = ctx.upstreams.find(head.host(), head.target()).is_some();
             match name {
                 Some(name) if routed => (
                     Reply::redirected(),
-                    redirect(&name, https_port, head.target()),
+                    redirect(&name, https_port, head.target(), &id),
+                    0,
                 ),
                 _ => (
                     Reply::rejected(404, "no redirect for the host"),
-                    NOT_REDIRECTED.to_vec(),
+                    not_redirected(&id),
+                    0,
                 ),
             }
         }
@@ -67,6 +77,9 @@ pub(in crate::inbound) async fn redirect_to(
     let by = after(Instant::now(), cfg.response_idle).min(session.conn_by());
     let sock = gate.stream();
     let _ = timeout_at(by, send_and_close(sock, &bytes)).await;
+    // The record of the answer comes before the wait for the client to stop sending.
+    let mut noted = Noted::new(id, reply, peer.ip()).of(&head);
+    session.note(&mut noted, accept, u64::try_from(sent).unwrap_or(u64::MAX));
     linger(sock, cfg, session.conn_by()).await;
-    Summary::of(session.id, reply)
+    session.summary(None)
 }

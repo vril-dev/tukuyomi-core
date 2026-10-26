@@ -171,32 +171,55 @@ fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 // The record stream
 // ---------------------------------------------------------------------------------------------------------
 
-/// The lines the proxy writes to stderr, as they arrive.
+/// What the proxy writes to stderr, as it arrives: one JSON object per line, each with a time (`ts`) and a type
+/// (`type`: `line` for a text of the process such as `start: listening`, `request`, `connection`, `tunnel` or
+/// `dropped`). A line that is not such an object is kept as the text it is, and fails the test that looks at the
+/// records.
 #[derive(Default)]
 pub(crate) struct Records {
-    lines: Mutex<Vec<String>>,
+    items: Mutex<Vec<Value>>,
     /// The proxy closed its stderr.
     ended: AtomicBool,
 }
 
 impl Records {
-    pub(crate) fn lines(&self) -> Vec<String> {
-        lock(&self.lines).clone()
+    /// Every record, parsed.
+    pub(crate) fn all(&self) -> Vec<Value> {
+        let items = lock(&self.items).clone();
+        for item in &items {
+            let ts = item["ts"].as_str().unwrap_or_default();
+            assert!(
+                ts.len() == 24 && ts.ends_with('Z') && item["type"].is_string(),
+                "not a record of the proxy: {item}"
+            );
+        }
+        items
     }
 
-    /// Waits for `n` lines that satisfy `want` (lines that are there already count) and returns them. Fails with
-    /// all the lines when the proxy ends first or nothing comes in time.
-    pub(crate) fn wait_lines(
+    /// The text of every record: the `line` of a record of the type `line`, and the JSON text of any other.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.all()
+            .into_iter()
+            .map(|item| match item["line"].as_str() {
+                Some(text) if item["type"] == "line" => text.to_string(),
+                _ => item.to_string(),
+            })
+            .collect()
+    }
+
+    /// Waits for `n` records that satisfy `want` (records that are there already count) and returns them. Fails
+    /// with all the records when the proxy ends first or nothing comes in time.
+    pub(crate) fn wait_records(
         &self,
         what: &str,
         n: usize,
-        want: impl Fn(&str) -> bool,
-    ) -> Vec<String> {
+        want: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
         let deadline = Instant::now() + PATIENCE;
         loop {
-            // The end is read first: the lines are all there once it is set.
+            // The end is read first: the records are all there once it is set.
             let ended = self.ended.load(Ordering::SeqCst);
-            let found: Vec<String> = self.lines().into_iter().filter(|l| want(l)).collect();
+            let found: Vec<Value> = self.all().into_iter().filter(|r| want(r)).collect();
             if found.len() >= n {
                 return found;
             }
@@ -214,15 +237,46 @@ impl Records {
         }
     }
 
-    /// The connection record that satisfies `want`.
-    pub(crate) fn conn(&self, what: &str, want: impl Fn(&str) -> bool) -> String {
+    /// Waits for `n` texts of the process (the `line` of the records of the type `line`) that satisfy `want`.
+    pub(crate) fn wait_lines(
+        &self,
+        what: &str,
+        n: usize,
+        want: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        self.wait_records(what, n, |r| {
+            r["type"] == "line" && r["line"].as_str().is_some_and(&want)
+        })
+        .iter()
+        .map(|r| r["line"].as_str().unwrap_or_default().to_string())
+        .collect()
+    }
+
+    /// The record of a request, a connection or a tunnel that satisfies `want`.
+    pub(crate) fn conn(&self, what: &str, want: impl Fn(&Value) -> bool) -> Value {
         self.conns(what, 1, want).remove(0)
     }
 
-    /// `n` connection records that satisfy `want`.
-    pub(crate) fn conns(&self, what: &str, n: usize, want: impl Fn(&str) -> bool) -> Vec<String> {
-        self.wait_lines(what, n, |l| l.starts_with("conn ") && want(l))
+    /// `n` records of a request, a connection or a tunnel that satisfy `want`.
+    pub(crate) fn conns(&self, what: &str, n: usize, want: impl Fn(&Value) -> bool) -> Vec<Value> {
+        self.wait_records(what, n, |r| r["type"] != "line" && want(r))
     }
+}
+
+/// Whether `record` is the record of an answer that was written to a client, with this class, status and reason.
+pub(crate) fn is_answer(record: &Value, class: &str, status: u16, reason: &str) -> bool {
+    record["type"] == "request" && shows(record, class, status, reason)
+}
+
+/// Whether `record` shows this class, status and reason, whether it is the record of a request or of a connection
+/// (a connection that ended with no answer shows the class `closed` and the status 0).
+pub(crate) fn shows(record: &Value, class: &str, status: u16, reason: &str) -> bool {
+    record["class"] == class && record["status"] == status && record["reason"] == reason
+}
+
+/// Whether `record` has no `key`: a value that there is none of is not written.
+pub(crate) fn no(record: &Value, key: &str) -> bool {
+    record.get(key).is_none()
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -454,13 +508,13 @@ pub(crate) fn free_port() -> u16 {
 fn upstream_reply(keeps: bool) -> Vec<u8> {
     if keeps {
         return format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nX-Up: visible\r\n\r\n{UPSTREAM_BODY}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nX-Up: visible\r\nX-Request-ID: from-the-upstream\r\n\r\n{UPSTREAM_BODY}",
             UPSTREAM_BODY.len()
         )
         .into_bytes();
     }
     format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close, X-Up-Hop\r\nKeep-Alive: timeout=9\r\nX-Up-Hop: 1\r\nX-Up: visible\r\n\r\n{UPSTREAM_BODY}",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close, X-Up-Hop\r\nKeep-Alive: timeout=9\r\nX-Up-Hop: 1\r\nX-Up: visible\r\nX-Request-ID: from-the-upstream\r\n\r\n{UPSTREAM_BODY}",
         UPSTREAM_BODY.len()
     )
     .into_bytes()
@@ -991,8 +1045,11 @@ impl Proxy {
                     buf.clear();
                     match input.read_until(b'\n', &mut buf) {
                         Ok(0) | Err(_) => break,
-                        Ok(_) => lock(&records.lines)
-                            .push(String::from_utf8_lossy(&buf).trim_end().to_string()),
+                        Ok(_) => {
+                            let text = String::from_utf8_lossy(&buf).trim_end().to_string();
+                            let item = serde_json::from_str(&text).unwrap_or(Value::String(text));
+                            lock(&records.items).push(item);
+                        }
                     }
                 }
                 records.ended.store(true, Ordering::SeqCst);
@@ -1154,10 +1211,14 @@ impl Proxy {
             "the kernel did not stop cleanly: {lines:#?}"
         );
         assert!(
-            !lines.iter().any(|l| l.contains("panic")
-                || l.contains("internal fault")
-                || l.contains("log lines dropped")),
+            !lines
+                .iter()
+                .any(|l| l.contains("panic") || l.contains("internal fault")),
             "the records show a fault: {lines:#?}"
+        );
+        assert!(
+            !self.records.all().iter().any(|r| r["type"] == "dropped"),
+            "records were dropped: {lines:#?}"
         );
         let counts = stop_counts(&lines);
         assert_gone(&self.inspectors);
@@ -1252,9 +1313,9 @@ pub(crate) const CLEAN_JSON: &str = concat!(
     "}\n"
 );
 
-/// The text of the record of a request that rule `id` blocked with 403.
-pub(crate) fn blocked_by(id: u32) -> String {
-    format!(": blocked 403 blocked by a rule rule {id} ")
+/// Whether `record` is the record of a request that rule `id` blocked with 403.
+pub(crate) fn blocked_by(record: &Value, id: i64) -> bool {
+    is_answer(record, "blocked", 403, "blocked by a rule") && record["rule"] == id
 }
 
 /// Checks what the upstream got as its request number `index` (from 0): the start line, the `Content-Type` value

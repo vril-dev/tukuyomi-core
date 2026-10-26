@@ -206,13 +206,14 @@ fn the_hosts_are_those_of_the_certificates_with_acme_and_there_is_nothing_withou
 
 #[test]
 fn the_answer_of_a_listener_that_writes_it_itself_has_the_length_and_no_body_for_a_head() {
-    let both = String::from_utf8(found(b"abc.def", false)).unwrap();
+    let both = String::from_utf8(found(b"abc.def", false, "0123456789abcdef-1")).unwrap();
     assert!(both.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(both.contains("\r\nContent-Type: text/plain\r\n"));
     assert!(both.contains("\r\nContent-Length: 7\r\n"));
+    assert!(both.contains("\r\nX-Request-ID: 0123456789abcdef-1\r\n"));
     assert!(both.contains("\r\nConnection: close\r\n"));
     assert!(both.ends_with("\r\n\r\nabc.def"));
-    let only = String::from_utf8(found(b"abc.def", true)).unwrap();
+    let only = String::from_utf8(found(b"abc.def", true, "0123456789abcdef-1")).unwrap();
     assert!(only.contains("\r\nContent-Length: 7\r\n"));
     assert!(only.ends_with("\r\n\r\n"));
 }

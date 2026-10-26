@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::{Semaphore, oneshot};
 use tukuyomi_kernel::{Config, Phase, Reason};
 
-use crate::inspect::driver::{BodyHold, Hold};
+use crate::inspect::driver::{Answer, BodyHold, Hold};
 
 /// A kernel that is stopped by the test: `shutdown` gives the answer the test chose.
 struct Stub {
@@ -61,7 +61,7 @@ fn shutdown(results: Vec<(ReqId, Verdict)>, exit_confirmed: bool) -> Shutdown {
 
 /// A slot of a generation with the mode `mode` that holds one request, with the id 0, and the answer of the
 /// request.
-fn slot_with_a_request(mode: Mode, done: Shutdown) -> (Slot<Stub>, oneshot::Receiver<Outcome>) {
+fn slot_with_a_request(mode: Mode, done: Shutdown) -> (Slot<Stub>, oneshot::Receiver<Answer>) {
     let permits = Arc::new(Semaphore::new(3));
     let take = || permits.clone().try_acquire_owned().unwrap();
     let (reply, answer) = oneshot::channel();
@@ -107,7 +107,19 @@ fn a_retired_slot_gets_the_results_of_its_shutdown_and_tells_whether_it_stopped_
                 clean: confirmed
             })
         );
-        assert_eq!(answer.try_recv(), Ok(Outcome::Verdict(unavailable)));
+        assert_eq!(answer.try_recv(), Ok(verdict(unavailable, Mode::Block)));
+    }
+}
+
+/// What a verdict of the slot of `slot_with_a_request` is answered with: the verdict, and the generation of the slot
+/// and the mode of its rules.
+fn verdict(verdict: Verdict, mode: Mode) -> Answer {
+    Answer {
+        outcome: Outcome::Verdict(verdict),
+        by: Some(Judge {
+            generation: Fingerprint::from_hex(&[b'7'; 64]).unwrap(),
+            mode,
+        }),
     }
 }
 
@@ -138,11 +150,14 @@ fn a_retired_slot_does_not_deliver_a_detection_of_a_generation_that_blocks() {
     assert!(slot.retire(deadline).wait().is_ok());
     assert_eq!(
         answer.try_recv(),
-        Ok(Outcome::Verdict(Verdict::Uninspectable(Reason::Protocol)))
+        Ok(verdict(
+            Verdict::Uninspectable(Reason::Protocol),
+            Mode::Block
+        ))
     );
 
     // A generation that detects gets it as it is.
     let (slot, mut answer) = slot_with_a_request(Mode::Detect, shutdown(vec![(0, detected)], true));
     assert!(slot.retire(deadline).wait().is_ok());
-    assert_eq!(answer.try_recv(), Ok(Outcome::Verdict(detected)));
+    assert_eq!(answer.try_recv(), Ok(verdict(detected, Mode::Detect)));
 }

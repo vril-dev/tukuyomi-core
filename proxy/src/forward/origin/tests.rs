@@ -19,13 +19,16 @@ use super::*;
 use crate::config::{ForwardConfig, ProxyConfig};
 use crate::forward::connect::connect_error;
 use crate::forward::group::Upstreams;
+use crate::inbound::session::RequestIds;
 use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::Ingress;
-use crate::log::start_logger;
+use crate::log::{Format, start_logger};
 use crate::rules::routes::{Routes, SharedRoutes};
 
 const BUDGET: usize = 4 << 20;
 const PEER: &str = "203.0.113.9:5555";
+/// The number of the request in these tests.
+pub(in crate::forward) const ID: &str = "0123456789abcdef-1";
 
 pub(in crate::forward) type Outcome = Result<Response<OriginBody>, OriginError>;
 
@@ -81,10 +84,11 @@ pub(in crate::forward) fn ctx_of(forward: &ForwardConfig, cfg: ProxyConfig) -> C
         budget: Arc::new(Semaphore::new(cfg.max_buffered_bytes)),
         inspect: Arc::new(Semaphore::new(1)),
         routes: SharedRoutes::new(Routes::default()),
-        log: start_logger().unwrap(),
+        log: start_logger(Format::Json).unwrap(),
         ingress: Arc::new(Ingress::new(to_driver)),
         tls: Tls::none(),
         challenge: None,
+        ids: RequestIds::new().unwrap(),
         cfg,
     }
 }
@@ -149,6 +153,7 @@ pub(in crate::forward) fn request(
         peer: PEER.parse().unwrap(),
         https: false,
         websocket: false,
+        id: ID.to_string(),
     }
 }
 
@@ -355,7 +360,7 @@ fn every_hop_by_hop_field_is_removed_from_the_request() {
     let peer: IpAddr = "203.0.113.9".parse().unwrap();
     for name in REQUEST_HOP {
         let sent = fields(&[("Host", "h.test"), (name, "x"), ("X-Keep", "1")]);
-        let out = forwarded_fields(sent, peer, true, true, false, false).unwrap();
+        let out = forwarded_fields(sent, peer, true, true, false, false, ID).unwrap();
         if name == "connection" {
             assert_eq!(only(&out, name), [b"close"], "{name}");
         } else {
@@ -363,6 +368,22 @@ fn every_hop_by_hop_field_is_removed_from_the_request() {
         }
         assert_eq!(only(&out, "x-keep"), [b"1"], "{name}");
         assert_eq!(only(&out, "host"), [b"h.test"], "{name}");
+    }
+}
+
+#[test]
+fn the_number_of_the_request_replaces_every_line_the_client_sent_whoever_the_peer_is() {
+    let peer: IpAddr = "203.0.113.9".parse().unwrap();
+    for trusted in [true, false] {
+        let sent = fields(&[
+            ("Host", "h.test"),
+            ("X-Request-ID", "client-1"),
+            ("x-request-id", "client-2"),
+            ("X-Keep", "k"),
+        ]);
+        let out = forwarded_fields(sent, peer, trusted, false, false, false, ID).unwrap();
+        assert_eq!(only(&out, "x-request-id"), [ID.as_bytes()], "{trusted}");
+        assert_eq!(only(&out, "x-keep"), [b"k"], "{trusted}");
     }
 }
 
@@ -379,7 +400,7 @@ fn the_names_are_collected_before_the_removal_and_the_additions_come_after_it() 
         ("X-Hop", "1"),
         ("X-Keep", "k"),
     ]);
-    let out = forwarded_fields(sent, peer, true, true, false, false).unwrap();
+    let out = forwarded_fields(sent, peer, true, true, false, false, ID).unwrap();
     // The client's own lines are gone with the names it listed; ours come after, and listing a name does not
     // take ours away, not even for `Connection` itself.
     assert_eq!(only(&out, "x-forwarded-for"), [b"203.0.113.9"]);
@@ -389,7 +410,8 @@ fn the_names_are_collected_before_the_removal_and_the_additions_come_after_it() 
     assert!(out.get("x-hop").is_none());
     assert_eq!(only(&out, "x-keep"), [b"k"]);
     assert_eq!(only(&out, "host"), [b"h.test"]);
-    assert_eq!(out.len(), 6);
+    assert_eq!(only(&out, "x-request-id"), [ID.as_bytes()]);
+    assert_eq!(out.len(), 7);
 }
 
 #[test]
@@ -409,7 +431,7 @@ fn x_forwarded_for_joins_the_lines_in_order_and_ends_with_the_peer() {
     for (lines, peer, expected) in cases {
         let mut pairs = vec![("Host", "h.test")];
         pairs.extend(lines.iter().map(|line| ("X-Forwarded-For", *line)));
-        let out = forwarded_fields(fields(&pairs), peer, true, true, false, false).unwrap();
+        let out = forwarded_fields(fields(&pairs), peer, true, true, false, false, ID).unwrap();
         assert_eq!(only(&out, "x-forwarded-for"), [expected], "{lines:?}");
     }
 }
@@ -418,7 +440,7 @@ fn x_forwarded_for_joins_the_lines_in_order_and_ends_with_the_peer() {
 fn the_scheme_of_the_listener_is_the_forwarded_proto_unless_a_trusted_peer_says_http_or_https() {
     let peer: IpAddr = "203.0.113.9".parse().unwrap();
     let proto = |pairs: &[(&str, &str)], trusted: bool, https: bool| {
-        let out = forwarded_fields(fields(pairs), peer, trusted, false, false, https).unwrap();
+        let out = forwarded_fields(fields(pairs), peer, trusted, false, false, https, ID).unwrap();
         only(&out, "x-forwarded-proto")
             .into_iter()
             .map(<[u8]>::to_vec)
@@ -448,7 +470,7 @@ fn a_peer_that_is_not_trusted_cannot_tell_the_upstream_who_the_client_is() {
         ("X-Forwarded-Host", "evil.test"),
         ("X-Keep", "k"),
     ]);
-    let out = forwarded_fields(sent, peer, false, false, false, false).unwrap();
+    let out = forwarded_fields(sent, peer, false, false, false, false, ID).unwrap();
     // The upstream gets the address of the peer alone, and our own scheme and host.
     assert_eq!(only(&out, "x-forwarded-for"), [b"203.0.113.9"]);
     assert_eq!(only(&out, "x-forwarded-proto"), [b"http"]);
@@ -458,7 +480,7 @@ fn a_peer_that_is_not_trusted_cannot_tell_the_upstream_who_the_client_is() {
     // Nothing else is touched, and the connection is not told to close when it is kept.
     assert_eq!(only(&out, "x-keep"), [b"k"]);
     assert!(out.get("connection").is_none());
-    assert_eq!(out.len(), 5);
+    assert_eq!(out.len(), 6);
 }
 
 #[test]
@@ -471,7 +493,7 @@ fn a_trusted_peer_keeps_its_claims_and_the_scheme_is_http_or_https_only() {
         ("Forwarded", "for=198.51.100.1"),
         ("X-Forwarded-Proto", "https"),
     ]);
-    let out = forwarded_fields(sent, peer, true, false, false, false).unwrap();
+    let out = forwarded_fields(sent, peer, true, false, false, false, ID).unwrap();
     assert_eq!(only(&out, "x-forwarded-for"), [b"198.51.100.1, 10.0.0.2"]);
     assert_eq!(only(&out, "x-real-ip"), [b"198.51.100.1"]);
     assert_eq!(only(&out, "forwarded"), [b"for=198.51.100.1"]);
@@ -480,7 +502,7 @@ fn a_trusted_peer_keeps_its_claims_and_the_scheme_is_http_or_https_only() {
     let proto = |lines: &[&str]| {
         let mut pairs = vec![("Host", "h.test")];
         pairs.extend(lines.iter().map(|line| ("X-Forwarded-Proto", *line)));
-        let out = forwarded_fields(fields(&pairs), peer, true, false, false, false).unwrap();
+        let out = forwarded_fields(fields(&pairs), peer, true, false, false, false, ID).unwrap();
         only(&out, "x-forwarded-proto")
             .into_iter()
             .map(<[u8]>::to_vec)
@@ -516,12 +538,21 @@ fn the_other_claims_about_the_client_are_kept_from_a_trusted_peer_and_dropped_fr
             false,
             false,
             false,
+            ID,
         );
         let untrusted = untrusted.unwrap();
         assert!(untrusted.get(name).is_none(), "{name}");
         assert_eq!(only(&untrusted, "x-keep"), [b"k"], "{name}");
-        let trusted =
-            forwarded_fields(sent, "10.0.0.2".parse().unwrap(), true, false, false, false).unwrap();
+        let trusted = forwarded_fields(
+            sent,
+            "10.0.0.2".parse().unwrap(),
+            true,
+            false,
+            false,
+            false,
+            ID,
+        )
+        .unwrap();
         assert_eq!(only(&trusted, name), [b"198.51.100.1"], "{name}");
     }
 }
@@ -580,7 +611,7 @@ fn a_handshake_leaves_with_fixed_upgrade_fields_and_only_a_proper_101_comes_back
         ("X-Hop", "1"),
         ("Sec-WebSocket-Key", "k"),
     ]);
-    let out = forwarded_fields(sent, peer, false, true, true, false).unwrap();
+    let out = forwarded_fields(sent, peer, false, true, true, false, ID).unwrap();
     assert_eq!(only(&out, "connection"), [b"upgrade"]);
     assert_eq!(only(&out, "upgrade"), [b"websocket"]);
     assert_eq!(only(&out, "sec-websocket-key"), [b"k"]);
@@ -800,8 +831,10 @@ fn the_upstream_gets_the_inspected_request_with_the_listed_changes() {
                 "x-forwarded-host",
                 "x-forwarded-proto",
                 "x-keep",
+                "x-request-id",
             ]
         );
+        assert_eq!(seen.all("x-request-id"), [ID]);
         assert_eq!(seen.all("connection"), ["close"]);
         assert_eq!(seen.all("x-forwarded-for"), ["203.0.113.9"]);
         assert_eq!(seen.all("x-forwarded-proto"), ["http"]);
@@ -1307,7 +1340,7 @@ fn the_forwarded_request_differs_from_the_inspected_one_only_by_the_edits_of_the
         ("X-Drop", "d"),
         ("X-Set", "old"),
     ]);
-    let plain = forwarded_fields(inspected, peer, false, false, false, false).unwrap();
+    let plain = forwarded_fields(inspected, peer, false, false, false, false, ID).unwrap();
     let uri = "/api/x/y?debug=1&keep=%41".parse().unwrap();
     let (edited, uri) = edits().request(plain.clone(), uri).unwrap();
     // `X-Forwarded-Host` is made from the `Host` that the client sent, before the route sets another one.

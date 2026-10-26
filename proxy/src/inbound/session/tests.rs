@@ -29,6 +29,7 @@ use crate::inbound::transport::tls::tests::{Pki, listener as tls_listener};
 use crate::inbound::transport::tls::{Files, Tls};
 use crate::inspect::driver::Outcome;
 use crate::log::Lines;
+use crate::log::is_answer;
 use crate::route::{Rule, Table};
 
 const SEC: Duration = Duration::from_secs(1);
@@ -908,12 +909,12 @@ fn a_tunnel_ends_when_the_upstream_is_silent_for_idle_and_when_total_has_passed(
     });
 }
 
-/// The lines of the record that tell how a tunnel ended.
-fn tunnel_lines(lines: &Lines) -> Vec<String> {
+/// The records that tell how a tunnel ended.
+fn tunnel_lines(lines: &Lines) -> Vec<serde_json::Value> {
     lines
         .take()
         .into_iter()
-        .filter(|line| line.contains(": tunnel "))
+        .filter(|record| record["type"] == "tunnel")
         .collect()
 }
 
@@ -935,7 +936,7 @@ fn a_client_that_says_nothing_does_not_keep_a_tunnel_after_the_upstream_has_ende
         assert!(began.elapsed() >= Duration::from_millis(250) && began.elapsed() < 5 * SEC);
         let ended = tunnel_lines(&lines);
         assert_eq!(ended.len(), 1, "{ended:?}");
-        assert!(ended[0].contains(": tunnel idle "), "{ended:?}");
+        assert!(ended[0]["end"] == "idle", "{ended:?}");
     });
 }
 
@@ -969,7 +970,7 @@ fn an_upstream_does_not_keep_a_tunnel_after_the_client_has_ended_silent_or_not()
             );
             let ended = tunnel_lines(&lines);
             assert_eq!(ended.len(), 1, "{talking}: {ended:?}");
-            assert!(ended[0].contains(": tunnel idle "), "{talking}: {ended:?}");
+            assert!(ended[0]["end"] == "idle", "{talking}: {ended:?}");
         }
     });
 }
@@ -994,8 +995,9 @@ fn a_client_that_says_nothing_is_not_cut_while_the_upstream_is_alive() {
         let ended = tunnel_lines(&lines);
         assert_eq!(ended.len(), 1, "{ended:?}");
         assert!(
-            ended[0].contains(": tunnel closed ")
-                && ended[0].ends_with(" to-upstream 0 from-upstream 12"),
+            ended[0]["end"] == "closed"
+                && ended[0]["to_upstream"] == 0
+                && ended[0]["from_upstream"] == 12,
             "{ended:?}"
         );
     });
@@ -1022,7 +1024,7 @@ fn a_tunnel_that_the_client_does_not_get_has_its_one_line_for_the_end() {
         rig.finish(task).await;
         let ended = tunnel_lines(&lines);
         assert_eq!(ended.len(), 1, "{ended:?}");
-        assert!(ended[0].contains(": tunnel error "), "{ended:?}");
+        assert!(ended[0]["end"] == "error", "{ended:?}");
     });
 }
 
@@ -1248,7 +1250,7 @@ fn a_host_the_certificate_does_not_cover_is_answered_with_421_before_the_inspect
         assert_eq!(
             lines
                 .iter()
-                .filter(|l| l.contains("rejected 421 host not covered by the certificate"))
+                .filter(|l| is_answer(l, "rejected", 421, "host not covered by the certificate"))
                 .count(),
             7,
             "{lines:?}"
@@ -1314,9 +1316,15 @@ fn a_client_that_is_silent_or_does_not_speak_tls_is_closed_with_one_line_in_the_
             let lines = rig.lines.clone();
             assert!(rig.finish(task).await.is_empty());
             let lines = lines.take();
-            let ours: Vec<&String> = lines.iter().filter(|l| l.contains(reason)).collect();
+            let ours: Vec<&serde_json::Value> =
+                lines.iter().filter(|l| l["reason"] == reason).collect();
             assert_eq!(ours.len(), 1, "{lines:?}");
-            assert!(ours[0].contains(": closed 0 "), "{ours:?}");
+            assert!(
+                ours[0]["type"] == "connection"
+                    && ours[0]["class"] == "closed"
+                    && ours[0]["status"] == 0,
+                "{ours:?}"
+            );
             if sent.is_empty() {
                 assert!(began.elapsed() >= Duration::from_millis(250));
             }
@@ -1348,6 +1356,8 @@ fn a_redirect_listener_sends_a_served_host_with_a_route_to_https_and_answers_any
         let pki = Pki::new();
         for (port, at) in [(443, ""), (8443, ":8443")] {
             let rig = over_tls(&pki, kept(), Mode::Answer(BLOCK), &subdomains_only(), port).await;
+            // The number of each redirect that was written, which its record has too.
+            let mut numbers = Vec::new();
             for (request, location) in [
                 (
                     "GET /a/b?x=1&y=%41 HTTP/1.1\r\nHost: www.a.example\r\n\r\n",
@@ -1367,6 +1377,7 @@ fn a_redirect_listener_sends_a_served_host_with_a_route_to_https_and_answers_any
                 assert_eq!(answer.all("location"), vec![location.as_str()], "{request}");
                 assert_eq!(answer.all("content-length"), ["0"]);
                 assert_eq!(answer.all("connection"), ["close"]);
+                numbers.extend(answer.all("x-request-id").iter().map(ToString::to_string));
             }
             // A host that a certificate has but no route holds for, a host no certificate has, a literal, and a
             // host that cannot be read.
@@ -1383,17 +1394,33 @@ fn a_redirect_listener_sends_a_served_host_with_a_route_to_https_and_answers_any
                 assert_eq!(answer.status, 404, "{host}");
                 assert!(answer.all("location").is_empty(), "{host}");
                 assert_eq!(answer.all("connection"), ["close"]);
+                assert_eq!(answer.all("x-request-id").len(), 1, "{host}");
             }
             // The body is not read, and nothing is inspected.
             let post = format!(
                 "POST /p HTTP/1.1\r\nHost: x.a.example\r\nContent-Type: {FORM}\r\nContent-Length: 1000\r\n\r\n0123456789"
             );
-            assert_eq!(redirected(&rig, &post).await.status, 308);
+            let answer = redirected(&rig, &post).await;
+            assert_eq!(answer.status, 308);
+            numbers.extend(answer.all("x-request-id").iter().map(ToString::to_string));
             let lines = rig.lines.take();
-            let count = |text: &str| lines.iter().filter(|l| l.contains(text)).count();
-            assert_eq!(count(": redirected 308 redirected rule - "), 4, "{lines:?}");
+            let mut recorded: Vec<String> = lines
+                .iter()
+                .filter(|l| is_answer(l, "redirected", 308, "redirected"))
+                .map(|l| l["id"].as_str().unwrap_or_default().to_string())
+                .collect();
+            recorded.sort();
+            numbers.sort();
+            assert_eq!(numbers, recorded, "{lines:?}");
+            let count = |class: &str, status: u16, reason: &str| {
+                lines
+                    .iter()
+                    .filter(|l| is_answer(l, class, status, reason) && l.get("rule").is_none())
+                    .count()
+            };
+            assert_eq!(count("redirected", 308, "redirected"), 4, "{lines:?}");
             assert_eq!(
-                count(": rejected 404 no redirect for the host rule - "),
+                count("rejected", 404, "no redirect for the host"),
                 6,
                 "{lines:?}"
             );
@@ -1518,16 +1545,15 @@ fn the_challenge_is_answered_before_all_else_on_a_plain_and_a_redirect_listener_
         // Only the two requests of the plain listener for `x.a.example` were inspected; no challenge ever was.
         assert_eq!(rig.finish(tokio::spawn(async {})).await.len(), 2);
         let lines = lines.take();
-        let count = |text: &str| lines.iter().filter(|l| l.contains(text)).count();
-        assert_eq!(
-            count(": answered 200 acme challenge rule - "),
-            5,
-            "{lines:?}"
-        );
-        assert_eq!(
-            count(": answered 404 acme challenge rule - "),
-            2,
-            "{lines:?}"
-        );
+        let count = |status: u16| {
+            lines
+                .iter()
+                .filter(|l| {
+                    is_answer(l, "answered", status, "acme challenge") && l.get("rule").is_none()
+                })
+                .count()
+        };
+        assert_eq!(count(200), 5, "{lines:?}");
+        assert_eq!(count(404), 2, "{lines:?}");
     });
 }

@@ -18,6 +18,9 @@
 //! submitted. A connection that gave up does not give it back: the kernel keeps the record until its result
 //! comes out.
 //!
+//! The answer on the reply slot is the outcome and, when the outcome is a verdict of a kernel, the generation of that
+//! kernel and the mode of its rules, so that the record of the request can say which rules judged it.
+//!
 //! A switch message makes the driver serve two generations for a while. It makes a second kernel on the rules of
 //! the new generation and steps it in every round for the shortest step that can read a frame, while new tickets
 //! still go to the kernel that serves. When the new kernel is ready, new tickets go to it, and the other kernel
@@ -106,8 +109,29 @@ impl Hold {
 
 pub struct Ticket {
     pub req: InspectReq,
-    pub reply: oneshot::Sender<Outcome>,
+    pub reply: oneshot::Sender<Answer>,
     pub hold: Hold,
+}
+
+/// The generation whose kernel gave a verdict, and what its rules do to a request they match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Judge {
+    pub generation: Fingerprint,
+    pub mode: bundle::Mode,
+}
+
+/// What the driver answers for a ticket: the outcome, and the generation that gave it if it is a verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Answer {
+    pub outcome: Outcome,
+    pub by: Option<Judge>,
+}
+
+/// An outcome that no kernel gave a verdict for.
+impl From<Outcome> for Answer {
+    fn from(outcome: Outcome) -> Answer {
+        Answer { outcome, by: None }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -567,7 +591,7 @@ impl<K: Kernel> Core<K> {
     /// After `shutdown` nothing is submitted.
     fn admit(&mut self, ticket: Ticket) -> Result<(), &'static str> {
         if self.mode == Mode::Down {
-            let _ = ticket.reply.send(Outcome::Unavailable);
+            let _ = ticket.reply.send(Outcome::Unavailable.into());
             return Ok(());
         }
         self.active.admit(ticket)

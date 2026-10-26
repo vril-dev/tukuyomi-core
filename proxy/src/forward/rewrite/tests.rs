@@ -345,6 +345,7 @@ fn a_field_the_proxy_owns_cannot_be_edited_in_remove_set_or_add() {
         "x-forwarded-for",
         "X-Forwarded-Host",
         "X-Forwarded-Proto",
+        "X-Request-ID",
         "X-Real-IP",
         "Forwarded",
         "CF-Connecting-IP",
@@ -377,6 +378,7 @@ fn a_field_the_proxy_owns_cannot_be_edited_in_remove_set_or_add() {
     };
     for name in [
         "Set-Cookie",
+        "X-Request-ID",
         "Content-Length",
         "Content-Type",
         "Content-Encoding",

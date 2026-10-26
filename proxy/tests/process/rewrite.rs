@@ -90,9 +90,12 @@ fn a_server_written_as_a_name_is_looked_up_at_the_start_and_reached() {
     let requests = proxy.upstream.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(Message::parse(&requests[0]).start, "GET /named HTTP/1.1");
-    let want = format!(" upstream main/127.0.0.1:{port}");
+    let server = format!("127.0.0.1:{port}");
     proxy.records.conn("the record names the address", |l| {
-        l.contains(": forwarded 200 forwarded rule - ") && l.ends_with(&want)
+        is_answer(l, "forwarded", 200, "forwarded")
+            && no(l, "rule")
+            && l["upstream"] == "main"
+            && l["server"] == server.as_str()
     });
     proxy.finish(1);
 }
@@ -174,7 +177,7 @@ fn a_route_edits_the_request_after_the_inspection_and_the_response_and_turns_oth
     proxy
         .records
         .conn("the record of the turned away client", |l| {
-            l.contains(": rejected 403 denied by route access ") && !l.contains(" upstream ")
+            is_answer(l, "rejected", 403, "denied by route access") && no(l, "upstream")
         });
     // So is a request that writes the same path another way, which the route for `/private/` does not hold for, and
     // one for the path just before it.

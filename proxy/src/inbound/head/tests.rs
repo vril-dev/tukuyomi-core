@@ -548,12 +548,20 @@ fn every_refusal_has_the_fixed_answer_of_its_status() {
             .unwrap()
             .canonical_reason()
             .unwrap();
-        let expected =
-            format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        assert_eq!(reject.response(), Some(expected.as_bytes()), "{reject:?}");
+        let expected = format!(
+            "HTTP/1.1 {status} {reason}\r\nX-Request-ID: 0123456789abcdef-1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            reject.response("0123456789abcdef-1"),
+            Some(expected.into_bytes()),
+            "{reject:?}"
+        );
     }
     assert_eq!(
-        (Reject::Closed.status(), Reject::Closed.response()),
+        (
+            Reject::Closed.status(),
+            Reject::Closed.response("0123456789abcdef-1")
+        ),
         (None, None)
     );
 }

@@ -12,6 +12,7 @@ use crate::inbound::head::trim_ows;
 static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 static X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 static X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
+static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 /// Fields of the request that belong to the connection with the client or to a single hop. `Connection` and the
 /// names it lists go as well.
@@ -96,8 +97,9 @@ fn forwarded_proto(fields: &HeaderMap, https: bool) -> HeaderValue {
 /// The fields the upstream gets, in this order: the names listed in `Connection` are collected from the fields as
 /// they were inspected; the hop-by-hop fields and the listed names are removed; if the peer is not `trusted`, so
 /// are the fields by which it says who the client is; then the forwarding fields are put in, and `Connection:
-/// upgrade` with `Upgrade: websocket` for a handshake, or `Connection: close` if `close`. All other fields stay as
-/// they were inspected. `https` is whether the listener ended TLS.
+/// upgrade` with `Upgrade: websocket` for a handshake, or `Connection: close` if `close`. Every `X-Request-ID` field
+/// is removed, whoever the peer is, and one with `id` is put in. All other fields stay as they were inspected.
+/// `https` is whether the listener ended TLS.
 pub(super) fn forwarded_fields(
     mut fields: HeaderMap,
     peer: IpAddr,
@@ -105,6 +107,7 @@ pub(super) fn forwarded_fields(
     close: bool,
     websocket: bool,
     https: bool,
+    id: &str,
 ) -> Result<HeaderMap, OriginError> {
     let named: Vec<HeaderName> = fields
         .get_all(CONNECTION)
@@ -118,6 +121,7 @@ pub(super) fn forwarded_fields(
     for name in &named {
         fields.remove(name);
     }
+    fields.remove(&X_REQUEST_ID);
     if !trusted {
         for name in CLIENT_CLAIMS {
             fields.remove(name);
@@ -136,6 +140,10 @@ pub(super) fn forwarded_fields(
         }
     }
     fields.insert(X_FORWARDED_PROTO.clone(), proto);
+    fields.insert(
+        X_REQUEST_ID.clone(),
+        HeaderValue::from_str(id).map_err(|_| OriginError::Send)?,
+    );
     if websocket {
         fields.insert(CONNECTION, HeaderValue::from_static("upgrade"));
         fields.insert(UPGRADE, HeaderValue::from_static("websocket"));

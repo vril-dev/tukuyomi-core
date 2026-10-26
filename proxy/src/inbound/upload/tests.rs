@@ -12,6 +12,7 @@ use crate::inbound::conn::tests::{
     BLOCK, FORM, Mode, Rig, config, finish_sending, gz, parse_response, put, read_all, run,
 };
 use crate::inspect::driver::Outcome;
+use crate::log::is_answer;
 use crate::route::{Rule, Table};
 use crate::rules::routes::{Route, Routes};
 
@@ -201,7 +202,7 @@ fn field_of<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 /// What a client got back and what the record said, after the connection is over.
 struct Done {
     status: Option<u16>,
-    lines: Vec<String>,
+    lines: Vec<serde_json::Value>,
     seen: Vec<crate::inbound::conn::tests::Seen>,
 }
 
@@ -230,8 +231,15 @@ async fn through(
     }
 }
 
-fn record_with<'a>(lines: &'a [String], text: &str) -> Option<&'a String> {
-    lines.iter().find(|line| line.contains(text))
+fn record_with<'a>(
+    lines: &'a [serde_json::Value],
+    class: &str,
+    status: u16,
+    reason: &str,
+) -> Option<&'a serde_json::Value> {
+    lines
+        .iter()
+        .find(|line| is_answer(line, class, status, reason))
 }
 
 #[test]
@@ -257,8 +265,12 @@ fn a_body_longer_than_the_inspected_bytes_is_inspected_cut_and_forwarded_whole_w
         assert_eq!(got.field("content-length"), Some("200000"));
         assert_eq!(got.field("transfer-encoding"), None);
         assert_eq!(got.body(), body);
-        let line = record_with(&out.lines, ": forwarded 200 forwarded ").expect("the record");
-        assert!(line.ends_with(" body 200000 inspected 1024 cut"), "{line}");
+        let line = record_with(&out.lines, "forwarded", 200, "forwarded").expect("the record");
+        assert_eq!(
+            (&line["body"], &line["inspected"]),
+            (&serde_json::json!(200000), &serde_json::json!(1024)),
+            "{line}"
+        );
     });
 }
 
@@ -286,8 +298,12 @@ fn a_long_chunked_body_is_inspected_cut_and_forwarded_chunked_and_whole() {
         assert_eq!(got.field("transfer-encoding"), Some("chunked"));
         assert_eq!(got.field("content-length"), None);
         assert_eq!(got.body(), body);
-        let line = record_with(&out.lines, ": forwarded 200 forwarded ").expect("the record");
-        assert!(line.ends_with(" body 200000 inspected 1024 cut"), "{line}");
+        let line = record_with(&out.lines, "forwarded", 200, "forwarded").expect("the record");
+        assert_eq!(
+            (&line["body"], &line["inspected"]),
+            (&serde_json::json!(200000), &serde_json::json!(1024)),
+            "{line}"
+        );
     });
 }
 
@@ -338,7 +354,9 @@ fn a_chunked_body_that_passes_the_limit_while_it_is_passed_on_ends_the_request_a
         assert!(
             record_with(
                 &out.lines,
-                ": closed 0 body over the limit while it was sent on "
+                "closed",
+                0,
+                "body over the limit while it was sent on"
             )
             .is_some(),
             "{:?}",
@@ -365,7 +383,9 @@ fn a_request_whose_body_was_passed_on_is_not_sent_again() {
         assert!(
             record_with(
                 &out.lines,
-                ": failed 502 upstream failed while the body was sent on "
+                "failed",
+                502,
+                "upstream failed while the body was sent on"
             )
             .is_some(),
             "{:?}",
@@ -394,7 +414,13 @@ fn a_trailer_after_the_rest_of_the_body_is_400_and_the_request_to_the_upstream_i
         let out = through(streaming(), ALLOW, &forward, None, &request).await;
         assert_eq!(out.status, Some(400));
         assert!(
-            record_with(&out.lines, ": rejected 400 request trailers not supported ").is_some(),
+            record_with(
+                &out.lines,
+                "rejected",
+                400,
+                "request trailers not supported"
+            )
+            .is_some(),
             "{:?}",
             out.lines
         );
@@ -430,7 +456,13 @@ fn an_upstream_that_reads_the_whole_body_and_never_answers_fails_the_request_aft
             assert!(rig.ctx.upstreams.group(0).left_out(0));
             let _ = rig.finish(task).await;
             assert!(
-                record_with(&lines.take(), ": failed 502 upstream response head failed ").is_some(),
+                record_with(
+                    &lines.take(),
+                    "failed",
+                    502,
+                    "upstream response head failed"
+                )
+                .is_some(),
                 "{}",
                 body.len()
             );
@@ -472,7 +504,7 @@ fn a_client_that_is_silent_for_longer_than_the_body_time_between_two_reads_is_cu
         let lines = rig.lines.clone();
         assert!(!rig.ctx.upstreams.group(0).left_out(0));
         let _ = rig.finish(task).await;
-        assert!(record_with(&lines.take(), ": rejected 408 body not received in time ").is_some());
+        assert!(record_with(&lines.take(), "rejected", 408, "body not received in time").is_some());
         assert!(!got.await.unwrap().complete);
     });
 }
@@ -527,7 +559,7 @@ fn a_client_that_goes_away_in_the_middle_of_the_rest_of_the_body_ends_the_reques
         let _ = rig.finish(task).await;
         let lines = lines.take();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(record_with(&lines, ": closed 0 peer closed during the body ").is_some());
+        assert!(record_with(&lines, "closed", 0, "peer closed during the body").is_some());
         let got = got.await.unwrap();
         assert!(!got.complete);
         assert!(!got.wire.is_empty() && got.wire.len() < 50_000);
@@ -550,7 +582,9 @@ fn a_chunked_body_that_passes_the_wire_limit_while_it_is_passed_on_is_413_and_th
         assert!(
             record_with(
                 &out.lines,
-                ": rejected 413 body over the limit on the wire "
+                "rejected",
+                413,
+                "body over the limit on the wire"
             )
             .is_some(),
             "{:?}",
@@ -579,7 +613,7 @@ fn the_end_of_the_request_time_during_the_rest_of_the_body_is_503_and_the_server
         let lines = rig.lines.clone();
         assert!(!rig.ctx.upstreams.group(0).left_out(0));
         let _ = rig.finish(task).await;
-        assert!(record_with(&lines.take(), ": failed 503 request time used up ").is_some());
+        assert!(record_with(&lines.take(), "failed", 503, "request time used up").is_some());
         assert!(!got.await.unwrap().complete);
     });
 }
@@ -598,8 +632,12 @@ fn the_record_gives_the_announced_length_when_the_request_is_stopped_before_the_
         let lines = rig.lines.clone();
         let _ = rig.finish(task).await;
         let lines = lines.take();
-        let line = record_with(&lines, ": blocked 403 ").expect("the record");
-        assert!(line.ends_with(" body 200000 inspected 1024 cut"), "{line}");
+        let line = record_with(&lines, "blocked", 403, "blocked by a rule").expect("the record");
+        assert_eq!(
+            (&line["body"], &line["inspected"]),
+            (&serde_json::json!(200000), &serde_json::json!(1024)),
+            "{line}"
+        );
     });
 }
 
@@ -637,7 +675,7 @@ fn a_gzip_body_is_held_and_decoded_whole_and_neither_form_may_pass_the_inspected
         )
         .await;
         assert_eq!((over.status, over.seen.len()), (Some(413), 0));
-        assert!(record_with(&over.lines, ": rejected 413 decoded body over the limit ").is_some());
+        assert!(record_with(&over.lines, "rejected", 413, "decoded body over the limit").is_some());
         // Coded: a body that is stored, so that it is longer than what it decodes to, is refused by its own length.
         let mut stored = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
         std::io::Write::write_all(&mut stored, &pattern(INSPECT - 4)).unwrap();
@@ -668,8 +706,11 @@ fn a_request_under_a_route_that_skips_the_inspection_streams_a_long_body_and_doe
             assert!(got.complete);
             assert_eq!(got.body(), body);
             let line =
-                record_with(&out.lines, ": forwarded 200 bypassed by a route ").expect("record");
-            assert!(line.ends_with(" body 200000"), "{line}");
+                record_with(&out.lines, "forwarded", 200, "bypassed by a route").expect("record");
+            assert!(
+                line["body"] == 200000 && line.get("inspected").is_none(),
+                "{line}"
+            );
         }
     });
 }
@@ -797,7 +838,9 @@ fn a_route_may_lower_the_limit_on_the_body_and_it_is_looked_at_before_the_body_i
         assert!(
             record_with(
                 &out.lines,
-                ": rejected 413 body over the limit of the route "
+                "rejected",
+                413,
+                "body over the limit of the route"
             )
             .is_some()
         );
@@ -811,7 +854,7 @@ fn a_route_may_lower_the_limit_on_the_body_and_it_is_looked_at_before_the_body_i
         )
         .await;
         assert_eq!((out.status, out.seen.len()), (Some(413), 0));
-        assert!(record_with(&out.lines, ": rejected 413 body over the limit ").is_some());
+        assert!(record_with(&out.lines, "rejected", 413, "body over the limit").is_some());
         // The limit itself goes through.
         let out = through(
             streaming(),

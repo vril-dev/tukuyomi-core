@@ -308,13 +308,13 @@ fn a_detect_only_generation_lets_a_matched_request_through_and_a_blocking_one_of
     assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
     assert_eq!(reply.message().body, UPSTREAM_BODY.as_bytes());
     proxy.records.conn("the detection record", |l| {
-        l.contains(": forwarded 200 detected by a rule rule 9201 ")
+        is_answer(l, "forwarded", 200, "detected by a rule") && l["rule"] == 9201
     });
     let seen = Message::parse(&proxy.upstream.requests()[0]);
     assert_eq!(seen.start, "GET /block-probe/x HTTP/1.1");
     assert_eq!(exchange(proxy.port, &get("/ok")).status(), 200);
     proxy.records.conn("the forwarded record", |l| {
-        l.contains(": forwarded 200 forwarded rule - ")
+        is_answer(l, "forwarded", 200, "forwarded") && no(l, "rule")
     });
 
     // The same rules in a blocking generation stop the request that the detect generation let through.
@@ -336,7 +336,7 @@ fn a_detect_only_generation_lets_a_matched_request_through_and_a_blocking_one_of
     assert_empty_answer(&exchange(proxy.port, &get("/block-probe/x")), 403);
     proxy
         .records
-        .conn("the blocked record", |l| l.contains(&blocked_by(9201)));
+        .conn("the blocked record", |l| blocked_by(l, 9201));
     proxy.finish(2);
 }
 
@@ -419,7 +419,7 @@ fn a_request_under_a_route_is_forwarded_without_inspection_and_an_ambiguous_one_
     assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
     assert_eq!(reply.message().body, UPSTREAM_BODY.as_bytes());
     proxy.records.conn("the bypass record", |l| {
-        l.contains(": forwarded 200 bypassed by a route rule - ")
+        is_answer(l, "forwarded", 200, "bypassed by a route") && no(l, "rule")
     });
     let seen = Message::parse(&proxy.upstream.requests()[0]);
     assert_eq!(seen.start, "GET /block-probe/pass/x HTTP/1.1");
@@ -438,11 +438,11 @@ fn a_request_under_a_route_is_forwarded_without_inspection_and_an_ambiguous_one_
     let marks = get("/block-probe/%41-._~!$&'()*+,=:@/x");
     assert_eq!(exchange(proxy.port, &marks).status(), 200);
     proxy.records.conns("the bypass records", 3, |l| {
-        l.contains(": forwarded 200 bypassed by a route rule - ")
+        is_answer(l, "forwarded", 200, "bypassed by a route") && no(l, "rule")
     });
     proxy
         .records
-        .conns("the blocked records", 4, |l| l.contains(&blocked_by(9201)));
+        .conns("the blocked records", 4, |l| blocked_by(l, 9201));
     proxy.finish(3);
 }
 

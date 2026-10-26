@@ -63,7 +63,7 @@ fn an_allowed_get_is_forwarded_without_hop_by_hop_fields_and_with_forwarding_fie
     assert_eq!(seen.values("x-forwarded-proto"), ["http"]);
 
     proxy.records.conn("the forwarded record", |l| {
-        l.contains(": forwarded 200 forwarded rule - ")
+        is_answer(l, "forwarded", 200, "forwarded") && no(l, "rule")
     });
     proxy.finish(1);
 }
@@ -96,8 +96,11 @@ fn a_trusted_peer_names_the_client_and_the_inspection_the_upstream_and_the_recor
     assert_eq!(seen.values("x-real-ip"), ["198.51.100.7"]);
     assert_eq!(seen.values("x-forwarded-proto"), ["https"]);
     proxy.records.conn("the forwarded record", |l| {
-        l.contains(": forwarded 200 forwarded rule - ")
-            && l.contains(" client 198.51.100.7 upstream main/")
+        is_answer(l, "forwarded", 200, "forwarded")
+            && no(l, "rule")
+            && l["client"] == "198.51.100.7"
+            && l["upstream"] == "main"
+            && l.get("server").is_some()
     });
 
     // A blocked request is recorded under the same client.
@@ -107,7 +110,7 @@ fn a_trusted_peer_names_the_client_and_the_inspection_the_upstream_and_the_recor
     );
     assert_empty_answer(&blocked, 403);
     proxy.records.conn("the blocked record", |l| {
-        l.contains(&blocked_by(9201)) && l.ends_with(" client 198.51.100.8")
+        blocked_by(l, 9201) && l["client"] == "198.51.100.8" && no(l, "upstream")
     });
 
     // An entry that is not an address leaves the peer as the client.
@@ -117,8 +120,11 @@ fn a_trusted_peer_names_the_client_and_the_inspection_the_upstream_and_the_recor
     );
     assert_eq!(odd.status(), 200, "answer: {:?}", odd.text());
     proxy.records.conn("the record of the odd chain", |l| {
-        l.contains(": forwarded 200 forwarded rule - ")
-            && l.contains(" client 127.0.0.1 upstream main/")
+        is_answer(l, "forwarded", 200, "forwarded")
+            && no(l, "rule")
+            && l["client"] == "127.0.0.1"
+            && l["upstream"] == "main"
+            && l.get("server").is_some()
     });
 
     // A name with an underscore says nothing, not even from a trusted peer: it is not inspected, not forwarded,
@@ -136,8 +142,11 @@ fn a_trusted_peer_names_the_client_and_the_inspection_the_upstream_and_the_recor
     );
     assert_eq!(seen.values("x-forwarded-for"), ["127.0.0.1"]);
     proxy.records.conns("the records under the peer", 2, |l| {
-        l.contains(": forwarded 200 forwarded rule - ")
-            && l.contains(" client 127.0.0.1 upstream main/")
+        is_answer(l, "forwarded", 200, "forwarded")
+            && no(l, "rule")
+            && l["client"] == "127.0.0.1"
+            && l["upstream"] == "main"
+            && l.get("server").is_some()
     });
     proxy.finish(3);
 }
@@ -149,7 +158,7 @@ fn the_uri_rule_blocks_with_its_status_and_the_upstream_is_not_contacted() {
     let blocked = exchange(proxy.port, &get("/block-probe/x"));
     assert_empty_answer(&blocked, 403);
     proxy.records.conn("the blocked record", |l| {
-        l.contains(": blocked 403 blocked by a rule rule 9201 ")
+        is_answer(l, "blocked", 403, "blocked by a rule") && l["rule"] == 9201
     });
     assert_eq!(proxy.upstream.connections(), 0);
 

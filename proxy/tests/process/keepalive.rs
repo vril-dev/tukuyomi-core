@@ -88,7 +88,7 @@ fn requests_share_one_connection_to_the_upstream_and_do_not_ask_it_to_close() {
         assert!(Message::parse(&request).values("connection").is_empty());
     }
     proxy.records.conns("four forwarded records", 4, |l| {
-        l.contains(": forwarded 200 forwarded rule - ")
+        is_answer(l, "forwarded", 200, "forwarded") && no(l, "rule")
     });
     proxy.finish(1);
 }
@@ -134,11 +134,11 @@ fn one_connection_carries_several_requests_in_order_and_a_refusal_does_not_lose_
     );
     assert_eq!(Message::parse(&proxy.upstream.requests()[1]).body, b"ok=1");
     proxy.records.conns("three forwarded records", 3, |l| {
-        l.contains(": forwarded 200 forwarded rule - ")
+        is_answer(l, "forwarded", 200, "forwarded") && no(l, "rule")
     });
     proxy
         .records
-        .conn("the blocked record", |l| l.contains(&blocked_by(9201)));
+        .conn("the blocked record", |l| blocked_by(l, 9201));
     drop(sock);
 
     // A bad second head ends the connection after the answer to the first request, whole, and has no answer.
@@ -158,7 +158,7 @@ fn one_connection_carries_several_requests_in_order_and_a_refusal_does_not_lose_
     );
     assert_eq!(answer.body, UPSTREAM_BODY.as_bytes());
     proxy.records.conn("the refused head", |l| {
-        l.contains(": closed 0 malformed request head ")
+        shows(l, "closed", 0, "malformed request head")
     });
     drop(sock);
 
@@ -201,7 +201,7 @@ fn one_connection_carries_several_requests_in_order_and_a_refusal_does_not_lose_
     sock.shutdown(Shutdown::Write).expect("end the sending");
     assert!(read_until_end(&mut sock).is_empty());
     proxy.records.conn("the 413 record", |l| {
-        l.contains(": rejected 413 body over the limit ")
+        is_answer(l, "rejected", 413, "body over the limit")
     });
     drop(sock);
 

@@ -8,10 +8,12 @@
 //! frames of a header block, which h2 derives from the size of the header list (5 at least).
 //!
 //! Every stream is made into the head of an HTTP/1.1 request (see `head`) and then goes the way of every request
-//! (see `conn`), and is answered as one. A stream that hyper or h2 refuses before it reaches the service (a reset,
-//! a head over the size, a stream over `max_streams`, a client that floods the connection with resets) has no line of
-//! its own. The connection has one at its end, with a fixed reason and the number of streams that reached the
-//! service. A stream is counted when the service is called, before anything is waited for.
+//! (see `conn`), and is answered as one: its answer has a record of the type `request`, also when the head of the
+//! stream could not be made (that record has no method, `Host` or path). A stream that hyper or h2 refuses before it
+//! reaches the service (a reset, a head over the size, a stream over `max_streams`, a client that floods the
+//! connection with resets) has no record of its own. The connection has one of the type `connection` at its end, with
+//! a fixed reason and the number of streams that reached the service. A stream is counted when the service is
+//! called, before anything is waited for.
 //!
 //! A connection is wound down by one `graceful_shutdown` of hyper, which tells the client with a `GOAWAY` that no
 //! new stream is taken, and ends the connection when the streams that are open are done. That is done when one of
@@ -26,7 +28,7 @@
 //! Winding down does not always end the connection: hyper waits for the client to answer a `PING` that it sends
 //! with the `GOAWAY`, and for ever if it does not, and until it is answered h2 takes new streams. So a client that
 //! was told `lingering_timeout` ago is not waited for any more. A stream that begins after that is turned away: it is
-//! reset, is not counted, is not inspected and has no line of its own, and when more than `max_streams` of them have
+//! reset, is not counted, is not inspected and has no record of its own, and when more than `max_streams` of them have
 //! been turned away the connection is dropped at once. Otherwise it is dropped when no stream has been open for
 //! `lingering_timeout`, counted from the end of the last stream or from the `GOAWAY`, whichever is later: a client
 //! that answers the `PING` has that time to take the end of a response that began earlier. Only the streams that began
@@ -75,7 +77,7 @@ use crate::inbound::answer::{Abort, Noted, Reply, answer};
 use crate::inbound::conn::{Ctx, Handled, Scheme, after, peer_gone};
 use crate::inbound::head::{Limits, Reject};
 use crate::inbound::session::{
-    Progress, Session, Summary, Tracked, close_write, first_head_by, linger, lock,
+    Progress, Proto, Session, Summary, Tracked, close_write, first_head_by, linger, lock,
 };
 use crate::inbound::transport::tls::Hosts;
 use crate::log::Log;
@@ -228,12 +230,16 @@ enum Ended {
     Stalled,
 }
 
-/// Serves the connection to its end. `hosts` are those of the certificate of the handshake.
+/// Serves the connection of the listener at `listener` to its end. `hosts` are those of the certificate of the
+/// handshake.
+// One argument for each part of the connection that it is made of; a struct of them would only repeat their names.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::inbound) async fn run<T>(
     stream: T,
     peer: SocketAddr,
     local: SocketAddr,
     ctx: &Arc<Ctx>,
+    listener: usize,
     accept: Instant,
     hosts: Arc<Hosts>,
     settings: Http2Config,
@@ -250,7 +256,16 @@ where
         cfg.conn_total,
         cfg.response_idle,
     );
-    let session = Session::new(ctx, peer, local, accept, Scheme::Https(hosts), gauge);
+    let session = Session::new(
+        ctx,
+        peer,
+        local,
+        listener,
+        Proto::H2,
+        accept,
+        Scheme::Https(hosts),
+        gauge,
+    );
     let life = Life::new(accept);
     let ended = drive(&session, &life, &settings, &mut watch, head_by).await;
     let (reason, lingers) = if watch.timed_out() {
@@ -431,7 +446,7 @@ async fn request(
     req: Request<Incoming>,
     guard: Option<Guard>,
 ) -> Result<Response<Tracked<Guard>>, Abort> {
-    // A stream that began too late is reset, with no line in the record.
+    // A stream that began too late is reset, with no record.
     let mut guard = guard.ok_or(Abort)?;
     let start = Instant::now();
     let no_body = req.body().is_end_stream();
@@ -444,12 +459,7 @@ async fn request(
         Ok(head) => head,
         Err(reject) => {
             let reply = Reply::of(reject);
-            let noted = Noted {
-                reply,
-                client: session.peer.ip(),
-                via: None,
-                body: None,
-            };
+            let noted = Noted::new(session.ctx.ids.mint(), reply, session.peer.ip());
             return Ok(session.track(noted, answer(reply.status), start, guard));
         }
     };
@@ -471,7 +481,8 @@ async fn request(
             Ok(session.track(noted, response, start, guard))
         }
         Err(abort) => {
-            session.note(&noted, start);
+            let mut noted = noted;
+            session.note(&mut noted, start, 0);
             Err(abort)
         }
     }

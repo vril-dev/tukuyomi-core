@@ -16,7 +16,7 @@ fn transfer_encoding_with_content_length_gives_400_and_no_upstream_connection() 
         assert_empty_answer(&reply, 400);
     }
     proxy.records.conns("two malformed-head records", 2, |l| {
-        l.contains(": rejected 400 malformed request head ")
+        is_answer(l, "rejected", 400, "malformed request head")
     });
     assert_eq!(proxy.upstream.connections(), 0);
     proxy.finish(0);
@@ -40,7 +40,7 @@ fn a_content_length_over_the_limit_gives_413_and_no_100_continue() {
     );
     assert_empty_answer(&refused, 413);
     proxy.records.conn("the 413 record", |l| {
-        l.contains(": rejected 413 body over the limit ")
+        is_answer(l, "rejected", 413, "body over the limit")
     });
     assert_eq!(proxy.upstream.connections(), 0);
     proxy.finish(0);

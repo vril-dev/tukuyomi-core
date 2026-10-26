@@ -389,7 +389,12 @@ fn a_request_goes_to_an_upstream_that_speaks_tls_and_its_connection_is_used_agai
     assert_eq!(seen.start, "GET /ok?q=1 HTTP/1.1");
     assert_eq!(seen.values("x-forwarded-proto"), ["http"]);
     proxy.records.conns("the forwarded records", 2, |l| {
-        l.contains(": forwarded 200 forwarded rule - ") && l.contains(" upstream main/127.0.0.1:")
+        is_answer(l, "forwarded", 200, "forwarded")
+            && no(l, "rule")
+            && l["upstream"] == "main"
+            && l["server"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("127.0.0.1:"))
     });
     proxy.finish(0);
     upstream.stop();
@@ -443,9 +448,11 @@ fn a_websocket_echoes_through_an_upstream_that_speaks_tls_in_pieces_of_several_r
         .expect("end the writing side");
     assert!(read_to_close(&mut sock).is_empty());
     proxy.records.conn("the record of the tunnel", |l| {
-        l.contains(": tunnel closed ")
-            && l.contains(" upstream main/")
-            && l.ends_with(&format!(" to-upstream {total} from-upstream {total}"))
+        l["type"] == "tunnel"
+            && l["end"] == "closed"
+            && l["upstream"] == "main"
+            && l["to_upstream"] == total
+            && l["from_upstream"] == total
     });
     let requests = upstream.requests();
     assert_eq!(requests.len(), 1);

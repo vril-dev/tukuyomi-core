@@ -34,7 +34,7 @@ fn the_head_deadline_gives_408_and_the_connection_permits_come_back() {
         assert!(late.took >= SEC, "408 after {:?}", late.took);
     }
     proxy.records.conns("two head-deadline records", 2, |l| {
-        l.contains(": rejected 408 head not received in time ")
+        is_answer(l, "rejected", 408, "head not received in time")
     });
     proxy.finish(1);
 }

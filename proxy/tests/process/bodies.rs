@@ -13,7 +13,7 @@ fn a_urlencoded_body_rule_blocks_a_chunked_body_and_a_clean_one_is_forwarded_wit
     );
     assert_empty_answer(&blocked, 403);
     proxy.records.conn("the blocked record", |l| {
-        l.contains(": blocked 403 blocked by a rule rule 9202 ")
+        is_answer(l, "blocked", 403, "blocked by a rule") && l["rule"] == 9202
     });
     assert_eq!(proxy.upstream.connections(), 0);
 
@@ -48,7 +48,7 @@ fn a_json_body_rule_blocks_a_body_with_a_content_length_and_a_clean_one_is_forwa
     assert_empty_answer(&blocked, 403);
     proxy
         .records
-        .conn("the blocked record", |l| l.contains(&blocked_by(9203)));
+        .conn("the blocked record", |l| blocked_by(l, 9203));
     assert_eq!(proxy.upstream.connections(), 0);
 
     let clean = CLEAN_JSON.as_bytes();
@@ -59,7 +59,7 @@ fn a_json_body_rule_blocks_a_body_with_a_content_length_and_a_clean_one_is_forwa
     assert_eq!(proxy.upstream.requests().len(), 1);
     assert_forwarded_json(&proxy, 0, "POST /api HTTP/1.1", JSON, clean);
     proxy.records.conn("the forwarded record", |l| {
-        l.contains(": forwarded 200 forwarded ")
+        is_answer(l, "forwarded", 200, "forwarded")
     });
     proxy.finish(1);
 }
@@ -81,7 +81,7 @@ fn a_gzip_urlencoded_body_is_inspected_decoded_and_a_clean_one_is_forwarded_deco
     assert_empty_answer(&reply, 403);
     proxy
         .records
-        .conn("the blocked record", |l| l.contains(&blocked_by(9202)));
+        .conn("the blocked record", |l| blocked_by(l, 9202));
     assert_eq!(proxy.upstream.connections(), 0);
 
     // A clean body whose decoded form is much longer than its coded form: the length that reaches the upstream
@@ -117,7 +117,7 @@ fn a_gzip_body_that_decodes_to_more_than_the_limit_gives_413_and_no_upstream_con
     let reply = exchange(proxy.port, &post_coded("/big", URLENCODED, "gzip", &over));
     assert_empty_answer(&reply, 413);
     proxy.records.conn("the 413 record", |l| {
-        l.contains(": rejected 413 decoded body over the limit ")
+        is_answer(l, "rejected", 413, "decoded body over the limit")
     });
     assert_eq!(proxy.upstream.connections(), 0);
 
@@ -159,7 +159,7 @@ fn an_attack_in_the_first_bytes_of_a_long_body_is_blocked_and_one_behind_them_is
     assert_empty_answer(&reply, 403);
     proxy
         .records
-        .conns("the blocked records", 2, |l| l.contains(&blocked_by(9202)));
+        .conns("the blocked records", 2, |l| blocked_by(l, 9202));
     assert_eq!(proxy.upstream.connections(), 0);
 
     // The same argument behind the 16 KiB is not looked at: the body goes through whole.
@@ -184,12 +184,9 @@ fn a_json_body_that_is_cut_is_forwarded_whole_and_byte_for_byte_and_is_not_block
     assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
     assert_forwarded_json(&proxy, 0, "POST /api HTTP/1.1", JSON, &long);
     let line = proxy.records.conn("the cut record", |l| {
-        l.contains(": forwarded 200 forwarded ") && l.contains(" inspected 16384 cut")
+        is_answer(l, "forwarded", 200, "forwarded") && l["inspected"] == 16384
     });
-    assert!(
-        line.ends_with(&format!(" body {} inspected 16384 cut", long.len())),
-        "{line}"
-    );
+    assert_eq!(line["body"], long.len(), "{line}");
 
     // A body that is short enough to be inspected whole, and is broken, is blocked as it always was.
     let mut broken = padded_json("ok", 4096);
@@ -198,7 +195,7 @@ fn a_json_body_that_is_cut_is_forwarded_whole_and_byte_for_byte_and_is_not_block
     assert_empty_answer(&reply, 403);
     proxy
         .records
-        .conn("the broken record", |l| l.contains(&blocked_by(4000001)));
+        .conn("the broken record", |l| blocked_by(l, 4000001));
 
     // An attack in the first bytes of a cut body is blocked.
     let attack = padded_json("block", 150_000);
@@ -206,7 +203,7 @@ fn a_json_body_that_is_cut_is_forwarded_whole_and_byte_for_byte_and_is_not_block
     assert_empty_answer(&reply, 403);
     proxy
         .records
-        .conn("the blocked record", |l| l.contains(&blocked_by(9203)));
+        .conn("the blocked record", |l| blocked_by(l, 9203));
     proxy.finish(1);
 }
 
@@ -248,7 +245,7 @@ fn a_long_chunked_body_reaches_the_upstream_chunked_and_whole_and_one_over_the_l
         String::from_utf8_lossy(&answer)
     );
     proxy.records.conn("the closed record", |l| {
-        l.contains(": closed 0 body over the limit while it was sent on ")
+        shows(l, "closed", 0, "body over the limit while it was sent on")
     });
     assert_eq!(proxy.upstream.requests().len(), 1);
     proxy.finish(2);

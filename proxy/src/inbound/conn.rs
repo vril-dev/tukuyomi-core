@@ -30,7 +30,7 @@
 //! is down. What is inspected and what is forwarded is the same request, in the form that `represent` builds it: the
 //! decoded body, without its `Content-Encoding`, with its decoded length, or, for a body that goes on past the
 //! inspected bytes or is not decoded, the body as the client sent it with its own framing; the edits of the route
-//! come after the inspection and are the only difference. The record line gives the length of the body: its
+//! come after the inspection and are the only difference. The record gives the length of the body: its
 //! `Content-Length` if it has one, and otherwise the bytes read so far.
 //!
 //! The route is found on the bytes received, but an application behind the proxy may read another spelling of a path
@@ -71,22 +71,24 @@ use crate::forward::group::{Route, Upstreams};
 use crate::forward::origin::{self, Forward, OriginBody, OriginError};
 use crate::forward::tunnel::{self, Record, Tunnel};
 use crate::inbound::answer::{
-    Abort, Decision, Noted, Out, Passed, Reply, Sizes, Stop, Via, answer, decide, text, who,
+    Abort, Decision, Noted, Out, Passed, Reply, Sizes, Stop, Via, answer, decide, text,
 };
 use crate::inbound::challenge::{Challenge, Proof};
 use crate::inbound::head::{Head, Reject};
 use crate::inbound::represent::{Represented, gunzip, represent};
+use crate::inbound::session::RequestIds;
 use crate::inbound::transport::io::Gauge;
 use crate::inbound::transport::tls::{Hosts, Tls};
 use crate::inbound::upload::{Cause, Fate, Terms, Upload};
-use crate::inspect::driver::{BodyHold, Hold, Ingress, InspectReq, Msg, Ticket};
+use crate::inspect::driver::{Answer, BodyHold, Hold, Ingress, InspectReq, Judge, Msg, Ticket};
 use crate::log::Log;
 use crate::rules::routes::SharedRoutes;
 
 /// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
 /// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, the
 /// upstream groups with the routes to them and the connections that wait to be used again, the way to the driver,
-/// the TLS of the listeners that end it, and the answer to the challenge of the CA, if the configuration has `acme`.
+/// the TLS of the listeners that end it, the answer to the challenge of the CA, if the configuration has `acme`, and the
+/// numbers of the requests.
 pub struct Ctx {
     pub cfg: ProxyConfig,
     pub budget: Arc<Semaphore>,
@@ -97,6 +99,7 @@ pub struct Ctx {
     pub ingress: Arc<Ingress>,
     pub tls: Tls,
     pub challenge: Option<Challenge>,
+    pub ids: RequestIds,
 }
 
 /// How the listener that took a connection carries its requests: over plain HTTP, or over TLS, with the hosts of the
@@ -123,6 +126,8 @@ pub(super) struct Conn {
     ctx: Arc<Ctx>,
     /// The number of the connection, for the record.
     id: u64,
+    /// The number of the request: in the record, to the upstream and in the response.
+    request: String,
     head: Head,
     peer: SocketAddr,
     /// The address that stands for the client: the peer, or what a trusted peer says (see `client_ip`). The
@@ -145,6 +150,8 @@ pub(super) struct Conn {
     via: Mutex<Option<Via>>,
     /// The size of the body, set when it has been read (or, if it goes on, as far as it has).
     sizes: Mutex<Option<Sizes>>,
+    /// The generation whose rules gave a verdict, set when one did.
+    judged: Mutex<Option<Judge>>,
 }
 
 /// The first bytes of a body, which `read_body` holds, and the rest of it if the body goes on.
@@ -179,6 +186,7 @@ impl Conn {
     pub(super) fn new(
         ctx: &Arc<Ctx>,
         id: u64,
+        request: String,
         head: Head,
         peer: SocketAddr,
         local: SocketAddr,
@@ -195,6 +203,7 @@ impl Conn {
         Conn {
             ctx: ctx.clone(),
             id,
+            request,
             client,
             head,
             peer,
@@ -207,6 +216,7 @@ impl Conn {
             read_done: Arc::new(AtomicBool::new(false)),
             via: Mutex::new(None),
             sizes: Mutex::new(None),
+            judged: Mutex::new(None),
         }
     }
 
@@ -256,12 +266,17 @@ impl Conn {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        let judged = self
+            .judged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         Handled {
             noted: Noted {
-                reply,
-                client: self.client.ip(),
                 via,
                 body,
+                judged,
+                ..Noted::new(self.request.clone(), reply, self.client.ip()).of(&self.head)
             },
             response,
             tunnel,
@@ -286,12 +301,7 @@ impl Conn {
             Proof::Missing => (Reply::answered(404), answer(404)),
         };
         Some(Handled {
-            noted: Noted {
-                reply,
-                client: self.client.ip(),
-                via: None,
-                body: None,
-            },
+            noted: Noted::new(self.request.clone(), reply, self.client.ip()).of(&self.head),
             response: Ok(response),
             tunnel: None,
             stream: None,
@@ -377,6 +387,7 @@ impl Conn {
             peer: self.peer,
             https: matches!(self.scheme, Scheme::Https(_)),
             websocket: websocket.is_some(),
+            id: self.request.clone(),
         };
         let sent = origin::forward(
             forward,
@@ -410,14 +421,17 @@ impl Conn {
         })
     }
 
-    /// The words of the line for the end of the tunnel of this request, which the tunnel holds from the moment it is
-    /// made.
+    /// What the record for the end of the tunnel of this request says besides how it ended, which the tunnel holds
+    /// from the moment it is made.
     fn record(&self) -> Record {
         let via = self.via.lock().unwrap_or_else(PoisonError::into_inner);
         Record {
             log: self.ctx.log.clone(),
-            id: self.id,
-            who: who(self.client.ip(), via.as_ref()),
+            id: self.request.clone(),
+            conn: self.id,
+            client: self.client.ip(),
+            upstream: via.as_ref().map(|via| via.group.clone()),
+            server: via.as_ref().and_then(|via| via.server),
         }
     }
 
@@ -701,11 +715,12 @@ impl Conn {
         }
         drop(sender);
         let by = stage(Instant::now(), self.ctx.cfg.inspect_wait, self.request_by);
-        let outcome = match timeout_at(by, verdict).await {
+        let Answer { outcome, by } = match timeout_at(by, verdict).await {
             Err(_) => return Err(Reply::failed(503, "inspection wait expired").into()),
             Ok(Err(_)) => return Err(Reply::failed(503, "inspection driver gone").into()),
-            Ok(Ok(outcome)) => outcome,
+            Ok(Ok(answer)) => answer,
         };
+        *self.judged.lock().unwrap_or_else(PoisonError::into_inner) = by;
         match decide(outcome) {
             Decision::Pass(passed) => Ok(passed),
             Decision::Answer(reply) => Err(reply.into()),
