@@ -112,6 +112,11 @@ impl Switcher {
         }
     }
 
+    /// The generation that serves.
+    pub fn running(&self) -> Fingerprint {
+        self.running.generation
+    }
+
     /// The driver has answered: the new generation serves (`switched`) or the one that ran goes on.
     pub fn finish(&mut self, switched: bool) {
         if let Some(next) = self.next.take()

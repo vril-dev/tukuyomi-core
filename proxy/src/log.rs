@@ -12,6 +12,11 @@
 //! time it was queued, except for the report, which has the time it was written. The encoding is done on the
 //! logger thread. An encoded record of more than `record::RECORD_MAX` bytes with its line feed is dropped and
 //! counted like a full queue. A write that fails loses its line and is counted apart (`Log::write_errors`).
+//!
+//! In the JSON form the logger can be given a record file (`sink`, `Log::attach`), and then writes every line to it as
+//! well, after the standard error. A line that the file does not take is lost for the file only and is counted apart
+//! (`Log::file_errors`). What was queued before the file was handed over is not written to it. The text form never
+//! has a record file.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -21,9 +26,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use self::record::Record;
+use self::sink::RecordFile;
 
 pub mod counters;
 pub mod record;
+pub mod sink;
 mod time;
 
 /// Longest text of a line item in bytes; a longer text is cut.
@@ -50,6 +57,8 @@ enum Item {
         at: SystemTime,
         record: Record,
     },
+    /// The record file, which the logger writes to as well from then on.
+    File(Box<RecordFile>),
     /// A marker: the logger answers on the channel once every item queued before it is written.
     Flush(SyncSender<()>),
 }
@@ -61,6 +70,8 @@ struct Counts {
     dropped: AtomicU64,
     /// Lines that the logger could not write.
     write_errors: AtomicU64,
+    /// Lines that the logger could not write to the record file.
+    file_errors: AtomicU64,
 }
 
 /// A handle to the record queue. Sending never waits.
@@ -117,6 +128,17 @@ impl Log {
         self.counts.write_errors.load(Ordering::Relaxed)
     }
 
+    /// Lines that could not be written to the record file so far.
+    pub fn file_errors(&self) -> u64 {
+        self.counts.file_errors.load(Ordering::Relaxed)
+    }
+
+    /// Hands the record file to the logger, which writes every line it writes to the standard error to it from then
+    /// on (the items queued before are not). False: the queue did not take the file, and it is closed.
+    pub fn attach(&self, file: RecordFile) -> bool {
+        self.queue.try_send(Item::File(Box::new(file))).is_ok()
+    }
+
     /// Asks the logger to write what it has; true if it answered within `wait`. A marker that does not fit into
     /// the queue, a queue without a logger and a `wait` that overflows the clock all give false at once.
     pub fn flush(&self, wait: Duration) -> bool {
@@ -143,17 +165,29 @@ fn open(capacity: usize) -> (Log, Receiver<Item>) {
     (log, items)
 }
 
-/// Writes one line with its line feed in a single write.
-fn write_line<W: Write>(out: &mut W, counts: &Counts, text: &str) {
-    if out.write_all(format!("{text}\n").as_bytes()).is_err() {
+/// Writes one line with its line feed in a single write, to `out` and then to the record file if there is one. A
+/// write that fails loses the line there and is counted apart.
+fn write_line<W: Write>(out: &mut W, counts: &Counts, file: &mut Option<RecordFile>, text: &str) {
+    let line = format!("{text}\n");
+    if out.write_all(line.as_bytes()).is_err() {
         counts.write_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(file) = file
+        && !file.append(line.as_bytes())
+    {
+        counts.file_errors.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// Writes an encoded line; one that did not fit the limit is dropped and counted.
-fn write_encoded<W: Write>(out: &mut W, counts: &Counts, line: Option<String>) {
+fn write_encoded<W: Write>(
+    out: &mut W,
+    counts: &Counts,
+    file: &mut Option<RecordFile>,
+    line: Option<String>,
+) {
     match line {
-        Some(line) => write_line(out, counts, &line),
+        Some(line) => write_line(out, counts, file, &line),
         None => {
             counts.dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -164,15 +198,23 @@ fn write_encoded<W: Write>(out: &mut W, counts: &Counts, line: Option<String>) {
 /// report. It returns when every handle is gone. A failed write loses that line and nothing more.
 fn run<W: Write>(items: &Receiver<Item>, counts: &Counts, format: Format, out: &mut W) {
     let mut reported = 0;
+    let mut file = None;
     while let Ok(item) = items.recv() {
         let mut ack = None;
         match item {
             Item::Line { at, text } => match format {
-                Format::Text => write_line(out, counts, &text),
-                Format::Json => write_encoded(out, counts, record::encode_line(at, &text)),
+                Format::Text => write_line(out, counts, &mut file, &text),
+                Format::Json => {
+                    write_encoded(out, counts, &mut file, record::encode_line(at, &text));
+                }
             },
             Item::Record { at, record } => {
-                write_encoded(out, counts, record::encode(at, &record));
+                write_encoded(out, counts, &mut file, record::encode(at, &record));
+            }
+            Item::File(next) => {
+                if format == Format::Json {
+                    file = Some(*next);
+                }
             }
             Item::Flush(answer) => ack = Some(answer),
         }
@@ -180,10 +222,18 @@ fn run<W: Write>(items: &Receiver<Item>, counts: &Counts, format: Format, out: &
         if total > reported {
             let count = total - reported;
             match format {
-                Format::Text => write_line(out, counts, &format!("log lines dropped: {count}")),
+                Format::Text => {
+                    write_line(
+                        out,
+                        counts,
+                        &mut file,
+                        &format!("log lines dropped: {count}"),
+                    );
+                }
                 Format::Json => write_encoded(
                     out,
                     counts,
+                    &mut file,
                     record::encode_dropped(SystemTime::now(), count),
                 ),
             }
@@ -234,7 +284,7 @@ impl Lines {
                 let line = match item {
                     Item::Line { at, text } => record::encode_line(at, &text),
                     Item::Record { at, record } => record::encode(at, &record),
-                    Item::Flush(_) => return None,
+                    Item::File(_) | Item::Flush(_) => return None,
                 };
                 let line = line.expect("a record within the limit");
                 Some(serde_json::from_str(&line).expect("a record is a line of JSON"))

@@ -868,6 +868,15 @@ fn config_json(k: &Knobs, listen: SocketAddr, upstreams: &[SocketAddr], root: &P
     .to_string()
 }
 
+/// Adds the object `value` under `key` to the configuration file in the test root `root`.
+pub(crate) fn add_object(root: &Path, key: &str, value: Value) {
+    let path = root.join("config.json");
+    let text = fs::read_to_string(&path).expect("read the configuration");
+    let mut config: Value = serde_json::from_str(&text).expect("parse the configuration");
+    config[key] = value;
+    fs::write(&path, config.to_string()).expect("write the configuration");
+}
+
 pub(crate) fn run_kill(signal: &str, pid: u32) {
     let status = Command::new("kill")
         .arg("-s")

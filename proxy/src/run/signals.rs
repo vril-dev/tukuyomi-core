@@ -12,6 +12,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, timeout_at};
 use tukuyomi_kernel::Failure;
 
+use super::control::{Control, Order};
 use super::status::Status;
 use crate::inbound::transport::accept::{Accepted, Acceptor, Arrival};
 use crate::inspect::driver::{End, Switched};
@@ -69,6 +70,8 @@ pub(super) enum Event {
     Certificates,
     /// The driver answered a switch: whether the new generation serves.
     Switched(bool),
+    /// An order from the control socket.
+    Control(Order),
     Failed(Failure),
     Ended(End),
     Lost(Source),
@@ -81,7 +84,8 @@ pub(super) enum Event {
 
 /// Everything the main thread waits for, behind one poll. The order of the polls is the order of precedence: the
 /// driver's answers and the signals before the connections that ended, those before the next accept. The status
-/// listener answers on its own and is held here only so that the stop can close it.
+/// listener answers on its own and is held here only so that the stop can close it; the control socket gives its
+/// orders to the main loop, which carries them out.
 pub(super) struct Waits {
     term: Signal,
     int: Signal,
@@ -95,6 +99,7 @@ pub(super) struct Waits {
     end: Option<oneshot::Receiver<End>>,
     pub(super) accept: Option<Acceptor>,
     pub(super) status: Option<Status>,
+    pub(super) control: Option<Control>,
     pub(super) conns: JoinSet<()>,
 }
 
@@ -117,6 +122,7 @@ impl Waits {
             end: Some(end),
             accept: None,
             status: None,
+            control: None,
             conns: JoinSet::new(),
         }
     }
@@ -165,6 +171,15 @@ impl Waits {
             return Poll::Ready(answer.map_or(Event::Lost(Source::Switch), |switched| {
                 Event::Switched(switched == Switched::Yes)
             }));
+        }
+        if let Some(control) = self.control.as_mut()
+            && let Poll::Ready(order) = control.poll_order(cx)
+        {
+            match order {
+                Some(order) => return Poll::Ready(Event::Control(order)),
+                // The task of the socket is gone: no order will come.
+                None => self.control = None,
+            }
         }
         if let Some(end) = self.end.as_mut()
             && let Poll::Ready(answer) = Pin::new(end).poll(cx)

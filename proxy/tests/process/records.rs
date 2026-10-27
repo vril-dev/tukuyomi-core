@@ -1,7 +1,11 @@
 //! The records of requests in a real process: the number of a request is the same in its record, in the response
 //! to the client and in the request that the upstream gets, and what the record shows of the request.
 
-use serde_json::json;
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::time::Instant;
+
+use serde_json::{Value, json};
 
 use crate::http2::{Client, add_listener};
 use crate::support::*;
@@ -173,4 +177,117 @@ fn the_text_of_a_request_has_every_byte_that_could_hurt_a_reader_as_a_percent_co
     // Where the request went does not matter here.
     let upstream = proxy.upstream.connections();
     proxy.finish(upstream);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn the_records_are_kept_in_a_file_of_mode_0600_with_the_lines_the_standard_error_has() {
+    let proxy = Proxy::start_with("records_file", Knobs::quick(), |root| {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.join("rec"))
+            .expect("make the directory of the records");
+        add_object(
+            root,
+            "records",
+            json!({ "dir": root.join("rec").to_string_lossy(), "file_bytes": 1 << 20, "files": 2 }),
+        );
+    });
+    let reply = exchange(proxy.port, &get("/ok"));
+    assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
+    let id = response_number(&reply);
+    proxy.records.conn("the forwarded record", |l| {
+        is_answer(l, "forwarded", 200, "forwarded")
+    });
+
+    let file = proxy.root().join("rec").join("records.log");
+    let meta = fs::symlink_metadata(&file).expect("the record file is there");
+    assert!(meta.is_file());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    // The inspector does not inherit the file.
+    for entry in
+        fs::read_dir(format!("/proc/{}/fd", proxy.inspector())).expect("list the descriptors")
+    {
+        let target = fs::read_link(entry.expect("an entry").path()).expect("read a descriptor");
+        assert!(
+            !target.to_string_lossy().ends_with("records.log"),
+            "{target:?}"
+        );
+    }
+    // The file gets a line a moment after the standard error does.
+    let deadline = Instant::now() + 30 * SEC;
+    let text = loop {
+        let text = fs::read_to_string(&file).expect("read the record file");
+        if text.contains(&id) {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "the record is not in the file");
+        std::thread::sleep(20 * MS);
+    };
+    let kept: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a line of the file is a record"))
+        .collect();
+    assert!(
+        kept.iter()
+            .any(|r| r["type"] == "request" && r["id"] == id.as_str()),
+        "{text}"
+    );
+    // Every line is one that the standard error has too. The lines of the start before the file was opened are not
+    // in it, the ones after are.
+    let all = proxy.records.all();
+    assert!(kept.iter().all(|r| all.contains(r)), "{text}");
+    assert!(!text.contains("configuration accepted"), "{text}");
+    assert!(text.contains("start: listening"), "{text}");
+    // The root holds only the configuration and the store at the end.
+    fs::remove_dir_all(proxy.root().join("rec")).expect("remove the records");
+    proxy.finish(1);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_records_directory_that_others_can_reach_ends_the_start_before_the_inspector_runs() {
+    let mut proxy = Proxy::spawn_with("records_open", Knobs::quick(), |root| {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.join("rec"))
+            .expect("make the directory of the records");
+        fs::set_permissions(root.join("rec"), fs::Permissions::from_mode(0o755))
+            .expect("open the directory to others");
+        add_object(
+            root,
+            "records",
+            json!({ "dir": root.join("rec").to_string_lossy(), "file_bytes": 1 << 20, "files": 2 }),
+        );
+    });
+    let started = proxy.started;
+    let (status, _) = proxy.wait_exit(started, MARGIN);
+    let lines = proxy.records.lines();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "exit status {status}; records: {lines:#?}"
+    );
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("start: record file refused: the directory has group or other permission bits"),
+        "records: {lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("kernel") || l.starts_with("stop")),
+        "records: {lines:#?}"
+    );
+    // No inspector was started, and no file was made in the directory.
+    assert_turned_away(proxy.port);
+    assert_eq!(
+        fs::read_dir(proxy.root().join("rec"))
+            .expect("list the directory")
+            .count(),
+        0
+    );
+    proxy.clear_root(&["config.json", STORE, "rec"]);
+    proxy.upstream.stop();
+    assert_eq!(proxy.upstream.connections(), 0);
 }

@@ -11,10 +11,13 @@
 //! and the file system id. Any of the four being 0 refuses it, not the effective id alone, because a process whose
 //! saved id is 0 can return to root, and the file system id owns what the process creates. `check` makes this
 //! refusal before the others, and a command that does not make the others makes this one alone (`not_root`). The
-//! user id that the file system sees (`fs_uid`) is the fourth of the same four.
+//! user id that the file system sees (`fs_uid`) is the fourth of the same four. `private_dir` is the check of a
+//! directory in which the process keeps files for itself: its own, and closed to others.
 
 use std::fs::{self, File};
 use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
 /// SIGCHLD on x86_64 and aarch64 Linux.
 const SIGCHLD: u32 = 17;
@@ -65,6 +68,23 @@ pub fn fs_uid() -> Result<u32, &'static str> {
     let status = read_proc("/proc/self/status", STATUS_READ)
         .map_err(|_| "cannot read the process status")?;
     user_ids_of(&status).map(|ids| ids[3])
+}
+
+/// Looks at `dir` with `lstat`, as the rules store looks at its directory: it must be a real directory (not a link)
+/// without group or other permission bits and owned by `uid`, which is the user id that the file system sees for this
+/// process (`fs_uid`). A refusal is a sentence that stands alone.
+pub(crate) fn private_dir(dir: &Path, uid: u32) -> Result<(), &'static str> {
+    let meta = fs::symlink_metadata(dir).map_err(|_| "the directory cannot be read")?;
+    if !meta.file_type().is_dir() {
+        return Err("the directory is not a real directory");
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err("the directory has group or other permission bits");
+    }
+    if meta.uid() != uid {
+        return Err("the directory is not owned by this user");
+    }
+    Ok(())
 }
 
 /// At most `limit` bytes of a `/proc` file.

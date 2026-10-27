@@ -22,6 +22,7 @@ fn scrape<'a>(counters: &'a Counters, groups: Vec<(&'a str, u64)>) -> Scrape<'a>
         upstream_failures: groups,
         records_dropped: 7,
         record_write_errors: 8,
+        record_file_errors: 9,
     }
 }
 
@@ -69,8 +70,8 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
             samples += 1;
         }
     }
-    assert_eq!(families.len(), 18);
-    assert!(samples >= 18, "{samples}");
+    assert_eq!(families.len(), 19);
+    assert!(samples >= 19, "{samples}");
 
     for line in [
         "tukuyomi_requests_total{class=\"forwarded\"} 1",
@@ -89,6 +90,7 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
         "tukuyomi_upstream_failures_total{group=\"api\"} 2",
         "tukuyomi_records_dropped_total 7",
         "tukuyomi_record_write_errors_total 8",
+        "tukuyomi_record_file_errors_total 9",
     ] {
         assert!(text.lines().any(|have| have == line), "{line} in {text}");
     }

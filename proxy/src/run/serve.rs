@@ -1,5 +1,5 @@
-//! The runtime part of the start: the signal handlers, the status listener, the driver, the wait for the kernel to be
-//! ready, the listeners, and the accept side until something asks for a stop.
+//! The runtime part of the start: the signal handlers, the status listener, the control socket, the driver, the wait
+//! for the kernel to be ready, the listeners, and the accept side until something asks for a stop.
 
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
@@ -8,13 +8,13 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::Instant;
 
-use super::EXIT_FAILED;
 use super::notify::Notify;
-use super::reload::{reload, reload_certificates};
+use super::reload::{control_order, control_while_starting, reload, reload_certificates};
 use super::signals::{Event, Signals, Waits};
 use super::status::{self, Readiness, View};
 use super::stop::{Cause, stop};
-use crate::config::{ForwardConfig, ProxyConfig, StatusConfig, addresses};
+use super::{EXIT_FAILED, control};
+use crate::config::{AdminConfig, ForwardConfig, ProxyConfig, StatusConfig, addresses};
 use crate::forward::group::Upstreams;
 use crate::inbound::challenge::Challenge;
 use crate::inbound::conn::Ctx;
@@ -45,6 +45,7 @@ pub(super) async fn run(
     mut switcher: Switcher,
     ids: RequestIds,
     status: Option<StatusConfig>,
+    admin: Option<AdminConfig>,
     log: Log,
 ) -> u8 {
     let signals = match Signals::install() {
@@ -62,6 +63,17 @@ pub(super) async fn run(
             Ok(listener) => Some(listener),
             Err(_) => {
                 log.line("start: the status address cannot be bound");
+                return EXIT_FAILED;
+            }
+        },
+        None => None,
+    };
+    // The control socket is bound at the same place and for the same reason.
+    let control_socket = match admin {
+        Some(config) => match control::bind(&config.control) {
+            Ok(bound) => Some(bound),
+            Err(why) => {
+                log.line(&format!("start: control socket refused: {why}"));
                 return EXIT_FAILED;
             }
         },
@@ -114,6 +126,16 @@ pub(super) async fn run(
         counters: Counters::start(),
     });
     let readiness = Arc::new(Readiness::new());
+    if let Some(bound) = control_socket {
+        let switch_wait = proxy.ready_wait.saturating_add(control::SWITCH_MARGIN);
+        waits.control = Some(control::serve(
+            bound,
+            state.clone(),
+            readiness.clone(),
+            switch_wait,
+            log.clone(),
+        ));
+    }
     if let Some(listener) = status_listener {
         let view = View::new(ctx.clone(), wait_queue, state, readiness.clone());
         waits.status = Some(status::serve(listener, Arc::new(view)));
@@ -161,6 +183,7 @@ async fn until_stop(
             Event::Ready(Ok(())) => break,
             Event::Reload => log.line("reload: ignored while starting"),
             Event::Certificates => log.line("reload: certificates ignored while starting"),
+            Event::Control(order) => control_while_starting(order, waits, switcher, log),
             event => {
                 if let Some(cause) = Cause::of(event) {
                     return cause;
@@ -189,6 +212,9 @@ async fn until_stop(
             Event::Joined(done) => note_joined(done, log),
             Event::Reload => reload(waits, switcher, ingress, &ctx.counters, log),
             Event::Certificates => reload_certificates(ctx),
+            Event::Control(order) => {
+                control_order(order, waits, switcher, ingress, &ctx.counters, log);
+            }
             Event::Switched(switched) => {
                 ctx.counters.add_switch(if switched {
                     SwitchResult::Switched
@@ -196,6 +222,9 @@ async fn until_stop(
                     SwitchResult::Failed
                 });
                 switcher.finish(switched);
+                if let Some(control) = waits.control.as_mut() {
+                    control.switch_ended(switched, switcher.running(), log);
+                }
             }
             event => {
                 if let Some(cause) = Cause::of(event) {

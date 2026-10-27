@@ -37,9 +37,9 @@ use crate::run::host;
 /// `O_NOFOLLOW` of Linux, which std has no name for. x86_64: the UAPI header `asm-generic/fcntl.h` (and Go's
 /// `syscall/zerrors_linux_amd64.go`). aarch64: Go's `syscall/zerrors_linux_arm64.go`, where the value differs.
 #[cfg(target_arch = "x86_64")]
-const O_NOFOLLOW: i32 = 0o400_000;
+pub(crate) const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(target_arch = "aarch64")]
-const O_NOFOLLOW: i32 = 0o100_000;
+pub(crate) const O_NOFOLLOW: i32 = 0o100_000;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("O_NOFOLLOW is only known for x86_64 and aarch64 Linux");
 /// `O_NONBLOCK` of Linux, the same on x86_64 and aarch64 (the same sources as for `O_NOFOLLOW`).

@@ -9,12 +9,15 @@ use std::path::{Path, PathBuf};
 use super::host;
 use super::serve::run;
 use crate::acme;
-use crate::config::{self, ForwardConfig, ProxyConfig, StatusConfig, addresses};
+use crate::config::{
+    self, AdminConfig, ForwardConfig, ProxyConfig, RecordsConfig, StatusConfig, addresses,
+};
 use crate::forward::resolve;
 use crate::inbound::challenge::Challenge;
 use crate::inbound::session::RequestIds;
 use crate::inbound::transport::tls::{Files, Tls};
 use crate::log::Log;
+use crate::log::sink::RecordFile;
 use crate::rules::bundle::{Fingerprint, Mode};
 use crate::rules::command;
 use crate::rules::routes::Routes;
@@ -76,10 +79,25 @@ pub fn start(log: &Log) -> u8 {
         routes,
         switcher,
         status,
+        records,
+        admin,
     } = match prepare(&path, "start", log) {
         Ok(prepared) => prepared,
         Err(code) => return code,
     };
+    if let Some(records) = &records {
+        let handed = match RecordFile::open(records) {
+            Ok(file) => log.attach(file),
+            Err(why) => {
+                log.line(&format!("start: record file refused: {why}"));
+                return EXIT_FAILED;
+            }
+        };
+        if !handed {
+            log.line("start: record file refused: the logger did not take it");
+            return EXIT_FAILED;
+        }
+    }
     let Some(ids) = RequestIds::new() else {
         log.line("start: no random number is available for the request numbers");
         return EXIT_FAILED;
@@ -106,6 +124,7 @@ pub fn start(log: &Log) -> u8 {
         switcher,
         ids,
         status,
+        admin,
         log.clone(),
     ))
 }
@@ -124,6 +143,10 @@ struct Prepared {
     switcher: Switcher,
     /// Where the status listener is bound, if the configuration has one.
     status: Option<StatusConfig>,
+    /// Where the record file is kept, if the configuration has one.
+    records: Option<RecordsConfig>,
+    /// The admin process settings, if the configuration has them; the proxy binds its control socket.
+    admin: Option<AdminConfig>,
 }
 
 /// The steps of start-up from the configuration to the kernel configuration of the chosen generation, the hold on it
@@ -235,6 +258,8 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         routes,
         switcher: Switcher::new(rules, loaded.kernel, generation, hold),
         status: loaded.status,
+        records: loaded.records,
+        admin: loaded.admin,
     })
 }
 

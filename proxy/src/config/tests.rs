@@ -1976,3 +1976,319 @@ fn a_server_may_not_be_at_the_status_address() {
     pass(&[status("127.0.0.1:9180"), sv("address", "127.0.0.1:9181")]);
     pass(&[status("127.0.0.1:9180"), sv("address", "127.0.0.2:9180")]);
 }
+
+// ---- records ----
+
+fn records(key: &'static str, value: impl Into<Value>) -> Edit {
+    let mut object = serde_json::json!({ "dir": "/var/lib/tukuyomi/records", "file_bytes": 1 << 20, "files": 2 });
+    object[key] = value.into();
+    ("", "records", object)
+}
+
+#[test]
+fn the_records_object_is_left_out_or_has_a_clean_dir_a_size_and_a_count() {
+    assert!(parse(BASE.as_bytes()).unwrap().records.is_none());
+    let loaded = parse(&doc(&[records("files", 64)])).unwrap();
+    assert_eq!(
+        loaded.records,
+        Some(RecordsConfig {
+            dir: PathBuf::from("/var/lib/tukuyomi/records"),
+            file_bytes: 1 << 20,
+            files: 64,
+        })
+    );
+
+    // Each limit and the first value past it.
+    let size = "records file_bytes is not 1 MiB to 1 GiB";
+    pass(&[records("file_bytes", MIB)]);
+    pass(&[records("file_bytes", GIB)]);
+    refuse(&[records("file_bytes", MIB - 1)], size);
+    refuse(&[records("file_bytes", GIB + 1)], size);
+    let count = "records files is not 2 to 64";
+    pass(&[records("files", 2)]);
+    refuse(&[records("files", 1)], count);
+    refuse(&[records("files", 65)], count);
+    let dir = "records dir is not an absolute clean path of at most 3840 bytes";
+    pass(&[records("dir", format!("/{}", "d".repeat(3839)))]);
+    refuse(&[records("dir", format!("/{}", "d".repeat(3840)))], dir);
+    for bad in ["records", "/var/lib/../records", "/var/lib/records/", "/"] {
+        refuse(&[records("dir", bad)], dir);
+    }
+
+    // Every key, as an object, and never null.
+    refuse(
+        &[(
+            "",
+            "records",
+            serde_json::json!({"dir": "/var/lib/r", "files": 2}),
+        )],
+        "configuration has a missing key",
+    );
+    refuse(
+        &[records("path", "/var/lib/r")],
+        "configuration has an unknown key",
+    );
+    refuse(
+        &[records("files", Value::Null)],
+        "configuration has a value of the wrong type",
+    );
+    refuse(
+        &[("", "records", Value::Null)],
+        "configuration has a value of the wrong type",
+    );
+}
+
+// ---- admin ----
+
+fn admin_object() -> Value {
+    serde_json::json!({
+        "listen": "127.0.0.1:9190",
+        "control": "/run/tukuyomi/control.sock",
+        "store": {"kind": "file", "dir": "/var/lib/tukuyomi/admin"},
+        "origin": "https://admin.example.test",
+        "trusted_proxies": ["127.0.0.1/32"],
+        "mfa": "optional",
+        "session_idle_ms": 1_800_000,
+        "session_total_ms": 43_200_000,
+        "crs_dir": "/var/lib/tukuyomi/crs",
+    })
+}
+
+fn admin(key: &str, value: impl Into<Value>) -> Edit {
+    let mut object = admin_object();
+    object[key] = value.into();
+    ("", "admin", object)
+}
+
+fn admin_without(key: &str) -> Edit {
+    let mut object = admin_object();
+    object.as_object_mut().unwrap().remove(key);
+    ("", "admin", object)
+}
+
+#[test]
+fn the_admin_object_is_left_out_or_has_every_key_checked() {
+    assert!(parse(BASE.as_bytes()).unwrap().admin.is_none());
+    let loaded = parse(&doc(&[("", "admin", admin_object())])).unwrap();
+    assert_eq!(
+        loaded.admin,
+        Some(AdminConfig {
+            listen: "127.0.0.1:9190".parse().unwrap(),
+            control: PathBuf::from("/run/tukuyomi/control.sock"),
+            store: AdminStoreConfig::File {
+                dir: PathBuf::from("/var/lib/tukuyomi/admin")
+            },
+            origin: "https://admin.example.test".to_string(),
+            trusted_proxies: vec![Cidr::parse("127.0.0.1/32").unwrap()],
+            mfa: Mfa::Optional,
+            session_idle: Duration::from_millis(1_800_000),
+            session_total: Duration::from_millis(43_200_000),
+            crs_dir: Some(PathBuf::from("/var/lib/tukuyomi/crs")),
+        })
+    );
+    // `crs_dir` may be left out, and the proxy does not look at the other values as the admin process does.
+    assert_eq!(
+        parse(&doc(&[admin_without("crs_dir")]))
+            .unwrap()
+            .admin
+            .unwrap()
+            .crs_dir,
+        None
+    );
+    pass(&[admin("mfa", "required")]);
+
+    // The object is whole, and an object, and not null.
+    refuse(
+        &[admin_without("control")],
+        "configuration has a missing key",
+    );
+    refuse(&[admin("tls", true)], "configuration has an unknown key");
+    refuse(
+        &[admin("crs_dir", Value::Null)],
+        "configuration has a value of the wrong type",
+    );
+    refuse(
+        &[("", "admin", serde_json::json!(["127.0.0.1:9190"]))],
+        "configuration has a value of the wrong type",
+    );
+    refuse(
+        &[("", "admin", Value::Null)],
+        "configuration has a value of the wrong type",
+    );
+}
+
+#[test]
+fn the_admin_listen_address_is_loopback_and_clashes_with_no_listener_and_not_with_the_status_listener()
+ {
+    let not_loopback = "admin listen is not a loopback address";
+    for listen in [
+        "0.0.0.0:9190",
+        "[::]:9190",
+        "192.0.2.1:9190",
+        "[::ffff:127.0.0.1]:9190",
+    ] {
+        refuse(&[admin("listen", listen)], not_loopback);
+    }
+    pass(&[admin("listen", "[::1]:9190")]);
+    refuse(
+        &[admin("listen", "localhost:9190")],
+        "admin listen is not an IP address and port",
+    );
+    refuse(&[admin("listen", "127.0.0.1:0")], "admin listen port is 0");
+
+    let clash = "admin listen is the address of a listener or of the status listener, or one is an unspecified address at the port of the other";
+    refuse(&[admin("listen", "127.0.0.1:8080")], clash);
+    let (at_unspecified, listen) = (at("0.0.0.0:9190"), admin("listen", "127.0.0.1:9190"));
+    refuse(&[at_unspecified, listen.clone()], clash);
+    refuse(&[at("[::]:9190"), admin("listen", "[::1]:9190")], clash);
+    pass(&[at("0.0.0.0:9191"), listen.clone()]);
+    // The status listener and the admin listener cannot share an address either.
+    refuse(&[status("127.0.0.1:9190"), listen.clone()], clash);
+    pass(&[status("127.0.0.1:9191"), listen]);
+}
+
+#[test]
+fn an_upstream_server_may_be_at_the_admin_listen_address() {
+    // The route to the admin process is the way in from outside, unlike a route to a listener or the status listener.
+    pass(&[
+        admin("listen", "127.0.0.1:9190"),
+        sv("address", "127.0.0.1:9190"),
+    ]);
+    refuse(
+        &[
+            admin("listen", "127.0.0.1:9190"),
+            sv("address", "127.0.0.1:8080"),
+        ],
+        "a listener and a server are the same address",
+    );
+}
+
+#[test]
+fn the_admin_paths_and_the_origin_are_clean_and_within_their_limits() {
+    let control = "admin control is not an absolute clean path of at most 107 bytes";
+    pass(&[admin("control", format!("/run/{}", "c".repeat(102)))]);
+    refuse(
+        &[admin("control", format!("/run/{}", "c".repeat(103)))],
+        control,
+    );
+    for bad in [
+        "control.sock",
+        "/run/../control.sock",
+        "/run//control.sock",
+        "/run/control.sock/",
+    ] {
+        refuse(&[admin("control", bad)], control);
+    }
+
+    let dir = "admin store dir is not an absolute clean path of at most 3840 bytes";
+    let store =
+        |kind: &str, dir: String| admin("store", serde_json::json!({"kind": kind, "dir": dir}));
+    pass(&[store("file", format!("/{}", "d".repeat(3839)))]);
+    refuse(&[store("file", format!("/{}", "d".repeat(3840)))], dir);
+    refuse(&[store("file", "admin".to_string())], dir);
+    refuse(
+        &[store("db", "/var/lib/tukuyomi/admin".to_string())],
+        "admin store kind is not supported",
+    );
+    let crs = "admin crs_dir is not an absolute clean path of at most 3840 bytes";
+    pass(&[admin("crs_dir", format!("/{}", "d".repeat(3839)))]);
+    refuse(&[admin("crs_dir", format!("/{}", "d".repeat(3840)))], crs);
+    refuse(&[admin("crs_dir", "crs")], crs);
+
+    let origin = "admin origin is not https:// and a host with an optional port";
+    for good in [
+        "https://admin.example.test",
+        "https://admin.example.test:8443",
+        "https://localhost",
+    ] {
+        pass(&[admin("origin", good)]);
+    }
+    for bad in [
+        "http://admin.example.test",
+        "admin.example.test",
+        "https://",
+        "https://admin.example.test/",
+        "https://admin.example.test/x",
+        "https://admin.example.test?x=1",
+        "https://admin.example.test:0",
+        "https://admin.example.test:65536",
+        "https://*.example.test",
+        "https://Admin.example.test",
+        "https://admin.example.test.",
+        "https://user@admin.example.test",
+    ] {
+        refuse(&[admin("origin", bad)], origin);
+    }
+}
+
+#[test]
+fn the_admin_trusted_networks_mfa_and_session_times_are_within_their_limits() {
+    let many = "admin trusted_proxies has more than 256 entries";
+    pass(&[admin("trusted_proxies", vec!["10.0.0.0/8"; 256])]);
+    refuse(&[admin("trusted_proxies", vec!["10.0.0.0/8"; 257])], many);
+    refuse(
+        &[admin("trusted_proxies", vec!["10.0.0.1/8"])],
+        "admin trusted_proxies has an entry that is not a network",
+    );
+    pass(&[admin("trusted_proxies", Vec::<String>::new())]);
+    refuse(
+        &[admin("mfa", "off")],
+        "admin mfa is not optional or required",
+    );
+
+    // The two times together: the total may not be below the idle time.
+    let sessions = |idle: u64, total: u64| {
+        let mut object = admin_object();
+        object["session_idle_ms"] = idle.into();
+        object["session_total_ms"] = total.into();
+        ("", "admin", object)
+    };
+    let idle = "admin session_idle_ms is not 1 minute to 24 hours";
+    pass(&[sessions(60_000, 60_000)]);
+    pass(&[sessions(86_400_000, 86_400_000)]);
+    refuse(&[sessions(59_999, 1_800_000)], idle);
+    refuse(&[sessions(86_400_001, 604_800_000)], idle);
+    let total = "admin session_total_ms is not session_idle_ms to 7 days";
+    pass(&[sessions(1_800_000, 604_800_000)]);
+    refuse(&[sessions(1_800_000, 1_799_999)], total);
+    refuse(&[sessions(1_800_000, 604_800_001)], total);
+}
+
+#[test]
+fn the_rules_store_the_records_the_admin_store_and_the_control_socket_are_in_places_apart() {
+    let inside =
+        "admin control is inside the rules store dir, the records dir or the admin store dir";
+    let apart = "the rules store dir, the records dir, the admin store dir and the directory of admin control are the same or inside one another";
+    let with_records = records("dir", "/var/lib/tukuyomi/records");
+    pass(&[with_records.clone(), admin("mfa", "optional")]);
+
+    // The socket in the directory of the records, of the admin store or of the rules store.
+    for dir in ["records", "admin", "rules"] {
+        let control = admin("control", format!("/var/lib/tukuyomi/{dir}/control.sock"));
+        refuse(&[with_records.clone(), control], inside);
+    }
+    // The directory of the socket has the other places inside it, or is one of them.
+    refuse(&[admin("control", "/var/lib/tukuyomi/control.sock")], apart);
+    refuse(
+        &[admin(
+            "store",
+            serde_json::json!({"kind": "file", "dir": "/var/lib/tukuyomi/rules/admin"}),
+        )],
+        apart,
+    );
+    // Two places the same, or one inside another; a name that only starts with the other one is no place inside it.
+    refuse(&[records("dir", "/var/lib/tukuyomi/rules")], apart);
+    refuse(&[records("dir", "/var/lib/tukuyomi/rules/records")], apart);
+    refuse(&[records("dir", "/var/lib/tukuyomi")], apart);
+    refuse(
+        &[
+            with_records.clone(),
+            admin(
+                "store",
+                serde_json::json!({"kind": "file", "dir": "/var/lib/tukuyomi/records"}),
+            ),
+        ],
+        apart,
+    );
+    pass(&[records("dir", "/var/lib/tukuyomi/rules2")]);
+}

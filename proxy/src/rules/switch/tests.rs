@@ -113,7 +113,9 @@ fn the_chosen_generation_is_held_until_the_switch_is_finished() {
     assert_eq!(refusal(commands.remove(b)), in_use);
 
     // The new generation serves: the old one is free, the new one is held.
+    assert_eq!(switcher.running(), a);
     switcher.finish(true);
+    assert_eq!(switcher.running(), b);
     commands.activate(b).unwrap();
     assert_eq!(commands.remove(a), Ok(()));
     assert!(matches!(switcher.prepare(), Next::Running(g) if g == b));

@@ -30,6 +30,7 @@ pub(super) struct Scrape<'a> {
     pub(super) upstream_failures: Vec<(&'a str, u64)>,
     pub(super) records_dropped: u64,
     pub(super) record_write_errors: u64,
+    pub(super) record_file_errors: u64,
 }
 
 /// A label value with `\`, `"` and the line feed escaped.
@@ -198,6 +199,12 @@ pub(super) fn render(scrape: &Scrape<'_>) -> String {
         "counter",
         "Records that could not be written.",
         scrape.record_write_errors,
+    );
+    page.single(
+        "tukuyomi_record_file_errors_total",
+        "counter",
+        "Records that could not be written to the record file.",
+        scrape.record_file_errors,
     );
     page.single(
         "tukuyomi_start_time_seconds",

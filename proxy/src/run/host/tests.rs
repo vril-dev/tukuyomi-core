@@ -106,3 +106,43 @@ fn user_ids_that_are_all_above_zero_pass_and_ids_that_cannot_be_read_do_not() {
     assert_eq!(not_root_in("Name:\tproxy\n"), Err(bad));
     assert_eq!(not_root_in(&uids("0\t1\t2")), Err(bad));
 }
+
+#[test]
+fn a_private_directory_is_a_real_directory_of_the_user_closed_to_group_and_others() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+
+    let root = std::env::temp_dir().join(format!("tukuyomi-proxy-host-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let uid = fs_uid().unwrap();
+    assert_eq!(private_dir(&root, uid), Ok(()));
+    // The user id of another owner: a directory of another owner cannot be made without privilege.
+    assert_eq!(
+        private_dir(&root, uid.wrapping_add(1)),
+        Err("the directory is not owned by this user")
+    );
+    for mode in [0o750, 0o705] {
+        fs::set_permissions(&root, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            private_dir(&root, uid),
+            Err("the directory has group or other permission bits")
+        );
+    }
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(root.join("file"), b"").unwrap();
+    symlink(&root, root.join("link")).unwrap();
+    assert_eq!(
+        private_dir(&root.join("file"), uid),
+        Err("the directory is not a real directory")
+    );
+    assert_eq!(
+        private_dir(&root.join("link"), uid),
+        Err("the directory is not a real directory")
+    );
+    assert_eq!(
+        private_dir(&root.join("absent"), uid),
+        Err("the directory cannot be read")
+    );
+    fs::remove_dir_all(&root).unwrap();
+}

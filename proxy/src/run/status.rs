@@ -84,7 +84,7 @@ impl Readiness {
 
     /// `Ok` if requests can be served: the stop has not begun, the forwarding listeners are bound and the kernel that
     /// serves is in `phase` `Ready`. Otherwise the word that says why not.
-    fn check(&self, phase: Phase) -> Result<(), &'static str> {
+    pub(super) fn check(&self, phase: Phase) -> Result<(), &'static str> {
         if self.stopping.load(Ordering::Acquire) {
             Err("stopping")
         } else if !self.bound.load(Ordering::Acquire) {
@@ -156,6 +156,7 @@ impl Source for View {
             upstream_failures: ctx.upstreams.failures().collect(),
             records_dropped: ctx.log.dropped(),
             record_write_errors: ctx.log.write_errors(),
+            record_file_errors: ctx.log.file_errors(),
         })
     }
 }

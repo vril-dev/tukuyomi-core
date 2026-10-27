@@ -48,6 +48,7 @@ impl Cause {
             | Event::Reload
             | Event::Certificates
             | Event::Switched(_)
+            | Event::Control(_)
             | Event::Conn(_)
             | Event::AcceptErr(_)
             | Event::Joined(_) => None,
@@ -108,6 +109,7 @@ impl Stop {
             Event::Lost(_)
             | Event::Ready(_)
             | Event::Switched(_)
+            | Event::Control(_)
             | Event::Late
             | Event::Conn(_)
             | Event::AcceptErr(_) => {}
@@ -136,6 +138,8 @@ pub(super) async fn stop(
     // The listeners are closed here; a connection that was not accepted yet is never accepted. The connections get
     // no sender for a request that starts from now on, and the ones that wait for a request end.
     waits.accept = None;
+    // The control socket is closed and its file removed first of all: a client that waits for an answer gets none.
+    waits.control = None;
     connections.close();
 
     // The driver finishes what it holds by `inspect_by`. The channel has room for this message by construction;

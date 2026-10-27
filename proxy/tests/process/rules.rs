@@ -105,14 +105,14 @@ fn a_store_that_is_refused_ends_the_start_with_exit_code_1_and_its_sentence() {
 }
 
 /// How a command of the binary ended, and what it wrote.
-struct Ran {
-    code: Option<i32>,
-    out: String,
-    err: String,
+pub(crate) struct Ran {
+    pub(crate) code: Option<i32>,
+    pub(crate) out: String,
+    pub(crate) err: String,
 }
 
 /// Runs `tukuyomi-proxy rules <command> <the configuration of the test root> <rest>` and waits for it.
-fn rules(root: &Path, command: &str, rest: &[&OsStr]) -> Ran {
+pub(crate) fn rules(root: &Path, command: &str, rest: &[&OsStr]) -> Ran {
     let output = Command::new(env!("CARGO_BIN_EXE_tukuyomi-proxy"))
         .arg("rules")
         .arg(command)

@@ -1,5 +1,6 @@
 //! The configuration file: one JSON object `{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store":
-//! {..}}, "acme": {..}, "status": {..}}`; every value is chosen by the operator and checked here.
+//! {..}}, "acme": {..}, "status": {..}, "records": {..}, "admin": {..}}`; every value is chosen by the operator and
+//! checked here.
 //!
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present (a
 //! route may leave out its `host`, its `path`, its `access`, its `rewrite`, its `stream` and its `max_body`; `access`
@@ -7,16 +8,17 @@
 //! `tls`, which may leave out its `server_name`; a listener may leave out its `tls` and its `redirect`, and the `tls`
 //! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
 //! may leave out `acme`, which it must have if and only if a certificate has one, see `acme`, and `status`, which
-//! has the one key `listen`, see `status`); an unknown or repeated
+//! has the one key `listen`, see `status`, and `records` and `admin`, see their files); an unknown or repeated
 //! key is refused, and so is a value of the wrong
 //! type, an array in place of an object and `null` for a key that may be left out included (such a key is either left
 //! out or has a value). A refusal is one fixed sentence per kind of fault and never carries a key or a value from the
 //! file. Then the values are checked in a fixed order and the first broken rule is returned: the `proxy` bounds, the
 //! `status` object against the listeners (before `forward`, for no server may be at its address), the `forward`
 //! values (see `forward`; the names of the servers are not looked up here, `forward::resolve` does that when the proxy
-//! starts), the `rules.store` values, the `acme` object with the certificates that have `acme`, the conversion of the
-//! `kernel` object into `tukuyomi_kernel::Config` with that type's own check, and last the relations between the
-//! `proxy` and `kernel` objects.
+//! starts), the `rules.store` values, the `acme` object with the certificates that have `acme`, the `records` object,
+//! the `admin` object against the listeners and the status listener, the directories and the control socket against
+//! each other (see `places`), the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's
+//! own check, and last the relations between the `proxy` and `kernel` objects.
 //!
 //! `max_body` (1 KiB to 4 GiB) is the most bytes a request body may have once decoded (a gzip body under a route
 //! that skips the inspection is not decoded, so the limit counts its coded bytes), and `inspect_body` (1 KiB up to
@@ -58,12 +60,16 @@ use crate::forward::client_ip::Cidr;
 use crate::rules::bundle::Fingerprint;
 
 mod acme;
+mod admin;
 mod forward;
 mod listeners;
+mod places;
+mod records;
 mod rewrite;
 mod status;
 
 pub use acme::AcmeConfig;
+pub use admin::{AdminConfig, AdminStoreConfig, Mfa};
 pub(crate) use forward::MAX_SERVERS;
 pub use forward::{
     Address, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig, Stream,
@@ -72,6 +78,8 @@ pub use listeners::{
     CertificateAcme, CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion,
     TlsConfig, addresses,
 };
+pub(crate) use records::MAX_RECORD_FILES;
+pub use records::RecordsConfig;
 pub use status::StatusConfig;
 
 const MAX_FILE: u64 = 256 * 1024;
@@ -161,6 +169,10 @@ pub struct Loaded {
     pub acme: Option<AcmeConfig>,
     /// There if the file has the `status` object.
     pub status: Option<StatusConfig>,
+    /// There if the file has the `records` object.
+    pub records: Option<RecordsConfig>,
+    /// There if the file has the `admin` object.
+    pub admin: Option<AdminConfig>,
 }
 
 /// Where the rule generations are kept, as the file names it.
@@ -206,6 +218,10 @@ struct RawFile {
     acme: Option<Object<acme::RawAcme>>,
     #[serde(default, deserialize_with = "present")]
     status: Option<Object<status::RawStatus>>,
+    #[serde(default, deserialize_with = "present")]
+    records: Option<Object<records::RawRecords>>,
+    #[serde(default, deserialize_with = "present")]
+    admin: Option<Object<admin::RawAdmin>>,
 }
 
 #[derive(Deserialize)]
@@ -339,14 +355,7 @@ fn parse(bytes: &[u8]) -> Result<Loaded, ConfigError> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| ConfigError("configuration file is not UTF-8"))?;
     let Object(file): Object<RawFile> = serde_json::from_str(text).map_err(|e| refusal(&e))?;
-    build(
-        file.proxy.0,
-        file.forward.0,
-        file.rules.0.store.0,
-        file.kernel.0,
-        file.acme,
-        file.status,
-    )
+    build(file)
 }
 
 /// The fixed sentence for a deserialization fault. The text of the fault is only used to tell the kinds apart.
@@ -370,6 +379,20 @@ fn refusal(e: &serde_json::Error) -> ConfigError {
 
 fn ensure(ok: bool, text: &'static str) -> Result<(), ConfigError> {
     if ok { Ok(()) } else { Err(ConfigError(text)) }
+}
+
+/// A list of networks for a `trusted_proxies`: at most `MAX_TRUSTED`, each in the form `Cidr::parse` takes. `many` and
+/// `bad` are the two sentences of the refusal.
+fn networks(
+    list: &[String],
+    many: &'static str,
+    bad: &'static str,
+) -> Result<Vec<Cidr>, ConfigError> {
+    ensure(list.len() <= MAX_TRUSTED, many)?;
+    list.iter()
+        .map(|text| Cidr::parse(text))
+        .collect::<Option<Vec<Cidr>>>()
+        .ok_or(ConfigError(bad))
 }
 
 fn bytes(value: usize) -> u64 {
@@ -421,14 +444,17 @@ fn inspect_floor(kernel: &tukuyomi_kernel::Config, slice: Duration) -> Option<Du
         .checked_add(steps)
 }
 
-fn build(
-    p: RawProxy,
-    f: forward::RawForward,
-    s: RawStore,
-    k: RawKernel,
-    a: Option<Object<acme::RawAcme>>,
-    st: Option<Object<status::RawStatus>>,
-) -> Result<Loaded, ConfigError> {
+fn build(file: RawFile) -> Result<Loaded, ConfigError> {
+    let RawFile {
+        proxy: Object(p),
+        forward: Object(f),
+        kernel: Object(k),
+        rules: Object(RawRules { store: Object(s) }),
+        acme: a,
+        status: st,
+        records: rec,
+        admin: ad,
+    } = file;
     let listeners = listeners::check(p.listeners)?;
     ensure(within(p.max_conns, 1, 65536), "max_conns is out of range")?;
     ensure(
@@ -518,18 +544,11 @@ fn build(
         within(p.lingering_bytes, 1, 4 * MIB),
         "lingering_bytes is out of range",
     )?;
-    ensure(
-        p.trusted_proxies.len() <= MAX_TRUSTED,
+    let trusted_proxies = networks(
+        &p.trusted_proxies,
         "trusted_proxies has more than 256 entries",
+        "trusted_proxies has an entry that is not a network",
     )?;
-    let trusted_proxies = p
-        .trusted_proxies
-        .iter()
-        .map(|text| Cidr::parse(text))
-        .collect::<Option<Vec<Cidr>>>()
-        .ok_or(ConfigError(
-            "trusted_proxies has an entry that is not a network",
-        ))?;
     ensure(
         within(p.upstream_keepalive, 0, 1024),
         "upstream_keepalive is out of range",
@@ -561,6 +580,11 @@ fn build(
     )?;
 
     let acme = acme::check(a, &listeners)?;
+    let records = records::check(rec)?;
+    // Unlike the status listener, the admin process may be the server of an upstream: `bound` above does not hold
+    // its address.
+    let admin = admin::check(ad, &listeners, status)?;
+    places::separate(&dir, records.as_ref(), admin.as_ref())?;
 
     let kernel = tukuyomi_kernel::Config {
         inspector: PathBuf::from(k.inspector),
@@ -711,6 +735,8 @@ fn build(
         store: StoreConfig::File { dir },
         acme,
         status,
+        records,
+        admin,
     })
 }
 

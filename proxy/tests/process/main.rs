@@ -33,6 +33,7 @@
 mod acme;
 mod bodies;
 mod config_check;
+mod control;
 mod deadlines;
 mod forwarding;
 mod http2;
