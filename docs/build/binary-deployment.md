@@ -1,6 +1,6 @@
 # 実行ファイルの build と配置
 
-この文書は、今の実装を1台の Linux のホストで動かす手順を示す。設定の鍵の意味と範囲、命令、合図、記録の行は [運用リファレンス](../operations/operator-reference.md) に書く。
+この文書は、今の実装を1台の Linux のホストで動かす手順を示す。設定の鍵の意味と範囲、命令、合図、記録、監視は [運用リファレンス](../operations/operator-reference.md) に書く。
 
 ここに出てくる置き場の path（`/opt/tukuyomi-core`、`/etc/tukuyomi-core`、`/var/lib/tukuyomi-core`）と利用者の名前（`tukuyomi`）は例である。設定の path は、どれも絶対の path で書く（`.`・`..`・空の要素・末尾の `/` は断られる）。
 
@@ -145,14 +145,16 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 User=tukuyomi
 Group=tukuyomi
 ExecStart=/opt/tukuyomi-core/bin/tukuyomi-proxy /etc/tukuyomi-core/config.json
 ExecReload=/bin/kill -USR2 $MAINPID
 KillMode=mixed
 KillSignal=SIGTERM
+TimeoutStartSec=90
 TimeoutStopSec=60
+LogRateLimitIntervalSec=0
 Restart=on-failure
 RestartSec=5
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -171,7 +173,13 @@ WantedBy=multi-user.target
   - 既定の `control-group` では、停止の SIGTERM が検査プロセスにも届く。
   - 検査プロセスは SIGTERM を扱わないので、その場で終わる。proxy が検査プロセスを順に止めること（検査の残りを終え、終わりの知らせを受ける）ができない。
   - `mixed` では SIGTERM は proxy だけに届く。proxy は自分で検査プロセスを止めてから終わる。
-- `TimeoutStopSec` は、`stop_wait_ms` と `kill_grace_ms` を足した時間より長くする。停止の流れは [運用リファレンス](../operations/operator-reference.md) の「停止」にある。
+- `Type=notify` にする。proxy は、検査核の準備ができて待ち受けを全部 bind した後に `READY=1` を、停止の始めに `STOPPING=1` を systemd へ送る。`systemctl start` と、この unit の後に `After=` で並べた unit は、そこまで待つ。`Type=simple` では、実行した時点で起動したと見なされる。
+  - 知らせを送るのは proxy の主プロセスだけである。`NotifyAccess` は既定（`main`）のままでよい。
+  - `TimeoutStartSec` は、上流の名前を引く時間（`resolve_timeout_ms`）と、検査核の準備を待つ時間（`ready_wait_ms`）を足した時間より長くする。`READY=1` が届かないと、systemd はこの時間の後に proxy を止める。
+- `TimeoutStopSec` は、`stop_wait_ms` と `kill_grace_ms` と、記録の書き出しの 200 ms を足した時間より長くする。短いと、systemd が先に SIGKILL を送る。停止の流れは [運用リファレンス](../operations/operator-reference.md) の「停止」にある。
+- `LogRateLimitIntervalSec=0` を置く。journald の既定の流量の上限では、混んだときに要求の記録が journal に入らずに落ちる。
+- 記録は journal に入る。保存の期間と容量は、journald の設定（`/etc/systemd/journald.conf` の `SystemMaxUse`、`MaxRetentionSec` など）で決める。記録には client の address と path が入るので、journal を読める組（Ubuntu では `adm`・`systemd-journal`）に入れる利用者を絞る。記録の形は [運用リファレンス](../operations/operator-reference.md) の「記録」にある。
+- 監視の待ち受け（設定の `status`）を置くと、同じ host の監視の program から `/healthz`・`/readyz`・`/metrics` を引ける。ロードバランサーの準備の確かめには `/readyz` を使う。
 - 合図は proxy の主プロセスだけに送る（`ExecReload` の `$MAINPID`、または `systemctl kill --kill-whom=main`）。
   - `--kill-whom=main` を付けない `systemctl kill` は、検査プロセスにも合図を送る。
   - 検査プロセスは、SIGUSR1・SIGUSR2 は無視するが、SIGTERM・SIGINT・SIGHUP が届くと終わる。

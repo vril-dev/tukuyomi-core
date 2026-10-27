@@ -1,6 +1,6 @@
 # 運用リファレンス
 
-この文書は、今の実装の命令、合図、設定ファイルの鍵、ルールセットの扱い、要求の扱い、記録の行を、引いて使える形でまとめる。置き方と systemd の例は [実行ファイルの build と配置](../build/binary-deployment.md) に書く。
+この文書は、今の実装の命令、合図、設定ファイルの鍵、ルールセットの扱い、要求の扱い、記録、監視を、引いて使える形でまとめる。置き方と systemd の例は [実行ファイルの build と配置](../build/binary-deployment.md) に書く。
 
 例の path と名前（`/etc/tukuyomi-core/config.json`、利用者 `tukuyomi`、`example.com` など）は例である。
 
@@ -22,17 +22,20 @@ tukuyomi-proxy <config>
   3. 上流の server の名前の解決と、上流の組の CA のファイル
   4. TLS の待ち受けの証明書と鍵
   5. ルールの保管場所と、選んだ世代
-  6. 検査核の起動と、検査プロセスの準備
-  7. 待ち受けの bind
+  6. 監視の待ち受け（設定に `status` があるとき）の bind
+  7. 検査核の起動と、検査プロセスの準備
+  8. 待ち受けの bind
+- 監視の待ち受けは、検査プロセスより前に bind する。bind できなければ、検査プロセスを起動せずに止まる（exit 1）。
 - 待ち受けは、検査核の準備ができてから、全部を bind する。1つでも bind できなければ、どれも使わずに止まる。
 - 合図を扱う処理は、5 の後に入る。それより前（名前の解決は最長 `resolve_timeout_ms` かかる）に届いた合図は、どれも proxy をそのまま終わらせる。
-- 記録には、準備ができると `start: the kernel is ready`、待ち受けを始めると `start: listening` が出る。
+- 記録には、準備ができると `start: the kernel is ready`、待ち受けを始めると `start: listening` の文が出る（`line` の記録。下の「記録」）。
+- 環境に `NOTIFY_SOCKET` があれば、待ち受けを全部 bind した後に `READY=1` を送る（下の「systemd への知らせ」）。
 - exit code は次のとおり。
 
 | exit code | 意味 |
 |---|---|
 | 0 | 合図で止まり、検査核の停止（検査プロセスの終わりと作業場所の削除）まで確かめられた |
-| 1 | ほかの終わり方。root での起動、起動の前の確かめの失敗、引けない上流の名前、使えない CA のファイル、断られた証明書や鍵、断られた保管場所や世代も含む（このときは何も起動していない） |
+| 1 | ほかの終わり方。root での起動、起動の前の確かめの失敗、引けない上流の名前、使えない CA のファイル、断られた証明書や鍵、断られた保管場所や世代、bind できない監視の待ち受けも含む（このときは何も起動していない） |
 | 2 | 引数の誤り、または設定ファイルが断られた |
 
 ### `config check`
@@ -145,16 +148,16 @@ tukuyomi-proxy acme renew <config>
   - 新しい方が起動に失敗するか、`ready_wait` の中に準備できなければ、古い方がそのまま検査を続ける。
 - 検査しない経路の表は、新しい世代が要求を受け始めるときに一緒に入れ替わる。
 - 切り替えの間は検査プロセスが2つになり、メモリもおよそ2倍になる。CRS 4.23.0 で測った検査プロセスは、1つ約 52 MB だった。
-- 合図の処理が入ってから待ち受けを bind するまでの間、切り替えの途中、停止の間に受けた SIGUSR1 は、記録の行を出すだけで何もしない。今と同じ世代が選ばれているときも、その旨の行を出すだけである。
+- 合図の処理が入ってから待ち受けを bind するまでの間、切り替えの途中、停止の間に受けた SIGUSR1 は、記録に文を1つ出すだけで何もしない。今と同じ世代が選ばれているときも、その旨の文を出すだけである。
 - 使っている間、proxy は世代の印（保管場所の `using/<指紋>`）に共有の lock を持つ。そのため `rules remove` は、使用中の世代を消せない。
 
 ### SIGUSR2（証明書の読み直し）
 
 - 読み直したすべての証明書と鍵が確かめに通ったときだけ、まとめて入れ替える（確かめの中身は下の `proxy.listeners` の `cert_file`・`key_file`）。入れ替えた後に始まる handshake から、新しいものを使う。開いている接続は、今のものを使い続ける。
-- 1つでも通らなければ、どれも入れ替えず、どれが通らなかったかの行を出す。
+- 1つでも通らなければ、どれも入れ替えず、どれが通らなかったかの文を記録に出す。
 - `acme` を持つ証明書でファイルが無いものは、断る理由にならない。行を出して handshake から外し、ファイルができた後の SIGUSR2 で使い始める。動いている間にファイルを消してから SIGUSR2 を送ると、その証明書も handshake から外れ、その host への接続は失敗する。
 - 上流の組の CA のファイルは、SIGUSR2 では読み直さない。
-- 合図の処理が入ってから待ち受けを bind するまでの間と、停止の間に受けた SIGUSR2 は、記録の行を出すだけである。SIGUSR1 とは関係しない。
+- 合図の処理が入ってから待ち受けを bind するまでの間と、停止の間に受けた SIGUSR2 は、記録に文を1つ出すだけである。SIGUSR1 とは関係しない。
 
 ### 読み直さないもの
 
@@ -169,13 +172,13 @@ tukuyomi-proxy acme renew <config>
 
 最初の止める理由（合図、起動か driver の失敗）の時刻を t0 とする。
 
-1. 待ち受けを閉じ、新しい要求を断る。次の要求を待っている接続は閉じる。
+1. 待ち受けを閉じ、新しい要求を断る。次の要求を待っている接続は閉じる。`/readyz` は 503 `stopping` になり、`NOTIFY_SOCKET` があれば `STOPPING=1` を送る。
 2. 検査は `t0 + stop_inspect` までに終える。
-3. 接続は `t0 + stop_wait` まで待ち、残りは打ち切る。WebSocket の tunnel は停止では終わらず、このときに打ち切られる。
+3. 接続は `t0 + stop_wait` まで待ち、残りは打ち切る。WebSocket の tunnel は停止では終わらず、このときに打ち切られる。この後に監視の待ち受けを閉じる。
 4. 検査核の終わりを `t0 + stop_wait + kill_grace` まで待つ。
 5. 記録を最長 200 ms 書き出して終わる。
 
-最後に `stop: kernel ..., bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` の行が出る。検査核の終わりが確かめられなかったときは、代わりに `stop: the driver stopped: ...` か `stop: the driver gave no end` が出る。
+最後に `stop: kernel ..., bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` の文が出る。検査核の終わりが確かめられなかったときは、代わりに `stop: the driver stopped: ...` か `stop: the driver gave no end` が出る。
 
 - `bye true` は、検査プロセスが終わりの知らせを送ってから終わったことを示す。
 - exit code が 0 になるのは、止めた理由が失敗でなく、止めた検査核（切り替えで前に止めたものも含む）のすべてで、検査プロセスの終わりと作業場所の削除が確かめられたときだけである。
@@ -185,8 +188,10 @@ tukuyomi-proxy acme renew <config>
 ### 全体の形
 
 ```text
-{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store": {..}}, "acme": {..}}
+{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store": {..}}, "acme": {..}, "status": {..}}
 ```
+
+- `acme` と `status` は省いてよい（下のそれぞれの節）。
 
 - UTF-8 の JSON の1つの object で、256 KiB までである。
 - 値に既定値は無い。省いてよいと書いた鍵のほかは、すべて書く。
@@ -514,9 +519,9 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
   - `_` を含む名前
   - 接続に属する field（`Connection`、`Keep-Alive`、`Transfer-Encoding`、`Upgrade` など）
   - client の address を伝える field（`X-Forwarded-For`、`X-Forwarded-Proto`、`X-Real-IP`、`Forwarded` など）
-  - `Host`、`X-Forwarded-Host`
+  - `Host`、`X-Forwarded-Host`、`X-Request-ID`
   - 本文の長さと型を伝える field（`Content-Length`、`Content-Type`、`Content-Encoding`）
-- 応答の field では、接続に属する field、`Set-Cookie`、本文の長さと型と範囲を伝える field（`Content-Length`、`Content-Type`、`Content-Encoding`、`Content-Range`）は書けない。proxy が自分で作る答えは書き換えない。
+- 応答の field では、接続に属する field、`Set-Cookie`、`X-Request-ID`、本文の長さと型と範囲を伝える field（`Content-Length`、`Content-Type`、`Content-Encoding`、`Content-Range`）は書けない。proxy が自分で作る答えは書き換えない。
 - 書き換えの順は、要求の field、`Host`、target（path、次に query）である。`X-Forwarded-Host` は、その前に client が送った `Host` から作る。
 - 書き換えは、経路を引いて検査した後に1回だけする。そのため、WAF の規則と除外、検査しない経路、`access` は、公開側（書き換えの前）の path と `Host` で書く。2つの公開の接頭辞が同じ内部の path に入るときも、片方の公開の path に向けた規則は、もう片方には効かない。
 - form の本文の引数は、`query` の書き換えの対象ではない。
@@ -547,7 +552,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
   - すべてが信じる proxy なら、いちばん左を client とする。
   - IP の literal でない項目があれば、そこで読むのをやめ、相手を client とする。
 - 信じない相手からの要求では、相手が client である。その `X-Forwarded-For` などの申告は捨てる。
-- この client の address を、検査、`access`、記録の行に使う。
+- この client の address を、検査、`access`、記録に使う。
 
 上流へ送る要求には、次の field を付ける。
 
@@ -556,6 +561,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 | `X-Forwarded-For` | 信じる相手からの要求: 受けた行に相手の address を足したもの。ほか: 相手の address だけ |
 | `X-Forwarded-Proto` | 信じる相手が `http` か `https` ちょうどを送ったときはそれ。ほか: 待ち受けの scheme（TLS の待ち受けは `https`、ほかは `http`） |
 | `X-Forwarded-Host` | client が書いた `Host`（相手を問わない） |
+| `X-Request-ID` | 要求の番号（下の「記録」の `id`）。client が送ったものは、相手を問わず捨てて置き換える |
 
 ### `kernel`
 
@@ -609,6 +615,19 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 - `challenge_dir` の直下に、これらのファイルや、ほかの証明書の `cert_file`・`key_file` を置かない。
 - 普通の待ち受けか redirect の待ち受けが、少なくとも1つ要る（CA は平文の HTTP で challenge を取りに来る）。
 
+### `status`
+
+監視の待ち受け（下の「監視」）を置くときだけ書く。省けば、監視の待ち受けは無い。
+
+| 鍵 | 範囲 | 意味 |
+|---|---|---|
+| `listen` | loopback の IP（`127.0.0.0/8` か `::1`）と port（0 は不可） | 監視の待ち受けの address |
+
+- 答えに認証が無いので、同じ host の監視の program から使う。`::ffff:127.0.0.1` の形は loopback と見なさない。
+- 待ち受け（`proxy.listeners`）と重ならない（待ち受けどうしと同じ決まり。`0.0.0.0`・`::` と同じ port も重なる）。
+- 上流の server（書いた address も、名前を引いた address も）は、この address にできない。待ち受けの address と同じく断る。
+- 待ち受けの数（1〜8）にも、「普通か TLS の待ち受けが少なくとも1つ」にも数えない。
+
 ### 値どうしの関係
 
 起動と `config check` は、値の範囲のほかに、次の関係を確かめる。
@@ -654,7 +673,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 - gzip の本文:
   - 検査する経路: 全体をためてほどく。gzip のままの長さも、ほどいた長さも、`inspect_body`（経路の `max_body` がそれより小さければ、その値）までで、どちらかが超えれば 413。gzip として読めない本文、gzip の後ろに続くバイト、空の gzip の本文は 400。ほどいた本文を `Content-Encoding` 無しで検査し、そのまま転送する。
   - 検査しない経路: ほどかない。ほかの本文と同じに扱い、上限は gzip のままの長さで数える。
-- chunked の本文を流している途中で `max_body` を超えたときは、413 は返せない（上流へ送り始めている）。上流への要求を切り、client の接続を閉じ、記録の行に理由を書く。
+- chunked の本文を流している途中で `max_body` を超えたときは、413 は返せない（上流へ送り始めている）。上流への要求を切り、client の接続を閉じ、記録に理由を書く。
 - 予算（`max_buffered_bytes`）:
   - 本文を流す1つの要求が持つのは、検査の間は、先頭の `inspect_body`、検査核の写し（先頭と field）、流すための小さな buffer（32 KiB）である。判定が出た後は、先頭の `inspect_body` と 32 KiB の buffer だけになる。本文の長さでは増えない。検査しない経路には、検査核の写しは無い。
   - 同時に進む要求の数だけ要るので、予算は、同時に来ると見込む最大の数に合わせて決める。
@@ -680,7 +699,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 ### 検知だけのモード
 
-- `rules import --detect-only` で作った世代は、規則に当たった要求も通す。記録の行は `forwarded <状態> detected by a rule rule <規則の id>` になる。
+- `rules import --detect-only` で作った世代は、規則に当たった要求も通す。要求の記録は class `forwarded`、reason `detected by a rule` で、`rule` に当たった規則の id が入る。
 - 遮断の世代と同じルールのファイルで、遮断するかどうかだけが違う。最初はこの形で動かし、誤検知を見て除外を足してから、遮断の世代を取り込み直すとよい。
 - 検知だけの世代でも、下の「検査プロセスが足す決まり」の規則は遮断する。
 - 検知だけの世代は、ルールの前と後に印の規則（id 4000010、4000011）を足す。運用者の規則でこれを消したり飛ばしたりすると、その要求は検査できないとして 503 になる。黙って遮断や素通しにはならない。
@@ -754,7 +773,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 ほかの違反は 400 になる。断るときの応答は本文が無い。
 
 - HTTP/1.1 の接続の最初の要求では、応答を返して接続を閉じる。
-- 2つ目からの要求の head を断るときは、応答を返さない。前の応答を送り終えてから接続を閉じ、記録は `closed 0 <理由>` になる。
+- 2つ目からの要求の head を断るときは、応答を返さない。前の応答を送り終えてから接続を閉じ、記録は class `closed`、status 0 の接続の記録になる。
 - HTTP/2 の stream の field も、HTTP/1.1 の head の形に書き直してから、同じ決まりで確かめる。断るときは、その stream にだけ応答を返し、接続は続ける。
 
 - 名前に `_` を含む field は、検査もせず転送もしない。上流の多くのサーバーは `X_Forwarded_For` と `X-Forwarded-For` を同じ変数に読むので、client がその名前で proxy の付ける address を装えないようにするため。
@@ -786,57 +805,156 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 proxy が自分で作る答えは、本文が空で `Content-Length: 0` を持つ（204・304 は `Content-Length` を持たない）。ACME の challenge の 200 は、そのファイルを本文に持つ。
 
-## 記録の行
+proxy が返すすべての応答（上流の応答、遮断、head の拒否、redirect も含む）は、要求の番号を `X-Request-ID` に1つ持つ。上流の応答に同じ名前の field があれば置き換える。番号は、その要求の記録の `id` と同じなので、断られた人が番号を伝えれば記録を引ける。
 
-記録は標準エラーに1行ずつ出る（systemd では journal）。
+## 記録
 
-- 行が詰まって書けないときは捨て、書けるようになってから捨てた数の行を出す。
-- 1行は 512 バイトまでで、長い行は切る。制御文字は空白にする。
+記録は、標準エラーに1行1件の JSON で出る（systemd では journal）。短い命令（`config check`・`rules`・`acme`）の出力は、人が読む文の行のままである。
 
-### 要求の行
+どの記録も、次の2つの項目で始まる。値の無い項目は書かない（`null` にしない）。
+
+| 項目 | 中身 |
+|---|---|
+| `ts` | 記録した時刻。UTC の RFC 3339 で ms まで（例: `2026-10-27T03:53:27.123Z`） |
+| `type` | `request`、`connection`、`tunnel`、`line`、`dropped` のどれか |
+
+### 要求の記録（`request`）
+
+client へ答えを書いた要求ごとに1件出る。head の拒否、redirect、ACME の challenge の答えも含む。応答を送り終えたとき（または切れたとき）に書くので、長い応答の記録は応答の終わりに出る。
 
 ```text
-conn <接続の番号>: <class> <状態> <理由> rule <規則の id か -> <時間> ms client <address>[ upstream <組>/<server>][ body <長さ>[ inspected <長さ> cut]]
+{"ts":"2026-10-27T03:53:27.123Z","type":"request","id":"0186af5443bddbd9-1","conn":1,"listener":0,"proto":"h1","tls":false,"client":"192.0.2.10","method":"GET","host":"example.com","path":"/q","class":"blocked","status":403,"reason":"blocked by a rule","ms":3,"mode":"block","generation":"2f3bda9b9ca7db60","rule":949110,"rules":[941100,941110],"severity":2,"score":10,"sent":0}
 ```
 
-- `class`: 次のどれかである。
-
-  | class | とき |
-  |---|---|
-  | `forwarded` | 上流の応答を返した |
-  | `blocked` | 規則が遮断した |
-  | `rejected` | head か本文が断られた。経路で断った 403・404・421 と、redirect の待ち受けの 404 も含む |
-  | `redirected` | https へ redirect した |
-  | `answered` | ACME の challenge に答えた |
-  | `failed` | こちらの理由で答えられなかった（混んでいる、検査できない、上流の失敗） |
-  | `closed` | 何も答えなかった |
-
-- `理由`: 決まった英語の語句である（例: `malformed request head`、`body over the limit`、`inspection queue full`、`upstream connection failed`）。`forwarded` の行では、次のどれかになる。
-  - `forwarded`: 検査で許した
-  - `detected by a rule`: 検知だけのモードで規則に当たった
-  - `bypassed by a route`: 検査しない経路
-  - `closed while the response was sent`: 応答を送り終える前に切れた
-- `rule`: 遮断した規則か、当たった規則の id。無ければ `-`。
-- `client`: 上の「client の address」で決めた address。要求を読む前の行では、接続の相手の address になる。
-- `upstream <組>/<server>`: 上流の組へ回した要求に付く。server を1つも試せなかったときは `<組>/-` になる。
-- `body <長さ>`: 本文を読み始めた、長さが 0 でない要求に付く。長さは `Content-Length` があればそれ、無ければそれまでに読んだバイト数である（gzip の本文は gzip のままの長さ）。経路で断った要求と、本文の先頭を読み終えられなかった要求には付かない。
-- `inspected <長さ> cut`: 先頭だけを検査して残りを流した要求に付く。`<長さ>` は検査したバイト数である。検査しない経路で流した本文には付かない。
-- 行は、応答を送り終えたとき（または切れたとき）に書く。長い応答の行は、応答の終わりに出る。
-
-行には、数、決まった語、設定の組の名前、正規の形の address だけが入る。要求の中身（path、field の値など）は入らない。
-
-### ほかの行
-
-| 行 | とき |
+| 項目 | 中身 |
 |---|---|
-| `conn <番号>: tunnel <理由> <秒> s client <address> upstream <組>/<server> to-upstream <バイト> from-upstream <バイト>` | WebSocket の tunnel が終わった（動く前に終わったときも出る）。理由は `closed`（両方の向きが終わった）、`idle`、`total`、`error`、`stop`（停止で打ち切った）のどれか。秒は切り捨て |
-| `conn <番号>: internal fault: <理由>` | proxy の中の不整合 |
+| `id` | 要求の番号。応答の `X-Request-ID` と、上流へ送る `X-Request-ID` と同じ。起動ごとの乱数の16桁と、要求ごとの通し番号を `-` でつないだもの。HTTP/2 では stream ごとに1つ |
+| `conn` | 接続の番号 |
+| `listener` | 受けた待ち受けの番号（設定の `listeners` の順で、0 から） |
+| `proto` | `h1` か `h2` |
+| `tls` | TLS の待ち受けか |
+| `client` | 上の「client の address」で決めた address。head を読む前の答えでは、接続の相手の address |
+| `method`、`host`、`path` | 要求の method、`Host`（HTTP/2 では `:authority`）、target の `?` より前（受けたまま）。head の確かめに通らなかった要求には無い |
+| `cut` | 上限で切った項目の名前の一覧（例: `["path"]`） |
+| `class` | 下の表 |
+| `status` | 答えた状態コード（何も答えなかったときは 0） |
+| `reason` | 決まった英語の語句（例: `malformed request head`、`body over the limit`、`inspection queue full`、`upstream connection failed`） |
+| `ms` | かかった時間（ミリ秒） |
+| `upstream`、`server` | 上流の組の名前と、最後に試した server の address（試していなければ `server` は無い） |
+| `mode`、`generation` | 判定したルールの世代のモード（`block` か `detect`）と、世代の指紋の先頭16桁。検査しなかった要求には無い |
+| `rule` | 遮断した規則、または検知だけのモードで当たった規則の id |
+| `rules` | ほかに当たった規則の id。評価の順に16個まで。記録しない規則（`nolog`）と、検査プロセスが足す決まり（4000001〜4000011）は入らない |
+| `rules_more` | 16個より多く当たったとき `true` |
+| `severity` | 当たった規則の重さのうち、いちばん重いもの（0 が最も重い。規則の `severity` の数） |
+| `score` | CRS の inbound の anomaly score（`tx.blocking_inbound_anomaly_score`）。0 のときと、CRS の無いルールセットでは無い |
+| `body` | 本文の長さ。`Content-Length` があればそれ、無ければそれまでに読んだバイト数（gzip の本文は gzip のままの長さ）。本文の無い要求、経路で断った要求、本文の先頭を読み終えられなかった要求には無い |
+| `inspected` | 先頭だけを検査して残りを流した要求の、検査したバイト数。検査しない経路で流した本文には無い |
+| `sent` | client へ送った応答の本文のバイト数 |
+
+`class` は次のどれかである。
+
+| class | とき |
+|---|---|
+| `forwarded` | 上流の応答を返した |
+| `blocked` | 規則が遮断した |
+| `rejected` | head か本文が断られた。経路で断った 403・404・421 と、redirect の待ち受けの 404 も含む |
+| `redirected` | https へ redirect した |
+| `answered` | ACME の challenge に答えた |
+| `failed` | こちらの理由で答えられなかった（混んでいる、検査できない、上流の失敗） |
+| `closed` | 何も答えなかった |
+
+`forwarded` の `reason` は次のどれかになる。
+
+- `forwarded`: 検査で許した
+- `detected by a rule`: 検知だけのモードで規則に当たった
+- `bypassed by a route`: 検査しない経路
+- `closed while the response was sent`: 応答を送り終える前に切れた
+
+要求から来る文字（`method`、`host`、`path`）は、0x21〜0x7e の外のバイトと `"`・`\` を `%XX`（大文字の16進）にしてから、`method` は 32、`host` は 255、`path` は 1024 バイトで切る。`%XX` の途中では切らない。受けた `%` はそのままなので、受けた `%80` とバイトの 0x80 は同じ `%80` になる。
+
+query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）、規則に一致した値と変数の名前、規則の `msg` は記録しない。path に秘密の値を入れる作りのサイトでは、その値が記録に残る。
+
+### ほかの記録
+
+| type | 項目 | とき |
+|---|---|---|
+| `connection` | `conn`、`listener`、`client`、`class`、`status`、`reason`、`ms`、`streams` | 答えを書かずに終わった接続（要求の前に閉じた、2つ目からの head を断った、TLS の handshake に失敗したなど）と、HTTP/2 の接続の終わり（`streams` は受けた stream の数） |
+| `tunnel` | `id`（tunnel を開いた要求の番号）、`conn`、`client`、`upstream`、`server`、`end`、`ms`、`to_upstream`、`from_upstream` | WebSocket の tunnel が終わった（動く前に終わったときも出る）。`end` は `closed`（両方の向きが終わった）、`idle`、`total`、`error`、`stop`（停止で打ち切った）のどれか。バイト数は handshake の後に各向きで読んだ量 |
+| `line` | `line` | 下の表の文。512 バイトまでで、長い文は切る。制御文字は空白にする |
+| `dropped` | `count` | 書けずに捨てた記録の数（前の `dropped` の記録の後に捨てた分） |
+
+`line` の文は次のとおり。
+
+| 文 | とき |
+|---|---|
 | `start: ...` | 起動の各段（`start: rules generation <指紋>`、`start: rules mode <block か detect>`、`start: the kernel is ready`、`start: listening` など） |
 | `reload: ...` | SIGUSR1・SIGUSR2 を受けたこと、切り替えと証明書の入れ替えの結果 |
 | `driver: inspector incarnation changed, inc <回>, restarts <回>` | 検査プロセスが起動し直した |
+| `conn <番号>: internal fault: <理由>` | proxy の中の不整合 |
+| `notify: <知らせ> not sent ...` | systemd への知らせを送れなかった |
 | `stop: ...` | 停止の理由と、最後の停止の結果 |
 
-HTTP/2 の接続は、終わりに1行を持つ（理由と、受けた stream の数）。
+### 書けないとき
+
+- 記録は 1024 件の待ち行列に入れ、書くのは1つの thread だけである。要求の処理と停止は、書き込みを待たない。
+- 待ち行列が満ちたときは、その記録を捨てて数え、書けるようになってから `dropped` の記録を1件出す。標準エラーを読む側が止まると、こうなる。
+- 書き込みの失敗（`/dev/full` など）は、その記録を失い、別に数える。
+- どちらの数も、監視の `/metrics` で見られる（`tukuyomi_records_dropped_total`、`tukuyomi_record_write_errors_total`）。標準エラーが詰まっている間は、記録では知らせられない。
+- 1件は 4 KiB 未満で、切らない（項目の上限からこの大きさを超えない）。
+
+### 記録を読める人
+
+記録には、client の address と path が入る。journal を読める利用者（root と、Ubuntu では `adm`・`systemd-journal` の組の利用者）は、それを読める。組に入れる人を絞る。保存の期間と容量は journald の設定で決める（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。
+
+## 監視
+
+設定に `status` を書くと、その loopback の address で次の3つに答える。答えに認証は無い。
+
+| 要求 | 答え |
+|---|---|
+| `GET /healthz` | 200 `ok`。proxy が答えられることだけを示す |
+| `GET /readyz` | 準備ができていれば 200 `ready`。でなければ 503 と理由の語: `starting`（待ち受けを bind する前）、`inspector down`（検査プロセスが動いていない。起動し直しの間も含む）、`stopping`（停止が始まった後） |
+| `GET /metrics` | 200 と、下の表の数（Prometheus の text の形、`text/plain; version=0.0.4`） |
+
+- 準備ができているのは、検査プロセスが動いていて、待ち受けを全部 bind し、停止が始まっていないときである。世代の切り替えの間は、古い世代が答えるので準備ができたままである。
+- `HEAD` は、同じ状態コードで本文を返さない。ほかの method は 405、ほかの target（query の付いたものも）は 404、HTTP/1.1 でない要求と、4 KiB に収まらない head は 400 で答える。
+- 1つの接続で1つの要求に答え、答えたら閉じる。同時に答える接続は 8 つまでで、転送の `max_conns` とは別に数える。それを超えた接続は、受けてすぐ閉じる。head を待つのは 2 秒、答えを書くのは 2 秒までである。
+- 監視の要求は、検査も転送もせず、記録もしない。
+- 監視の待ち受けは、検査プロセスより前に bind し、停止の 3 の後に閉じる。それまで `/healthz` は 200 を返す。
+
+### 数（`/metrics`）
+
+数は proxy のメモリの中にあり、起動し直すと 0 から数える。label の値は、決まった語か、設定の名前だけである（要求から来る値は label にしない）。
+
+| 名前 | 型 | label | 中身 |
+|---|---|---|---|
+| `tukuyomi_requests_total` | counter | `class` | 要求の記録の数（`class` は記録と同じ7つ） |
+| `tukuyomi_waf_rule_hits_total` | counter | `decision`（`block`、`detect`） | 規則が遮断した要求と、検知だけのモードで規則に当たった要求 |
+| `tukuyomi_uninspectable_total` | counter | `reason` | 検査できなかった要求（`invalid`、`queue_full`、`unavailable`、`wait_deadline`、`verdict_deadline`、`inspector_lost`、`protocol`、`inspector_error`、`not_created`、`cancelled`） |
+| `tukuyomi_connections_accepted_total` | counter | | 受けた接続 |
+| `tukuyomi_connections_open` | gauge | | 開いている接続 |
+| `tukuyomi_connection_permit_waits_total` | counter | | 受付が接続の枠を待った回数（`max_conns` に届いた回数の目安） |
+| `tukuyomi_tls_handshake_failures_total` | counter | | TLS の handshake の失敗と時間切れ |
+| `tukuyomi_body_buffer_bytes` | gauge | | 本文などをためている予算のバイト数（`max_buffered_bytes` のうち使っている分） |
+| `tukuyomi_inspections_waiting` | gauge | | 検査の待ちの席を持っている要求（`wait_queue` のうち使っている分） |
+| `tukuyomi_inspector_up` | gauge | | 要求を受けている検査核の準備ができていれば 1、でなければ 0 |
+| `tukuyomi_inspector_restarts_total` | counter | | 検査プロセスの起動し直し |
+| `tukuyomi_rules_generation_info` | gauge | `generation`（指紋の先頭16桁）、`mode` | 要求を受けている世代。値はいつも 1 |
+| `tukuyomi_rules_switches_total` | counter | `result`（`switched`、`refused`、`failed`） | SIGUSR1 による世代の切り替え |
+| `tukuyomi_certificate_reloads_total` | counter | `result`（`replaced`、`refused`） | SIGUSR2 による証明書の読み直し |
+| `tukuyomi_upstream_failures_total` | counter | `group` | 上流の組の server の失敗 |
+| `tukuyomi_records_dropped_total` | counter | | 捨てた記録（上の「書けないとき」） |
+| `tukuyomi_record_write_errors_total` | counter | | 書き込みに失敗した記録 |
+| `tukuyomi_start_time_seconds` | gauge | | 起動した時刻（Unix 時間の秒） |
+
+### systemd への知らせ
+
+環境に `NOTIFY_SOCKET` があれば、待ち受けを全部 bind した後に `READY=1` を、停止が始まったときに `STOPPING=1` を、その socket へ1回ずつ送る。
+
+- `NOTIFY_SOCKET` は、絶対の path か、`@` で始まる名前（Linux の abstract の名前）である。ほかの値なら `start:` の文を1行出し、知らせを送らずに動く。
+- 送れなかったときは `notify:` の文を1行出すだけで、動きは変えない。待たずに送るので、受ける側が読まなくても proxy は止まらない。
+- 検査プロセスの環境は空なので、検査プロセスは知らせを送らない。
+- unit を `Type=notify` にすると、`systemctl start` は検査核の準備と待ち受けの bind まで待つ（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。
 
 ## ACME
 
