@@ -1,4 +1,5 @@
-//! The notices to the service manager that the proxy is ready and that it is stopping (`sd_notify`).
+//! The notices to the service manager that the proxy, or the admin process, is ready and that it is stopping
+//! (`sd_notify`).
 //!
 //! When the environment has `NOTIFY_SOCKET`, the proxy sends one datagram, `READY=1`, once every forwarding listener is
 //! bound, and one, `STOPPING=1`, at the first cause of a stop, to the socket the variable names: an absolute path, or
@@ -39,13 +40,13 @@ fn target(value: &OsStr) -> Option<Target> {
 }
 
 /// Sends the notices, or does nothing when there is no socket to send them to.
-pub(super) struct Notify {
+pub(crate) struct Notify {
     sender: Option<(UnixDatagram, Target)>,
 }
 
 impl Notify {
     /// The notices for the value of `NOTIFY_SOCKET`, which is `None` when the variable is not set.
-    pub(super) fn new(value: Option<OsString>, log: &Log) -> Notify {
+    pub(crate) fn new(value: Option<OsString>, log: &Log) -> Notify {
         let none = Notify { sender: None };
         let Some(value) = value else {
             return none;
@@ -72,17 +73,17 @@ impl Notify {
     }
 
     /// The notices for the environment of the process.
-    pub(super) fn from_env(log: &Log) -> Notify {
+    pub(crate) fn from_env(log: &Log) -> Notify {
         Notify::new(std::env::var_os("NOTIFY_SOCKET"), log)
     }
 
-    /// Every forwarding listener is bound.
-    pub(super) fn ready(&self, log: &Log) {
+    /// Every listener is bound.
+    pub(crate) fn ready(&self, log: &Log) {
         self.send("READY=1", log);
     }
 
-    /// The proxy begins to stop.
-    pub(super) fn stopping(&self, log: &Log) {
+    /// The process begins to stop.
+    pub(crate) fn stopping(&self, log: &Log) {
         self.send("STOPPING=1", log);
     }
 

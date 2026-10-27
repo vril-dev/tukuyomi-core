@@ -8,6 +8,10 @@
 //! line it writes to the standard error, one write for each line and after the standard error. What was queued before
 //! the file was handed over is not in it.
 //!
+//! The same file keeps the audit log of the admin process (see `admin::audit`), under the stem `audit` in place of
+//! `records`: `audit.log`, `audit.N.log` and `audit.rotating`. What is written here of the names holds for it with
+//! the stem changed (`RecordFile::open_in`).
+//!
 //! A line that would take the file above `file_bytes` first starts the next file. The file in use is renamed to
 //! `records.rotating` first; if that fails nothing has moved. Then `records.N.log` becomes `records.N+1.log` for N
 //! from `files - 2` down to 1, `records.rotating` becomes `records.1.log`, and a new `records.log` is opened. If one
@@ -42,8 +46,8 @@ use crate::run::host;
 const RETRY: Duration = Duration::from_secs(1);
 /// The least time between two looks at the path of the file in use, a look before a rotation apart.
 const LOOK: Duration = Duration::from_secs(1);
-/// The name of the file in use while the older files are renamed up by one.
-const MOVING: &str = "records.rotating";
+/// The stem of the names of the record files.
+const RECORDS: &str = "records";
 
 /// The file in use, its size, and its device and inode.
 struct Current {
@@ -55,6 +59,8 @@ struct Current {
 /// The file in use and the files of earlier lines, in a directory.
 pub struct RecordFile {
     dir: PathBuf,
+    /// The first part of the names of the files: `records`, or `audit`.
+    stem: &'static str,
     file_bytes: u64,
     files: usize,
     /// The user id that the files must have.
@@ -67,26 +73,26 @@ pub struct RecordFile {
     looked: Instant,
 }
 
-/// The path of file number `n`: `records.log` for 0 and `records.<n>.log` for the files of earlier lines.
-fn name(dir: &Path, n: usize) -> PathBuf {
+/// The path of file number `n`: `<stem>.log` for 0 and `<stem>.<n>.log` for the files of earlier lines.
+pub(crate) fn name(dir: &Path, stem: &str, n: usize) -> PathBuf {
     if n == 0 {
-        dir.join("records.log")
+        dir.join(format!("{stem}.log"))
     } else {
-        dir.join(format!("records.{n}.log"))
+        dir.join(format!("{stem}.{n}.log"))
     }
 }
 
-/// Opens `records.log` for append, made when it is not there, and looks at it. It is opened like every file that is
+/// Opens `<stem>.log` for append, made when it is not there, and looks at it. It is opened like every file that is
 /// read from the rules store: a link is not followed, a FIFO does not make the open wait, a terminal does not become
 /// the controlling terminal, and what is not a regular file of `uid` is refused. The mode of a file that was there
 /// with group or other bits is set to 0600 on the open file.
-fn open_current(dir: &Path, uid: u32) -> Result<Current, &'static str> {
+fn open_current(dir: &Path, stem: &str, uid: u32) -> Result<Current, &'static str> {
     let file = OpenOptions::new()
         .append(true)
         .create(true)
         .mode(0o600)
         .custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
-        .open(name(dir, 0))
+        .open(name(dir, stem, 0))
         .map_err(|_| "the record file cannot be opened")?;
     let meta = file
         .metadata()
@@ -105,19 +111,32 @@ fn open_current(dir: &Path, uid: u32) -> Result<Current, &'static str> {
     })
 }
 
-/// Whether `records.log` is the file that `current` has open: the same device and inode, looked at with `lstat`, so
+/// Whether `<stem>.log` is the file that `current` has open: the same device and inode, looked at with `lstat`, so
 /// that a link in its place is another file.
-fn at_path(dir: &Path, current: &Current) -> bool {
-    fs::symlink_metadata(name(dir, 0)).is_ok_and(|meta| (meta.dev(), meta.ino()) == current.id)
+fn at_path(dir: &Path, stem: &str, current: &Current) -> bool {
+    fs::symlink_metadata(name(dir, stem, 0))
+        .is_ok_and(|meta| (meta.dev(), meta.ino()) == current.id)
 }
 
 impl RecordFile {
     /// Looks at the directory and opens the file in use. A refusal is a sentence.
     pub fn open(config: &RecordsConfig) -> Result<RecordFile, &'static str> {
+        RecordFile::open_in(RECORDS, &config.dir, config.file_bytes, config.files)
+    }
+
+    /// The same for the files that begin with `stem`, in `dir`: `file_bytes` and `files` are as in the `records`
+    /// object (`files` from 2 to `MAX_RECORD_FILES`).
+    pub fn open_in(
+        stem: &'static str,
+        dir: &Path,
+        file_bytes: u64,
+        files: usize,
+    ) -> Result<RecordFile, &'static str> {
         let mut file = RecordFile {
-            dir: config.dir.clone(),
-            file_bytes: config.file_bytes,
-            files: config.files,
+            dir: dir.to_path_buf(),
+            stem,
+            file_bytes,
+            files,
             uid: host::fs_uid()?,
             current: None,
             failed: None,
@@ -126,6 +145,13 @@ impl RecordFile {
         file.current = Some(file.reopen()?);
         file.remove_extra();
         Ok(file)
+    }
+
+    /// Makes what was written reach the disk. False: it did not, or the file is not open.
+    pub fn sync(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|current| current.file.sync_data().is_ok())
     }
 
     /// Writes `line`, which ends with its line feed, in one write. False: the file did not take it.
@@ -143,7 +169,7 @@ impl RecordFile {
         // The path is looked at once a second at most, and always before the file is renamed.
         if full || now.saturating_duration_since(self.looked) >= LOOK {
             self.looked = now;
-            if !at_path(&self.dir, &current) {
+            if !at_path(&self.dir, self.stem, &current) {
                 // The file is closed here. The disk did not fail, so the next line opens the path at once.
                 self.failed = None;
                 return false;
@@ -194,7 +220,7 @@ impl RecordFile {
     /// Looks at the directory again, as at the start, and opens the file in use.
     fn reopen(&self) -> Result<Current, &'static str> {
         host::private_dir(&self.dir, self.uid)?;
-        open_current(&self.dir, self.uid)
+        open_current(&self.dir, self.stem, self.uid)
     }
 
     /// Renames the files up by one, the last one being replaced by the one before it, and opens a new file in use.
@@ -202,35 +228,38 @@ impl RecordFile {
     /// back. None: a rename or the open failed.
     fn rotate(&self) -> Option<Current> {
         host::private_dir(&self.dir, self.uid).ok()?;
-        let moving = self.dir.join(MOVING);
-        fs::rename(name(&self.dir, 0), &moving).ok()?;
+        let moving = self.dir.join(format!("{}.rotating", self.stem));
+        fs::rename(name(&self.dir, self.stem, 0), &moving).ok()?;
         if self.shift(&moving).is_err() {
-            let _ = fs::rename(&moving, name(&self.dir, 0));
+            let _ = fs::rename(&moving, name(&self.dir, self.stem, 0));
             return None;
         }
         self.remove_extra();
-        open_current(&self.dir, self.uid).ok()
+        open_current(&self.dir, self.stem, self.uid).ok()
     }
 
-    /// Renames `records.N.log` to `records.N+1.log` for N from `files - 2` down to 1, and `moving` to `records.1.log`.
+    /// Renames `<stem>.N.log` to `<stem>.N+1.log` for N from `files - 2` down to 1, and `moving` to `<stem>.1.log`.
     fn shift(&self, moving: &Path) -> io::Result<()> {
         for n in (1..self.files.saturating_sub(1)).rev() {
-            match fs::rename(name(&self.dir, n), name(&self.dir, n + 1)) {
+            match fs::rename(
+                name(&self.dir, self.stem, n),
+                name(&self.dir, self.stem, n + 1),
+            ) {
                 Ok(()) => {}
                 // A file that is not there is no file to keep.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
-        fs::rename(moving, name(&self.dir, 1))
+        fs::rename(moving, name(&self.dir, self.stem, 1))
     }
 
-    /// Removes `records.N.log` for N from `files` up to the largest number an earlier, larger `files` can have made,
+    /// Removes `<stem>.N.log` for N from `files` up to the largest number an earlier, larger `files` can have made,
     /// if it is a regular file of this user (looked at with `lstat`, so a link or a directory stays). A file that
     /// cannot be removed stays until the next rotation.
     fn remove_extra(&self) {
         for n in self.files..MAX_RECORD_FILES {
-            let path = name(&self.dir, n);
+            let path = name(&self.dir, self.stem, n);
             if fs::symlink_metadata(&path)
                 .is_ok_and(|meta| meta.is_file() && meta.uid() == self.uid)
             {

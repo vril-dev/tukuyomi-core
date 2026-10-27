@@ -415,7 +415,7 @@ fn read_manifest(dir: &Path, generation: Fingerprint) -> Result<Manifest, StoreE
 /// Opens the file at `path` that a lock is taken on, and makes it (empty, 0600) when it is not there. It is opened
 /// like every file that is read: a link is not followed, a FIFO does not make the open wait, a terminal does not
 /// become the controlling terminal, and what is not a regular file is refused. `cannot_open` and `not_regular` are the two sentences of the refusal.
-fn open_lock_file(
+pub(crate) fn open_lock_file(
     path: &Path,
     cannot_open: StoreError,
     not_regular: StoreError,
@@ -483,7 +483,7 @@ fn write_stage(dir: &Path, bundle: &Bundle) -> io::Result<()> {
 }
 
 /// A new file of mode 0600 with `data`, synced. It fails if the name is taken, also by a link.
-fn write_new(path: &Path, data: &[u8]) -> io::Result<()> {
+pub(crate) fn write_new(path: &Path, data: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -494,7 +494,7 @@ fn write_new(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 /// Makes the entries of a directory durable.
-fn sync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 

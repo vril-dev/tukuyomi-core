@@ -4,7 +4,8 @@
 //! line is one JSON object whose first two fields are `ts` and `type`; then come the fields of the type in the
 //! order they are declared here, and a field that has no value is left out. The types are `request` (an answer
 //! that was written to a client), `connection` (a connection that ended without one), `tunnel`, `line` (a text of
-//! the process, see `Log::line`) and `dropped` (how many records could not be queued since the last report). A
+//! the process, see `Log::line`), `audit` (a line of the audit log of the admin process, see `admin::audit`) and
+//! `dropped` (how many records could not be queued since the last report). A
 //! `request` that the rules judged also shows what they matched, as numbers of the rule set and never as text of the
 //! request: `rules`, `rules_more`, `severity` and `score`.
 //!
@@ -181,6 +182,9 @@ pub enum Record {
     Request(Box<Request>),
     Connection(Connection),
     Tunnel(Tunnel),
+    /// A line of the audit log, already encoded as `framed` does it with the type `audit`: the logger writes it as
+    /// it is.
+    Audit(String),
 }
 
 /// The first two fields of every line, and the fields of its type.
@@ -277,7 +281,7 @@ struct TunnelBody<'a> {
 }
 
 /// The line, or `None` if it is longer than `RECORD_MAX` bytes with its line feed.
-fn framed<T: Serialize>(at: SystemTime, kind: &'static str, body: T) -> Option<String> {
+pub(crate) fn framed<T: Serialize>(at: SystemTime, kind: &'static str, body: T) -> Option<String> {
     let ts = rfc3339(at);
     let line = serde_json::to_string(&Framed {
         ts: &ts,
@@ -302,6 +306,7 @@ pub fn encode_dropped(at: SystemTime, count: u64) -> Option<String> {
 pub fn encode(at: SystemTime, record: &Record) -> Option<String> {
     match record {
         Record::Request(request) => encode_request(at, request),
+        Record::Audit(line) => (line.len() < RECORD_MAX).then(|| line.clone()),
         Record::Connection(c) => framed(
             at,
             "connection",

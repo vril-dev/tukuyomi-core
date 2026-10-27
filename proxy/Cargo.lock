@@ -661,6 +661,7 @@ version = "0.0.0"
 name = "tukuyomi-proxy"
 version = "0.0.0"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "flate2",
  "http",

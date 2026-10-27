@@ -31,6 +31,7 @@
 //!   length that reaches the upstream cannot be the coded one), or one that decodes to just over the limit.
 
 mod acme;
+mod admin;
 mod bodies;
 mod config_check;
 mod control;

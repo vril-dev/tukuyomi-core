@@ -1,10 +1,11 @@
 //! The running proxy process, in the parts it is made of: `start` (the arguments, the short commands that take the
-//! place of the proxy, and `prepare`, the steps from the configuration to the kernel configuration), `serve` (the
+//! place of the proxy, the admin process and its command `admin bootstrap`, which are in `admin`, and `prepare`, the
+//! steps from the configuration to the kernel configuration), `serve` (the
 //! runtime part: the driver, the wait for the kernel, the listeners and the accept side), `reload` (SIGUSR1 and
 //! SIGUSR2), `stop`, `signals` (what the process waits for, behind one poll), `status` (the listener that answers
 //! `/healthz`, `/readyz` and `/metrics`), `control` (the socket on which the admin process asks for the state and for
-//! a switch), `notify` (the notices to the service manager) and `host` (the checks of the
-//! host process).
+//! a switch), `notify` (the notices to the service manager, which the admin process sends as well) and `host` (the
+//! checks of the host process, which the admin process makes as well).
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration file),
 //! the host checks, the configuration, the lookup of the names of the upstream servers (in the same step, the CA file
@@ -76,7 +77,7 @@
 
 mod control;
 pub(crate) mod host;
-mod notify;
+pub(crate) mod notify;
 mod reload;
 mod serve;
 mod signals;

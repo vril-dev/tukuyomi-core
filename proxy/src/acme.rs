@@ -15,7 +15,7 @@
 //! A failure of a step is a `Failure` (see `failure`): a fixed sentence, or the `type` of the problem document that
 //! the CA sent, with every byte outside 0x20 to 0x7e written as `\xNN`. Nothing else from the CA is written out.
 
-mod base64;
+pub(crate) mod base64;
 mod client;
 pub mod command;
 mod der;

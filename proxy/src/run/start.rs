@@ -1,6 +1,6 @@
 //! The start of the process, before the runtime runs: the arguments, which of the short commands (`rules`, `acme`,
-//! `config`) the process is, and the steps from the configuration to the kernel configuration (`prepare`), which
-//! `config check` runs as well.
+//! `config`) the process is, whether it is the admin process or its command `admin bootstrap` (see `admin`), and
+//! the steps from the configuration to the kernel configuration (`prepare`), which `config check` runs as well.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use super::host;
 use super::serve::run;
 use crate::acme;
+use crate::admin;
 use crate::config::{
     self, AdminConfig, ForwardConfig, ProxyConfig, RecordsConfig, StatusConfig, addresses,
 };
@@ -28,6 +29,10 @@ pub(super) const EXIT_OK: u8 = 0;
 pub const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const CHECK_USAGE: &str = "usage: tukuyomi-proxy config check <config>";
+const ADMIN_USAGE: [&str; 2] = [
+    "usage: tukuyomi-proxy admin <config>",
+    "       tukuyomi-proxy admin bootstrap <config> <name>",
+];
 
 /// Everything before the runtime runs, then the runtime. Returns the exit code.
 pub fn start(log: &Log) -> u8 {
@@ -54,6 +59,11 @@ pub fn start(log: &Log) -> u8 {
         args.next();
         let args: Vec<OsString> = args.collect();
         return config_check(&args, log);
+    }
+    if args.peek().is_some_and(|arg| arg == "admin") {
+        args.next();
+        let args: Vec<OsString> = args.collect();
+        return admin_command(&args, log);
     }
     let path = match (args.next(), args.next()) {
         (Some(path), None) if config::clean_abs(Path::new(&path)) => PathBuf::from(path),
@@ -285,6 +295,60 @@ fn config_check(args: &[OsString], log: &Log) -> u8 {
     }
     let _ = writeln!(io::stdout(), "accepted");
     EXIT_OK
+}
+
+/// What the arguments after `admin` ask for.
+#[derive(Debug, PartialEq, Eq)]
+enum AdminArgs {
+    /// The admin process, with its configuration file.
+    Run(PathBuf),
+    /// The first user, with the configuration file and the name.
+    Bootstrap { config: PathBuf, name: String },
+}
+
+/// The arguments after `admin`: one absolute clean path, or `bootstrap`, one such path and a name.
+fn admin_args(args: &[OsString]) -> Result<AdminArgs, &'static str> {
+    let path = |arg: &OsString| {
+        if config::clean_abs(Path::new(arg)) {
+            Ok(PathBuf::from(arg))
+        } else {
+            Err("the configuration file is not an absolute clean path")
+        }
+    };
+    match args {
+        [] => Err("the configuration file is missing"),
+        [first, rest @ ..] if first == "bootstrap" => match rest {
+            [config, name] => Ok(AdminArgs::Bootstrap {
+                config: path(config)?,
+                name: name.to_str().ok_or("the name is not text")?.to_owned(),
+            }),
+            _ => Err("bootstrap takes the configuration file and a name"),
+        },
+        [config] => Ok(AdminArgs::Run(path(config)?)),
+        _ => Err("admin takes one argument, the configuration file"),
+    }
+}
+
+/// The admin process or its command. `args` is what follows `admin`. Returns the exit code.
+fn admin_command(args: &[OsString], log: &Log) -> u8 {
+    let exit = match admin_args(args) {
+        Err(why) => {
+            log.line(&format!("admin: {why}"));
+            for line in ADMIN_USAGE {
+                log.line(line);
+            }
+            return EXIT_USAGE;
+        }
+        Ok(AdminArgs::Run(path)) => admin::server::run(&path, log),
+        Ok(AdminArgs::Bootstrap { config, name }) => {
+            admin::users::bootstrap(&config, &name, &mut io::stdin().lock(), log)
+        }
+    };
+    match exit {
+        admin::Exit::Done => EXIT_OK,
+        admin::Exit::Failed => EXIT_FAILED,
+        admin::Exit::Usage => EXIT_USAGE,
+    }
 }
 
 /// The configuration file that `args` (what follows `config`) name: `check` and one absolute clean path.

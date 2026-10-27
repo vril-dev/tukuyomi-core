@@ -34,6 +34,9 @@ fn scratch() -> TestDir {
     TestDir(dir)
 }
 
+/// The name of the file in use while the older files are renamed up by one.
+const MOVING: &str = "records.rotating";
+
 fn config(dir: &Path, file_bytes: u64, files: usize) -> RecordsConfig {
     RecordsConfig {
         dir: dir.to_path_buf(),
@@ -190,7 +193,7 @@ fn the_directory_and_the_file_are_looked_at_before_anything_is_written() {
     assert!(opened(dir.path(), 100, 2).current.is_some());
     let uid = host::fs_uid().unwrap();
     assert_eq!(
-        open_current(dir.path(), uid.wrapping_add(1)).err(),
+        open_current(dir.path(), RECORDS, uid.wrapping_add(1)).err(),
         Some("the record file is not a regular file of this user")
     );
 }
@@ -418,4 +421,17 @@ fn a_file_with_group_or_other_bits_is_set_to_0600_and_the_directory_is_looked_at
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     assert!(file.append_at(line(3).as_bytes(), t0 + Duration::from_secs(2)));
     assert_eq!(read(dir.path(), "records.log"), lines(&[0, 3]));
+}
+
+#[test]
+fn the_files_of_another_stem_are_named_and_rotated_by_it() {
+    let dir = scratch();
+    let mut file = RecordFile::open_in("audit", dir.path(), 90, 2).unwrap();
+    for n in 0..4 {
+        assert!(file.append(line(n).as_bytes()));
+    }
+    assert!(file.sync());
+    assert_eq!(names(dir.path()), ["audit.1.log", "audit.log"]);
+    assert_eq!(read(dir.path(), "audit.1.log"), lines(&[0, 1, 2]));
+    assert_eq!(read(dir.path(), "audit.log"), lines(&[3]));
 }
