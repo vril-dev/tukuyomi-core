@@ -12,6 +12,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, timeout_at};
 use tukuyomi_kernel::Failure;
 
+use super::status::Status;
 use crate::inbound::transport::accept::{Accepted, Acceptor, Arrival};
 use crate::inspect::driver::{End, Switched};
 
@@ -79,7 +80,8 @@ pub(super) enum Event {
 }
 
 /// Everything the main thread waits for, behind one poll. The order of the polls is the order of precedence: the
-/// driver's answers and the signals before the connections that ended, those before the next accept.
+/// driver's answers and the signals before the connections that ended, those before the next accept. The status
+/// listener answers on its own and is held here only so that the stop can close it.
 pub(super) struct Waits {
     term: Signal,
     int: Signal,
@@ -92,6 +94,7 @@ pub(super) struct Waits {
     pub(super) switch: Option<oneshot::Receiver<Switched>>,
     end: Option<oneshot::Receiver<End>>,
     pub(super) accept: Option<Acceptor>,
+    pub(super) status: Option<Status>,
     pub(super) conns: JoinSet<()>,
 }
 
@@ -113,6 +116,7 @@ impl Waits {
             switch: None,
             end: Some(end),
             accept: None,
+            status: None,
             conns: JoinSet::new(),
         }
     }

@@ -17,6 +17,7 @@ use crate::forward::origin::OriginBody;
 use crate::inbound::head::{Head, Reject};
 use crate::inbound::upload::Fate;
 use crate::inspect::driver::{Judge, Outcome};
+use crate::log::counters::RuleHit;
 use crate::log::record::Seen;
 
 /// How a connection ended, for the record.
@@ -142,6 +143,15 @@ impl Reply {
     /// The answer of a head refusal that has one.
     pub(super) fn of(reject: Reject) -> Reply {
         Reply::rejected(reject.status().unwrap_or(400), reject.reason())
+    }
+
+    /// What a rule did to the request, if one decided it: it blocked it, or it matched while the rules only detect.
+    pub(super) fn hit(&self) -> Option<RuleHit> {
+        match (self.class, self.rule) {
+            (Class::Blocked, _) => Some(RuleHit::Block),
+            (Class::Forwarded, Some(_)) => Some(RuleHit::Detect),
+            _ => None,
+        }
     }
 }
 
@@ -280,8 +290,9 @@ impl Sizes {
 
 /// What the record shows of a request besides the time it took: its number, its reply, the address of the client it
 /// is recorded under, its method, `Host` and path if its head passed the check, the upstream it went to, if it got as
-/// far as that, the size of its body, if it has one, and the generation whose rules gave a verdict, with the rules
-/// that matched the request, if any did. Only numbers, fixed texts, the name of a group from the configuration,
+/// far as that, the size of its body, if it has one, and the generation whose rules gave a verdict, with that verdict
+/// and the rules that matched the request, if any did. The record shows the generation, the mode and the rules; the
+/// counters read the verdict. Only numbers, fixed texts, the name of a group from the configuration,
 /// addresses in their canonical forms and the request's own text as the record writes it (see `log::record`), so
 /// nothing the peer sent gets in as it is.
 pub(super) struct Noted {

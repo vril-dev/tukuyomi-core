@@ -1889,3 +1889,90 @@ fn a_file_of_a_certificate_without_acme_is_no_file_of_the_command() {
     refuse(&config("/etc/tukuyomi/acme/account.key"), refused);
     refuse(&config("/etc/tukuyomi/tls/a.key"), refused);
 }
+
+// ---- status ----
+
+fn status(listen: &str) -> Edit {
+    ("", "status", serde_json::json!({ "listen": listen }))
+}
+
+#[test]
+fn the_status_object_is_left_out_or_names_a_loopback_address_that_no_listener_has() {
+    // Left out: no listener. Written: the address, which is no listener of the 1 to 8.
+    assert!(parse(BASE.as_bytes()).unwrap().status.is_none());
+    let loaded = parse(&doc(&[status("127.0.0.1:9180")])).unwrap();
+    assert_eq!(
+        loaded.status,
+        Some(StatusConfig {
+            listen: "127.0.0.1:9180".parse().unwrap()
+        })
+    );
+    assert_eq!(loaded.proxy.listeners.len(), 1);
+    pass(&[status("[::1]:9180")]);
+    pass(&[status("127.5.6.7:9180")]);
+    // The port of a listener on another address is free.
+    pass(&[status("127.0.0.2:8080")]);
+
+    let not_loopback = "status listen is not a loopback address";
+    for listen in [
+        "0.0.0.0:9180",
+        "[::]:9180",
+        "192.0.2.1:9180",
+        "[::ffff:127.0.0.1]:9180",
+    ] {
+        refuse(&[status(listen)], not_loopback);
+    }
+    refuse(
+        &[status("localhost:9180")],
+        "status listen is not an IP address and port",
+    );
+    refuse(&[status("127.0.0.1:0")], "status listen port is 0");
+
+    // The address of a listener, and a listener that is unspecified at the port.
+    let clash = "status listen is the address of a listener, or one is an unspecified address at the port of the other";
+    refuse(&[status("127.0.0.1:8080")], clash);
+    refuse(&[at("0.0.0.0:9180"), status("127.0.0.1:9180")], clash);
+    refuse(&[at("[::]:9180"), status("[::1]:9180")], clash);
+    pass(&[at("0.0.0.0:9181"), status("127.0.0.1:9180")]);
+
+    // The object has the one key `listen`, as an object.
+    refuse(
+        &[("", "status", serde_json::json!({}))],
+        "configuration has a missing key",
+    );
+    refuse(
+        &[(
+            "",
+            "status",
+            serde_json::json!({"listen": "127.0.0.1:9180", "path": "/"}),
+        )],
+        "configuration has an unknown key",
+    );
+    refuse(
+        &[("", "status", serde_json::json!(["127.0.0.1:9180"]))],
+        "configuration has a value of the wrong type",
+    );
+    refuse(
+        &[("", "status", Value::Null)],
+        "configuration has a value of the wrong type",
+    );
+}
+
+#[test]
+fn a_server_may_not_be_at_the_status_address() {
+    // Like the address of a listener: a route to it would send the requests of clients to the status listener.
+    let same = "a listener and a server are the same address";
+    refuse(
+        &[status("127.0.0.1:9180"), sv("address", "127.0.0.1:9180")],
+        same,
+    );
+    refuse(
+        &[
+            status("127.0.0.1:9180"),
+            sv("address", "[::ffff:127.0.0.1]:9180"),
+        ],
+        same,
+    );
+    pass(&[status("127.0.0.1:9180"), sv("address", "127.0.0.1:9181")]);
+    pass(&[status("127.0.0.1:9180"), sv("address", "127.0.0.2:9180")]);
+}

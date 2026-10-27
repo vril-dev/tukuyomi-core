@@ -1,11 +1,14 @@
+use super::core::{Mode, Switching};
 use super::*;
 use std::collections::{BTreeMap, VecDeque};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::mpsc::TryRecvError;
 
 use tokio::sync::Semaphore;
 use tokio::sync::oneshot::error::TryRecvError as SlotError;
-use tukuyomi_kernel::{Config, Reason};
+use tukuyomi_kernel::{Config, Phase, Reason};
 
 use crate::inspect::slot::{Pending, deliver, restart_line, submit};
 use crate::log::{Format, start_logger};
@@ -18,11 +21,17 @@ const HOUR: Duration = Duration::from_secs(3600);
 const INSPECT: usize = 16;
 const BUDGET: usize = 10_000;
 
-/// The generation and the mode that a verdict of `mode` is told to come from.
-fn judge(mode: bundle::Mode) -> Judge {
+/// The generation that a verdict is told to come from.
+fn judged_by() -> Fingerprint {
+    Fingerprint::from_hex(&[b'7'; 64]).unwrap()
+}
+
+/// What a delivered `verdict` of the generation `judged_by` is answered with: the mode of its rules, none matched.
+fn judge(mode: bundle::Mode, verdict: Verdict) -> Judge {
     Judge {
-        generation: Fingerprint::from_hex(&[b'7'; 64]).unwrap(),
+        generation: judged_by(),
         mode,
+        verdict,
         matched: Matched::NONE,
     }
 }
@@ -283,12 +292,20 @@ struct Rig {
     core: Core<Fake>,
     tx: Option<SyncSender<Msg>>,
     world: World,
+    /// What the core publishes after a round.
+    state: watch::Receiver<State>,
 }
 
 impl Rig {
     /// An intake takes `wait_queue + 1` messages; the channel has room for `room`.
     fn new(wait_queue: usize, room: usize) -> Rig {
         let (tx, rx) = sync_channel(room);
+        let (state_tx, state) = watch::channel(State {
+            phase: Phase::Starting,
+            restarts: 0,
+            generation: generation(1),
+            mode: bundle::Mode::Block,
+        });
         let core = Core::new(
             Slot::new(generation(1), bundle::Mode::Block, Fake::new()),
             SharedRoutes::new(Routes::default()),
@@ -298,11 +315,13 @@ impl Rig {
             limits(20 * MS),
             30 * MS,
             wait_queue + 1,
+            state_tx,
         );
         Rig {
             core,
             tx: Some(tx),
             world: World::new(),
+            state,
         }
     }
 
@@ -577,7 +596,8 @@ fn a_result_for_an_unknown_request_is_fatal() {
                 (1, Verdict::Allow, Matched::NONE),
                 (2, Verdict::Allow, Matched::NONE)
             ],
-            judge(bundle::Mode::Block)
+            judged_by(),
+            bundle::Mode::Block
         ),
         unknown
     );
@@ -586,7 +606,7 @@ fn a_result_for_an_unknown_request_is_fatal() {
         answer(&mut made.answer),
         Answer {
             outcome: Outcome::Verdict(Verdict::Allow),
-            by: Some(judge(bundle::Mode::Block)),
+            by: Some(judge(bundle::Mode::Block, Verdict::Allow)),
         }
     );
     // a result comes out once: the same id again is unknown
@@ -594,12 +614,13 @@ fn a_result_for_an_unknown_request_is_fatal() {
         deliver(
             &mut pending,
             &[(1, Verdict::Allow, Matched::NONE)],
-            judge(bundle::Mode::Block)
+            judged_by(),
+            bundle::Mode::Block
         ),
         unknown
     );
     assert_eq!(
-        deliver(&mut pending, &[], judge(bundle::Mode::Block)),
+        deliver(&mut pending, &[], judged_by(), bundle::Mode::Block),
         Ok(false)
     );
 }
@@ -640,10 +661,10 @@ fn a_verdict_is_delivered_with_the_rules_that_matched_the_request() {
                 cancelled: false,
             },
         );
-        deliver(&mut pending, &[(0, given, matched)], judge(mode)).unwrap();
+        deliver(&mut pending, &[(0, given, matched)], judged_by(), mode).unwrap();
         let by = Judge {
             matched: want_matched,
-            ..judge(mode)
+            ..judge(mode, want)
         };
         let got = answer(&mut made.answer);
         assert_eq!(got.outcome, Outcome::Verdict(want));
@@ -1188,4 +1209,62 @@ fn a_stop_during_a_switch_stops_the_new_kernel_at_once_and_lets_the_old_one_fini
     assert_eq!(outcome(&mut a.answer), Outcome::Verdict(unavailable));
     assert_eq!(told.try_recv(), Ok(Switched::Yes));
     assert!(r.core.retired_clean);
+}
+
+// ---- the state ----
+
+#[test]
+fn the_state_follows_the_kernel_that_serves_and_its_restarts_add_up_over_a_switch() {
+    let mut r = Rig::new(4, 8);
+    let seen = |r: &Rig| *r.state.borrow();
+    assert_eq!(seen(&r).phase, Phase::Starting);
+    r.core.active.kernel.phase = Phase::Ready;
+    r.core.round().unwrap();
+    let ready = State {
+        phase: Phase::Ready,
+        restarts: 0,
+        generation: generation(1),
+        mode: bundle::Mode::Block,
+    };
+    assert_eq!(seen(&r), ready);
+
+    // The restart window of the inspector: the phase leaves Ready, and the restarts made so far rise.
+    r.core.active.kernel.phase = Phase::Starting;
+    r.core.active.kernel.restarts = 1;
+    r.core.round().unwrap();
+    assert_eq!(
+        seen(&r),
+        State {
+            phase: Phase::Starting,
+            restarts: 1,
+            ..ready
+        }
+    );
+    r.core.active.kernel.phase = Phase::Ready;
+    r.core.round().unwrap();
+    assert_eq!(
+        seen(&r),
+        State {
+            restarts: 1,
+            ..ready
+        }
+    );
+
+    // Another generation takes over: its kernel counts from 0, and the restarts of the one before it are kept.
+    let mut told = r.send_switch(2);
+    r.core.round().unwrap();
+    r.other().phase = Phase::Ready;
+    r.core.round().unwrap();
+    assert_eq!(settle(&mut r, &mut told), Switched::Yes);
+    assert_eq!(
+        seen(&r),
+        State {
+            restarts: 1,
+            generation: generation(2),
+            ..ready
+        }
+    );
+    r.core.active.kernel.restarts = 1;
+    r.core.round().unwrap();
+    assert_eq!(seen(&r).restarts, 2);
 }

@@ -17,11 +17,11 @@
 //! for. The proxy does not start if the file cannot be used, or if a name cannot be used for TLS.
 //!
 //! The proxy does not start if a name cannot be looked up, has no address, or has one that is unspecified, a
-//! multicast address, or the address of a listener (or a loopback address at its port, if the listener is
-//! unspecified), if the lookups are not done in time, or if a group has more than 64 servers once the names are
-//! looked up. The sentences of the refusals are fixed: the error of the system is not kept, and each tells the group
-//! and the place of the server (from 1) it is about, except one about the file of the authorities of a group, which
-//! tells the group only.
+//! multicast address, or the address of a listener, the status listener included (or a loopback address at the port
+//! of a listener, if the listener is unspecified), if the lookups are not done in time, or if a group has more than
+//! 64 servers once the names are looked up. The sentences of the refusals are fixed: the error of the system is not
+//! kept, and each tells the group and the place of the server (from 1) it is about, except one about the file of the
+//! authorities of a group, which tells the group only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -181,7 +181,7 @@ where
 }
 
 /// Looks the names of the servers up with `lookup`, and returns the groups with a server for each address.
-/// `listeners` are the addresses the proxy listens on.
+/// `listeners` are the addresses the proxy listens on, the status listener's included.
 pub fn complete<L>(
     settings: ForwardSettings,
     listeners: &[SocketAddr],

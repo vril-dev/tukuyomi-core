@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use self::record::Record;
 
+pub mod counters;
 pub mod record;
 mod time;
 

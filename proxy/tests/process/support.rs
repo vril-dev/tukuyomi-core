@@ -723,6 +723,8 @@ pub(crate) struct Knobs {
     /// The most bytes a body may have, and how many of its first bytes are inspected.
     pub(crate) max_body: usize,
     pub(crate) inspect_body: usize,
+    /// The value of `NOTIFY_SOCKET` of the proxy's environment; none: the variable is not set.
+    pub(crate) notify_socket: Option<String>,
 }
 
 impl Knobs {
@@ -747,6 +749,7 @@ impl Knobs {
             // A body is inspected whole, up to the most the kernel takes.
             max_body: MAX_BODY,
             inspect_body: MAX_BODY,
+            notify_socket: None,
         }
     }
 
@@ -1026,13 +1029,18 @@ impl Proxy {
         make_store(root.path());
         edit(root.path());
         let started = Instant::now();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tukuyomi-proxy"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tukuyomi-proxy"));
+        command
             .arg(&config)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start the proxy");
+            .stderr(Stdio::piped());
+        // The environment of the test run does not leak into the proxy: the variable is what the test says.
+        match &knobs.notify_socket {
+            Some(socket) => command.env("NOTIFY_SOCKET", socket),
+            None => command.env_remove("NOTIFY_SOCKET"),
+        };
+        let mut child = command.spawn().expect("start the proxy");
         let pid = child.id();
         let stderr = child.stderr.take().expect("the proxy's stderr is piped");
         let records = Arc::new(Records::default());

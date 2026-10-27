@@ -56,16 +56,17 @@ fn turned_line(generation: Fingerprint) -> String {
 }
 
 /// Takes the result of every `(id, verdict, matched)` out of the table: sends it to the connection unless `cancel`
-/// was called, and drops the ticket, which gives its permits back. The `judge` names the generation and its mode; the
-/// rules that matched are the ones of the result. A `Detected` for a generation that blocks is sent as
-/// `Uninspectable(Protocol)` without the rules it came with: the request is not let through, and nothing the
-/// inspector said about it is believed. The answer is true if there was one, for the record line of a slot that
-/// serves; a slot that is stopped makes none. A result for a request that is not in the table breaks the promise
-/// that every result comes out once.
+/// was called, and drops the ticket, which gives its permits back. The answer names the `generation` and its `mode`,
+/// the verdict that is delivered and the rules that matched, which are the ones of the result. A `Detected` for a
+/// generation that blocks is sent as `Uninspectable(Protocol)` without the rules it came with: the request is not
+/// let through, and nothing the inspector said about it is believed. The answer is true if there was one, for the
+/// record line of a slot that serves; a slot that is stopped makes none. A result for a request that is not in the
+/// table breaks the promise that every result comes out once.
 pub(super) fn deliver(
     pending: &mut BTreeMap<ReqId, Pending>,
     results: &[(ReqId, Verdict, Matched)],
-    judge: Judge,
+    generation: Fingerprint,
+    mode: Mode,
 ) -> Result<bool, &'static str> {
     let mut turned = false;
     for &(id, verdict, matched) in results {
@@ -73,7 +74,7 @@ pub(super) fn deliver(
             return Err("result for an unknown request");
         };
         let (verdict, matched) = match verdict {
-            Verdict::Detected { .. } if judge.mode == Mode::Block => {
+            Verdict::Detected { .. } if mode == Mode::Block => {
                 turned = true;
                 (Verdict::Uninspectable(Reason::Protocol), Matched::NONE)
             }
@@ -89,7 +90,12 @@ pub(super) fn deliver(
             // Err only says that the connection is gone already.
             let _ = reply.send(Answer {
                 outcome: Outcome::Verdict(verdict),
-                by: Some(Judge { matched, ..judge }),
+                by: Some(Judge {
+                    generation,
+                    mode,
+                    verdict,
+                    matched,
+                }),
             });
         }
     }
@@ -186,19 +192,8 @@ impl<K: Kernel> Slot<K> {
     /// Steps the kernel until a result is ready or `until`, and delivers the results.
     pub(super) fn step(&mut self, until: Instant) -> Result<(), &'static str> {
         let results = self.kernel.poll(until);
-        let judge = self.judge();
-        self.turned |= deliver(&mut self.pending, &results, judge)?;
+        self.turned |= deliver(&mut self.pending, &results, self.generation, self.mode)?;
         Ok(())
-    }
-
-    /// The generation of the slot and the mode of its rules, as a verdict of its kernel names them. The rules that
-    /// matched come with each result (`deliver`).
-    fn judge(&self) -> Judge {
-        Judge {
-            generation: self.generation,
-            mode: self.mode,
-            matched: Matched::NONE,
-        }
     }
 
     pub(super) fn status(&self) -> Status {
@@ -229,8 +224,7 @@ impl<K: Kernel> Slot<K> {
     /// left in the table breaks the promise that every result comes out once.
     pub(super) fn shutdown(&mut self, deadline: Instant) -> Result<Shutdown, &'static str> {
         let done = self.kernel.shutdown(deadline);
-        let judge = self.judge();
-        deliver(&mut self.pending, &done.results, judge)?;
+        deliver(&mut self.pending, &done.results, self.generation, self.mode)?;
         if !self.pending.is_empty() {
             return Err("request left after shutdown");
         }
@@ -322,12 +316,7 @@ impl Retirement {
                 clean: false,
             });
         };
-        let judge = Judge {
-            generation: self.generation,
-            mode: self.mode,
-            matched: Matched::NONE,
-        };
-        deliver(&mut self.pending, &done.results, judge)?;
+        deliver(&mut self.pending, &done.results, self.generation, self.mode)?;
         if !self.pending.is_empty() {
             return Err("request left after shutdown");
         }

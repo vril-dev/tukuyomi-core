@@ -6,8 +6,9 @@
 //! "max_fails", "fail_timeout_ms", "backup"}` with every key present: the address is an IP literal and a port
 //! (`[..]:port` for IPv6) or a name and a port (`name:port`), the weight is 1 to 100, `max_fails` is 0 to 100 (0:
 //! failures are not counted), `fail_timeout_ms` is the time a failing server is left out, and `backup` tells that the
-//! server is used only when no other one can be. An IP literal is not the address of a listener (nor a loopback
-//! address at the port of one, if that is an unspecified address), and is not unspecified or a multicast address. A
+//! server is used only when no other one can be. An IP literal is not the address of a listener, the status listener
+//! included (nor a loopback address at the port of one, if that is an unspecified address), and is not unspecified or
+//! a multicast address. A
 //! name is 1 to 253 bytes of lowercase letters, digits, `-`, `_` and `.`, in labels of 1 to 63 bytes of which the last
 //! starts with a letter (an OS takes `127.1` or `0x7f000001` for an address, not for a name); the port is 1 to 65535
 //! without a leading zero. The configuration does not look a name up: that is done once, when the proxy starts (see
@@ -402,8 +403,8 @@ fn tls(
     }))
 }
 
-/// Checks the `forward` object. `listeners` are the addresses the proxy listens on, and `max_body` is the limit on a
-/// request body that the proxy has: a route may lower it, not raise it.
+/// Checks the `forward` object. `listeners` are the addresses the proxy listens on, the status listener's included, and
+/// `max_body` is the limit on a request body that the proxy has: a route may lower it, not raise it.
 pub(super) fn check(
     raw: RawForward,
     listeners: &[SocketAddr],

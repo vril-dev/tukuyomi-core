@@ -42,6 +42,7 @@ mod records;
 mod refusals;
 mod rewrite;
 mod rules;
+mod status;
 mod stopping;
 mod support;
 mod tls;

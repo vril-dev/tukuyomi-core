@@ -10,6 +10,7 @@ use crate::inbound::conn::Ctx;
 use crate::inbound::transport::tls::Files;
 use crate::inspect::driver::{Msg, Switch};
 use crate::log::Log;
+use crate::log::counters::{Counters, ReloadResult, SwitchResult};
 use crate::rules::switch::{Next, Switcher};
 
 /// SIGUSR1: reads the rules store, and if it chooses another generation, orders the driver to switch to it. The
@@ -18,6 +19,7 @@ pub(super) fn reload(
     waits: &mut Waits,
     switcher: &mut Switcher,
     ingress: &SyncSender<Msg>,
+    counters: &Counters,
     log: &Log,
 ) {
     log.line("reload: SIGUSR1");
@@ -27,7 +29,10 @@ pub(super) fn reload(
             "reload: generation {} is already running",
             generation.hex()
         )),
-        Next::Refused(why) => log.line(&format!("reload: rules store refused: {why}")),
+        Next::Refused(why) => {
+            counters.add_switch(SwitchResult::Refused);
+            log.line(&format!("reload: rules store refused: {why}"));
+        }
         Next::Ready {
             generation,
             mode,
@@ -47,6 +52,7 @@ pub(super) fn reload(
             });
             if ingress.try_send(order).is_err() {
                 log.line("reload: the driver did not take the switch");
+                counters.add_switch(SwitchResult::Failed);
                 switcher.finish(false);
                 return;
             }
@@ -61,14 +67,17 @@ pub(super) fn reload_certificates(ctx: &Ctx) {
     ctx.log.line("reload: SIGUSR2");
     match ctx.tls.reload(&ctx.cfg.listeners, &Files) {
         Ok(()) => {
+            ctx.counters.add_reload(ReloadResult::Replaced);
             ctx.log.line("reload: certificates replaced");
             for place in ctx.tls.waiting() {
                 ctx.log
                     .line(&format!("reload: tls certificate not issued yet ({place})"));
             }
         }
-        Err(refusal) => ctx
-            .log
-            .line(&format!("reload: certificates refused: {refusal}")),
+        Err(refusal) => {
+            ctx.counters.add_reload(ReloadResult::Refused);
+            ctx.log
+                .line(&format!("reload: certificates refused: {refusal}"));
+        }
     }
 }

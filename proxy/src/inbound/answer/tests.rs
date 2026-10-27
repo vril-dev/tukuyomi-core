@@ -131,6 +131,34 @@ fn the_replies_show_their_class_status_reason_and_rule() {
 }
 
 #[test]
+fn only_a_reply_that_a_rule_decided_is_a_rule_hit() {
+    let blocked = |status| match decide(Outcome::Verdict(Verdict::Block {
+        phase: 1,
+        rule_id: 9201,
+        status,
+    })) {
+        Decision::Answer(reply) => reply,
+        Decision::Pass(_) => panic!("not an answer"),
+    };
+    assert_eq!(blocked(403).hit(), Some(RuleHit::Block));
+    assert_eq!(
+        Reply::forwarded(200, Passed::Detected { rule: 9201 }).hit(),
+        Some(RuleHit::Detect)
+    );
+    // A block status that no response can have is a fault of ours with the rule's number, and no hit.
+    assert_eq!(blocked(99).hit(), None);
+    for reply in [
+        Reply::forwarded(200, Passed::Allowed),
+        Reply::forwarded(200, Passed::Bypassed),
+        Reply::failed(502, "upstream unavailable"),
+        Reply::rejected(400, "malformed request head"),
+        Reply::NONE,
+    ] {
+        assert_eq!(reply.hit(), None);
+    }
+}
+
+#[test]
 fn a_body_is_shown_by_its_length() {
     assert_eq!(Sizes::whole(Some(0), 0).lengths(), None);
     assert_eq!(Sizes::whole(None, 12).lengths(), Some((12, None)));

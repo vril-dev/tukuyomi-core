@@ -82,13 +82,14 @@ use crate::inbound::transport::tls::{Hosts, Tls};
 use crate::inbound::upload::{Cause, Fate, Terms, Upload};
 use crate::inspect::driver::{Answer, BodyHold, Hold, Ingress, InspectReq, Judge, Msg, Ticket};
 use crate::log::Log;
+use crate::log::counters::Counters;
 use crate::rules::routes::SharedRoutes;
 
 /// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
 /// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, the
 /// upstream groups with the routes to them and the connections that wait to be used again, the way to the driver,
-/// the TLS of the listeners that end it, the answer to the challenge of the CA, if the configuration has `acme`, and the
-/// numbers of the requests.
+/// the TLS of the listeners that end it, the answer to the challenge of the CA, if the configuration has `acme`, the
+/// numbers of the requests, and the counters that `/metrics` shows.
 pub struct Ctx {
     pub cfg: ProxyConfig,
     pub budget: Arc<Semaphore>,
@@ -100,6 +101,7 @@ pub struct Ctx {
     pub tls: Tls,
     pub challenge: Option<Challenge>,
     pub ids: RequestIds,
+    pub counters: Counters,
 }
 
 /// How the listener that took a connection carries its requests: over plain HTTP, or over TLS, with the hosts of the
@@ -150,7 +152,7 @@ pub(super) struct Conn {
     via: Mutex<Option<Via>>,
     /// The size of the body, set when it has been read (or, if it goes on, as far as it has).
     sizes: Mutex<Option<Sizes>>,
-    /// The generation whose rules gave a verdict, set when one did.
+    /// The generation whose rules gave a verdict, and that verdict, set when one did.
     judged: Mutex<Option<Judge>>,
 }
 

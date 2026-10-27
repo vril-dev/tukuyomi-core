@@ -157,6 +157,9 @@ pub(super) async fn stop(
         }
         stop.note(event, log);
     }
+    // The status listener answered, also about the stop, until the connections were done or aborted; it closes now,
+    // and the connections it is answering end with it.
+    waits.status = None;
     // Aborted connections are dropped when the runtime next runs them; a connection that does not end by then
     // is left to the process exit.
     let end_by = abort_at.checked_add(kill_grace).unwrap_or(abort_at);

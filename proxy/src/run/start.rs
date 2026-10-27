@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use super::host;
 use super::serve::run;
 use crate::acme;
-use crate::config::{self, ForwardConfig, ProxyConfig, addresses};
+use crate::config::{self, ForwardConfig, ProxyConfig, StatusConfig, addresses};
 use crate::forward::resolve;
 use crate::inbound::challenge::Challenge;
 use crate::inbound::session::RequestIds;
@@ -75,6 +75,7 @@ pub fn start(log: &Log) -> u8 {
         mode,
         routes,
         switcher,
+        status,
     } = match prepare(&path, "start", log) {
         Ok(prepared) => prepared,
         Err(code) => return code,
@@ -104,6 +105,7 @@ pub fn start(log: &Log) -> u8 {
         routes,
         switcher,
         ids,
+        status,
         log.clone(),
     ))
 }
@@ -120,6 +122,8 @@ struct Prepared {
     routes: Routes,
     /// Keeps the hold on `generation`, and the store for the switches.
     switcher: Switcher,
+    /// Where the status listener is bound, if the configuration has one.
+    status: Option<StatusConfig>,
 }
 
 /// The steps of start-up from the configuration to the kernel configuration of the chosen generation, the hold on it
@@ -134,7 +138,9 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         }
     };
     log.line(&format!("{name}: configuration accepted"));
-    let listening = addresses(&loaded.proxy.listeners);
+    // A server may not have an address the proxy listens on, the one of the status listener included.
+    let mut listening = addresses(&loaded.proxy.listeners);
+    listening.extend(loaded.status.map(|status| status.listen));
     let forward = match resolve::complete(loaded.forward, &listening, resolve::system) {
         Ok(done) => {
             for line in &done.lines {
@@ -228,6 +234,7 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         mode,
         routes,
         switcher: Switcher::new(rules, loaded.kernel, generation, hold),
+        status: loaded.status,
     })
 }
 

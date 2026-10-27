@@ -22,6 +22,7 @@ use crate::forward::group::Upstreams;
 use crate::inbound::session::RequestIds;
 use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::Ingress;
+use crate::log::counters::Counters;
 use crate::log::{Format, start_logger};
 use crate::rules::routes::{Routes, SharedRoutes};
 
@@ -89,6 +90,7 @@ pub(in crate::forward) fn ctx_of(forward: &ForwardConfig, cfg: ProxyConfig) -> C
         tls: Tls::none(),
         challenge: None,
         ids: RequestIds::new().unwrap(),
+        counters: Counters::start(),
         cfg,
     }
 }

@@ -75,6 +75,12 @@ fn a_server_is_not_left_out_if_it_is_the_only_one_or_does_not_count_failures() {
         group.fail(0, at(ms));
     }
     assert!(chosen(group, at(10), 4).contains(&0));
+    // The failures are counted for the group also when the server does not count them to leave itself out.
+    assert_eq!(group.failures(), 5);
+    assert_eq!(
+        upstreams.failures().map(|(_, n)| n).collect::<Vec<_>>(),
+        [5]
+    );
 }
 
 #[test]

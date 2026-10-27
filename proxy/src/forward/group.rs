@@ -20,6 +20,9 @@
 //! with a `max_fails` of 0 is never left out, nor is the only server of a group. A group of which no server can be
 //! used has none to give (`Group::pick` is `None`).
 //!
+//! A group also counts all the failures of its servers from the start of the proxy (`Group::failures`), also those of
+//! a server with a `max_fails` of 0, for `/metrics`.
+//!
 //! The counts are atomic numbers that are read and written one at a time, so two failures that come in the same
 //! instant may count as one; a count that is a little low or high changes how soon a server is left out, nothing
 //! that a client sees. The times are milliseconds from the start of the group.
@@ -103,6 +106,13 @@ impl Upstreams {
         self.routes
             .could_hold(host, target)
             .map(|route| &route.access)
+    }
+
+    /// The name of every group with the failures counted for it since the start, in the order of the configuration.
+    pub fn failures(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.groups
+            .iter()
+            .map(|group| (&**group.name(), group.failures()))
     }
 
     /// The group at `index`, for the tests.
@@ -209,6 +219,8 @@ pub struct Group {
     servers: Vec<Server>,
     turn: Turn,
     born: Instant,
+    /// The failures of all the servers, counted since the start.
+    failures: AtomicU64,
 }
 
 impl Group {
@@ -227,6 +239,7 @@ impl Group {
                 .collect(),
             turn: Turn::new(&cfg.servers),
             born,
+            failures: AtomicU64::new(0),
         }
     }
 
@@ -263,7 +276,13 @@ impl Group {
 
     /// Counts a failure of the server at `index`, at `now`.
     pub(super) fn fail(&self, index: usize, now: Instant) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
         self.servers[index].fail(self.since(now));
+    }
+
+    /// The failures of all the servers since the start.
+    pub fn failures(&self) -> u64 {
+        self.failures.load(Ordering::Relaxed)
     }
 
     /// Whether the server at `index` is left out at the moment, for the tests.

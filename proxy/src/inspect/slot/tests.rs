@@ -122,6 +122,7 @@ fn verdict(verdict: Verdict, mode: Mode) -> Answer {
         by: Some(Judge {
             generation: Fingerprint::from_hex(&[b'7'; 64]).unwrap(),
             mode,
+            verdict,
             matched: Matched::NONE,
         }),
     }

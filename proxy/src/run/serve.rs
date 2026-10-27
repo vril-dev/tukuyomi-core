@@ -1,5 +1,5 @@
-//! The runtime part of the start: the signal handlers, the driver, the wait for the kernel to be ready, the
-//! listeners, and the accept side until something asks for a stop.
+//! The runtime part of the start: the signal handlers, the status listener, the driver, the wait for the kernel to be
+//! ready, the listeners, and the accept side until something asks for a stop.
 
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
@@ -9,10 +9,12 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::Instant;
 
 use super::EXIT_FAILED;
+use super::notify::Notify;
 use super::reload::{reload, reload_certificates};
 use super::signals::{Event, Signals, Waits};
+use super::status::{self, Readiness, View};
 use super::stop::{Cause, stop};
-use crate::config::{ForwardConfig, ProxyConfig, addresses};
+use crate::config::{ForwardConfig, ProxyConfig, StatusConfig, addresses};
 use crate::forward::group::Upstreams;
 use crate::inbound::challenge::Challenge;
 use crate::inbound::conn::Ctx;
@@ -21,6 +23,7 @@ use crate::inbound::transport::accept::{Acceptor, Arrival};
 use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::{self, Driver, Ingress, Limits, Msg};
 use crate::log::Log;
+use crate::log::counters::{Counters, SwitchResult};
 use crate::rules::bundle::{Fingerprint, Mode};
 use crate::rules::routes::{Routes, SharedRoutes};
 use crate::rules::switch::Switcher;
@@ -41,6 +44,7 @@ pub(super) async fn run(
     routes: Routes,
     mut switcher: Switcher,
     ids: RequestIds,
+    status: Option<StatusConfig>,
     log: Log,
 ) -> u8 {
     let signals = match Signals::install() {
@@ -49,6 +53,19 @@ pub(super) async fn run(
             log.line("start: cannot install the signal handlers");
             return EXIT_FAILED;
         }
+    };
+    let notify = Notify::from_env(&log);
+    // The status listener is bound before the driver starts, so an address that cannot be bound ends the start before
+    // the inspector runs.
+    let status_listener = match status {
+        Some(config) => match status::bind(config.listen).await {
+            Ok(listener) => Some(listener),
+            Err(_) => {
+                log.line("start: the status address cannot be bound");
+                return EXIT_FAILED;
+            }
+        },
+        None => None,
     };
     let wait_queue = kernel.wait_queue;
     let kill_grace = kernel.kill_grace;
@@ -79,6 +96,7 @@ pub(super) async fn run(
         ready,
         failed,
         end,
+        state,
     } = driver;
     let mut waits = Waits::new(signals, ready, failed, end);
     // What the connections share. They take a sender from its handle for every request, and the stop closes it.
@@ -93,8 +111,25 @@ pub(super) async fn run(
         tls,
         challenge,
         ids,
+        counters: Counters::start(),
     });
-    let cause = until_stop(&mut waits, &ctx, &ingress, &mut switcher).await;
+    let readiness = Arc::new(Readiness::new());
+    if let Some(listener) = status_listener {
+        let view = View::new(ctx.clone(), wait_queue, state, readiness.clone());
+        waits.status = Some(status::serve(listener, Arc::new(view)));
+    }
+    let cause = until_stop(
+        &mut waits,
+        &ctx,
+        &ingress,
+        &mut switcher,
+        &readiness,
+        &notify,
+    )
+    .await;
+    // The first cause of a stop: the status listener and the service manager are told before the stop begins.
+    readiness.stopping();
+    notify.stopping(&log);
     stop(
         waits,
         cause,
@@ -107,12 +142,15 @@ pub(super) async fn run(
     .await
 }
 
-/// Waits for the kernel, binds, and accepts until something asks for a stop. Returns that cause.
+/// Waits for the kernel, binds, and accepts until something asks for a stop. Returns that cause. Once the listeners
+/// are bound `readiness` and `notify` say so.
 async fn until_stop(
     waits: &mut Waits,
     ctx: &Arc<Ctx>,
     ingress: &SyncSender<Msg>,
     switcher: &mut Switcher,
+    readiness: &Readiness,
+    notify: &Notify,
 ) -> Cause {
     let (proxy, log) = (&ctx.cfg, &ctx.log);
     let Some(ready_by) = Instant::now().checked_add(proxy.ready_wait) else {
@@ -139,7 +177,9 @@ async fn until_stop(
             Err(_) => return Cause::Bind,
         };
     waits.accept = Some(acceptor);
+    readiness.bound();
     log.line("start: listening");
+    notify.ready(log);
 
     loop {
         match waits.wait(None).await {
@@ -147,9 +187,16 @@ async fn until_stop(
             Event::AcceptErr(Some(errno)) => log.line(&format!("accept: failed, errno {errno}")),
             Event::AcceptErr(None) => log.line("accept: failed"),
             Event::Joined(done) => note_joined(done, log),
-            Event::Reload => reload(waits, switcher, ingress, log),
+            Event::Reload => reload(waits, switcher, ingress, &ctx.counters, log),
             Event::Certificates => reload_certificates(ctx),
-            Event::Switched(switched) => switcher.finish(switched),
+            Event::Switched(switched) => {
+                ctx.counters.add_switch(if switched {
+                    SwitchResult::Switched
+                } else {
+                    SwitchResult::Failed
+                });
+                switcher.finish(switched);
+            }
             event => {
                 if let Some(cause) = Cause::of(event) {
                     return cause;
@@ -159,8 +206,10 @@ async fn until_stop(
     }
 }
 
-/// Starts one connection. The permit lives as long as the connection and goes back when it ends or is aborted.
+/// Starts one connection. The permit lives as long as the connection and goes back when it ends or is aborted; so
+/// does the count of the connections that are open.
 fn spawn_connection(conns: &mut JoinSet<()>, arrival: Arrival, ctx: &Arc<Ctx>, log: &Log) {
+    ctx.counters.accepted.add();
     let Arrival {
         sock,
         peer,
@@ -175,8 +224,10 @@ fn spawn_connection(conns: &mut JoinSet<()>, arrival: Arrival, ctx: &Arc<Ctx>, l
         }
     };
     let ctx = ctx.clone();
+    let counted = ctx.counters.open.count();
     conns.spawn(async move {
         let _permit = permit;
+        let _counted = counted;
         session::serve_on(sock, peer, local, ctx, listener).await;
     });
 }

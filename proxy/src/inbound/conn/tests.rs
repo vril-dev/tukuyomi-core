@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle as Served;
 use tokio::time::{sleep, timeout};
-use tukuyomi_kernel::Verdict;
+use tukuyomi_kernel::{Matched, Reason, Verdict};
 
 use super::*;
 use crate::config::{ForwardConfig, RouteConfig};
@@ -21,8 +21,10 @@ use crate::inbound::http1::run as run_session;
 use crate::inbound::session::{serve, serve_on};
 use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::Outcome;
+use crate::log::counters::Counters;
 use crate::log::{Lines, recording};
 use crate::route::{Rule, Table};
+use crate::rules::bundle::{self, Fingerprint};
 use crate::rules::routes::{Route, Routes};
 
 pub(in crate::inbound) const FORM: &str = "application/x-www-form-urlencoded";
@@ -123,6 +125,21 @@ pub(in crate::inbound) struct Seen {
     abandoned: bool,
 }
 
+/// What the driver answers for `outcome`: a verdict comes with the generation that gave it, as it does from the
+/// driver.
+fn answered(outcome: Outcome) -> Answer {
+    let by = match outcome {
+        Outcome::Verdict(verdict) => Some(Judge {
+            generation: Fingerprint::from_hex(&[b'7'; 64]).unwrap(),
+            mode: bundle::Mode::Block,
+            verdict,
+            matched: Matched::NONE,
+        }),
+        Outcome::Refused(_) | Outcome::Unavailable => None,
+    };
+    Answer { outcome, by }
+}
+
 fn driver(rx: Receiver<Msg>, answer: Option<Outcome>) -> JoinHandle<Vec<Seen>> {
     thread::spawn(move || {
         let mut kept = Vec::new();
@@ -150,7 +167,7 @@ fn driver(rx: Receiver<Msg>, answer: Option<Outcome>) -> JoinHandle<Vec<Seen>> {
             };
             match answer {
                 Some(outcome) => {
-                    let _ = ticket.reply.send(outcome.into());
+                    let _ = ticket.reply.send(answered(outcome));
                     kept.push((seen, None));
                 }
                 None => kept.push((seen, Some(ticket))),
@@ -231,6 +248,7 @@ impl Rig {
             tls,
             challenge: None,
             ids: RequestIds::new().unwrap(),
+            counters: Counters::start(),
         });
         let (driver, full) = match mode {
             Mode::Answer(outcome) => (Some(driver(rx, Some(outcome))), None),
@@ -461,6 +479,53 @@ fn a_blocked_request_is_answered_with_the_status_of_the_rule() {
             ("GET", "/a")
         );
         assert_eq!(seen[0].headers, [pair("Host", "h")]);
+    });
+}
+
+/// The context after one request whose verdict is `outcome`, for the counters.
+async fn counted(outcome: Outcome) -> Arc<Ctx> {
+    let rig = Rig::new(config(), Mode::Answer(outcome)).await;
+    let ctx = rig.ctx.clone();
+    let (client, task) = rig.connect().await;
+    put(&client, b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n").await;
+    let _ = read_all(&client).await;
+    drop(client);
+    rig.finish(task).await;
+    ctx
+}
+
+fn count(samples: &[(&str, u64)], label: &str) -> u64 {
+    samples
+        .iter()
+        .find(|(known, _)| *known == label)
+        .map_or(0, |&(_, count)| count)
+}
+
+#[test]
+fn the_counters_have_the_class_the_rule_and_the_reason_of_an_answer() {
+    run(async {
+        let ctx = counted(BLOCK).await;
+        let requests = ctx.counters.requests.samples();
+        assert_eq!(count(&requests, "blocked"), 1);
+        assert_eq!(requests.iter().map(|&(_, n)| n).sum::<u64>(), 1);
+        assert_eq!(
+            ctx.counters.rule_hits.samples(),
+            [("block", 1), ("detect", 0)]
+        );
+        let reasons = ctx.counters.uninspectable.samples();
+        assert!(reasons.iter().all(|&(_, n)| n == 0), "{reasons:?}");
+
+        // The kernel could not inspect the request: the answer is a failure, and the reason is counted, not a rule.
+        let lost = Outcome::Verdict(Verdict::Uninspectable(Reason::InspectorLost));
+        let ctx = counted(lost).await;
+        assert_eq!(count(&ctx.counters.requests.samples(), "failed"), 1);
+        let reasons = ctx.counters.uninspectable.samples();
+        assert_eq!(count(&reasons, "inspector_lost"), 1);
+        assert_eq!(reasons.iter().map(|&(_, n)| n).sum::<u64>(), 1);
+        assert_eq!(
+            ctx.counters.rule_hits.samples(),
+            [("block", 0), ("detect", 0)]
+        );
     });
 }
 

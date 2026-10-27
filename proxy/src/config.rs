@@ -1,20 +1,22 @@
 //! The configuration file: one JSON object `{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store":
-//! {..}}, "acme": {..}}`; every value is chosen by the operator and checked here.
+//! {..}}, "acme": {..}, "status": {..}}`; every value is chosen by the operator and checked here.
 //!
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present (a
 //! route may leave out its `host`, its `path`, its `access`, its `rewrite`, its `stream` and its `max_body`; `access`
 //! and `rewrite` have no key that must be present, see `rewrite`, and a `stream` has all three; an upstream group may leave out its
 //! `tls`, which may leave out its `server_name`; a listener may leave out its `tls` and its `redirect`, and the `tls`
 //! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
-//! may leave out `acme`, which it must have if and only if a certificate has one, see `acme`); an unknown or repeated
+//! may leave out `acme`, which it must have if and only if a certificate has one, see `acme`, and `status`, which
+//! has the one key `listen`, see `status`); an unknown or repeated
 //! key is refused, and so is a value of the wrong
 //! type, an array in place of an object and `null` for a key that may be left out included (such a key is either left
 //! out or has a value). A refusal is one fixed sentence per kind of fault and never carries a key or a value from the
 //! file. Then the values are checked in a fixed order and the first broken rule is returned: the `proxy` bounds, the
-//! `forward` values (see `forward`; the names of the servers are not looked up here, `forward::resolve` does that when
-//! the proxy starts), the `rules.store` values, the `acme` object with the certificates that have `acme`, the
-//! conversion of the `kernel` object into `tukuyomi_kernel::Config`
-//! with that type's own check, and last the relations between the `proxy` and `kernel` objects.
+//! `status` object against the listeners (before `forward`, for no server may be at its address), the `forward`
+//! values (see `forward`; the names of the servers are not looked up here, `forward::resolve` does that when the proxy
+//! starts), the `rules.store` values, the `acme` object with the certificates that have `acme`, the conversion of the
+//! `kernel` object into `tukuyomi_kernel::Config` with that type's own check, and last the relations between the
+//! `proxy` and `kernel` objects.
 //!
 //! `max_body` (1 KiB to 4 GiB) is the most bytes a request body may have once decoded (a gzip body under a route
 //! that skips the inspection is not decoded, so the limit counts its coded bytes), and `inspect_body` (1 KiB up to
@@ -59,6 +61,7 @@ mod acme;
 mod forward;
 mod listeners;
 mod rewrite;
+mod status;
 
 pub use acme::AcmeConfig;
 pub(crate) use forward::MAX_SERVERS;
@@ -69,6 +72,7 @@ pub use listeners::{
     CertificateAcme, CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion,
     TlsConfig, addresses,
 };
+pub use status::StatusConfig;
 
 const MAX_FILE: u64 = 256 * 1024;
 /// Longest accepted `rules.store.dir` in bytes: the paths below it must stay inside the Linux `PATH_MAX`. A guard
@@ -155,6 +159,8 @@ pub struct Loaded {
     pub store: StoreConfig,
     /// There if and only if a certificate has `acme`.
     pub acme: Option<AcmeConfig>,
+    /// There if the file has the `status` object.
+    pub status: Option<StatusConfig>,
 }
 
 /// Where the rule generations are kept, as the file names it.
@@ -198,6 +204,8 @@ struct RawFile {
     rules: Object<RawRules>,
     #[serde(default, deserialize_with = "present")]
     acme: Option<Object<acme::RawAcme>>,
+    #[serde(default, deserialize_with = "present")]
+    status: Option<Object<status::RawStatus>>,
 }
 
 #[derive(Deserialize)]
@@ -337,6 +345,7 @@ fn parse(bytes: &[u8]) -> Result<Loaded, ConfigError> {
         file.rules.0.store.0,
         file.kernel.0,
         file.acme,
+        file.status,
     )
 }
 
@@ -418,6 +427,7 @@ fn build(
     s: RawStore,
     k: RawKernel,
     a: Option<Object<acme::RawAcme>>,
+    st: Option<Object<status::RawStatus>>,
 ) -> Result<Loaded, ConfigError> {
     let listeners = listeners::check(p.listeners)?;
     ensure(within(p.max_conns, 1, 65536), "max_conns is out of range")?;
@@ -533,7 +543,11 @@ fn build(
         "upstream_keepalive_requests is out of range",
     )?;
 
-    let forward = forward::check(f, &addresses(&listeners), p.max_body)?;
+    let status = status::check(st, &listeners)?;
+    // A server may not be at an address the proxy listens on, the one of the status listener included.
+    let mut bound = addresses(&listeners);
+    bound.extend(status.map(|status| status.listen));
+    let forward = forward::check(f, &bound, p.max_body)?;
 
     ensure(s.kind == "file", "rules store kind is not supported")?;
     let dir = PathBuf::from(s.dir);
@@ -696,6 +710,7 @@ fn build(
         kernel: KernelSettings(kernel),
         store: StoreConfig::File { dir },
         acme,
+        status,
     })
 }
 

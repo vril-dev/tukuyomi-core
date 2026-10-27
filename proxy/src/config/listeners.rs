@@ -183,7 +183,7 @@ pub fn addresses(listeners: &[ListenerConfig]) -> Vec<SocketAddr> {
 }
 
 /// Whether a bind at `b` fails when `a` is bound: the same port, and the same address or one of them unspecified.
-fn clash(a: SocketAddr, b: SocketAddr) -> bool {
+pub(super) fn clash(a: SocketAddr, b: SocketAddr) -> bool {
     let (x, y) = (a.ip().to_canonical(), b.ip().to_canonical());
     a.port() == b.port() && (x == y || x.is_unspecified() || y.is_unspecified())
 }

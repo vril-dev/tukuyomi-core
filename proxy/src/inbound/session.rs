@@ -13,8 +13,9 @@
 //! Every answer that is written to a client has a record of the type `request`, written when the response has been
 //! given to the connection or was cut off, and has a number (`RequestIds`) that the record and the response (in an
 //! `X-Request-ID` field) share. That includes the answer to a first head that was refused, the answers of a listener
-//! that redirects, and the answer to a stream whose head could not be made. The record has the address of the client
-//! that the inspection was told (see `conn`); a record that is written before a request has been read has the
+//! that redirects, and the answer to a stream whose head could not be made. The counters that `/metrics` shows (see
+//! `log::counters`) are added when the record is queued. The record has the address of the client that the
+//! inspection was told (see `conn`); a record that is written before a request has been read has the
 //! address of the peer, and no method, `Host` or path, which are written only when the head of the request passed
 //! the head check. A request that was sent to an upstream has the group and the server in its record, and one that
 //! was judged by the rules has the generation and the mode of the rules and the rules that matched it. A connection
@@ -42,6 +43,7 @@ use rustls::crypto::aws_lc_rs::default_provider;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
+use tukuyomi_kernel::Verdict;
 
 use crate::config::{Http2Config, ListenerKind, ProxyConfig, Stream};
 use crate::inbound::answer::{Class, Noted, Out, Reply, Sizes};
@@ -238,8 +240,14 @@ async fn serve_tls(
                         }
                     }
                 }
-                Ok(Err(_)) => Summary::unserved("tls handshake failed"),
-                Err(_) => Summary::unserved("tls handshake not finished in time"),
+                Ok(Err(_)) => {
+                    ctx.counters.tls_failures.add();
+                    Summary::unserved("tls handshake failed")
+                }
+                Err(_) => {
+                    ctx.counters.tls_failures.add();
+                    Summary::unserved("tls handshake not finished in time")
+                }
             }
         }
         None => Summary::unserved("no tls for the listener"),
@@ -390,6 +398,15 @@ impl Session {
             *lock(&self.last) = reply;
         }
         self.recorded.fetch_add(1, Ordering::Relaxed);
+        // The counters are added before the record is queued, so a record that has been seen is counted.
+        let counters = &self.ctx.counters;
+        counters.add_request(reply.class.name());
+        if let Some(hit) = reply.hit() {
+            counters.add_rule_hit(hit);
+        }
+        if let Some(Verdict::Uninspectable(reason)) = noted.judged.map(|judge| judge.verdict) {
+            counters.add_uninspectable(reason);
+        }
         if reply.internal {
             self.ctx.log.line(&format!(
                 "conn {}: internal fault: {}",
@@ -507,7 +524,7 @@ impl<G> Drop for Tracked<G> {
 }
 
 /// Writes all of `bytes`, then ends the sending direction.
-pub(super) async fn send_and_close<T>(stream: &mut T, bytes: &[u8])
+pub(crate) async fn send_and_close<T>(stream: &mut T, bytes: &[u8])
 where
     T: AsyncWrite + Unpin,
 {
