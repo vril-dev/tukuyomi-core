@@ -183,10 +183,15 @@ func (o *owner) send(b []byte) { o.t.send(b) }
 // before the files ran (detectBeginID): without it the transaction was never
 // switched to DetectionOnly, so a rule of the operator may have blocked it and
 // nothing says what the engine did. That request is incomplete, as for a
-// Continue (detectionOf).
+// Continue (detectionOf). The VERDICT of a request phase carries what matched
+// so far (detailFor).
 func (o *owner) verdict(msg uint32, phase uint8, it *types.Interruption) {
 	if it == nil {
-		b, _ := encodeVerdict(o.t.run, o.t.inc, o.id, msg, phase, 0, 0, "", "", false)
+		b, ok := encodeVerdict(o.t.run, o.t.inc, o.id, msg, phase, 0, 0, "", "", false, o.detailFor(phase, 0))
+		if !ok {
+			o.fail(msg, codeBadVerdict, "verdict fields out of range")
+			return
+		}
 		o.send(b)
 		return
 	}
@@ -194,9 +199,9 @@ func (o *owner) verdict(msg uint32, phase uint8, it *types.Interruption) {
 		o.fail(msg, codeIncomplete, "request inspection incomplete")
 		return
 	}
-	b, ok := encodeVerdict(o.t.run, o.t.inc, o.id, msg, phase, it.RuleID, it.Status, it.Action, it.Data, true)
+	b, ok := encodeVerdict(o.t.run, o.t.inc, o.id, msg, phase, it.RuleID, it.Status, it.Action, it.Data, true, o.detailFor(phase, it.RuleID))
 	if !ok {
-		o.fail(msg, codeBadVerdict, "interruption status out of range")
+		o.fail(msg, codeBadVerdict, "verdict fields out of range")
 		return
 	}
 	if phase <= 2 {
@@ -205,6 +210,16 @@ func (o *owner) verdict(msg uint32, phase uint8, it *types.Interruption) {
 		o.state = stBlockedRs
 	}
 	o.send(b)
+}
+
+// detailFor is what the VERDICT of the phase says about the rules that matched
+// so far; deciding is the rule id of the VERDICT (0 for none). The response
+// phases carry nothing.
+func (o *owner) detailFor(phase uint8, deciding int) ruleDetail {
+	if phase > 2 {
+		return noDetail
+	}
+	return detailOf(o.tx, deciding)
 }
 
 // fail sends the transaction's single ERROR and moves to the failed state.
@@ -492,9 +507,9 @@ func (o *owner) continueDetect(msg uint32) {
 		o.verdict(msg, 2, nil)
 		return
 	}
-	b, ok := encodeDetected(o.t.run, o.t.inc, o.id, msg, it.RuleID, it.Status, it.Action, it.Data)
+	b, ok := encodeDetected(o.t.run, o.t.inc, o.id, msg, it.RuleID, it.Status, it.Action, it.Data, o.detailFor(2, it.RuleID))
 	if !ok {
-		o.fail(msg, codeBadVerdict, "interruption status out of range")
+		o.fail(msg, codeBadVerdict, "verdict fields out of range")
 		return
 	}
 	o.send(b)

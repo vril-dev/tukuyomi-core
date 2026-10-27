@@ -79,7 +79,7 @@ func TestNewWAFReadsNoFile(t *testing.T) {
 	if err := os.WriteFile(words, []byte("attack\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for name, arg := range map[string]string{"absolute": words, "relative": "testdata/v0-golden.txt"} {
+	for name, arg := range map[string]string{"absolute": words, "relative": "testdata/v1-golden.txt"} {
 		_, err := newWAF(ruleBundle(`SecRule ARGS "@pmFromFile ` + arg + `" "id:5,phase:1,pass"` + "\n"))
 		if err == nil || !strings.Contains(err.Error(), "file does not exist") {
 			t.Errorf("%s name: %v", name, err)

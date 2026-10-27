@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::process::child::Exit;
 use crate::process::start::{self, Start, StartDir, Stopping};
-use crate::protocol::codec;
+use crate::protocol::codec::{self, Matched};
 use crate::requests::state::{Decision, Engine, Halt, OutKind, Why};
 
 /// The wait between two tries to reap a child when the supervisor is dropped.
@@ -64,7 +64,8 @@ pub struct Request<'a> {
 /// The answer for one request. `Allow` is a verdict on the bytes that were given to `submit`, inspected by the
 /// rules and the fixed trailing directives in the phases 1 and 2, and on nothing else: whatever was not inspected,
 /// or inspected in part, is `Uninspectable`. `Detected` is an `Allow` in which a rule matched while the rules only
-/// detect.
+/// detect. A result is the request number, the verdict and the rules that matched (`Matched`) as the VERDICT that
+/// decided the request says them: for `Allow`, `Detected` and `Block`, and nothing for `Uninspectable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Allow,
@@ -143,7 +144,7 @@ pub struct Status {
 #[derive(Debug)]
 pub struct Shutdown {
     /// Every result not delivered before, each once.
-    pub results: Vec<(ReqId, Verdict)>,
+    pub results: Vec<(ReqId, Verdict, Matched)>,
     /// Stopped or Failed(..); a Failed reason stays after a later retry.
     pub phase: Phase,
     /// This call received the BYE that answered its DRAIN.

@@ -280,9 +280,10 @@ impl Sizes {
 
 /// What the record shows of a request besides the time it took: its number, its reply, the address of the client it
 /// is recorded under, its method, `Host` and path if its head passed the check, the upstream it went to, if it got as
-/// far as that, the size of its body, if it has one, and the generation whose rules gave a verdict, if any did. Only
-/// numbers, fixed texts, the name of a group from the configuration, addresses in their canonical forms and the
-/// request's own text as the record writes it (see `log::record`), so nothing the peer sent gets in as it is.
+/// far as that, the size of its body, if it has one, and the generation whose rules gave a verdict, with the rules
+/// that matched the request, if any did. Only numbers, fixed texts, the name of a group from the configuration,
+/// addresses in their canonical forms and the request's own text as the record writes it (see `log::record`), so
+/// nothing the peer sent gets in as it is.
 pub(super) struct Noted {
     pub(super) id: String,
     pub(super) reply: Reply,

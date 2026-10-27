@@ -23,6 +23,7 @@ fn judge(mode: bundle::Mode) -> Judge {
     Judge {
         generation: Fingerprint::from_hex(&[b'7'; 64]).unwrap(),
         mode,
+        matched: Matched::NONE,
     }
 }
 
@@ -224,10 +225,14 @@ impl Kernel for Fake {
         self.calls.push(Call::Cancel(id));
     }
 
-    fn poll(&mut self, until: Instant) -> Vec<(ReqId, Verdict)> {
+    fn poll(&mut self, until: Instant) -> Vec<(ReqId, Verdict, Matched)> {
         self.calls.push(Call::Poll);
         self.until.push(until);
-        self.polls.pop_front().unwrap_or_default()
+        let results = self.polls.pop_front().unwrap_or_default();
+        results
+            .into_iter()
+            .map(|(id, verdict)| (id, verdict, Matched::NONE))
+            .collect()
     }
 
     fn status(&self) -> Status {
@@ -251,7 +256,10 @@ impl Kernel for Fake {
         // The exit that shutdown confirms numbers the next incarnation.
         self.inc += 1;
         Shutdown {
-            results: mem::take(&mut self.at_shutdown),
+            results: mem::take(&mut self.at_shutdown)
+                .into_iter()
+                .map(|(id, verdict)| (id, verdict, Matched::NONE))
+                .collect(),
             phase: Phase::Stopped,
             bye: true,
             exit_confirmed: true,
@@ -565,7 +573,10 @@ fn a_result_for_an_unknown_request_is_fatal() {
     assert_eq!(
         deliver(
             &mut pending,
-            &[(1, Verdict::Allow), (2, Verdict::Allow)],
+            &[
+                (1, Verdict::Allow, Matched::NONE),
+                (2, Verdict::Allow, Matched::NONE)
+            ],
             judge(bundle::Mode::Block)
         ),
         unknown
@@ -582,7 +593,7 @@ fn a_result_for_an_unknown_request_is_fatal() {
     assert_eq!(
         deliver(
             &mut pending,
-            &[(1, Verdict::Allow)],
+            &[(1, Verdict::Allow, Matched::NONE)],
             judge(bundle::Mode::Block)
         ),
         unknown
@@ -591,6 +602,53 @@ fn a_result_for_an_unknown_request_is_fatal() {
         deliver(&mut pending, &[], judge(bundle::Mode::Block)),
         Ok(false)
     );
+}
+
+#[test]
+fn a_verdict_is_delivered_with_the_rules_that_matched_the_request() {
+    let mut ids = [0; 16];
+    ids[..2].copy_from_slice(&[942100, 941100]);
+    let matched = Matched {
+        count: 2,
+        ids,
+        more: false,
+        severity: 2,
+        score: 10,
+    };
+    let blocked = Verdict::Block {
+        phase: 2,
+        rule_id: 949110,
+        status: 403,
+    };
+    let protocol = Verdict::Uninspectable(Reason::Protocol);
+    // The rules come with a verdict that was an inspection, whatever it was. A detection that a generation which
+    // blocks cannot have made is not believed, and nothing that came with it is either.
+    let cases = [
+        (bundle::Mode::Block, Verdict::Allow, Verdict::Allow, matched),
+        (bundle::Mode::Block, blocked, blocked, matched),
+        (bundle::Mode::Detect, DETECTED, DETECTED, matched),
+        (bundle::Mode::Block, DETECTED, protocol, Matched::NONE),
+    ];
+    for (mode, given, want, want_matched) in cases {
+        let world = World::new();
+        let mut made = world.ticket(b"/", 0);
+        let mut pending = BTreeMap::new();
+        pending.insert(
+            0,
+            Pending {
+                ticket: made.ticket,
+                cancelled: false,
+            },
+        );
+        deliver(&mut pending, &[(0, given, matched)], judge(mode)).unwrap();
+        let by = Judge {
+            matched: want_matched,
+            ..judge(mode)
+        };
+        let got = answer(&mut made.answer);
+        assert_eq!(got.outcome, Outcome::Verdict(want));
+        assert_eq!(got.by, Some(by));
+    }
 }
 
 #[test]
@@ -782,7 +840,7 @@ fn at_the_stop_deadline_shutdown_is_called_and_a_late_ticket_is_unavailable() {
     let done = r.core.round().unwrap().expect("the deadline is reached");
     // the result of shutdown is delivered like any other, and the main thread still sees it counted
     assert_eq!(outcome(&mut a.answer), Outcome::Verdict(unavailable));
-    assert_eq!(done.results, vec![(0, unavailable)]);
+    assert_eq!(done.results, vec![(0, unavailable, Matched::NONE)]);
     assert_eq!(r.world.free().0, INSPECT);
 
     // a ticket that comes later is answered and not submitted; the kernel is not stepped any more

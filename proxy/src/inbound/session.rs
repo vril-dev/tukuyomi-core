@@ -17,10 +17,10 @@
 //! that the inspection was told (see `conn`); a record that is written before a request has been read has the
 //! address of the peer, and no method, `Host` or path, which are written only when the head of the request passed
 //! the head check. A request that was sent to an upstream has the group and the server in its record, and one that
-//! was judged by the rules has the generation and the mode of the rules. A connection that never had a response,
-//! one that was closed over a head that was refused after the first, and one that fails in the handshake of TLS
-//! have a record of the type `connection` when they end, and so does a connection that speaks HTTP/2, in any
-//! case. A tunnel has a record of its own, also one that never ran (see `tunnel`).
+//! was judged by the rules has the generation and the mode of the rules and the rules that matched it. A connection
+//! that never had a response, one that was closed over a head that was refused after the first, and one that fails
+//! in the handshake of TLS have a record of the type `connection` when they end, and so does a connection that
+//! speaks HTTP/2, in any case. A tunnel has a record of its own, also one that never ran (see `tunnel`).
 //!
 //! A connection is closed by whoever served it, after hyper is done with it: the writing direction is ended (on TLS
 //! that sends the closing alert of TLS first), and after a response that closed the connection, or a head that was
@@ -414,6 +414,7 @@ impl Session {
             mode: noted.judged.map(|judge| judge.mode.name()),
             generation: noted.judged.map(|judge| judge.generation.bytes()),
             rule: reply.rule,
+            matched: noted.judged.map(|judge| judge.matched).unwrap_or_default(),
             body: lengths.map(|(length, _)| length),
             inspected: lengths.and_then(|(_, inspected)| inspected),
             sent,

@@ -55,6 +55,18 @@ fn only_end(e: &mut Engine, now: Instant) -> (u32, u8) {
 }
 
 fn cont(e: &mut Engine, now: Instant, tx: u64, msg: u32, phase: u8) -> Result<(), ConnFault> {
+    cont_with(e, now, tx, msg, phase, Matched::NONE)
+}
+
+/// A continue that says these rules matched.
+fn cont_with(
+    e: &mut Engine,
+    now: Instant,
+    tx: u64,
+    msg: u32,
+    phase: u8,
+    matched: Matched,
+) -> Result<(), ConnFault> {
     e.on_verdict(
         now,
         tx,
@@ -64,11 +76,24 @@ fn cont(e: &mut Engine, now: Instant, tx: u64, msg: u32, phase: u8) -> Result<()
         false,
         0,
         0,
+        matched,
         &[phase, 0, msg as u8],
     )
 }
 
 fn blk(e: &mut Engine, now: Instant, tx: u64, msg: u32, phase: u8) -> Result<(), ConnFault> {
+    blk_with(e, now, tx, msg, phase, Matched::NONE)
+}
+
+/// A block that says these rules matched.
+fn blk_with(
+    e: &mut Engine,
+    now: Instant,
+    tx: u64,
+    msg: u32,
+    phase: u8,
+    matched: Matched,
+) -> Result<(), ConnFault> {
     e.on_verdict(
         now,
         tx,
@@ -78,12 +103,24 @@ fn blk(e: &mut Engine, now: Instant, tx: u64, msg: u32, phase: u8) -> Result<(),
         false,
         949110,
         403,
+        matched,
         &[phase, 1, msg as u8],
     )
 }
 
 /// A continue of phase 2 that carries a match the rules only detected.
 fn det(e: &mut Engine, now: Instant, tx: u64, msg: u32) -> Result<(), ConnFault> {
+    det_with(e, now, tx, msg, Matched::NONE)
+}
+
+/// The same, and these rules matched.
+fn det_with(
+    e: &mut Engine,
+    now: Instant,
+    tx: u64,
+    msg: u32,
+    matched: Matched,
+) -> Result<(), ConnFault> {
     e.on_verdict(
         now,
         tx,
@@ -93,8 +130,27 @@ fn det(e: &mut Engine, now: Instant, tx: u64, msg: u32) -> Result<(), ConnFault>
         true,
         949110,
         403,
+        matched,
         &[2, 0, msg as u8, 4],
     )
+}
+
+/// The rules that matched: these ids, the severity and the score.
+fn matched(ids: &[i64], severity: u8, score: i32) -> Matched {
+    let mut all = [0; 16];
+    all[..ids.len()].copy_from_slice(ids);
+    Matched {
+        count: ids.len() as u8,
+        ids: all,
+        more: false,
+        severity,
+        score,
+    }
+}
+
+/// The next decision handed over, without its rules.
+fn done(e: &mut Engine) -> Option<(ReqId, Decision)> {
+    e.next_done().map(|(id, decision, _)| (id, decision))
 }
 
 fn blocked(phase: u8) -> Decision {
@@ -572,6 +628,44 @@ fn nothing_else_forwards() {
 }
 
 #[test]
+fn the_decision_carries_the_rules_of_the_verdict_that_made_it() {
+    let early = matched(&[942100], 4, 3);
+    let late = matched(&[942100, 941100], 2, 10);
+    // The continue of phase 1 and the continue of phase 2 say different things: the answer is the second.
+    let Fx { mut e, t0, id, tx } = row_p1();
+    cont_with(&mut e, t0, tx, 1, 1, early).unwrap();
+    assert_eq!(drain(&mut e, t0).len(), 3);
+    cont_with(&mut e, t0, tx, 4, 2, late).unwrap();
+    assert_eq!(e.next_done(), Some((id, Decision::Forward, late)));
+    // So is a detection, and so is a block of phase 2.
+    let Fx { mut e, t0, id, tx } = row_p1();
+    cont_with(&mut e, t0, tx, 1, 1, early).unwrap();
+    assert_eq!(drain(&mut e, t0).len(), 3);
+    det_with(&mut e, t0, tx, 4, late).unwrap();
+    assert_eq!(e.next_done(), Some((id, detected(), late)));
+    let Fx { mut e, t0, id, tx } = row_p1();
+    cont_with(&mut e, t0, tx, 1, 1, early).unwrap();
+    assert_eq!(drain(&mut e, t0).len(), 3);
+    blk_with(&mut e, t0, tx, 4, 2, late).unwrap();
+    assert_eq!(e.next_done(), Some((id, blocked(2), late)));
+    // A block of phase 1 delivers its own.
+    let Fx { mut e, t0, id, tx } = row_p1();
+    blk_with(&mut e, t0, tx, 1, 1, early).unwrap();
+    assert_eq!(e.next_done(), Some((id, blocked(1), early)));
+    // A decision that no verdict made, or that a verdict out of order made, says nothing.
+    let Fx { mut e, t0, id, tx } = row_p2();
+    cont_with(&mut e, t0, tx, 4, 3, late).unwrap();
+    let unins = Decision::Uninspectable(Why::Order);
+    assert_eq!(e.next_done(), Some((id, unins, Matched::NONE)));
+    let Fx { mut e, t0, id, .. } = row_p1();
+    e.cancel(t0, id);
+    assert_eq!(
+        e.next_done(),
+        Some((id, Decision::ClientDisconnect, Matched::NONE))
+    );
+}
+
+#[test]
 fn the_decision_is_made_once() {
     // block first, then both continues: stays blocked
     let Fx { mut e, t0, id, tx } = row_p1();
@@ -598,7 +692,7 @@ fn the_decision_is_made_once() {
     let Fx { mut e, t0, id, tx } = row_body();
     cont(&mut e, t0, tx, 1, 1).unwrap();
     assert_eq!((out(&e, id).decision, e.discarded()), (None, 1));
-    e.on_verdict(t0, tx, 1, 1, false, false, 0, 0, &[0xff])
+    e.on_verdict(t0, tx, 1, 1, false, false, 0, 0, Matched::NONE, &[0xff])
         .unwrap();
     assert_eq!(
         out(&e, id).decision,
@@ -1197,7 +1291,7 @@ fn a_full_record_table_refuses_without_a_record() {
     assert_eq!(e.submit(t0, request()), Err(SubmitError::Full));
     assert_eq!((e.records(), e.waiting(), e.held_slots()), (1, 0, 0));
     // a record ends when its decision was handed over and no slot is held: room again
-    assert_eq!(e.next_done(), Some((bad, invalid)));
+    assert_eq!(done(&mut e), Some((bad, invalid)));
     assert_eq!(e.records(), 0);
     assert_eq!(e.submit(t0, request()), Ok(1));
 }
@@ -1213,12 +1307,12 @@ fn request_numbers_run_out_without_a_record() {
     assert_eq!(e.records(), 1);
     // no number is used twice, also after the record ended
     assert_eq!(
-        e.next_done(),
+        done(&mut e),
         None,
         "an undecided request is not handed over"
     );
     e.cancel(t0, last);
-    assert_eq!(e.next_done(), Some((last, Decision::ClientDisconnect)));
+    assert_eq!(done(&mut e), Some((last, Decision::ClientDisconnect)));
     assert_eq!(e.records(), 0);
     assert_eq!(e.submit(t0, request()), Err(SubmitError::IdsExhausted));
 }
@@ -1231,19 +1325,19 @@ fn a_decision_is_handed_over_once() {
     let b = e.submit(t0, request()).unwrap();
     let c = e.submit(t0, request()).unwrap();
     assert_eq!(drain(&mut e, t0).len(), 3);
-    assert_eq!(e.next_done(), None);
+    assert_eq!(done(&mut e), None);
     blk(&mut e, t0, 101, 1, 1).unwrap();
     blk(&mut e, t0, 100, 1, 1).unwrap();
-    assert_eq!(e.next_done(), Some((b, blocked(1))));
-    assert_eq!(e.next_done(), Some((a, blocked(1))));
-    assert_eq!(e.next_done(), None);
+    assert_eq!(done(&mut e), Some((b, blocked(1))));
+    assert_eq!(done(&mut e), Some((a, blocked(1))));
+    assert_eq!(done(&mut e), None);
     // more events do not hand over a request again
     blk(&mut e, t0, 100, 1, 1).unwrap();
     e.cancel(t0, a);
     e.cancel(t0, c);
     e.tick(at(t0, 60_000));
-    assert_eq!(e.next_done(), Some((c, Decision::ClientDisconnect)));
-    assert_eq!(e.next_done(), None);
+    assert_eq!(done(&mut e), Some((c, Decision::ClientDisconnect)));
+    assert_eq!(done(&mut e), None);
 }
 
 #[test]
@@ -1251,8 +1345,8 @@ fn the_record_of_a_decision_handed_over_ends_with_the_slot() {
     // decided, slot held: handed over once, the record stays, CLOSED returns the slot and ends it
     let Fx { mut e, t0, id, tx } = row_p1();
     blk(&mut e, t0, tx, 1, 1).unwrap();
-    assert_eq!(e.next_done(), Some((id, blocked(1))));
-    assert_eq!(e.next_done(), None);
+    assert_eq!(done(&mut e), Some((id, blocked(1))));
+    assert_eq!(done(&mut e), None);
     assert_eq!(out(&e, id).decision, Some(blocked(1)));
     assert_eq!(e.records(), 1);
     let end = take(&mut e, t0);
@@ -1260,19 +1354,19 @@ fn the_record_of_a_decision_handed_over_ends_with_the_slot() {
     closed(&mut e, t0, tx, end.msg).unwrap();
     assert!(e.outcome(id).is_none());
     assert_eq!((e.records(), e.held_slots()), (0, 0));
-    assert_eq!(e.next_done(), None);
+    assert_eq!(done(&mut e), None);
     // undecided, then the connection fault: handed over with the fault, the exit ends the record
     let Fx { mut e, t0, id, .. } = row_p1();
     e.conn_fault(t0);
     assert_eq!(
-        e.next_done(),
+        done(&mut e),
         Some((id, Decision::Uninspectable(Why::ConnFault)))
     );
     assert_eq!(e.outcome(id).map(|o| o.returns.len()), Some(0));
     e.exit_confirmed(t0, 1);
     assert!(e.outcome(id).is_none());
     assert_eq!((e.records(), e.held_slots()), (0, 0));
-    assert_eq!(e.next_done(), None);
+    assert_eq!(done(&mut e), None);
 }
 
 // ---- the halt and a connection fault ----
@@ -1304,7 +1398,7 @@ fn a_fault_after_the_halt_decides_the_unsent_requests() {
         out(&e, a).decision,
         Some(Decision::Uninspectable(Why::ConnFault))
     );
-    let order: Vec<ReqId> = std::iter::from_fn(|| e.next_done().map(|(id, _)| id)).collect();
+    let order: Vec<ReqId> = std::iter::from_fn(|| done(&mut e).map(|(id, _)| id)).collect();
     assert_eq!(order, vec![b, c, a]);
     // the exit: the taken one returns; nothing waits, nothing is assigned after the restart
     e.exit_confirmed(at(t0, 6), 1);

@@ -20,7 +20,7 @@ use std::sync::mpsc::{Receiver, SendError, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Instant;
 
-use tukuyomi_kernel::{Reason, Refused, ReqId, Request, Shutdown, Status, Verdict};
+use tukuyomi_kernel::{Matched, Reason, Refused, ReqId, Request, Shutdown, Status, Verdict};
 
 use crate::inspect::driver::{Answer, InspectReq, Judge, Kernel, Outcome, Ticket};
 use crate::rules::bundle::{Fingerprint, Mode};
@@ -55,27 +55,29 @@ fn turned_line(generation: Fingerprint) -> String {
     )
 }
 
-/// Takes the result of every `(id, verdict)` out of the table: sends it to the connection unless `cancel` was
-/// called, and drops the ticket, which gives its permits back. A `Detected` for a generation that blocks is sent
-/// as `Uninspectable(Protocol)`: the request is not let through. The answer is true if there was one, for the
-/// record line of a slot that serves; a slot that is stopped makes none. A result for a request that is not in
-/// the table breaks the promise that every result comes out once.
+/// Takes the result of every `(id, verdict, matched)` out of the table: sends it to the connection unless `cancel`
+/// was called, and drops the ticket, which gives its permits back. The `judge` names the generation and its mode; the
+/// rules that matched are the ones of the result. A `Detected` for a generation that blocks is sent as
+/// `Uninspectable(Protocol)` without the rules it came with: the request is not let through, and nothing the
+/// inspector said about it is believed. The answer is true if there was one, for the record line of a slot that
+/// serves; a slot that is stopped makes none. A result for a request that is not in the table breaks the promise
+/// that every result comes out once.
 pub(super) fn deliver(
     pending: &mut BTreeMap<ReqId, Pending>,
-    results: &[(ReqId, Verdict)],
+    results: &[(ReqId, Verdict, Matched)],
     judge: Judge,
 ) -> Result<bool, &'static str> {
     let mut turned = false;
-    for &(id, verdict) in results {
+    for &(id, verdict, matched) in results {
         let Some(Pending { ticket, cancelled }) = pending.remove(&id) else {
             return Err("result for an unknown request");
         };
-        let verdict = match verdict {
+        let (verdict, matched) = match verdict {
             Verdict::Detected { .. } if judge.mode == Mode::Block => {
                 turned = true;
-                Verdict::Uninspectable(Reason::Protocol)
+                (Verdict::Uninspectable(Reason::Protocol), Matched::NONE)
             }
-            other => other,
+            other => (other, matched),
         };
         // The request and the hold live to the end of this turn, after the send.
         let Ticket {
@@ -87,7 +89,7 @@ pub(super) fn deliver(
             // Err only says that the connection is gone already.
             let _ = reply.send(Answer {
                 outcome: Outcome::Verdict(verdict),
-                by: Some(judge),
+                by: Some(Judge { matched, ..judge }),
             });
         }
     }
@@ -189,11 +191,13 @@ impl<K: Kernel> Slot<K> {
         Ok(())
     }
 
-    /// The generation of the slot and the mode of its rules, as a verdict of its kernel names them.
+    /// The generation of the slot and the mode of its rules, as a verdict of its kernel names them. The rules that
+    /// matched come with each result (`deliver`).
     fn judge(&self) -> Judge {
         Judge {
             generation: self.generation,
             mode: self.mode,
+            matched: Matched::NONE,
         }
     }
 
@@ -321,6 +325,7 @@ impl Retirement {
         let judge = Judge {
             generation: self.generation,
             mode: self.mode,
+            matched: Matched::NONE,
         };
         deliver(&mut self.pending, &done.results, judge)?;
         if !self.pending.is_empty() {

@@ -126,6 +126,9 @@ type out struct {
 	stat  uint16
 	act   string
 	data  string
+	ids   []int64 // VERDICT: rule ids, severity and score at its end
+	sev   uint8
+	score int32
 	class uint8
 	code  uint16
 	text  string
@@ -154,7 +157,16 @@ func parseOut(b []byte) (out, error) {
 		o.block = d == 1
 		o.rule, o.stat = int64(c.u64()), c.u16()
 		o.act, o.data = c.str16(0, 0xffff), c.str16(0, 0xffff)
-		c.bad = c.bad || d > 1 || zero != 0
+		n := c.u8()
+		for range n {
+			o.ids = append(o.ids, int64(c.u64()))
+		}
+		o.sev = c.u8()
+		if v := c.take(4); v != nil {
+			o.score = int32(binary.BigEndian.Uint32(v))
+		}
+		c.bad = c.bad || d > 1 || zero != 0 || n > maxRuleIDs || (o.flags&flagMoreRules != 0 && n != maxRuleIDs) ||
+			(o.sev > maxSeverity && o.sev != severityNone) || o.score < scoreNone
 	case kindError:
 		var zero uint8
 		o.class, zero = c.u8(), c.u8()
@@ -363,7 +375,8 @@ func (f *fakeTx) ProcessRequestHeaders() *types.Interruption {
 	}
 	return f.phase1
 }
-func (f *fakeTx) IsRuleEngineOff() bool { defer f.enter("ruleoff")(); return false }
+func (f *fakeTx) MatchedRules() []types.MatchedRule { defer f.enter("matched")(); return nil }
+func (f *fakeTx) IsRuleEngineOff() bool             { defer f.enter("ruleoff")(); return false }
 func (f *fakeTx) IsRequestBodyAccessible() bool {
 	defer f.enter("reqaccess")()
 	return f.reqAccess && (f.accessLost == 0 || f.count("reqaccess") < f.accessLost)

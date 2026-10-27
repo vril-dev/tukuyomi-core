@@ -52,6 +52,9 @@ impl TrialKernel for Supervisor {
 
     fn poll(&mut self, until: Instant) -> Vec<(ReqId, Verdict)> {
         Supervisor::poll(self, until)
+            .into_iter()
+            .map(|(id, verdict, _)| (id, verdict))
+            .collect()
     }
 
     fn status(&self) -> Status {

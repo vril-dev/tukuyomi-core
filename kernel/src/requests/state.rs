@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::protocol::codec::Matched;
+
 /// Upper bounds checked before anything is sent: a TX_BEGIN payload 32 KiB, a body fragment 64 KiB, 16 fragments.
 const MAX_BEGIN: usize = 32 * 1024;
 const MAX_FRAG: usize = 64 * 1024;
@@ -201,6 +203,9 @@ pub enum ConnFault {
 pub struct Outcome {
     /// The final decision, once.
     pub decision: Option<Decision>,
+    /// The rules that matched, as the VERDICT that made the decision says. Nothing for a decision that no VERDICT
+    /// made, and for the continue of phase 1, whose rules the continue of phase 2 repeats and adds to.
+    pub matched: Matched,
     pub decided_at: Option<Instant>,
     /// Transaction numbers assigned, in order (a request restored to the waiting queue gets another).
     pub txs: Vec<u64>,
@@ -342,20 +347,24 @@ struct Req {
 }
 
 /// How a stage ends. `Done` is the continue of the last phase (Forward); `Detected` is that continue with a
-/// match that did not stop the request.
+/// match that did not stop the request. The ones that a VERDICT makes carry the rules it says matched.
 #[derive(Clone, Copy)]
 enum Ending {
     Block {
         phase: u8,
         rule_id: i64,
         status: u16,
+        matched: Matched,
     },
     Uninspectable(Why),
     Disconnect,
-    Done,
+    Done {
+        matched: Matched,
+    },
     Detected {
         rule_id: i64,
         status: u16,
+        matched: Matched,
     },
 }
 

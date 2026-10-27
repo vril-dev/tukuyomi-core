@@ -5,6 +5,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 
+use serde_json::{Value, json};
+
 use crate::support::*;
 
 /// Where a test moves the store to, so that a link in its place can lead to a store that is good in every other
@@ -528,4 +530,98 @@ fn sigusr1_switches_to_the_chosen_generation_and_a_generation_in_use_is_not_remo
     assert!(listed.out.starts_with(&second), "{}", listed.out);
     assert_eq!(listed.out.lines().count(), 1, "{}", listed.out);
     proxy.finish(2);
+}
+
+/// Rules for the records of what matched: a request to `/detail-probe` is matched by a rule that is logged (severity
+/// 4), by one that is not (severity 0, which must not count), by one that sets the score, and is denied by a rule
+/// that is logged (severity 2). The rule that denies decides, so it is not in the list of the rules that matched.
+const DETAIL_RULES: &str = concat!(
+    "SecRule REQUEST_URI \"@beginsWith /detail-probe\" \"id:9301,phase:2,pass,log,severity:4,msg:'logged'\"\n",
+    "SecRule REQUEST_URI \"@beginsWith /detail-probe\" \"id:9302,phase:2,pass,nolog,severity:0\"\n",
+    "SecRule REQUEST_URI \"@beginsWith /detail-probe\" ",
+    "\"id:9303,phase:2,pass,nolog,setvar:tx.blocking_inbound_anomaly_score=7\"\n",
+    "SecRule REQUEST_URI \"@beginsWith /detail-probe\" ",
+    "\"id:9304,phase:2,deny,status:403,log,severity:2,msg:'denied'\"\n",
+);
+
+/// Imports the test rules and `DETAIL_RULES` as one generation, which blocks or only detects, and chooses it.
+fn import_detail_rules(root: &Path, detect_only: bool) {
+    let extra = root.join("detail.conf");
+    fs::write(&extra, DETAIL_RULES).expect("write the rule file");
+    let basic = rules_file();
+    let mut args = vec![
+        OsStr::new("--rules"),
+        basic.as_os_str(),
+        OsStr::new("--rules"),
+        extra.as_os_str(),
+    ];
+    if detect_only {
+        args.push(OsStr::new("--detect-only"));
+    }
+    let imported = rules(root, "import", &args);
+    fs::remove_file(&extra).expect("remove the rule file");
+    assert_eq!(imported.code, Some(0), "{}", imported.err);
+    let created = imported
+        .out
+        .strip_suffix(" created\n")
+        .unwrap_or_else(|| panic!("unexpected output {:?}", imported.out));
+    let chosen = rules(root, "activate", &[OsStr::new(created)]);
+    assert_eq!(chosen.code, Some(0), "{}", chosen.err);
+}
+
+/// The record of the request to `/detail-probe`: the rule that decided, the rules that matched without it and
+/// without the one that is not logged, the heaviest severity among the ones that count, and the score.
+fn assert_detail(record: &Value, mode: &str) {
+    assert_eq!(record["mode"], mode, "{record}");
+    assert_eq!(record["rule"], 9304, "{record}");
+    assert_eq!(record["rules"], json!([9301]), "{record}");
+    assert_eq!(record["severity"], 2, "{record}");
+    assert_eq!(record["score"], 7, "{record}");
+    assert!(no(record, "rules_more"), "{record}");
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_blocked_request_has_the_rules_that_matched_it_in_its_record() {
+    let mut proxy = Proxy::spawn_with("rules_matched_block", Knobs::quick(), |root| {
+        import_detail_rules(root, false);
+    });
+    proxy
+        .records
+        .wait_lines("the proxy to listen", 1, |l| l == "start: listening");
+    proxy.wait_inspector(None);
+    assert_empty_answer(&exchange(proxy.port, &get("/detail-probe")), 403);
+    let record = proxy
+        .records
+        .conn("the blocked record", |l| blocked_by(l, 9304));
+    assert_detail(&record, "block");
+    // A request that no rule matched has none of it.
+    assert_eq!(exchange(proxy.port, &get("/ok")).status(), 200);
+    let clean = proxy.records.conn("the forwarded record", |l| {
+        is_answer(l, "forwarded", 200, "forwarded")
+    });
+    for key in ["rules", "rules_more", "severity", "score"] {
+        assert!(no(&clean, key), "{key} in {clean}");
+    }
+    proxy.finish(1);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_request_that_is_let_through_by_a_detecting_generation_has_the_rules_that_matched_it_in_its_record()
+ {
+    let mut proxy = Proxy::spawn_with("rules_matched_detect", Knobs::quick(), |root| {
+        import_detail_rules(root, true);
+    });
+    proxy
+        .records
+        .wait_lines("the proxy to listen", 1, |l| l == "start: listening");
+    proxy.wait_inspector(None);
+    let reply = exchange(proxy.port, &get("/detail-probe"));
+    assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
+    let record = proxy.records.conn("the detection record", |l| {
+        is_answer(l, "forwarded", 200, "detected by a rule")
+    });
+    assert_detail(&record, "detect");
+    proxy.finish(1);
 }

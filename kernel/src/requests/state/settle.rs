@@ -4,8 +4,8 @@
 use std::time::Instant;
 
 use super::{
-    Decision, Ending, Engine, QFrame, QKind, ReqId, ReturnReason, Stage, StopOrigin, StopPlan, Why,
-    after, free, rec,
+    Decision, Ending, Engine, Matched, QFrame, QKind, ReqId, ReturnReason, Stage, StopOrigin,
+    StopPlan, Why, after, free, rec,
 };
 
 impl Engine {
@@ -27,8 +27,9 @@ impl Engine {
         }
     }
 
-    /// Record the result of the current stage once: the request decision. A decision other than Forward and
-    /// Detected frees the payloads. The request is queued for `next_done` where the decision is first made.
+    /// Record the result of the current stage once: the request decision, with the rules of the VERDICT that made
+    /// it. A decision other than Forward and Detected frees the payloads. The request is queued for `next_done`
+    /// where the decision is first made.
     pub(super) fn set_result(&mut self, now: Instant, ti: usize, e: Ending) {
         let l = &self.held[ti];
         if l.stage == Stage::Ended {
@@ -37,25 +38,35 @@ impl Engine {
         let id = l.req;
         let r = rec(&mut self.reqs, id);
         if r.out.decision.is_none() {
-            r.out.decision = Some(match e {
+            let (decision, matched) = match e {
                 Ending::Block {
                     phase,
                     rule_id,
                     status,
-                } => Decision::Block {
-                    phase,
+                    matched,
+                } => (
+                    Decision::Block {
+                        phase,
+                        rule_id,
+                        status,
+                    },
+                    matched,
+                ),
+                Ending::Uninspectable(w) => (Decision::Uninspectable(w), Matched::NONE),
+                Ending::Disconnect => (Decision::ClientDisconnect, Matched::NONE),
+                Ending::Done { matched } => (Decision::Forward, matched),
+                Ending::Detected {
                     rule_id,
                     status,
-                },
-                Ending::Uninspectable(w) => Decision::Uninspectable(w),
-                Ending::Disconnect => Decision::ClientDisconnect,
-                Ending::Done => Decision::Forward,
-                Ending::Detected { rule_id, status } => Decision::Detected { rule_id, status },
-            });
+                    matched,
+                } => (Decision::Detected { rule_id, status }, matched),
+            };
+            r.out.decision = Some(decision);
+            r.out.matched = matched;
             r.out.decided_at = Some(now);
             self.done.push_back(id);
         }
-        if !matches!(e, Ending::Done | Ending::Detected { .. }) {
+        if !matches!(e, Ending::Done { .. } | Ending::Detected { .. }) {
             free(r);
         }
     }
@@ -74,7 +85,7 @@ impl Engine {
     /// Settle the stage and hand TX_END to the writer queue.
     pub(super) fn end_tx(&mut self, now: Instant, ti: usize, e: Ending) {
         let reason = match e {
-            Ending::Done | Ending::Detected { .. } => 1,
+            Ending::Done { .. } | Ending::Detected { .. } => 1,
             Ending::Block { .. } => 2,
             Ending::Uninspectable(Why::VerdictDeadline) => 5,
             Ending::Uninspectable(_) => 3,

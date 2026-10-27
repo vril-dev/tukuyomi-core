@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::config::{Config, ConfigError};
-use crate::protocol::codec;
+use crate::protocol::codec::{self, Matched};
 use crate::requests::state::{self, Engine, Limits, SubmitError};
 
 use super::{
@@ -160,7 +160,7 @@ impl Supervisor {
     /// The return can also be later by a start made in that call (creating the start directory, spawning the
     /// inspector, reading `/dev/urandom`), by the removal of a start directory after an exit, and by the operating
     /// system's scheduling delay. A read in progress is not cut.
-    pub fn poll(&mut self, until: Instant) -> Vec<(ReqId, Verdict)> {
+    pub fn poll(&mut self, until: Instant) -> Vec<(ReqId, Verdict, Matched)> {
         loop {
             self.step(until);
             let results = self.results();
@@ -200,10 +200,10 @@ impl Supervisor {
     }
 
     /// Every decision not delivered yet, each once, in the order they were made.
-    pub(super) fn results(&mut self) -> Vec<(ReqId, Verdict)> {
+    pub(super) fn results(&mut self) -> Vec<(ReqId, Verdict, Matched)> {
         let mut results = Vec::new();
-        while let Some((id, decision)) = self.engine.next_done() {
-            results.push((id, verdict_of(decision)));
+        while let Some((id, decision, matched)) = self.engine.next_done() {
+            results.push((id, verdict_of(decision), matched));
         }
         results
     }

@@ -19,7 +19,8 @@
 //! comes out.
 //!
 //! The answer on the reply slot is the outcome and, when the outcome is a verdict of a kernel, the generation of that
-//! kernel and the mode of its rules, so that the record of the request can say which rules judged it.
+//! kernel, the mode of its rules and the rules that matched the request as the verdict says them, so that the record
+//! of the request can say which rules judged it and what they matched.
 //!
 //! A switch message makes the driver serve two generations for a while. It makes a second kernel on the rules of
 //! the new generation and steps it in every round for the shortest step that can read a frame, while new tickets
@@ -50,7 +51,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tukuyomi_kernel::{
-    Failure, Phase, Refused, ReqId, Request, Shutdown, Status, Supervisor, Verdict,
+    Failure, Matched, Phase, Refused, ReqId, Request, Shutdown, Status, Supervisor, Verdict,
 };
 
 use crate::inspect::slot::{Retired, Retirement, Slot};
@@ -113,11 +114,13 @@ pub struct Ticket {
     pub hold: Hold,
 }
 
-/// The generation whose kernel gave a verdict, and what its rules do to a request they match.
+/// The generation whose kernel gave a verdict, what its rules do to a request they match, and the rules that matched
+/// the request, as the verdict says them (none for a verdict that is not an inspection).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Judge {
     pub generation: Fingerprint,
     pub mode: bundle::Mode,
+    pub matched: Matched,
 }
 
 /// What the driver answers for a ticket: the outcome, and the generation that gave it if it is a verdict.
@@ -323,7 +326,7 @@ pub(super) trait Kernel: Send + 'static {
         Self: Sized;
     fn submit(&mut self, req: &Request<'_>) -> Result<ReqId, Refused>;
     fn cancel(&mut self, id: ReqId);
-    fn poll(&mut self, until: Instant) -> Vec<(ReqId, Verdict)>;
+    fn poll(&mut self, until: Instant) -> Vec<(ReqId, Verdict, Matched)>;
     fn status(&self) -> Status;
     fn start_detail(&self) -> Option<Vec<u8>>;
     fn shutdown(&mut self, deadline: Instant) -> Shutdown;
@@ -342,7 +345,7 @@ impl Kernel for Supervisor {
         Supervisor::cancel(self, id);
     }
 
-    fn poll(&mut self, until: Instant) -> Vec<(ReqId, Verdict)> {
+    fn poll(&mut self, until: Instant) -> Vec<(ReqId, Verdict, Matched)> {
         Supervisor::poll(self, until)
     }
 

@@ -86,6 +86,17 @@ const (
 	detectEnd     = `SecAction "id:4000011,phase:2,pass,nolog,ctl:ruleEngine=On"` + "\n"
 )
 
+// The ids from reservedIDFirst to reservedIDLast are the inspector's own
+// rules: the reserved directives and the two rules around the files of a bundle
+// that only detects.
+const (
+	reservedIDFirst = 4000001
+	reservedIDLast  = 4000011
+)
+
+// reservedID reports whether the id is one of them.
+func reservedID(id int) bool { return id >= reservedIDFirst && id <= reservedIDLast }
+
 // locateBudget bounds the search of failingFile. The process that starts the
 // inspector waits a limited time for the HELLO; a search that outlasts it would
 // end with the process killed, not with exit 11 and this diagnostic.

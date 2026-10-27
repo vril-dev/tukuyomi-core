@@ -3,7 +3,7 @@ use std::io;
 
 const GOLDEN: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../inspector/testdata/v0-golden.txt"
+    "/../inspector/testdata/v1-golden.txt"
 ));
 const RUN: u64 = 0x0102_0304_0506_0708;
 const INC: u32 = 7;
@@ -17,18 +17,44 @@ const SENT: [&str; 8] = [
     "tx_end",
     "drain",
 ];
-const RECEIVED: [&str; 10] = [
+const RECEIVED: [&str; 13] = [
     "hello",
     "verdict_continue",
     "verdict_block",
     "verdict_block_rule0",
     "verdict_truncated",
     "verdict_detected",
+    "verdict_allow_rules",
+    "verdict_rules_more",
+    "verdict_rules_severity",
     "error_not_created",
     "error_tx_failed",
     "closed",
     "bye",
 ];
+/// The VERDICTs that the receiver must refuse (the names that start with `bad_`), each with the reason.
+const REFUSED: [(&str, &str); 7] = [
+    ("bad_verdict_rules_17", "verdict rule count out of range"),
+    (
+        "bad_verdict_more_short",
+        "verdict more flag needs a full list of rule ids",
+    ),
+    ("bad_verdict_severity", "verdict severity out of range"),
+    ("bad_verdict_score", "verdict score out of range"),
+    ("bad_verdict_rule_id", "verdict rule id out of range"),
+    (
+        "bad_verdict_rules_phase",
+        "verdict of a response phase carries rules, a severity or a score",
+    ),
+    ("bad_verdict_no_tail", "payload too short"),
+];
+/// The whole frame of the HELLO of version 0: the HELLO of the golden file with the version 0000.
+const HELLO_V0: &str = concat!(
+    "544b5630010000000000006f01020304050607080000000700000000000000000000000000000000",
+    "1092000102030405060708090a0b0c0d0e0f01020304050607080000000700",
+    "08676f312e32372e32000676332e382e31000768313a6162633da0a1a2a3a4a5a6a7a8a9aaabacad",
+    "aeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf001000000000000010000000000200040011"
+);
 // Receivable kinds with their payload limits.
 const RECV: [(u8, usize); 5] = [
     (KIND_HELLO, MAX_HELLO),
@@ -145,7 +171,7 @@ fn golden_hello_reads_and_decodes() {
     assert_eq!(
         hello,
         Hello {
-            version: 0,
+            version: 1,
             pid: 0x1092,
             nonce,
             run: RUN,
@@ -166,9 +192,22 @@ fn golden_hello_reads_and_decodes() {
     assert_eq!((hello.tx_limit, hello.queue), (MAX_CONCUR_TX, QUEUE_DEPTH));
 }
 
+/// The rules that matched, as the test writes them.
+fn matched(ids: &[i64], more: bool, severity: u8, score: i32) -> Matched {
+    let mut all = [0; matched::MAX_RULE_IDS];
+    all[..ids.len()].copy_from_slice(ids);
+    Matched {
+        count: ids.len() as u8,
+        ids: all,
+        more,
+        severity,
+        score,
+    }
+}
+
 #[test]
 fn golden_verdicts_read_and_decode() {
-    let v = |phase, block, flags, rule_id, status, action: &[u8], data: &[u8]| Verdict {
+    let v = |phase, block, flags, rule_id, status, action: &[u8], data: &[u8], matched| Verdict {
         phase,
         block,
         flags,
@@ -176,32 +215,95 @@ fn golden_verdicts_read_and_decode() {
         status,
         action: action.to_vec(),
         data: data.to_vec(),
+        matched,
     };
+    let more_ids: Vec<i64> = (930100..930116).collect();
+    let none = Matched::NONE;
     let cases = [
         (
             "verdict_continue",
-            hdr(KIND_VERDICT, 18, 0x10, 1),
-            v(1, false, 0, 0, 0, b"", b""),
+            hdr(KIND_VERDICT, 24, 0x10, 1),
+            v(1, false, 0, 0, 0, b"", b"", none),
         ),
         (
             "verdict_block",
-            hdr(KIND_VERDICT, 23, 0x10, 2),
-            v(2, true, 0, 1021, 403, b"deny", b"x"),
+            hdr(KIND_VERDICT, 37, 0x10, 2),
+            v(
+                2,
+                true,
+                0,
+                1021,
+                403,
+                b"deny",
+                b"x",
+                matched(&[942100], false, 2, 5),
+            ),
         ),
         (
             "verdict_block_rule0",
-            hdr(KIND_VERDICT, 22, 0x10, 3),
-            v(2, true, 0, 0, 413, b"deny", b""),
+            hdr(KIND_VERDICT, 28, 0x10, 3),
+            v(2, true, 0, 0, 413, b"deny", b"", none),
         ),
         (
             "verdict_truncated",
-            hdr(KIND_VERDICT, 306, 0x10, 6),
-            v(4, true, 3, 1040, 403, &[b'a'; 32], &[b'd'; 256]),
+            hdr(KIND_VERDICT, 312, 0x10, 6),
+            v(4, true, 3, 1040, 403, &[b'a'; 32], &[b'd'; 256], none),
         ),
         (
             "verdict_detected",
-            hdr(KIND_VERDICT, 22, 0x10, 4),
-            v(2, false, FLAG_DETECTED, 949110, 403, b"deny", b""),
+            hdr(KIND_VERDICT, 44, 0x10, 4),
+            v(
+                2,
+                false,
+                FLAG_DETECTED,
+                949110,
+                403,
+                b"deny",
+                b"",
+                matched(&[942100, 941100], false, 2, 10),
+            ),
+        ),
+        (
+            "verdict_allow_rules",
+            hdr(KIND_VERDICT, 48, 0x10, 5),
+            v(
+                2,
+                false,
+                0,
+                0,
+                0,
+                b"",
+                b"",
+                matched(&[920280, 942100, 7000005], false, 5, 0),
+            ),
+        ),
+        (
+            "verdict_rules_more",
+            hdr(KIND_VERDICT, 156, 0x10, 7),
+            v(
+                2,
+                true,
+                FLAG_MORE_RULES,
+                949110,
+                403,
+                b"deny",
+                b"",
+                matched(&more_ids, true, 2, 80),
+            ),
+        ),
+        (
+            "verdict_rules_severity",
+            hdr(KIND_VERDICT, 28, 0x10, 8),
+            v(
+                1,
+                true,
+                0,
+                7000006,
+                403,
+                b"deny",
+                b"",
+                matched(&[], false, 3, -1),
+            ),
         ),
     ];
     for (name, want_h, want_v) in cases {
@@ -209,6 +311,42 @@ fn golden_verdicts_read_and_decode() {
         assert_eq!(h, want_h, "{name}");
         assert_eq!(decode_verdict(&p).unwrap(), want_v, "{name}");
     }
+}
+
+/// The names of the golden file, in its order.
+fn golden_names() -> Vec<&'static str> {
+    GOLDEN
+        .lines()
+        .filter_map(|l| l.trim().split_once(' '))
+        .map(|(name, _)| name)
+        .filter(|name| !name.starts_with('#'))
+        .collect()
+}
+
+#[test]
+fn every_valid_golden_verdict_decodes_and_every_bad_one_is_refused_for_its_reason() {
+    let names = golden_names();
+    let bad: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| name.starts_with("bad_"))
+        .collect();
+    // A refused vector that this table does not name would never be tried.
+    assert_eq!(bad, REFUSED.map(|(name, _)| name));
+    for (name, why) in REFUSED {
+        // The frame itself is good: only the content is refused.
+        let (_, p) = read_golden(name);
+        assert_eq!(reason(decode_verdict(&p)), why, "{name}");
+    }
+    let mut valid = 0;
+    for name in names.iter().filter(|name| !name.starts_with("bad_")) {
+        if golden(name)[4] == KIND_VERDICT {
+            let (_, p) = read_golden(name);
+            assert!(decode_verdict(&p).is_ok(), "{name}");
+            valid += 1;
+        }
+    }
+    assert_eq!(valid, 8);
 }
 
 #[test]
@@ -518,6 +656,28 @@ fn verdict(
     v.extend_from_slice(&status.to_be_bytes());
     tstr(&mut v, action);
     tstr(&mut v, data);
+    v.extend_from_slice(&NO_TAIL);
+    v
+}
+
+/// The end of a VERDICT that says nothing: no rules, no severity (255), no score (-1).
+const NO_TAIL: [u8; 6] = [0, 255, 255, 255, 255, 255];
+
+/// `payload` (made by `verdict`) with the end `tail` in place of the end that says nothing.
+fn with_tail(mut payload: Vec<u8>, tail: &[u8]) -> Vec<u8> {
+    payload.truncate(payload.len() - NO_TAIL.len());
+    payload.extend_from_slice(tail);
+    payload
+}
+
+/// The end of a VERDICT: the count, the ids, the severity and the score.
+fn tail(ids: &[i64], severity: u8, score: i32) -> Vec<u8> {
+    let mut v = vec![ids.len() as u8];
+    for id in ids {
+        v.extend_from_slice(&id.to_be_bytes());
+    }
+    v.push(severity);
+    v.extend_from_slice(&score.to_be_bytes());
     v
 }
 
@@ -630,7 +790,7 @@ fn verdict_rejects_out_of_range_values_with_the_matching_reason() {
         (0, 0, "verdict phase out of range"),
         (0, 5, "verdict phase out of range"),
         (1, 2, "verdict decision out of range"),
-        (2, 8, "verdict flags out of range"),
+        (2, 0x10, "verdict flags out of range"),
         (3, 1, "verdict reserved not zero"),
     ];
     for (at, value, why) in bytes {
@@ -672,6 +832,57 @@ fn verdict_rejects_out_of_range_values_with_the_matching_reason() {
 }
 
 #[test]
+fn the_rules_that_matched_are_held_to_their_limits() {
+    // A block of phase `phase` with this end; `flags` are the VERDICT flags.
+    let decode = |phase: u8, flags: u8, end: Vec<u8>| {
+        let p = verdict(phase, 1, flags, 0, 1, 403, b"deny", b"");
+        decode_verdict(&with_tail(p, &end))
+    };
+    let phase2 = |flags: u8, end: Vec<u8>| decode(2, flags, end);
+    // The limits themselves: 16 ids of the most digits, the flag that says there are more, the lightest severity and
+    // the highest score.
+    let full = [i64::MAX; matched::MAX_RULE_IDS];
+    let got = phase2(FLAG_MORE_RULES, tail(&full, 7, i32::MAX)).unwrap();
+    assert_eq!(got.matched, matched(&full, true, 7, i32::MAX));
+    assert_eq!(got.matched.ids(), full);
+    // A full list needs no flag; the heaviest severity, no severity and no score are values too.
+    assert!(phase2(0, tail(&full, 0, 0)).is_ok());
+    assert!(phase2(0, tail(&[1], 255, -1)).is_ok());
+    // One past each limit: a list of 17, the id 0 (and a negative one), the flag with a list of 15, the severities
+    // 8 and 254, and the scores -2 and the lowest.
+    let count = "verdict rule count out of range";
+    assert_eq!(reason(phase2(0, tail(&[1; 17], 2, 5))), count);
+    for id in [0, -1] {
+        let why = "verdict rule id out of range";
+        assert_eq!(reason(phase2(0, tail(&[1, id], 2, 5))), why);
+    }
+    let why = "verdict more flag needs a full list of rule ids";
+    assert_eq!(
+        reason(phase2(FLAG_MORE_RULES, tail(&full[..15], 2, 5))),
+        why
+    );
+    for severity in [8, 254] {
+        let why = "verdict severity out of range";
+        assert_eq!(reason(phase2(0, tail(&[1], severity, 5))), why);
+    }
+    for score in [-2, i32::MIN] {
+        let why = "verdict score out of range";
+        assert_eq!(reason(phase2(0, tail(&[1], 2, score))), why);
+    }
+    // The phases 3 and 4 carry the end that says nothing and no other.
+    let why = "verdict of a response phase carries rules, a severity or a score";
+    for phase in [3, 4] {
+        assert_eq!(
+            decode(phase, 0, NO_TAIL.to_vec()).unwrap().matched,
+            Matched::NONE
+        );
+        for end in [tail(&[1], 255, -1), tail(&[], 0, -1), tail(&[], 255, 0)] {
+            assert_eq!(reason(decode(phase, 0, end)), why, "phase {phase}");
+        }
+    }
+}
+
+#[test]
 fn error_rejects_out_of_range_values_with_the_matching_reason() {
     // Class 1 has the codes 1..=4 and class 2 the codes 16..=31; the text has at most 256 bytes.
     for (class, code) in [(1, 1), (1, 4), (2, 16), (2, 31)] {
@@ -699,7 +910,7 @@ fn error_rejects_out_of_range_values_with_the_matching_reason() {
 #[test]
 fn hello_accepts_the_string_boundaries_and_rejects_the_rest() {
     let s = |n: usize| vec![b'x'; n];
-    let lens = |go, coraza, sum| decode_hello(&hello(0, &s(go), &s(coraza), &s(sum)));
+    let lens = |go, coraza, sum| decode_hello(&hello(1, &s(go), &s(coraza), &s(sum)));
     let h = lens(64, 64, 128).unwrap();
     let got = (
         h.go_version.len(),
@@ -711,8 +922,28 @@ fn hello_accepts_the_string_boundaries_and_rejects_the_rest() {
         let why = "string length out of range";
         assert_eq!(reason(lens(go, coraza, sum)), why, "{go} {coraza} {sum}");
     }
-    let why = "hello contract version is not v0";
-    assert_eq!(reason(decode_hello(&hello(1, b"g", b"v", b"s"))), why);
+    let why = "hello contract version is not v1";
+    for version in [0, 2] {
+        assert_eq!(reason(decode_hello(&hello(version, b"g", b"v", b"s"))), why);
+    }
+}
+
+#[test]
+fn a_hello_of_version_0_is_refused() {
+    // The frame is good, the version is not: the bytes of a v0 inspector.
+    let bytes: Vec<u8> = (0..HELLO_V0.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&HELLO_V0[i..i + 2], 16).expect("hex digits"))
+        .collect();
+    assert_eq!(&bytes[HEADER_LEN..HEADER_LEN + 2], [0, 0]);
+    let (h, p) = read_frame(&mut &bytes[..], RUN, INC).unwrap();
+    assert_eq!(h, hdr(KIND_HELLO, 111, 0, 0));
+    assert_eq!(reason(decode_hello(&p)), "hello contract version is not v1");
+    // The same payload with the version 0001 is the HELLO of the golden file.
+    let mut v1 = p;
+    v1[1] = 1;
+    assert_eq!(v1, golden_payload("hello"));
+    assert!(decode_hello(&v1).is_ok());
 }
 
 #[test]
@@ -929,7 +1160,7 @@ type Mutation = (&'static str, fn(&mut Hello));
 
 fn good_hello() -> Hello {
     Hello {
-        version: 0,
+        version: 1,
         pid: PID,
         nonce: NONCE,
         run: RUN,
@@ -959,7 +1190,7 @@ fn checked(h: &Hello) -> Result<(), &'static str> {
 fn hello_matches_and_every_field_is_checked() {
     assert_eq!(checked(&good_hello()), Ok(()));
     let one: [Mutation; 14] = [
-        ("hello contract version is not v0", |h| h.version = 1),
+        ("hello contract version is not v1", |h| h.version = 0),
         ("hello pid is not the child's pid", |h| h.pid += 1),
         ("hello nonce differs", |h| h.nonce[15] ^= 1),
         ("hello run id differs", |h| h.run += 1),

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tukuyomi_kernel::{
-    Config, Failure, Phase, Reason, Refused, ReqId, Request, Status, Supervisor, Verdict,
+    Config, Failure, Matched, Phase, Reason, Refused, ReqId, Request, Status, Supervisor, Verdict,
 };
 
 const MS: Duration = Duration::from_millis(1);
@@ -99,7 +99,7 @@ struct Run {
     /// after the Supervisor has stopped its inspector and removed its per-start directory.
     root: Option<TestDir>,
     submitted: Vec<ReqId>,
-    got: Vec<(ReqId, Verdict)>,
+    got: Vec<(ReqId, Verdict, Matched)>,
 }
 
 impl Run {
@@ -153,7 +153,7 @@ impl Run {
     }
 
     fn verdict(&self, id: ReqId) -> Verdict {
-        let mut found = self.got.iter().filter(|&&(i, _)| i == id);
+        let mut found = self.got.iter().filter(|&&(i, _, _)| i == id);
         let v = found.next().expect("the request has a result").1;
         assert!(found.next().is_none(), "request {id} was answered twice");
         v
@@ -170,7 +170,7 @@ impl Run {
         assert_eq!(sd.waiting_left, 0);
         assert_eq!(sd.phase, self.sup.status().phase);
         self.got.extend(sd.results);
-        let mut ids: Vec<ReqId> = self.got.iter().map(|&(i, _)| i).collect();
+        let mut ids: Vec<ReqId> = self.got.iter().map(|&(i, _, _)| i).collect();
         ids.sort_unstable();
         let mut want = self.submitted.clone();
         want.sort_unstable();
@@ -205,7 +205,13 @@ fn shutdown_before_any_request_decides_the_waiting_request_once() {
 
     let sd = sup.shutdown(Instant::now());
     let cancelled = Verdict::Uninspectable(Reason::Cancelled);
-    assert_eq!(sd.results, vec![(c, cancelled), (a, UNAVAILABLE)]);
+    assert_eq!(
+        sd.results,
+        vec![
+            (c, cancelled, Matched::NONE),
+            (a, UNAVAILABLE, Matched::NONE)
+        ]
+    );
     assert_eq!(sd.phase, Phase::Stopped);
     assert!(!sd.bye && sd.exit_confirmed && sd.dir_removed);
     assert_eq!((sd.held_left, sd.waiting_left), (0, 0));
@@ -216,7 +222,10 @@ fn shutdown_before_any_request_decides_the_waiting_request_once() {
     // started.
     assert!(sup.shutdown(Instant::now()).results.is_empty());
     let b = sup.submit(&get).expect("accepted");
-    assert_eq!(sup.poll(Instant::now()), vec![(b, UNAVAILABLE)]);
+    assert_eq!(
+        sup.poll(Instant::now()),
+        vec![(b, UNAVAILABLE, Matched::NONE)]
+    );
     assert_eq!(sup.status().inc, 1);
 }
 
@@ -431,7 +440,7 @@ fn refused_full_when_the_records_are_used() {
     assert_eq!(run.sup.status().records, records);
     // Nothing has started: the first wait_queue requests wait, the others were decided by QueueFull at once.
     let sd = run.sup.shutdown(Instant::now());
-    let count = |v: Verdict| sd.results.iter().filter(|&&(_, w)| w == v).count();
+    let count = |v: Verdict| sd.results.iter().filter(|&&(_, w, _)| w == v).count();
     let unavailable = count(UNAVAILABLE);
     let queue_full = count(Verdict::Uninspectable(Reason::QueueFull));
     run.got.extend(sd.results);
@@ -896,7 +905,7 @@ fn a_full_restart_window_waits_and_the_supervisor_does_not_fail() {
     // A request that comes now waits, and the shutdown ends the wait.
     let late = run.submit(&request(b"GET", b"/", &hs, b""));
     let sd = run.sup.shutdown(Instant::now() + 20 * SEC);
-    assert_eq!(sd.results, vec![(late, UNAVAILABLE)]);
+    assert_eq!(sd.results, vec![(late, UNAVAILABLE, Matched::NONE)]);
     assert_eq!(sd.phase, Phase::Stopped);
     run.got.extend(sd.results);
     let (st, bye) = run.finish();

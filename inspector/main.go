@@ -1,4 +1,4 @@
-// Command inspector is the Go inspection process. It talks protocol 0 over a
+// Command inspector is the Go inspection process. It talks protocol 1 over a
 // socketpair inherited as fd 0 and inspects requests with the Coraza Go API.
 package main
 

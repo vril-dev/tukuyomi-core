@@ -1,6 +1,8 @@
 use super::*;
 use std::sync::Mutex;
 
+use tukuyomi_kernel::Matched;
+
 #[derive(Clone, Default)]
 struct Sink(Arc<Mutex<Vec<u8>>>);
 
@@ -60,6 +62,7 @@ fn request(upstream: Option<&str>) -> Record {
         mode: None,
         generation: None,
         rule: None,
+        matched: Matched::NONE,
         body: None,
         inspected: None,
         sent: 0,

@@ -246,7 +246,7 @@ impl Supervisor {
                 };
                 let detected = v.flags & codec::FLAG_DETECTED != 0;
                 let r = self.engine.on_verdict(
-                    now, h.tx, h.msg, v.phase, v.block, detected, v.rule_id, v.status, p,
+                    now, h.tx, h.msg, v.phase, v.block, detected, v.rule_id, v.status, v.matched, p,
                 );
                 if r.is_err() {
                     return self.lost(now, "engine fault");

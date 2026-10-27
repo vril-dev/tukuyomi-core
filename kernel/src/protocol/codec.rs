@@ -1,11 +1,12 @@
-//! Rust side of the wire protocol 0 (the accepted v0 bytes).
+//! Rust side of the wire protocol 1.
 //!
-//! The same bytes as the Go inspector's `codec.go` and `testdata/v0-golden.txt`. Every integer is big-endian; a `str`
+//! The same bytes as the Go inspector's `codec.go` and `testdata/v1-golden.txt`. Every integer is big-endian; a `str`
 //! is a u16 length and the bytes. Strings stay `&[u8]` / `Vec<u8>`: no UTF-8 conversion, normalisation or trimming.
 //! Rust receives HELLO, BYE, VERDICT, ERROR and CLOSED and sends DRAIN, TX_BEGIN, BODY, BODY_END and TX_END. The
 //! header flags of a frame Rust receives are zero. The only flag Rust sends is `FLAG_BODY_CUT`, on TX_BEGIN. The
-//! response kinds (RESP_BEGIN, RESP_BODY, RESP_END) are v0 kinds that Rust never sends: `encode_frame` refuses them and
-//! `check_header` reports one received as a wrong direction.
+//! response kinds (RESP_BEGIN, RESP_BODY, RESP_END) are kinds of the protocol that Rust never sends: `encode_frame`
+//! refuses them and `check_header` reports one received as a wrong direction. A VERDICT ends with the rules that
+//! matched the request (`matched`).
 //!
 //! Faults are split in two types: `ConnError` is a connection-wide violation (header or read; the frame boundary can no
 //! longer be trusted) and `ContentError` is an invalid payload behind a valid header, or a failed check before sending
@@ -46,7 +47,7 @@ pub(crate) const MAX_ERROR: usize = 512;
 pub(crate) const MAX_TX_END: usize = 8;
 pub(crate) const MAX_CLOSED: usize = 8;
 pub(crate) const MAX_BYE: usize = 64;
-pub(crate) const MAX_DECLARED: u64 = 1 << 20; // v0 declared body length limit (Go's `maxDeclared`, 1 MiB)
+pub(crate) const MAX_DECLARED: u64 = 1 << 20; // declared body length limit (Go's `maxDeclared`, 1 MiB)
 pub(crate) const MAX_ADDR: usize = 64;
 pub(crate) const MAX_METHOD: usize = 32;
 pub(crate) const MAX_URI: usize = 4096;
@@ -61,7 +62,7 @@ pub(crate) const MAX_ERR_MSG: usize = 256;
 pub(crate) const MAX_CONCUR_TX: u16 = 4;
 pub(crate) const QUEUE_DEPTH: u16 = 17;
 
-// HELLO string bounds (v0).
+// HELLO string bounds.
 const MAX_GO_VERSION: usize = 64;
 const MAX_CORAZA_VERSION: usize = 64;
 const MAX_CORAZA_SUM: usize = 128;
@@ -69,11 +70,13 @@ const MAX_CORAZA_SUM: usize = 128;
 // Header flags of a frame Rust sends: the body that follows TX_BEGIN is only the first bytes of the request body.
 pub(crate) const FLAG_BODY_CUT: u8 = 1 << 0;
 
-// VERDICT flags (the two cuts and the detection) and ERROR classes.
+// VERDICT flags (the two cuts, the detection and the rules past the list) and ERROR classes.
 pub(crate) const FLAG_ACTION_TRUNCATED: u8 = 1 << 0;
 pub(crate) const FLAG_DATA_TRUNCATED: u8 = 1 << 1;
 /// A continue of phase 2 that carries a match which did not stop the request (the rules only detect).
 pub(crate) const FLAG_DETECTED: u8 = 1 << 2;
+/// More rules matched than the `MAX_RULE_IDS` ids that the VERDICT lists.
+pub(crate) const FLAG_MORE_RULES: u8 = 1 << 3;
 pub(crate) const CLASS_NOT_CREATED: u8 = 1;
 pub(crate) const CLASS_TX_FAILED: u8 = 2;
 
@@ -592,6 +595,7 @@ pub(crate) struct Verdict {
     pub status: u16,
     pub action: Vec<u8>,
     pub data: Vec<u8>,
+    pub matched: Matched,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -608,14 +612,14 @@ pub(crate) struct Bye {
     pub close_errors: u64,
 }
 
-/// Decodes HELLO. A version other than v0 is its own reason ("hello contract version is not v0"): the caller treats it
+/// Decodes HELLO. A version other than v1 is its own reason ("hello contract version is not v1"): the caller treats it
 /// as a deterministic mismatch (no restart). The values (pid, nonce, run, inc, versions, sha256, limits) are
 /// checked by the caller, not here.
 pub(crate) fn decode_hello(p: &[u8]) -> Result<Hello, ContentError> {
     let mut c = Cursor { p };
     let version = c.u16()?;
-    if version != 0 {
-        return Err(ContentError("hello contract version is not v0"));
+    if version != 1 {
+        return Err(ContentError("hello contract version is not v1"));
     }
     let pid = c.u32()?;
     let nonce = c.array::<16>()?;
@@ -652,7 +656,8 @@ pub(crate) fn decode_hello(p: &[u8]) -> Result<Hello, ContentError> {
 /// Decodes VERDICT. Go cuts action and data only at their limits and then sets the matching flag (codec.go
 /// `encodeVerdict`), so a flag needs the exact cut length (32 or 256). A continuation carries no rule id, status,
 /// action or data, except the continue of phase 2 with `FLAG_DETECTED`: it carries them like a block, with the same
-/// cuts. That flag is refused on a block and in any other phase.
+/// cuts. That flag is refused on a block and in any other phase. The payload ends with the rules that matched
+/// (`matched::read`): a payload without that end is refused, and so is a value outside its limits.
 pub(crate) fn decode_verdict(p: &[u8]) -> Result<Verdict, ContentError> {
     let mut c = Cursor { p };
     let phase = c.u8()?;
@@ -665,7 +670,8 @@ pub(crate) fn decode_verdict(p: &[u8]) -> Result<Verdict, ContentError> {
         _ => return Err(ContentError("verdict decision out of range")),
     };
     let flags = c.u8()?;
-    if flags & !(FLAG_ACTION_TRUNCATED | FLAG_DATA_TRUNCATED | FLAG_DETECTED) != 0 {
+    if flags & !(FLAG_ACTION_TRUNCATED | FLAG_DATA_TRUNCATED | FLAG_DETECTED | FLAG_MORE_RULES) != 0
+    {
         return Err(ContentError("verdict flags out of range"));
     }
     if c.u8()? != 0 {
@@ -675,6 +681,7 @@ pub(crate) fn decode_verdict(p: &[u8]) -> Result<Verdict, ContentError> {
     let status = c.u16()?;
     let action = c.str16(0, MAX_ACTION)?;
     let data = c.str16(0, MAX_DATA)?;
+    let matched = matched::read(&mut c, phase, flags & FLAG_MORE_RULES != 0)?;
     c.done()?;
     let detected = flags & FLAG_DETECTED != 0;
     if detected && (block || phase != 2) {
@@ -706,6 +713,7 @@ pub(crate) fn decode_verdict(p: &[u8]) -> Result<Verdict, ContentError> {
         status,
         action: action.to_vec(),
         data: data.to_vec(),
+        matched,
     })
 }
 
@@ -788,8 +796,8 @@ pub(crate) fn check_hello(
     pid: u32,
     nonce: &[u8; 16],
 ) -> Result<(), &'static str> {
-    if h.version != 0 {
-        return Err("hello contract version is not v0");
+    if h.version != 1 {
+        return Err("hello contract version is not v1");
     }
     if h.pid != pid {
         return Err("hello pid is not the child's pid");
@@ -832,6 +840,9 @@ pub(crate) fn check_hello(
     }
     Ok(())
 }
+
+mod matched;
+pub use matched::Matched;
 
 #[cfg(test)]
 mod tests;

@@ -6,18 +6,20 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
 
-// loadGolden reads testdata/v0-golden.txt, the fixed byte-layout test vectors
-// of protocol 0.
+// loadGolden reads testdata/v1-golden.txt, the fixed byte-layout test vectors
+// of protocol 1.
 func loadGolden(t *testing.T) map[string][]byte {
 	t.Helper()
-	raw, err := os.ReadFile("testdata/v0-golden.txt")
+	raw, err := os.ReadFile("testdata/v1-golden.txt")
 	if err != nil {
 		t.Fatalf("golden: %v", err)
 	}
@@ -51,25 +53,47 @@ func TestGoldenOutbound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vc, ok1 := encodeVerdict(testRun, testInc, 0x10, 1, 1, 0, 0, "", "", false)
-	vb, ok2 := encodeVerdict(testRun, testInc, 0x10, 2, 2, 1021, 403, "deny", "x", true)
-	v0, ok3 := encodeVerdict(testRun, testInc, 0x10, 3, 2, 0, 413, "deny", "", true)
-	vt, ok4 := encodeVerdict(testRun, testInc, 0x10, 6, 4, 1040, 403, strings.Repeat("a", 33), strings.Repeat("d", 300), true)
-	vd, ok5 := encodeDetected(testRun, testInc, 0x10, 4, 949110, 403, "deny", "")
-	if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 {
-		t.Fatal("encodeVerdict failed")
+	verdict := func(msg uint32, phase uint8, rule, status int, action, data string, block bool, d ruleDetail) []byte {
+		b, ok := encodeVerdict(testRun, testInc, 0x10, msg, phase, rule, status, action, data, block, d)
+		if !ok {
+			t.Fatalf("encodeVerdict of msg %d failed", msg)
+		}
+		return b
 	}
+	rules := func(ids []int64, severity uint8, score int32) ruleDetail {
+		return ruleDetail{ids: ids, severity: severity, score: score}
+	}
+	var many []int64
+	for i := range int64(maxRuleIDs) {
+		many = append(many, 930100+i)
+	}
+	vd, ok := encodeDetected(testRun, testInc, 0x10, 4, 949110, 403, "deny", "", rules([]int64{942100, 941100}, 2, 10))
+	if !ok {
+		t.Fatal("encodeDetected failed")
+	}
+	more := rules(many, 2, 80)
+	more.more = true
 	cases := map[string][]byte{
-		"hello":               h,
-		"verdict_continue":    vc,
-		"verdict_block":       vb,
-		"verdict_block_rule0": v0,
-		"verdict_truncated":   vt,
-		"verdict_detected":    vd,
-		"error_not_created":   encodeError(testRun, testInc, 0x11, 1, classNotCreated, codeLimit, "concurrency limit"),
-		"error_tx_failed":     encodeError(testRun, testInc, 0x10, 3, classTxFailed, codeReqTruncated, "request body shorter than declared"),
-		"closed":              encodeClosed(testRun, testInc, 0x10, 7, false),
-		"bye":                 encodeBye(testRun, testInc, 3, 3, 0),
+		"hello":                  h,
+		"verdict_continue":       verdict(1, 1, 0, 0, "", "", false, noDetail),
+		"verdict_block":          verdict(2, 2, 1021, 403, "deny", "x", true, rules([]int64{942100}, 2, 5)),
+		"verdict_block_rule0":    verdict(3, 2, 0, 413, "deny", "", true, noDetail),
+		"verdict_truncated":      verdict(6, 4, 1040, 403, strings.Repeat("a", 33), strings.Repeat("d", 300), true, noDetail),
+		"verdict_detected":       vd,
+		"verdict_allow_rules":    verdict(5, 2, 0, 0, "", "", false, rules([]int64{920280, 942100, 7000005}, 5, 0)),
+		"verdict_rules_more":     verdict(7, 2, 949110, 403, "deny", "", true, more),
+		"verdict_rules_severity": verdict(8, 1, 7000006, 403, "deny", "", true, rules(nil, 3, scoreNone)),
+		"error_not_created":      encodeError(testRun, testInc, 0x11, 1, classNotCreated, codeLimit, "concurrency limit"),
+		"error_tx_failed":        encodeError(testRun, testInc, 0x10, 3, classTxFailed, codeReqTruncated, "request body shorter than declared"),
+		"closed":                 encodeClosed(testRun, testInc, 0x10, 7, false),
+		"bye":                    encodeBye(testRun, testInc, 3, 3, 0),
+	}
+	// Every valid VERDICT of the golden file is made here. The bad_ ones are
+	// not the output of an encoder: TestEncodeDetailLimits refuses their values.
+	for name, b := range g {
+		if b[4] == kindVerdict && !strings.HasPrefix(name, "bad_") && cases[name] == nil {
+			t.Errorf("%s: no encoder case", name)
+		}
 	}
 	for name, got := range cases {
 		if want := g[name]; !bytes.Equal(got, want) {
@@ -367,20 +391,20 @@ func TestDecodeRespBeginAndTxEnd(t *testing.T) {
 
 func TestEncodeLimits(t *testing.T) {
 	for _, st := range []int{65536, -1} {
-		if _, ok := encodeVerdict(testRun, testInc, 1, 1, 1, 1, st, "deny", "", true); ok {
+		if _, ok := encodeVerdict(testRun, testInc, 1, 1, 1, 1, st, "deny", "", true, noDetail); ok {
 			t.Errorf("status %d accepted", st)
 		}
 	}
-	b, ok := encodeVerdict(testRun, testInc, 1, 1, 1, -7, 65535, strings.Repeat("a", 32), strings.Repeat("d", 256), true)
+	b, ok := encodeVerdict(testRun, testInc, 1, 1, 1, -7, 65535, strings.Repeat("a", 32), strings.Repeat("d", 256), true, noDetail)
 	o, err := parseOut(b)
 	if !ok || err != nil || o.flags != 0 || o.rule != -7 || o.stat != 65535 {
 		t.Errorf("boundary verdict: ok %v err %v %+v", ok, err, o)
 	}
 	// A detection is cut like a block, and its flag stays beside the cut flags.
-	if _, ok := encodeDetected(testRun, testInc, 1, 1, 1, 65536, "deny", ""); ok {
+	if _, ok := encodeDetected(testRun, testInc, 1, 1, 1, 65536, "deny", "", noDetail); ok {
 		t.Error("status 65536 accepted")
 	}
-	b, ok = encodeDetected(testRun, testInc, 1, 1, 1, 403, strings.Repeat("a", 33), strings.Repeat("d", 257))
+	b, ok = encodeDetected(testRun, testInc, 1, 1, 1, 403, strings.Repeat("a", 33), strings.Repeat("d", 257), noDetail)
 	o, err = parseOut(b)
 	if !ok || err != nil || o.phase != 2 || o.block || o.flags != flagDetected|flagActionTruncated|flagDataTruncated || len(o.act) != maxAction || len(o.data) != maxData {
 		t.Errorf("cut detection: ok %v err %v %+v", ok, err, o)
@@ -388,5 +412,73 @@ func TestEncodeLimits(t *testing.T) {
 	e := encodeError(testRun, testInc, 1, 1, classTxFailed, codeOrder, strings.Repeat("x", 1000))
 	if o, err := parseOut(e); err != nil || len(o.text) != maxErrMsg || len(e)-headerLen > maxError {
 		t.Errorf("long error text: %v %d", err, len(o.text))
+	}
+}
+
+// The detail at the end of a VERDICT is accepted at each of its limits and
+// refused one past it, as the bad_ vectors of the golden file are, and phases
+// 3 and 4 carry nothing. A detail with nothing to carry is written as none.
+func TestEncodeDetailLimits(t *testing.T) {
+	ids := func(n int) []int64 {
+		l := make([]int64, n)
+		for i := range l {
+			l[i] = 930100 + int64(i)
+		}
+		return l
+	}
+	with := func(f func(d *ruleDetail)) ruleDetail {
+		d := noDetail
+		f(&d)
+		return d
+	}
+	for name, c := range map[string]struct {
+		phase uint8
+		d     ruleDetail
+		ok    bool
+	}{
+		"16 ids":              {2, with(func(d *ruleDetail) { d.ids = ids(16) }), true},
+		"16 ids and more":     {2, with(func(d *ruleDetail) { d.ids, d.more = ids(16), true }), true},
+		"17 ids":              {2, with(func(d *ruleDetail) { d.ids = ids(17) }), false},
+		"17 ids and more":     {2, with(func(d *ruleDetail) { d.ids, d.more = ids(17), true }), false},
+		"more with 15 ids":    {2, with(func(d *ruleDetail) { d.ids, d.more = ids(15), true }), false},
+		"id 1":                {1, with(func(d *ruleDetail) { d.ids = []int64{1} }), true},
+		"id 0":                {2, with(func(d *ruleDetail) { d.ids = []int64{930100, 0} }), false},
+		"severity 7":          {2, with(func(d *ruleDetail) { d.severity = 7 }), true},
+		"severity 8":          {2, with(func(d *ruleDetail) { d.severity = 8 }), false},
+		"score 0":             {2, with(func(d *ruleDetail) { d.score = 0 }), true},
+		"score max":           {2, with(func(d *ruleDetail) { d.score = math.MaxInt32 }), true},
+		"score -2":            {2, with(func(d *ruleDetail) { d.score = -2 }), false},
+		"nothing in phase 3":  {3, noDetail, true},
+		"score 0 in phase 4":  {4, with(func(d *ruleDetail) { d.score = 0 }), true},
+		"id in phase 3":       {3, with(func(d *ruleDetail) { d.ids = ids(1) }), false},
+		"severity in phase 4": {4, with(func(d *ruleDetail) { d.severity = 2 }), false},
+		"score in phase 4":    {4, with(func(d *ruleDetail) { d.score = 1 }), false},
+	} {
+		b, ok := encodeVerdict(testRun, testInc, 1, 1, c.phase, 0, 0, "", "", false, c.d)
+		if ok != c.ok {
+			t.Errorf("%s: ok %v, want %v", name, ok, c.ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		o, err := parseOut(b)
+		if err != nil || !slices.Equal(o.ids, c.d.ids) || o.sev != c.d.severity || (o.flags&flagMoreRules != 0) != c.d.more {
+			t.Errorf("%s: %v %+v", name, err, o)
+		}
+	}
+	// Nothing to carry is none; a score of 0 beside an id or a severity is kept.
+	for name, c := range map[string]struct {
+		d     ruleDetail
+		score int32
+	}{
+		"nothing":         {with(func(d *ruleDetail) { d.score = 0 }), scoreNone},
+		"with a severity": {with(func(d *ruleDetail) { d.severity, d.score = 3, 0 }), 0},
+		"with an id":      {with(func(d *ruleDetail) { d.ids, d.score = ids(1), 0 }), 0},
+	} {
+		b, _ := encodeVerdict(testRun, testInc, 1, 1, 2, 0, 0, "", "", false, c.d)
+		if o, err := parseOut(b); err != nil || o.score != c.score {
+			t.Errorf("%s: %v score %d, want %d", name, err, o.score, c.score)
+		}
 	}
 }

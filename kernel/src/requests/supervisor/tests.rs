@@ -339,7 +339,11 @@ fn a_request_past_its_wait_deadline_is_decided_with_that_reason_at_shutdown() {
     let sd = s.shutdown(Instant::now());
     assert_eq!(
         sd.results,
-        vec![(a, Verdict::Uninspectable(Reason::WaitDeadline))]
+        vec![(
+            a,
+            Verdict::Uninspectable(Reason::WaitDeadline),
+            Matched::NONE
+        )]
     );
 }
 
@@ -354,7 +358,10 @@ fn a_failed_supervisor_keeps_what_it_owns_and_starts_nothing() {
     let a = s.submit(&get(b"/a")).unwrap();
     assert_eq!(s.status().phase, Phase::Failed(Failure::CleanupUnknown));
     // poll starts nothing and only hands the result over
-    assert_eq!(s.poll(Instant::now()), vec![(a, unavailable())]);
+    assert_eq!(
+        s.poll(Instant::now()),
+        vec![(a, unavailable(), Matched::NONE)]
+    );
     assert!(matches!(s.run, Run::Failed { .. }));
     // an entry that cannot be identified stays, for every later shutdown
     for _ in 0..2 {
@@ -483,7 +490,7 @@ fn the_frames_of_a_body_are_written_up_to_body_end_in_one_step() {
     assert_eq!(frame_from(&mut peer).0, codec::KIND_TX_BEGIN);
     let now = Instant::now();
     s.engine
-        .on_verdict(now, tx, 1, 1, false, false, 0, 0, &[])
+        .on_verdict(now, tx, 1, 1, false, false, 0, 0, Matched::NONE, &[])
         .unwrap();
     assert_eq!(s.engine.queued(), 3);
     s.step(past());
@@ -589,14 +596,17 @@ fn a_request_in_flight_at_shutdown_gets_its_verdict() {
     until_ready(&mut s);
     let a = s.submit(&get(b"/")).unwrap();
     let sd = s.shutdown(within(10));
-    assert_eq!(sd.results, vec![(a, Verdict::Allow)]);
+    assert_eq!(sd.results, vec![(a, Verdict::Allow, Matched::NONE)]);
     assert!(sd.bye && sd.exit_confirmed && sd.dir_removed);
     assert_eq!(sd.phase, Phase::Stopped);
     assert_eq!(s.status().inc, 2);
     assert_eq!(root.entries(), 0);
     // nothing starts afterwards, and a new request is decided at once
     let b = s.submit(&get(b"/")).unwrap();
-    assert_eq!(s.poll(Instant::now()), vec![(b, unavailable())]);
+    assert_eq!(
+        s.poll(Instant::now()),
+        vec![(b, unavailable(), Matched::NONE)]
+    );
     assert_eq!(s.status().inc, 2);
 }
 
@@ -649,7 +659,10 @@ fn a_loss_moves_only_the_request_whose_begin_was_not_taken_to_the_next_start() {
     // Each result is delivered once, in the order they were decided, by the shutdown.
     let sd = finish(s, &root);
     let lost = Verdict::Uninspectable(Reason::InspectorLost);
-    assert_eq!(sd.results, vec![(a, lost), (b, Verdict::Allow)]);
+    assert_eq!(
+        sd.results,
+        vec![(a, lost, Matched::NONE), (b, Verdict::Allow, Matched::NONE)]
+    );
     assert_eq!(sd.phase, Phase::Stopped);
 }
 
@@ -658,7 +671,10 @@ fn a_tmp_root_that_does_not_exist_ends_the_supervisor_at_the_first_start() {
     // `cfg()` names a root that is not there: the start is refused before anything is made
     let mut s = Supervisor::new(cfg()).unwrap();
     let a = s.submit(&get(b"/")).unwrap();
-    assert_eq!(s.poll(Instant::now()), vec![(a, unavailable())]);
+    assert_eq!(
+        s.poll(Instant::now()),
+        vec![(a, unavailable(), Matched::NONE)]
+    );
     let st = s.status();
     assert!(
         matches!(st.phase, Phase::Failed(Failure::TmpDir(_))),
@@ -719,7 +735,7 @@ fn a_shutdown_past_its_deadline_kills_at_once_and_decides_everything() {
     until_ready(&mut s);
     let a = s.submit(&get(b"/")).unwrap();
     let sd = s.shutdown(past());
-    assert_eq!(sd.results, vec![(a, unavailable())]);
+    assert_eq!(sd.results, vec![(a, unavailable(), Matched::NONE)]);
     assert_eq!(sd.phase, Phase::Stopped);
     assert!(!sd.bye && sd.exit_confirmed && sd.dir_removed);
     assert_eq!(root.entries(), 0);
@@ -731,7 +747,11 @@ fn a_shutdown_past_its_deadline_kills_at_once_and_decides_everything() {
     let sd = s.shutdown(past());
     assert_eq!(
         sd.results,
-        vec![(b, Verdict::Uninspectable(Reason::InspectorLost))]
+        vec![(
+            b,
+            Verdict::Uninspectable(Reason::InspectorLost),
+            Matched::NONE
+        )]
     );
     assert_eq!(sd.phase, Phase::Stopped);
     assert!(!sd.bye && sd.exit_confirmed && sd.dir_removed);

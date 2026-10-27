@@ -4,7 +4,8 @@
 use std::time::Instant;
 
 use super::{
-    ConnFault, Decision, Ending, Engine, QFrame, QKind, ReqId, ReturnReason, Seen, Stage, Why, rec,
+    ConnFault, Decision, Ending, Engine, Matched, QFrame, QKind, ReqId, ReturnReason, Seen, Stage,
+    Why, rec,
 };
 
 impl Engine {
@@ -20,6 +21,7 @@ impl Engine {
         detected: bool,
         rule_id: i64,
         status: u16,
+        matched: Matched,
         payload: &[u8],
     ) -> Result<(), ConnFault> {
         if !self.faulted {
@@ -34,7 +36,9 @@ impl Engine {
             payload: payload.to_vec(),
         };
         if let Some(ti) = self.incoming(now, tx, Some(seen))? {
-            self.verdict(now, ti, msg, phase, block, detected, rule_id, status)?;
+            self.verdict(
+                now, ti, msg, phase, block, detected, rule_id, status, matched,
+            )?;
         }
         self.assign(now);
         Ok(())
@@ -156,6 +160,7 @@ impl Engine {
         detected: bool,
         rule_id: i64,
         status: u16,
+        matched: Matched,
     ) -> Result<(), ConnFault> {
         let l = &self.held[ti];
         let (stage, ri, correlated) = (l.stage, l.req, l.correlated(phase, msg));
@@ -186,13 +191,18 @@ impl Engine {
                     phase,
                     rule_id,
                     status,
+                    matched,
                 },
             );
         } else if last == Some(msg) {
             let done = if detected {
-                Ending::Detected { rule_id, status }
+                Ending::Detected {
+                    rule_id,
+                    status,
+                    matched,
+                }
             } else {
-                Ending::Done
+                Ending::Done { matched }
             };
             self.advance(now, ti, done);
         } else {
@@ -250,7 +260,8 @@ impl Engine {
         Ok(())
     }
 
-    /// The continue of the phase the stage waits for; `done` is how the last phase ends.
+    /// The continue of the phase the stage waits for; `done` is how the last phase ends. The continue of phase 1
+    /// ends nothing: its rules are not kept, the continue of phase 2 says them again.
     fn advance(&mut self, now: Instant, ti: usize, done: Ending) {
         let l = &mut self.held[ti];
         let ri = l.req;

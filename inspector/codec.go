@@ -1,5 +1,5 @@
-// Wire protocol 0. Every multi-byte integer is big-endian. The byte layout is
-// fixed by testdata/v0-golden.txt.
+// Wire protocol 1. Every multi-byte integer is big-endian. The byte layout is
+// fixed by testdata/v1-golden.txt.
 package main
 
 import (
@@ -53,6 +53,8 @@ const (
 	maxAction    = 32
 	maxData      = 256
 	maxErrMsg    = 256
+	maxRuleIDs   = 16 // matched rule ids in one VERDICT
+	maxSeverity  = 7  // SecLang severity: 0 (emergency) to 7 (debug)
 	maxConcurTx  = 4
 	queueDepth   = 17
 	frameTimeout = 3 * time.Second
@@ -111,7 +113,7 @@ const (
 	codeRespWrite      uint16 = 26 // WriteResponseBody error
 	codeRespShort      uint16 = 27 // WriteResponseBody wrote fewer bytes
 	codeRespProcess    uint16 = 28 // ProcessResponseBody error
-	codeBadVerdict     uint16 = 29 // interruption fields out of the encodable range
+	codeBadVerdict     uint16 = 29 // interruption fields or matched rules out of the encodable range
 	codeRespOver       uint16 = 30 // more response body than declared
 	codeRespTruncated  uint16 = 31 // RESP_END with total != declared
 )
@@ -126,7 +128,52 @@ const (
 	flagActionTruncated uint8 = 1 << 0
 	flagDataTruncated   uint8 = 1 << 1
 	flagDetected        uint8 = 1 << 2 // a Continue of phase 2 that carries a match which did not stop the request
+	flagMoreRules       uint8 = 1 << 3 // more rules matched than the VERDICT lists
 )
+
+// Values of "none" in the end of a VERDICT.
+const (
+	severityNone uint8 = 255
+	scoreNone    int32 = -1
+)
+
+// ruleDetail is what a VERDICT of phase 1 or 2 says about the rules that
+// matched: their ids in the order of evaluation (at most maxRuleIDs), whether
+// more matched than that, the lowest severity number among them (0 is the
+// heaviest) and the anomaly score. Severity 0 is a severity, so the zero value
+// is not "none": use noDetail.
+type ruleDetail struct {
+	ids      []int64
+	more     bool
+	severity uint8 // 0 to maxSeverity, or severityNone
+	score    int32 // 0 or more, or scoreNone
+}
+
+// noDetail carries nothing.
+var noDetail = ruleDetail{severity: severityNone, score: scoreNone}
+
+// wire checks the detail against the limits of the protocol for a VERDICT of
+// this phase and returns the score to write. A detail with no id, no severity
+// and a score of none or 0 carries nothing and is written as none; the
+// response phases carry nothing else. ok is false for a count over maxRuleIDs,
+// an id below 1, the more mark without maxRuleIDs ids, a severity outside 0 to
+// maxSeverity and severityNone, a score below none, and anything to carry in
+// phase 3 or 4.
+func (d ruleDetail) wire(phase uint8) (score int32, ok bool) {
+	if len(d.ids) > maxRuleIDs || (d.more && len(d.ids) != maxRuleIDs) ||
+		(d.severity > maxSeverity && d.severity != severityNone) || d.score < scoreNone {
+		return 0, false
+	}
+	for _, id := range d.ids {
+		if id < 1 {
+			return 0, false
+		}
+	}
+	if len(d.ids) == 0 && d.severity == severityNone && d.score <= 0 {
+		return scoreNone, true
+	}
+	return d.score, phase <= 2
+}
 
 // header is the fixed 36-byte frame header.
 type header struct {
@@ -478,7 +525,7 @@ func encodeHello(run uint64, inc uint32, v hello) ([]byte, error) {
 		return nil, errors.New("hello field out of range")
 	}
 	f := newFrame(header{kind: kindHello, run: run, inc: inc})
-	f.u16(0) // protocol version 0
+	f.u16(1) // protocol version 1
 	f.u32(v.pid)
 	f.raw(v.nonce[:])
 	f.u64(run)
@@ -496,29 +543,34 @@ func encodeHello(run uint64, inc uint32, v hello) ([]byte, error) {
 }
 
 // encodeVerdict encodes a VERDICT. A nil interruption is "continue". Action
-// and data are cut to their limits with a flag; a rule id or status outside the
-// encodable range is reported by ok=false so the caller sends an ERROR instead.
-func encodeVerdict(run uint64, inc uint32, tx uint64, msg uint32, phase uint8, ruleID int, status int, action, data string, block bool) ([]byte, bool) {
+// and data are cut to their limits with a flag; a rule id, status or detail
+// outside the encodable range is reported by ok=false so the caller sends an
+// ERROR instead.
+func encodeVerdict(run uint64, inc uint32, tx uint64, msg uint32, phase uint8, ruleID int, status int, action, data string, block bool, rules ruleDetail) ([]byte, bool) {
 	d := decisionContinue
 	if block {
 		d = decisionBlock
 	}
-	return verdictFrame(run, inc, tx, msg, phase, d, 0, ruleID, status, action, data)
+	return verdictFrame(run, inc, tx, msg, phase, d, 0, ruleID, status, action, data, rules)
 }
 
 // encodeDetected encodes the VERDICT of a request that a rule matched while the
 // engine only detected: a Continue of phase 2 with flagDetected, which holds
 // the rule, the status and the action it would have blocked with, and the data,
 // cut like those of a block. Only this form can carry the flag.
-func encodeDetected(run uint64, inc uint32, tx uint64, msg uint32, ruleID int, status int, action, data string) ([]byte, bool) {
-	return verdictFrame(run, inc, tx, msg, 2, decisionContinue, flagDetected, ruleID, status, action, data)
+func encodeDetected(run uint64, inc uint32, tx uint64, msg uint32, ruleID int, status int, action, data string, rules ruleDetail) ([]byte, bool) {
+	return verdictFrame(run, inc, tx, msg, 2, decisionContinue, flagDetected, ruleID, status, action, data, rules)
 }
 
 // verdictFrame is the frame of encodeVerdict and encodeDetected; flags holds
-// the flags that the caller sets, and the cuts add theirs.
-func verdictFrame(run uint64, inc uint32, tx uint64, msg uint32, phase, decision, flags uint8, ruleID int, status int, action, data string) ([]byte, bool) {
-	if status < 0 || status > 0xffff {
+// the flags that the caller sets, and the cuts and the more mark add theirs.
+func verdictFrame(run uint64, inc uint32, tx uint64, msg uint32, phase, decision, flags uint8, ruleID int, status int, action, data string, rules ruleDetail) ([]byte, bool) {
+	score, ok := rules.wire(phase)
+	if status < 0 || status > 0xffff || !ok {
 		return nil, false
+	}
+	if rules.more {
+		flags |= flagMoreRules
 	}
 	if len(action) > maxAction {
 		action, flags = action[:maxAction], flags|flagActionTruncated
@@ -535,6 +587,12 @@ func verdictFrame(run uint64, inc uint32, tx uint64, msg uint32, phase, decision
 	f.u16(uint16(status))
 	f.str16(action)
 	f.str16(data)
+	f.u8(uint8(len(rules.ids)))
+	for _, id := range rules.ids {
+		f.u64(uint64(id))
+	}
+	f.u8(rules.severity)
+	f.u32(uint32(score))
 	b, err := f.finish(maxVerdict)
 	return b, err == nil
 }

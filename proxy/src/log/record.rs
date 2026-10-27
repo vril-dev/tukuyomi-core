@@ -4,7 +4,9 @@
 //! line is one JSON object whose first two fields are `ts` and `type`; then come the fields of the type in the
 //! order they are declared here, and a field that has no value is left out. The types are `request` (an answer
 //! that was written to a client), `connection` (a connection that ended without one), `tunnel`, `line` (a text of
-//! the process, see `Log::line`) and `dropped` (how many records could not be queued since the last report).
+//! the process, see `Log::line`) and `dropped` (how many records could not be queued since the last report). A
+//! `request` that the rules judged also shows what they matched, as numbers of the rule set and never as text of the
+//! request: `rules`, `rules_more`, `severity` and `score`.
 //!
 //! Text that comes from a request (method, `Host`, path) is written in a form that cannot hurt the reader: every
 //! byte outside 0x21 to 0x7e, and `"` and `\`, becomes `%XX` in upper-case hexadecimal (a `%` stays as it is, so a
@@ -19,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
+use tukuyomi_kernel::Matched;
 
 use super::time::rfc3339;
 
@@ -136,6 +139,9 @@ pub struct Request {
     /// The fingerprint of the generation that gave the verdict; the record shows its first 8 bytes.
     pub generation: Option<[u8; 32]>,
     pub rule: Option<i64>,
+    /// The rules that matched, as the verdict says them. The record shows their ids (`rules`, `rules_more`), the
+    /// severity and the score, and leaves out what is none: no ids, severity 255, a score of -1 or 0.
+    pub matched: Matched,
     pub body: Option<u64>,
     pub inspected: Option<u64>,
     pub sent: u64,
@@ -227,6 +233,14 @@ struct RequestBody<'a> {
     generation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rule: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rules: Option<&'a [i64]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rules_more: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    severity: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -342,6 +356,7 @@ fn encode_request(at: SystemTime, r: &Request) -> Option<String> {
         .seen
         .as_ref()
         .map(|seen| field("path", &seen.path, PATH_MAX));
+    let matched = &r.matched;
     framed(
         at,
         "request",
@@ -367,6 +382,10 @@ fn encode_request(at: SystemTime, r: &Request) -> Option<String> {
                 .generation
                 .map(|g| g.iter().take(8).map(|b| format!("{b:02x}")).collect()),
             rule: r.rule,
+            rules: (!matched.ids().is_empty()).then_some(matched.ids()),
+            rules_more: matched.more.then_some(true),
+            severity: (matched.severity != Matched::NONE.severity).then_some(matched.severity),
+            score: (matched.score > 0).then_some(matched.score),
             body: r.body,
             inspected: r.inspected,
             sent: r.sent,

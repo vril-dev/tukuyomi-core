@@ -23,7 +23,7 @@ impl Kernel for Stub {
 
     fn cancel(&mut self, _id: ReqId) {}
 
-    fn poll(&mut self, _until: Instant) -> Vec<(ReqId, Verdict)> {
+    fn poll(&mut self, _until: Instant) -> Vec<(ReqId, Verdict, Matched)> {
         Vec::new()
     }
 
@@ -49,7 +49,10 @@ impl Kernel for Stub {
 
 fn shutdown(results: Vec<(ReqId, Verdict)>, exit_confirmed: bool) -> Shutdown {
     Shutdown {
-        results,
+        results: results
+            .into_iter()
+            .map(|(id, verdict)| (id, verdict, Matched::NONE))
+            .collect(),
         phase: Phase::Stopped,
         bye: true,
         exit_confirmed,
@@ -119,6 +122,7 @@ fn verdict(verdict: Verdict, mode: Mode) -> Answer {
         by: Some(Judge {
             generation: Fingerprint::from_hex(&[b'7'; 64]).unwrap(),
             mode,
+            matched: Matched::NONE,
         }),
     }
 }

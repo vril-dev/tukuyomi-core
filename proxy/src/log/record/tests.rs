@@ -83,9 +83,23 @@ fn request(seen: Option<Seen>) -> Request {
         mode: Some("block"),
         generation: Some([0xab; 32]),
         rule: None,
+        matched: Matched::NONE,
         body: Some(10),
         inspected: None,
         sent: 5,
+    }
+}
+
+/// The rules that matched: these ids, the flag for more of them, the severity and the score.
+fn matched(ids: &[i64], more: bool, severity: u8, score: i32) -> Matched {
+    let mut all = [0; 16];
+    all[..ids.len()].copy_from_slice(ids);
+    Matched {
+        count: ids.len() as u8,
+        ids: all,
+        more,
+        severity,
+        score,
     }
 }
 
@@ -132,11 +146,47 @@ fn a_request_record_has_its_fields_in_order_and_leaves_out_what_it_does_not_have
         "mode",
         "generation",
         "rule",
+        "rules",
+        "rules_more",
+        "severity",
+        "score",
         "body",
         "inspected",
     ] {
         assert!(!line.contains(&format!("\"{name}\"")), "{name} in {line}");
     }
+}
+
+#[test]
+fn the_rules_that_matched_come_after_the_rule_and_what_is_none_is_left_out() {
+    let line = |rule, matched| {
+        let mut r = request(None);
+        (r.rule, r.matched) = (rule, matched);
+        encode(SystemTime::UNIX_EPOCH, &Record::Request(Box::new(r))).unwrap()
+    };
+    // The ids, the severity and the score are written after the rule that decided, and before the size of the body.
+    let two = matched(&[942100, 941100], false, 2, 10);
+    let shown = line(Some(949110), two);
+    let want = "\"rule\":949110,\"rules\":[942100,941100],\"severity\":2,\"score\":10,\"body\":10";
+    assert!(shown.contains(want), "{shown}");
+    // A list with more matches behind it says so, and only then.
+    let sixteen: Vec<i64> = (1..=16).collect();
+    let more = line(None, matched(&sixteen, true, 7, 80));
+    assert!(
+        more.contains("\"rules_more\":true,\"severity\":7,\"score\":80"),
+        "{more}"
+    );
+    let full = line(None, matched(&sixteen, false, 7, 80));
+    assert!(!full.contains("rules_more"), "{full}");
+    // Severity 0 is a value; 255 is none. A score of 0 and of -1 are left out, one above 0 is not.
+    assert!(line(None, matched(&[1], false, 0, 0)).contains("\"severity\":0,\"body\""));
+    for none in [matched(&[], false, 255, 0), matched(&[], false, 255, -1)] {
+        let bare = line(None, none);
+        for name in ["rules", "rules_more", "severity", "score"] {
+            assert!(!bare.contains(&format!("\"{name}\"")), "{name} in {bare}");
+        }
+    }
+    assert!(line(None, matched(&[], false, 255, 1)).contains("\"score\":1,"));
 }
 
 #[test]
@@ -157,6 +207,8 @@ fn the_largest_request_record_is_a_json_line_under_the_limit() {
     largest.reason = "upstream failed while the body was sent on";
     largest.ms = u64::MAX;
     largest.rule = Some(i64::MIN);
+    // The most ids, each of the most digits (a rule id is above 0), and the flag, a severity and a score.
+    largest.matched = matched(&[i64::MAX; 16], true, 7, i32::MAX);
     largest.body = Some(u64::MAX);
     largest.inspected = Some(u64::MAX);
     largest.sent = u64::MAX;
@@ -165,6 +217,9 @@ fn the_largest_request_record_is_a_json_line_under_the_limit() {
     assert!(line.is_ascii());
     let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(parsed["cut"], serde_json::json!(["method", "host", "path"]));
+    assert_eq!(parsed["rules"].as_array().map(Vec::len), Some(16));
+    assert_eq!(parsed["rules"][15], i64::MAX);
+    assert_eq!(parsed["rules_more"], true);
     assert_eq!(
         parsed["method"].as_str().unwrap().len(),
         METHOD_MAX - METHOD_MAX % 3

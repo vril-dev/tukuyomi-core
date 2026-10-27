@@ -5,7 +5,7 @@
 use std::time::Instant;
 
 use super::{
-    Decision, Ending, Engine, Halt, Live, Outcome, QFrame, QKind, Req, ReqId, Request,
+    Decision, Ending, Engine, Halt, Live, Matched, Outcome, QFrame, QKind, Req, ReqId, Request,
     ReturnReason, Stage, SubmitError, Why, after, free, rec, valid,
 };
 
@@ -103,10 +103,10 @@ impl Engine {
         }
     }
 
-    /// The next decision that was not handed over, in the order they were decided, and the end of its record
-    /// if no slot is held for it: the record of a decision handed over while its slot is held goes when the
-    /// slot returns. A request is handed over once.
-    pub(crate) fn next_done(&mut self) -> Option<(ReqId, Decision)> {
+    /// The next decision that was not handed over, in the order they were decided, with the rules that matched, and
+    /// the end of its record if no slot is held for it: the record of a decision handed over while its slot is held
+    /// goes when the slot returns. A request is handed over once.
+    pub(crate) fn next_done(&mut self) -> Option<(ReqId, Decision, Matched)> {
         loop {
             let id = self.done.pop_front()?;
             let Some(r) = self.reqs.get_mut(&id) else {
@@ -115,11 +115,12 @@ impl Engine {
             let Some(d) = r.out.decision else {
                 continue;
             };
+            let matched = r.out.matched;
             r.delivered = true;
             if !self.held.iter().any(|l| l.req == id) {
                 self.reqs.remove(&id);
             }
-            return Some((id, d));
+            return Some((id, d, matched));
         }
     }
 
