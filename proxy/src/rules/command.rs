@@ -406,7 +406,7 @@ fn report(finish: &Finish, term: &mut Terminal) {
     }
 }
 
-fn describe(failed: &Failed) -> String {
+pub(crate) fn describe(failed: &Failed) -> String {
     match failed {
         Failed::Interrupted => "stopped by a signal".to_owned(),
         Failed::Start(Failure::Exit(code)) => {

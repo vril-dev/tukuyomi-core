@@ -8,7 +8,7 @@
 //! written), `auth` (how the actor got in when it was not by a session: `bootstrap` for the command that makes the
 //! first user), `client` (the address of the client), `action`, `target` (the user the action is about), `result`
 //! (`ok`, `denied` or `failed`) and `reason` (a fixed word), and, for a change of a user, `before` and `after` (only
-//! `after` for a user that was made). The line of a command run on the host has no `id` and no `client`: it is not a
+//! `after` for a user that was made), or for a switch of the rules the generation chosen before and the one asked for. The line of a command run on the host has no `id` and no `client`: it is not a
 //! request. No password, cookie or token is ever written.
 //!
 //! A change is audited before it is made. `write` fails when the line cannot be encoded or the file does not take
@@ -157,7 +157,7 @@ impl<'a> Event<'a> {
         self
     }
 
-    /// What a change of a user was from and to (a role or a state, as a word).
+    /// What a change of a user was from and to (a role or a state, as a word), or of the generation of the rules.
     pub fn change(mut self, before: &'a str, after: &'a str) -> Event<'a> {
         self.before = Some(before);
         self.after = Some(after);
@@ -285,7 +285,7 @@ impl AuditLog {
 
 /// The last `TAIL` bytes of the regular file at `path`, from the first whole line on, and whether they are the whole
 /// file. It is opened like every file that is read from a store: a link is not followed and a FIFO is not waited for.
-fn tail(path: &Path) -> io::Result<(Vec<u8>, bool)> {
+pub(super) fn tail(path: &Path) -> io::Result<(Vec<u8>, bool)> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)

@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use crate::support::*;
 
-const OWNER: &str = "first password 123";
+pub(crate) const OWNER: &str = "first password 123";
 const NEXT: &str = "second password 456";
 
 /// Adds the `admin` object that listens on `port`, with this `mfa`, and the directory of its store, to the
@@ -45,10 +45,10 @@ fn add_admin(root: &Path, port: u16, mfa: &str) {
 }
 
 /// How a command ended, and what it wrote.
-struct Ran {
-    code: Option<i32>,
-    out: String,
-    err: String,
+pub(crate) struct Ran {
+    pub(crate) code: Option<i32>,
+    pub(crate) out: String,
+    pub(crate) err: String,
 }
 
 /// Runs `tukuyomi-proxy admin <args>` with `input` on its standard input and waits for it.
@@ -75,7 +75,7 @@ fn command(args: &[&Path], input: &str) -> Ran {
     }
 }
 
-fn bootstrap(root: &Path, name: &str, input: &str) -> Ran {
+pub(crate) fn bootstrap(root: &Path, name: &str, input: &str) -> Ran {
     command(
         &[
             Path::new("bootstrap"),
@@ -87,7 +87,7 @@ fn bootstrap(root: &Path, name: &str, input: &str) -> Ran {
 }
 
 /// The admin process, with its records as they arrive.
-struct Admin {
+pub(crate) struct Admin {
     child: Child,
     records: Receiver<Value>,
     seen: Vec<Value>,
@@ -97,7 +97,7 @@ struct Admin {
 
 impl Admin {
     /// Starts the process on the configuration of `root` and waits until it listens.
-    fn start(root: &Path, port: u16) -> Admin {
+    pub(crate) fn start(root: &Path, port: u16) -> Admin {
         let mut child = Command::new(env!("CARGO_BIN_EXE_tukuyomi-proxy"))
             .arg("admin")
             .arg(root.join("config.json"))
@@ -148,7 +148,13 @@ impl Admin {
     }
 
     /// One request on a new connection.
-    fn call(&self, method: &str, path: &str, fields: &[(&str, &str)], body: &str) -> Message {
+    pub(crate) fn call(
+        &self,
+        method: &str,
+        path: &str,
+        fields: &[(&str, &str)],
+        body: &str,
+    ) -> Message {
         let mut request = format!(
             "{method} {path} HTTP/1.1\r\nHost: admin.example.test\r\nContent-Length: {}\r\n",
             body.len()
@@ -162,7 +168,7 @@ impl Admin {
     }
 
     /// SIGTERM, and the exit status once the process is gone; the records that remain are read.
-    fn stop(&mut self) -> ExitStatus {
+    pub(crate) fn stop(&mut self) -> ExitStatus {
         run_kill("TERM", self.child.id());
         let deadline = Instant::now() + MARGIN;
         let status = loop {
@@ -189,12 +195,12 @@ impl Drop for Admin {
     }
 }
 
-fn json_of(message: &Message) -> Value {
+pub(crate) fn json_of(message: &Message) -> Value {
     serde_json::from_slice(&message.body).expect("the body is JSON")
 }
 
 /// The value of the cookie that the answer sets: `tukuyomi_admin=<id>` up to the first `;`.
-fn cookie_of(message: &Message) -> String {
+pub(crate) fn cookie_of(message: &Message) -> String {
     let set = message.values("set-cookie");
     assert_eq!(set.len(), 1, "{:?}", message.fields);
     assert!(

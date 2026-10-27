@@ -31,7 +31,7 @@ use self::sink::RecordFile;
 pub mod counters;
 pub mod record;
 pub mod sink;
-mod time;
+pub(crate) mod time;
 
 /// Longest text of a line item in bytes; a longer text is cut.
 pub const LOG_LINE: usize = 512;

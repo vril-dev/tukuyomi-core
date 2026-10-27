@@ -7,23 +7,32 @@
 //! so a reader sees the old file or the new one, whole. A write that stopped halfway leaves at most a `.json.new`,
 //! which the next write to that user removes and which is not a user.
 //!
+//! `activations.log` is the history of the switches of the rules (see `waf::history`). A line is written whole to the
+//! end of the file, which is synced before the write returns, and so is the directory. A line that failed part way is
+//! cut off, and a file that does not end with a line feed (a write that a crash stopped) gets one before the next
+//! line, so that the lines stay apart. Only the last 1 MiB of the file is read back (`audit::tail`).
+//!
 //! Only the store directory itself is examined, as the directory of the rules store is: a real directory (not a link)
 //! without group or other permission bits, owned by the user that the file system sees for this process. A file is
 //! opened without following a link and without waiting for a writer. The files are made 0600 and the directories
 //! 0700.
 
-use std::fs::{self, DirBuilder, File, TryLockError};
-use std::io;
+use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+use super::audit::tail;
 use super::password::valid_name;
 use super::store::{AdminError, AdminStore, BUSY, CONFLICT};
 use super::users::User;
+use super::waf::history::Activation;
 use crate::config;
-use crate::rules::file_store::{open_lock_file, read_regular, sync_dir, write_new};
+use crate::rules::file_store::{
+    O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, open_lock_file, read_regular, sync_dir, write_new,
+};
 use crate::rules::store::StoreError;
 use crate::run::host;
 
@@ -31,6 +40,7 @@ use crate::run::host;
 pub(super) const AUDIT_DIR: &str = "audit";
 const USERS: &str = "users";
 const LOCK: &str = "lock";
+const ACTIVATIONS: &str = "activations.log";
 /// The most bytes of a user file.
 const USER_MAX: u64 = 4096;
 
@@ -163,6 +173,54 @@ impl AdminStore for FileAdminStore {
             Some(stored) if stored.changed == seen => self.write_user(user),
             Some(_) => Err(CONFLICT),
             None => Err(AdminError("the user is not in the store")),
+        }
+    }
+
+    fn record_activation(&self, activation: &Activation) -> Result<(), AdminError> {
+        const CANNOT: AdminError = AdminError("the history cannot be written");
+        let mut line = activation.encode().ok_or(CANNOT)?.into_bytes();
+        line.push(b'\n');
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
+            .open(self.dir.join(ACTIVATIONS))
+            .map_err(|_| CANNOT)?;
+        let meta = file.metadata().map_err(|_| CANNOT)?;
+        if !meta.is_file() {
+            return Err(CANNOT);
+        }
+        // A file that a crash stopped in the middle of a line gets its line feed first.
+        let mut last = [b'\n'];
+        if meta.len() > 0 {
+            file.read_exact_at(&mut last, meta.len() - 1)
+                .map_err(|_| CANNOT)?;
+        }
+        if last[0] != b'\n' {
+            line.insert(0, b'\n');
+        }
+        let written = file
+            .write_all(&line)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| sync_dir(&self.dir));
+        if written.is_err() {
+            let _ = file.set_len(meta.len());
+            return Err(CANNOT);
+        }
+        Ok(())
+    }
+
+    fn activations(&self, limit: usize) -> Result<Vec<Activation>, AdminError> {
+        match tail(&self.dir.join(ACTIVATIONS)) {
+            Ok((bytes, _)) => Ok(bytes
+                .rsplit(|&b| b == b'\n')
+                .filter_map(Activation::decode)
+                .take(limit)
+                .collect()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(_) => Err(AdminError("the history cannot be read")),
         }
     }
 }

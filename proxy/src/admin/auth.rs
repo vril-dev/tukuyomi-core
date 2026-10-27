@@ -235,6 +235,13 @@ impl Auth {
         &self.audit
     }
 
+    /// Whether the cookie names a session that is alive, of a user whose role is at least `least` as the store gives it
+    /// now; the session then counts as used at `now`. The user is read from the store, so this is not called on the
+    /// thread of the runtime.
+    pub fn allows(&self, cookie: &str, least: Role, now: Instant) -> bool {
+        matches!(self.session(cookie, now), Authed::Who(who) if who.role >= least)
+    }
+
     /// Whether the client may try to log in at `now`.
     pub fn allow_client(&self, ip: IpAddr, now: Instant) -> bool {
         self.guard.allow_client(ip, now)

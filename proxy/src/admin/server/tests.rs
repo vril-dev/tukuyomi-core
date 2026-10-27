@@ -1,7 +1,11 @@
 use std::fs;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Context;
+
+use http_body::{Body, Frame};
 
 use super::*;
 use crate::admin::audit::Append;
@@ -106,7 +110,15 @@ fn rig_trusting(trusted: &[&str]) -> Rig {
         session_total: Duration::from_secs(43_200),
         crs_dir: None,
     };
-    let app = App::new(&config, store, audit, RequestIds::new().unwrap(), ITER).unwrap();
+    let app = App::new(
+        &config,
+        store,
+        audit,
+        RequestIds::new().unwrap(),
+        ITER,
+        None,
+    )
+    .unwrap();
     Rig {
         app,
         fail,
@@ -131,6 +143,7 @@ fn request(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Re
     Req {
         method: Method::from_bytes(method.as_bytes()).unwrap(),
         path: path.to_owned(),
+        query: String::new(),
         headers: fields,
         peer: SocketAddr::from(([127, 0, 0, 1], 50_000)),
         body: Bytes::copy_from_slice(body.as_bytes()),
@@ -830,4 +843,133 @@ fn a_logout_closes_the_session_also_when_the_audit_log_cannot_be_written() {
         rig.with(&vera, "GET", "/api/session", &[], "").status,
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[test]
+fn the_routes_of_the_rules_are_in_the_table_with_the_roles_it_gives_them() {
+    let rig = rig();
+    let one = format!("/api/generations/{}", "0123456789abcdef".repeat(4));
+    let changes = [
+        ("POST", "/api/generations", "import"),
+        ("POST", "/api/activate", "activate"),
+        ("POST", "/api/rollback", "rollback"),
+        ("DELETE", one.as_str(), "remove"),
+    ];
+    let reads = [
+        ("GET", "/api/status"),
+        ("GET", "/api/generations"),
+        ("GET", one.as_str()),
+        ("GET", "/api/history"),
+        ("GET", "/api/records"),
+    ];
+    let (vera, ola) = (rig.login("vera"), rig.login("ola"));
+    let ola_cookie = format!("{COOKIE_NAME}={}", ola.id);
+    for (method, path, action) in changes {
+        let name = format!("{method} {path}");
+        let none = rig.send(method, path, &[JSON_TYPE], "{}");
+        assert_eq!(none.status, StatusCode::UNAUTHORIZED, "{name}");
+        // A viewer is refused, and the refusal is written.
+        let viewer = rig.with(&vera, method, path, &[], "{}");
+        assert_eq!(viewer.status, StatusCode::FORBIDDEN, "{name}");
+        let last = rig.audit().pop().unwrap();
+        assert_eq!(
+            (
+                last["action"].as_str(),
+                last["reason"].as_str(),
+                last["actor"].as_str()
+            ),
+            (Some(action), Some("role"), Some("vera")),
+            "{name}"
+        );
+        // An operator without the CSRF token is refused as well.
+        let headers = [JSON_TYPE, ("cookie", ola_cookie.as_str())];
+        let no_token = rig.send(method, path, &headers, "{}");
+        assert_eq!(no_token.status, StatusCode::FORBIDDEN, "{name}");
+        // An operator passes every check of the server; the rig has no routes of the rules, so the route is 404.
+        let operator = rig.with(&ola, method, path, &[], "{}");
+        assert_eq!(operator.status, StatusCode::NOT_FOUND, "{name}");
+    }
+    for (method, path) in reads {
+        let name = format!("{method} {path}");
+        let none = rig.send(method, path, &[], "");
+        assert_eq!(none.status, StatusCode::UNAUTHORIZED, "{name}");
+        let viewer = rig.with(&vera, method, path, &[], "");
+        assert_eq!(viewer.status, StatusCode::NOT_FOUND, "{name}");
+    }
+    // A path below `/api/generations/` is the star of the table, and the table says which methods it has.
+    for (method, path, allow) in [
+        ("PUT", "/api/generations", "GET, HEAD, POST"),
+        ("PUT", one.as_str(), "GET, HEAD, DELETE"),
+        ("POST", "/api/status", "GET, HEAD"),
+    ] {
+        let answer = rig.send(method, path, &[], "");
+        assert_eq!(
+            answer.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path}"
+        );
+        assert_eq!(answer.allow.as_deref(), Some(allow));
+    }
+    assert_eq!(
+        rig.send("GET", "/api/generation", &[], "").status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// A body that tells whether anybody asked for its data.
+struct Watched(Arc<AtomicBool>);
+
+impl Body for Watched {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        self.0.store(true, Ordering::SeqCst);
+        Poll::Ready(None)
+    }
+}
+
+#[test]
+fn a_body_over_the_usual_limit_is_read_only_for_a_live_session_of_an_operator() {
+    let rig = rig();
+    let (alice, ola, vera) = (rig.login("alice"), rig.login("ola"), rig.login("vera"));
+    let big = waf::body_limit(&Method::POST, "/api/generations").unwrap();
+    let dir = rig.dir.path().to_path_buf();
+    let app = Arc::new(rig.app);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Whether the body was asked for, and the request went on, for a client with this session.
+    let read = |session: Option<&Session>, limit: usize| {
+        let mut headers = HeaderMap::new();
+        if let Some(session) = session {
+            let cookie = format!("{COOKIE_NAME}={}", session.id);
+            headers.insert(COOKIE, HeaderValue::from_str(&cookie).unwrap());
+        }
+        let asked = Arc::new(AtomicBool::new(false));
+        let result = runtime.block_on(body::read(&app, &headers, Watched(asked.clone()), limit));
+        (result.is_ok(), asked.load(Ordering::SeqCst))
+    };
+    // The usual limit is read for everybody; the limit of the import for an operator and an owner.
+    assert_eq!(read(None, BODY_MAX), (true, true));
+    assert_eq!(read(Some(&vera), BODY_MAX), (true, true));
+    assert_eq!(read(Some(&ola), big), (true, true));
+    assert_eq!(read(Some(&alice), big), (true, true));
+    // No session, a cookie that names none, and a viewer get the request on without the body, to be refused.
+    assert_eq!(read(None, big), (true, false));
+    let unknown = Session {
+        id: "a".repeat(43),
+        csrf: String::new(),
+    };
+    assert_eq!(read(Some(&unknown), big), (true, false));
+    assert_eq!(read(Some(&vera), big), (true, false));
+    // The role is the one the store gives now: a user that was disabled is not read for either.
+    put_user(&dir, "ola", Role::Operator, PASSWORD, true);
+    assert_eq!(read(Some(&ola), big), (true, false));
+    put_user(&dir, "alice", Role::Viewer, PASSWORD, false);
+    assert_eq!(read(Some(&alice), big), (true, false));
 }

@@ -31,7 +31,9 @@ use crate::rules::bundle::{
     Bundle, Fingerprint, MANIFEST_NAME, MAX_MANIFEST_BYTES, Manifest, Mode, sha256,
 };
 use crate::rules::routes::Routes;
-use crate::rules::store::{Committed, Generation, Hold, RuleStore, Staged, StoreError};
+use crate::rules::store::{
+    Committed, Generation, Hold, NOT_EXPECTED, RuleStore, Staged, StoreError,
+};
 use crate::run::host;
 
 /// `O_NOFOLLOW` of Linux, which std has no name for. x86_64: the UAPI header `asm-generic/fcntl.h` (and Go's
@@ -163,6 +165,26 @@ impl FileStore {
         }
     }
 
+    /// Chooses `generation`, after `verify`. The lock is held by the caller.
+    fn choose(&self, generation: Fingerprint) -> Result<(), StoreError> {
+        const CANNOT: StoreError = StoreError("the current generation record cannot be written");
+        self.verify(generation)?;
+        let new = self.dir.join(CURRENT_NEW);
+        match fs::remove_file(&new) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(CANNOT),
+        }
+        let record = format!("{}\n", generation.hex());
+        write_new(&new, record.as_bytes())
+            .and_then(|()| fs::rename(&new, self.dir.join(CURRENT)))
+            .and_then(|()| sync_dir(&self.dir))
+            .map_err(|_| {
+                let _ = fs::remove_file(&new);
+                CANNOT
+            })
+    }
+
     /// Puts the staged bundle at its name in `generations/`, and reports what was there.
     fn place(&self, import: &Import) -> Result<Committed, StoreError> {
         const CANNOT: StoreError = StoreError("the generation cannot be made");
@@ -279,23 +301,22 @@ impl RuleStore for FileStore {
     }
 
     fn activate(&mut self, generation: Fingerprint) -> Result<(), StoreError> {
-        const CANNOT: StoreError = StoreError("the current generation record cannot be written");
         let _lock = self.lock()?;
-        self.verify(generation)?;
-        let new = self.dir.join(CURRENT_NEW);
-        match fs::remove_file(&new) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return Err(CANNOT),
+        self.choose(generation)
+    }
+
+    /// The order: the lock, the chosen generation (a record that cannot be read is a refusal, as for `remove`), then
+    /// the choice as `activate` makes it.
+    fn activate_if_current(
+        &mut self,
+        expect: Fingerprint,
+        generation: Fingerprint,
+    ) -> Result<(), StoreError> {
+        let _lock = self.lock()?;
+        if self.current()? != Some(expect) {
+            return Err(NOT_EXPECTED);
         }
-        let record = format!("{}\n", generation.hex());
-        write_new(&new, record.as_bytes())
-            .and_then(|()| fs::rename(&new, self.dir.join(CURRENT)))
-            .and_then(|()| sync_dir(&self.dir))
-            .map_err(|_| {
-                let _ = fs::remove_file(&new);
-                CANNOT
-            })
+        self.choose(generation)
     }
 
     fn list(&self) -> Result<Vec<Generation>, StoreError> {
@@ -343,6 +364,10 @@ impl RuleStore for FileStore {
             }
         }
         Ok(())
+    }
+
+    fn manifest(&self, generation: Fingerprint) -> Result<Manifest, StoreError> {
+        read_manifest(&self.generation_dir(generation)?, generation)
     }
 
     fn mode(&self, generation: Fingerprint) -> Result<Mode, StoreError> {

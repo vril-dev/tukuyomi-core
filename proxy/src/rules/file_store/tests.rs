@@ -441,6 +441,8 @@ fn one_command_at_a_time_changes_the_store() {
     let busy = "the rules store is in use by another command";
     assert_eq!(refusal(second.stage(&bundle)), busy);
     assert_eq!(refusal(second.activate(bundle.fingerprint())), busy);
+    let expect = bundle.fingerprint();
+    assert_eq!(refusal(second.activate_if_current(expect, expect)), busy);
     // Reading does not need the lock.
     assert_eq!(second.list(), Ok(Vec::new()));
     assert_eq!(refusal(first.stage(&bundle)), "a bundle is staged already");
@@ -494,6 +496,38 @@ fn activate_verifies_the_generation_before_it_replaces_the_record() {
         "a file of the generation differs from its manifest"
     );
     assert_eq!(fs::read(root.path().join("current")).unwrap(), before);
+}
+
+#[test]
+fn a_generation_is_chosen_only_if_the_chosen_one_is_the_one_expected() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let first = made(&mut store, &rules());
+    let second = made(&mut store, &other_rules());
+    // Nothing is chosen yet, so nothing is expected.
+    assert_eq!(
+        refusal(store.activate_if_current(first, second)),
+        NOT_EXPECTED.0
+    );
+    assert_eq!(store.current(), Ok(None));
+    store.activate(first).unwrap();
+    // Another command chose `second` after the caller saw `first`: that choice stays.
+    opened(root.path()).activate(second).unwrap();
+    assert_eq!(
+        refusal(store.activate_if_current(first, first)),
+        NOT_EXPECTED.0
+    );
+    assert_eq!(store.current(), Ok(Some(second)));
+    // The generation that is chosen is the one expected: it is replaced, and the lock is free again.
+    assert_eq!(store.activate_if_current(second, first), Ok(()));
+    assert_eq!(store.current(), Ok(Some(first)));
+    assert_eq!(store.activate(second), Ok(()));
+    // A generation that is not sound is refused after the check, and the record stays.
+    assert_eq!(
+        refusal(store.activate_if_current(second, generation())),
+        "the generation is not a real directory"
+    );
+    assert_eq!(store.current(), Ok(Some(second)));
 }
 
 #[test]
@@ -636,4 +670,22 @@ fn a_link_or_a_fifo_in_place_of_the_marker_is_refused_without_waiting() {
     make_fifo(&marker);
     let store = FileStore::open(root.path()).unwrap();
     assert_eq!(within(move || refusal(store.hold(first))), cannot);
+}
+
+#[test]
+fn the_manifest_of_a_generation_lists_its_files_in_the_order_of_their_paths() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let fingerprint = made(&mut store, &rules());
+    let manifest = store.manifest(fingerprint).unwrap();
+    let paths: Vec<&str> = manifest.files().iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["crs/rules/a.conf", "crs/rules/a.data", "rules/local.conf"]
+    );
+    assert_eq!(manifest.load().len(), 2);
+    assert_eq!(
+        refusal(store.manifest(generation())),
+        "the generation is not a real directory"
+    );
 }

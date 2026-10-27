@@ -17,6 +17,11 @@
 //!
 //! The file of the routes, if one is named, is read like an input file. It is not a file of the bundle: its routes
 //! are checked (`routes`) and go into the manifest, in the order they are written.
+//!
+//! A request can bring the operator's own files as content in place of paths (`collect_uploads`, `Uploads`): the name
+//! of a file is one name below `rules/`, as the file name of what `--rules` and `--data` take, so it has no `/`; the
+//! content is held in memory; and the same limits and the same checks hold. The directory of the CRS is read from the
+//! disk in both ways.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -50,6 +55,28 @@ pub struct Inputs {
     pub routes: Option<PathBuf>,
 }
 
+/// A file that came with a request in place of a path: its name, which is one name and no path, and its content.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Upload {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+/// What a request names, when the operator's own files come as content. The CRS is a directory of the host: the
+/// caller chooses it, a request never does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Uploads {
+    pub crs: Option<PathBuf>,
+    pub crs_off: Vec<OsString>,
+    /// Rule files, in the order they are loaded.
+    pub rules: Vec<Upload>,
+    /// Data files that rules read.
+    pub data: Vec<Upload>,
+    pub mode: Mode,
+    /// The content of the file of the routes.
+    pub routes: Option<Vec<u8>>,
+}
+
 /// Why the inputs were refused: a fixed English sentence, and the name or path of the input that it is about,
 /// as the operator wrote it or as the file system listed it. The subject is not safe to print as it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,8 +101,9 @@ struct Collector {
 }
 
 impl Collector {
-    /// Reads `source` into the bundle as `path`, and loads it when `loaded`.
-    fn add(&mut self, path: &str, source: &Path, loaded: bool) -> Result<(), CollectError> {
+    /// The name `path` in the bundle for a file that comes from `source`: it must be a name in a bundle, there must be
+    /// room for one more file, and no file may have the name already.
+    fn claim(&self, path: &str, source: &Path) -> Result<BundlePath, CollectError> {
         let Some(path) = BundlePath::parse(path) else {
             return refuse(
                 "the name of an input file is not a name in a bundle",
@@ -88,7 +116,17 @@ impl Collector {
         if self.files.contains_key(&path) {
             return refuse("two input files have the same name in the bundle", source);
         }
-        let data = read_input(source)?;
+        Ok(path)
+    }
+
+    /// Keeps `data` as the file `path` of the bundle, and loads it when `loaded`. `source` is what a refusal names.
+    fn keep(
+        &mut self,
+        path: BundlePath,
+        data: Vec<u8>,
+        source: &Path,
+        loaded: bool,
+    ) -> Result<(), CollectError> {
         self.total = self
             .total
             .saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
@@ -101,21 +139,70 @@ impl Collector {
         self.files.insert(path, data);
         Ok(())
     }
+
+    /// Reads `source` into the bundle as `path`, and loads it when `loaded`.
+    fn add(&mut self, path: &str, source: &Path, loaded: bool) -> Result<(), CollectError> {
+        let path = self.claim(path, source)?;
+        let data = read_input(source)?;
+        self.keep(path, data, source, loaded)
+    }
+
+    /// Takes a file of a request into the bundle as `rules/<name>`, and loads it when `loaded`.
+    fn add_upload(&mut self, file: Upload, loaded: bool) -> Result<(), CollectError> {
+        let source = Path::new(&file.name);
+        // A name with a `/` would be a file in a directory below `rules/`; the name of a file of the command is the
+        // last part of its path.
+        if file.name.contains('/') {
+            return refuse(
+                "the name of an input file is not a name in a bundle",
+                source,
+            );
+        }
+        let path = self.claim(&format!("rules/{}", file.name), source)?;
+        if u64::try_from(file.data.len()).is_ok_and(|size| size > MAX_FILE_BYTES) {
+            return refuse("an input file is over 2 MiB", source);
+        }
+        self.keep(path, file.data, source, loaded)
+    }
+
+    /// The files of the CRS in `dir`, if there is one, less those named by `off`.
+    fn crs(&mut self, dir: Option<&Path>, off: &[OsString]) -> Result<(), CollectError> {
+        match dir {
+            Some(dir) => add_crs(self, dir, off),
+            None if !off.is_empty() => Err(CollectError {
+                reason: "a file of the CRS is turned off but no CRS is given",
+                subject: None,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Refuses a collection that loads no rule file.
+    fn need_rules(&self) -> Result<(), CollectError> {
+        if self.load.is_empty() {
+            return Err(CollectError {
+                reason: "no rule file is given: name a CRS or a rule file",
+                subject: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// The bundle of what was collected, for the rules of `mode` and with `routes`.
+    fn finish(self, mode: Mode, routes: Routes) -> Result<Bundle, CollectError> {
+        Bundle::new(mode, self.files.into_iter().collect(), self.load, routes).map_err(|e| {
+            CollectError {
+                reason: e.0,
+                subject: None,
+            }
+        })
+    }
 }
 
 /// Reads the inputs into a bundle.
 pub fn collect(inputs: &Inputs) -> Result<Bundle, CollectError> {
     let mut collector = Collector::default();
-    match &inputs.crs {
-        Some(dir) => add_crs(&mut collector, dir, &inputs.crs_off)?,
-        None if !inputs.crs_off.is_empty() => {
-            return Err(CollectError {
-                reason: "a file of the CRS is turned off but no CRS is given",
-                subject: None,
-            });
-        }
-        None => {}
-    }
+    collector.crs(inputs.crs.as_deref(), &inputs.crs_off)?;
     for (group, loaded) in [(&inputs.rules, true), (&inputs.data, false)] {
         for source in group {
             let Some(name) = source.file_name().and_then(OsStr::to_str) else {
@@ -127,26 +214,38 @@ pub fn collect(inputs: &Inputs) -> Result<Bundle, CollectError> {
             collector.add(&format!("rules/{name}"), source, loaded)?;
         }
     }
-    if collector.load.is_empty() {
-        return Err(CollectError {
-            reason: "no rule file is given: name a CRS or a rule file",
-            subject: None,
-        });
-    }
+    collector.need_rules()?;
     let routes = match &inputs.routes {
         Some(source) => Routes::from_json(&read_input(source)?).or_else(|e| refuse(e.0, source))?,
         None => Routes::default(),
     };
-    Bundle::new(
-        inputs.mode,
-        collector.files.into_iter().collect(),
-        collector.load,
-        routes,
-    )
-    .map_err(|e| CollectError {
-        reason: e.0,
-        subject: None,
-    })
+    collector.finish(inputs.mode, routes)
+}
+
+/// Reads the inputs of a request into a bundle: the CRS from its directory, the other files from memory, in the
+/// same order and with the same checks as `collect`.
+pub fn collect_uploads(uploads: Uploads) -> Result<Bundle, CollectError> {
+    let mut collector = Collector::default();
+    // The directory of the CRS is the host's: a refusal names the last part of the path, not where the directory is.
+    collector
+        .crs(uploads.crs.as_deref(), &uploads.crs_off)
+        .map_err(|mut e| {
+            e.subject = (e.subject.as_deref().map(Path::new))
+                .and_then(Path::file_name)
+                .map(OsStr::to_owned);
+            e
+        })?;
+    for (group, loaded) in [(uploads.rules, true), (uploads.data, false)] {
+        for file in group {
+            collector.add_upload(file, loaded)?;
+        }
+    }
+    collector.need_rules()?;
+    let routes = match &uploads.routes {
+        Some(bytes) => Routes::from_json(bytes).or_else(|e| refuse(e.0, Path::new("routes")))?,
+        None => Routes::default(),
+    };
+    collector.finish(uploads.mode, routes)
 }
 
 /// How an entry of a directory is listed.

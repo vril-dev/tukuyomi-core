@@ -4,9 +4,11 @@
 //! that has TLS can be the way in from outside). At most 32 connections are served at once;
 //! one that finds no place is accepted and closed. A connection serves one request and is closed after the answer
 //! (`Connection: close`), so a connection never waits for a second request. The head is at most 8 KiB and comes within
-//! 10 s; the body is at most 64 KiB, for every route, and comes within 30 s; the answer is made within 30 s. A
-//! connection lives for 70 s at the most. A head that hyper refuses by itself (a malformed one, or one over the limit)
-//! gets hyper's own answer, or none, and not the fields below.
+//! 10 s; the body is at most 64 KiB (12 MiB for the import of a generation, read only for a client with a live session
+//! of an operator or an owner; see `body`) and comes within 30 s; the answer is made within 30 s, or for the import, the
+//! switch and the rollback of the rules within `Waf::longest`. A connection lives for the three times together at the
+//! most. A head that hyper refuses by itself (a malformed one, or one over the limit) gets hyper's own answer, or none,
+//! and not the fields below.
 //!
 //! Every answer is JSON and has `Content-Type: application/json`, `Cache-Control: no-store`, `X-Content-Type-Options:
 //! nosniff`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, `Referrer-Policy: no-referrer`
@@ -32,12 +34,15 @@
 //! /api/account/password` (`{"current", "new"}`; 200 with the new `csrf` and a new cookie, the other sessions of the
 //! user being closed); `GET /api/audit` (the newest 200 lines, the newest first, as `{"entries"}`).
 //! The cookie is `tukuyomi_admin=<43 characters>; Secure; HttpOnly; SameSite=Strict; Path=/`.
+//! The routes of the rules (`waf::ROUTES`) come after these in the table; a `*` ends a path that has a part left over.
 //!
 //! The start is refused, with exit code 1, when `admin.mfa` is `required`: there is no second factor yet, and the
 //! process must not run with the password alone for a configuration that asks for one.
 //!
 //! The stop: SIGTERM, SIGINT and SIGHUP close the listener and tell the service manager `STOPPING=1`; the requests
 //! in flight have 10 s to end, and the process exits with code 0. `READY=1` is told after the listener is bound.
+
+mod body;
 
 use std::convert::Infallible;
 use std::future::poll_fn;
@@ -54,7 +59,7 @@ use http::header::{
     ORIGIN, SET_COOKIE,
 };
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -76,6 +81,7 @@ use super::file_store::AUDIT_DIR;
 use super::password::{ITERATIONS, Secret};
 use super::store::{self, AdminStore};
 use super::users::Role;
+use super::waf::{self, Op, Waf};
 use crate::config::{self, AdminConfig, AdminStoreConfig, Mfa};
 use crate::forward::client_ip::{Cidr, effective, trusts};
 use crate::inbound::session::RequestIds;
@@ -104,26 +110,27 @@ const CSRF_HEADER: &str = "x-csrf-token";
 
 /// What a request asks the table for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Handler {
+pub(super) enum Handler {
     Login,
     Logout,
     Session,
     Password,
     Audit,
+    Waf(Op),
 }
 
 /// One route: the method and the path, who may use it, and the action the audit log calls it.
-struct Route {
-    method: Method,
-    path: &'static str,
-    handler: Handler,
+pub(super) struct Route {
+    pub(super) method: Method,
+    pub(super) path: &'static str,
+    pub(super) handler: Handler,
     /// The least role that may use the route; none: no session is needed.
-    least: Option<Role>,
-    action: &'static str,
+    pub(super) least: Option<Role>,
+    pub(super) action: &'static str,
 }
 
 /// The routes. A path that is not here is 404.
-const ROUTES: [Route; 5] = [
+static ROUTES: [Route; 5] = [
     Route {
         method: Method::POST,
         path: "/api/login",
@@ -166,6 +173,8 @@ pub struct Req {
     pub method: Method,
     /// The path of the target, without the query.
     pub path: String,
+    /// The query of the target, without the `?`; empty when there is none.
+    pub query: String,
     pub headers: HeaderMap,
     /// The address of the peer of the connection.
     pub peer: SocketAddr,
@@ -185,7 +194,7 @@ pub struct Answer {
 }
 
 impl Answer {
-    fn json(status: StatusCode, body: Value) -> Answer {
+    pub(super) fn json(status: StatusCode, body: Value) -> Answer {
         Answer {
             status,
             body,
@@ -195,11 +204,11 @@ impl Answer {
         }
     }
 
-    fn error(status: StatusCode, words: &'static str) -> Answer {
+    pub(super) fn error(status: StatusCode, words: &'static str) -> Answer {
         Answer::json(status, json!({ "error": words }))
     }
 
-    fn unavailable() -> Answer {
+    pub(super) fn unavailable() -> Answer {
         Answer::error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
     }
 
@@ -252,7 +261,7 @@ fn is_json(headers: &HeaderMap) -> bool {
 }
 
 /// The body of the request as the JSON object `T`, with exactly the keys `T` knows.
-fn json_body<T: DeserializeOwned>(req: &Req) -> Result<T, Answer> {
+pub(super) fn json_body<T: DeserializeOwned>(req: &Req) -> Result<T, Answer> {
     if !is_json(&req.headers) {
         return Err(Answer::error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -278,10 +287,14 @@ fn proxy_form(text: &str) -> bool {
     })
 }
 
+/// The routes of the table: those of the login and the session, then those of the rules.
+fn routes() -> impl Iterator<Item = &'static Route> {
+    ROUTES.iter().chain(waf::ROUTES.iter())
+}
+
 /// The methods that a path has in the table, for `Allow`.
 fn allowed(path: &str) -> String {
-    let mut methods: Vec<&str> = ROUTES
-        .iter()
+    let mut methods: Vec<&str> = routes()
         .filter(|route| route.path == path)
         .flat_map(|route| {
             if route.method == Method::GET {
@@ -315,17 +328,21 @@ pub struct App {
     trusted: Vec<Cidr>,
     auth: Auth,
     ids: RequestIds,
+    waf: Option<Waf>,
+    /// The time an answer may take.
+    answer_wait: Duration,
 }
 
 impl App {
     /// The routes over `store` and `audit`, for the configuration. `iterations` are the rounds of a new password
-    /// hash. None: no random number.
+    /// hash. `waf` are the routes of the rules; without them those routes are 404. None: no random number.
     pub fn new(
         config: &AdminConfig,
         store: Arc<dyn AdminStore>,
         audit: Arc<AuditLog>,
         ids: RequestIds,
         iterations: u32,
+        waf: Option<Waf>,
     ) -> Option<App> {
         Some(App {
             origin: config.origin.clone(),
@@ -338,6 +355,8 @@ impl App {
                 iterations,
             )?,
             ids,
+            answer_wait: ANSWER_WAIT.max(waf.as_ref().map_or(Duration::ZERO, Waf::longest)),
+            waf,
         })
     }
 
@@ -383,15 +402,14 @@ impl App {
         } else {
             req.method.clone()
         };
-        if !ROUTES.iter().any(|route| route.path == req.path) {
+        let path = waf::pattern(&req.path);
+        if !routes().any(|route| route.path == path) {
             return Answer::error(StatusCode::NOT_FOUND, "not found");
         }
-        let Some(route) = ROUTES
-            .iter()
-            .find(|route| route.path == req.path && route.method == method)
+        let Some(route) = routes().find(|route| route.path == path && route.method == method)
         else {
             let mut answer = Answer::error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-            answer.allow = Some(allowed(&req.path));
+            answer.allow = Some(allowed(path));
             return answer;
         };
         let who = match route.least {
@@ -419,6 +437,10 @@ impl App {
             (Handler::Session, Some(who)) => session_answer(&who),
             (Handler::Password, Some(who)) => self.password(req, &who, cx, now),
             (Handler::Audit, Some(_)) => self.audit(),
+            (Handler::Waf(op), Some(who)) => match &self.waf {
+                Some(waf) => waf.handle(op, req, &who, cx),
+                None => Answer::error(StatusCode::NOT_FOUND, "not found"),
+            },
             // A route that names a least role has a user by now.
             (_, None) => Answer::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         }
@@ -588,32 +610,32 @@ async fn answer(
     request: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
+    let limit = waf::body_limit(&parts.method, parts.uri.path()).unwrap_or(BODY_MAX);
+    let slow = waf::slow(&parts.method, parts.uri.path());
+    let wait = if slow { app.answer_wait } else { ANSWER_WAIT };
     let declared = parts
         .headers
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|text| text.parse::<usize>().ok());
-    if declared.is_some_and(|length| length > BODY_MAX) {
+    if declared.is_some_and(|length| length > limit) {
         return app.refuse(StatusCode::PAYLOAD_TOO_LARGE, "payload too large");
     }
-    let body = match timeout(BODY_WAIT, Limited::new(body, BODY_MAX).collect()).await {
-        Ok(Ok(collected)) => collected.to_bytes(),
-        Ok(Err(e)) if e.is::<LengthLimitError>() => {
-            return app.refuse(StatusCode::PAYLOAD_TOO_LARGE, "payload too large");
-        }
-        Ok(Err(_)) => return app.refuse(StatusCode::BAD_REQUEST, "bad request"),
-        Err(_) => return app.refuse(StatusCode::REQUEST_TIMEOUT, "request timeout"),
+    let body = match body::read(&app, &parts.headers, body, limit).await {
+        Ok(body) => body,
+        Err(response) => return response,
     };
     let req = Req {
         method: parts.method,
         path: parts.uri.path().to_owned(),
+        query: parts.uri.query().unwrap_or_default().to_owned(),
         headers: parts.headers,
         peer,
         body,
     };
     let worker = app.clone();
     match timeout(
-        ANSWER_WAIT,
+        wait,
         tokio::task::spawn_blocking(move || worker.handle(&req)),
     )
     .await
@@ -625,6 +647,7 @@ async fn answer(
 
 /// One connection: one request, one answer, and the close.
 async fn connection(stream: TcpStream, peer: SocketAddr, app: Arc<App>) {
+    let total = HEAD_WAIT + BODY_WAIT + app.answer_wait;
     let service = service_fn(move |request: Request<Incoming>| {
         let app = app.clone();
         async move { Ok::<_, Infallible>(answer(app, peer, request).await) }
@@ -638,7 +661,7 @@ async fn connection(stream: TcpStream, peer: SocketAddr, app: Arc<App>) {
         .max_header_size(HEAD_MAX)
         .max_buf_size(HEAD_MAX);
     let served = server.serve_connection(TokioIo::new(stream), service);
-    let _ = timeout(HEAD_WAIT + BODY_WAIT + ANSWER_WAIT, served).await;
+    let _ = timeout(total, served).await;
 }
 
 /// Binds the listener, serves until a signal asks for the stop, and stops.
@@ -694,6 +717,7 @@ async fn serve(address: SocketAddr, app: Arc<App>, log: &Log) -> Exit {
     };
     log.line(&format!("admin: stop: {cause}"));
     notify.stopping(log);
+    app.waf.iter().for_each(Waf::interrupt);
     drop(listener);
     let by = tokio::time::Instant::now() + STOP_WAIT;
     while timeout_at(by, conns.join_next())
@@ -717,7 +741,7 @@ pub fn run(path: &Path, log: &Log) -> Exit {
             return Exit::Usage;
         }
     };
-    let Some(admin) = loaded.admin else {
+    let Some(admin) = loaded.admin.clone() else {
         log.line("admin: configuration refused: there is no admin object");
         return Exit::Usage;
     };
@@ -746,7 +770,8 @@ pub fn run(path: &Path, log: &Log) -> Exit {
         log.line("admin: no random number is available for the request numbers");
         return Exit::Failed;
     };
-    let Some(app) = App::new(&admin, store, audit, ids, ITERATIONS) else {
+    let waf = Waf::from_config(&loaded, &admin, store.clone(), audit.clone());
+    let Some(app) = App::new(&admin, store, audit, ids, ITERATIONS, Some(waf)) else {
         log.line("admin: no random number is available");
         return Exit::Failed;
     };

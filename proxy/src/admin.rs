@@ -7,7 +7,9 @@
 //! runs, and the start and stop of the process), `auth` (the login with its limits, the session of a request, the
 //! change of a password), `session` (the sessions in memory), `password` (the rules for names and passwords, the
 //! hash, the random bytes), `users` (the user and the role, and the first user), `store` and `file_store` (where the
-//! users are kept: the trait and the directory of files), and `audit` (the audit log).
+//! users and the history of the switches are kept: the trait and the directory of files), `audit` (the audit log),
+//! and `waf` (the routes of the rules: the generations, their import, the switch of the proxy and the way back, the
+//! history and the records; the client of the control socket of the proxy is `waf::control`).
 //!
 //! The commands: `admin <config>` runs the process and writes its records as JSON, like the proxy; it does not start
 //! when `admin.mfa` is `required`, because there is no second factor yet (exit code 1). `admin bootstrap <config>
@@ -21,8 +23,9 @@
 //!
 //! The routes, each with the least role that may use it (`viewer`, then `operator`, then `owner`): `POST /api/login`
 //! (no session needed), `POST /api/logout` (viewer), `GET /api/session` (viewer), `PUT /api/account/password`
-//! (viewer) and `GET /api/audit` (operator). Every body is JSON of at most 64 KiB. A path that is not in the table is
-//! 404, a path with another method is 405.
+//! (viewer) and `GET /api/audit` (operator), and those of the rules, which `waf` lists. Every body is JSON of at most
+//! 64 KiB, the one of the import of a generation of at most 12 MiB. A path that is not in the table is 404, a path
+//! with another method is 405.
 //!
 //! Sessions are kept in memory only: when the process starts again, everybody logs in again.
 
@@ -34,6 +37,7 @@ pub mod server;
 pub mod session;
 pub mod store;
 pub mod users;
+pub mod waf;
 
 /// How a command of the admin process ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

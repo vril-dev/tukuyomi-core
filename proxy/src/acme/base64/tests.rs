@@ -30,3 +30,34 @@ fn a_pem_object_has_padding_and_lines_of_64_characters() {
     assert_eq!(lines[3], "BwcHBw==");
     assert!(long.ends_with("-----END TEST-----\n"));
 }
+
+#[test]
+fn the_standard_form_with_padding_is_read_back_and_each_value_has_one_text() {
+    for (plain, coded) in [
+        ("", ""),
+        ("f", "Zg=="),
+        ("fo", "Zm8="),
+        ("foo", "Zm9v"),
+        ("foob", "Zm9vYg=="),
+        ("fooba", "Zm9vYmE="),
+        ("foobar", "Zm9vYmFy"),
+    ] {
+        assert_eq!(decode(coded).as_deref(), Some(plain.as_bytes()), "{coded}");
+    }
+    assert_eq!(decode("+//+").unwrap(), [0xfb, 0xff, 0xfe]);
+    for bad in [
+        "Zg",
+        "Zg=",
+        "Zh==",
+        "Zm9=",
+        "Z===",
+        "Zm=v",
+        "Zg==Zm9v",
+        "Zm9v\n",
+        "Zm9 v",
+        "-_8=",
+        "Zm9vZg===",
+    ] {
+        assert_eq!(decode(bad), None, "{bad:?}");
+    }
+}

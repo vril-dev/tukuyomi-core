@@ -5,19 +5,24 @@
 //! uses (`hold`) for as long as it uses it. The commands change the store in this order: `stage` writes a bundle
 //! where the inspector can read it and takes the lock of the store, the caller tries the bundle, then `commit`
 //! makes it a generation or `discard` throws it away, and either gives the lock back. `activate` chooses a
-//! generation, `remove` deletes one that is neither chosen nor held, `list`, `verify`, `mode` and `routes` only read.
+//! generation, `activate_if_current` does so only if the chosen generation is the one the caller saw, `remove`
+//! deletes one that is neither chosen nor held, `list`, `verify`, `mode`, `routes` and `manifest` only read.
 
 use std::any::Any;
 use std::path::PathBuf;
 
 use crate::config::StoreConfig;
-use crate::rules::bundle::{Bundle, Fingerprint, Mode};
+use crate::rules::bundle::{Bundle, Fingerprint, Manifest, Mode};
 use crate::rules::file_store::FileStore;
 use crate::rules::routes::Routes;
 
 /// Why the rules store refused: a fixed English sentence, never a path or a value read from the store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreError(pub &'static str);
+
+/// Why `activate_if_current` refuses a generation that is not the one the caller saw as chosen.
+pub const NOT_EXPECTED: StoreError =
+    StoreError("the chosen generation is not the one that was expected");
 
 /// A bundle written for a trial, not yet a generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +82,14 @@ pub trait RuleStore {
     fn discard(&mut self) -> Result<(), StoreError>;
     /// Chooses a generation, after `verify`. A proxy that runs does not notice; one that starts later uses it.
     fn activate(&mut self, generation: Fingerprint) -> Result<(), StoreError>;
+    /// `activate`, but only if the chosen generation is `expect`: it is read and the generation is chosen under the
+    /// same lock, so a choice that another process made in between is not overwritten. Another choice, or none, is
+    /// refused with `NOT_EXPECTED`.
+    fn activate_if_current(
+        &mut self,
+        expect: Fingerprint,
+        generation: Fingerprint,
+    ) -> Result<(), StoreError>;
     /// The generations of the store, the oldest first. The lock is not needed.
     fn list(&self) -> Result<Vec<Generation>, StoreError>;
     /// Checks that the manifest of a generation is as its name says and that every file is as the manifest says.
@@ -84,6 +97,9 @@ pub trait RuleStore {
     /// The mode of a generation, from its manifest, which is read and checked as `verify` checks it. The files are
     /// not read.
     fn mode(&self, generation: Fingerprint) -> Result<Mode, StoreError>;
+    /// The manifest of a generation, read and checked as `verify` checks it: the files it lists with their sizes and
+    /// digests, the order they are loaded in, the mode and the routes. The files are not read.
+    fn manifest(&self, generation: Fingerprint) -> Result<Manifest, StoreError>;
     /// The routes of a generation, from its manifest, which is read and checked as `verify` checks it. The files are
     /// not read. The manifest of a generation is the very bytes its name says, so this and `mode` read the same
     /// manifest.

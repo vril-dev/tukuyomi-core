@@ -403,3 +403,132 @@ fn the_bundle_needs_a_rule_file_and_keeps_its_names_and_limits() {
     };
     assert_eq!(refused(&inputs), "the input files add up to over 8 MiB");
 }
+
+fn upload(name: &str, data: &[u8]) -> Upload {
+    Upload {
+        name: name.to_owned(),
+        data: data.to_vec(),
+    }
+}
+
+fn refused_upload(uploads: Uploads) -> &'static str {
+    match collect_uploads(uploads) {
+        Err(e) => e.reason,
+        Ok(_) => panic!("accepted"),
+    }
+}
+
+fn rules_upload(name: &str, data: &[u8]) -> Uploads {
+    Uploads {
+        rules: vec![upload(name, data)],
+        ..Uploads::default()
+    }
+}
+
+#[test]
+fn uploaded_files_make_the_bundle_that_the_same_files_on_disk_make() {
+    let root = scratch();
+    let crs_dir = crs(&root);
+    let routes = br#"[{"host":"admin.example.test","path":"/api/generations","action":"bypass"}]"#;
+    let on_disk = collect(&Inputs {
+        crs: Some(crs_dir.clone()),
+        crs_off: vec!["B-second.conf".into()],
+        rules: vec![root.put("mine/a.conf", b"a\n")],
+        data: vec![root.put("mine/list.data", b"one\n")],
+        mode: Mode::Detect,
+        routes: Some(root.put("mine/routes.json", routes)),
+    })
+    .unwrap();
+    let uploaded = collect_uploads(Uploads {
+        crs: Some(crs_dir),
+        crs_off: vec!["B-second.conf".into()],
+        rules: vec![upload("a.conf", b"a\n")],
+        data: vec![upload("list.data", b"one\n")],
+        mode: Mode::Detect,
+        routes: Some(routes.to_vec()),
+    })
+    .unwrap();
+    assert_eq!(uploaded.fingerprint(), on_disk.fingerprint());
+}
+
+#[test]
+fn an_uploaded_name_is_one_name_below_rules_and_the_limits_of_the_files_hold() {
+    let name = "the name of an input file is not a name in a bundle";
+    for bad in [
+        "sub/a.conf",
+        "../a.conf",
+        "/etc/a.conf",
+        ".a.conf",
+        "",
+        "a b.conf",
+    ] {
+        assert_eq!(refused_upload(rules_upload(bad, b"a\n")), name, "{bad:?}");
+    }
+    // 2 MiB is the most for a file; one byte more is refused.
+    let at_limit = vec![b'x'; 2 << 20];
+    assert!(collect_uploads(rules_upload("big.conf", &at_limit)).is_ok());
+    let over = vec![b'x'; (2 << 20) + 1];
+    assert_eq!(
+        refused_upload(rules_upload("big.conf", &over)),
+        "an input file is over 2 MiB"
+    );
+    // The files add up to 8 MiB at the most.
+    let mut many = rules_upload("a.conf", &at_limit);
+    many.data = (0..4)
+        .map(|i| upload(&format!("d{i}.data"), &at_limit))
+        .collect();
+    assert_eq!(refused_upload(many), "the input files add up to over 8 MiB");
+    // 128 files, and not 129.
+    let files = |n: usize| Uploads {
+        rules: (0..n)
+            .map(|i| upload(&format!("f{i}.conf"), b"a\n"))
+            .collect(),
+        ..Uploads::default()
+    };
+    assert!(collect_uploads(files(128)).is_ok());
+    assert_eq!(
+        refused_upload(files(129)),
+        "the bundle would have more than 128 files"
+    );
+}
+
+#[test]
+fn uploads_that_name_nothing_to_load_or_the_same_name_twice_or_a_wrong_routes_file_are_refused() {
+    let mut twice = rules_upload("a.conf", b"a\n");
+    twice.data = vec![upload("a.conf", b"one\n")];
+    assert_eq!(
+        refused_upload(twice),
+        "two input files have the same name in the bundle"
+    );
+    let data_only = Uploads {
+        data: vec![upload("list.data", b"one\n")],
+        ..Uploads::default()
+    };
+    assert_eq!(
+        refused_upload(data_only),
+        "no rule file is given: name a CRS or a rule file"
+    );
+    let mut off = rules_upload("a.conf", b"a\n");
+    off.crs_off = vec!["A-first.conf".into()];
+    assert_eq!(
+        refused_upload(off),
+        "a file of the CRS is turned off but no CRS is given"
+    );
+    // A refusal of the CRS names the last part of the path of what is wrong, not where the directory is.
+    let root = scratch();
+    let crs_dir = crs(&root);
+    root.put("crs/plugins/x.conf", b"x\n");
+    let mut with_crs = rules_upload("a.conf", b"a\n");
+    with_crs.crs = Some(crs_dir);
+    let e = collect_uploads(with_crs).unwrap_err();
+    assert_eq!(
+        e.reason,
+        "the CRS directory holds an entry that is not part of it"
+    );
+    assert_eq!(e.subject, Some("plugins".into()));
+    let mut routes = rules_upload("a.conf", b"a\n");
+    routes.routes = Some(b"[]".to_vec());
+    let e = collect_uploads(routes).unwrap_err();
+    assert_eq!(e.reason, "the routes file has no route");
+    assert_eq!(e.subject, Some("routes".into()));
+}

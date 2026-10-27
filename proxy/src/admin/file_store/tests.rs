@@ -1,9 +1,12 @@
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::SystemTime;
 
 use super::*;
 use crate::admin::password::Hash;
 use crate::admin::users::Role;
+use crate::admin::waf::history::{Ended, Kind};
+use crate::rules::bundle::Fingerprint;
 
 /// A fresh 0700 directory under the temp directory, removed with everything in it when dropped.
 pub(crate) struct TestDir(PathBuf);
@@ -123,4 +126,49 @@ fn a_write_waits_for_nobody_and_is_refused_while_another_process_holds_the_lock(
     store
         .create_first(&user("alice", "first password", 1))
         .unwrap();
+}
+
+fn activation(actor: &str, result: Ended) -> Activation {
+    let (from, to) = (Fingerprint::of(b"a"), Fingerprint::of(b"b"));
+    Activation::new(SystemTime::now(), actor, (from, to), Kind::Activate, result)
+}
+
+#[test]
+fn the_history_is_appended_whole_and_read_back_newest_first() {
+    let dir = scratch();
+    let store = FileAdminStore::open(dir.path()).unwrap();
+    assert!(store.activations(10).unwrap().is_empty());
+    for (i, ended) in [Ended::Switched, Ended::Refused, Ended::Failed]
+        .into_iter()
+        .enumerate()
+    {
+        store
+            .record_activation(&activation(&format!("user{i}"), ended))
+            .unwrap();
+    }
+    let file = dir.path().join("activations.log");
+    assert_eq!(mode_of(&file), 0o600);
+    let newest = store.activations(2).unwrap();
+    let actors: Vec<&str> = newest.iter().map(|a| a.actor.as_str()).collect();
+    assert_eq!(actors, ["user2", "user1"]);
+    // A line that a crash cut off is left out, and the next line starts a line of its own.
+    let mut text = fs::read(&file).unwrap();
+    text.extend_from_slice(b"{\"ts\":\"cut");
+    fs::write(&file, text).unwrap();
+    assert_eq!(store.activations(10).unwrap().len(), 3);
+    store
+        .record_activation(&activation("user3", Ended::Switched))
+        .unwrap();
+    let all = store.activations(10).unwrap();
+    assert_eq!(all.len(), 4);
+    assert_eq!(all[0].actor, "user3");
+    // A link in the place of the file is not followed.
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("elsewhere"), &file).unwrap();
+    assert!(
+        store
+            .record_activation(&activation("user4", Ended::Failed))
+            .is_err()
+    );
+    assert!(store.activations(10).is_err());
 }
