@@ -14,7 +14,9 @@ use super::signals::{Event, Signals, Waits};
 use super::status::{self, Readiness, View};
 use super::stop::{Cause, stop};
 use super::{EXIT_FAILED, control};
-use crate::config::{AdminConfig, ForwardConfig, ProxyConfig, StatusConfig, addresses};
+use crate::config::{
+    AdminConfig, ForwardConfig, PolicyConfig, ProxyConfig, StatusConfig, addresses,
+};
 use crate::forward::group::Upstreams;
 use crate::inbound::challenge::Challenge;
 use crate::inbound::conn::Ctx;
@@ -24,6 +26,7 @@ use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::{self, Driver, Ingress, Limits, Msg};
 use crate::log::Log;
 use crate::log::counters::{Counters, SwitchResult};
+use crate::policy::RateLimit;
 use crate::rules::bundle::{Fingerprint, Mode};
 use crate::rules::routes::{Routes, SharedRoutes};
 use crate::rules::switch::Switcher;
@@ -46,6 +49,7 @@ pub(super) async fn run(
     ids: RequestIds,
     status: Option<StatusConfig>,
     admin: Option<AdminConfig>,
+    policy: PolicyConfig,
     log: Log,
 ) -> u8 {
     let signals = match Signals::install() {
@@ -124,6 +128,8 @@ pub(super) async fn run(
         challenge,
         ids,
         counters: Counters::start(),
+        access: policy.access,
+        rate_limit: policy.rate_limit.as_ref().map(RateLimit::new),
     });
     let readiness = Arc::new(Readiness::new());
     if let Some(bound) = control_socket {

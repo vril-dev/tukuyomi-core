@@ -39,12 +39,18 @@ fn who() -> Who {
     Who {
         name: "ola".to_owned(),
         role: Role::Operator,
+        auth: None,
         cookie: String::new(),
         csrf: String::new(),
         handle: "ab12cd34".to_owned(),
         changed: 1,
         idle_left: Duration::ZERO,
         total_left: Duration::ZERO,
+        pending: false,
+        must_change: false,
+        setup_needed: false,
+        mfa: false,
+        recovery_left: 0,
     }
 }
 

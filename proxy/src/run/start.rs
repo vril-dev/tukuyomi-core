@@ -1,6 +1,7 @@
 //! The start of the process, before the runtime runs: the arguments, which of the short commands (`rules`, `acme`,
-//! `config`) the process is, whether it is the admin process or its command `admin bootstrap` (see `admin`), and
-//! the steps from the configuration to the kernel configuration (`prepare`), which `config check` runs as well.
+//! `config`) the process is, whether it is the admin process or one of its commands `admin bootstrap` and `admin
+//! reset` (see `admin`), and the steps from the configuration to the kernel configuration (`prepare`), which
+//! `config check` runs as well.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -11,7 +12,8 @@ use super::serve::run;
 use crate::acme;
 use crate::admin;
 use crate::config::{
-    self, AdminConfig, ForwardConfig, ProxyConfig, RecordsConfig, StatusConfig, addresses,
+    self, AdminConfig, ForwardConfig, PolicyConfig, ProxyConfig, RecordsConfig, StatusConfig,
+    addresses,
 };
 use crate::forward::resolve;
 use crate::inbound::challenge::Challenge;
@@ -29,9 +31,10 @@ pub(super) const EXIT_OK: u8 = 0;
 pub const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const CHECK_USAGE: &str = "usage: tukuyomi-proxy config check <config>";
-const ADMIN_USAGE: [&str; 2] = [
+const ADMIN_USAGE: [&str; 3] = [
     "usage: tukuyomi-proxy admin <config>",
     "       tukuyomi-proxy admin bootstrap <config> <name>",
+    "       tukuyomi-proxy admin reset <config> <name>",
 ];
 
 /// Everything before the runtime runs, then the runtime. Returns the exit code.
@@ -91,6 +94,7 @@ pub fn start(log: &Log) -> u8 {
         status,
         records,
         admin,
+        policy,
     } = match prepare(&path, "start", log) {
         Ok(prepared) => prepared,
         Err(code) => return code,
@@ -135,6 +139,7 @@ pub fn start(log: &Log) -> u8 {
         ids,
         status,
         admin,
+        policy,
         log.clone(),
     ))
 }
@@ -157,6 +162,8 @@ struct Prepared {
     records: Option<RecordsConfig>,
     /// The admin process settings, if the configuration has them; the proxy binds its control socket.
     admin: Option<AdminConfig>,
+    /// The `access` and the `rate_limit` of the configuration.
+    policy: PolicyConfig,
 }
 
 /// The steps of start-up from the configuration to the kernel configuration of the chosen generation, the hold on it
@@ -270,6 +277,7 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         status: loaded.status,
         records: loaded.records,
         admin: loaded.admin,
+        policy: loaded.policy,
     })
 }
 
@@ -304,9 +312,11 @@ enum AdminArgs {
     Run(PathBuf),
     /// The first user, with the configuration file and the name.
     Bootstrap { config: PathBuf, name: String },
+    /// The new password of a user, with the configuration file and the name.
+    Reset { config: PathBuf, name: String },
 }
 
-/// The arguments after `admin`: one absolute clean path, or `bootstrap`, one such path and a name.
+/// The arguments after `admin`: one absolute clean path, or `bootstrap` or `reset`, one such path and a name.
 fn admin_args(args: &[OsString]) -> Result<AdminArgs, &'static str> {
     let path = |arg: &OsString| {
         if config::clean_abs(Path::new(arg)) {
@@ -323,6 +333,13 @@ fn admin_args(args: &[OsString]) -> Result<AdminArgs, &'static str> {
                 name: name.to_str().ok_or("the name is not text")?.to_owned(),
             }),
             _ => Err("bootstrap takes the configuration file and a name"),
+        },
+        [first, rest @ ..] if first == "reset" => match rest {
+            [config, name] => Ok(AdminArgs::Reset {
+                config: path(config)?,
+                name: name.to_str().ok_or("the name is not text")?.to_owned(),
+            }),
+            _ => Err("reset takes the configuration file and a name"),
         },
         [config] => Ok(AdminArgs::Run(path(config)?)),
         _ => Err("admin takes one argument, the configuration file"),
@@ -342,6 +359,9 @@ fn admin_command(args: &[OsString], log: &Log) -> u8 {
         Ok(AdminArgs::Run(path)) => admin::server::run(&path, log),
         Ok(AdminArgs::Bootstrap { config, name }) => {
             admin::users::bootstrap(&config, &name, &mut io::stdin().lock(), log)
+        }
+        Ok(AdminArgs::Reset { config, name }) => {
+            admin::users::reset(&config, &name, &mut io::stdin().lock(), log)
         }
     };
     match exit {

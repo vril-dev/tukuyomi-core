@@ -136,7 +136,9 @@ impl Drop for TestDir {
 
 /// A new 0700 root for one test, under `TUKUYOMI_TEST_TMP`. Its name has the process id and the test name, so
 /// earlier runs do not meet. The end of a test removes it, and fails if it holds anything but the configuration.
-/// A test that fails leaves nothing in `TUKUYOMI_TEST_TMP`: the guard removes the root with what it holds.
+/// A test that fails leaves nothing in `TUKUYOMI_TEST_TMP`: the guard removes the root with what it holds. A test
+/// that has a control socket (`ctl/c.sock` in its root) has a short name, because the path of a socket is 107 bytes
+/// at most: it is `TUKUYOMI_TEST_TMP`, the name, a process id of up to 7 digits and 13 more bytes.
 fn make_root(test: &str) -> TestDir {
     let root =
         PathBuf::from(var("TUKUYOMI_TEST_TMP")).join(format!("{test}-{}", std::process::id()));

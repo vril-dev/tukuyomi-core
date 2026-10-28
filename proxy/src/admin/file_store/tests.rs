@@ -3,12 +3,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 
 use super::*;
+use crate::admin::auth::tokens::{Token, mint};
 use crate::admin::password::Hash;
 use crate::admin::users::Role;
 use crate::admin::waf::history::{Ended, Kind};
 use crate::rules::bundle::Fingerprint;
 
-/// A fresh 0700 directory under the temp directory, removed with everything in it when dropped.
+/// A fresh 0700 directory under the temp directory, removed with everything in it when dropped. Its name is short:
+/// a socket of the tests is in it, and the path of a socket is at most 107 bytes.
 pub(crate) struct TestDir(PathBuf);
 
 impl TestDir {
@@ -27,7 +29,7 @@ impl Drop for TestDir {
 pub(crate) fn scratch() -> TestDir {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "tukuyomi-proxy-admin-{}-{}",
+        "admin-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
@@ -52,6 +54,7 @@ fn the_store_makes_its_directories_and_refuses_a_directory_that_others_can_reach
     let dir = scratch();
     FileAdminStore::open(dir.path()).unwrap();
     assert_eq!(mode_of(&dir.path().join("users")), 0o700);
+    assert_eq!(mode_of(&dir.path().join("tokens")), 0o700);
     assert_eq!(mode_of(&dir.path().join("audit")), 0o700);
     // Opened again, it takes what is there.
     FileAdminStore::open(dir.path()).unwrap();
@@ -126,6 +129,100 @@ fn a_write_waits_for_nobody_and_is_refused_while_another_process_holds_the_lock(
     store
         .create_first(&user("alice", "first password", 1))
         .unwrap();
+}
+
+#[test]
+fn a_second_admin_process_does_not_get_the_store_and_the_commands_need_no_lock_of_the_process() {
+    let dir = scratch();
+    let first = FileAdminStore::open_exclusive(dir.path()).unwrap();
+    assert_eq!(mode_of(&dir.path().join("process.lock")), 0o600);
+    assert_eq!(
+        FileAdminStore::open_exclusive(dir.path()).err(),
+        Some(IN_USE)
+    );
+    // A command opens the store and writes to it while the admin process holds it, and the process writes as well.
+    let command = FileAdminStore::open(dir.path()).unwrap();
+    command
+        .create_first(&user("alice", "first password", 1))
+        .unwrap();
+    first
+        .replace(1, &user("alice", "second password", 2))
+        .unwrap();
+    // The lock ends with the store.
+    drop(first);
+    FileAdminStore::open_exclusive(dir.path()).unwrap();
+}
+
+#[test]
+fn a_user_is_made_once_and_listed() {
+    let dir = scratch();
+    let store = FileAdminStore::open(dir.path()).unwrap();
+    store.create(&user("alice", "first password", 10)).unwrap();
+    assert_eq!(
+        store.create(&user("alice", "other password", 11)),
+        Err(EXISTS)
+    );
+    assert!(
+        store
+            .create(&user("../alice", "other password", 11))
+            .is_err()
+    );
+    store.create(&user("bob", "second password", 12)).unwrap();
+    assert_eq!(store.user("alice").unwrap().unwrap().changed, 10);
+    let mut names: Vec<String> = store.users().unwrap().into_iter().map(|u| u.name).collect();
+    names.sort();
+    assert_eq!(names, ["alice", "bob"]);
+}
+
+fn token(owner: &str, role: Role) -> Token {
+    mint(owner, role, "test", 10, 1).unwrap().1
+}
+
+#[test]
+fn tokens_are_kept_touched_when_they_are_there_and_removed_by_owner_and_role() {
+    let dir = scratch();
+    let store = FileAdminStore::open(dir.path()).unwrap();
+    let (first, second, third) = (
+        token("alice", Role::Operator),
+        token("alice", Role::Viewer),
+        token("bob", Role::Operator),
+    );
+    for token in [&first, &second, &third] {
+        store.create_token(token).unwrap();
+    }
+    assert_eq!(store.create_token(&first), Err(EXISTS));
+    assert_eq!(
+        mode_of(&dir.path().join("tokens").join(format!("{}.json", first.id))),
+        0o600
+    );
+    assert_eq!(store.tokens().unwrap().len(), 3);
+    assert_eq!(store.token(&first.id).unwrap(), Some(first.clone()));
+    assert_eq!(store.token("../users/alice").unwrap(), None);
+    // The time of use goes forward only, and a token that is gone is not made again by it.
+    store.touch_token(&first.id, 500).unwrap();
+    store.touch_token(&first.id, 400).unwrap();
+    assert_eq!(store.token(&first.id).unwrap().unwrap().last_used, 500);
+    assert!(store.remove_token(&third.id).unwrap());
+    store.touch_token(&third.id, 600).unwrap();
+    assert_eq!(store.token(&third.id).unwrap(), None);
+    assert!(!store.remove_token(&third.id).unwrap());
+    // The tokens of an owner above a role, then all of them.
+    assert_eq!(store.remove_tokens("alice", Some(Role::Viewer)).unwrap(), 1);
+    assert_eq!(store.token(&first.id).unwrap(), None);
+    assert!(store.token(&second.id).unwrap().is_some());
+    assert_eq!(store.remove_tokens("alice", None).unwrap(), 1);
+    assert!(store.tokens().unwrap().is_empty());
+    // A file that is not a token is left out of the list and refused when it is asked for by its id; a name that is
+    // no id is not looked at.
+    let broken = "0123456789abcdef";
+    fs::write(
+        dir.path().join("tokens").join(format!("{broken}.json")),
+        b"{",
+    )
+    .unwrap();
+    fs::write(dir.path().join("tokens").join("notes.json"), b"{}").unwrap();
+    assert!(store.tokens().unwrap().is_empty());
+    assert!(store.token(broken).is_err());
 }
 
 fn activation(actor: &str, result: Ended) -> Activation {

@@ -6,9 +6,10 @@
 //! counts from the accept), and the rest is the same over the TLS stream, unless the handshake chose `h2` as the
 //! protocol, which is then spoken (see `http2`); a handshake that fails or is not done in time ends the connection
 //! with one record and no more. On a listener that redirects to https the first head is read as
-//! everywhere else, and then it is answered with the redirect, or with 404, without hyper, the inspection or the
-//! upstream, and without reading its body (see `http1::redirect_to`). A plain listener and a listener that redirects
-//! first answer a request for the challenge of the CA that issues the certificates with `acme` (see `challenge`).
+//! everywhere else, and then it is answered with the redirect, or with 404, or with 403 or 429 when the policy of
+//! the configuration turns the client away, without hyper, the inspection or the upstream, and without reading its
+//! body (see `http1::redirect_to`). A plain listener and a listener that redirects first answer a request for the
+//! challenge of the CA that issues the certificates with `acme` (see `challenge`).
 //!
 //! Every answer that is written to a client has a record of the type `request`, written when the response has been
 //! given to the connection or was cut off, and has a number (`RequestIds`) that the record and the response (in an

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use tukuyomi_kernel::Reason;
 
 use super::*;
-use crate::log::counters::RuleHit;
+use crate::log::counters::{Policy, RuleHit};
 use crate::rules::bundle::{Fingerprint, Mode};
 
 fn scrape<'a>(counters: &'a Counters, groups: Vec<(&'a str, u64)>) -> Scrape<'a> {
@@ -20,6 +20,8 @@ fn scrape<'a>(counters: &'a Counters, groups: Vec<(&'a str, u64)>) -> Scrape<'a>
         body_buffer_bytes: 4096,
         inspections_waiting: 1,
         upstream_failures: groups,
+        rate_limit_keys: 12,
+        rate_limit_evicted: 13,
         records_dropped: 7,
         record_write_errors: 8,
         record_file_errors: 9,
@@ -48,6 +50,7 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
     counters.add_request("blocked");
     counters.add_rule_hit(RuleHit::Block);
     counters.add_uninspectable(Reason::InspectorLost);
+    counters.add_policy_refusal(Policy::Access);
     counters.accepted.add();
     let text = render(&scrape(&counters, vec![("main", 0), ("api", 2)]));
 
@@ -70,8 +73,8 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
             samples += 1;
         }
     }
-    assert_eq!(families.len(), 19);
-    assert!(samples >= 19, "{samples}");
+    assert_eq!(families.len(), 22);
+    assert!(samples >= 22, "{samples}");
 
     for line in [
         "tukuyomi_requests_total{class=\"forwarded\"} 1",
@@ -79,6 +82,10 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
         "tukuyomi_requests_total{class=\"closed\"} 0",
         "tukuyomi_waf_rule_hits_total{decision=\"block\"} 1",
         "tukuyomi_uninspectable_total{reason=\"inspector_lost\"} 1",
+        "tukuyomi_policy_refusals_total{policy=\"access\"} 1",
+        "tukuyomi_policy_refusals_total{policy=\"rate_limit\"} 0",
+        "tukuyomi_rate_limit_keys 12",
+        "tukuyomi_rate_limit_evicted_total 13",
         "tukuyomi_connections_accepted_total 1",
         "tukuyomi_connections_open 2",
         "tukuyomi_connection_permit_waits_total 5",

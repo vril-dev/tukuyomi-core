@@ -1,4 +1,5 @@
 use std::future::poll_fn;
+use std::io;
 use std::io::Write;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -249,6 +250,8 @@ impl Rig {
             challenge: None,
             ids: RequestIds::new().unwrap(),
             counters: Counters::start(),
+            access: Access::default(),
+            rate_limit: None,
         });
         let (driver, full) = match mode {
             Mode::Answer(outcome) => (Some(driver(rx, Some(outcome))), None),
@@ -1271,5 +1274,193 @@ fn a_request_is_not_judged_by_the_other_routes_when_no_route_has_an_access_list(
         let got = spelled_all(&forward, "app.test", &targets).await;
         assert_eq!(got, vec![(403, 1); targets.len()]);
         assert_eq!(spelled(&forward, "open..test", "/x").await, (403, 1));
+    });
+}
+
+// ---- the policy of the configuration: the access and the rate limit ----
+
+use crate::config::RateLimitConfig;
+
+impl Rig {
+    /// The same rig, with this `access` and this `rate_limit` in force.
+    pub(in crate::inbound) fn with_policy(
+        mut self,
+        access: Access,
+        rate_limit: Option<RateLimit>,
+    ) -> Rig {
+        let ctx = Arc::get_mut(&mut self.ctx).expect("no connection has started");
+        ctx.access = access;
+        ctx.rate_limit = rate_limit;
+        self
+    }
+}
+
+fn nets(list: &[&str]) -> Vec<Cidr> {
+    list.iter().map(|net| Cidr::parse(net).unwrap()).collect()
+}
+
+/// A POST from the loopback address, when the `access` of the configuration has the networks `deny` and `allow`,
+/// `trusted` are the networks of `trusted_proxies` and the request has the extra fields `extra`: the status of the
+/// answer, and the number of tickets the driver got. The driver blocks every ticket with 403, so a request that is
+/// inspected is told from one that is turned away by its ticket.
+async fn policed_post(
+    deny: &[&str],
+    allow: &[&str],
+    trusted: &[&str],
+    extra: &str,
+) -> (u16, usize) {
+    let cfg = ProxyConfig {
+        trusted_proxies: nets(trusted),
+        ..config()
+    };
+    let access = Access::new(nets(deny), nets(allow));
+    let rig = Rig::new(cfg, Mode::Answer(BLOCK))
+        .await
+        .with_policy(access, None);
+    let (client, task) = rig.connect().await;
+    put(
+        &client,
+        &form_post(&format!("{extra}Content-Length: 3\r\n\r\na=b")),
+    )
+    .await;
+    let response = parse_response(&read_all(&client).await);
+    drop(client);
+    (response.status, rig.finish(task).await.len())
+}
+
+#[test]
+fn a_client_that_the_access_of_the_configuration_turns_away_gets_403_before_the_body_is_read() {
+    run(async {
+        // In both lists, outside the allow list: turned away. In neither: inspected.
+        assert_eq!(
+            policed_post(&["127.0.0.0/8"], &["127.0.0.0/8"], &[], "").await,
+            (403, 0)
+        );
+        assert_eq!(policed_post(&[], &["10.0.0.0/8"], &[], "").await, (403, 0));
+        assert_eq!(
+            policed_post(&["10.0.0.0/8"], &["127.0.0.0/8"], &[], "").await,
+            (403, 1)
+        );
+        // The address that a trusted peer names decides; the one that a peer that is not trusted names does not.
+        let named = "X-Forwarded-For: 10.1.2.3\r\n";
+        let trusted = ["127.0.0.0/8"];
+        assert_eq!(
+            policed_post(&["10.0.0.0/8"], &[], &trusted, named).await,
+            (403, 0)
+        );
+        assert_eq!(
+            policed_post(&[], &["10.0.0.0/8"], &trusted, named).await,
+            (403, 1)
+        );
+        assert_eq!(
+            policed_post(&["10.0.0.0/8"], &[], &[], named).await,
+            (403, 1)
+        );
+        assert_eq!(
+            policed_post(&[], &["10.0.0.0/8"], &[], named).await,
+            (403, 0)
+        );
+    });
+}
+
+#[test]
+fn a_client_over_the_rate_limit_gets_429_with_retry_after_and_a_body_that_is_not_read_closes_the_connection()
+ {
+    run(async {
+        // One request a second and none beyond it, from the one loopback client. Connections are kept, so that only
+        // an unread body closes one.
+        let cfg = ProxyConfig {
+            keepalive_timeout: Duration::from_secs(5),
+            ..config()
+        };
+        let limit = RateLimit::new(&RateLimitConfig {
+            rate: 1,
+            burst: 0,
+            keys: 1024,
+            exempt: Vec::new(),
+        });
+        let rig = Rig::new(cfg, Mode::Answer(BLOCK))
+            .await
+            .with_policy(Access::default(), Some(limit));
+        let lines = rig.lines.clone();
+        let get = b"GET /a HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n";
+
+        // The first request is inspected (and blocked by the driver of the test).
+        let (client, first) = rig.connect().await;
+        put(&client, get).await;
+        assert_eq!(parse_response(&read_all(&client).await).status, 403);
+        first.await.unwrap();
+
+        // The second is turned away at once.
+        let (client, second) = rig.connect().await;
+        put(&client, get).await;
+        let response = parse_response(&read_all(&client).await);
+        assert_eq!(response.status, 429);
+        assert_eq!(response.all("retry-after"), ["1"]);
+        assert_eq!(response.all("content-length"), ["0"]);
+        second.await.unwrap();
+
+        // A request with a body is turned away before the body is read, and the connection is closed after the
+        // answer, though the client does not close it.
+        let (client, third) = rig.connect().await;
+        put(&client, &form_post("Content-Length: 3\r\n\r\na=b")).await;
+        let response = parse_response(&read_all(&client).await);
+        assert_eq!(response.status, 429);
+        assert_eq!(response.all("retry-after"), ["1"]);
+        assert_eq!(response.all("connection"), ["close"]);
+
+        let counters = &rig.ctx.counters;
+        assert_eq!(
+            counters.policy_refusals.samples(),
+            [("access", 0), ("rate_limit", 2)]
+        );
+        assert_eq!(rig.ctx.rate_limit.as_ref().map(RateLimit::keys), Some(1));
+        let seen = rig.finish(third).await;
+        assert_eq!(seen.len(), 1);
+        let refused = lines
+            .take()
+            .into_iter()
+            .filter(|record| record["status"] == 429)
+            .map(|record| (record["class"].clone(), record["reason"].clone()))
+            .collect::<Vec<_>>();
+        let want = (
+            serde_json::json!("rejected"),
+            serde_json::json!("too many requests"),
+        );
+        assert_eq!(refused, [want.clone(), want]);
+    });
+}
+
+#[test]
+fn a_request_the_access_of_the_configuration_turns_away_is_recorded_as_rejected_and_counted() {
+    run(async {
+        let access = Access::new(nets(&["127.0.0.0/8"]), Vec::new());
+        let rig = Rig::new(config(), Mode::Answer(BLOCK))
+            .await
+            .with_policy(access, None);
+        let lines = rig.lines.clone();
+        let ctx = rig.ctx.clone();
+        let (client, task) = rig.connect().await;
+        put(&client, b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n").await;
+        assert_eq!(parse_response(&read_all(&client).await).status, 403);
+        drop(client);
+        assert!(rig.finish(task).await.is_empty());
+        assert_eq!(
+            ctx.counters.policy_refusals.samples(),
+            [("access", 1), ("rate_limit", 0)]
+        );
+        let reasons: Vec<_> = lines
+            .take()
+            .into_iter()
+            .filter(|record| record["type"] == "request")
+            .map(|record| (record["class"].clone(), record["reason"].clone()))
+            .collect();
+        assert_eq!(
+            reasons,
+            [(
+                serde_json::json!("rejected"),
+                serde_json::json!("denied by access")
+            )]
+        );
     });
 }

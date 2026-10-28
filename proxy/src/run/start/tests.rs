@@ -25,7 +25,7 @@ fn config_check_refuses_a_wrong_argument_with_exit_code_2() {
 }
 
 #[test]
-fn admin_takes_a_configuration_file_or_bootstrap_with_a_file_and_a_name() {
+fn admin_takes_a_configuration_file_or_bootstrap_or_reset_with_a_file_and_a_name() {
     let path = |text: &str| PathBuf::from(text);
     assert_eq!(
         admin_args(&os_args(&["/etc/a.json"])),
@@ -38,7 +38,14 @@ fn admin_takes_a_configuration_file_or_bootstrap_with_a_file_and_a_name() {
             name: "alice".to_owned()
         })
     );
-    let wrong: [&[&str]; 7] = [
+    assert_eq!(
+        admin_args(&os_args(&["reset", "/etc/a.json", "alice"])),
+        Ok(AdminArgs::Reset {
+            config: path("/etc/a.json"),
+            name: "alice".to_owned()
+        })
+    );
+    let wrong: [&[&str]; 10] = [
         &[],
         &["etc/a.json"],
         &["/etc/a.json", "/etc/b.json"],
@@ -46,6 +53,9 @@ fn admin_takes_a_configuration_file_or_bootstrap_with_a_file_and_a_name() {
         &["bootstrap", "/etc/a.json"],
         &["bootstrap", "etc/a.json", "alice"],
         &["bootstrap", "/etc/a.json", "alice", "bob"],
+        &["reset"],
+        &["reset", "/etc/a.json"],
+        &["reset", "etc/a.json", "alice"],
     ];
     for list in wrong {
         assert!(admin_args(&os_args(list)).is_err(), "{list:?}");

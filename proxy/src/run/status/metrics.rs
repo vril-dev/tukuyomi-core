@@ -3,8 +3,8 @@
 //! A family is written once: its `# HELP` line, its `# TYPE` line and then all its samples, one after another. The
 //! label values come from fixed lists or are the names of the upstream groups of the configuration, never a value of
 //! a request, and they are written with `\`, `"` and the line feed escaped. The counters are those of `Counters`; the
-//! numbers that fall as well as rise are given by the caller, who reads them from `Counters`, the permits and the
-//! configuration when the page is asked for. Every counter starts at 0 when the process starts.
+//! numbers that fall as well as rise are given by the caller, who reads them from `Counters`, the permits, the rate
+//! limit and the configuration when the page is asked for. Every counter starts at 0 when the process starts.
 
 use std::fmt::{Display, Write as _};
 
@@ -28,6 +28,9 @@ pub(super) struct Scrape<'a> {
     pub(super) inspections_waiting: usize,
     /// The name of each upstream group and its failures.
     pub(super) upstream_failures: Vec<(&'a str, u64)>,
+    /// The clients that the rate limit counts, and those it dropped to make room; both 0 without a rate limit.
+    pub(super) rate_limit_keys: usize,
+    pub(super) rate_limit_evicted: u64,
     pub(super) records_dropped: u64,
     pub(super) record_write_errors: u64,
     pub(super) record_file_errors: u64,
@@ -107,6 +110,24 @@ pub(super) fn render(scrape: &Scrape<'_>) -> String {
         "Requests that could not be inspected, by the reason the kernel gave.",
         "reason",
         &counters.uninspectable.samples(),
+    );
+    page.labelled(
+        "tukuyomi_policy_refusals_total",
+        "Requests turned away before their route was looked for, by what turned them away.",
+        "policy",
+        &counters.policy_refusals.samples(),
+    );
+    page.single(
+        "tukuyomi_rate_limit_keys",
+        "gauge",
+        "Clients that the rate limit counts now.",
+        scrape.rate_limit_keys,
+    );
+    page.single(
+        "tukuyomi_rate_limit_evicted_total",
+        "counter",
+        "Clients dropped from the rate limit to make room while their count was still in force.",
+        scrape.rate_limit_evicted,
     );
     page.single(
         "tukuyomi_connections_accepted_total",

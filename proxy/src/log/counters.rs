@@ -7,7 +7,10 @@
 //! it starts and lowers it when it ends, however it ends. The other numbers that fall as well as rise (the bytes of
 //! the byte budget in use, the inspections that wait) are not kept here: they are read from the permits and the
 //! configuration when the page is asked for. The counts of the upstream groups are kept by the groups
-//! (`forward::group`), and the numbers of the records that were dropped or not written by the logger (`Log`).
+//! (`forward::group`), and the numbers of the records that were dropped or not written by the logger (`Log`). The
+//! requests that the access list or the rate limit of the configuration turned away are counted where they are turned
+//! away (`policy`), and the clients that the rate limit counts, and those it dropped for lack of room, are read
+//! from it when the page is asked for (`policy::rate`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -70,6 +73,24 @@ impl RuleHit {
         match self {
             RuleHit::Block => "block",
             RuleHit::Detect => "detect",
+        }
+    }
+}
+
+/// What turned a request away before its route was looked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    /// The `access` of the configuration.
+    Access,
+    /// The `rate_limit` of the configuration.
+    RateLimit,
+}
+
+impl Policy {
+    fn label(self) -> &'static str {
+        match self {
+            Policy::Access => "access",
+            Policy::RateLimit => "rate_limit",
         }
     }
 }
@@ -186,6 +207,8 @@ pub struct Counters {
     pub rule_hits: Family<2>,
     /// The requests that could not be inspected, by the reason the kernel gave.
     pub uninspectable: Family<10>,
+    /// The requests turned away before their route was looked for, by what turned them away.
+    pub policy_refusals: Family<2>,
     /// The switches to another generation of the rules, by how they ended.
     pub switches: Family<3>,
     /// The readings of the certificate files again, by how they ended.
@@ -207,6 +230,7 @@ impl Counters {
             requests: Family::new(CLASSES),
             rule_hits: Family::new([RuleHit::Block.label(), RuleHit::Detect.label()]),
             uninspectable: Family::new(REASONS),
+            policy_refusals: Family::new([Policy::Access.label(), Policy::RateLimit.label()]),
             switches: Family::new([
                 SwitchResult::Switched.label(),
                 SwitchResult::Refused.label(),
@@ -236,6 +260,10 @@ impl Counters {
 
     pub fn add_uninspectable(&self, reason: Reason) {
         self.uninspectable.add(reason_label(reason));
+    }
+
+    pub fn add_policy_refusal(&self, policy: Policy) {
+        self.policy_refusals.add(policy.label());
     }
 
     pub fn add_switch(&self, result: SwitchResult) {

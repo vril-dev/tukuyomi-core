@@ -1,4 +1,5 @@
-//! What a request is answered with: its reply and class, the answer table, the empty response, the response that holds
+//! What a request is answered with: its reply and class, the answer table, the empty response (with a `Retry-After`
+//! when the client is to wait), the response that holds
 //! the file of a challenge of the CA, the answers that are written to the socket as bytes, and what the record of the
 //! request is made of.
 
@@ -8,7 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER};
 use http::{HeaderValue, Response, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use tukuyomi_kernel::{Reason, Refused, Verdict};
@@ -19,6 +20,7 @@ use crate::inbound::upload::Fate;
 use crate::inspect::driver::{Judge, Outcome};
 use crate::log::counters::RuleHit;
 use crate::log::record::Seen;
+use crate::policy::Refusal;
 
 /// How a connection ended, for the record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +147,11 @@ impl Reply {
         Reply::rejected(reject.status().unwrap_or(400), reject.reason())
     }
 
+    /// The request was turned away by the policy of the configuration (see `policy`).
+    pub(super) fn refused(refusal: Refusal) -> Reply {
+        Reply::rejected(refusal.status(), refusal.reason())
+    }
+
     /// What a rule did to the request, if one decided it: it blocked it, or it matched while the rules only detect.
     pub(super) fn hit(&self) -> Option<RuleHit> {
         match (self.class, self.rule) {
@@ -158,6 +165,8 @@ impl Reply {
 /// Why the exchange ends without a response to forward.
 pub(super) enum Stop {
     Reply(Reply),
+    /// The same, and the answer says in `Retry-After` how many seconds the client has to wait.
+    Retry(Reply, u32),
     /// Close the connection without an answer; the text is for the record.
     Close(&'static str),
 }
@@ -165,6 +174,16 @@ pub(super) enum Stop {
 impl From<Reply> for Stop {
     fn from(reply: Reply) -> Stop {
         Stop::Reply(reply)
+    }
+}
+
+impl From<Refusal> for Stop {
+    fn from(refusal: Refusal) -> Stop {
+        let reply = Reply::refused(refusal);
+        match refusal.retry_after() {
+            Some(seconds) => Stop::Retry(reply, seconds),
+            None => Stop::Reply(reply),
+        }
     }
 }
 
@@ -399,6 +418,24 @@ pub(super) fn not_redirected(id: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// The whole answer of a listener that redirects to https to a request that the policy turns away, as it is written to
+/// the socket (like the answers of `head::Reject`), with the number `id` of the request: 403, or 429 with the seconds
+/// to wait in `Retry-After`.
+pub(super) fn turned_away(refusal: Refusal, id: &str) -> Vec<u8> {
+    let status = match refusal {
+        Refusal::Access => "403 Forbidden",
+        Refusal::RateLimit(_) => "429 Too Many Requests",
+    };
+    let wait = refusal
+        .retry_after()
+        .map(|seconds| format!("Retry-After: {seconds}\r\n"))
+        .unwrap_or_default();
+    format!(
+        "HTTP/1.1 {status}\r\n{wait}X-Request-ID: {id}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
 /// The whole answer of a listener that redirects to https, as it is written to the socket: 308 to the name and the
 /// target of the request at `https_port`, which is left out of the address if it is 443. `name` is a name that the
 /// request's `Host` held, in lowercase; `target` is the origin-form target that the head check passed, so it starts
@@ -429,6 +466,15 @@ pub(super) fn answer(status: u16) -> Response<Out> {
             .headers_mut()
             .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
     }
+    response
+}
+
+/// An answer with an empty body that tells the client in `Retry-After` to wait `seconds`.
+pub(super) fn answer_after(status: u16, seconds: u32) -> Response<Out> {
+    let mut response = answer(status);
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from(seconds));
     response
 }
 

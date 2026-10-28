@@ -133,7 +133,7 @@ fn finish(proxy: Proxy, upstream_connections: usize) {
 #[ignore = "needs a built inspector"]
 fn the_control_socket_has_mode_0600_and_switches_only_to_the_generation_that_is_expected() {
     let status_port = free_port();
-    let mut proxy = Proxy::start_with("control_switch", Knobs::quick(), |root| {
+    let mut proxy = Proxy::start_with("ctl_switch", Knobs::quick(), |root| {
         add_admin(root, Some(status_port));
     });
     let root = proxy.root().to_path_buf();
@@ -205,7 +205,7 @@ fn the_control_socket_has_mode_0600_and_switches_only_to_the_generation_that_is_
 #[ignore = "needs a built inspector"]
 fn a_second_proxy_on_the_same_configuration_does_not_take_the_socket_of_a_running_one() {
     // No `status` object: the second proxy would end at its address before it came to the socket.
-    let proxy = Proxy::start_with("control_second", Knobs::quick(), |root| {
+    let proxy = Proxy::start_with("ctl_second", Knobs::quick(), |root| {
         add_admin(root, None);
     });
     let root = proxy.root().to_path_buf();
@@ -243,7 +243,7 @@ fn a_second_proxy_on_the_same_configuration_does_not_take_the_socket_of_a_runnin
 #[test]
 #[ignore = "needs a built inspector"]
 fn a_control_socket_path_that_holds_a_file_ends_the_start_before_the_inspector_runs() {
-    let mut proxy = Proxy::spawn_with("control_taken", Knobs::quick(), |root| {
+    let mut proxy = Proxy::spawn_with("ctl_taken", Knobs::quick(), |root| {
         add_admin(root, Some(free_port()));
         fs::write(socket(root), b"not a socket").expect("put a file in the place of the socket");
     });

@@ -2038,6 +2038,117 @@ fn the_records_object_is_left_out_or_has_a_clean_dir_a_size_and_a_count() {
     );
 }
 
+// ---- access and rate_limit ----
+
+fn rate_limit(key: &'static str, value: impl Into<Value>) -> Edit {
+    let mut object = serde_json::json!({ "rate": 100, "burst": 20, "keys": 4096 });
+    object[key] = value.into();
+    ("", "rate_limit", object)
+}
+
+fn global_access(key: &'static str, value: impl Into<Value>) -> Edit {
+    ("", "access", serde_json::json!({ key: value.into() }))
+}
+
+#[test]
+fn the_access_and_rate_limit_objects_are_left_out_or_have_their_values_in_range() {
+    use crate::forward::client_ip::Access;
+
+    assert_eq!(
+        parse(BASE.as_bytes()).unwrap().policy,
+        PolicyConfig::default()
+    );
+    let net = |text: &str| Cidr::parse(text).unwrap();
+    let loaded = parse(&doc(&[
+        (
+            "",
+            "access",
+            serde_json::json!({"deny_cidrs": ["10.0.0.0/8"], "allow_cidrs": ["10.1.0.0/16"]}),
+        ),
+        rate_limit(
+            "exempt_cidrs",
+            serde_json::json!(["127.0.0.1/32", "::1/128"]),
+        ),
+    ]))
+    .unwrap();
+    assert_eq!(
+        loaded.policy.access,
+        Access::new(vec![net("10.0.0.0/8")], vec![net("10.1.0.0/16")])
+    );
+    assert_eq!(
+        loaded.policy.rate_limit,
+        Some(RateLimitConfig {
+            rate: 100,
+            burst: 20,
+            keys: 4096,
+            exempt: vec![net("127.0.0.1/32"), net("::1/128")],
+        })
+    );
+
+    // Each limit and the first value past it.
+    let rate = "rate_limit rate is not 1 to 100000";
+    pass(&[rate_limit("rate", 1)]);
+    pass(&[rate_limit("rate", 100_000)]);
+    refuse(&[rate_limit("rate", 0)], rate);
+    refuse(&[rate_limit("rate", 100_001)], rate);
+    let burst = "rate_limit burst is not 0 to 100000";
+    pass(&[rate_limit("burst", 0)]);
+    pass(&[rate_limit("burst", 100_000)]);
+    refuse(&[rate_limit("burst", 100_001)], burst);
+    let keys = "rate_limit keys is not 1024 to 1048576";
+    pass(&[rate_limit("keys", 1024)]);
+    pass(&[rate_limit("keys", 1 << 20)]);
+    refuse(&[rate_limit("keys", 1023)], keys);
+    refuse(&[rate_limit("keys", (1 << 20) + 1)], keys);
+    let many = "rate_limit exempt_cidrs has more than 256 entries";
+    let list = |n: usize| serde_json::json!(vec!["127.0.0.1/32"; n]);
+    pass(&[rate_limit("exempt_cidrs", list(256))]);
+    refuse(&[rate_limit("exempt_cidrs", list(257))], many);
+    refuse(
+        &[rate_limit("exempt_cidrs", serde_json::json!(["127.0.0.1"]))],
+        "rate_limit exempt_cidrs has an entry that is not a network",
+    );
+    // The access of the configuration is read as the access of a route is.
+    pass(&[global_access("deny_cidrs", list(256))]);
+    refuse(
+        &[global_access("allow_cidrs", list(257))],
+        "access has a list of more than 256 networks",
+    );
+    refuse(
+        &[global_access(
+            "deny_cidrs",
+            serde_json::json!(["10.0.0.1/8"]),
+        )],
+        "access has an entry that is not a network",
+    );
+
+    // Every key of the rate limit but `exempt_cidrs`, as an object, and never null.
+    refuse(
+        &[(
+            "",
+            "rate_limit",
+            serde_json::json!({"rate": 100, "burst": 20}),
+        )],
+        "configuration has a missing key",
+    );
+    refuse(
+        &[rate_limit("per_second", 5)],
+        "configuration has an unknown key",
+    );
+    refuse(
+        &[global_access("countries", serde_json::json!(["JP"]))],
+        "configuration has an unknown key",
+    );
+    for edit in [
+        rate_limit("rate", Value::Null),
+        ("", "rate_limit", Value::Null),
+        ("", "access", Value::Null),
+        ("", "access", serde_json::json!([])),
+    ] {
+        refuse(&[edit], "configuration has a value of the wrong type");
+    }
+}
+
 // ---- admin ----
 
 fn admin_object() -> Value {

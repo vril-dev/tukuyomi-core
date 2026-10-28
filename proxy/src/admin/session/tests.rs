@@ -64,6 +64,37 @@ fn a_text_that_is_not_an_id_names_no_session_and_closing_ends_the_sessions_asked
 }
 
 #[test]
+fn pending_sessions_are_counted_apart_from_the_others_and_end_after_five_minutes() {
+    let sessions = Sessions::new(Duration::from_secs(3600), Duration::from_secs(7200));
+    let t0 = Instant::now();
+    let kept = sessions.open("alice", 1, t0).unwrap();
+    let pending: Vec<Opened> = (0..17)
+        .map(|n| sessions.open_pending("alice", 1, secs(t0, n)).unwrap())
+        .collect();
+    // The seventeenth pending session closed the first pending one and no session that counts.
+    assert_eq!(
+        pending[16].closed.as_deref(),
+        Some(pending[0].handle.as_str())
+    );
+    assert!(sessions.find(&pending[0].cookie, secs(t0, 17)).is_none());
+    assert!(!sessions.find(&kept.cookie, secs(t0, 17)).unwrap().pending);
+    let found = sessions.find(&pending[1].cookie, secs(t0, 17)).unwrap();
+    assert!(found.pending);
+    // Five minutes after it was made, however lately it was used, a pending session is over; the other lives on.
+    assert!(
+        sessions
+            .find(&pending[16].cookie, secs(t0, 16 + 299))
+            .is_some()
+    );
+    assert!(
+        sessions
+            .find(&pending[16].cookie, secs(t0, 16 + 300))
+            .is_none()
+    );
+    assert!(sessions.find(&kept.cookie, secs(t0, 16 + 300)).is_some());
+}
+
+#[test]
 fn a_user_keeps_sixteen_sessions_and_one_more_closes_the_oldest_of_that_user() {
     let sessions = Sessions::new(IDLE, TOTAL);
     let t0 = Instant::now();

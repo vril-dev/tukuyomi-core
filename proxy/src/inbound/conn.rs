@@ -3,8 +3,10 @@
 //! The head was checked by `head` before this runs. On an HTTP/1.1 connection `http1::gate` passed it, and the session
 //! hands it over with the request that hyper made of the same bytes; on an HTTP/2 connection it was made from the
 //! fields of the stream (see `http2::head`). A request for the challenge of the CA that issues the certificates with
-//! `acme`, on a plain listener, is answered before all that follows (see `challenge`). The route for the request is
-//! looked up first, by its `Host` and its target
+//! `acme`, on a plain listener, is answered before all that follows (see `challenge`). The first thing that follows is
+//! the policy of the configuration (see `policy`): a client that the `access` turns away gets 403, and one that is over
+//! the `rate_limit` gets 429 with a `Retry-After`, before any route is looked for, whether the route skips the
+//! inspection or not. The route for the request is looked up next, by its `Host` and its target
 //! as the client sent them. A request that no route holds for, with no default group, is answered with 404, and one
 //! from a client that the access lists of its route turn away with 403, before anything of its body is read and before
 //! the inspection is asked for. So is a request on a connection that ended TLS, whose `Host` is not one of the hosts of
@@ -51,7 +53,6 @@
 //! puts off the end of the connection once its head is ready (see `session`). A sum that does not fit into the
 //! clock counts as passed.
 
-use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -65,13 +66,15 @@ use hyper::body::Incoming;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 
+use self::fault::upstream_stop;
 use crate::config::{ProxyConfig, STREAM_HOLD, Stream};
-use crate::forward::client_ip;
+use crate::forward::client_ip::{self, Access, Cidr};
 use crate::forward::group::{Route, Upstreams};
-use crate::forward::origin::{self, Forward, OriginBody, OriginError};
+use crate::forward::origin::{self, Forward, OriginBody};
 use crate::forward::tunnel::{self, Record, Tunnel};
 use crate::inbound::answer::{
-    Abort, Decision, Noted, Out, Passed, Reply, Sizes, Stop, Via, answer, decide, text,
+    Abort, Decision, Noted, Out, Passed, Reply, Sizes, Stop, Via, answer, answer_after, decide,
+    text,
 };
 use crate::inbound::challenge::{Challenge, Proof};
 use crate::inbound::head::{Head, Reject};
@@ -79,17 +82,23 @@ use crate::inbound::represent::{Represented, gunzip, represent};
 use crate::inbound::session::RequestIds;
 use crate::inbound::transport::io::Gauge;
 use crate::inbound::transport::tls::{Hosts, Tls};
-use crate::inbound::upload::{Cause, Fate, Terms, Upload};
+use crate::inbound::upload::{Fate, Terms, Upload};
 use crate::inspect::driver::{Answer, BodyHold, Hold, Ingress, InspectReq, Judge, Msg, Ticket};
 use crate::log::Log;
 use crate::log::counters::Counters;
+use crate::policy::{self, RateLimit, Refusal};
 use crate::rules::routes::SharedRoutes;
+
+mod fault;
+
+pub(super) use self::fault::peer_gone;
 
 /// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
 /// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, the
 /// upstream groups with the routes to them and the connections that wait to be used again, the way to the driver,
 /// the TLS of the listeners that end it, the answer to the challenge of the CA, if the configuration has `acme`, the
-/// numbers of the requests, and the counters that `/metrics` shows.
+/// numbers of the requests, the networks that may not use the proxy at all, the rate limit if the configuration has one,
+/// and the counters that `/metrics` shows.
 pub struct Ctx {
     pub cfg: ProxyConfig,
     pub budget: Arc<Semaphore>,
@@ -102,6 +111,10 @@ pub struct Ctx {
     pub challenge: Option<Challenge>,
     pub ids: RequestIds,
     pub counters: Counters,
+    /// The `access` of the configuration: asked of every request before its route is looked for.
+    pub access: Access,
+    /// The `rate_limit` of the configuration, if it has one.
+    pub rate_limit: Option<RateLimit>,
 }
 
 /// How the listener that took a connection carries its requests: over plain HTTP, or over TLS, with the hosts of the
@@ -121,6 +134,17 @@ pub(super) fn after(start: Instant, len: Duration) -> Instant {
 /// `request_by`.
 fn stage(start: Instant, len: Duration, request_by: Instant) -> Instant {
     after(start, len).min(request_by)
+}
+
+/// The address that stands for the client of the request with `head` that came from `peer`: the peer, or what a peer
+/// in `trusted` says in its `X-Forwarded-For` lines (see `client_ip`).
+pub(super) fn client_of(head: &Head, peer: SocketAddr, trusted: &[Cidr]) -> SocketAddr {
+    let lines: Vec<&[u8]> = head
+        .fields()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(b"x-forwarded-for"))
+        .map(|(_, value)| value)
+        .collect();
+    client_ip::effective(peer, trusted, &lines)
 }
 
 /// The state of one request that its service reads.
@@ -196,12 +220,7 @@ impl Conn {
         gauge: Gauge,
         request_by: Instant,
     ) -> Conn {
-        let lines: Vec<&[u8]> = head
-            .fields()
-            .filter(|(name, _)| name.eq_ignore_ascii_case(b"x-forwarded-for"))
-            .map(|(_, value)| value)
-            .collect();
-        let client = client_ip::effective(peer, &ctx.cfg.trusted_proxies, &lines);
+        let client = client_of(&head, peer, &ctx.cfg.trusted_proxies);
         Conn {
             ctx: ctx.clone(),
             id,
@@ -248,6 +267,9 @@ impl Conn {
                 (reply, response, tunnel, stream)
             }
             Err(Stop::Reply(reply)) => (reply, Ok(answer(reply.status)), None, None),
+            Err(Stop::Retry(reply, seconds)) => {
+                (reply, Ok(answer_after(reply.status, seconds)), None, None)
+            }
             Err(Stop::Close(reason)) => (
                 Reply {
                     reason,
@@ -445,13 +467,20 @@ impl Conn {
         })
     }
 
-    /// The route the request takes. A request that no route holds for, and that has no default group, is answered
+    /// The route the request takes. Before any route is looked for, a client that the `access` of the configuration
+    /// turns away is answered with 403, and one that is over the `rate_limit` with 429 and the seconds to wait, also
+    /// when the request would take a route that skips the inspection (a client that is in `exempt_cidrs` of the
+    /// limit is not counted). A request that no route holds for, and that has no default group, is answered
     /// with 404 here, and one from a client that the access lists turn away with 403, before the body is read. If
     /// some route has an access list, every route that the request could be taken for, however it is written, has to
     /// allow the client (see `Upstreams::accesses`); if none has, nobody is turned away and that is not asked. On a
     /// connection that ended TLS the `Host` has to be covered by the certificate of the handshake first, or the
     /// answer is 421: the client may not use a connection for a site that its certificate does not stand for.
     fn route(&self) -> Result<Route<'_>, Stop> {
+        let client = self.client.ip();
+        let ctx = &self.ctx;
+        policy::check(&ctx.access, ctx.rate_limit.as_ref(), &ctx.counters, client)
+            .map_err(|refusal| self.turned_away_by(refusal))?;
         let (host, target) = (self.head.host(), self.head.target());
         if let Scheme::Https(hosts) = &self.scheme
             && !hosts.covers_host(host)
@@ -462,7 +491,6 @@ impl Conn {
         let route = upstreams
             .find(host, target)
             .ok_or_else(|| self.turned_away(404, "no route matches"))?;
-        let client = self.client.ip();
         if upstreams.guarded()
             && !upstreams
                 .accesses(host, target)
@@ -487,6 +515,12 @@ impl Conn {
     fn turned_away(&self, status: u16, reason: &'static str) -> Stop {
         self.note_empty_body();
         Reply::rejected(status, reason).into()
+    }
+
+    /// The same for a request that the policy turns away (see `policy::check`).
+    fn turned_away_by(&self, refusal: Refusal) -> Stop {
+        self.note_empty_body();
+        refusal.into()
     }
 
     /// A request with no body has been read to its end, whatever the answer is.
@@ -728,70 +762,6 @@ impl Conn {
             Decision::Answer(reply) => Err(reply.into()),
         }
     }
-}
-
-/// What the failure of the exchange with the upstream means for the client. `fate` is there if the body of the request
-/// was passed on while the client sent it: part of it may have gone to the upstream already, so a failure that comes
-/// after the request was sent says so, unless all of the body had been handed on by then: the failure is then the
-/// one of a request whose body was held.
-fn upstream_stop(error: OriginError, fate: Option<&Fate>) -> Stop {
-    Stop::Reply(match error {
-        OriginError::Unavailable => Reply::failed(502, "upstream unavailable"),
-        OriginError::Connect => Reply::failed(502, "upstream connection failed"),
-        OriginError::Send | OriginError::Head if fate.is_some_and(|fate| !fate.handed()) => {
-            Reply::failed(502, "upstream failed while the body was sent on")
-        }
-        OriginError::Send => Reply::failed(502, "upstream send failed"),
-        OriginError::Head => Reply::failed(502, "upstream response head failed"),
-        OriginError::Invalid => Reply::failed(502, "upstream response invalid"),
-        // Not the fault of the upstream: the answers of the proxy's own limits are 503.
-        OriginError::Late => Reply::failed(503, "request time used up"),
-        OriginError::Local => Reply::failed(503, "local connection failure"),
-        // The client's side of the body failed. Without a reason in the fate this is a fault of ours.
-        OriginError::Body => match fate.and_then(Fate::cause) {
-            Some(cause) => return cause_stop(cause),
-            None => Reply::failed(502, "upstream send failed"),
-        },
-    })
-}
-
-/// The answer to a client whose body failed while it was passed on to the upstream. A chunked body that passes the
-/// limit, and a client that is gone, get none: the connection is closed.
-fn cause_stop(cause: Cause) -> Stop {
-    match cause {
-        Cause::Idle => Reply::rejected(408, "body not received in time").into(),
-        Cause::Late => Reply::failed(503, "request time used up").into(),
-        Cause::Over => Stop::Close("body over the limit while it was sent on"),
-        Cause::Trailers => Reply::rejected(400, "request trailers not supported").into(),
-        Cause::Wire => Reply::rejected(413, "body over the limit on the wire").into(),
-        Cause::Gone => Stop::Close("peer closed during the body"),
-        Cause::Malformed => Reply::rejected(400, "malformed body").into(),
-    }
-}
-
-/// Whether the body failed because the peer went away, not because of what it sent.
-pub(super) fn peer_gone(e: &hyper::Error) -> bool {
-    if e.is_incomplete_message() {
-        return true;
-    }
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
-    while let Some(err) = source {
-        if let Some(io) = err.downcast_ref::<io::Error>()
-            && matches!(
-                io.kind(),
-                io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::NotConnected
-                    | io::ErrorKind::TimedOut
-            )
-        {
-            return true;
-        }
-        source = err.source();
-    }
-    false
 }
 
 #[cfg(test)]

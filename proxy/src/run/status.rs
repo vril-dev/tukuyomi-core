@@ -39,6 +39,7 @@ use tukuyomi_kernel::Phase;
 use crate::inbound::conn::Ctx;
 use crate::inbound::session::send_and_close;
 use crate::inspect::driver::State;
+use crate::policy::RateLimit;
 
 mod metrics;
 
@@ -154,6 +155,8 @@ impl Source for View {
                 .wait_queue
                 .saturating_sub(ctx.inspect.available_permits()),
             upstream_failures: ctx.upstreams.failures().collect(),
+            rate_limit_keys: ctx.rate_limit.as_ref().map_or(0, RateLimit::keys),
+            rate_limit_evicted: ctx.rate_limit.as_ref().map_or(0, RateLimit::evicted),
             records_dropped: ctx.log.dropped(),
             record_write_errors: ctx.log.write_errors(),
             record_file_errors: ctx.log.file_errors(),

@@ -17,8 +17,9 @@ use tukuyomi_kernel::Verdict;
 use super::*;
 use crate::config::{
     AcmeConfig, CertificateAcme, CertificateConfig, ForwardConfig, ListenerConfig, MinVersion,
-    RouteConfig, TlsConfig,
+    RateLimitConfig, RouteConfig, TlsConfig,
 };
+use crate::forward::client_ip::{Access, Cidr};
 use crate::inbound::challenge::Challenge;
 use crate::inbound::challenge::tests::Dir;
 use crate::inbound::conn::tests::{
@@ -30,6 +31,7 @@ use crate::inbound::transport::tls::{Files, Tls};
 use crate::inspect::driver::Outcome;
 use crate::log::Lines;
 use crate::log::is_answer;
+use crate::policy::RateLimit;
 use crate::route::{Rule, Table};
 
 const SEC: Duration = Duration::from_secs(1);
@@ -1555,5 +1557,136 @@ fn the_challenge_is_answered_before_all_else_on_a_plain_and_a_redirect_listener_
         };
         assert_eq!(count(200), 5, "{lines:?}");
         assert_eq!(count(404), 2, "{lines:?}");
+    });
+}
+
+// ---- the policy of the configuration on the listener that redirects ----
+
+/// A rig with a listener that redirects, with the challenge of the CA for `a.example` and this `access` and this
+/// `rate_limit` in force, and these `trusted_proxies`. The rig closes a connection soon after its answer.
+async fn policed_redirects(
+    pki: &Pki,
+    proofs: &Dir,
+    access: Access,
+    rate_limit: Option<RateLimit>,
+    trusted: &[&str],
+) -> Rig {
+    let cfg = ProxyConfig {
+        lingering_timeout: Duration::from_millis(50),
+        trusted_proxies: trusted
+            .iter()
+            .map(|net| Cidr::parse(net).unwrap())
+            .collect(),
+        ..kept()
+    };
+    over_tls(pki, cfg, Mode::Answer(BLOCK), &subdomains_only(), 443)
+        .await
+        .with_challenge(challenge_in(&proofs.0))
+        .with_policy(access, rate_limit)
+}
+
+#[test]
+fn a_redirect_listener_turns_away_what_the_policy_turns_away_instead_of_redirecting() {
+    run(async {
+        let pki = Pki::new();
+        let proofs = Dir::new();
+        fs::write(proofs.0.join("Tok_-1"), b"abc.def").unwrap();
+        let served = "GET /p HTTP/1.1\r\nHost: www.a.example\r\n\r\n";
+        let unserved = "GET / HTTP/1.1\r\nHost: www.other.example\r\n\r\n";
+        let proof = "GET /.well-known/acme-challenge/Tok_-1 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n";
+
+        // The access turns away the client, which is on the loopback address: 403 where there would be the redirect
+        // and where there would be the 404; the challenge is answered all the same.
+        let access = Access::new(vec![Cidr::parse("127.0.0.0/8").unwrap()], Vec::new());
+        let rig = policed_redirects(&pki, &proofs, access, None, &[]).await;
+        for request in [served, unserved] {
+            let answer = redirected(&rig, request).await;
+            assert_eq!(answer.status, 403, "{request}");
+            assert!(answer.all("location").is_empty(), "{request}");
+            assert!(answer.all("retry-after").is_empty(), "{request}");
+            assert_eq!(answer.all("content-length"), ["0"]);
+            assert_eq!(answer.all("connection"), ["close"]);
+            assert_eq!(answer.all("x-request-id").len(), 1);
+        }
+        let (head, body) = answered(&rig, 2, proof).await;
+        assert_eq!((head.status, body), (200, b"abc.def".to_vec()));
+        assert_eq!(
+            rig.ctx.counters.policy_refusals.samples(),
+            [("access", 2), ("rate_limit", 0)]
+        );
+        let lines = rig.lines.take();
+        let count = |class: &str, status: u16, reason: &str| {
+            lines
+                .iter()
+                .filter(|l| is_answer(l, class, status, reason))
+                .count()
+        };
+        assert_eq!(count("rejected", 403, "denied by access"), 2, "{lines:?}");
+        assert_eq!(count("answered", 200, "acme challenge"), 1, "{lines:?}");
+        assert!(rig.finish(tokio::spawn(async {})).await.is_empty());
+
+        // One request a second and none beyond it: the first request is redirected, the next one is 429 with the
+        // seconds to wait, and the challenge is neither refused nor counted.
+        let limit = RateLimit::new(&RateLimitConfig {
+            rate: 1,
+            burst: 0,
+            keys: 1024,
+            exempt: Vec::new(),
+        });
+        let rig = policed_redirects(&pki, &proofs, Access::default(), Some(limit), &[]).await;
+        assert_eq!(redirected(&rig, served).await.status, 308);
+        let answer = redirected(&rig, served).await;
+        assert_eq!(answer.status, 429);
+        assert!(answer.all("location").is_empty());
+        assert_eq!(answer.all("retry-after"), ["1"]);
+        assert_eq!(answer.all("content-length"), ["0"]);
+        assert_eq!(answer.all("connection"), ["close"]);
+        let (head, _) = answered(&rig, 2, proof).await;
+        assert_eq!(head.status, 200);
+        assert_eq!(
+            rig.ctx.counters.policy_refusals.samples(),
+            [("access", 0), ("rate_limit", 1)]
+        );
+        let lines = rig.lines.take();
+        let count = |class: &str, status: u16, reason: &str| {
+            lines
+                .iter()
+                .filter(|l| is_answer(l, class, status, reason))
+                .count()
+        };
+        assert_eq!(count("redirected", 308, "redirected"), 1, "{lines:?}");
+        assert_eq!(count("rejected", 429, "too many requests"), 1, "{lines:?}");
+        assert!(rig.finish(tokio::spawn(async {})).await.is_empty());
+    });
+}
+
+#[test]
+fn a_redirect_listener_judges_and_records_the_client_that_a_trusted_peer_names() {
+    run(async {
+        let pki = Pki::new();
+        let proofs = Dir::new();
+        // The client is on the loopback address and says in `X-Forwarded-For` that it is 10.1.2.3. The access turns
+        // away one of the two addresses. The address that a trusted peer names decides, and the one that a peer that
+        // is not trusted names does not. The one record of the request names the address that was judged, also when
+        // the answer is the redirect.
+        let request = "GET /p HTTP/1.1\r\nHost: www.a.example\r\nX-Forwarded-For: 10.1.2.3\r\n\r\n";
+        for (peer_trusted, denied, status, client) in [
+            (true, "10.0.0.0/8", 403, "10.1.2.3"),
+            (true, "127.0.0.0/8", 308, "10.1.2.3"),
+            (false, "10.0.0.0/8", 308, "127.0.0.1"),
+            (false, "127.0.0.0/8", 403, "127.0.0.1"),
+        ] {
+            let access = Access::new(vec![Cidr::parse(denied).unwrap()], Vec::new());
+            let trusted: &[&str] = if peer_trusted { &["127.0.0.0/8"] } else { &[] };
+            let rig = policed_redirects(&pki, &proofs, access, None, trusted).await;
+            let answer = redirected(&rig, request).await;
+            assert_eq!(answer.status, status, "{trusted:?} {denied}");
+            let lines = rig.lines.take();
+            let records: Vec<&serde_json::Value> =
+                lines.iter().filter(|l| l["type"] == "request").collect();
+            assert_eq!(records.len(), 1, "{lines:?}");
+            assert_eq!(records[0]["client"], client, "{trusted:?} {denied}");
+            assert!(rig.finish(tokio::spawn(async {})).await.is_empty());
+        }
     });
 }

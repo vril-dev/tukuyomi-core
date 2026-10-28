@@ -146,8 +146,8 @@ fn metrics_count_a_forwarded_and_a_blocked_request_and_a_scrape_is_no_request() 
     let mut unique = helped.clone();
     unique.sort();
     unique.dedup();
-    assert_eq!(helped.len(), 19, "{helped:?}");
-    assert_eq!((unique.len(), &typed), (19, &helped));
+    assert_eq!(helped.len(), 22, "{helped:?}");
+    assert_eq!((unique.len(), &typed), (22, &helped));
 
     // The scrape and the other pages were not requests: the two records are the only ones.
     assert_eq!(page(port, "/healthz").0, 200);

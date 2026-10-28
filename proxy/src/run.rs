@@ -43,7 +43,8 @@
 //! The upstream groups and the routes to them are read from the configuration file when the proxy starts, and stay
 //! as they are until it is started again; so do the addresses that the names of the servers have then, the
 //! authorities in the CA files of the groups that have `tls` (SIGUSR2 does not read them again), and the listeners
-//! with the hosts of their certificates.
+//! with the hosts of their certificates. So are the `access` and the `rate_limit` (see `policy`): the clients that
+//! the rate limit counts are counted again from nothing when the proxy is started again.
 //!
 //! SIGUSR1 makes the proxy switch to the generation that the rules store chooses now (`rules::switch` reads the
 //! store, the driver starts the new inspector and moves the requests over when it is ready). It is a line in the

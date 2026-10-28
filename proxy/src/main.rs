@@ -3,13 +3,13 @@
 //! `rules` the process is a short command on the rules store instead (`rules::command`), when it is `acme` it is
 //! the short command that issues and renews the certificates that have `acme` (`acme::command`), and when it is
 //! `config` it is the short command `config check <config>`; nothing of the proxy starts in any of them. When it
-//! is `admin` the process is the admin process (`admin <config>`, see `admin`) or the short command `admin
-//! bootstrap <config> <name>`.
+//! is `admin` the process is the admin process (`admin <config>`, see `admin`) or one of the short commands `admin
+//! bootstrap <config> <name>` and `admin reset <config> <name>`.
 //!
 //! This file starts the logger and the panic hook, runs `run::start` (see `run` for the rest), and flushes the log
 //! before the process ends with the exit code that `start` gave, or the failure code if it panicked. The logger
-//! writes JSON, except in the three short commands and in `admin bootstrap`, which write texts for a person to
-//! read.
+//! writes JSON, except in the three short commands and in `admin bootstrap` and `admin reset`, which write texts for
+//! a person to read.
 
 use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
@@ -30,7 +30,11 @@ fn main() -> ExitCode {
         (Some(first), _) if first == "rules" || first == "acme" || first == "config" => {
             Format::Text
         }
-        (Some(first), Some(second)) if first == "admin" && second == "bootstrap" => Format::Text,
+        (Some(first), Some(second))
+            if first == "admin" && (second == "bootstrap" || second == "reset") =>
+        {
+            Format::Text
+        }
         _ => Format::Json,
     };
     let log = match log::start_logger(format) {

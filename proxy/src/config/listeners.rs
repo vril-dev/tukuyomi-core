@@ -3,7 +3,8 @@
 //! There are 1 to 8 listeners, in no order that matters. A listener is `{"address", "tls"?, "redirect"?}`: the
 //! address is an IP literal and a port (`[..]:port` for IPv6, port 0 is refused). With neither key the listener is
 //! plain: it speaks HTTP and the requests go to the upstream groups. With `tls` it ends TLS first and then does the
-//! same. With `redirect` it answers every request it serves with a redirect to https, or 404, and forwards nothing.
+//! same. With `redirect` it answers every request it serves with a redirect to https, or 404, or 403 or 429 for a
+//! client that the policy turns away (see `policy`), and forwards nothing.
 //! The two keys exclude each other. At least one listener is plain or has `tls`, and a `redirect` needs a listener
 //! with `tls` to point at. Two listeners may not have the same address, nor may one be an unspecified address
 //! (`0.0.0.0`, `::`) at the port of another: the second bind would fail.
@@ -75,7 +76,8 @@ pub enum ListenerKind {
     Plain,
     /// TLS is ended here; the requests go to the upstream groups.
     Tls(TlsConfig),
-    /// Every request is answered with a redirect to https at this port, or with 404.
+    /// Every request is answered with a redirect to https at this port, or with 404; a client that the policy turns
+    /// away gets 403 or 429 instead.
     Redirect { https_port: u16 },
 }
 

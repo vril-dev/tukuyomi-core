@@ -1,7 +1,8 @@
 //! The routes of the rules: the generations of the rules store, the import of one with a trial, the switch of the
 //! proxy to a generation and the way back, the history of the switches, and the records of the proxy. `ROUTES` says
-//! which role may use each route; `server` checks the origin, the session, the CSRF token and the role before
-//! `Waf::handle` runs, and writes a refusal to the audit log.
+//! which role may use each route; `server` checks the origin, the session or the token, the CSRF token of a session,
+//! the state of the session and the role before `Waf::handle` runs, and writes a refusal to the audit log. A request
+//! with a token may use all of these routes; the audit log shows the token (`auth`) where it shows the session.
 //!
 //! The parts, one file each: `control` (the control socket of the proxy), `history` (what is kept of each switch),
 //! `import` (the body of an import and the trial) and `records` (reading the record files).
@@ -78,7 +79,7 @@ use self::import::{Inspector, Trial};
 use super::audit::{AuditLog, Event, Outcome};
 use super::auth::{Cx, Who};
 use super::password::hex;
-use super::server::{Answer, Handler, Req, Route, json_body};
+use super::server::{Answer, Gate, Handler, Req, Route, json_body};
 use super::store::AdminStore;
 use super::users::Role;
 use crate::config::{AdminConfig, Loaded, ProxyConfig, RecordsConfig, StoreConfig};
@@ -140,6 +141,8 @@ const fn route(method: Method, path: &'static str, least: Role, op: Op) -> Route
         path,
         handler: Handler::Waf(op),
         least: Some(least),
+        gate: Gate::Open,
+        token: true,
         action: op.action(),
     }
 }
@@ -243,9 +246,7 @@ impl<'a> Caller<'a> {
     /// An event of the request, with the user and the session it came from.
     fn event(&self, action: &'static str, outcome: Outcome) -> Event<'a> {
         let Caller { who, cx } = *self;
-        Event::new(cx.id, cx.client, action, outcome)
-            .actor(&who.name)
-            .session(&who.handle)
+        who.event(cx, action, outcome)
     }
 }
 

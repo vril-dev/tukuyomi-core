@@ -18,10 +18,10 @@ use crate::log::{self, Lines, sink::RecordFile};
 use crate::rules::bundle::sha256;
 
 /// The iterations of the hashes of the tests.
-const ITER: u32 = 1000;
-const PASSWORD: &str = "correct horse battery";
-const ORIGIN_OK: &str = "https://admin.example.test";
-const JSON_TYPE: (&str, &str) = ("content-type", "application/json");
+pub(crate) const ITER: u32 = 1000;
+pub(crate) const PASSWORD: &str = "correct horse battery";
+pub(crate) const ORIGIN_OK: &str = "https://admin.example.test";
+pub(crate) const JSON_TYPE: (&str, &str) = ("content-type", "application/json");
 
 /// An audit sink that writes the file and keeps the lines in memory, and takes none while `fail` is set.
 struct Memory {
@@ -40,22 +40,22 @@ impl Append for Memory {
     }
 }
 
-struct Rig {
-    app: App,
-    fail: Arc<AtomicBool>,
-    written: Arc<Mutex<Vec<u8>>>,
+pub(crate) struct Rig {
+    pub(crate) app: App,
+    pub(crate) fail: Arc<AtomicBool>,
+    pub(crate) written: Arc<Mutex<Vec<u8>>>,
     /// What the logger got.
-    lines: Lines,
-    dir: TestDir,
+    pub(crate) lines: Lines,
+    pub(crate) dir: TestDir,
 }
 
 /// A session: the value of its cookie and its CSRF token.
-struct Session {
-    id: String,
-    csrf: String,
+pub(crate) struct Session {
+    pub(crate) id: String,
+    pub(crate) csrf: String,
 }
 
-fn put_user(dir: &Path, name: &str, role: Role, password: &str, disabled: bool) {
+pub(crate) fn put_user(dir: &Path, name: &str, role: Role, password: &str, disabled: bool) {
     let mut user = User::new(name, role, Hash::new(password, ITER).unwrap(), 1000);
     user.disabled = disabled;
     fs::write(
@@ -66,7 +66,7 @@ fn put_user(dir: &Path, name: &str, role: Role, password: &str, disabled: bool) 
 }
 
 /// Rewrites the file of the user `name` with `change` applied, as another process would.
-fn alter_user(rig: &Rig, name: &str, change: impl FnOnce(&mut User)) {
+pub(crate) fn alter_user(rig: &Rig, name: &str, change: impl FnOnce(&mut User)) {
     let mut user = rig.user(name);
     change(&mut user);
     fs::write(
@@ -77,7 +77,12 @@ fn alter_user(rig: &Rig, name: &str, change: impl FnOnce(&mut User)) {
 }
 
 /// An app over a store with the owner `alice`, the operator `ola`, the viewer `vera` and the disabled viewer `dave`.
-fn rig_trusting(trusted: &[&str]) -> Rig {
+pub(crate) fn rig_trusting(trusted: &[&str]) -> Rig {
+    rig_with(trusted, Mfa::Optional)
+}
+
+/// As `rig_trusting`, with this `admin.mfa`.
+pub(crate) fn rig_with(trusted: &[&str], mfa: Mfa) -> Rig {
     let dir = scratch();
     let store = Arc::new(FileAdminStore::open(dir.path()).unwrap());
     put_user(dir.path(), "alice", Role::Owner, PASSWORD, false);
@@ -105,7 +110,7 @@ fn rig_trusting(trusted: &[&str]) -> Rig {
             .iter()
             .map(|net| Cidr::parse(net).unwrap())
             .collect(),
-        mfa: Mfa::Optional,
+        mfa,
         session_idle: Duration::from_secs(1800),
         session_total: Duration::from_secs(43_200),
         crs_dir: None,
@@ -128,11 +133,11 @@ fn rig_trusting(trusted: &[&str]) -> Rig {
     }
 }
 
-fn rig() -> Rig {
+pub(crate) fn rig() -> Rig {
     rig_trusting(&[])
 }
 
-fn request(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Req {
+pub(crate) fn request(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Req {
     let mut fields = HeaderMap::new();
     for (name, value) in headers {
         fields.append(
@@ -151,23 +156,29 @@ fn request(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Re
 }
 
 impl Rig {
-    fn send(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Answer {
+    pub(crate) fn send(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Answer {
         self.app.handle(&request(method, path, headers, body))
     }
 
-    fn try_login(&self, name: &str, password: &str) -> Answer {
+    pub(crate) fn try_login(&self, name: &str, password: &str) -> Answer {
         let body = json!({ "name": name, "password": password }).to_string();
         self.send("POST", "/api/login", &[JSON_TYPE], &body)
     }
 
-    fn login(&self, name: &str) -> Session {
+    pub(crate) fn login(&self, name: &str) -> Session {
         let answer = self.try_login(name, PASSWORD);
         assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
         session_of(&answer)
     }
 
     /// A request with the cookie and the CSRF token of `session`, and `extra` fields.
-    fn with(
+    pub(crate) fn with(
         &self,
         session: &Session,
         method: &str,
@@ -186,7 +197,7 @@ impl Rig {
     }
 
     /// The lines of the audit log so far.
-    fn audit(&self) -> Vec<Value> {
+    pub(crate) fn audit(&self) -> Vec<Value> {
         let bytes = self.written.lock().unwrap().clone();
         String::from_utf8(bytes)
             .unwrap()
@@ -195,14 +206,14 @@ impl Rig {
             .collect()
     }
 
-    fn user(&self, name: &str) -> User {
+    pub(crate) fn user(&self, name: &str) -> User {
         let store = FileAdminStore::open(self.dir.path()).unwrap();
         store.user(name).unwrap().unwrap()
     }
 }
 
 /// The session that a login answer opened.
-fn session_of(answer: &Answer) -> Session {
+pub(crate) fn session_of(answer: &Answer) -> Session {
     let cookie = answer.cookie.as_deref().expect("a cookie");
     let id = cookie
         .strip_prefix(&format!("{COOKIE_NAME}="))
@@ -390,6 +401,34 @@ fn the_fifth_failure_locks_the_user_and_the_sixth_try_with_the_right_password_is
         audit.iter().filter(|line| line["action"] == "lock").count(),
         1
     );
+}
+
+#[test]
+fn a_reset_of_a_locked_user_by_another_process_ends_the_lock_and_the_new_password_logs_in() {
+    let rig = rig();
+    for n in 1..=5 {
+        let answer = rig.try_login("vera", &format!("wrong password {n}"));
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "failure {n}");
+    }
+    assert_eq!(
+        rig.try_login("vera", PASSWORD).status,
+        StatusCode::UNAUTHORIZED
+    );
+    // `admin reset` runs in another process: it writes a new password and a later `changed`.
+    alter_user(&rig, "vera", |user| {
+        user.password = Hash::new("another password", ITER).unwrap();
+        user.must_change = true;
+        user.changed += 1;
+        user.tokens_after = user.changed;
+    });
+    // The count starts again: four wrong tries do not lock, and the new password logs in.
+    for n in 1..=4 {
+        let answer = rig.try_login("vera", &format!("wrong password {n}"));
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "failure {n}");
+    }
+    let answer = rig.try_login("vera", "another password");
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.body);
+    assert_eq!(answer.body["must_change"], true);
 }
 
 #[test]
@@ -584,13 +623,15 @@ fn the_cookie_has_its_attributes_and_the_answer_to_a_login_and_to_a_session_say_
     );
     assert_eq!(answer.body["name"], "ola");
     assert_eq!(answer.body["role"], "operator");
-    assert_eq!(answer.body["mfa"], false);
+    assert_eq!(answer.body["mfa"], "off");
+    assert_eq!(answer.body["must_change"], false);
     assert_eq!(answer.body["csrf"].as_str().unwrap().len(), 43);
     let ola = session_of(&answer);
     let seen = rig.with(&ola, "GET", "/api/session", &[], "");
     assert_eq!(seen.body["csrf"], ola.csrf.as_str());
     assert_eq!(seen.body["role"], "operator");
     assert_eq!(seen.body["idle_expires_in_ms"], 1_800_000);
+    assert_eq!(seen.body["state"], "active");
     // The cookie must be there once, and the logout takes it away.
     let twice = format!("{COOKIE_NAME}={id}; {COOKIE_NAME}={id}");
     assert_eq!(
@@ -939,6 +980,7 @@ fn a_body_over_the_usual_limit_is_read_only_for_a_live_session_of_an_operator() 
     let big = waf::body_limit(&Method::POST, "/api/generations").unwrap();
     let dir = rig.dir.path().to_path_buf();
     let app = Arc::new(rig.app);
+    let client = IpAddr::from([127, 0, 0, 1]);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -951,7 +993,13 @@ fn a_body_over_the_usual_limit_is_read_only_for_a_live_session_of_an_operator() 
             headers.insert(COOKIE, HeaderValue::from_str(&cookie).unwrap());
         }
         let asked = Arc::new(AtomicBool::new(false));
-        let result = runtime.block_on(body::read(&app, &headers, Watched(asked.clone()), limit));
+        let result = runtime.block_on(body::read(
+            &app,
+            &headers,
+            client,
+            Watched(asked.clone()),
+            limit,
+        ));
         (result.is_ok(), asked.load(Ordering::SeqCst))
     };
     // The usual limit is read for everybody; the limit of the import for an operator and an owner.
@@ -972,4 +1020,69 @@ fn a_body_over_the_usual_limit_is_read_only_for_a_live_session_of_an_operator() 
     assert_eq!(read(Some(&ola), big), (true, false));
     put_user(&dir, "alice", Role::Viewer, PASSWORD, false);
     assert_eq!(read(Some(&alice), big), (true, false));
+}
+
+#[test]
+fn a_body_over_the_usual_limit_is_read_for_the_token_of_an_operator_and_for_nothing_else() {
+    use crate::admin::auth::tokens::mint;
+    let rig = rig();
+    let store = FileAdminStore::open(rig.dir.path()).unwrap();
+    let text = |owner: &str, role: Role| {
+        let (text, token) = mint(owner, role, "test", crate::admin::users::now_ms(), 1).unwrap();
+        store.create_token(&token).unwrap();
+        text.as_str().to_owned()
+    };
+    let (operator, viewer, owner) = (
+        text("ola", Role::Operator),
+        text("vera", Role::Viewer),
+        text("alice", Role::Owner),
+    );
+    let cookie = format!("{COOKIE_NAME}={}", rig.login("ola").id);
+    let big = waf::body_limit(&Method::POST, "/api/generations").unwrap();
+    let client = IpAddr::from([127, 0, 0, 1]);
+    let app = Arc::new(rig.app);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let read = |fields: &[(&str, &str)]| {
+        let mut headers = HeaderMap::new();
+        for (name, value) in fields {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let asked = Arc::new(AtomicBool::new(false));
+        let result = runtime.block_on(body::read(
+            &app,
+            &headers,
+            client,
+            Watched(asked.clone()),
+            big,
+        ));
+        (result.is_ok(), asked.load(Ordering::SeqCst))
+    };
+    let bearer = |text: &str| format!("Bearer {text}");
+    assert_eq!(read(&[("authorization", &bearer(&operator))]), (true, true));
+    assert_eq!(read(&[("authorization", &bearer(&owner))]), (true, true));
+    // A viewer's token, a token that is not one, and a cookie together with a token are not read.
+    assert_eq!(read(&[("authorization", &bearer(&viewer))]), (true, false));
+    assert_eq!(
+        read(&[("authorization", "Bearer tkc_nothing")]),
+        (true, false)
+    );
+    assert_eq!(
+        read(&[("authorization", &bearer(&operator)), ("cookie", &cookie)]),
+        (true, false)
+    );
+    // A client that has used up its tries is not looked at, even with a token that is right.
+    let bad = bearer(&format!("tkc_0123456789abcdef_{}", "a".repeat(43)));
+    for _ in 0..30 {
+        read(&[("authorization", &bad)]);
+    }
+    assert_eq!(
+        read(&[("authorization", &bearer(&operator))]),
+        (true, false)
+    );
 }

@@ -10,7 +10,8 @@ use crate::log::recording;
 use crate::rules::bundle::Mode;
 use crate::run::signals::tests::runtime;
 
-/// A fresh 0700 directory under the temp directory (`TMPDIR`), removed with everything in it when dropped.
+/// A fresh 0700 directory under the temp directory (`TMPDIR`), removed with everything in it when dropped. Its name is
+/// short because the socket in it has to fit into 107 bytes together with the path of `TMPDIR`.
 struct TestDir(PathBuf);
 
 impl TestDir {
@@ -29,7 +30,7 @@ impl Drop for TestDir {
 fn scratch() -> TestDir {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "tukuyomi-proxy-control-{}-{}",
+        "tk-c-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));

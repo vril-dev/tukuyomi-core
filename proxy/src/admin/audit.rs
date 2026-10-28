@@ -6,7 +6,9 @@
 //! user whose password or session was checked for the request; it is left out when no user was, and it never comes
 //! from a header of the request), `session` (the first 8 digits of the SHA-256 of the session id; the id is never
 //! written), `auth` (how the actor got in when it was not by a session: `bootstrap` for the command that makes the
-//! first user), `client` (the address of the client), `action`, `target` (the user the action is about), `result`
+//! first user, `reset` for the command that sets a password again, `token:<id>` for a request with an API token),
+//! `client` (the address of the client), `action`,
+//! `target` (the user, or the token, the action is about), `result`
 //! (`ok`, `denied` or `failed`) and `reason` (a fixed word), and, for a change of a user, `before` and `after` (only
 //! `after` for a user that was made), or for a switch of the rules the generation chosen before and the one asked for. The line of a command run on the host has no `id` and no `client`: it is not a
 //! request. No password, cookie or token is ever written.
@@ -14,8 +16,9 @@
 //! A change is audited before it is made. `write` fails when the line cannot be encoded or the file does not take
 //! it, and then the caller refuses the change and makes none. The file has the line on the disk (`RecordFile::sync`)
 //! before `write` returns, and the line goes to the standard error only after that. Requests that are refused before
-//! a user is known (no session, a login that was refused for the rate of the client or for its `Origin`) are not
-//! written, so that nobody who has no session can fill the log and push older lines out of it.
+//! a user is known (no session, no token or a token that is not right, a login that was refused for the rate of the
+//! client or for its `Origin`) are not written, so that nobody who has no session can fill the log and push older lines
+//! out of it.
 //!
 //! `recent` reads the newest lines back: from the end of `audit.log`, and from the older files while it needs more,
 //! at most 1 MiB of a file; a line that cannot be parsed is left out. It does not take the lock of the writer, so it
@@ -85,7 +88,7 @@ pub struct Event<'a> {
     outcome: Outcome,
     actor: Option<&'a str>,
     session: Option<&'a str>,
-    auth: Option<&'static str>,
+    auth: Option<&'a str>,
     target: Option<&'a str>,
     reason: Option<&'static str>,
     before: Option<&'a str>,
@@ -142,7 +145,7 @@ impl<'a> Event<'a> {
     }
 
     /// How the actor got in, when it was not by a session.
-    pub fn auth(mut self, kind: &'static str) -> Event<'a> {
+    pub fn auth(mut self, kind: &'a str) -> Event<'a> {
         self.auth = Some(kind);
         self
     }
@@ -180,7 +183,7 @@ struct Body<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    auth: Option<&'static str>,
+    auth: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     client: Option<IpAddr>,
     action: &'static str,

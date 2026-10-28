@@ -3,7 +3,10 @@
 //! `admin bootstrap` and the password on the standard input; the admin process is started, and a client logs in,
 //! reads its session, changes its password, logs out and logs in again, over TCP. Then SIGTERM stops the process
 //! with exit code 0. The audit log is read from the file and from the standard error of the process; the first user's
-//! creation is in it as well. A configuration that asks for `mfa` `required` is refused by the process.
+//! creation is in it as well. A second test goes through the accounts: an owner sets up a second factor (the test
+//! makes the code from the seed with aws-lc-rs), logs in with it, makes an API token and uses it without a cookie
+//! or a CSRF token, makes a user who has to change the password first, and disables that user, whose session is then
+//! refused.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -12,8 +15,9 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use aws_lc_rs::hmac;
 use serde_json::{Value, json};
 
 use crate::support::*;
@@ -21,9 +25,9 @@ use crate::support::*;
 pub(crate) const OWNER: &str = "first password 123";
 const NEXT: &str = "second password 456";
 
-/// Adds the `admin` object that listens on `port`, with this `mfa`, and the directory of its store, to the
+/// Adds the `admin` object that listens on `port`, with `mfa` optional, and the directory of its store, to the
 /// configuration in `root`.
-fn add_admin(root: &Path, port: u16, mfa: &str) {
+fn add_admin(root: &Path, port: u16) {
     fs::DirBuilder::new()
         .mode(0o700)
         .create(root.join("admin"))
@@ -37,7 +41,7 @@ fn add_admin(root: &Path, port: u16, mfa: &str) {
             "store": {"kind": "file", "dir": root.join("admin").to_string_lossy()},
             "origin": "https://admin.example.test",
             "trusted_proxies": [],
-            "mfa": mfa,
+            "mfa": "optional",
             "session_idle_ms": 1_800_000,
             "session_total_ms": 43_200_000,
         }),
@@ -233,7 +237,7 @@ fn assert_fixed_fields(message: &Message) {
 fn the_first_owner_logs_in_changes_the_password_and_logs_out_and_sigterm_stops_the_process() {
     let port = free_port();
     let idle = Idle::new("admin_api", &Knobs::quick(), |root| {
-        add_admin(root, port, "optional");
+        add_admin(root, port);
     });
     let root = idle.root();
 
@@ -290,7 +294,8 @@ fn the_first_owner_logs_in_changes_the_password_and_logs_out_and_sigterm_stops_t
         (session["name"].as_str(), session["role"].as_str()),
         (Some("alice"), Some("owner"))
     );
-    assert_eq!(session["mfa"], false);
+    assert_eq!(session["mfa"], "off");
+    assert_eq!(session["must_change"], false);
     let cookie = cookie_of(&login);
     let csrf = session["csrf"].as_str().expect("a token").to_owned();
 
@@ -467,19 +472,338 @@ fn both_commands_refuse_a_configuration_without_the_admin_object() {
 
 #[test]
 #[ignore = "needs a built inspector"]
-fn the_admin_process_does_not_start_when_mfa_is_required() {
+fn a_second_admin_process_on_the_same_store_does_not_start() {
     let port = free_port();
-    let idle = Idle::new("admin_mfa", &Knobs::quick(), |root| {
-        add_admin(root, port, "required");
+    let idle = Idle::new("admin_twice", &Knobs::quick(), |root| {
+        add_admin(root, port);
     });
-    let config = idle.root().join("config.json");
-    let run = command(&[config.as_path()], "");
-    assert_eq!(run.code, Some(1), "{}", run.err);
+    let root = idle.root();
+    let mut admin = Admin::start(root, port);
+    let config = root.join("config.json");
+    let second = command(&[config.as_path()], "");
+    assert_eq!(second.code, Some(1), "{}", second.err);
     assert!(
-        run.err
-            .contains("admin: start: mfa required is not available yet"),
+        second
+            .err
+            .contains("admin: admin store refused: another admin process runs on this store"),
         "{}",
-        run.err
+        second.err
     );
-    assert_turned_away(port);
+    // The first process is not disturbed, and after it ended the store is free for another one.
+    assert_eq!(admin.call("GET", "/api/missing", &[], "").status(), 404);
+    assert_eq!(admin.stop().code(), Some(0), "{:#?}", admin.seen);
+    let mut again = Admin::start(root, port);
+    assert_eq!(again.stop().code(), Some(0), "{:#?}", again.seen);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_reset_while_the_process_runs_ends_the_sessions_and_makes_the_user_change_the_password() {
+    let port = free_port();
+    let idle = Idle::new("admin_reset", &Knobs::quick(), |root| {
+        add_admin(root, port);
+    });
+    let root = idle.root();
+    let made = bootstrap(root, "alice", &format!("{OWNER}\n"));
+    assert_eq!(made.code, Some(0), "{}", made.err);
+    let mut admin = Admin::start(root, port);
+    let alice = Login::of(&log_in(&admin, "alice", OWNER));
+    let seen = |login: &Login| {
+        login
+            .call(&admin, "GET", "/api/session", &json!({}))
+            .status()
+    };
+    assert_eq!(seen(&alice), 200);
+    let config = root.join("config.json");
+    let reset = |name: &str, input: &str| {
+        command(
+            &[Path::new("reset"), config.as_path(), Path::new(name)],
+            input,
+        )
+    };
+    // A user that the store does not have is refused, and nothing is changed.
+    let none = reset("nobody", &format!("{NEXT}\n"));
+    assert_eq!((none.code, none.out.as_str()), (Some(1), ""));
+    assert!(
+        none.err
+            .ends_with("admin reset: the user is not in the store\n"),
+        "{}",
+        none.err
+    );
+    assert_eq!(seen(&alice), 200);
+    // The reset is audited first, with the way it was done, and ends the session of the user.
+    let done = reset("alice", &format!("{NEXT}\n"));
+    assert_eq!(
+        (done.code, done.out.as_str()),
+        (Some(0), "reset password of alice\n"),
+        "{}",
+        done.err
+    );
+    let line: Value =
+        serde_json::from_str(done.err.lines().next().unwrap()).expect("an audit line");
+    for (key, value) in [
+        ("action", "reset"),
+        ("result", "ok"),
+        ("target", "alice"),
+        ("auth", "reset"),
+    ] {
+        assert_eq!(line[key], value, "{key}");
+    }
+    assert_eq!(seen(&alice), 401);
+    assert_eq!(log_in(&admin, "alice", OWNER).status(), 401);
+    let login = log_in(&admin, "alice", NEXT);
+    assert_eq!(login.status(), 200);
+    assert_eq!(json_of(&login)["must_change"], true);
+    assert_eq!(admin.stop().code(), Some(0), "{:#?}", admin.seen);
+}
+
+/// The bytes that `text` stands for in base32 (RFC 4648, no padding).
+fn unbase32(text: &str) -> Vec<u8> {
+    const ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let (mut out, mut buffer, mut held) = (Vec::new(), 0u32, 0u32);
+    for c in text.chars() {
+        buffer = (buffer << 5) | u32::try_from(ALPHABET.find(c).expect("a base32 letter")).unwrap();
+        held += 5;
+        if held >= 8 {
+            held -= 8;
+            out.push(u8::try_from((buffer >> held) & 0xff).unwrap());
+        }
+    }
+    out
+}
+
+/// The one-time password (RFC 4226 with HMAC-SHA1 and 6 digits) of `seed` for the 30-second step `step`.
+fn one_time_code(seed: &[u8], step: u64) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, seed);
+    let tag = hmac::sign(&key, &step.to_be_bytes());
+    let digest = tag.as_ref();
+    let offset = usize::from(digest[19] & 0x0f);
+    let number = u32::from_be_bytes([
+        digest[offset] & 0x7f,
+        digest[offset + 1],
+        digest[offset + 2],
+        digest[offset + 3],
+    ]);
+    format!("{:06}", number % 1_000_000)
+}
+
+/// The present 30-second step.
+fn step_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs()
+        / 30
+}
+
+/// A session of the admin API: its cookie and CSRF token.
+struct Login {
+    cookie: String,
+    csrf: String,
+}
+
+impl Login {
+    /// The session that an answer to a login, a check of the second factor or a renewal opened.
+    fn of(message: &Message) -> Login {
+        assert_eq!(
+            message.status(),
+            200,
+            "{}",
+            String::from_utf8_lossy(&message.body)
+        );
+        Login {
+            cookie: cookie_of(message),
+            csrf: json_of(message)["csrf"]
+                .as_str()
+                .expect("a token")
+                .to_owned(),
+        }
+    }
+
+    /// A request of this session, with its CSRF token.
+    fn call(&self, admin: &Admin, method: &str, path: &str, body: &Value) -> Message {
+        let fields = [
+            ("Content-Type", "application/json"),
+            ("Cookie", self.cookie.as_str()),
+            ("X-CSRF-Token", self.csrf.as_str()),
+        ];
+        admin.call(method, path, &fields, &body.to_string())
+    }
+}
+
+fn log_in(admin: &Admin, name: &str, password: &str) -> Message {
+    let body = json!({"name": name, "password": password}).to_string();
+    admin.call(
+        "POST",
+        "/api/login",
+        &[("Content-Type", "application/json")],
+        &body,
+    )
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn an_owner_sets_up_a_second_factor_makes_a_token_and_a_user_who_must_change_the_password_and_is_then_disabled()
+ {
+    const VERA: &str = "viewer password 123";
+    const VERA_NEXT: &str = "viewer password 456";
+    let port = free_port();
+    let idle = Idle::new("admin_accounts", &Knobs::quick(), |root| {
+        add_admin(root, port);
+    });
+    let root = idle.root();
+    let made = bootstrap(root, "alice", &format!("{OWNER}\n"));
+    assert_eq!(made.code, Some(0), "{}", made.err);
+    let mut admin = Admin::start(root, port);
+
+    // The owner logs in, and sets up the second factor with the password and a code of the seed.
+    let alice = Login::of(&log_in(&admin, "alice", OWNER));
+    let started = alice.call(
+        &admin,
+        "POST",
+        "/api/account/mfa/setup",
+        &json!({"password": OWNER}),
+    );
+    assert_eq!(started.status(), 200);
+    let started = json_of(&started);
+    assert!(
+        started["uri"]
+            .as_str()
+            .expect("an address")
+            .starts_with("otpauth://totp/tukuyomi-core:alice?secret=")
+    );
+    let seed = unbase32(started["secret"].as_str().expect("a seed"));
+    assert_eq!(seed.len(), 20);
+    // The step is read once: it may change during the test, and the same code must be sent twice.
+    let step = step_now();
+    let confirmed = alice.call(
+        &admin,
+        "POST",
+        "/api/account/mfa/confirm",
+        &json!({"code": one_time_code(&seed, step)}),
+    );
+    assert_eq!(confirmed.status(), 200);
+    assert_eq!(
+        json_of(&confirmed)["recovery"].as_array().map(Vec::len),
+        Some(10)
+    );
+    let alice = Login::of(&confirmed);
+    assert_eq!(
+        alice
+            .call(&admin, "POST", "/api/logout", &json!({}))
+            .status(),
+        200
+    );
+
+    // The next login asks for the code; until it is given the session can do nothing else. A code of the step that
+    // confirmed is refused, the next step's is taken.
+    let pending = log_in(&admin, "alice", OWNER);
+    assert_eq!(json_of(&pending)["mfa"], "verify");
+    let pending = Login::of(&pending);
+    let blocked = admin.call("GET", "/api/session", &[("Cookie", &pending.cookie)], "");
+    assert_eq!(blocked.status(), 403);
+    assert_eq!(json_of(&blocked)["error"], "second factor required");
+    let replay = pending.call(
+        &admin,
+        "POST",
+        "/api/login/mfa",
+        &json!({"code": one_time_code(&seed, step)}),
+    );
+    assert_eq!(replay.status(), 401);
+    let verified = pending.call(
+        &admin,
+        "POST",
+        "/api/login/mfa",
+        &json!({"code": one_time_code(&seed, step + 1)}),
+    );
+    assert_eq!(json_of(&verified)["mfa"], "off");
+    let alice = Login::of(&verified);
+    assert_ne!(alice.cookie, pending.cookie);
+
+    // A token of the role operator is used without a cookie or a CSRF token; the routes of the account are not for it.
+    let made = alice.call(
+        &admin,
+        "POST",
+        "/api/account/tokens",
+        &json!({"name": "ci", "role": "operator", "days": 30, "password": OWNER}),
+    );
+    assert_eq!(made.status(), 200);
+    let token = json_of(&made)["token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
+    let bearer = format!("Bearer {token}");
+    let by_token = admin.call("GET", "/api/generations", &[("Authorization", &bearer)], "");
+    assert_eq!(
+        by_token.status(),
+        200,
+        "{}",
+        String::from_utf8_lossy(&by_token.body)
+    );
+    assert_eq!(
+        json_of(&by_token)["generations"].as_array().map(Vec::len),
+        Some(1)
+    );
+    let account = admin.call(
+        "GET",
+        "/api/account/tokens",
+        &[("Authorization", &bearer)],
+        "",
+    );
+    assert_eq!(account.status(), 403);
+    let both = admin.call(
+        "GET",
+        "/api/generations",
+        &[("Authorization", &bearer), ("Cookie", &alice.cookie)],
+        "",
+    );
+    assert_eq!(both.status(), 400);
+
+    // A viewer has to change the password first: until then only the change works.
+    let created = alice.call(
+        &admin,
+        "POST",
+        "/api/users",
+        &json!({"name": "vera", "role": "viewer", "password": VERA}),
+    );
+    assert_eq!(
+        created.status(),
+        200,
+        "{}",
+        String::from_utf8_lossy(&created.body)
+    );
+    let login = log_in(&admin, "vera", VERA);
+    assert_eq!(json_of(&login)["must_change"], true);
+    let vera = Login::of(&login);
+    let limited = admin.call("GET", "/api/generations", &[("Cookie", &vera.cookie)], "");
+    assert_eq!(limited.status(), 403);
+    assert_eq!(json_of(&limited)["error"], "password change required");
+    let changed = vera.call(
+        &admin,
+        "PUT",
+        "/api/account/password",
+        &json!({"current": VERA, "new": VERA_NEXT}),
+    );
+    let vera = Login::of(&changed);
+    let allowed = admin.call("GET", "/api/generations", &[("Cookie", &vera.cookie)], "");
+    assert_eq!(allowed.status(), 200);
+
+    // The owner disables the viewer, and the session of the viewer is refused.
+    let disabled = alice.call(&admin, "PUT", "/api/users/vera", &json!({"disabled": true}));
+    assert_eq!(disabled.status(), 200);
+    let after = admin.call("GET", "/api/generations", &[("Cookie", &vera.cookie)], "");
+    assert_eq!(after.status(), 401);
+    assert_eq!(log_in(&admin, "vera", VERA_NEXT).status(), 401);
+
+    let status = admin.stop();
+    assert_eq!(status.code(), Some(0), "{:#?}", admin.seen);
+    let text = fs::read_to_string(root.join("admin").join("audit").join("audit.log"))
+        .expect("the audit file");
+    // No password, code, token or cookie is in the audit log or in the records of the process.
+    let records = format!("{:?}", admin.seen);
+    for secret in [OWNER, VERA, VERA_NEXT, token.as_str(), &token[21..]] {
+        assert!(!text.contains(secret) && !records.contains(secret));
+    }
+    assert!(text.contains("\"action\":\"mfa_confirm\""));
+    assert!(text.contains("\"action\":\"user_create\""));
 }
