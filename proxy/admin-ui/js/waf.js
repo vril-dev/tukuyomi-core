@@ -1,10 +1,18 @@
-// The screens of the WAF. For now there is one, the status: the state of the proxy, the rule generation that the
-// rules store chooses and the one that the proxy serves (with a warning when they differ), and the generation that a
-// rollback would choose. A screen is `{ id, title, least, mount }`; `mount(ctx, root)` draws into `root` and gives back
-// a function that undoes what it set up. Nothing runs when the module is loaded.
+// The screens of the WAF. This file has the status: the state of the proxy, the rule generation that the rules store
+// chooses and the one that the proxy serves (with a warning when they differ), and the generation that a rollback
+// would choose. The other screens are in `generations.js` (the generations, the history and the rollback),
+// `import.js` and `records.js` (the records and the audit log), and `screens` puts them in the order of the menu. A
+// screen is `{ id, title, least, mount }`; `mount(ctx, root)` draws into `root` and gives back a function that undoes
+// what it set up. Nothing runs when the module is loaded.
 
 import { badge, el, mount, notice } from './dom.js';
+import { screens as generationScreens } from './generations.js';
 import { language, t } from './i18n.js';
+import { screens as importScreens } from './import.js';
+import { generationState } from './parts.js';
+import { screens as recordScreens } from './records.js';
+
+export { generationState };
 
 // The tone and the words of each phase of the proxy, and the words of each mode. A value that is not here is shown as
 // the API gave it.
@@ -19,18 +27,6 @@ const MODES = {
   block: () => t('mode.block'),
   detect: () => t('mode.detect'),
 };
-
-/**
- * How the generation that the rules store chooses compares with the one that the proxy serves, from the answer of
- * `GET /api/status`: `same`; `switching` (they differ while a switch is under way); `differ`; or `unknown` when the
- * proxy did not say which it serves.
- */
-export function generationState(data) {
-  const proxy = data?.proxy ?? null;
-  if (proxy === null || typeof proxy !== 'object') return 'unknown';
-  if (data.current === proxy.generation) return 'same';
-  return proxy.switching === true ? 'switching' : 'differ';
-}
 
 function row(label, value) {
   return [el('dt', {}, label), el('dd', {}, value)];
@@ -124,4 +120,10 @@ function mountStatus(ctx, root) {
   return stop;
 }
 
-export const screens = [{ id: 'status', title: () => t('nav.status'), least: 'viewer', mount: mountStatus }];
+const statusScreen = { id: 'status', title: () => t('nav.status'), least: 'viewer', mount: mountStatus };
+
+// The order of the menu.
+const ORDER = ['status', 'generations', 'import', 'history', 'records', 'audit'];
+const ALL = [statusScreen, ...generationScreens, ...importScreens, ...recordScreens];
+
+export const screens = ORDER.map((id) => ALL.find((screen) => screen.id === id));

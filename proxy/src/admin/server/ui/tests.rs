@@ -28,6 +28,13 @@ fn each_file_answers_with_its_type_and_the_fields_of_the_page_and_needs_no_sessi
         ("/ui/dom.js", "text/javascript; charset=utf-8"),
         ("/ui/i18n.js", "text/javascript; charset=utf-8"),
         ("/ui/waf.js", "text/javascript; charset=utf-8"),
+        ("/ui/parts.js", "text/javascript; charset=utf-8"),
+        ("/ui/generations.js", "text/javascript; charset=utf-8"),
+        ("/ui/import.js", "text/javascript; charset=utf-8"),
+        ("/ui/records.js", "text/javascript; charset=utf-8"),
+        ("/ui/account.js", "text/javascript; charset=utf-8"),
+        ("/ui/users.js", "text/javascript; charset=utf-8"),
+        ("/ui/qr.js", "text/javascript; charset=utf-8"),
         ("/ui/favicon.svg", "image/svg+xml"),
     ] {
         // No cookie, no token: the files hold no secret.

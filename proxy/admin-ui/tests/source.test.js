@@ -18,6 +18,7 @@ const FORBIDDEN = [
   ['createContextualFragment', /createContextualFragment/],
   ['DOMParser', /DOMParser/],
   ['an event attribute set by name', /setAttribute\s*\(\s*['"]on/i],
+  ['a style, an address or a document set as an attribute by name', /setAttribute\s*\(\s*['"](?:style|href|src|srcdoc|action|formaction)['"]/i],
 ];
 
 test('the scripts use none of the APIs that make markup or code from a string', () => {
@@ -40,8 +41,13 @@ test('the page has no inline script, style or event attribute, one stylesheet, a
   assert.equal([...html.matchAll(/<link\b[^>]*rel="stylesheet"/gi)].length, 1);
 });
 
+// The one name of this kind that a script holds: the namespace of SVG elements, which is a name that tells the browser
+// what kind of element to make and is never fetched.
+const SVG_NAMESPACE = "'http://www.w3.org/2000/svg'";
+
 test('nothing in the page asks for an address outside it', () => {
   const sources = [...scripts, ['app.css', read('app.css')], ['index.html', read('index.html')]];
-  for (const [name, source] of sources) assert.doesNotMatch(source, /https?:\/\//i, name);
+  for (const [name, source] of sources) assert.doesNotMatch(source.replaceAll(SVG_NAMESPACE, ''), /https?:\/\//i, name);
+  assert.equal(scripts.filter(([, source]) => source.includes(SVG_NAMESPACE)).length, 1, 'only the account script names it');
   assert.doesNotMatch(read('app.css'), /@import|url\(/i);
 });

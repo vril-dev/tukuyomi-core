@@ -22,7 +22,7 @@
   --radius-s: 6px;
   --bar-h: 3.5rem;
   --nav-w: 13.5rem;
-  --content-w: 62rem;
+  --content-w: 72rem;
 
   --bg: #f4f6f9;
   --surface: #ffffff;
@@ -573,4 +573,427 @@ select {
   .kv dd {
     margin-bottom: var(--space-2);
   }
+}
+
+/* ---- the screens of the rules ---- */
+
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.block {
+  display: block;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: var(--text-s);
+}
+
+.notice p + p {
+  margin-top: var(--space-2);
+}
+
+.btn-small {
+  min-height: 2rem;
+  padding: 0 var(--space-3);
+  font-size: var(--text-s);
+}
+
+.btn-danger {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: var(--accent-ink);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--bad);
+  filter: brightness(0.92);
+}
+
+textarea.input {
+  min-height: 6rem;
+  padding: var(--space-2) var(--space-3);
+  resize: vertical;
+}
+
+input[type="file"].input {
+  padding: var(--space-2) var(--space-3);
+}
+
+.spin {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  vertical-align: -0.15em;
+  animation: spin 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation-duration: 3s;
+  }
+}
+
+.badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.fp-view {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 var(--space-2);
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.row-actions p {
+  flex-basis: 100%;
+}
+
+.plain-list {
+  margin: 0;
+  padding-left: var(--space-5);
+}
+
+.raw {
+  margin: 0;
+  padding: var(--space-3);
+  overflow: auto;
+  border-radius: var(--radius-s);
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: var(--text-s);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* tables */
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.grid {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.grid th,
+.grid td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--edge);
+  overflow-wrap: break-word;
+  text-align: left;
+  vertical-align: top;
+}
+
+.grid th {
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: var(--text-s);
+  white-space: nowrap;
+}
+
+.grid td.tight,
+.table-wrap .badge {
+  white-space: nowrap;
+}
+
+.grid td.wide {
+  overflow-wrap: anywhere;
+}
+
+.grid tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+/* forms of the import and of the search */
+
+.group {
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius-s);
+  background: var(--surface);
+}
+
+.group legend {
+  padding: 0 var(--space-2);
+  font-weight: 600;
+}
+
+.group > * + * {
+  margin-top: var(--space-3);
+}
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.check input {
+  flex: none;
+  width: 1.1rem;
+  height: 1.1rem;
+  margin: 0.2rem 0 0;
+}
+
+.checks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+  gap: var(--space-2) var(--space-4);
+}
+
+.files {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding-left: var(--space-5);
+}
+
+.files li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+}
+
+.file-name {
+  font-family: var(--mono);
+  font-size: var(--text-s);
+  font-weight: 600;
+}
+
+.filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+  gap: var(--space-3);
+}
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+/* dialogs: the confirmation in the middle, the detail as a sheet from the right */
+
+dialog {
+  padding: 0;
+  border: 1px solid var(--edge-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 8px 32px rgb(0 0 0 / 0.3);
+}
+
+dialog::backdrop {
+  background: rgb(10 15 25 / 0.55);
+}
+
+.confirm {
+  width: min(34rem, calc(100% - 2rem));
+  padding: var(--space-5);
+}
+
+.confirm > * + * {
+  margin-top: var(--space-4);
+}
+
+.confirm-actions {
+  justify-content: flex-end;
+}
+
+.sheet {
+  width: min(42rem, 100%);
+  max-width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  max-height: none;
+  margin: 0 0 0 auto;
+  padding: var(--space-5);
+  overflow: auto;
+  border-width: 0 0 0 1px;
+  border-radius: 0;
+}
+
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.sheet h3 {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text);
+}
+
+@media (max-width: 48rem) {
+  .grid,
+  .grid tbody,
+  .grid tr,
+  .grid td {
+    display: block;
+  }
+
+  .grid thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  .grid tr {
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--edge-strong);
+  }
+
+  .grid tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .grid td,
+  .grid td.tight {
+    position: relative;
+    padding: var(--space-1) var(--space-3) var(--space-1) 7.5rem;
+    border: 0;
+    white-space: normal;
+  }
+
+  .grid td:empty {
+    display: none;
+  }
+
+  .filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .grid td::before {
+    content: attr(data-label);
+    position: absolute;
+    left: var(--space-3);
+    width: 6.5rem;
+    color: var(--ink-2);
+    font-size: var(--text-s);
+    font-weight: 600;
+  }
+
+  .sheet,
+  .confirm {
+    padding: var(--space-4);
+  }
+}
+
+/* ---- the account and the users ---- */
+
+/* A region that announces what happened takes no room in a stack while it is empty. */
+.stack > .notes:empty {
+  margin-top: calc(-1 * var(--space-4));
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+  gap: var(--space-3) var(--space-4);
+  align-items: start;
+}
+
+/* A QR code is black on white in every theme, because a reader needs that contrast. */
+.qr {
+  display: block;
+  width: min(100%, 15rem);
+  height: auto;
+  border: 1px solid var(--edge-strong);
+  border-radius: var(--radius-s);
+}
+
+.qr-light {
+  fill: #ffffff;
+}
+
+.qr-dark {
+  fill: #000000;
+}
+
+.secret {
+  display: inline-block;
+  max-width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-s);
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: var(--text);
+  letter-spacing: 0.04em;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.card h3 {
+  margin: 0;
+  font-size: var(--text);
+}
+
+.codes {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: code;
+}
+
+.codes li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  counter-increment: code;
+}
+
+.codes li::before {
+  content: counter(code) ".";
+  min-width: 1.75rem;
+  color: var(--ink-2);
+  text-align: right;
+}
+
+.codes code {
+  font-family: var(--mono);
+  font-size: var(--text);
+  letter-spacing: 0.04em;
+  user-select: all;
+}
+
+.sheet .card {
+  box-shadow: none;
 }

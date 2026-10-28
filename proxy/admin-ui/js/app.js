@@ -6,10 +6,13 @@
 // open. The CSRF token lives in the `Api` object in memory; the only things kept in the browser are the language and
 // the theme. Nothing runs when the module is loaded, except the start of the page when there is one.
 
+import { screens as accountScreens, forgetHeld, mfaSetup, passwordForm } from './account.js';
 import { Api, ApiError, gateOf } from './api.js';
 import { badge, el, mount, notice, setText } from './dom.js';
 import { LANGUAGES, language, pickLanguage, sentence, setLanguage, t } from './i18n.js';
-import { generationState, screens } from './waf.js';
+import { forgetEnded } from './import.js';
+import { screens as userScreens } from './users.js';
+import { generationState, screens as wafScreens } from './waf.js';
 
 const KEYS = { language: 'tukuyomi_admin_language', theme: 'tukuyomi_admin_theme' };
 const THEMES = ['auto', 'light', 'dark'];
@@ -17,8 +20,8 @@ const THEME_WORDS = { auto: () => t('theme.auto'), light: () => t('theme.light')
 const ROLES = ['viewer', 'operator', 'owner'];
 /** How long the server keeps a session that waits for the code of the second factor. */
 const CODE_WAIT_MS = 5 * 60 * 1000;
-const PASSWORD_MIN = 12;
-const PASSWORD_MAX = 128;
+/** The screens in the order of the menu; the page offers those that the role of the user may open. */
+const screens = [...wafScreens, ...accountScreens, ...userScreens];
 
 function recall(key) {
   try {
@@ -52,11 +55,6 @@ export function describe(error, { change = false } = {}) {
   return t('error.generic');
 }
 
-/** The number of bytes of `text` in UTF-8, which is what the server counts in a password. */
-function bytesOf(text) {
-  return new TextEncoder().encode(text).length;
-}
-
 class App {
   constructor(root) {
     this.root = root;
@@ -70,6 +68,8 @@ class App {
     /** Counts the views: an answer that comes after the view it was asked for has gone is dropped. */
     this.epoch = 0;
     this.redraw = () => this.boot();
+    /** True while the page is drawn again only for the language: what a screen holds to show once is kept. */
+    this.redrawing = false;
     this.codeBy = 0;
     const saved = recall(KEYS.theme);
     this.theme = THEMES.includes(saved) ? saved : 'auto';
@@ -98,7 +98,12 @@ class App {
     setLanguage(code);
     remember(KEYS.language, code);
     globalThis.document.documentElement.lang = code;
-    this.redraw();
+    this.redrawing = true;
+    try {
+      this.redraw();
+    } finally {
+      this.redrawing = false;
+    }
   }
 
   cycleTheme(button) {
@@ -238,6 +243,8 @@ class App {
 
   showLogin(why) {
     this.leave();
+    forgetHeld();
+    forgetEnded();
     this.user = null;
     this.api.csrf = null;
     this.status = { data: null, error: null, at: null, busy: false };
@@ -350,76 +357,39 @@ class App {
   showPassword() {
     this.leave();
     this.redraw = () => this.showPassword();
-    const epoch = this.epoch;
-    const messages = el('div', { class: 'stack', 'aria-live': 'polite' });
-    const attributes = { type: 'password', autocomplete: 'new-password', maxlength: '128', required: true };
-    const current = this.field(t('password.current'), { ...attributes, autocomplete: 'current-password', name: 'current' });
-    const next = this.field(t('password.new'), { ...attributes, name: 'new' });
-    const again = this.field(t('password.confirm'), { ...attributes, name: 'again' });
-    const submit = el('button', { type: 'submit', class: 'btn btn-primary' }, t('password.submit'));
-    const form = el(
-      'form',
-      {
-        class: 'stack',
-        on: {
-          submit: async (event) => {
-            event.preventDefault();
-            if (submit.disabled) return;
-            const typed = { current: current.input.value, next: next.input.value, again: again.input.value };
-            const size = bytesOf(typed.next);
-            const problem =
-              typed.next !== typed.again
-                ? t('password.mismatch')
-                : size < PASSWORD_MIN || size > PASSWORD_MAX
-                  ? t('password.length')
-                  : typed.next === typed.current
-                    ? t('password.same')
-                    : null;
-            if (problem !== null) {
-              mount(messages, notice('bad', problem));
-              return;
-            }
-            await this.guarded(submit, async () => {
-              try {
-                await this.api.call('PUT', '/api/account/password', { current: typed.current, new: typed.next });
-              } catch (error) {
-                if (!this.live(epoch)) return;
-                mount(messages, notice('bad', describe(error, { change: true })));
-                for (const field of [current, next, again]) field.input.value = '';
-                current.input.focus();
-                return;
-              }
-              // The password is changed, and the change gives a new session; read it to find the next gate.
-              try {
-                if (this.api.csrf === null) this.showLogin(() => t('login.ended'));
-                else this.enter(await this.api.call('GET', '/api/session'));
-              } catch (error) {
-                // A 401 has taken the page to the sign-in already. Any other failure must not read as a failed change.
-                if (!(error instanceof ApiError && error.kind === 'session')) this.showLogin(() => t('login.changed'));
-              }
-            });
-          },
-        },
-      },
-      // Not shown: the name of the account, so that a password manager can tell whose password is changed.
-      el('input', { type: 'text', name: 'username', autocomplete: 'username', value: this.user.name, readonly: true, hidden: true }),
-      current.row,
-      next.row,
-      again.row,
-      el('p', { class: 'muted small' }, t('password.hint')),
-      submit,
-    );
+    const messages = el('div', { class: 'notes', 'aria-live': 'polite' });
+    const form = passwordForm(this.formContext(), {
+      username: this.user.name,
+      messages,
+      onChanged: () => this.afterRenewal(() => t('login.changed')),
+    });
     const out = this.signOutButton(t('bar.logout'), 'btn btn-link', messages);
-    this.gatePage(t('password.title'), el('p', {}, t('password.intro')), messages, form, el('div', { class: 'actions' }, out));
-    current.input.focus();
+    this.gatePage(t('password.title'), el('p', {}, t('password.intro')), messages, form.node, el('div', { class: 'actions' }, out));
+    form.focus();
+  }
+
+  /**
+   * After a change that gave the session a new CSRF token (the password, the second factor): reads the session to find
+   * the next gate. A session that the API could not renew is gone, and a session that cannot be read is told as `lost`.
+   */
+  async afterRenewal(lost) {
+    try {
+      if (this.api.csrf === null) this.showLogin(() => t('login.ended'));
+      else this.enter(await this.api.call('GET', '/api/session'));
+    } catch (error) {
+      // A 401 has taken the page to the sign-in already. Any other failure must not read as a failed change.
+      if (!(error instanceof ApiError && error.kind === 'session')) this.showLogin(lost);
+    }
   }
 
   showSetup() {
     this.leave();
     this.redraw = () => this.showSetup();
-    const messages = el('div', { class: 'stack', 'aria-live': 'polite' });
-    const out = this.signOutButton(t('bar.logout'), 'btn btn-primary', messages);
-    this.gatePage(t('setup.title'), notice('info', t('setup.body')), messages, el('div', { class: 'actions' }, out));
+    const messages = el('div', { class: 'notes', 'aria-live': 'polite' });
+    const setup = mfaSetup(this.formContext(), { onDone: () => this.afterRenewal(() => t('login.mfa_changed')) });
+    this.teardown.push(() => setup.stop());
+    const out = this.signOutButton(t('bar.logout'), 'btn btn-link', messages);
+    this.gatePage(t('setup.title'), notice('info', t('setup.body')), messages, setup.node, el('div', { class: 'actions' }, out));
   }
 
   // ---- the shell and its screens ----
@@ -452,9 +422,19 @@ class App {
     for (const listener of this.listeners) listener(this.status);
   }
 
-  context() {
+  /** What the forms that a gate and a screen share need of the page. */
+  formContext() {
     return {
       api: this.api,
+      describe,
+      guarded: (button, task) => this.guarded(button, task),
+      redrawing: () => this.redrawing,
+    };
+  }
+
+  context() {
+    return {
+      ...this.formContext(),
       user: this.user,
       status: () => this.status,
       refreshStatus: () => this.refreshStatus(),
@@ -462,7 +442,7 @@ class App {
         this.listeners.add(listener);
         return () => this.listeners.delete(listener);
       },
-      describe,
+      toLogin: (why) => this.showLogin(why),
     };
   }
 

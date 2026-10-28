@@ -58,7 +58,7 @@ static INDEX: File = File {
 };
 
 /// The other files, below `/ui/`.
-static FILES: [File; 7] = [
+static FILES: [File; 14] = [
     File {
         name: "app.css",
         kind: CSS,
@@ -93,6 +93,41 @@ static FILES: [File; 7] = [
         name: "waf.js",
         kind: JAVASCRIPT,
         bytes: include_bytes!("../../../admin-ui/js/waf.js"),
+    },
+    File {
+        name: "parts.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/parts.js"),
+    },
+    File {
+        name: "generations.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/generations.js"),
+    },
+    File {
+        name: "import.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/import.js"),
+    },
+    File {
+        name: "records.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/records.js"),
+    },
+    File {
+        name: "account.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/account.js"),
+    },
+    File {
+        name: "users.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/users.js"),
+    },
+    File {
+        name: "qr.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/qr.js"),
     },
 ];
 
