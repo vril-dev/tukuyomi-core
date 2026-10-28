@@ -1,7 +1,9 @@
 //! The `access` and the `rewrite` object of a route in the configuration.
 //!
-//! `access` is `{"deny_cidrs"?, "allow_cidrs"?}`: lists of at most 256 networks each, written as for
-//! `trusted_proxies`. `rewrite` is `{"host"?, "path"?, "query"?, "request_headers"?, "response_headers"?}`: `host` is
+//! `access` is `{"deny_cidrs"?, "allow_cidrs"?, "deny_countries"?, "allow_countries"?}`: lists of at most 256 networks
+//! each, written as for `trusted_proxies`, and of at most 256 countries each, each written as the two upper-case
+//! letters of its ISO 3166-1 alpha-2 code or `UNKNOWN` (see `policy::country`). `rewrite` is `{"host"?, "path"?,
+//! "query"?, "request_headers"?, "response_headers"?}`: `host` is
 //! a name and an optional port as the host of a route is written, without a wildcard, and `path` is a path as the
 //! path of a route is written (see `forward::rewrite` for what the path of a route with and without a `/` at the end
 //! allows). `query` is `{"remove"?, "remove_prefixes"?, "set"?, "add"?}`, and `request_headers` and
@@ -12,11 +14,12 @@
 use serde::Deserialize;
 
 use super::{ConfigError, Object, ensure};
-use crate::forward::client_ip::{Access, Cidr};
+use crate::forward::client_ip::{Access, Cidr, Country};
 use crate::forward::rewrite::{Headers, Query, Rewrite, RewriteError};
 
-/// The most networks in each list of `access`.
+/// The most networks in each list of `access`, and the most countries.
 const MAX_NETWORKS: usize = 256;
+const MAX_COUNTRIES: usize = 256;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +28,10 @@ pub(super) struct RawAccess {
     deny_cidrs: Vec<String>,
     #[serde(default)]
     allow_cidrs: Vec<String>,
+    #[serde(default)]
+    deny_countries: Vec<String>,
+    #[serde(default)]
+    allow_countries: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -94,15 +101,28 @@ fn networks(list: &[String]) -> Result<Vec<Cidr>, ConfigError> {
         .ok_or(ConfigError("access has an entry that is not a network"))
 }
 
-/// The networks of a route.
+fn countries(list: &[String]) -> Result<Vec<Country>, ConfigError> {
+    ensure(
+        list.len() <= MAX_COUNTRIES,
+        "access has a list of more than 256 countries",
+    )?;
+    list.iter()
+        .map(|text| Country::parse(text))
+        .collect::<Option<Vec<Country>>>()
+        .ok_or(ConfigError("access has an entry that is not a country"))
+}
+
+/// The networks and countries of a route, or of the configuration as a whole.
 pub(super) fn access(raw: Option<Object<RawAccess>>) -> Result<Access, ConfigError> {
     let Some(Object(raw)) = raw else {
         return Ok(Access::default());
     };
-    Ok(Access::new(
-        networks(&raw.deny_cidrs)?,
-        networks(&raw.allow_cidrs)?,
-    ))
+    Ok(
+        Access::new(networks(&raw.deny_cidrs)?, networks(&raw.allow_cidrs)?).with_countries(
+            countries(&raw.deny_countries)?,
+            countries(&raw.allow_countries)?,
+        ),
+    )
 }
 
 fn query(raw: Option<Object<RawQuery>>) -> Result<Query, ConfigError> {

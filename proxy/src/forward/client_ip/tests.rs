@@ -207,20 +207,81 @@ fn access(deny: &[&str], allow: &[&str]) -> Access {
 
 #[test]
 fn a_denied_network_is_turned_away_and_an_allow_list_turns_away_all_outside_it() {
+    // Where the lists name no country, the country does not matter.
+    let permits = |access: &Access, text: &str| access.permits(ip(text), Country::Unknown);
     let anyone = Access::default();
-    assert!(anyone.permits(ip("203.0.113.5")) && anyone.permits(ip("2001:db8::1")));
+    assert!(permits(&anyone, "203.0.113.5") && permits(&anyone, "2001:db8::1"));
     // The edge of a /24, and one past it on each side.
     let deny = access(&["192.0.2.0/24"], &[]);
-    assert!(!deny.permits(ip("192.0.2.0")) && !deny.permits(ip("192.0.2.255")));
-    assert!(deny.permits(ip("192.0.1.255")) && deny.permits(ip("192.0.3.0")));
+    assert!(!permits(&deny, "192.0.2.0") && !permits(&deny, "192.0.2.255"));
+    assert!(permits(&deny, "192.0.1.255") && permits(&deny, "192.0.3.0"));
     let allow = access(&[], &["192.0.2.0/24"]);
-    assert!(allow.permits(ip("192.0.2.0")) && allow.permits(ip("192.0.2.255")));
-    assert!(!allow.permits(ip("192.0.1.255")) && !allow.permits(ip("192.0.3.0")));
-    assert!(!allow.permits(ip("2001:db8::1")));
+    assert!(permits(&allow, "192.0.2.0") && permits(&allow, "192.0.2.255"));
+    assert!(!permits(&allow, "192.0.1.255") && !permits(&allow, "192.0.3.0"));
+    assert!(!permits(&allow, "2001:db8::1"));
     // Deny is looked at first, and an IPv4 address that is mapped is the IPv4 address.
     let both = access(&["192.0.2.128/25"], &["192.0.2.0/24"]);
-    assert!(both.permits(ip("192.0.2.127")));
-    assert!(!both.permits(ip("192.0.2.128")));
-    assert!(!deny.permits(ip("::ffff:192.0.2.9")));
-    assert!(allow.permits(ip("::ffff:192.0.2.9")));
+    assert!(permits(&both, "192.0.2.127"));
+    assert!(!permits(&both, "192.0.2.128"));
+    assert!(!permits(&deny, "::ffff:192.0.2.9"));
+    assert!(permits(&allow, "::ffff:192.0.2.9"));
+}
+
+fn countries(list: &[&str]) -> Vec<Country> {
+    list.iter()
+        .map(|text| Country::parse(text).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_country_is_two_upper_case_letters_or_unknown_and_nothing_else() {
+    assert_eq!(Country::parse("JP"), Some(Country::Known(*b"JP")));
+    assert_eq!(Country::parse("UNKNOWN"), Some(Country::Unknown));
+    for bad in [
+        "", "J", "JPN", "jp", "Jp", "J1", "J ", "unknown", "Unknown", "\u{e9}a",
+    ] {
+        assert_eq!(Country::parse(bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn a_denied_country_is_turned_away_and_each_allow_list_that_is_not_empty_has_to_hold_the_client() {
+    let (jp, us) = (Country::Known(*b"JP"), Country::Known(*b"US"));
+    let client = ip("203.0.113.5");
+    let with =
+        |deny: &[&str], allow: &[&str], deny_countries: &[&str], allow_countries: &[&str]| {
+            access(deny, allow)
+                .with_countries(countries(deny_countries), countries(allow_countries))
+        };
+    let deny = with(&[], &[], &["JP", "UNKNOWN"], &[]);
+    assert!(!deny.permits(client, jp) && !deny.permits(client, Country::Unknown));
+    assert!(deny.permits(client, us));
+    let allow = with(&[], &[], &[], &["JP", "UNKNOWN"]);
+    assert!(allow.permits(client, jp) && allow.permits(client, Country::Unknown));
+    assert!(!allow.permits(client, us));
+    // A deny of either kind turns the client away, also if it is in an allow list.
+    let both = with(&["203.0.113.0/24"], &[], &[], &["JP"]);
+    assert!(!both.permits(client, jp));
+    let both = with(&[], &["203.0.113.0/24"], &["JP"], &["JP", "US"]);
+    assert!(!both.permits(client, jp));
+    // Both allow lists are present: the client has to be in the networks and in the countries.
+    let both = with(&[], &["203.0.113.0/24"], &[], &["JP"]);
+    assert!(both.permits(client, jp));
+    assert!(!both.permits(client, us));
+    assert!(!both.permits(ip("198.51.100.5"), jp));
+    // The lists of networks alone do not look at the country.
+    assert!(access(&[], &["203.0.113.0/24"]).permits(client, us));
+}
+
+#[test]
+fn a_list_of_countries_makes_an_access_that_is_not_empty() {
+    let jp = countries(&["JP"]);
+    assert!(Access::default().is_empty() && !Access::default().has_countries());
+    for list in [
+        Access::default().with_countries(jp.clone(), Vec::new()),
+        Access::default().with_countries(Vec::new(), jp),
+    ] {
+        assert!(!list.is_empty() && list.has_countries());
+    }
+    assert!(!access(&["10.0.0.0/8"], &[]).has_countries());
 }

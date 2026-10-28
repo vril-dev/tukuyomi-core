@@ -129,6 +129,7 @@ pub(super) async fn run(
         ids,
         counters: Counters::start(),
         access: policy.access,
+        country: policy.country,
         rate_limit: policy.rate_limit.as_ref().map(RateLimit::new),
     });
     let readiness = Arc::new(Readiness::new());

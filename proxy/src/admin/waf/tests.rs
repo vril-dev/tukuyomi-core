@@ -508,6 +508,9 @@ fn a_switch_is_written_to_the_history_and_a_rollback_goes_to_the_from_of_the_las
     assert_eq!(first.status, StatusCode::OK);
     assert_eq!(first.body["result"], "switched");
     assert_eq!((rig.current(), rig.serving()), (Some(g2), g2));
+    // The status says where a rollback would go, and a rollback goes there.
+    let status = rig.get(Op::Status, "/api/status", "");
+    assert_eq!(status.body["rollback_to"], g1.hex());
     assert_eq!(rig.activate(g3, g2).body["result"], "switched");
     // The proxy refuses the next one: the store chooses it all the same, and the history says what happened.
     rig.behave(Behavior::Refuse);
@@ -833,6 +836,9 @@ fn the_status_the_generations_and_one_generation_show_the_store_and_the_proxy() 
     assert_eq!(status.body["reachable"], true);
     assert_eq!(status.body["proxy"]["generation"], g1.hex());
     assert_eq!(status.body["proxy"]["phase"], "ready");
+    // No switch has been asked for, and the configuration names no CRS.
+    assert_eq!(status.body["rollback_to"], Value::Null);
+    assert_eq!(status.body["crs"], json!({"available": false, "files": []}));
 
     let list = rig.get(Op::Generations, "/api/generations", "");
     assert_eq!(list.body["reachable"], true);
@@ -872,6 +878,72 @@ fn the_status_the_generations_and_one_generation_show_the_store_and_the_proxy() 
             "{path}"
         );
     }
+}
+
+#[test]
+fn the_status_lists_the_conf_files_of_the_crs_directory_by_name_only() {
+    let mut rig = rig(false);
+    let crs = scratch();
+    let rules = crs.path().join("rules");
+    fs::create_dir(&rules).unwrap();
+    for name in ["b.conf", "a.conf", "c.data", "d.example"] {
+        fs::write(rules.join(name), b"x").unwrap();
+    }
+    fs::create_dir(rules.join("e.conf")).unwrap();
+    std::os::unix::fs::symlink(rules.join("a.conf"), rules.join("f.conf")).unwrap();
+    rig.waf.crs_dir = Some(crs.path().to_path_buf());
+    let status = rig.get(Op::Status, "/api/status", "");
+    assert_eq!(
+        status.body["crs"],
+        json!({"available": true, "files": ["a.conf", "b.conf"]})
+    );
+    assert!(
+        !status
+            .body
+            .to_string()
+            .contains(crs.path().to_str().unwrap())
+    );
+    // A directory that cannot be read: the CRS is configured, and no file is listed.
+    rig.waf.crs_dir = Some(crs.path().join("missing"));
+    let gone = rig.get(Op::Status, "/api/status", "");
+    assert_eq!(gone.body["crs"], json!({"available": true, "files": []}));
+    // A link in place of the directory, or of its `rules` directory, is not followed, as the import does not.
+    let linked = scratch();
+    std::os::unix::fs::symlink(crs.path(), linked.path().join("whole")).unwrap();
+    std::os::unix::fs::symlink(&rules, linked.path().join("rules")).unwrap();
+    for dir in [linked.path().join("whole"), linked.path().to_path_buf()] {
+        rig.waf.crs_dir = Some(dir);
+        let status = rig.get(Op::Status, "/api/status", "");
+        assert_eq!(status.body["crs"], json!({"available": true, "files": []}));
+    }
+}
+
+#[test]
+fn the_status_is_refused_when_the_history_cannot_be_read_or_the_generations_cannot_be_listed() {
+    let rig = rig(false);
+    let g1 = rig.make(1);
+    rig.start_on(g1);
+    assert_eq!(
+        rig.get(Op::Status, "/api/status", "").status,
+        StatusCode::OK
+    );
+    // A directory in place of the history: 503, as the history route answers.
+    let history = rig.dir.path().join("admin").join("activations.log");
+    fs::create_dir(&history).unwrap();
+    let unreadable = rig.get(Op::Status, "/api/status", "");
+    assert_eq!(unreadable.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(unreadable.body, json!({"error": "unavailable"}));
+    fs::remove_dir(&history).unwrap();
+    // A file in place of the directory of the generations: the rules store cannot list them, and says why.
+    let generations = rig.dir.path().join("rules").join("generations");
+    fs::remove_dir_all(&generations).unwrap();
+    fs::write(&generations, b"x").unwrap();
+    let broken = rig.get(Op::Status, "/api/status", "");
+    assert_eq!(broken.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        broken.body,
+        json!({"error": "the generations directory is not a real directory"})
+    );
 }
 
 #[test]

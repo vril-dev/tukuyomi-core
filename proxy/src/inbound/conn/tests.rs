@@ -251,6 +251,7 @@ impl Rig {
             ids: RequestIds::new().unwrap(),
             counters: Counters::start(),
             access: Access::default(),
+            country: None,
             rate_limit: None,
         });
         let (driver, full) = match mode {
@@ -1007,8 +1008,13 @@ use crate::forward::client_ip::{Access, Cidr};
 /// A forwarding configuration whose one route holds for every request and has these access lists.
 pub(in crate::inbound) fn guarded(deny: &[&str], allow: &[&str]) -> ForwardConfig {
     let nets = |list: &[&str]| list.iter().map(|net| Cidr::parse(net).unwrap()).collect();
+    guarded_by(Access::new(nets(deny), nets(allow)))
+}
+
+/// The same, with this `access`.
+fn guarded_by(access: Access) -> ForwardConfig {
     let route = RouteConfig {
-        access: Access::new(nets(deny), nets(allow)),
+        access,
         ..RouteConfig::plain(0)
     };
     let mut forward = ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]);
@@ -1462,5 +1468,179 @@ fn a_request_the_access_of_the_configuration_turns_away_is_recorded_as_rejected_
                 serde_json::json!("denied by access")
             )]
         );
+    });
+}
+
+// ---- the countries of the access of the configuration and of a route ----
+
+use crate::forward::client_ip::Country;
+use crate::policy::country::Geo;
+use crate::policy::mmdb::tests::{Record, database};
+
+impl Rig {
+    /// The same rig, with this country database.
+    pub(in crate::inbound) fn with_countries(mut self, geo: Geo) -> Rig {
+        let ctx = Arc::get_mut(&mut self.ctx).expect("no connection has started");
+        ctx.country = Some(geo);
+        self
+    }
+}
+
+/// A database in which 203.0.113.0/24 is in JP and 198.51.100.0/24 is in US. An address on the loopback is in neither,
+/// and in no country.
+pub(in crate::inbound) fn countries() -> Geo {
+    let networks = [
+        ("203.0.113.0/24", Record::Country("JP")),
+        ("198.51.100.0/24", Record::Country("US")),
+    ];
+    Geo::open(database(true, 24, &networks)).unwrap()
+}
+
+/// An access with these countries and no networks.
+pub(in crate::inbound) fn in_countries(deny: &[&str], allow: &[&str]) -> Access {
+    let codes = |list: &[&str]| -> Vec<Country> {
+        list.iter()
+            .map(|code| Country::parse(code).unwrap())
+            .collect()
+    };
+    Access::new(Vec::new(), Vec::new()).with_countries(codes(deny), codes(allow))
+}
+
+/// A POST from the loopback address to a proxy with the `countries` database, when the `access` of the configuration
+/// is `global` and the one route has the access `route`, `trusted` are the networks of `trusted_proxies` and the
+/// request has the extra fields `extra`: the status of the answer, the number of tickets the driver got and the reason
+/// of the record. The driver blocks every ticket with 403, so a request that is inspected is told from one that is
+/// turned away by its ticket.
+async fn country_post(
+    global: Access,
+    route: Access,
+    trusted: &[&str],
+    extra: &str,
+) -> (u16, usize, serde_json::Value) {
+    let cfg = ProxyConfig {
+        trusted_proxies: nets(trusted),
+        ..config()
+    };
+    let rig = Rig::with(cfg, Mode::Answer(BLOCK), &guarded_by(route))
+        .await
+        .with_policy(global, None)
+        .with_countries(countries());
+    let lines = rig.lines.clone();
+    let (client, task) = rig.connect().await;
+    put(
+        &client,
+        &form_post(&format!("{extra}Content-Length: 3\r\n\r\na=b")),
+    )
+    .await;
+    let response = parse_response(&read_all(&client).await);
+    drop(client);
+    let seen = rig.finish(task).await.len();
+    let reasons: Vec<_> = lines
+        .take()
+        .into_iter()
+        .filter(|record| record["type"] == "request")
+        .map(|record| record["reason"].clone())
+        .collect();
+    assert_eq!(reasons.len(), 1);
+    (response.status, seen, reasons[0].clone())
+}
+
+/// The same for an `access` of the configuration that has these countries: the status and the tickets.
+async fn by_configuration(
+    deny: &[&str],
+    allow: &[&str],
+    trusted: &[&str],
+    extra: &str,
+) -> (u16, usize) {
+    let access = in_countries(deny, allow);
+    let (status, seen, _) = country_post(access, Access::default(), trusted, extra).await;
+    (status, seen)
+}
+
+/// The same for an `access` of the route, from a peer that is trusted.
+async fn by_route(access: Access, extra: &str) -> (u16, usize) {
+    let (status, seen, _) = country_post(Access::default(), access, &["127.0.0.0/8"], extra).await;
+    (status, seen)
+}
+
+const JP: &str = "X-Forwarded-For: 203.0.113.9\r\n";
+const US: &str = "X-Forwarded-For: 198.51.100.9\r\n";
+
+#[test]
+fn a_client_whose_country_the_access_of_the_configuration_turns_away_gets_403_before_the_body_is_read()
+ {
+    run(async {
+        let trusted = ["127.0.0.0/8"];
+        // The country of the address that a trusted peer names: a deny turns it away, and so does an allow list that
+        // does not hold it. A client that is not turned away is inspected, and the driver blocks it.
+        assert_eq!(by_configuration(&["JP"], &[], &trusted, JP).await, (403, 0));
+        assert_eq!(by_configuration(&["US"], &[], &trusted, JP).await, (403, 1));
+        assert_eq!(by_configuration(&[], &["US"], &trusted, JP).await, (403, 0));
+        assert_eq!(by_configuration(&[], &["JP"], &trusted, JP).await, (403, 1));
+        assert_eq!(
+            by_configuration(&["JP"], &["JP", "US"], &trusted, JP).await,
+            (403, 0)
+        );
+        assert_eq!(
+            by_configuration(&[], &["JP", "US"], &trusted, US).await,
+            (403, 1)
+        );
+        // The loopback address has no country: it is UNKNOWN, which the lists can name.
+        assert_eq!(by_configuration(&[], &["JP"], &[], "").await, (403, 0));
+        assert_eq!(by_configuration(&["UNKNOWN"], &[], &[], "").await, (403, 0));
+        assert_eq!(by_configuration(&[], &["UNKNOWN"], &[], "").await, (403, 1));
+        assert_eq!(by_configuration(&["JP"], &[], &[], "").await, (403, 1));
+        // The country of the address that a peer that is not trusted names does not count.
+        assert_eq!(by_configuration(&["JP"], &[], &[], JP).await, (403, 1));
+        assert_eq!(by_configuration(&[], &["JP"], &[], JP).await, (403, 0));
+    });
+}
+
+#[test]
+fn a_client_whose_country_the_access_of_a_route_turns_away_gets_403_and_the_networks_are_asked_too()
+{
+    run(async {
+        assert_eq!(by_route(in_countries(&["JP"], &[]), JP).await, (403, 0));
+        assert_eq!(by_route(in_countries(&["US"], &[]), JP).await, (403, 1));
+        assert_eq!(by_route(in_countries(&[], &["US"]), JP).await, (403, 0));
+        assert_eq!(by_route(in_countries(&[], &["JP"]), JP).await, (403, 1));
+        assert_eq!(
+            by_route(in_countries(&[], &["UNKNOWN"]), "").await,
+            (403, 1)
+        );
+        assert_eq!(by_route(in_countries(&[], &["JP"]), "").await, (403, 0));
+        // Both kinds of allow list have to hold the client.
+        let both = |net: &str| {
+            Access::new(Vec::new(), nets(&[net]))
+                .with_countries(Vec::new(), vec![Country::Known(*b"JP")])
+        };
+        assert_eq!(by_route(both("203.0.113.0/24"), JP).await, (403, 1));
+        assert_eq!(by_route(both("198.51.100.0/24"), JP).await, (403, 0));
+        assert_eq!(by_route(both("203.0.113.0/24"), US).await, (403, 0));
+    });
+}
+
+#[test]
+fn the_record_of_a_request_turned_away_by_country_says_whether_the_configuration_or_the_route_did_it()
+ {
+    run(async {
+        let trusted = ["127.0.0.0/8"];
+        let (status, seen, reason) =
+            country_post(in_countries(&["JP"], &[]), Access::default(), &trusted, JP).await;
+        assert_eq!((status, seen), (403, 0));
+        assert_eq!(reason, "denied by access");
+        let (status, seen, reason) =
+            country_post(Access::default(), in_countries(&["JP"], &[]), &trusted, JP).await;
+        assert_eq!((status, seen), (403, 0));
+        assert_eq!(reason, "denied by route access");
+        // Both turn the client away: the configuration is asked first.
+        let both = country_post(
+            in_countries(&["JP"], &[]),
+            in_countries(&["JP"], &[]),
+            &trusted,
+            JP,
+        )
+        .await;
+        assert_eq!(both.2, "denied by access");
     });
 }

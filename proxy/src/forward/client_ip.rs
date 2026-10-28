@@ -7,8 +7,9 @@
 //! client, whatever its lines say. An address taken from the lines has no port of its own, so its port is 0.
 //! Everything here is a pure function of its arguments.
 //!
-//! `Access` is the lists of networks of a route: the client of a request, as found above, decides whether the
-//! route may be used. A request is held to the lists of every route it could be taken for, however its path is
+//! `Access` is the lists of networks and of countries of a route, and of the configuration as a whole: the client of
+//! a request, as found above, decides whether the route may be used. The country is that of the same address (see
+//! `policy::country`). A request is held to the lists of every route it could be taken for, however its path is
 //! written, not only of the one it was matched to (see `route` and `inbound::conn`). The default route has no
 //! lists.
 
@@ -83,27 +84,78 @@ pub fn trusts(list: &[Cidr], ip: IpAddr) -> bool {
     list.iter().any(|net| net.contains(ip))
 }
 
-/// The networks that decide who may use a route. A client in a `deny` network is turned away; so is a client in
-/// none of the `allow` networks, if there are any. Both lists empty turn nobody away.
+/// A country, as the lists of an `Access` and the country database name it: the two letters of its ISO 3166-1 alpha-2
+/// code, or `Unknown` for an address that no country is known for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Country {
+    Known([u8; 2]),
+    Unknown,
+}
+
+impl Country {
+    /// `UNKNOWN`, or a code of exactly two upper-case ASCII letters; anything else, lower case included, is `None`.
+    /// A code is not looked up in the list of ISO 3166: a database may hold codes that the list has not.
+    pub fn parse(text: &str) -> Option<Country> {
+        if text == "UNKNOWN" {
+            return Some(Country::Unknown);
+        }
+        match text.as_bytes() {
+            &[a, b] if a.is_ascii_uppercase() && b.is_ascii_uppercase() => {
+                Some(Country::Known([a, b]))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The networks and the countries that decide who may use a route. A client in a `deny` network or country is turned
+/// away; so is a client that is outside the `allow` networks, if there are any, and one that is outside the `allow`
+/// countries, if there are any: every list of `allow` that is not empty has to hold the client. All four lists empty
+/// turn nobody away.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Access {
     deny: Vec<Cidr>,
     allow: Vec<Cidr>,
+    deny_countries: Vec<Country>,
+    allow_countries: Vec<Country>,
 }
 
 impl Access {
     pub fn new(deny: Vec<Cidr>, allow: Vec<Cidr>) -> Access {
-        Access { deny, allow }
+        Access {
+            deny,
+            allow,
+            deny_countries: Vec::new(),
+            allow_countries: Vec::new(),
+        }
     }
 
-    /// Whether the client at `ip` may use the route.
-    pub fn permits(&self, ip: IpAddr) -> bool {
-        !trusts(&self.deny, ip) && (self.allow.is_empty() || trusts(&self.allow, ip))
+    /// The same lists, with these countries.
+    pub fn with_countries(self, deny: Vec<Country>, allow: Vec<Country>) -> Access {
+        Access {
+            deny_countries: deny,
+            allow_countries: allow,
+            ..self
+        }
     }
 
-    /// Whether both lists are empty, so that nobody is turned away.
+    /// Whether the client at `ip`, which is in `country`, may use the route. `country` is only asked of the lists of
+    /// countries, so it can be `Country::Unknown` where there are none.
+    pub fn permits(&self, ip: IpAddr, country: Country) -> bool {
+        !trusts(&self.deny, ip)
+            && !self.deny_countries.contains(&country)
+            && (self.allow.is_empty() || trusts(&self.allow, ip))
+            && (self.allow_countries.is_empty() || self.allow_countries.contains(&country))
+    }
+
+    /// Whether all four lists are empty, so that nobody is turned away.
     pub fn is_empty(&self) -> bool {
-        self.deny.is_empty() && self.allow.is_empty()
+        self.deny.is_empty() && self.allow.is_empty() && !self.has_countries()
+    }
+
+    /// Whether a list of countries is not empty.
+    pub fn has_countries(&self) -> bool {
+        !self.deny_countries.is_empty() || !self.allow_countries.is_empty()
     }
 }
 

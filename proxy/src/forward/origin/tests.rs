@@ -93,6 +93,7 @@ pub(in crate::forward) fn ctx_of(forward: &ForwardConfig, cfg: ProxyConfig) -> C
         ids: RequestIds::new().unwrap(),
         counters: Counters::start(),
         access: Access::default(),
+        country: None,
         rate_limit: None,
         cfg,
     }

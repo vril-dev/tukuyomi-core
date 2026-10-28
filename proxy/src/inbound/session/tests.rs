@@ -1690,3 +1690,32 @@ fn a_redirect_listener_judges_and_records_the_client_that_a_trusted_peer_names()
         }
     });
 }
+
+use crate::inbound::conn::tests::{countries, in_countries};
+
+#[test]
+fn a_redirect_listener_judges_the_country_of_the_client_that_a_trusted_peer_names() {
+    run(async {
+        let pki = Pki::new();
+        let proofs = Dir::new();
+        // The client is on the loopback address and says in `X-Forwarded-For` that it is 203.0.113.9, which the
+        // database puts in JP. The list that names JP turns it away with 403, and the one that does not lets the
+        // redirect through.
+        let request =
+            "GET /p HTTP/1.1\r\nHost: www.a.example\r\nX-Forwarded-For: 203.0.113.9\r\n\r\n";
+        for (deny, allow, status) in [
+            (&["JP"][..], &[][..], 403),
+            (&["US"], &[], 308),
+            (&[], &["US"], 403),
+            (&[], &["JP"], 308),
+        ] {
+            let access = in_countries(deny, allow);
+            let rig = policed_redirects(&pki, &proofs, access, None, &["127.0.0.0/8"])
+                .await
+                .with_countries(countries());
+            let answer = redirected(&rig, request).await;
+            assert_eq!(answer.status, status, "{deny:?} {allow:?}");
+            assert!(rig.finish(tokio::spawn(async {})).await.is_empty());
+        }
+    });
+}

@@ -5,14 +5,16 @@
 //! with a token may use all of these routes; the audit log shows the token (`auth`) where it shows the session.
 //!
 //! The parts, one file each: `control` (the control socket of the proxy), `history` (what is kept of each switch),
-//! `import` (the body of an import and the trial) and `records` (reading the record files).
+//! `import` (the body of an import and the trial), `records` (reading the record files) and `status` (the status
+//! route).
 //!
 //! The routes (a viewer may use the status, the generations, the history and the records, an operator the import, the
 //! switch, the rollback and the removal as well; a body is JSON of at most 64 KiB, the one of the import 12 MiB; the
 //! answers are JSON, and `error` is a fixed sentence):
-//! - `GET /api/status`: `{"current", "reachable", "proxy"}`: the generation the rules store chooses, and the state of
-//!   the proxy from its control socket (`proxy` is `null` when the state could not be read, and `reachable` is false
-//!   when the proxy cannot be reached; a proxy that has no place for the question is reachable).
+//! - `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "crs"}`: the generation the rules store
+//!   chooses, the state of the proxy from its control socket (`proxy` is `null` when the state could not be read, and
+//!   `reachable` is false when the proxy cannot be reached; a proxy that has no place for the question is reachable),
+//!   the generation a rollback would go to now (`null` for none), and the CRS of the configuration (see `status`).
 //! - `GET /api/generations`: `{"reachable", "generations"}`, the newest first, each with its `fingerprint`, `made`
 //!   (seconds since the epoch), `mode`, number of `routes`, and whether it is `current` and `serving`.
 //! - `GET /api/generations/<fingerprint>`: that, and the `load` order, the `files` (path, size, SHA-256) and the
@@ -61,6 +63,7 @@ pub mod control;
 pub mod history;
 pub mod import;
 pub mod records;
+pub mod status;
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -455,26 +458,6 @@ impl Waf {
         let _ = self
             .audit
             .write(&caller.event(action, outcome).target(target).reason(reason));
-    }
-
-    fn status(&self) -> Answer {
-        let store = match self.rules() {
-            Ok(store) => store,
-            Err(answer) => return answer,
-        };
-        let current = match store.current() {
-            Ok(current) => current,
-            Err(e) => return failed(e),
-        };
-        let proxy = self.control.status();
-        Answer::json(
-            StatusCode::OK,
-            json!({
-                "current": current.map(|current| current.hex()),
-                "reachable": proxy.reachable(),
-                "proxy": proxy.state().map(|status| status.json()),
-            }),
-        )
     }
 
     fn generations(&self) -> Answer {

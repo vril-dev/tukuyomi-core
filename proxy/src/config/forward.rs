@@ -19,11 +19,11 @@
 //! TLS has to be able to use it; without it each server is checked for its own name (so every name of a server of such
 //! a group must be one TLS can use), or, written as an IP literal, for its address.
 //! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?}`.
-//! The `host` and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access` and
-//! `rewrite` are the networks that may use the route and the edits it makes (see `rewrite`). `stream` is `{"idle_ms",
-//! "total_ms", "websocket"}`, all three present: a response on the route may last `total_ms` from its head at the
-//! most (1 ms to 24 h) while the upstream may be silent for `idle_ms` (1 ms up to `total_ms`) and `websocket` tells
-//! whether a WebSocket handshake is let through. `max_body` is the most bytes a request body may have on the route
+//! The `host` and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access`
+//! and `rewrite` are the networks and countries that may use the route and the edits it makes (see `rewrite`).
+//! `stream` is `{"idle_ms", "total_ms", "websocket"}`, all three present: a response on the route may last `total_ms`
+//! from its head at the most (1 ms to 24 h) while the upstream may be silent for `idle_ms` (1 ms up to `total_ms`) and
+//! `websocket` tells whether a WebSocket handshake is let through. `max_body` is the most bytes a request body may have on the route
 //! (0: none); it is not above the `max_body` of the proxy, which the route can only lower. `default_upstream` is the group that serves a request no route
 //! holds for, or the empty string, and then such a request is answered with 404. The default group has no
 //! `access`, no `rewrite`, no `stream` and no `max_body`. The `path` of a route that has an access list is in its canonical

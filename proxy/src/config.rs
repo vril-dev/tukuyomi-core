@@ -1,6 +1,6 @@
 //! The configuration file: one JSON object `{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store":
-//! {..}}, "acme": {..}, "status": {..}, "records": {..}, "access": {..}, "rate_limit": {..}, "admin": {..}}`; every
-//! value is chosen by the operator and checked here.
+//! {..}}, "acme": {..}, "status": {..}, "records": {..}, "access": {..}, "rate_limit": {..}, "geo": {..}, "admin":
+//! {..}}`; every value is chosen by the operator and checked here.
 //!
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present (a
 //! route may leave out its `host`, its `path`, its `access`, its `rewrite`, its `stream` and its `max_body`; `access`
@@ -8,8 +8,8 @@
 //! `tls`, which may leave out its `server_name`; a listener may leave out its `tls` and its `redirect`, and the `tls`
 //! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
 //! may leave out `acme`, which it must have if and only if a certificate has one, see `acme`, and `status`, which
-//! has the one key `listen`, see `status`, and `records`, `access`, `rate_limit` and `admin`, see their files
-//! (`access` and `rate_limit` are in `policy`); an unknown or repeated
+//! has the one key `listen`, see `status`, and `records`, `access`, `rate_limit`, `geo` and `admin`, see their files
+//! (`access`, `rate_limit` and `geo` are in `policy`); an unknown or repeated
 //! key is refused, and so is a value of the wrong
 //! type, an array in place of an object and `null` for a key that may be left out included (such a key is either left
 //! out or has a value). A refusal is one fixed sentence per kind of fault and never carries a key or a value from the
@@ -17,8 +17,8 @@
 //! `status` object against the listeners (before `forward`, for no server may be at its address), the `forward`
 //! values (see `forward`; the names of the servers are not looked up here, `forward::resolve` does that when the proxy
 //! starts), the `rules.store` values, the `acme` object with the certificates that have `acme`, the `records` object,
-//! the `access` and `rate_limit` objects (see `policy`), the `admin` object against the listeners and the status
-//! listener, the directories and the control socket against
+//! the `access`, `rate_limit` and `geo` objects (see `policy`) and that `geo` is there if a list of countries is, the
+//! `admin` object against the listeners and the status listener, the directories and the control socket against
 //! each other (see `places`), the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's
 //! own check, and last the relations between the `proxy` and `kernel` objects.
 //!
@@ -81,7 +81,7 @@ pub use listeners::{
     CertificateAcme, CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion,
     TlsConfig, addresses,
 };
-pub use policy::{PolicyConfig, RateLimitConfig};
+pub use policy::{GeoConfig, PolicyConfig, RateLimitConfig};
 pub(crate) use records::MAX_RECORD_FILES;
 pub use records::RecordsConfig;
 pub use status::StatusConfig;
@@ -175,7 +175,7 @@ pub struct Loaded {
     pub status: Option<StatusConfig>,
     /// There if the file has the `records` object.
     pub records: Option<RecordsConfig>,
-    /// What turns a request away before its route is looked for: the `access` and the `rate_limit` objects.
+    /// What turns a request away before its route is looked for: the `access`, `rate_limit` and `geo` objects.
     pub policy: PolicyConfig,
     /// There if the file has the `admin` object.
     pub admin: Option<AdminConfig>,
@@ -230,6 +230,8 @@ struct RawFile {
     access: Option<Object<rewrite::RawAccess>>,
     #[serde(default, deserialize_with = "present")]
     rate_limit: Option<Object<policy::RawRateLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    geo: Option<Object<policy::RawGeo>>,
     #[serde(default, deserialize_with = "present")]
     admin: Option<Object<admin::RawAdmin>>,
 }
@@ -342,7 +344,7 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
     }
 }
 
-/// Reads and checks the configuration file.
+/// Reads and checks the configuration file, and the country database that its `geo` names (see `policy`).
 pub fn load(path: &Path) -> Result<Loaded, ConfigError> {
     const UNREADABLE: ConfigError = ConfigError("configuration file cannot be read");
     let meta = fs::metadata(path).map_err(|_| UNREADABLE)?;
@@ -355,7 +357,16 @@ pub fn load(path: &Path) -> Result<Loaded, ConfigError> {
         .take(MAX_FILE + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| UNREADABLE)?;
-    parse(&bytes)
+    let mut loaded = parse(&bytes)?;
+    if let Some(geo) = &loaded.policy.geo {
+        // The database is read and checked whether or not a list uses it, so that a bad one is found at once; it is
+        // kept only if one does.
+        let country = geo.open()?;
+        if uses_countries(&loaded.policy, &loaded.forward) {
+            loaded.policy.country = Some(country);
+        }
+    }
+    Ok(loaded)
 }
 
 fn parse(bytes: &[u8]) -> Result<Loaded, ConfigError> {
@@ -389,6 +400,15 @@ fn refusal(e: &serde_json::Error) -> ConfigError {
 
 fn ensure(ok: bool, text: &'static str) -> Result<(), ConfigError> {
     if ok { Ok(()) } else { Err(ConfigError(text)) }
+}
+
+/// Whether the `access` of the configuration or of some route has a list of countries.
+fn uses_countries(policy: &PolicyConfig, forward: &ForwardSettings) -> bool {
+    policy.access.has_countries()
+        || forward
+            .routes
+            .targets()
+            .any(|route| route.access.has_countries())
 }
 
 /// A list of networks for a `trusted_proxies`: at most `MAX_TRUSTED`, each in the form `Cidr::parse` takes. `many` and
@@ -465,6 +485,7 @@ fn build(file: RawFile) -> Result<Loaded, ConfigError> {
         records: rec,
         access: ac,
         rate_limit: rl,
+        geo: ge,
         admin: ad,
     } = file;
     let listeners = listeners::check(p.listeners)?;
@@ -593,7 +614,11 @@ fn build(file: RawFile) -> Result<Loaded, ConfigError> {
 
     let acme = acme::check(a, &listeners)?;
     let records = records::check(rec)?;
-    let policy = policy::check(ac, rl)?;
+    let policy = policy::check(ac, rl, ge)?;
+    ensure(
+        policy.geo.is_some() || !uses_countries(&policy, &forward),
+        "access has a list of countries while geo is left out",
+    )?;
     // Unlike the status listener, the admin process may be the server of an upstream: `bound` above does not hold
     // its address.
     let admin = admin::check(ad, &listeners, status)?;

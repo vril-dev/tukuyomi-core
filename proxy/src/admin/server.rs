@@ -10,7 +10,8 @@
 //! connection lives for the three times together at the most. A head that hyper refuses by itself (a malformed one,
 //! or one over the limit) gets hyper's own answer, or none, and not the fields below.
 //!
-//! Every answer is JSON and has `Content-Type: application/json`, `Cache-Control: no-store`, `X-Content-Type-Options:
+//! The files of the page (`GET /` and `GET /ui/<name>`) are answered first, by `ui`, with fields of their own. Each API
+//! answer is JSON and has `Content-Type: application/json`, `Cache-Control: no-store`, `X-Content-Type-Options:
 //! nosniff`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, `Referrer-Policy: no-referrer`
 //! and `X-Request-ID`. An error is `{"error": "<words>"}`. The number of a request is the value of `X-Request-ID`
 //! when the peer is in `admin.trusted_proxies` and the value has the form that the proxy gives (16 lowercase
@@ -42,6 +43,7 @@
 //! in flight have 10 s to end, and the process exits with code 0. `READY=1` is told after the listener is bound.
 
 mod body;
+mod ui;
 
 use std::convert::Infallible;
 use std::future::poll_fn;
@@ -616,6 +618,9 @@ async fn answer(
     request: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
+    if let Some(page) = ui::serve(&app, &parts.method, parts.uri.path()) {
+        return page;
+    }
     let limit = waf::body_limit(&parts.method, parts.uri.path()).unwrap_or(BODY_MAX);
     let slow = waf::slow(&parts.method, parts.uri.path());
     let wait = if slow { app.answer_wait } else { ANSWER_WAIT };

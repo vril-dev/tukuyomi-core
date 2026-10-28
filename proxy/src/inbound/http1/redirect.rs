@@ -17,7 +17,7 @@ use super::drive::Serving;
 use super::gate::Taken;
 use crate::inbound::answer::{Noted, Reply, not_redirected, redirect, turned_away};
 use crate::inbound::challenge::{Proof, found};
-use crate::inbound::conn::{Ctx, Scheme, after, client_of};
+use crate::inbound::conn::{Ctx, Scheme, after, client_of, country_of};
 use crate::inbound::head::Reject;
 use crate::inbound::session::{Summary, first_head_by, linger, send_and_close};
 use crate::inbound::transport::tls::host_name;
@@ -70,6 +70,7 @@ pub(in crate::inbound) async fn redirect_to(
             ctx.rate_limit.as_ref(),
             &ctx.counters,
             client.ip(),
+            country_of(ctx, client.ip()),
         ) {
             Err(refusal) => (Reply::refused(refusal), turned_away(refusal, &id), 0),
             Ok(()) => {

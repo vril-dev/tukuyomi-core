@@ -4,10 +4,12 @@
 //! hands it over with the request that hyper made of the same bytes; on an HTTP/2 connection it was made from the
 //! fields of the stream (see `http2::head`). A request for the challenge of the CA that issues the certificates with
 //! `acme`, on a plain listener, is answered before all that follows (see `challenge`). The first thing that follows is
-//! the policy of the configuration (see `policy`): a client that the `access` turns away gets 403, and one that is over
-//! the `rate_limit` gets 429 with a `Retry-After`, before any route is looked for, whether the route skips the
-//! inspection or not. The route for the request is looked up next, by its `Host` and its target
-//! as the client sent them. A request that no route holds for, with no default group, is answered with 404, and one
+//! the policy of the configuration (see `policy`): a client that the `access` turns away, by its network or its country,
+//! gets 403, and one that is over the `rate_limit` gets 429 with a `Retry-After`, before any route is looked for,
+//! whether the route skips the inspection or not. The country of the client, which those lists and the lists of the
+//! route may name, is looked up once for the request, if the configuration has a country database (see
+//! `policy::country`). The route for the request is looked up next, by its `Host` and its target as the client sent
+//! them. A request that no route holds for, with no default group, is answered with 404, and one
 //! from a client that the access lists of its route turn away with 403, before anything of its body is read and before
 //! the inspection is asked for. So is a request on a connection that ended TLS, whose `Host` is not one of the hosts of
 //! the certificate that the handshake used, or cannot be read (421; it comes before the route is looked up), and so is
@@ -53,7 +55,7 @@
 //! puts off the end of the connection once its head is ready (see `session`). A sum that does not fit into the
 //! clock counts as passed.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -68,7 +70,7 @@ use tokio::time::{Instant, timeout_at};
 
 use self::fault::upstream_stop;
 use crate::config::{ProxyConfig, STREAM_HOLD, Stream};
-use crate::forward::client_ip::{self, Access, Cidr};
+use crate::forward::client_ip::{self, Access, Cidr, Country};
 use crate::forward::group::{Route, Upstreams};
 use crate::forward::origin::{self, Forward, OriginBody};
 use crate::forward::tunnel::{self, Record, Tunnel};
@@ -86,6 +88,7 @@ use crate::inbound::upload::{Fate, Terms, Upload};
 use crate::inspect::driver::{Answer, BodyHold, Hold, Ingress, InspectReq, Judge, Msg, Ticket};
 use crate::log::Log;
 use crate::log::counters::Counters;
+use crate::policy::country::Geo;
 use crate::policy::{self, RateLimit, Refusal};
 use crate::rules::routes::SharedRoutes;
 
@@ -97,8 +100,8 @@ pub(super) use self::fault::peer_gone;
 /// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, the
 /// upstream groups with the routes to them and the connections that wait to be used again, the way to the driver,
 /// the TLS of the listeners that end it, the answer to the challenge of the CA, if the configuration has `acme`, the
-/// numbers of the requests, the networks that may not use the proxy at all, the rate limit if the configuration has one,
-/// and the counters that `/metrics` shows.
+/// numbers of the requests, the networks and countries that may not use the proxy at all, the country database if some
+/// list of countries needs one, the rate limit if the configuration has one, and the counters that `/metrics` shows.
 pub struct Ctx {
     pub cfg: ProxyConfig,
     pub budget: Arc<Semaphore>,
@@ -113,6 +116,8 @@ pub struct Ctx {
     pub counters: Counters,
     /// The `access` of the configuration: asked of every request before its route is looked for.
     pub access: Access,
+    /// The country database, there if some list of countries of the `access` or of a route needs one.
+    pub country: Option<Geo>,
     /// The `rate_limit` of the configuration, if it has one.
     pub rate_limit: Option<RateLimit>,
 }
@@ -147,6 +152,13 @@ pub(super) fn client_of(head: &Head, peer: SocketAddr, trusted: &[Cidr]) -> Sock
     client_ip::effective(peer, trusted, &lines)
 }
 
+/// The country of the client at `client`, which is `Country::Unknown` if there is no database, for then no list asks.
+pub(super) fn country_of(ctx: &Ctx, client: IpAddr) -> Country {
+    ctx.country
+        .as_ref()
+        .map_or(Country::Unknown, |geo| geo.country(client))
+}
+
 /// The state of one request that its service reads.
 pub(super) struct Conn {
     ctx: Arc<Ctx>,
@@ -159,6 +171,8 @@ pub(super) struct Conn {
     /// The address that stands for the client: the peer, or what a trusted peer says (see `client_ip`). The
     /// inspection and the record use it.
     client: SocketAddr,
+    /// The country of `client`, found once for the request.
+    country: Country,
     local: SocketAddr,
     scheme: Scheme,
     gauge: Gauge,
@@ -225,6 +239,7 @@ impl Conn {
             ctx: ctx.clone(),
             id,
             request,
+            country: country_of(ctx, client.ip()),
             client,
             head,
             peer,
@@ -479,8 +494,14 @@ impl Conn {
     fn route(&self) -> Result<Route<'_>, Stop> {
         let client = self.client.ip();
         let ctx = &self.ctx;
-        policy::check(&ctx.access, ctx.rate_limit.as_ref(), &ctx.counters, client)
-            .map_err(|refusal| self.turned_away_by(refusal))?;
+        policy::check(
+            &ctx.access,
+            ctx.rate_limit.as_ref(),
+            &ctx.counters,
+            client,
+            self.country,
+        )
+        .map_err(|refusal| self.turned_away_by(refusal))?;
         let (host, target) = (self.head.host(), self.head.target());
         if let Scheme::Https(hosts) = &self.scheme
             && !hosts.covers_host(host)
@@ -494,7 +515,7 @@ impl Conn {
         if upstreams.guarded()
             && !upstreams
                 .accesses(host, target)
-                .all(|access| access.permits(client))
+                .all(|access| access.permits(client, self.country))
         {
             return Err(self.turned_away(403, "denied by route access"));
         }

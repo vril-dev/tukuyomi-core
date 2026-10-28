@@ -328,7 +328,6 @@ fn a_viewer_is_refused_a_route_of_an_operator_and_the_refusal_is_written() {
 fn a_path_that_is_not_in_the_table_is_404_and_another_method_is_405_with_the_methods_it_has() {
     let rig = rig();
     for path in [
-        "/",
         "/api",
         "/api/nothing",
         "/api/login/",

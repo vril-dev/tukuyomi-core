@@ -1,4 +1,6 @@
 use super::*;
+use crate::forward::client_ip::{Access, Country};
+use crate::policy::mmdb::tests::{Record, database, database_of};
 use serde_json::Value;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1293,13 +1295,13 @@ fn the_access_of_a_route_is_two_lists_of_at_most_256_networks() {
         "allow_cidrs": ["10.1.0.0/16", "192.0.2.0/24"],
     });
     let access = access_of(&route(both));
-    let permits = |text: &str| access.permits(text.parse().unwrap());
+    let permits = |text: &str| access.permits(text.parse().unwrap(), Country::Unknown);
     // Deny first; then only the networks of allow.
     assert!(!permits("10.1.2.3"));
     assert!(permits("192.0.2.5"));
     assert!(!permits("198.51.100.1"));
     let empty = access_of(&route(serde_json::json!({})));
-    assert!(empty.permits("203.0.113.1".parse().unwrap()));
+    assert!(empty.permits("203.0.113.1".parse().unwrap(), Country::Unknown));
 
     let list = |key: &str, n: usize| {
         let mut object = serde_json::Map::new();
@@ -2052,8 +2054,6 @@ fn global_access(key: &'static str, value: impl Into<Value>) -> Edit {
 
 #[test]
 fn the_access_and_rate_limit_objects_are_left_out_or_have_their_values_in_range() {
-    use crate::forward::client_ip::Access;
-
     assert_eq!(
         parse(BASE.as_bytes()).unwrap().policy,
         PolicyConfig::default()
@@ -2147,6 +2147,289 @@ fn the_access_and_rate_limit_objects_are_left_out_or_have_their_values_in_range(
     ] {
         refuse(&[edit], "configuration has a value of the wrong type");
     }
+}
+
+// ---- countries and geo ----
+
+const GEO_SHA256: &str = "abababababababababababababababababababababababababababababababab";
+
+fn geo(path: &str, sha256: &str) -> Edit {
+    (
+        "",
+        "geo",
+        serde_json::json!({ "country_db": path, "sha256": sha256 }),
+    )
+}
+
+fn countries_access(deny: Value, allow: Value) -> Edit {
+    (
+        "",
+        "access",
+        serde_json::json!({ "deny_countries": deny, "allow_countries": allow }),
+    )
+}
+
+#[test]
+fn the_access_has_lists_of_at_most_256_countries_that_are_codes_or_unknown_and_they_need_geo() {
+    let jp = Country::Known(*b"JP");
+    let loaded = parse(&doc(&[
+        geo("/etc/tukuyomi/country.mmdb", GEO_SHA256),
+        countries_access(
+            serde_json::json!(["JP", "UNKNOWN"]),
+            serde_json::json!(["US"]),
+        ),
+    ]))
+    .unwrap();
+    assert_eq!(
+        loaded.policy.access,
+        Access::new(Vec::new(), Vec::new())
+            .with_countries(vec![jp, Country::Unknown], vec![Country::Known(*b"US")])
+    );
+    // The file is not read when the configuration is parsed.
+    assert_eq!(
+        loaded.policy.geo,
+        Some(GeoConfig {
+            country_db: PathBuf::from("/etc/tukuyomi/country.mmdb"),
+            sha256: [0xab; 32],
+        })
+    );
+    assert_eq!(loaded.policy.country, None);
+
+    // Each list and the first entry past 256; the same sentences for the access of a route.
+    let geo_edit = || geo("/a", GEO_SHA256);
+    let many = |n: usize| serde_json::json!(vec!["JP"; n]);
+    let none = serde_json::json!([]);
+    for (deny, allow) in [
+        (many(256), none.clone()),
+        (none.clone(), many(256)),
+        (many(256), many(256)),
+    ] {
+        pass(&[geo_edit(), countries_access(deny, allow)]);
+    }
+    let sentence = "access has a list of more than 256 countries";
+    refuse(
+        &[geo_edit(), countries_access(many(257), none.clone())],
+        sentence,
+    );
+    refuse(
+        &[geo_edit(), countries_access(none.clone(), many(257))],
+        sentence,
+    );
+    let route = |access: Value| {
+        let route = serde_json::json!({"upstream": "api", "access": access});
+        doc(&[geo_edit(), f("routes", Value::Array(vec![route]))])
+    };
+    assert_eq!(
+        refusal_of(&route(serde_json::json!({"deny_countries": many(257)}))),
+        Some(sentence)
+    );
+    assert_eq!(
+        refusal_of(&route(serde_json::json!({"allow_countries": many(256)}))),
+        None
+    );
+    for bad in [
+        "jp", "Jp", "JPN", "J", "", "J1", "unknown", "UNKNOWN ", MARK,
+    ] {
+        let sentence = "access has an entry that is not a country";
+        refuse(
+            &[
+                geo_edit(),
+                countries_access(serde_json::json!([bad]), none.clone()),
+            ],
+            sentence,
+        );
+        assert_eq!(
+            refusal_of(&route(serde_json::json!({"allow_countries": [bad]}))),
+            Some(sentence),
+            "{bad:?}"
+        );
+    }
+
+    // A list of countries needs `geo`, in the access of the configuration and in that of a route.
+    let needs = "access has a list of countries while geo is left out";
+    refuse(
+        &[countries_access(serde_json::json!(["JP"]), none.clone())],
+        needs,
+    );
+    refuse(
+        &[countries_access(none.clone(), serde_json::json!(["JP"]))],
+        needs,
+    );
+    let guarded = serde_json::json!({"upstream": "api", "access": {"deny_countries": ["JP"]}});
+    assert_eq!(refusal_of(&with_route(guarded)), Some(needs));
+    // Empty lists do not, and `geo` alone is fine.
+    pass(&[countries_access(none.clone(), none.clone())]);
+    pass(&[geo_edit()]);
+    assert_eq!(
+        refusal_of(&route(serde_json::json!({"deny_countries": ["JP"]}))),
+        None
+    );
+}
+
+#[test]
+fn a_route_with_only_a_list_of_countries_is_a_route_with_an_access_list() {
+    let with = |route: Value| {
+        doc(&[
+            geo("/a", GEO_SHA256),
+            f("routes", Value::Array(vec![route])),
+        ])
+    };
+    let access = serde_json::json!({"allow_countries": ["JP"]});
+    // The canonical form of the path and the absence of a port in the hosts are asked of such a route as of any other.
+    let lowercase = serde_json::json!({"path": "/%61dmin/", "upstream": "api", "access": access});
+    assert_eq!(
+        refusal_of(&with(lowercase)),
+        Some(
+            "a route with an access list has an escape in its path that is lowercase or is for a byte that needs no escape"
+        )
+    );
+    let ported = serde_json::json!({"host": "h.test:8080", "upstream": "api", "access": access});
+    assert_eq!(
+        refusal_of(&with(ported)),
+        Some("a route host has a port while a route has an access list")
+    );
+    let other = serde_json::json!({"host": "h.test:8080", "upstream": "api"});
+    assert_eq!(refusal_of(&with(other)), None);
+}
+
+#[test]
+fn geo_has_an_absolute_clean_path_and_a_sha256_of_64_lower_case_digits() {
+    pass(&[geo("/a", GEO_SHA256)]);
+    pass(&[geo(&format!("/{}", "a".repeat(4000)), GEO_SHA256)]);
+    let path = "geo country_db is not an absolute clean path";
+    let long = format!("/{}", "a".repeat(4096));
+    for bad in ["", "a.mmdb", "/a/../b", "/a//b", "/a/", "/a/./b", &long] {
+        refuse(&[geo(bad, GEO_SHA256)], path);
+    }
+    let digits = "geo sha256 is not 64 lower-case hexadecimal digits";
+    let (short, long, upper) = (
+        &GEO_SHA256[1..],
+        format!("{GEO_SHA256}a"),
+        GEO_SHA256.to_uppercase(),
+    );
+    let (not_hex, newline) = (format!("{short}g"), format!("{GEO_SHA256}\n"));
+    for bad in ["", short, &long, &upper, &not_hex, &newline, MARK] {
+        refuse(&[geo("/a", bad)], digits);
+    }
+    // Both keys, an object, and nothing else.
+    let wrong = "configuration has a value of the wrong type";
+    refuse(
+        &[("", "geo", serde_json::json!({"country_db": "/a"}))],
+        "configuration has a missing key",
+    );
+    refuse(
+        &[("", "geo", serde_json::json!({"sha256": GEO_SHA256}))],
+        "configuration has a missing key",
+    );
+    refuse(
+        &[(
+            "",
+            "geo",
+            serde_json::json!({"country_db": "/a", "sha256": GEO_SHA256, "url": "x"}),
+        )],
+        "configuration has an unknown key",
+    );
+    for bad in [Value::Null, serde_json::json!([]), serde_json::json!("/a")] {
+        refuse(&[("", "geo", bad)], wrong);
+    }
+}
+
+fn hex(bytes: [u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Loads the base document with these edits from a file in `dir`.
+fn loaded_from(dir: &TestDir, edits: &[Edit]) -> Result<Loaded, ConfigError> {
+    let file = dir.path().join("config.json");
+    fs::write(&file, doc(edits)).unwrap();
+    load(&file)
+}
+
+#[test]
+fn load_reads_the_country_database_checks_its_sha256_and_keeps_it_only_for_a_list_of_countries() {
+    let dir = scratch();
+    let db = dir.path().join("country.mmdb");
+    let path = db.to_str().unwrap().to_owned();
+    let file = database(true, 24, &[("203.0.113.0/24", Record::Country("JP"))]);
+    fs::write(&db, &file).unwrap();
+    let sha = hex(crate::rules::bundle::sha256(&file));
+    let lists = countries_access(serde_json::json!(["JP"]), serde_json::json!([]));
+
+    let loaded = loaded_from(&dir, &[geo(&path, &sha), lists.clone()]).unwrap();
+    let country = loaded.policy.country.expect("the database is kept");
+    assert_eq!(
+        country.country("203.0.113.9".parse().unwrap()),
+        Country::Known(*b"JP")
+    );
+    // It is read and checked also where no list needs it, and then it is not kept.
+    let loaded = loaded_from(&dir, &[geo(&path, &sha)]).unwrap();
+    assert_eq!(
+        (loaded.policy.country, loaded.policy.geo.is_some()),
+        (None, true)
+    );
+    let route = serde_json::json!({"upstream": "api", "access": {"allow_countries": ["JP"]}});
+    let by_route = [geo(&path, &sha), f("routes", Value::Array(vec![route]))];
+    assert!(
+        loaded_from(&dir, &by_route)
+            .unwrap()
+            .policy
+            .country
+            .is_some()
+    );
+
+    // A file with another sha256, the same one in capitals not being the same string either.
+    let other = hex(crate::rules::bundle::sha256(b"other"));
+    let sha_sentence = "geo country_db does not have the sha256 that geo gives";
+    for edits in [vec![lists.clone()], Vec::new()] {
+        let mut all = vec![geo(&path, &other)];
+        all.extend(edits);
+        assert_eq!(
+            loaded_from(&dir, &all).err().map(|e| e.0),
+            Some(sha_sentence)
+        );
+    }
+    // A file that is not there, a link to the file, a directory, and a file one byte over 256 MiB.
+    let unreadable = "geo country_db cannot be read, or is a link";
+    let not_regular = "geo country_db is not a regular file of at most 256 MiB";
+    let refused = |path: &Path, sha: &str| {
+        let edits = [geo(path.to_str().unwrap(), sha), lists.clone()];
+        loaded_from(&dir, &edits).err().map(|e| e.0)
+    };
+    assert_eq!(
+        refused(&dir.path().join("absent.mmdb"), &sha),
+        Some(unreadable)
+    );
+    let link = dir.path().join("link.mmdb");
+    std::os::unix::fs::symlink(&db, &link).unwrap();
+    assert_eq!(refused(&link, &sha), Some(unreadable));
+    assert_eq!(refused(dir.path(), &sha), Some(not_regular));
+    let big = dir.path().join("big.mmdb");
+    fs::File::create(&big)
+        .unwrap()
+        .set_len((256 << 20) + 1)
+        .unwrap();
+    assert_eq!(refused(&big, &sha), Some(not_regular));
+
+    // A file whose sha256 is right but which is cut, and one that is not a database of countries.
+    let cut = dir.path().join("cut.mmdb");
+    fs::write(&cut, &file[..file.len() / 2]).unwrap();
+    let sha_cut = hex(crate::rules::bundle::sha256(&file[..file.len() / 2]));
+    assert_eq!(
+        refused(&cut, &sha_cut),
+        Some("the country database has no metadata section")
+    );
+    let isp = dir.path().join("isp.mmdb");
+    let not_countries = database_of(
+        "GeoIP2-ISP",
+        true,
+        24,
+        &[("203.0.113.0/24", Record::Neither)],
+    );
+    fs::write(&isp, &not_countries).unwrap();
+    assert_eq!(
+        refused(&isp, &hex(crate::rules::bundle::sha256(&not_countries))),
+        Some("the country database is not of countries: it has no country records")
+    );
 }
 
 // ---- admin ----
