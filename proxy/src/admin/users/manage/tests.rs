@@ -1,3 +1,4 @@
+use std::fs;
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -139,6 +140,34 @@ fn an_owner_makes_a_user_who_must_change_the_password_and_nobody_else_may() {
     // The new user logs in, and has to change the password.
     let login = rig.try_login("newbie", "first password 1");
     assert_eq!(login.body["must_change"], true);
+}
+
+#[test]
+fn a_store_with_1000_users_takes_no_more_and_the_answer_is_409() {
+    let rig = rig();
+    let alice = rig.login("alice");
+    // The store counts the files of `users/` and reads none of them to do so, so copies of one stored file (the
+    // copy keeps its mode) under other names bring it to 999 users without 999 writes that are synced.
+    let users = rig.dir.path().join("users");
+    let count = || fs::read_dir(&users).unwrap().count();
+    for n in 0..999 - count() {
+        fs::copy(users.join("vera.json"), users.join(format!("copy{n}.json"))).unwrap();
+    }
+    assert_eq!(count(), 999);
+    let new =
+        |name: &str| json!({ "name": name, "role": "viewer", "password": "first password 1" });
+    // The 1000th user is made, and the next one is refused and leaves the 1000 users as they were.
+    let made = change(&rig, &alice, "POST", "/api/users", new("last"));
+    assert_eq!(made.status, StatusCode::OK, "{:?}", made.body);
+    assert_eq!(count(), 1000);
+    let over = change(&rig, &alice, "POST", "/api/users", new("over"));
+    assert_eq!(over.status, StatusCode::CONFLICT, "{:?}", over.body);
+    assert_eq!(words(&over), "the store has too many users");
+    assert_eq!(count(), 1000);
+    assert!(!users.join("over.json").exists());
+    assert!(rig.audit().iter().any(|line| {
+        line["action"] == "user_create" && line["result"] == "failed" && line["reason"] == "full"
+    }));
 }
 
 #[test]

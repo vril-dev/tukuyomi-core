@@ -9,7 +9,7 @@ use tukuyomi_kernel::Verdict;
 
 use crate::config::{ForwardConfig, ProxyConfig, RouteConfig};
 use crate::inbound::conn::tests::{
-    BLOCK, FORM, Mode, Rig, config, finish_sending, gz, parse_response, put, read_all, run,
+    BLOCK, FORM, Mode, Rig, config, finish_sending, gz, pair, parse_response, put, read_all, run,
 };
 use crate::inspect::driver::Outcome;
 use crate::log::is_answer;
@@ -293,6 +293,16 @@ fn a_long_chunked_body_is_inspected_cut_and_forwarded_chunked_and_whole() {
         assert_eq!(out.seen.len(), 1);
         assert!(out.seen[0].cut);
         assert_eq!(out.seen[0].body, body[..INSPECT]);
+        // The body has no length to name, so the inspection gets the framing the client used and makes up no length.
+        let fields = &out.seen[0].headers;
+        assert!(
+            fields.contains(&pair("Transfer-Encoding", "chunked")),
+            "{fields:?}"
+        );
+        assert!(
+            fields.iter().all(|(name, _)| name != "Content-Length"),
+            "{fields:?}"
+        );
         let got = got.await.unwrap();
         assert!(got.complete);
         assert_eq!(got.field("transfer-encoding"), Some("chunked"));
@@ -683,6 +693,122 @@ fn a_gzip_body_is_held_and_decoded_whole_and_neither_form_may_pass_the_inspected
         assert!(stored.len() > INSPECT);
         let long = through(streaming(), ALLOW, &forward, None, &post(&stored)).await;
         assert_eq!((long.status, long.seen.len()), (Some(413), 0));
+    });
+}
+
+#[test]
+fn a_body_of_a_type_that_is_not_read_goes_on_under_a_route_that_skips_the_inspection_and_is_415_elsewhere()
+ {
+    run(async {
+        let routes = || Routes::new(vec![Route::new(None, "/up/").unwrap()]).unwrap();
+        let xml = b"<a>1</a>";
+        let post = |path: &str, type_line: &str, chunked: bool| {
+            let mut request =
+                format!("POST {path} HTTP/1.1\r\nHost: example.test\r\n{type_line}").into_bytes();
+            if chunked {
+                request.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                request.extend_from_slice(&chunks(xml, 4));
+            } else {
+                request
+                    .extend_from_slice(format!("Content-Length: {}\r\n\r\n", xml.len()).as_bytes());
+                request.extend_from_slice(xml);
+            }
+            request
+        };
+        let nowhere = ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]);
+        // A type that is not read, and none at all, with a length and chunked.
+        for type_line in ["Content-Type: application/xml\r\n", ""] {
+            for chunked in [false, true] {
+                let (addr, got) = upstream(None).await;
+                let forward = ForwardConfig::of(&[addr]);
+                let request = post("/up/x", type_line, chunked);
+                let out = through(streaming(), ALLOW, &forward, Some(routes()), &request).await;
+                assert_eq!(
+                    (out.status, out.seen.len()),
+                    (Some(200), 0),
+                    "{type_line:?} {chunked}"
+                );
+                let got = got.await.unwrap();
+                assert!(got.complete);
+                assert_eq!(got.body(), xml);
+                // Another path, and two spellings of the path of the route that the matching does not take for
+                // it (an escape of a letter, and a `.` segment): inspected, so refused before the upstream.
+                for path in ["/dynamic", "/u%70/x", "/up/./x"] {
+                    let request = post(path, type_line, chunked);
+                    let out = through(streaming(), ALLOW, &nowhere, Some(routes()), &request).await;
+                    let case = format!("{path} {type_line:?} {chunked}");
+                    assert_eq!((out.status, out.seen.len()), (Some(415), 0), "{case}");
+                }
+            }
+        }
+        // The rule on the coding of the body is kept under the route.
+        let coded = b"POST /up/x HTTP/1.1\r\nHost: example.test\r\nContent-Encoding: br\r\nContent-Length: 1\r\n\r\nx";
+        let out = through(streaming(), ALLOW, &nowhere, Some(routes()), coded).await;
+        assert_eq!((out.status, out.seen.len()), (Some(415), 0));
+    });
+}
+
+#[test]
+fn a_body_with_two_content_type_lines_is_415_also_under_a_route_that_skips_the_inspection() {
+    run(async {
+        let routes = || Routes::new(vec![Route::new(None, "/up/").unwrap()]).unwrap();
+        let nowhere = ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]);
+        let post = |path: &str, chunked: bool, body: &[u8]| {
+            let mut request = format!(
+                "POST {path} HTTP/1.1\r\nHost: example.test\r\nContent-Type: application/json\r\nContent-Type: text/plain\r\n"
+            )
+            .into_bytes();
+            if chunked {
+                request.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                request.extend_from_slice(&chunks(body, 4));
+            } else {
+                request.extend_from_slice(
+                    format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
+                );
+                request.extend_from_slice(body);
+            }
+            request
+        };
+        // With a length (the head check) and chunked (once the body has been read), under the route and off it:
+        // refused, and nothing reaches the upstream (a request that was forwarded would be 502).
+        for path in ["/up/x", "/dynamic"] {
+            for chunked in [false, true] {
+                let request = post(path, chunked, b"<a>1</a>");
+                let out = through(streaming(), ALLOW, &nowhere, Some(routes()), &request).await;
+                assert_eq!(
+                    (out.status, out.seen.len()),
+                    (Some(415), 0),
+                    "{path} {chunked}"
+                );
+            }
+        }
+        // A chunked body with no bytes has nothing to give a type to: it goes on.
+        let (addr, got) = upstream(None).await;
+        let forward = ForwardConfig::of(&[addr]);
+        let request = post("/up/x", true, b"");
+        let out = through(streaming(), ALLOW, &forward, Some(routes()), &request).await;
+        assert_eq!((out.status, out.seen.len()), (Some(200), 0));
+        assert!(got.await.unwrap().complete);
+    });
+}
+
+#[test]
+fn a_body_with_a_length_that_the_inspection_does_not_read_is_415_before_it_is_read() {
+    run(async {
+        let nowhere = ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]);
+        // Only the head is sent. If the type were looked at once the body has been read, the proxy would wait for
+        // the body and answer something else when the time for it ran out.
+        for type_line in ["Content-Type: text/plain\r\n", ""] {
+            let head = format!(
+                "POST /dynamic HTTP/1.1\r\nHost: example.test\r\n{type_line}Content-Length: 8\r\n\r\n"
+            );
+            let out = through(streaming(), ALLOW, &nowhere, None, head.as_bytes()).await;
+            assert_eq!(
+                (out.status, out.seen.len()),
+                (Some(415), 0),
+                "{type_line:?}"
+            );
+        }
     });
 }
 

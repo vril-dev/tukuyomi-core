@@ -56,8 +56,10 @@ pub struct Request<'a> {
     /// The decoded body (no transfer coding): the whole body, or its first bytes if `body_cut`.
     pub body: &'a [u8],
     /// The body goes on after `body` (at most `limits::BODY` bytes, at least one). A `Content-Length` field then
-    /// names more bytes than `body` has. The inspector does not take a failure to parse the body for a fault of the
-    /// request, since the parser met the end of the bytes before the end of the body.
+    /// names more bytes than `body` has. A body of unknown length has none, and may have one `Transfer-Encoding`
+    /// field that is exactly `chunked`: it is the only coding that `submit` lets in, and only for a body that goes
+    /// on, and `body` is decoded all the same. The inspector does not take a failure to parse the body for a fault
+    /// of the request, since the parser met the end of the bytes before the end of the body.
     pub body_cut: bool,
 }
 

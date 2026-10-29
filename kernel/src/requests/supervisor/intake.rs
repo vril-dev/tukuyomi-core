@@ -80,8 +80,18 @@ impl Supervisor {
                 .iter()
                 .filter(move |h| h.0.eq_ignore_ascii_case(name))
         };
-        if header(b"transfer-encoding").next().is_some() {
-            return Err(Refused::Unsupported("transfer-encoding"));
+        // The bytes given are the decoded body, so a coding that is still on it cannot be inspected. The one thing
+        // let in is the `chunked` of a body that goes on, as a field: it has no length to name, and the rules need
+        // to see that the request has a framing. It is the only coding line and comes without a `Content-Length`.
+        let mut codings = header(b"transfer-encoding");
+        if let Some(coding) = codings.next() {
+            let chunked_cut = req.body_cut
+                && codings.next().is_none()
+                && coding.1.eq_ignore_ascii_case(b"chunked")
+                && header(b"content-length").next().is_none();
+            if !chunked_cut {
+                return Err(Refused::Unsupported("transfer-encoding"));
+            }
         }
         // The body is not decompressed, so a body that is coded cannot be inspected.
         if header(b"content-encoding").next().is_some() {

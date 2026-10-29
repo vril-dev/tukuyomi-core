@@ -118,7 +118,7 @@ pub(in crate::inbound) struct Seen {
     pub(in crate::inbound) proto: String,
     /// The address the inspection was told is the client's.
     pub(in crate::inbound) client: SocketAddr,
-    headers: Vec<(String, String)>,
+    pub(in crate::inbound) headers: Vec<(String, String)>,
     pub(in crate::inbound) body: Vec<u8>,
     /// The body goes on after the bytes in `body`.
     pub(in crate::inbound) cut: bool,

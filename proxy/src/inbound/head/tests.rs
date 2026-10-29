@@ -457,15 +457,13 @@ fn a_gzip_body_that_is_empty_on_its_face_is_400() {
         FORM,
     ]));
     assert!(chunked.gzip() && chunked.chunked());
-    // The type rule is the one of a body with a length: a gzip body needs the type of the decoded body.
-    assert_eq!(
-        refused(&head_with(&["Content-Encoding: gzip", "Content-Length: 1"])),
-        Reject::UnsupportedMedia
-    );
+    // The type is not a rule of the head: the caller asks for the type of the decoded body.
+    let untyped = ok(&head_with(&["Content-Encoding: gzip", "Content-Length: 1"]));
+    assert!(untyped.gzip() && !untyped.inspectable_type());
 }
 
 #[test]
-fn a_body_needs_exactly_one_inspectable_content_type() {
+fn the_head_says_whether_a_body_has_exactly_one_inspectable_content_type() {
     let lengthy = |lines: &[&str]| {
         let mut all = vec!["Content-Length: 1"];
         all.extend_from_slice(lines);
@@ -480,28 +478,49 @@ fn a_body_needs_exactly_one_inspectable_content_type() {
         // The `x-www-form-urlencoded` start is refused only when the name really starts with it.
         "Content-Type: application/xx-www-form-urlencoded+json",
     ] {
-        ok(&lengthy(&[line]));
+        assert!(ok(&lengthy(&[line])).inspectable_type(), "line {line:?}");
     }
     // The longest name is 122 bytes.
     let named = |len: usize| format!("Content-Type: application/{}+json", "a".repeat(len));
-    ok(&lengthy(&[&named(122)]));
-    assert_eq!(refused(&lengthy(&[&named(123)])), Reject::UnsupportedMedia);
+    assert!(ok(&lengthy(&[&named(122)])).inspectable_type());
+    // A body of another type is not refused by the head: the caller refuses it if the request is inspected.
+    assert!(!ok(&lengthy(&[&named(123)])).inspectable_type());
     for lines in [
         &[][..],
         &["Content-Type: text/plain"],
         &["Content-Type: application/jsonp"],
         &["Content-Type: text/x+json"],
-        &[FORM, FORM],
-        &[FORM, "Content-Type: text/plain"],
         &["Content-Type: application/+json"],
         &["Content-Type: application/a_b+json"],
         &["Content-Type: application/x-www-form-urlencoded+json"],
+    ] {
+        let head = ok(&lengthy(lines));
+        assert!(
+            !head.inspectable_type() && !head.repeated_type(),
+            "lines {lines:?}"
+        );
+        assert_eq!(head.content_length(), Some(1));
+    }
+    // More than one line is refused with a body that has a length, whatever the lines say, for a reader may take any
+    // of them for the type. With no body, and with a chunked one that the caller judges once it has been read, the
+    // head passes and says so.
+    for lines in [
+        &[FORM, FORM][..],
+        &[FORM, "Content-Type: text/plain"],
+        &["Content-Type: text/plain", "Content-Type: text/xml"],
     ] {
         assert_eq!(
             refused(&lengthy(lines)),
             Reject::UnsupportedMedia,
             "lines {lines:?}"
         );
+        for framing in ["Content-Length: 0", "Transfer-Encoding: chunked"] {
+            let head = ok(&head_with(&[&[framing][..], lines].concat()));
+            assert!(
+                head.repeated_type() && !head.inspectable_type(),
+                "{framing} {lines:?}"
+            );
+        }
     }
     // No body: no type needed, and the flag says what the type is. A chunked body is checked by the caller.
     assert!(!ok(&head_with(&["Content-Length: 0"])).inspectable_type());
@@ -518,7 +537,7 @@ fn the_first_broken_rule_decides() {
     // A size before the Host rule.
     let big = format!("GET / HTTP/1.1\r\nX-A: {}\r\n\r\n", "x".repeat(4097));
     assert_eq!(refused(big.as_bytes()), Reject::FieldsTooLarge);
-    // Content-Length over the limit is decided before Expect, Connection and the body type.
+    // Content-Length over the limit is decided before Expect and Connection.
     let raw = head_with(&[
         "Content-Length: 2097152",
         "Expect: nope",

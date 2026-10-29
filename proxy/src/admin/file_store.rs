@@ -32,7 +32,7 @@ use std::sync::{Mutex, PoisonError};
 use super::audit::tail;
 use super::auth::tokens::{self, Token};
 use super::password::valid_name;
-use super::store::{AdminError, AdminStore, BUSY, CONFLICT, EXISTS, IN_USE};
+use super::store::{AdminError, AdminStore, BUSY, CONFLICT, EXISTS, FULL, IN_USE};
 use super::users::{Role, User};
 use super::waf::history::Activation;
 use crate::config;
@@ -255,7 +255,7 @@ impl AdminStore for FileAdminStore {
             return Err(EXISTS);
         }
         if self.listed(USERS)?.len() >= USERS_MAX {
-            return Err(AdminError("the store has too many users"));
+            return Err(FULL);
         }
         self.write_user(user)
     }

@@ -35,7 +35,7 @@ use crate::admin::auth::tokens::Token;
 use crate::admin::auth::{Auth, Cx, Refusal, Who};
 use crate::admin::password::{Hash, Secret, valid_name, valid_password};
 use crate::admin::server::{Answer, App, Gate, Handler, Req, Route, json_body, refusal};
-use crate::admin::store::EXISTS;
+use crate::admin::store::{EXISTS, FULL};
 
 const USERS: &str = "/api/users/";
 const TOKENS: &str = "/api/tokens/";
@@ -221,14 +221,15 @@ impl Auth {
         match self.store.create(&user) {
             Ok(()) => Ok(user),
             Err(e) => {
-                let taken = e == EXISTS;
-                let reason = if taken { "exists" } else { "store" };
-                let _ = self.audit.write(&event(Outcome::Failed).reason(reason));
-                Err(if taken {
-                    Refusal::Conflict("the name is taken")
+                let (reason, refusal) = if e == EXISTS {
+                    ("exists", Refusal::Conflict("the name is taken"))
+                } else if e == FULL {
+                    ("full", Refusal::Conflict("the store has too many users"))
                 } else {
-                    Refusal::Unavailable
-                })
+                    ("store", Refusal::Unavailable)
+                };
+                let _ = self.audit.write(&event(Outcome::Failed).reason(reason));
+                Err(refusal)
             }
         }
     }

@@ -266,6 +266,29 @@ fn refused_transfer_and_content_encoding() {
     ];
     let r = run.refused(&request(b"POST", b"/", &both, b"a=b"));
     assert_eq!(r, Refused::Unsupported("transfer-encoding"));
+
+    // The coding of a body that goes on is let in as a field: one line that is `chunked` (ASCII case ignored), and no
+    // length. The first cases past that are refused as before: the body is not cut, the coding is more than that, it
+    // comes twice, or the request names a length as well.
+    fn cut<'a>(hs: &'a [(&'a [u8], &'a [u8])]) -> Request<'a> {
+        Request {
+            body_cut: true,
+            ..request(b"POST", b"/", hs, b"a=b")
+        }
+    }
+    let ct = header(b"Content-Type", URLENCODED);
+    let transfer = Refused::Unsupported("transfer-encoding");
+    run.submit(&cut(&[ct, te[0]]));
+    run.submit(&cut(&[ct, header(b"Transfer-Encoding", b"Chunked")]));
+    assert_eq!(
+        run.refused(&request(b"POST", b"/", &[ct, te[0]], b"a=b")),
+        transfer
+    );
+    let listed = header(b"Transfer-Encoding", b"gzip, chunked");
+    assert_eq!(run.refused(&cut(&[ct, listed])), transfer);
+    assert_eq!(run.refused(&cut(&[ct, te[0], te[0]])), transfer);
+    let len = header(b"Content-Length", b"4");
+    assert_eq!(run.refused(&cut(&[ct, te[0], len])), transfer);
     run.finish();
 }
 

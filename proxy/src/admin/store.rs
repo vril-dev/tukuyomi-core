@@ -31,6 +31,8 @@ pub const BUSY: AdminError = AdminError("the admin store is in use by another pr
 pub const CONFLICT: AdminError = AdminError("the user was changed since it was read");
 /// A user or a token of that name is in the store already.
 pub const EXISTS: AdminError = AdminError("the entry is in the store already");
+/// The store holds as many users as it may.
+pub const FULL: AdminError = AdminError("the store has too many users");
 /// Another admin process holds the store.
 pub const IN_USE: AdminError = AdminError("another admin process runs on this store");
 
@@ -41,7 +43,7 @@ pub trait AdminStore: Send + Sync {
     /// Stores `user`, only if the store has no user at all.
     fn create_first(&self, user: &User) -> Result<(), AdminError>;
     /// Stores `user`, only if the store has no user of that name (else the answer is `EXISTS`) and has less than
-    /// 1000 users.
+    /// 1000 users (else the answer is `FULL`).
     fn create(&self, user: &User) -> Result<(), AdminError>;
     /// Stores `user` in place of the user of that name, only if the stored one has `changed` equal to `seen`; else
     /// the answer is `CONFLICT`.

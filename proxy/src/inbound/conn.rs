@@ -16,7 +16,10 @@
 //! a request with a `Content-Length` over the `max_body` of its route (413). Then the request either matches a rule of
 //! the generation that serves that skips the inspection, and is forwarded without being inspected, or its first
 //! `inspect_body` bytes are read through hyper into a budgeted buffer and handed to the inspection driver as a
-//! ticket, and only an `Allow` or a `Detected` is forwarded. A body that ends within those bytes is held whole and is
+//! ticket, and only an `Allow` or a `Detected` is forwarded. An inspected body has to be of a type that the
+//! inspection reads (`Head::inspectable_type`), or the answer is 415: before the body is read if it has a length,
+//! after it if it is chunked and not empty. So is a body with more than one `Content-Type` line, whether the
+//! inspection runs or not. A body that ends within those bytes is held whole and is
 //! forwarded as it was inspected (or, under a route that skips the inspection, as it was read). A longer one goes on
 //! past them: the ticket says that the body is cut, and once the request is let through the rest is passed on to the
 //! upstream as the client sends it (see `upload`), so what the request holds does not grow with the length of the
@@ -33,9 +36,11 @@
 //! kernel's copy and no place in the driver's channel, so it goes on also when the inspection is full or the inspector
 //! is down. What is inspected and what is forwarded is the same request, in the form that `represent` builds it: the
 //! decoded body, without its `Content-Encoding`, with its decoded length, or, for a body that goes on past the
-//! inspected bytes or is not decoded, the body as the client sent it with its own framing; the edits of the route
-//! come after the inspection and are the only difference. The record gives the length of the body: its
-//! `Content-Length` if it has one, and otherwise the bytes read so far.
+//! inspected bytes or is not decoded, the body as the client sent it with its own framing. The edits of the route
+//! come after the inspection. The other difference is the `Transfer-Encoding` that an HTTP/1.1 client sent with a
+//! chunked body that goes on: the inspection gets it, and the upstream gets the body chunked by the client side of
+//! the proxy. The record gives the length of the body: its `Content-Length` if it has one, and otherwise the bytes
+//! read so far.
 //!
 //! The route is found on the bytes received, but an application behind the proxy may read another spelling of a path
 //! as the path of a route that limits who may use it (`/priv%61te/x` for `/private/x`). So if some route has an
@@ -367,6 +372,13 @@ impl Conn {
         } else {
             (cfg.inspect_body, limit)
         };
+        // The type of a body that is inspected has to be one that the inspection reads; under a route that skips the
+        // inspection any type goes, but not more than one `Content-Type` line. A body with a length is judged before
+        // it is read (the head check refuses the lines); a chunked one, which may be empty, below.
+        let typed = self.head.inspectable_type() || (bypass && !self.head.repeated_type());
+        if !typed && self.head.content_length().is_some_and(|n| n > 0) {
+            return Err(Reject::UnsupportedMedia.into());
+        }
         let Taken {
             bytes,
             budget,
@@ -387,12 +399,9 @@ impl Conn {
             headers,
             field_bytes,
         } = represent(&self.head, upload.is_none().then_some(bytes.len()), decode)?;
-        // The head check cannot tell whether a chunked body is empty, so its rule on the body type is applied
+        // A chunked body is not known to be empty before it has been read, so the rule on the body type is applied
         // here, with the same test (on the decoded body, when it was decoded).
-        if self.head.chunked()
-            && (!bytes.is_empty() || upload.is_some())
-            && !self.head.inspectable_type()
-        {
+        if !typed && self.head.chunked() && (!bytes.is_empty() || upload.is_some()) {
             return Err(Reject::UnsupportedMedia.into());
         }
         let cut = upload.is_some() && !bypass;

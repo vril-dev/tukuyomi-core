@@ -1,6 +1,8 @@
 use http::Request;
+use http::header::TRANSFER_ENCODING;
 
 use super::*;
+use crate::inbound::represent::represent;
 
 const LIM: Limits = Limits {
     max_head_bytes: 8192,
@@ -110,23 +112,61 @@ fn the_length_of_the_body_is_kept_and_a_body_of_unknown_length_is_chunked() {
     // The stream is ended by its head: there is no body.
     let head = build(&parts("POST", "https://a.example/x", &json), true, &LIM).unwrap();
     assert_eq!((head.content_length(), head.chunked()), (None, false));
-    // The rules of every head hold: a body that is too long, or of a type that is not read, is refused before it
-    // is read.
+    // The rules of every head hold: a body that is too long is refused before it is read. The type of the body is
+    // not a rule of the head, which only says whether the inspection reads it.
     let long = [json[0], ("content-length", "1048577")];
     assert_eq!(
         build(&parts("POST", "https://a.example/x", &long), false, &LIM).unwrap_err(),
         Reject::ContentTooLarge
     );
     let text = [("content-type", "text/plain"), ("content-length", "5")];
+    let head = build(&parts("POST", "https://a.example/x", &text), false, &LIM).unwrap();
+    assert!(!head.inspectable_type());
+    // More than one `content-type` is refused with a length, as on every head; a body whose end is not known gets
+    // its head, and the caller judges it once the body has been read.
+    let lines = [
+        ("content-type", "application/json"),
+        ("content-type", "text/plain"),
+        ("content-length", "5"),
+    ];
     assert_eq!(
-        build(&parts("POST", "https://a.example/x", &text), false, &LIM).unwrap_err(),
+        build(&parts("POST", "https://a.example/x", &lines), false, &LIM).unwrap_err(),
         Reject::UnsupportedMedia
     );
+    let head = build(
+        &parts("POST", "https://a.example/x", &lines[..2]),
+        false,
+        &LIM,
+    )
+    .unwrap();
+    assert!(head.chunked() && head.repeated_type());
     let twice = [json[0], ("content-length", "5"), ("content-length", "5")];
     assert_eq!(
         build(&parts("POST", "https://a.example/x", &twice), false, &LIM).unwrap_err(),
         Reject::BadRequest
     );
+}
+
+#[test]
+fn the_chunked_field_made_for_a_body_without_a_length_is_not_shown_to_the_inspection() {
+    let json = [("content-type", "application/json")];
+    let head = build(&parts("POST", "https://a.example/x", &json), false, &LIM).unwrap();
+    assert!(head.chunked() && head.http2());
+    let names = |rep: &crate::inbound::represent::Represented| -> Vec<String> {
+        rep.headers
+            .iter()
+            .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+            .collect()
+    };
+    // A body that goes on: neither the inspection nor the upstream gets a framing field, as the client sent none.
+    let rep = represent(&head, None, false).unwrap();
+    assert_eq!(names(&rep), ["Host", "Content-Type"]);
+    assert!(rep.fields.get(TRANSFER_ENCODING).is_none());
+    assert!(rep.fields.get(CONTENT_LENGTH).is_none());
+    // A body that is held gets the length it is held at, as a chunked body of HTTP/1.1 does.
+    let rep = represent(&head, Some(3), false).unwrap();
+    assert_eq!(names(&rep), ["Host", "Content-Type", "Content-Length"]);
+    assert!(rep.fields.get(TRANSFER_ENCODING).is_none());
 }
 
 #[test]

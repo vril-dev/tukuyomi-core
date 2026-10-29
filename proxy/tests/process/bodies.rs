@@ -228,6 +228,11 @@ fn a_long_chunked_body_reaches_the_upstream_chunked_and_whole_and_one_over_the_l
     assert_eq!(seen.values("transfer-encoding"), ["chunked"]);
     assert!(seen.values("content-length").is_empty());
     assert_eq!(unchunk(&seen.body), body);
+    // The kernel takes the form of a cut chunked body (a `Transfer-Encoding` and no `Content-Length`): the request
+    // was inspected and forwarded, and no rule matched.
+    proxy.records.conn("the forwarded record", |l| {
+        is_answer(l, "forwarded", 200, "forwarded") && l["inspected"] == 16384 && no(l, "rule")
+    });
 
     // A body over the limit is passed on up to it; then the request to the upstream is dropped, and so is the
     // connection of the client, which gets no answer.

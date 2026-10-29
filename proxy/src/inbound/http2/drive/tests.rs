@@ -148,6 +148,26 @@ fn a_request_that_a_rule_blocks_is_answered_with_403_over_h2_and_its_body_was_in
 }
 
 #[test]
+fn a_body_of_a_type_that_the_inspection_does_not_read_is_answered_with_415_over_h2_and_goes_nowhere()
+ {
+    run(async {
+        let pki = Pki::new();
+        let up = Raw::start(|sock, seen| reply(sock, seen, OK)).await;
+        let forward = ForwardConfig::of(&[up.addr]);
+        let rig = h2_rig(&pki, kept(), Mode::Answer(ALLOW), &forward).await;
+        let (tcp, task) = rig.connect_on(0).await;
+        let mut send = client(shake(&pki, tcp).await).await;
+        let post = Request::post("https://www.a.example/p").header("content-type", "text/plain");
+        let (status, _) = fetch(&mut send, post.body(Full::new(Bytes::from("a=b"))).unwrap()).await;
+        assert_eq!(status, 415);
+        drop(send);
+        // Neither the inspection nor the upstream got the request.
+        assert!(rig.finish(task).await.is_empty());
+        assert!(up.seen().is_empty());
+    });
+}
+
+#[test]
 fn every_request_of_a_connection_has_its_name_checked_against_the_certificate_and_its_host_field() {
     run(async {
         let pki = Pki::new();

@@ -13,8 +13,9 @@
 //!   A value with a CR, an LF or a NUL in it is refused, although h2 has refused such a stream before.
 //! - A stream whose `HEADERS` frame did not end it, and that has no `content-length`, gets
 //!   `Transfer-Encoding: chunked`, for the rules of the head and the reading of the body to take it for a body whose
-//!   end is not known. A `content-length` is kept: h2 has made sure that the data frames are as long, and the rules
-//!   on the size and the type of the body can answer before the body is read.
+//!   end is not known. The client sent no such field (h2 refuses one), so the inspection is not shown it (see
+//!   `represent`). A `content-length` is kept: h2 has made sure that the data frames are as long, and the rule on
+//!   the size of the body can answer before the body is read.
 //! - A head of more than `max_head_bytes` is refused with 431.
 //!
 //! The target that the upstream is sent is the one of the head, in origin-form: the `uri` of the request that h2

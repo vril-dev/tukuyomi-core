@@ -74,6 +74,41 @@ fn a_chunked_request_loses_its_encoding_and_gets_the_decoded_length() {
 }
 
 #[test]
+fn a_chunked_request_whose_body_goes_on_keeps_its_encoding_in_the_inspected_form_only() {
+    let raw = format!(
+        "POST /x HTTP/1.1\r\nContent-Type: {FORM}\r\nHost: h\r\nTransfer-Encoding: Chunked\r\nx-forwarded-for: 1.2.3.4\r\n\r\n"
+    );
+    let rep = represent(&head_of(&raw), None, false).expect("represented");
+    // As the client sent it, in its place among the others, and no length is made up.
+    let expected = [
+        pair("Host", "h"),
+        pair("Content-Type", FORM),
+        pair("Transfer-Encoding", "Chunked"),
+        pair("X-Forwarded-For", "1.2.3.4"),
+    ];
+    assert_eq!(pairs(&rep), expected);
+    let bytes: usize = expected
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    assert_eq!(rep.field_bytes, bytes);
+    // The fields that are forwarded have neither the encoding nor a length.
+    assert!(rep.fields.get(TRANSFER_ENCODING).is_none());
+    assert!(rep.fields.get(CONTENT_LENGTH).is_none());
+    assert_eq!(rep.fields.len(), 3);
+}
+
+#[test]
+fn a_chunked_head_of_64_fields_is_within_the_limits_whether_or_not_the_body_is_held() {
+    // The form that is inspected has 64 fields with the encoding, and 64 with the length of a body that is held.
+    let raw = numbered(63, "POST").replace("\r\n\r\n", "\r\nTransfer-Encoding: chunked\r\n\r\n");
+    let head = head_of(&raw);
+    assert_eq!(head.fields().len(), 64);
+    assert_eq!(represent(&head, None, false).unwrap().headers.len(), 64);
+    assert_eq!(represent(&head, Some(0), false).unwrap().headers.len(), 64);
+}
+
+#[test]
 fn a_gzip_request_loses_its_coding_and_gets_the_decoded_length() {
     // The coding and the length are replaced by the decoded length, which comes last as a chunked request's
     // does; the others keep their order.

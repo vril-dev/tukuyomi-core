@@ -22,10 +22,14 @@
 //! 8. `Content-Encoding` is absent, or one line that is exactly `gzip` (ASCII case ignored); any other value, a
 //!    list and a repeated line are refused with 415. A gzip body that is empty on its face (`Content-Length: 0`,
 //!    or no body framing at all) is refused with 400, for it is not a gzip stream; for a chunked body the caller
-//!    applies that rule once the body has been read. A body that is not empty needs exactly one `Content-Type` that
-//!    is `application/x-www-form-urlencoded`, `multipart/form-data`, `application/json` or
-//!    `application/<name>+json` (the name is described at `inspectable_essence`); for a chunked body the caller
-//!    applies the same rule once the body has been read.
+//!    applies that rule once the body has been read. A body that is not empty has at most one `Content-Type` line, or
+//!    it is refused with 415, for a reader may take any of the lines for its type; for a chunked body the caller
+//!    applies that rule once the body has been read.
+//!
+//! The type itself is not a rule here, because a request on a route that skips the inspection is not refused for it.
+//! The head only says whether the body has exactly one `Content-Type` line, of a type that the inspection reads
+//! (`Head::inspectable_type`), and whether it has more than one line (`Head::repeated_type`). The caller refuses a
+//! body of another type with 415 once it knows that the request is inspected.
 //!
 //! A refusal is a fixed answer with no body that closes the connection. It has the number of the request in an
 //! `X-Request-ID` field, so a client that was refused can name it.
@@ -130,6 +134,7 @@ pub struct Head {
     websocket: bool,
     gzip: bool,
     inspectable_type: bool,
+    repeated_type: bool,
     http2: bool,
 }
 
@@ -180,6 +185,12 @@ impl Head {
         }
     }
 
+    /// The head was made from the fields of an HTTP/2 stream, so a `Transfer-Encoding` line in it is the one that
+    /// the proxy made for a body without a length, not one that the client sent.
+    pub fn http2(&self) -> bool {
+        self.http2
+    }
+
     /// The value of the one `Content-Length` line, if there is one.
     pub fn content_length(&self) -> Option<u64> {
         self.content_length
@@ -214,9 +225,17 @@ impl Head {
     }
 
     /// There is exactly one `Content-Type` and its type is one that the inspection reads (urlencoded,
-    /// multipart or JSON).
+    /// multipart or JSON). The head check does not refuse a body of another type: the caller does, once it knows
+    /// that the request is inspected.
     pub fn inspectable_type(&self) -> bool {
         self.inspectable_type
+    }
+
+    /// There is more than one `Content-Type` line. The head check refuses a body with a length that has them, and the
+    /// caller refuses a chunked body that has them once the body has been read, on every route: a reader may take
+    /// any of the lines for the type.
+    pub fn repeated_type(&self) -> bool {
+        self.repeated_type
     }
 }
 
@@ -491,10 +510,10 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         return Err(Reject::BadRequest);
     }
     let types: Vec<&[u8]> = named(b"content-type").collect();
-    let inspectable_type = matches!(types.as_slice(), [value] if inspectable_essence(value));
-    if content_length.is_some_and(|n| n > 0) && !inspectable_type {
+    if content_length.is_some_and(|n| n > 0) && types.len() > 1 {
         return Err(Reject::UnsupportedMedia);
     }
+    let inspectable_type = matches!(types.as_slice(), [value] if inspectable_essence(value));
 
     let websocket = method == b"GET"
         && !http10
@@ -518,6 +537,7 @@ fn scan(buf: &[u8], lim: &Limits) -> Result<Option<Head>, Reject> {
         websocket,
         gzip,
         inspectable_type,
+        repeated_type: types.len() > 1,
         http2: false,
     }))
 }

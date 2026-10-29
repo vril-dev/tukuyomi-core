@@ -42,7 +42,8 @@ pub(super) fn gunzip(coded: &[u8], max: usize) -> Result<Vec<u8>, Reply> {
     Ok(plain)
 }
 
-/// The request as it is inspected and, unchanged, forwarded.
+/// The request as it is inspected and forwarded: the same fields, except that the inspection also gets the
+/// `Transfer-Encoding` that an HTTP/1.1 client sent with a chunked body that is not held (see `represent`).
 pub(super) struct Represented {
     /// The fields in the order received; this is the one map the forwarding is made from.
     pub(super) fields: HeaderMap,
@@ -75,10 +76,16 @@ fn title_case(name: &str) -> Bytes {
 /// loses its `Transfer-Encoding` and gets a `Content-Length` of the length it is held at; a gzip request that was
 /// decoded loses its `Content-Encoding` and its `Content-Length` (if it has one) and gets one `Content-Length` of the
 /// decoded length, last like a chunked one; a POST, PUT or PATCH with neither gets `Content-Length: 0`. A body that
-/// goes on keeps its `Content-Length` and its `Content-Encoding` as the client sent them, and a chunked one has no
-/// length: the upstream gets it chunked. A gzip body that is held and not decoded keeps its `Content-Encoding` and
-/// its `Content-Length` as well. The limits of the kernel are checked on the result, so a request that fit before the
-/// change and not after it is refused here and never reaches the kernel.
+/// goes on keeps its `Content-Length` and its `Content-Encoding` as the client sent them. A chunked one has no
+/// length, so its `Transfer-Encoding` stays in the form that is inspected, as the client sent it and in its place
+/// among the fields: without it the inspection would take the request for a POST with no framing at all. The fields
+/// that are forwarded do not have it, as they do not for a body that is held, because it belongs to the connection
+/// with the client; the upstream gets the body chunked, by the client side of the proxy. The head of an HTTP/2
+/// stream is the exception: its `Transfer-Encoding` is one that `http2::head` made for a body without a length,
+/// and the client sent none (HTTP/2 has none), so the inspection is not shown it and gets no framing field. A gzip
+/// body that is held and not decoded keeps its `Content-Encoding` and its `Content-Length` as well. The limits of
+/// the kernel are checked on the inspected form, so a request that fit before the change and not after it is
+/// refused here and never reaches the kernel.
 pub(super) fn represent(
     head: &Head,
     body_len: Option<usize>,
@@ -92,17 +99,22 @@ pub(super) fn represent(
             continue;
         }
         let name = HeaderName::from_bytes(name).map_err(|_| Reject::BadRequest)?;
-        if name == EXPECT || (head.chunked() && name == TRANSFER_ENCODING) {
+        // The head check lets through one `Transfer-Encoding` line, exactly `chunked`, so this is the only one.
+        let coding = head.chunked() && name == TRANSFER_ENCODING;
+        if name == EXPECT || (coding && (body_len.is_some() || head.http2())) {
             continue;
         }
         if body_len.is_some() && decoded && (name == CONTENT_ENCODING || name == CONTENT_LENGTH) {
             continue;
         }
         let entry = (title_case(name.as_str()), Bytes::copy_from_slice(value));
-        fields.append(
-            name.clone(),
-            HeaderValue::from_bytes(value).map_err(|_| Reject::BadRequest)?,
-        );
+        // The coding that an HTTP/1.1 client sent with a body that goes on is inspected and not forwarded.
+        if !coding {
+            fields.append(
+                name.clone(),
+                HeaderValue::from_bytes(value).map_err(|_| Reject::BadRequest)?,
+            );
+        }
         if name == HOST {
             host = Some(entry);
         } else {
