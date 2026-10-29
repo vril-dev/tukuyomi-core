@@ -258,6 +258,35 @@ proxy は、設定に `admin` があると、起動のときに `admin.control` 
 - 検査しない経路は世代の一部である。どの世代にも同じ経路を入れ続ける。入れ忘れた世代を選ぶと、その世代からは取り込みが検査される。
 - この経路が効くのは、入れた世代が使われてからである。最初にこの経路を入れる世代は、命令で取り込む（`rules import ... --routes <file>`）。管理画面の取り込みも、同じ形の JSON を入力できる。
 
+### 管理の Host の CRS の調整
+
+管理の Host を CRS で検査すると、CRS の既定の設定は、管理画面の次の要求を遮断する。どちらも、管理の Host にだけ効く調整で通す。調整の後も、ほかの Host の検査は変わらない。
+
+- PUT と DELETE: CRS が既定で許す method は `GET`・`HEAD`・`POST`・`OPTIONS` だけで、ほかの method は規則 911100 で遮断される。管理 API は、パスワードの変更、役割と有効・無効の変更、第二要素の解除、API token と世代の削除に PUT と DELETE を使う。調整が無いと、新しい利用者は最初のパスワードの変更ができず、ログインを終えられない。
+- パスワードの欄: CRS は JSON の本文の値も検査する。記号の並びによっては、正しいパスワードが SQL injection と判定され、ログインやパスワードの変更が遮断される（規則 942100 など）。
+
+method の調整は、CRS のディレクトリの `crs-setup.conf` の終わりに足してから、世代を取り込む。運用者のルールのファイルは CRS の規則の後に読み込まれる（[運用リファレンス](operator-reference.md) の「`rules`」）ので、そこに書いても、method の規則より後になって効かない。管理画面の取り込みで CRS を使うときは、`admin.crs_dir` の `crs-setup.conf` に足す。
+
+```text
+SecRule REQUEST_HEADERS:Host "@rx ^admin\.example\.com(?::[0-9]{1,5})?$" \
+    "id:1000100,phase:1,pass,nolog,t:none,t:lowercase,setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT DELETE'"
+```
+
+パスワードの欄の調整は、運用者のルールのファイルに書き、取り込みで `--rules`（管理画面では「ルールのファイル」）に渡す。phase 1 の規則なので、CRS の後に読み込まれても、本文を検査する CRS の規則より先に効く。
+
+```text
+SecRule REQUEST_HEADERS:Host "@rx ^admin\.example\.com(?::[0-9]{1,5})?$" \
+    "id:1000101,phase:1,pass,nolog,t:none,t:lowercase,\
+    ctl:ruleRemoveTargetByTag=OWASP_CRS;ARGS:json.password,\
+    ctl:ruleRemoveTargetByTag=OWASP_CRS;ARGS:json.current,\
+    ctl:ruleRemoveTargetByTag=OWASP_CRS;ARGS:json.new"
+```
+
+- `admin\.example\.com` は、`admin.origin` の host に替える。`.` は `\.` と書く。
+- 外すのはパスワードの3つの欄（`password`、`current`、`new`）だけである。名前の欄、token の名前、query などは、調整の後も検査される。攻撃に似た名前は遮断されるので、別の名前にする。
+- 規則の id は、ほかの規則と重ならない値にする（検査プロセスが使う id は、[運用リファレンス](operator-reference.md) の「検査プロセスが足す決まり」にある）。
+- 調整を入れた世代は、管理の Host の PUT と DELETE、記号を含むパスワードでのログインを試してから選ぶ。遮断された要求は、画面に出る要求の番号で記録を探すと、`rules` で規則の id が分かる。
+
 ### 本文の大きさ
 
 - 取り込みの本文は 12 MiB まで届く。`proxy.max_body` を 12 MiB（12582912）以上にする。経路の `max_body` は `proxy.max_body` を下げることしかできないので、ほかの経路を絞りたいなら、そちらの経路に小さい `max_body` を書く。
@@ -654,6 +683,7 @@ session は、状態によって使える API が決まる。状態に合わな�
 - どの画面も自動では読み直さない。最新にするには「読み直す」を使う。
 - ログインの後、パスワードの変更待ちと設定待ちのときは、その画面だけを出す。
 - 画面は、ブラウザの `fetch` で管理 API を呼ぶ。API の答えの文（`error`）は、画面が言語ごとの文に置き換える。
+- 答えに `error` の文が無い失敗（前に置いた proxy が規則で遮断した要求の 403、proxy が管理のプロセスに届かなかった 502 など）では、画面は失敗の文の後に、答えの `X-Request-ID` の要求の番号を出す。その番号で記録の画面を探すと、遮断した規則などが分かる（上の「管理の Host の CRS の調整」）。番号は、proxy と管理のプロセスが付ける形のときだけ出す。
 
 ## API の path の一覧
 
