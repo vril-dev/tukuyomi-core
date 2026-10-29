@@ -1,16 +1,22 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { Api, ApiError, gateOf, kindOf } from '../js/api.js';
+import { Api, ApiError, gateOf, kindOf, requestOf } from '../js/api.js';
+import { describe } from '../js/app.js';
+import { sentence, setLanguage, t } from '../js/i18n.js';
 import { generationState } from '../js/waf.js';
 
-/** A fetch that answers from a list, in order, and keeps what it was asked. */
+/**
+ * A fetch that answers from a list, in order, and keeps what it was asked. A reply is `[status, body, fields]`: the
+ * fields are the header fields it carries, by lower-case name; its body is JSON.
+ */
 function fake(replies) {
   const asked = [];
   const fetchFunction = async (path, init) => {
     asked.push({ path, method: init.method, headers: { ...init.headers }, body: init.body, init });
-    const [status, body] = replies.shift();
-    return { status, headers: { get: () => 'application/json' }, json: async () => body };
+    const [status, body, fields = {}] = replies.shift();
+    const get = (name) => (name.toLowerCase() === 'content-type' ? 'application/json' : (fields[name.toLowerCase()] ?? null));
+    return { status, headers: { get }, json: async () => body };
   };
   return { asked, fetchFunction };
 }
@@ -98,6 +104,53 @@ test('a call sets no mode and no referrer policy, so that a browser sends the re
   for (const { init } of asked) {
     assert.ok(!('mode' in init) && !('referrerPolicy' in init), init.method);
   }
+});
+
+test('the number of a request is kept only in the form the proxy gives, at its limits and one past them', () => {
+  const prefix = '0123456789abcdef';
+  for (const good of [`${prefix}-0`, `${prefix}-14c`, `${prefix}-${'f'.repeat(16)}`]) assert.equal(requestOf(good), good, good);
+  const bad = [
+    null, undefined, '', 17, `${prefix}`, `${prefix}-`, `${prefix}-${'f'.repeat(17)}`, `${prefix.slice(1)}-1`, `${prefix}0-1`,
+    `${prefix.toUpperCase()}-1`, `${prefix}-1F`, `${prefix}-1g`, ` ${prefix}-1`, `${prefix}-1 `, `${prefix}-1\n`,
+    `${prefix}-1, ${prefix}-2`, `${prefix}_1`, '<b>0123456789abcdef-1</b>',
+  ];
+  for (const odd of bad) assert.equal(requestOf(odd), '', JSON.stringify(odd));
+});
+
+test('an answer with no sentence shows the number of its request, and one with a sentence shows only the sentence', async () => {
+  setLanguage('en');
+  const id = '9f3a51c0e2b47d18-14c';
+  const fail = async (reply, options) => {
+    const api = new Api(fake([reply]).fetchFunction);
+    const error = await api.call('GET', '/api/status').catch((caught) => caught);
+    assert.ok(error instanceof ApiError);
+    return { error, words: describe(error, options) };
+  };
+  const blocked = await fail([403, null, { 'x-request-id': id }]);
+  assert.equal(blocked.error.request, id);
+  assert.equal(blocked.words, `${t('error.generic')} ${t('error.request', { id })}`);
+  assert.ok(blocked.words.includes(id));
+
+  // The proxy that gave up says so with an empty answer too, and its words are kept.
+  const gaveUp = await fail([502, null, { 'x-request-id': id }], { change: true });
+  assert.equal(gaveUp.words, `${t('error.unknown_result')} ${t('error.request', { id })}`);
+
+  // A value that is not of the form is dropped, and so is a missing one.
+  for (const fields of [{ 'x-request-id': '9F3A51C0E2B47D18-14c' }, { 'x-request-id': '<b>x</b>' }, {}]) {
+    const plain = await fail([403, null, fields]);
+    assert.equal(plain.error.request, '');
+    assert.equal(plain.words, t('error.generic'));
+  }
+
+  // An answer with a sentence is shown as it was: the number is not added.
+  const said = await fail([403, { error: 'forbidden' }, { 'x-request-id': id }]);
+  assert.equal(said.error.request, id);
+  assert.equal(said.words, sentence('forbidden'));
+  assert.ok(!said.words.includes(id));
+
+  // An error that the page makes itself, and any other error, are worded as before.
+  assert.equal(describe(new ApiError('refused', 400, '', null, id)), `${t('error.generic')} ${t('error.request', { id })}`);
+  assert.equal(describe(new Error('x')), t('error.generic'));
 });
 
 test('a sign-out ends only on the word of the server, and a failure keeps the session as it was', async () => {

@@ -46,11 +46,16 @@ export function routeOf(hash, ids) {
   return ids.includes(name) ? name : ids[0];
 }
 
-/** The words for a failed call. A change whose answer never came has an unknown result; a read just failed. */
+/**
+ * The words for a failed call. A change whose answer never came has an unknown result; a read just failed. An answer
+ * with no sentence of its own (for example the empty 403 or 502 of the proxy in front) adds the number of its request,
+ * which finds its record on the records screen.
+ */
 export function describe(error, { change = false } = {}) {
   if (error instanceof ApiError) {
     if (error.sentence !== '') return sentence(error.sentence);
-    if (error.kind === 'unknown') return change || error.status !== 0 ? t('error.unknown_result') : t('error.network');
+    const words = error.kind === 'unknown' ? (change || error.status !== 0 ? t('error.unknown_result') : t('error.network')) : t('error.generic');
+    return error.request === '' ? words : `${words} ${t('error.request', { id: error.request })}`;
   }
   return t('error.generic');
 }

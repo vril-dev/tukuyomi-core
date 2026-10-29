@@ -16,6 +16,13 @@ test('the two dictionaries have the same keys, and every text is filled', () => 
   }
 });
 
+test('a text has the same values to fill in, in both languages', () => {
+  const names = (text) => [...text.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort();
+  for (const key of Object.keys(dictionaries.en)) {
+    assert.deepEqual(names(dictionaries.ja[key]), names(dictionaries.en[key]), key);
+  }
+});
+
 test('every key that a script asks for with t() is in the dictionaries', () => {
   for (const name of readdirSync(scripts)) {
     const source = readFileSync(new URL(name, scripts), 'utf8');

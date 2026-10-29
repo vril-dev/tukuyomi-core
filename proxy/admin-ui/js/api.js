@@ -9,6 +9,8 @@
 //                read the status and the history again
 //   refused      another 4xx: the request was not valid
 //   failed       any other answer that is not a success
+// An error keeps the number of the request (`request`) when the answer carried one in the form that the proxy and the
+// admin process give, so that the user can find its record when the answer has no sentence of its own.
 // A call has no time limit of its own: an import, a switch and a rollback may take as long as the server lets them.
 // Nothing runs when the module is loaded.
 
@@ -26,14 +28,23 @@ export function kindOf(status) {
 }
 
 export class ApiError extends Error {
-  constructor(kind, status, sentence, body = null) {
+  constructor(kind, status, sentence, body = null, request = '') {
     super(sentence || kind);
     this.name = 'ApiError';
     this.kind = kind;
     this.status = status;
     this.sentence = sentence;
     this.body = body;
+    this.request = request;
   }
+}
+
+/**
+ * The number of a request from the `X-Request-ID` of an answer: 16 lower-case hexadecimal digits, a `-` and 1 to 16
+ * lower-case hexadecimal digits, the form that the proxy and the admin process give. Anything else, or none, gives ''.
+ */
+export function requestOf(value) {
+  return typeof value === 'string' && /^[0-9a-f]{16}-[0-9a-f]{1,16}$/.test(value) ? value : '';
 }
 
 /** The `error` sentence of an answer's body; empty when there is none. */
@@ -70,7 +81,10 @@ export class Api {
     this.onSessionLost = () => {};
   }
 
-  /** One request: the status and the parsed JSON body (null when the answer has none). Throws `unknown` on no answer. */
+  /**
+   * One request: the status, the parsed JSON body (null when the answer has none) and the number of the request ('' when
+   * the answer has none that is valid). Throws `unknown` on no answer.
+   */
   async send(method, path, body) {
     const headers = { Accept: 'application/json' };
     // No `mode` and no `referrerPolicy`: the Fetch standard has a browser send `Origin: null` with a change (neither
@@ -103,7 +117,7 @@ export class Api {
         parsed = null;
       }
     }
-    return { status: response.status, body: parsed };
+    return { status: response.status, body: parsed, request: requestOf(response.headers.get('x-request-id')) };
   }
 
   /**
@@ -136,7 +150,7 @@ export class Api {
     return false;
   }
 
-  settle({ status, body }, auth) {
+  settle({ status, body, request }, auth) {
     if (status >= 200 && status < 300) {
       if (body !== null && typeof body === 'object' && 'csrf' in body) {
         this.csrf = typeof body.csrf === 'string' ? body.csrf : null;
@@ -144,7 +158,7 @@ export class Api {
       return body ?? {};
     }
     if (status === 401 && auth) this.lose();
-    throw new ApiError(kindOf(status), status, sentenceOf(body), body);
+    throw new ApiError(kindOf(status), status, sentenceOf(body), body, request);
   }
 
   lose() {

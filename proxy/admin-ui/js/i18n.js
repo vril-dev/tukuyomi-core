@@ -91,6 +91,7 @@ const ja = {
   'error.unknown_result': '結果が分かりません。接続が切れたか、応答が間に合わなかった可能性があります。状態を読み直して確かめてください。',
   'error.network': '管理のプロセスに接続できません。',
   'error.generic': '処理に失敗しました。',
+  'error.request': '要求の番号は {id} です。管理者は、記録の画面でこの番号を探せます。',
 
   'invalid credentials': 'ユーザー名かパスワードが違います。',
   'too many tries': '試行が多すぎます。しばらく待ってからやり直してください。',
@@ -688,6 +689,7 @@ const en = {
   'error.unknown_result': 'The result is not known. The connection may have dropped, or the answer came too late. Reload the status to check.',
   'error.network': 'The admin process cannot be reached.',
   'error.generic': 'The request failed.',
+  'error.request': 'The request ID is {id}. An administrator can search for it on the Records screen.',
 
   'invalid credentials': 'The user name or the password is wrong.',
   'too many tries': 'Too many tries. Wait a while and try again.',
@@ -861,7 +863,7 @@ const en = {
   'import.p.size': '{name} is over 2 MiB.',
   'import.p.name': '{name} cannot be used as a name (only letters, digits and . _ -, not starting with a dot, up to 128 characters).',
   'import.p.twice': 'The name {name} is used twice.',
-  'import.p.more': '{n} more problems.',
+  'import.p.more': 'Not shown: {n} more.',
   'import.submit': 'Import',
   'import.read_failed': 'A file could not be read. Choose the files again.',
   'import.done': 'Imported generation {id}.',
@@ -907,7 +909,7 @@ const en = {
   'records.loading': 'Reading…',
   'records.empty': 'No record matches.',
   'records.searched': 'This part was searched and nothing matched. The read stopped at its limit, so there is more. Use Older to go on searching.',
-  'records.page': 'Page {page} ({n} records)',
+  'records.page': 'Page {page} ({n} found)',
   'records.newer': 'Newer',
   'records.older': 'Older',
   'records.open': 'Open',

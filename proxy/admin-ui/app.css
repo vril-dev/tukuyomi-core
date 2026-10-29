@@ -547,6 +547,7 @@ select {
 
   .nav {
     flex-direction: row;
+    flex-wrap: wrap;
     overflow-x: auto;
     padding: var(--space-2) var(--space-3);
     border-right: 0;
