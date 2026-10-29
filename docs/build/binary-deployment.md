@@ -1,6 +1,6 @@
 # 実行ファイルの build と配置
 
-この文書は、今の実装を1台の Linux のホストで動かす手順を示す。設定の鍵の意味と範囲、命令、合図、記録、監視は [運用リファレンス](../operations/operator-reference.md) に書く。
+この文書は、今の実装を1台の Linux のホストで動かす手順を示す。設定の鍵の意味と範囲、命令、合図、記録、監視は [運用リファレンス](../operations/operator-reference.md) に書く。管理のプロセスの設定と API は [管理リファレンス](../operations/admin-reference.md) に書く。
 
 ここに出てくる置き場の path（`/opt/tukuyomi-core`、`/etc/tukuyomi-core`、`/var/lib/tukuyomi-core`）と利用者の名前（`tukuyomi`）は例である。設定の path は、どれも絶対の path で書く（`.`・`..`・空の要素・末尾の `/` は断られる）。
 
@@ -8,21 +8,26 @@
 
 | もの | 中身 |
 |---|---|
-| `tukuyomi-proxy`（Rust、`proxy/`） | HTTP・HTTPS の受付と転送。検査核（`kernel/`、Rust のライブラリ）を組み込み、検査プロセスの起動・停止・再起動を受け持つ。同じ実行ファイルが、ルールの保管場所の命令（`rules`）、証明書の命令（`acme renew`）、設定の確かめ（`config check`）も持つ |
+| `tukuyomi-proxy`（Rust、`proxy/`） | HTTP・HTTPS の受付と転送。検査核（`kernel/`、Rust のライブラリ）を組み込み、検査プロセスの起動・停止・再起動を受け持つ。同じ実行ファイルが、ルールの保管場所の命令（`rules`）、証明書の命令（`acme renew`）、設定の確かめ（`config check`）、管理のプロセス（`admin`）も持つ |
 | `tukuyomi-inspector`（Go、`inspector/`） | Coraza で要求を検査する。proxy が子のプロセスとして起動し、引き継いだ Unix domain socket の対で話す。待ち受けの port は持たない |
-| 設定ファイル | JSON の1つのファイル。値に既定値はない。鍵は、省けると決まったもの（`acme` など）のほかは、すべて書く |
-| ルールの保管場所 | ルールセットの世代を置くディレクトリ（設定の `rules.store.dir`）。`rules import` が世代を作り、`rules activate` が使う世代を選ぶ |
+| 管理のプロセス | 同じ実行ファイルの `tukuyomi-proxy admin <config>`。proxy とは別の unit で動かす。loopback の待ち受けで、管理 API と管理画面（実行ファイルに組み込んである）に答える。ルールの世代の操作と、proxy への切り替えの依頼（制御 socket）をする |
+| 設定ファイル | JSON の1つのファイル。値に既定値はない。鍵は、省けると決まったもの（`acme`、`records`、`access`、`rate_limit`、`geo`、`admin` など）のほかは、すべて書く。proxy と管理のプロセスが同じファイルを読む |
+| ルールの保管場所 | ルールセットの世代を置くディレクトリ（設定の `rules.store.dir`）。`rules import` が世代を作り、`rules activate` が使う世代を選ぶ。管理のプロセスも同じ操作をする |
 | 検査プロセスの作業場所 | 起動ごとの一時のディレクトリを作る親（設定の `kernel.tmp_root`） |
 | 証明書と鍵 | TLS の待ち受けのもの。`acme renew` で発行・更新するか、運用者が置く |
+| 記録のファイル | 標準エラーに出す記録の写しを置くディレクトリ（設定の `records.dir`）。proxy が書き、管理のプロセスが読む |
+| 管理の置き場 | 管理のプロセスが利用者・API の token・監査の記録・切り替えの履歴を置くディレクトリ（設定の `admin.store.dir`） |
+| 制御 socket | proxy が管理のプロセスの依頼を受ける Unix domain socket（設定の `admin.control`） |
+| 国のデータベース | 国の一覧（`access`）が使う、MaxMind DB の形式のファイル（設定の `geo.country_db`）。運用者が用意する |
 
-検査プロセスは、proxy と同じ利用者で動く。
+検査プロセスと管理のプロセスは、proxy と同じ利用者で動く。
 
 ## 要るもの
 
 - Linux。試したのは x86_64 だけである。
 - Landlock が有効な Linux。
   - 検査プロセスは、ルールを読んだ後に Landlock で自分を絞る（下の「検査プロセスの絞り」）。
-  - Landlock が無い Linux では、検査プロセスは起動を断る（exit 14）。proxy も起動せず（記録は `stop: the kernel failed: Exit(14)`）、`rules import` の試しも失敗する。絞らずに動かす設定は無い。
+  - Landlock が無い Linux では、検査プロセスは起動を断る（exit 14）。proxy も起動せず（記録は `stop: the kernel failed: Exit(14)`）、`rules import` の試しも、管理のプロセスの取り込みの試しも失敗する。絞らずに動かす設定は無い。
   - 要るのは、Landlock を含む Linux 5.13 以上で、LSM の並びに `landlock` があること（`/sys/kernel/security/lsm` で分かる）。どの distribution の既定で有効かは確かめていない。
   - Linux の版によって、絞れる範囲が違う。どの版で絞ったかは、外からは見えない。
     - TCP の bind と connect まで絞るには、Linux 6.7 以上（Landlock の ABI 4 以上）が要る。それより前の版では、ファイルだけを絞って動く。
@@ -41,7 +46,7 @@ proxy は `proxy/` で build する。検査核は、そこから一緒に build
 cd proxy && cargo build --release --locked
 ```
 
-実行ファイルは `proxy/target/release/tukuyomi-proxy` にできる。
+実行ファイルは `proxy/target/release/tukuyomi-proxy` にできる。管理画面のファイル（`proxy/admin-ui/`）は、この build で実行ファイルに組み込まれる。画面のための build や配布は、別には要らない。
 
 検査プロセスは、`inspector/` で cgo を使わずに build する。
 
@@ -80,6 +85,7 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
 
 - 専用の利用者を作り、サービスも命令もその利用者で流す。たとえば `sudo -u tukuyomi tukuyomi-proxy ...` とする。
 - root で `acme renew` を流すと、作った鍵を別の利用者の proxy が読めないので、これも断る。
+- 管理のプロセス（`admin`）と、その短い命令（`admin bootstrap`・`admin reset`）も、同じ利用者で流す。ルールの保管場所、記録のディレクトリ、制御 socket は、その利用者だけが使える（0700）ためである。別の利用者で動かすと、どれも使えない。
 
 置き場の例を次に示す。
 
@@ -92,20 +98,46 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
 | `/var/lib/tukuyomi-core/tls/` | 証明書の `cert_file`・`key_file` | サービスの利用者（`acme renew` が書く） |
 | `/var/lib/tukuyomi-core/acme/account.key` | `acme.account_key_file` | `acme renew` が初めての実行のときに作る（0600） |
 | `/var/lib/tukuyomi-core/challenges` | `acme.challenge_dir` | サービスの利用者 |
+| `/var/lib/tukuyomi-core/records` | `records.dir` | サービスの利用者。権限は 0700。中の `records.log` などは proxy が 0600 で作る |
+| `/var/lib/tukuyomi-core/admin` | `admin.store.dir` | サービスの利用者。権限は 0700。中の `users/`・`tokens/`・`audit/` などは管理のプロセスが作る |
+| `/var/lib/tukuyomi-core/control` | `admin.control` のあるディレクトリ（例の socket は `/var/lib/tukuyomi-core/control/proxy.sock`） | サービスの利用者。権限は 0700。socket は proxy が 0600 で作る。socket の path は 107 バイトまで |
+| `/var/lib/tukuyomi-core/crs-4.23.0` | `admin.crs_dir`（管理の API で CRS を取り込むとき） | 「CRS の取得」で作ったディレクトリ。サービスの利用者が読めること |
+| `/etc/tukuyomi-core/country.mmdb` | `geo.country_db` | root。サービスの利用者が読めて、書き換えられない形にする（0644）。proxy は持ち主と権限を確かめない |
 
-- 上の表のディレクトリは、先に作っておく。proxy も命令も、これらは作らない。保管場所の中のもの（`generations/`、`staging/`、`using/` など）は、命令と proxy が作る。
-- 保管場所と作業場所は、本物のディレクトリ（link ではない）で、持ち主がプロセスの利用者で、group と other の権限が無いことを確かめる。確かめる時が違う。
-  - 保管場所は、proxy の起動、`config check`、`rules` の命令で確かめる。違えば exit 1 で断る。
+- 上の表のディレクトリは、先に作っておく。proxy も命令も、これらは作らない。保管場所の中のもの（`generations/`、`staging/`、`using/` など）は、命令と proxy が作る。管理の置き場の中のものは管理のプロセスが、記録のファイルと制御 socket は proxy が作る。
+- ルールの保管場所、記録のディレクトリ、管理の置き場、制御 socket のあるディレクトリは、別々のディレクトリにする。同じにも、互いの中にも置けない（設定が断られる）。上の表の例は、どれも `/var/lib/tukuyomi-core` の下の別々のディレクトリである。
+- 保管場所、作業場所、記録のディレクトリ、管理の置き場、制御 socket のあるディレクトリは、本物のディレクトリ（link ではない）で、持ち主がプロセスの利用者で、group と other の権限が無いことを確かめる。確かめる時が違う。
+  - 保管場所は、proxy の起動、`config check`、`rules` の命令で確かめる。管理のプロセスが保管場所を開くときも確かめる。違えば exit 1 で断る。
   - 作業場所は、検査プロセスを起動するたびに確かめる（proxy の起動、検査プロセスの起動し直し、SIGUSR1 の切り替え、`rules import` の試し）。違えば検査プロセスを起動しない。proxy の起動では exit 1 で終わり、SIGUSR1 の切り替えでは今の世代が動き続け、起動し直しでは proxy が止まる。
-  - `config check` と `acme renew` は、作業場所を確かめない。
-- 上の2つの親のディレクトリは確かめない。ほかの利用者が中の名前を作ったり差し替えたりできないようにするのは、運用者の受け持ちである。
+  - 記録のディレクトリは、proxy の起動のときに確かめる。違えば proxy は起動しない（exit 1）。記録のファイルを開き直す前と、回す前にも確かめる。
+  - 制御 socket のあるディレクトリは、proxy の起動のときに確かめる。違えば proxy は起動しない（exit 1）。
+  - 管理の置き場は、管理のプロセスの起動と、`admin bootstrap`・`admin reset` で確かめる。違えば exit 1 で断る。
+  - `config check` と `acme renew` は、作業場所を確かめない。`config check` は、記録のディレクトリ、制御 socket のあるディレクトリ、管理の置き場も確かめない。
+- 上の置き場の親のディレクトリは確かめない。ほかの利用者が中の名前を作ったり差し替えたりできないようにするのは、運用者の受け持ちである。
 - 作業場所に setgid が付いていると、中に作るディレクトリがその印を受け継いで権限の確かめに落ち、検査プロセスが起動できない。
 - `acme renew` は、証明書・鍵・challenge のファイルを、それぞれの置き場のディレクトリに一時のファイルとして書いてから置き換える。サービスの利用者が、これらのディレクトリに書けること。
 - 設定ファイルが読めない利用者で命令を流すと、設定の段で断られる。保管場所の持ち主と違う利用者で流すと、保管場所の段で断られる。
 
+### 国のデータベース
+
+国の一覧（`access` の `deny_countries`・`allow_countries`）を使うときだけ要る。
+
+- データベースは、proxy に同梱せず、proxy は取得もしない。MaxMind DB の形式（版 2）のファイルを、運用者が用意する。使用許諾は、提供元の条件に従って運用者が守る。
+- 置く所と権限: root が持ち主で、サービスの利用者が読めて書き換えられないファイル（0644）にする。例は `/etc/tukuyomi-core/country.mmdb` である。proxy は持ち主と権限を確かめず、中身を `geo.sha256` で確かめる。link にはしない（断られる）。大きさは 256 MiB までである。
+- 設定の命令（proxy の起動、`config check`、`rules`、`acme renew`、`admin`）は、どれもサービスの利用者でこのファイルの全体を読む。読めない利用者の命令は、設定の段で断られる。
+- 国の一覧があれば、proxy と管理のプロセスは、確かめたファイルの全体をメモリに持つ。どの命令も読むたびに全体を確かめるので、大きいファイルでは時間とメモリを使う。
+- ファイルの SHA-256 を求めて、設定の `geo.sha256` に書く。値が合わないと、どの命令も設定を断る。
+
+  ```bash
+  sha256sum /etc/tukuyomi-core/country.mmdb
+  ```
+
+- 替えるときは、新しいファイルを別の名前で置き、設定の `geo.country_db` と `geo.sha256` を1回の置き換えで書き換える。`config check` で確かめてから、proxy と管理のプロセスを起動し直す。データベースは、起動の後は読み直さない。
+- 設定の鍵と、国の決め方（private な address や、IPv4 だけのデータベースの IPv6 は `UNKNOWN`）は [運用リファレンス](../operations/operator-reference.md) の「要求の前の方針」にある。
+
 ## 初めて起動する手順
 
-1. 設定ファイルを書く。鍵の一覧と例は [運用リファレンス](../operations/operator-reference.md) にある。
+1. 設定ファイルを書く。鍵の一覧と例は [運用リファレンス](../operations/operator-reference.md) にある。置き場のディレクトリ（上の表）を先に作る。国の一覧を使うときは、国のデータベースも置き、`sha256` を書く（上の「国のデータベース」）。
 2. CRS を取得する（上の「CRS の取得」）。
 3. ルールセットを取り込む。
 
@@ -133,6 +165,18 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
    - 上流の server の名前と、TLS の証明書と鍵のファイルも確かめる。断られたときは、同じ exit 1 で、行の頭（`upstream refused`、`tls refused`）で分かる。
    - 検査プロセスは起動しないので、作業場所、検査プロセスの実行ファイル、Landlock は確かめない。
 6. サービスを起動する（下の「systemd」）。
+7. 管理のプロセスを使うときは、その unit も起動し（下の「管理のプロセス」）、最初の利用者を作る。
+
+   ```bash
+   read -r -s -p 'password: ' PW; echo
+   printf '%s\n' "$PW" | sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy admin bootstrap /etc/tukuyomi-core/config.json <名前>
+   unset PW
+   ```
+
+   - パスワードは、標準入力の最初の1行から読む（12〜128 バイト）。引数には渡さない。名前は 1〜32 バイトの `a-z`・`0-9`・`.`・`_`・`-` である。
+   - 作る利用者の役割は `owner` である。成功すると `created owner <名前>` が出る。管理の置き場に利用者が1人でもいれば、断られる（exit 1）。
+   - 管理のプロセスの起動の前でも後でも流せる。パスワードを忘れた利用者には `admin reset` を使う。
+   - 管理 API、役割、画面は [管理リファレンス](../operations/admin-reference.md) にある。
 
 ## systemd
 
@@ -178,7 +222,7 @@ WantedBy=multi-user.target
   - `TimeoutStartSec` は、上流の名前を引く時間（`resolve_timeout_ms`）と、検査核の準備を待つ時間（`ready_wait_ms`）を足した時間より長くする。`READY=1` が届かないと、systemd はこの時間の後に proxy を止める。
 - `TimeoutStopSec` は、`stop_wait_ms` と `kill_grace_ms` と、記録の書き出しの 200 ms を足した時間より長くする。短いと、systemd が先に SIGKILL を送る。停止の流れは [運用リファレンス](../operations/operator-reference.md) の「停止」にある。
 - `LogRateLimitIntervalSec=0` を置く。journald の既定の流量の上限では、混んだときに要求の記録が journal に入らずに落ちる。
-- 記録は journal に入る。保存の期間と容量は、journald の設定（`/etc/systemd/journald.conf` の `SystemMaxUse`、`MaxRetentionSec` など）で決める。記録には client の address と path が入るので、journal を読める組（Ubuntu では `adm`・`systemd-journal`）に入れる利用者を絞る。記録の形は [運用リファレンス](../operations/operator-reference.md) の「記録」にある。
+- 記録は journal に入る。設定に `records` があれば、同じ記録がファイルにも入る（上の「利用者と置き場」）。保存の期間と容量は、journald の設定（`/etc/systemd/journald.conf` の `SystemMaxUse`、`MaxRetentionSec` など）で決める。記録には client の address と path が入るので、journal を読める組（Ubuntu では `adm`・`systemd-journal`）に入れる利用者を絞る。記録の形は [運用リファレンス](../operations/operator-reference.md) の「記録」にある。
 - 監視の待ち受け（設定の `status`）を置くと、同じ host の監視の program から `/healthz`・`/readyz`・`/metrics` を引ける。ロードバランサーの準備の確かめには `/readyz` を使う。
 - 合図は proxy の主プロセスだけに送る（`ExecReload` の `$MAINPID`、または `systemctl kill --kill-whom=main`）。
   - `--kill-whom=main` を付けない `systemctl kill` は、検査プロセスにも合図を送る。
@@ -191,9 +235,51 @@ WantedBy=multi-user.target
   systemctl kill -s SIGUSR1 --kill-whom=main tukuyomi-core.service
   ```
 
+- 記録のディレクトリ、制御 socket のあるディレクトリ、管理の置き場は、`ReadWritePaths` の中に置く（上の例は `/var/lib/tukuyomi-core` の下）。別の所に置くときは、`ReadWritePaths` に足す。
 - port 80・443 で待ち受けるには `CAP_NET_BIND_SERVICE` が要る。ambient の capability は検査プロセスにも受け継がれるが、検査プロセスは起動のときにすべての capability を捨てる。
 - `LimitNOFILE` は、受ける接続（`max_conns`）と上流への接続の数を足したより大きくする。接続ごとに file descriptor を使う。
 - 設定の誤りなどで起動が断られると、`Restart=on-failure` により `RestartSec` ごとに起動し直す。設定を変える前に `config check` で確かめる。
+
+### 管理のプロセス
+
+管理のプロセスは、proxy とは別の unit で動かす。同じ実行ファイル、同じ設定ファイル、同じ利用者である。unit の例を示す。
+
+```ini
+# tukuyomi-core-admin.service
+[Unit]
+Description=tukuyomi-core admin
+After=network.target
+
+[Service]
+Type=notify
+User=tukuyomi
+Group=tukuyomi
+ExecStart=/opt/tukuyomi-core/bin/tukuyomi-proxy admin /etc/tukuyomi-core/config.json
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+LogRateLimitIntervalSec=0
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/tukuyomi-core
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- `Type=notify` にする。管理のプロセスは、待ち受けを bind した後に `READY=1` を、停止の始めに `STOPPING=1` を送る。
+- `KillMode=mixed` にする。管理のプロセスは、ルールの取り込みの試しで検査プロセスを起動する。停止の SIGTERM が主プロセスにだけ届けば、管理のプロセスが、動いている試しを終えて、検査プロセスと作業場所を片付ける。
+- 管理のプロセスは、停止の合図（SIGTERM、SIGINT、SIGHUP）を受けると、待ち受けを閉じ、動いている要求を 10 秒まで待つ。`TimeoutStopSec` は、この 10 秒より長くする。取り込みの試しが動いているときのために、その検査プロセスを止める時間（`proxy.stop_inspect_ms` と `kernel.kill_grace_ms`）も足しておく。
+- `LogRateLimitIntervalSec=0` を置く。監査の記録は標準エラー（journal）にも出るので、journald の流量の上限で落ちないようにする。
+- 検査プロセスの実行ファイル（`kernel.inspector`）と作業場所（`kernel.tmp_root`）は、proxy と同じものを使う。取り込みの試しの検査プロセスは、proxy と同じに Landlock で自分を絞る。
+- 管理のプロセスは、`admin.listen` の loopback の address で、平文の HTTP で待つ。1024 以上の port なら、`AmbientCapabilities` は要らない。
+- 設定ファイルは、起動のときに1回だけ読む。設定を変えたら、`config check` で確かめてから、`systemctl restart` で起動し直す。`ExecReload` は置かない（SIGHUP は読み直しではなく、停止である）。
+- proxy が動いていなくても、管理のプロセスは起動する。そのあいだは、世代の切り替えを依頼できない。
+- 外から使うときは、proxy の TLS の待ち受けの経路から、`admin.listen` の address へ転送する。`admin.listen` は、上流の server にしてよい（[運用リファレンス](../operations/operator-reference.md) の「`admin`」）。経路の書き方は [管理リファレンス](../operations/admin-reference.md) の「外から使う」に、画面と API の使い方は同じ文書にある。
+- 記録は journal に入り、監査の記録は管理の置き場の `audit/` にも書く。
 
 ### 証明書の更新の timer
 
@@ -259,11 +345,11 @@ WantedBy=timers.target
 - MPTCP を使わないホストでは、`net.mptcp.enabled=0` にすれば MPTCP の socket は作れなくなる。
 - 1024 未満の port は、capability を捨てるので取れない（Linux の `net.ipv4.ip_unprivileged_port_start` が既定の 1024 のとき）。
 
-proxy の側は、絞りをかけない。proxy は設定・保管場所・証明書と鍵を読み、待ち受けと上流への接続を持つ。
+proxy の側は、絞りをかけない。proxy は設定・保管場所・証明書と鍵を読み、待ち受けと上流への接続を持つ。管理のプロセスも、自分には絞りをかけない。取り込みの試しで起動する検査プロセスだけが、上の絞りをかける。
 
 ## 起動の前の確かめ
 
-proxy の起動と `rules import`（試しで検査プロセスを起動する）は、`/proc` を読んで次も確かめる。違えば断る。`config check` とほかの命令は、root でないことだけを確かめる。
+proxy の起動、`rules import`（試しで検査プロセスを起動する）、管理のプロセスの命令（`admin <config>`、`admin bootstrap`、`admin reset`）は、`/proc` を読んで次も確かめる。違えば断る。`config check` とほかの命令は、root でないことだけを確かめる。
 
 - SIGCHLD を無視していないこと。検査核は、子のプロセスの終わりを自分で待つ。
 - 2 より上の file descriptor が、すべて close-on-exec であること。検査プロセスに余計な descriptor を渡さないため。
