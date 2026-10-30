@@ -9,7 +9,7 @@
 | もの | 中身 |
 |---|---|
 | `tukuyomi-proxy`（Rust、`proxy/`） | HTTP・HTTPS の受付と転送。検査核（`kernel/`、Rust のライブラリ）を組み込み、検査プロセスの起動・停止・再起動を受け持つ。同じ実行ファイルが、ルールの保管場所の命令（`rules`）、証明書の命令（`acme renew`）、設定の確かめ（`config check`）、管理のプロセス（`admin`）も持つ |
-| `tukuyomi-inspector`（Go、`inspector/`） | Coraza で要求を検査する。proxy が子のプロセスとして起動し、引き継いだ Unix domain socket の対で話す。待ち受けの port は持たない |
+| `tukuyomi-inspector`（Go、`inspector/`） | Coraza で要求を検査する。proxy が子のプロセスとして起動し、引き継いだ Unix domain socket の対で話す。待ち受けの port は持たない。設定の `kernel.inspector` に書く。Coraza 以外のエンジンの検査プロセスは、省いてよい `kernel.engines` に書く。この build が持つエンジンは Coraza だけである |
 | 管理のプロセス | 同じ実行ファイルの `tukuyomi-proxy admin <config>`。proxy とは別の unit で動かす。loopback の待ち受けで、管理 API と管理画面（実行ファイルに組み込んである）に答える。ルールの世代の操作と、proxy への切り替えの依頼（制御 socket）をする |
 | 設定ファイル | JSON の1つのファイル。値に既定値はない。鍵は、省けると決まったもの（`acme`、`records`、`access`、`rate_limit`、`geo`、`admin` など）のほかは、すべて書く。proxy と管理のプロセスが同じファイルを読む |
 | ルールの保管場所 | ルールセットの世代を置くディレクトリ（設定の `rules.store.dir`）。`rules import` が世代を作り、`rules activate` が使う世代を選ぶ。管理のプロセスも同じ操作をする |
@@ -91,7 +91,7 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
 
 | 例 | 設定の鍵 | 持ち主と権限 |
 |---|---|---|
-| `/opt/tukuyomi-core/bin/tukuyomi-proxy`、`/opt/tukuyomi-core/bin/tukuyomi-inspector` | `kernel.inspector`（検査プロセスの方） | root。サービスの利用者が書き換えられない所に置く |
+| `/opt/tukuyomi-core/bin/tukuyomi-proxy`、`/opt/tukuyomi-core/bin/tukuyomi-inspector` | `kernel.inspector`（Coraza の検査プロセスの方） | root。サービスの利用者が書き換えられない所に置く |
 | `/etc/tukuyomi-core/config.json` | （起動の引数） | root。サービスの利用者が読めること。大きさは 256 KiB まで |
 | `/var/lib/tukuyomi-core/store` | `rules.store.dir` | サービスの利用者。権限は 0700 |
 | `/var/lib/tukuyomi-core/tmp` | `kernel.tmp_root` | サービスの利用者。権限は 0700。setgid は付けない |
@@ -274,7 +274,7 @@ WantedBy=multi-user.target
 - `KillMode=mixed` にする。管理のプロセスは、ルールの取り込みの試しで検査プロセスを起動する。停止の SIGTERM が主プロセスにだけ届けば、管理のプロセスが、動いている試しを終えて、検査プロセスと作業場所を片付ける。
 - 管理のプロセスは、停止の合図（SIGTERM、SIGINT、SIGHUP）を受けると、待ち受けを閉じ、動いている要求を 10 秒まで待つ。`TimeoutStopSec` は、この 10 秒より長くする。取り込みの試しが動いているときのために、その検査プロセスを止める時間（`proxy.stop_inspect_ms` と `kernel.kill_grace_ms`）も足しておく。
 - `LogRateLimitIntervalSec=0` を置く。監査の記録は標準エラー（journal）にも出るので、journald の流量の上限で落ちないようにする。
-- 検査プロセスの実行ファイル（`kernel.inspector`）と作業場所（`kernel.tmp_root`）は、proxy と同じものを使う。取り込みの試しの検査プロセスは、proxy と同じに Landlock で自分を絞る。
+- 検査プロセスの実行ファイル（`kernel.inspector`。Coraza でない世代では `kernel.engines` の方）と作業場所（`kernel.tmp_root`）は、proxy と同じものを使う。取り込みの試しの検査プロセスは、proxy と同じに Landlock で自分を絞る。
 - 管理のプロセスは、`admin.listen` の loopback の address で、平文の HTTP で待つ。1024 以上の port なら、`AmbientCapabilities` は要らない。
 - 設定ファイルは、起動のときに1回だけ読む。設定を変えたら、`config check` で確かめてから、`systemctl restart` で起動し直す。`ExecReload` は置かない（SIGHUP は読み直しではなく、停止である）。
 - proxy が動いていなくても、管理のプロセスは起動する。そのあいだは、世代の切り替えを依頼できない。
@@ -328,7 +328,7 @@ WantedBy=timers.target
 
 検査プロセスは、起動のときに次のとおり自分を絞る。どれもプロセスの全部の thread に、元に戻せない形でかける。
 
-1. ルールセットの世代を読む（この後はファイルを読まない）。読めなければ exit 11 で断る。
+1. ルールセットの世代を読む（この後はファイルを読まない）。読めなければ exit 11 で断る。別のエンジンの世代の manifest も、この検査プロセスは読めず、この exit 11 で断る。
 2. Landlock の規則を組む。
    - 起動ごとの一時のディレクトリ（作業場所の中に作る）の外のファイルに触れなくする。作業場所の中のほかのディレクトリにも触れない。
    - 一時のディレクトリの中で許すのは、ファイルを作る・書く・読む・切り詰める・消すことだけである。ディレクトリを作る・一覧する、そこから外への名前の変更、プログラムの実行はできない。

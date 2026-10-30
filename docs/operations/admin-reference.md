@@ -474,7 +474,7 @@ session は、状態によって使える API が決まる。状態に合わな�
 
 - API ごとの確かめで断った要求は、利用者が分かっていれば `denied` の行を書く。reason は `origin`、`csrf`、`token`（token が使えない API）、`role`、`state`、`second factor pending`、`password change`、`second factor setup` である。
 - 利用者が分からない段で断った要求は書かない。session も token も無い、合わない token、client の回数を超えたログイン、`Origin` が違うログイン、path が無いなどである。誰でも送れる要求で、古い行を押し出せないようにするためである。
-- 世代の操作の行は、`target` に対象の世代の指紋を書く。`activate` と `rollback` の `ok` の行は、`before` に選ばれていた世代、`after` に依頼した世代も書く。`ok` の行は変更の前に書くので、成功の印ではない。終わり方は、後に続く `failed` の行と、切り替えの履歴で見る。`failed` の reason は、`expect`、`store`、`refused`、`failed`、`unconfirmed`、`history`（履歴の行を書けなかった）で、取り込みは `store` と `trial` である。変更の前に断ったときは `denied` で、reason は `expect`、`busy`、`unreachable` である。削除は、選ばれている世代が `chosen`、戻しの先が `rollback target` である。
+- 世代の操作の行は、`target` に対象の世代の指紋を書く。`activate` と `rollback` の `ok` の行は、`before` に選ばれていた世代、`after` に依頼した世代も書く。`ok` の行は変更の前に書くので、成功の印ではない。終わり方は、後に続く `failed` の行と、切り替えの履歴で見る。`failed` の reason は、`expect`、`store`、`refused`、`failed`、`unconfirmed`、`history`（履歴の行を書けなかった）で、取り込みは `store` と `trial` である。変更の前に断ったときは `denied` で、reason は `expect`、`engine`、`busy`、`unreachable` である。削除は、選ばれている世代が `chosen`、戻しの先が `rollback target` である。
 
 書き方:
 
@@ -493,10 +493,10 @@ session は、状態によって使える API が決まる。状態に合わな�
 - `GET /api/status`: 次を返す。
   - `current`: ルールの保管場所が選んでいる世代の指紋（無ければ `null`）
   - `reachable`: proxy に届くか。同時の接続の上限で答えられない proxy は、届くとする
-  - `proxy`: proxy の状態（`generation`、`mode`、`phase`、`switching`、`ready`）。読めなければ `null`
+  - `proxy`: proxy の状態（`generation`、`mode`、`engine`、`phase`、`switching`、`ready`）。読めなければ `null`
   - `rollback_to`: 今戻しを依頼したら選ぶ世代（無ければ `null`）
   - `crs`: `{"available", "files"}`。`admin.crs_dir` があるか、取り込みで外せる CRS の `.conf` の名前
-- `GET /api/generations`: `{"reachable", "generations"}`。新しい順に、各世代の `fingerprint`、`made`（作った時刻。epoch からの秒）、`mode`（`block`、`detect`、manifest が読めなければ `unknown`）、`routes`（検査しない経路の数）、`current`（保管場所が選んでいる）、`serving`（proxy が使っている）を返す。
+- `GET /api/generations`: `{"reachable", "generations"}`。新しい順に、各世代の `fingerprint`、`made`（作った時刻。epoch からの秒）、`mode`（`block`、`detect`、manifest が読めなければ `unknown`）、`engine`（`coraza`、`modsecurity`、manifest が読めなければ `unknown`）、`routes`（検査しない経路の数）、`current`（保管場所が選んでいる）、`serving`（proxy が使っている）を返す。
 - `GET /api/generations/<指紋>`: 上に加えて、`load`（読み込む順）、`files`（`path`、`size`、`sha256`）を返す。`routes` は、ここでは数でなく経路の配列（`host`、`path`、`action`）である。経路が `host` を持たないときは、`host` は付かない。保管場所に無い世代は 404。
 
 「選ばれている」世代と「使っている」世代は別である。保管場所が選んでいても、proxy が切り替えに失敗していれば、使っていない。管理画面は、切り替えの途中ではないのに2つが違うときに、警告を出す。
@@ -514,10 +514,15 @@ session は、状態によって使える API が決まる。状態に合わな�
 | `crs` | `true` で `admin.crs_dir` の CRS を使う。要求では path を指定できない。`admin.crs_dir` が無いと 400 |
 | `crs_off` | 読み込まない CRS の `.conf` の名前の配列（`--crs-off` に当たる） |
 | `routes` | 検査しない経路の配列（`--routes` のファイルと同じ形） |
+| `engine` | 検査のエンジンの名前（`--engine` に当たる）。省けば `coraza`。この build が持つエンジンは `coraza` だけ |
 | `detect_only` | `true` で検知だけの世代にする |
 | `accept_block` | `true` で、試しの要求が遮断されても失敗にしない |
 
 - 上限と名前の決まりは `rules import` と同じである（[運用リファレンス](operator-reference.md) の「`rules`」）。ファイルは 128 個、1つ 2 MiB、全体 8 MiB まで。2 MiB を超えるファイルは、デコードする前に断る。
+- `engine` がエンジンの名前でないときと、そのエンジンが使えないときは、ファイルを集める前に 400 で断る。何も仮に置かず、試しも流さない。文は次のどれかである。
+  - `engine is not the name of an engine (coraza or modsecurity)`
+  - `kernel.engines has no inspector for the engine of the generation`（設定に、そのエンジンの検査プロセスが無い）
+  - `the inspector build of the engine is not pinned`（この build が、そのエンジンを持たない）
 - 試しは `rules import` と同じで、管理のプロセスが検査プロセスを1つ起動し、決まった3つの要求（`GET /`、form の `POST /`、JSON の `POST /`）を検査する。`kernel` の値と、`proxy` の `ready_wait_ms`・`inspect_wait_ms`・`stop_inspect_ms`・`drive_slice_ms` を使う。
 - 取り込み、選択、戻し、削除は、管理のプロセスの中で1つずつ進む。ほかの変更が進んでいるときは、待たずに 409 `a change of the rules is under way`。命令や別のプロセスが保管場所の lock を持っているときは、409 `the rules store is in use by another command`。
 
@@ -526,7 +531,7 @@ session は、状態によって使える API が決まる。状態に合わな�
 | 状態コード | とき | 本文 |
 |---|---|---|
 | 200 | 世代を作れた | `{"fingerprint", "result", "trial"}`。`result` は `created`、`existing`（同じ世代が既にあった）、`repaired`（壊れていた同じ指紋の世代を作り直した） |
-| 400 | 入力が断られた | `{"error"}`。入力のファイルの名前があれば `subject` に付く（0x20〜0x7e の外のバイトは `\xNN`、128 バイトまで） |
+| 400 | 入力が断られた（使えないエンジンも含む） | `{"error"}`。入力のファイルの名前があれば `subject` に付く（0x20〜0x7e の外のバイトは `\xNN`、128 バイトまで） |
 | 409 | 保管場所が断った、ほかの変更が進んでいる | `{"error"}` |
 | 422 | 試しが失敗した。世代は作らない | `{"error": "the trial failed", "trial": {..}}` |
 | 500 | 試しを流せない | `{"error"}` |
@@ -547,13 +552,14 @@ session は、状態によって使える API が決まる。状態に合わな�
 
 1. 世代が保管場所にあること（`activate`。無ければ 404 `no such generation`）。戻しは、戻しの先を決める（下）。
 2. 保管場所が選んでいる世代が `expect` と同じこと。違えば 409（変更なし。履歴には書かない。監査に `denied`、reason `expect`）。
-3. proxy の状態を問う。
+3. 切り替える先の世代のエンジンが使えること。使えなければ、`{"error": <文>}` の 409（変更なし。履歴には書かない。監査に `denied`、reason `engine`）。文は、上の「取り込み」の 400 の `kernel.engines has no inspector for the engine of the generation` か `the inspector build of the engine is not pinned` と同じである。manifest が読めない世代は、ここでは断らず、保管場所が世代を選ぶ段で断る。
+4. proxy の状態を問う。
    - 届かない: 503 `the proxy cannot be reached`。保管場所は変えず、履歴に `unreachable` を書く（監査にも `denied`、reason `unreachable`）。
    - 接続を受けて何も答えずに閉じる（同時の接続の上限）: 503 `the proxy is busy`。保管場所は変えず、履歴には書かない（監査に `denied`、reason `busy`）。
-4. 監査の行を書く（書けなければ 503 `unavailable` で、変更しない）。
-5. 保管場所が世代を選ぶ。選ぶのは lock の中で、`expect` をもう一度確かめる。別のプロセスがこの間に選んでいれば、上書きせずに 409 とする。
-6. proxy に切り替えを依頼し、終わりを待つ（上の「制御 socket」）。
-7. 履歴に1行書き、答える。
+5. 監査の行を書く（書けなければ 503 `unavailable` で、変更しない）。
+6. 保管場所が世代を選ぶ。選ぶのは lock の中で、`expect` をもう一度確かめる。別のプロセスがこの間に選んでいれば、上書きせずに 409 とする。
+7. proxy に切り替えを依頼し、終わりを待つ（上の「制御 socket」）。
+8. 履歴に1行書き、答える。
 
 答え（本文は `{"result", "from", "generation", "chosen"}`。失敗では `error` も付く）:
 
@@ -569,7 +575,7 @@ session は、状態によって使える API が決まる。状態に合わな�
 - `chosen` は「保管場所が今その世代を選んでいる」かどうかである。
 - 切り替えが `refused`、`failed`、`unconfirmed` に終わっても、保管場所は元に戻さない。`refused` と `failed` では、proxy は前の世代を使い続ける。`unconfirmed` では、proxy がどちらの世代を使っているか分からないので、`GET /api/status` の `proxy.generation` で確かめる。proxy を起動し直すと、保管場所が選んでいる世代で始まる。その世代を使わないなら、前の世代を選び直す。
 - 履歴に行を書けなかったときは、答えに `"history": "not written"` が付く。
-- `result` と `chosen` を持つのは、上の表の6つの場合だけである。ほかの失敗の本文は `{"error": <文>}` だけである。`expect` が合わない 409（`the chosen generation is not the one that was expected`）、`the proxy is busy` の 503、戻しの先が決まらない 409、保管場所そのものが選択を断った 409 がそれに当たる。この中で履歴に行（`refused`）を書くのは、保管場所そのものが選択を断ったときだけである。
+- `result` と `chosen` を持つのは、上の表の6つの場合だけである。ほかの失敗の本文は `{"error": <文>}` だけである。`expect` が合わない 409（`the chosen generation is not the one that was expected`）、`the proxy is busy` の 503、戻しの先が決まらない 409、世代のエンジンが使えない 409、保管場所そのものが選択を断った 409 がそれに当たる。この中で履歴に行（`refused`）を書くのは、保管場所そのものが選択を断ったときだけである。
 
 戻しの先:
 
@@ -747,7 +753,7 @@ session は、状態によって使える API が決まる。状態に合わな�
 | 404 | 表に無い path、無い世代・利用者・token、`records` が無い設定 | `not found`、`no such generation`、`records are not configured` |
 | 405 | path にその method が無い。`Allow` を付ける（`GET` があれば `HEAD` も挙げる） | `method not allowed` |
 | 408 | 本文が 30 秒の中に届かない | `request timeout` |
-| 409 | 別の変更と重なった、状態に合わない、数の上限 | `conflict`、`the name is taken`、`the store has too many users`、`the user has too many tokens`、`the last enabled owner stays`、`the user was changed since it was read`、世代の操作の文 |
+| 409 | 別の変更と重なった、状態に合わない、数の上限、世代のエンジンが使えない | `conflict`、`the name is taken`、`the store has too many users`、`the user has too many tokens`、`the last enabled owner stays`、`the user was changed since it was read`、世代の操作の文 |
 | 413 | 本文が上限を超える | `payload too large` |
 | 415 | 本文を読む API に、`application/json` でない `Content-Type` | `unsupported media type` |
 | 422 | 取り込みの試しの失敗 | `the trial failed` |

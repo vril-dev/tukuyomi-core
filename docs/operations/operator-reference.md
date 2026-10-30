@@ -51,6 +51,7 @@ tukuyomi-proxy config check <config>
   - 通れば、標準出力に `accepted` の1行が出て exit 0 になる。
   - ほかの行は標準エラーに出て、`config check:` で始まる。引数の誤りのときだけ `config:` で始まり、使い方の行が続く。
   - exit code は起動と同じである。
+  - 選んだ世代のエンジンが使えるかも確かめる。使えなければ、`config check: rules generation refused: <理由>` の行を出して exit 1 になる。この build が持つ検査のエンジンは `coraza` だけである（下の「`kernel`」の `engines`）。
 - `geo` があれば、国のデータベースも起動と同じに読んで確かめる（「要求の前の方針」の `geo`）。
 - 確かめないもの:
   - SIGCHLD と file descriptor（上の 1 のうち、root でないこと以外）
@@ -66,7 +67,7 @@ tukuyomi-proxy config check <config>
 ### `rules`
 
 ```text
-tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--accept-block] [--detect-only]
+tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--engine <name>] [--accept-block] [--detect-only]
 tukuyomi-proxy rules activate <config> <fingerprint>
 tukuyomi-proxy rules remove <config> <fingerprint>
 tukuyomi-proxy rules list <config>
@@ -77,9 +78,9 @@ tukuyomi-proxy rules list <config>
 | 命令 | すること | 標準出力 |
 |---|---|---|
 | `import` | 入力からルールセットを作って保管場所に置き、試しに通れば世代にする。世代を選びはしない | `<指紋> created`、`<指紋> already exists`、`<指紋> recreated, the stored copy was broken` |
-| `activate` | 世代を選ぶ。後で起動する proxy と、SIGUSR1 を受けた proxy がそれを使う | `<指紋> current` |
+| `activate` | 世代を選ぶ。後で起動する proxy と、SIGUSR1 を受けた proxy がそれを使う。世代のエンジンが使えないときは、選ばずに断る（exit 2） | `<指紋> current` |
 | `remove` | 選ばれていない世代で、どの proxy も使っていないものを消す | `<指紋> removed` |
-| `list` | 世代の一覧 | 指紋、作った時刻（epoch からの秒）、mode（`block`・`detect`、manifest が読めなければ `unknown`）、bypass の経路があれば `routes` と数、選ばれた世代に `current` |
+| `list` | 世代の一覧 | 指紋、作った時刻（epoch からの秒）、mode（`block`・`detect`、manifest が読めなければ `unknown`）、エンジン（`coraza`・`modsecurity`、manifest が読めなければ `unknown`）、bypass の経路があれば `routes` と数、選ばれた世代に `current` |
 
 `import` の入力は次のとおりである。option の path は、命令を流す場所からの相対でも書ける。
 
@@ -90,6 +91,7 @@ tukuyomi-proxy rules list <config>
 | `--rules <file>` | 運用者のルールのファイル。何度でも書け、CRS の後に書いた順に読み込む |
 | `--data <file>` | 運用者のルールが読むデータのファイル。ルールセットに入るが、ルールとしては読み込まない |
 | `--routes <file>` | 検査しない経路（bypass）のファイル（下の「検査しない経路」） |
+| `--engine <name>` | 世代の検査のエンジンの名前。省けば `coraza`。この build が持つエンジンは `coraza` だけで、ほかのエンジンの世代は、何も置かずに断る（exit 2） |
 | `--accept-block` | 試しの要求が遮断されても、試しを失敗にしない（当たった規則は出る） |
 | `--detect-only` | 検知だけの世代にする（下の「検知だけのモード」） |
 
@@ -107,7 +109,7 @@ tukuyomi-proxy rules list <config>
 - 試しの間に SIGINT（Ctrl-C）か SIGTERM を受けると、試しを止め、検査プロセスと作業場所を片付けて、世代を作らずに終わる。試しの後は、この2つの合図で命令は止まらない。
 - `import` は検査プロセスを起動するので、起動の前の確かめ（[実行ファイルの build と配置](../build/binary-deployment.md) の「起動の前の確かめ」）も流す。
 
-exit code は、0 が成功、1 がほかの終わり方（断られた保管場所や入力、失敗した試し、使用中の保管場所、`list` で manifest が読めない世代や選んだ世代が無い保管場所、root での実行）、2 が引数の誤りか断られた設定ファイルである。
+exit code は、0 が成功、1 がほかの終わり方（断られた保管場所や入力、失敗した試し、使用中の保管場所、`list` で manifest が読めない世代や選んだ世代が無い保管場所、root での実行）、2 が引数の誤り、断られた設定ファイル、または使えないエンジン（`import` と `activate`）である。
 
 ### `acme renew`
 
@@ -165,6 +167,7 @@ tukuyomi-proxy admin reset <config> <name>
 - proxy は保管場所を読み、選ばれた世代で新しい検査核と検査プロセスを起動する。新しい方の準備ができたら、新しい要求をそちらへ回す。
   - 古い方は、持っている要求を `stop_inspect` まで検査してから止まる。
   - 新しい方が起動に失敗するか、`ready_wait` の中に準備できなければ、古い方がそのまま検査を続ける。
+  - 選ばれた世代のエンジンが使えないときは、切り替えない。`reload: rules store refused: <理由>` の文を出し、古い方がそのまま検査を続ける。`rules activate` と管理のプロセスは、そのような世代を選ばない。
 - 検査しない経路の表は、新しい世代が要求を受け始めるときに一緒に入れ替わる。
 - 切り替えの間は検査プロセスが2つになり、メモリもおよそ2倍になる。CRS 4.23.0 で測った検査プロセスは、1つ約 52 MB だった。
 - 合図の処理が入ってから待ち受けを bind するまでの間、切り替えの途中、停止の間に受けた SIGUSR1 は、記録に文を1つ出すだけで何もしない。今と同じ世代が選ばれているときも、その旨の文を出すだけである。
@@ -607,7 +610,8 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 | 鍵 | 範囲 | 意味 |
 |---|---|---|
-| `inspector` | 絶対の path | 検査プロセスの実行ファイル |
+| `inspector` | 絶対の path | Coraza の検査プロセスの実行ファイル |
+| `engines` | 省いてよい。`{"modsecurity": {"inspector": <絶対の path>}}` の形で、どちらの段の鍵も要る。path は 4095 バイトまで | Coraza 以外のエンジンの検査プロセスの実行ファイル。この build が持つエンジンは `coraza` だけなので、ここに書いても、`coraza` でない世代は、取り込み、選択、起動のどれでも断る |
 | `tmp_root` | 絶対の path、3840 バイトまで | 起動ごとの作業場所を作る親。本物のディレクトリで、持ち主が proxy の利用者、group と other の権限が無く、setgid が無いこと |
 | `gomaxprocs` | 1〜65535 | 検査プロセスの `GOMAXPROCS` |
 | `gomemlimit` | 1〜9223372036854775807（バイト） | 検査プロセスの `GOMEMLIMIT` |
@@ -698,7 +702,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 | 依頼 | 答え |
 |---|---|
-| `{"op":"status"}` | `{"generation", "mode", "phase", "switching", "ready"}`。使っている世代の指紋（64 桁）、その世代のモード（`block`、`detect`）、検査核の段（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、`/readyz` が `ready` と答える状態か |
+| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "ready"}`。使っている世代の指紋（64 桁）、その世代のモード（`block`、`detect`）、その世代のエンジン（この build では `coraza`）、検査核の段（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、`/readyz` が `ready` と答える状態か |
 | `{"op":"switch","expect":"<指紋 64 桁>"}` | ルールの保管場所が今選んでいる世代が `expect` と同じときだけ、SIGUSR1 と同じ切り替えをする。切り替えが終わってから、`{"result", "reason"?, "generation"}` で答える。`generation` は、答えるときに使っている世代である |
 | ほかの行 | `{"result":"error","reason":..}`。`reason` は `line too long`、`malformed request`、`unknown op`、`bad expect` |
 
@@ -780,6 +784,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 ## ルールセットと世代
 
 - 世代は、`rules import` が作るルールセットの一式で、指紋（manifest の sha256）で呼ぶ。作った後は変えない。
+- 世代は、ルールを検査するエンジンも持つ（`rules import --engine`。省けば `coraza`）。同じファイルでも、エンジンが違えば manifest が変わり、別の世代（別の指紋）になる。この build が持つエンジンは `coraza` だけで、ほかのエンジンの世代は断られる。
 - 保管場所の中身:
   - `generations/<指紋>/`: 世代
   - `current`: 選んだ世代
@@ -1066,7 +1071,7 @@ proxy が返すすべての応答（上流の応答、遮断、head の拒否、
 client へ答えを書いた要求ごとに1件出る。head の拒否、redirect、ACME の challenge の答えも含む。応答を送り終えたとき（または切れたとき）に書くので、長い応答の記録は応答の終わりに出る。
 
 ```text
-{"ts":"2026-10-27T03:53:27.123Z","type":"request","id":"0186af5443bddbd9-1","conn":1,"listener":0,"proto":"h1","tls":false,"client":"192.0.2.10","method":"GET","host":"example.com","path":"/q","class":"blocked","status":403,"reason":"blocked by a rule","ms":3,"mode":"block","generation":"2f3bda9b9ca7db60","rule":949110,"rules":[941100,941110],"severity":2,"score":10,"sent":0}
+{"ts":"2026-10-27T03:53:27.123Z","type":"request","id":"0186af5443bddbd9-1","conn":1,"listener":0,"proto":"h1","tls":false,"client":"192.0.2.10","method":"GET","host":"example.com","path":"/q","class":"blocked","status":403,"reason":"blocked by a rule","ms":3,"mode":"block","engine":"coraza","generation":"2f3bda9b9ca7db60","rule":949110,"rules":[941100,941110],"severity":2,"score":10,"sent":0}
 ```
 
 | 項目 | 中身 |
@@ -1084,7 +1089,7 @@ client へ答えを書いた要求ごとに1件出る。head の拒否、redirec
 | `reason` | 決まった英語の語句（例: `malformed request head`、`body over the limit`、`inspection queue full`、`upstream connection failed`、`denied by access`、`too many requests`） |
 | `ms` | かかった時間（ミリ秒） |
 | `upstream`、`server` | 上流の組の名前と、最後に試した server の address（試していなければ `server` は無い） |
-| `mode`、`generation` | 判定したルールの世代のモード（`block` か `detect`）と、世代の指紋の先頭16桁。検査しなかった要求には無い |
+| `mode`、`engine`、`generation` | 判定したルールの世代のモード（`block` か `detect`）と、そのエンジン（この build では `coraza`）と、世代の指紋の先頭16桁。検査しなかった要求には無い |
 | `rule` | 遮断した規則、または検知だけのモードで当たった規則の id |
 | `rules` | ほかに当たった規則の id。評価の順に16個まで。記録しない規則（`nolog`）と、検査プロセスが足す決まり（4000001〜4000011）は入らない |
 | `rules_more` | 16個より多く当たったとき `true` |
@@ -1131,8 +1136,8 @@ query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）�
 
 | 文 | とき |
 |---|---|
-| `start: ...` | 起動の各段（`start: rules generation <指紋>`、`start: rules mode <block か detect>`、`start: the kernel is ready`、`start: listening`、`start: record file refused: <理由>`、`start: control socket refused: <理由>` など） |
-| `reload: ...` | SIGUSR1・SIGUSR2 を受けたこと、切り替え（SIGUSR1 と制御 socket）と証明書の入れ替えの結果 |
+| `start: ...` | 起動の各段（`start: rules generation <指紋>`、`start: rules engine <名前>`、`start: rules mode <block か detect>`、`start: rules generation refused: <理由>`、`start: the kernel is ready`、`start: listening`、`start: record file refused: <理由>`、`start: control socket refused: <理由>` など） |
+| `reload: ...` | SIGUSR1・SIGUSR2 を受けたこと、切り替え（SIGUSR1 と制御 socket。始めるときに `reload: rules engine <名前>`、断られたときに `reload: rules store refused: <理由>`）と証明書の入れ替えの結果 |
 | `control: switch ...` | 制御 socket の切り替えの依頼への答え（上の「制御 socket」） |
 | `driver: inspector incarnation changed, inc <回>, restarts <回>` | 検査プロセスが起動し直した |
 | `conn <番号>: internal fault: <理由>` | proxy の中の不整合 |
@@ -1225,7 +1230,7 @@ query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）�
 | `tukuyomi_inspections_waiting` | gauge | | 検査の待ちの席を持っている要求（`wait_queue` のうち使っている分） |
 | `tukuyomi_inspector_up` | gauge | | 要求を受けている検査核の準備ができていれば 1、でなければ 0 |
 | `tukuyomi_inspector_restarts_total` | counter | | 検査プロセスの起動し直し |
-| `tukuyomi_rules_generation_info` | gauge | `generation`（指紋の先頭16桁）、`mode` | 要求を受けている世代。値はいつも 1 |
+| `tukuyomi_rules_generation_info` | gauge | `generation`（指紋の先頭16桁）、`mode`、`engine` | 要求を受けている世代。値はいつも 1 |
 | `tukuyomi_rules_switches_total` | counter | `result`（`switched`、`refused`、`failed`） | SIGUSR1 と制御 socket による世代の切り替え |
 | `tukuyomi_certificate_reloads_total` | counter | `result`（`replaced`、`refused`） | SIGUSR2 による証明書の読み直し |
 | `tukuyomi_upstream_failures_total` | counter | `group` | 上流の組の server の失敗 |
