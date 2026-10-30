@@ -60,6 +60,7 @@ fn request(upstream: Option<&str>) -> Record {
         upstream: upstream.map(Arc::from),
         server: None,
         mode: None,
+        engine: None,
         generation: None,
         rule: None,
         matched: Matched::NONE,

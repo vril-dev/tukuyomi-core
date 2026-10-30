@@ -12,20 +12,29 @@
 //! version 1, that of a `Detect` bundle without routes is version 2, which has the key `mode`, and that of a bundle
 //! with routes is version 3, which has the keys `mode` (`block` or `detect`) and `routes` (at least one route).
 //!
+//! A bundle has an engine too: the one that inspects the requests with its rules (`Engine`). The same rule files give
+//! another bundle, with another fingerprint, under another engine. The bundles of the engine Coraza have the
+//! manifests of versions 1 to 3 above, which have no key for the engine. A bundle of any other engine has version 4,
+//! which has the keys `engine`, `mode` and `routes` always (`routes` may be empty). Version 4 with the engine Coraza
+//! is the form of no bundle and is refused, so that a bundle has one manifest only.
+//!
 //! The manifest has one form for each kind of bundle, which `Manifest::encode` writes by hand and does not take from a
-//! serializer: the keys in the order `version`, `mode` (versions 2 and 3; always `"detect"` in version 2), `files`,
-//! `load` (`path`, `size`, `sha256` in a file), `routes` (version 3 only; `host` if the route has one, `path`,
-//! `action` in a route), no white space, strings between quotes without any escape (a path, a host and a
-//! hexadecimal digest hold no character that needs one), numbers in decimal, one newline at the end.
+//! serializer: the keys in the order `version`, `engine` (version 4 only), `mode` (versions 2 to 4; always `"detect"`
+//! in version 2), `files`, `load` (`path`, `size`, `sha256` in a file), `routes` (versions 3 and 4; at least one route
+//! in version 3, and written in version 4 when there is none; `host` if the route has one, `path`, `action` in a
+//! route), no white space, strings between quotes without any escape (a path, a host and a hexadecimal digest hold
+//! no character that needs one), numbers in decimal, one newline at the end.
 //! `Manifest::parse` reads a manifest with a loose decoder, writes what it read in that form again and requires the
 //! very bytes that were read, so every other spelling of the same values is refused. The Go inspector reads and
 //! checks a bundle the same way, and both sides are tested against the same golden files
-//! (`inspector/testdata/manifest-v1-golden.json`, `manifest-v2-golden.json` and `manifest-v3-golden.json`).
+//! (`inspector/testdata/manifest-v1-golden.json` to `manifest-v4-golden.json`); the Go inspector inspects with
+//! Coraza and refuses version 4.
 
 use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tukuyomi_kernel::Engine;
 
 use crate::rules::routes::{RawRoute, Routes};
 
@@ -164,10 +173,11 @@ pub struct Entry {
     pub sha256: [u8; 32],
 }
 
-/// The content of `manifest.json`: version 1 for the mode `Block`, version 2 for the mode `Detect`, version 3 for
-/// either mode with routes.
+/// The content of `manifest.json`: for the engine Coraza, version 1 for the mode `Block`, version 2 for the mode
+/// `Detect`, version 3 for either mode with routes; version 4 for any other engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
+    engine: Engine,
     mode: Mode,
     files: Vec<Entry>,
     load: Vec<BundlePath>,
@@ -178,6 +188,7 @@ pub struct Manifest {
 #[serde(deny_unknown_fields)]
 struct RawManifest {
     version: u64,
+    engine: Option<String>,
     mode: Option<String>,
     files: Vec<RawEntry>,
     load: Vec<String>,
@@ -194,9 +205,11 @@ struct RawEntry {
 
 impl Manifest {
     /// A manifest of `files`, which must be in strictly increasing order of their paths, and of the rule files
-    /// that are `load`ed in this order, for the rules of the given `mode`, with the given `routes`. Every limit of
-    /// a bundle is checked here except the size of the encoded manifest, which `Bundle::new` and `parse` check.
+    /// that are `load`ed in this order, for the rules of the given `engine` and `mode`, with the given `routes`.
+    /// Every limit of a bundle is checked here except the size of the encoded manifest, which `Bundle::new` and
+    /// `parse` check.
     pub fn new(
+        engine: Engine,
         mode: Mode,
         files: Vec<Entry>,
         load: Vec<BundlePath>,
@@ -236,11 +249,17 @@ impl Manifest {
             }
         }
         Ok(Manifest {
+            engine,
             mode,
             files,
             load,
             routes,
         })
+    }
+
+    /// The engine that inspects the requests with the rules of the bundle.
+    pub fn engine(&self) -> Engine {
+        self.engine
     }
 
     /// What the rules of the bundle do to a request they match.
@@ -265,12 +284,23 @@ impl Manifest {
 
     /// The bytes of `manifest.json`: the one form.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = String::from(match (self.mode, self.routes.is_empty()) {
-            (Mode::Block, true) => r#"{"version":1,"files":["#,
-            (Mode::Detect, true) => r#"{"version":2,"mode":"detect","files":["#,
-            (Mode::Block, false) => r#"{"version":3,"mode":"block","files":["#,
-            (Mode::Detect, false) => r#"{"version":3,"mode":"detect","files":["#,
-        });
+        let mut out = match (self.engine, self.mode, self.routes.is_empty()) {
+            (Engine::Coraza, Mode::Block, true) => r#"{"version":1,"files":["#.to_owned(),
+            (Engine::Coraza, Mode::Detect, true) => {
+                r#"{"version":2,"mode":"detect","files":["#.to_owned()
+            }
+            (Engine::Coraza, Mode::Block, false) => {
+                r#"{"version":3,"mode":"block","files":["#.to_owned()
+            }
+            (Engine::Coraza, Mode::Detect, false) => {
+                r#"{"version":3,"mode":"detect","files":["#.to_owned()
+            }
+            (engine, mode, _) => format!(
+                r#"{{"version":4,"engine":"{}","mode":"{}","files":["#,
+                engine.name(),
+                mode.name()
+            ),
+        };
         for (i, file) in self.files.iter().enumerate() {
             if i > 0 {
                 out.push(',');
@@ -293,7 +323,11 @@ impl Manifest {
             out.push('"');
         }
         out.push(']');
-        self.routes.write_to(&mut out);
+        if self.engine != Engine::Coraza && self.routes.is_empty() {
+            out.push_str(r#","routes":[]"#);
+        } else {
+            self.routes.write_to(&mut out);
+        }
         out.push_str("}\n");
         out.into_bytes()
     }
@@ -303,21 +337,36 @@ impl Manifest {
     pub fn parse(bytes: &[u8]) -> Result<Manifest, BundleError> {
         const BAD: BundleError =
             BundleError("the manifest is not a manifest of the expected types");
+        const BAD_VERSION: BundleError =
+            BundleError("the version of the manifest is not 1, 2, 3 or 4");
+        const BAD_ENGINE: BundleError =
+            BundleError("the engine of the manifest does not fit its version");
         if u64::try_from(bytes.len()).is_ok_and(|n| n > MAX_MANIFEST_BYTES) {
             return Err(BundleError("the manifest is over 64 KiB"));
         }
         let raw: RawManifest = serde_json::from_slice(bytes).map_err(|_| BAD)?;
+        let engine = match (raw.version, raw.engine.as_deref()) {
+            (1..=3, None) => Engine::Coraza,
+            // The engine Coraza is the engine of versions 1 to 3, which have no key for it; version 4 is for the
+            // others.
+            (4, Some(name)) => match Engine::parse(name) {
+                Some(Engine::Coraza) | None => return Err(BAD_ENGINE),
+                Some(engine) => engine,
+            },
+            (1..=4, _) => return Err(BAD_ENGINE),
+            _ => return Err(BAD_VERSION),
+        };
         let mode = match (raw.version, raw.mode.as_deref(), raw.routes.is_some()) {
             (1, None, false) => Mode::Block,
             (2, Some("detect"), false) => Mode::Detect,
-            (3, Some("block"), true) => Mode::Block,
-            (3, Some("detect"), true) => Mode::Detect,
-            (1..=3, _, _) => {
+            (3 | 4, Some("block"), true) => Mode::Block,
+            (3 | 4, Some("detect"), true) => Mode::Detect,
+            (1..=4, _, _) => {
                 return Err(BundleError(
                     "the mode or the routes of the manifest do not fit its version",
                 ));
             }
-            _ => return Err(BundleError("the version of the manifest is not 1, 2 or 3")),
+            _ => return Err(BAD_VERSION),
         };
         let routes = match raw.routes {
             Some(list) => Routes::from_raw(list)?,
@@ -342,7 +391,7 @@ impl Manifest {
             .iter()
             .map(|text| path(text))
             .collect::<Result<Vec<_>, BundleError>>()?;
-        let manifest = Manifest::new(mode, files, load, routes)?;
+        let manifest = Manifest::new(engine, mode, files, load, routes)?;
         if manifest.encode() != bytes {
             return Err(BundleError("the manifest is not in the canonical form"));
         }
@@ -360,8 +409,9 @@ pub struct Bundle {
 
 impl Bundle {
     /// A bundle of `files`, in any order but each path once, and of the rule files that are `load`ed in this order,
-    /// for the rules of the given `mode`, with the given `routes`.
+    /// for the rules of the given `engine` and `mode`, with the given `routes`.
     pub fn new(
+        engine: Engine,
         mode: Mode,
         mut files: Vec<(BundlePath, Vec<u8>)>,
         load: Vec<BundlePath>,
@@ -382,7 +432,7 @@ impl Bundle {
                 })
             })
             .collect::<Result<Vec<_>, BundleError>>()?;
-        let checked = Manifest::new(mode, entries, load, routes)?;
+        let checked = Manifest::new(engine, mode, entries, load, routes)?;
         let manifest = checked.encode();
         if u64::try_from(manifest.len()).is_ok_and(|n| n > MAX_MANIFEST_BYTES) {
             // The routes are in the manifest and can take most of its room, so the sentence names them.

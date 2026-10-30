@@ -26,6 +26,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use tukuyomi_kernel::Engine;
+
 use crate::config;
 use crate::rules::bundle::{
     Bundle, Fingerprint, MANIFEST_NAME, MAX_MANIFEST_BYTES, Manifest, Mode, sha256,
@@ -368,6 +370,11 @@ impl RuleStore for FileStore {
 
     fn manifest(&self, generation: Fingerprint) -> Result<Manifest, StoreError> {
         read_manifest(&self.generation_dir(generation)?, generation)
+    }
+
+    fn engine(&self, generation: Fingerprint) -> Result<Engine, StoreError> {
+        let dir = self.generation_dir(generation)?;
+        Ok(read_manifest(&dir, generation)?.engine())
     }
 
     fn mode(&self, generation: Fingerprint) -> Result<Mode, StoreError> {

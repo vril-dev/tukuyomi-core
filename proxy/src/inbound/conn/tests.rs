@@ -132,6 +132,7 @@ fn answered(outcome: Outcome) -> Answer {
     let by = match outcome {
         Outcome::Verdict(verdict) => Some(Judge {
             generation: Fingerprint::from_hex(&[b'7'; 64]).unwrap(),
+            engine: tukuyomi_kernel::Engine::Coraza,
             mode: bundle::Mode::Block,
             verdict,
             matched: Matched::NONE,

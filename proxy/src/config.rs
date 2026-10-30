@@ -41,7 +41,8 @@
 //! `listeners` is a list of 1 to 8 listeners (see `listeners`). `rules.store.kind` is `file`, the
 //! only kind there is, and `dir` is an absolute clean path of at most 3840 bytes. The `kernel` object has no
 //! rules path and no rules fingerprint: the directory and the fingerprint of the chosen generation come from the
-//! rules store when the proxy starts (`KernelSettings::for_generation`).
+//! rules store when the proxy starts (`KernelSettings::for_generation`). Its `inspector` is the one of the engine
+//! Coraza; the inspectors of the other engines are in its `engines` object, which may be left out (see `kernel`).
 
 use std::fmt;
 use std::fs::{self, File};
@@ -56,14 +57,15 @@ use serde::Deserialize;
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::error::Category;
+use tukuyomi_kernel::Engine;
 use tukuyomi_kernel::limits::{BODY, HEADER_TOTAL};
 
 use crate::forward::client_ip::Cidr;
-use crate::rules::bundle::Fingerprint;
 
 mod acme;
 mod admin;
 mod forward;
+mod kernel;
 mod listeners;
 mod places;
 mod policy;
@@ -77,6 +79,7 @@ pub(crate) use forward::MAX_SERVERS;
 pub use forward::{
     Address, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig, Stream,
 };
+pub use kernel::KernelSettings;
 pub use listeners::{
     CertificateAcme, CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion,
     TlsConfig, addresses,
@@ -187,28 +190,6 @@ pub enum StoreConfig {
     File { dir: PathBuf },
 }
 
-/// The kernel values of the file, checked. The rules directory and fingerprint come from the rules store at
-/// start-up.
-#[derive(Clone, Debug)]
-pub struct KernelSettings(tukuyomi_kernel::Config);
-
-impl KernelSettings {
-    /// The kernel configuration for one generation, checked again.
-    pub fn for_generation(
-        &self,
-        dir: PathBuf,
-        generation: Fingerprint,
-    ) -> Result<tukuyomi_kernel::Config, ConfigError> {
-        let kernel = tukuyomi_kernel::Config {
-            rules: dir,
-            rules_sha256: generation.bytes(),
-            ..self.0.clone()
-        };
-        kernel.check().map_err(|e| ConfigError(e.0))?;
-        Ok(kernel)
-    }
-}
-
 /// Why the file was refused: a fixed English sentence, never a value taken from the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfigError(pub &'static str);
@@ -277,6 +258,8 @@ struct RawProxy {
 #[serde(deny_unknown_fields)]
 struct RawKernel {
     inspector: String,
+    #[serde(default, deserialize_with = "present")]
+    engines: Option<Object<kernel::RawEngines>>,
     tmp_root: String,
     gomaxprocs: u16,
     gomemlimit: u64,
@@ -624,7 +607,9 @@ fn build(file: RawFile) -> Result<Loaded, ConfigError> {
     let admin = admin::check(ad, &listeners, status)?;
     places::separate(&dir, records.as_ref(), admin.as_ref())?;
 
+    let engines = kernel::check(k.engines)?;
     let kernel = tukuyomi_kernel::Config {
+        engine: Engine::Coraza,
         inspector: PathBuf::from(k.inspector),
         // The check looks at the form of the path only, so the directory of a generation, which is below this
         // one, gets the same answer. The fingerprint is any value of its type.
@@ -769,7 +754,7 @@ fn build(file: RawFile) -> Result<Loaded, ConfigError> {
             upstream_keepalive_requests: p.upstream_keepalive_requests,
         },
         forward,
-        kernel: KernelSettings(kernel),
+        kernel: KernelSettings::new(kernel, engines),
         store: StoreConfig::File { dir },
         acme,
         status,

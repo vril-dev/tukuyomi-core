@@ -9,6 +9,8 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use tukuyomi_kernel::Engine;
+
 const CONFIG: &str = r#"{"proxy":{"listeners":[{"address":"127.0.0.1:8080"}],"max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"inspect_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"forward":{"resolve_timeout_ms":30000,"upstreams":{"main":{"servers":[{"address":"127.0.0.1:9000","weight":1,"max_fails":1,"fail_timeout_ms":10000,"backup":false}]},"api":{"servers":[{"address":"127.0.0.1:9001","weight":3,"max_fails":2,"fail_timeout_ms":5000,"backup":false},{"address":"127.0.0.1:9002","weight":1,"max_fails":0,"fail_timeout_ms":5000,"backup":true}]}},"routes":[{"host":"api.example.test","path":"/v1/","upstream":"api"}],"default_upstream":"main"},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"@DIR@"}}}"#;
 
 /// A fresh 0700 directory under the temp directory (`TMPDIR`), removed with everything in it when dropped.
@@ -35,6 +37,7 @@ fn scratch() -> TestDir {
 fn bundle(name: &str) -> Bundle {
     let path = BundlePath::parse(&format!("rules/{name}.conf")).unwrap();
     Bundle::new(
+        Engine::Coraza,
         Mode::Block,
         vec![(path.clone(), format!("SecRuleEngine {name}\n").into_bytes())],
         vec![path],
@@ -129,7 +132,14 @@ fn the_mode_and_the_routes_of_the_generation_come_with_the_switch_and_a_manifest
     let path = BundlePath::parse("rules/d.conf").unwrap();
     let files = vec![(path.clone(), b"SecRuleEngine d\n".to_vec())];
     let table = Routes::new(vec![Route::new(Some("example.test"), "/static/").unwrap()]).unwrap();
-    let detect = Bundle::new(Mode::Detect, files, vec![path], table.clone()).unwrap();
+    let detect = Bundle::new(
+        Engine::Coraza,
+        Mode::Detect,
+        files,
+        vec![path],
+        table.clone(),
+    )
+    .unwrap();
     commands.stage(&detect).unwrap();
     commands.commit().unwrap();
     commands.activate(detect.fingerprint()).unwrap();
@@ -150,6 +160,34 @@ fn the_mode_and_the_routes_of_the_generation_come_with_the_switch_and_a_manifest
         switcher.prepare(),
         Next::Refused("the manifest of the generation cannot be read")
     ));
+}
+
+#[test]
+fn a_generation_of_an_engine_that_cannot_be_used_is_refused_by_the_switch_and_holds_nothing() {
+    let root = scratch();
+    let (mut commands, made) = made_in(&root.0, &["a"]);
+    let path = BundlePath::parse("rules/m.conf").unwrap();
+    let files = vec![(path.clone(), b"SecRuleEngine m\n".to_vec())];
+    let other = Bundle::new(
+        Engine::ModSecurity,
+        Mode::Block,
+        files,
+        vec![path],
+        Routes::default(),
+    )
+    .unwrap();
+    commands.stage(&other).unwrap();
+    commands.commit().unwrap();
+    commands.activate(other.fingerprint()).unwrap();
+    // The configuration has no inspector for the engine of the chosen generation: the proxy goes on as it is.
+    let mut switcher = switcher(&root.0, made[0]);
+    assert!(matches!(
+        switcher.prepare(),
+        Next::Refused("kernel.engines has no inspector for the engine of the generation")
+    ));
+    // The refusal left no hold: the generation can be removed once another one is chosen.
+    commands.activate(made[0]).unwrap();
+    assert_eq!(commands.remove(other.fingerprint()), Ok(()));
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //! `rules list`.
 //!
 //! ```text
-//! tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--accept-block] [--detect-only]
+//! tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--engine <name>] [--accept-block] [--detect-only]
 //! tukuyomi-proxy rules activate <config> <fingerprint>
 //! tukuyomi-proxy rules remove <config> <fingerprint>
 //! tukuyomi-proxy rules list <config>
@@ -14,19 +14,23 @@
 //! store, tries it (`trial`: an inspector is started on it, three requests are inspected) and makes it a generation
 //! only if the trial passes; it does not choose it. With `--detect-only` the bundle is a detect bundle: a request that
 //! a rule matches is let through and the match is reported, and the trial passes on such a match and writes a line
-//! for each; without it the bundle blocks. With `--routes` the bundle has the routes of the file, a JSON array of
+//! for each; without it the bundle blocks. With `--engine` the bundle is for that engine (`coraza`, the default, or
+//! `modsecurity`): its rules are inspected by that engine, and the import is refused, before anything is staged,
+//! when the configuration has no inspector for the engine or this build has no pinned build of it
+//! (`KernelSettings::check_engine`). With `--routes` the bundle has the routes of the file, a JSON array of
 //! `{"host": "<host>", "path": "<path>", "action": "bypass"}` (`host` is optional, no other key is taken): a request
 //! that a route matches is not inspected and goes on to the upstream. The routes are checked as the module `routes`
 //! says, and a running proxy takes them when it switches to the generation. `activate` chooses a generation, which
 //! a proxy that starts later
-//! uses, and a running proxy that is told to switch. `remove` deletes a generation that is not the chosen one and
+//! uses, and a running proxy that is told to switch; it is refused, before it chooses, for a generation whose engine
+//! cannot be used (the same check). `remove` deletes a generation that is not the chosen one and
 //! that no running proxy uses. `list` shows the generations.
 //!
 //! The results go to the standard output, one line each, and the first word of a line is the fingerprint: `import`
 //! says `created`, `already exists` or `recreated` after it, `activate` says `current`, `remove` says `removed`, and
 //! `list` gives the time the generation was made (seconds since the epoch), its mode (`block` or `detect`, and
-//! `unknown` when its manifest cannot be read), `routes` and their number for a generation that has routes, and
-//! `current` for the chosen one.
+//! `unknown` when its manifest cannot be read), its engine (`coraza` or `modsecurity`, and `unknown` likewise),
+//! `routes` and their number for a generation that has routes, and `current` for the chosen one.
 //! Everything else goes to the
 //! standard error, a line each, and starts with the name of the command. Whatever came from outside (an entry of a
 //! directory, the line an inspector left behind) is written with every byte outside 0x20 to 0x7e as `\xNN`.
@@ -37,7 +41,7 @@
 //!
 //! The exit code is 0 for success, 1 for any other end (a refused store or input, a failed trial, a store that is in
 //! use, a listed generation whose manifest cannot be read, a process that runs as root) and 2 for a wrong argument or
-//! a refused configuration.
+//! a refused configuration, an engine that cannot be used included.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -48,7 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::runtime::Builder;
 use tokio::signal::unix::{SignalKind, signal};
-use tukuyomi_kernel::Failure;
+use tukuyomi_kernel::{Engine, Failure};
 
 use crate::config::{self, Loaded};
 use crate::log::escaped;
@@ -58,7 +62,7 @@ use crate::rules::store::{self, Committed, RuleStore, Staged};
 use crate::rules::trial::{self, Accepted, Failed, Finish, Limits};
 use crate::run::host;
 
-const USAGE: &str = "usage: tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--accept-block] [--detect-only]\n       tukuyomi-proxy rules activate <config> <fingerprint>\n       tukuyomi-proxy rules remove <config> <fingerprint>\n       tukuyomi-proxy rules list <config>";
+const USAGE: &str = "usage: tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--engine <name>] [--accept-block] [--detect-only]\n       tukuyomi-proxy rules activate <config> <fingerprint>\n       tukuyomi-proxy rules remove <config> <fingerprint>\n       tukuyomi-proxy rules list <config>";
 
 /// How a command ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +175,7 @@ fn fingerprint(arg: &OsString) -> Result<Fingerprint, &'static str> {
 fn parse_import(config: PathBuf, rest: &[OsString]) -> Result<Command, &'static str> {
     let mut inputs = Inputs::default();
     let mut accept_block = false;
+    let mut engine = None;
     let mut args = rest.iter();
     while let Some(arg) = args.next() {
         if arg == "--accept-block" {
@@ -200,10 +205,19 @@ fn parse_import(config: PathBuf, rest: &[OsString]) -> Result<Command, &'static 
             if inputs.routes.replace(PathBuf::from(value)).is_some() {
                 return Err("--routes is given twice");
             }
+        } else if arg == "--engine" {
+            let named = value
+                .to_str()
+                .and_then(Engine::parse)
+                .ok_or("--engine is not the name of an engine (coraza or modsecurity)")?;
+            if engine.replace(named).is_some() {
+                return Err("--engine is given twice");
+            }
         } else {
             return Err("unknown option");
         }
     }
+    inputs.engine = engine.unwrap_or_default();
     if inputs.crs.is_none() && !inputs.crs_off.is_empty() {
         return Err("--crs-off needs --crs");
     }
@@ -259,6 +273,10 @@ fn import(config: &Path, inputs: &Inputs, accept_block: bool, term: &mut Termina
         Ok(opened) => opened,
         Err(exit) => return exit,
     };
+    if let Err(e) = loaded.kernel.check_engine(inputs.engine) {
+        term.note(&format!("{NAME}: configuration refused: {}", e.0));
+        return Exit::Usage;
+    }
     let bundle = match collect::collect(inputs) {
         Ok(bundle) => bundle,
         Err(CollectError { reason, subject }) => {
@@ -273,7 +291,14 @@ fn import(config: &Path, inputs: &Inputs, accept_block: bool, term: &mut Termina
             return Exit::Failed;
         }
     };
-    if !try_staged(&loaded, &staged, accept_block, inputs.mode, term) {
+    if !try_staged(
+        &loaded,
+        &staged,
+        accept_block,
+        inputs.engine,
+        inputs.mode,
+        term,
+    ) {
         if let Err(e) = store.discard() {
             term.note(&format!("{NAME}: {}", e.0));
         }
@@ -296,17 +321,18 @@ fn import(config: &Path, inputs: &Inputs, accept_block: bool, term: &mut Termina
     }
 }
 
-/// Tries the staged bundle and tells how it went. True if it passed. `mode` is the mode of the bundle.
+/// Tries the staged bundle and tells how it went. True if it passed. `engine` and `mode` are those of the bundle.
 fn try_staged(
     loaded: &Loaded,
     staged: &Staged,
     accept_block: bool,
+    engine: Engine,
     mode: Mode,
     term: &mut Terminal,
 ) -> bool {
     let kernel = match loaded
         .kernel
-        .for_generation(staged.dir.clone(), staged.fingerprint)
+        .for_generation(staged.dir.clone(), staged.fingerprint, engine)
     {
         Ok(kernel) => kernel,
         Err(e) => {
@@ -436,10 +462,24 @@ fn activate(config: &Path, generation: Fingerprint, term: &mut Terminal) -> Exit
     if let Err(exit) = not_root(NAME, term) {
         return exit;
     }
-    let (_, mut store) = match open_store(NAME, config, term) {
+    let (loaded, mut store) = match open_store(NAME, config, term) {
         Ok(opened) => opened,
         Err(exit) => return exit,
     };
+    // The check comes before the store chooses: a generation whose engine cannot be used is never left as the
+    // chosen one, which the next start would refuse.
+    match store.engine(generation) {
+        Ok(engine) => {
+            if let Err(e) = loaded.kernel.check_engine(engine) {
+                term.note(&format!("{NAME}: configuration refused: {}", e.0));
+                return Exit::Usage;
+            }
+        }
+        Err(e) => {
+            term.note(&format!("{NAME}: {}", e.0));
+            return Exit::Failed;
+        }
+    }
     match store.activate(generation) {
         Ok(()) => {
             term.result(&format!("{} current", generation.hex()));
@@ -493,16 +533,15 @@ fn list(config: &Path, term: &mut Terminal) -> Exit {
     let chosen = current.as_ref().ok().copied().flatten();
     let mut unreadable = Vec::new();
     for generation in &generations {
-        let described = store.mode(generation.fingerprint).and_then(|mode| {
-            store
-                .routes(generation.fingerprint)
-                .map(|routes| (mode.name(), routes.len()))
-        });
-        let (mode, routes) = match described {
-            Ok(described) => described,
+        let (mode, engine, routes) = match store.manifest(generation.fingerprint) {
+            Ok(manifest) => (
+                manifest.mode().name(),
+                manifest.engine().name(),
+                manifest.routes().len(),
+            ),
             Err(e) => {
                 unreadable.push((generation.fingerprint, e));
-                ("unknown", 0)
+                ("unknown", "unknown", 0)
             }
         };
         let routes = if routes == 0 {
@@ -516,7 +555,7 @@ fn list(config: &Path, term: &mut Terminal) -> Exit {
             ""
         };
         term.result(&format!(
-            "{} {} {mode}{routes}{mark}",
+            "{} {} {mode} {engine}{routes}{mark}",
             generation.fingerprint.hex(),
             generation.made
         ));

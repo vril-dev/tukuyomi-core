@@ -13,10 +13,11 @@
 //! answers are JSON, and `error` is a fixed sentence):
 //! - `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "crs"}`: the generation the rules store
 //!   chooses, the state of the proxy from its control socket (`proxy` is `null` when the state could not be read, and
-//!   `reachable` is false when the proxy cannot be reached; a proxy that has no place for the question is reachable),
-//!   the generation a rollback would go to now (`null` for none), and the CRS of the configuration (see `status`).
+//!   `reachable` is false when the proxy cannot be reached; a proxy that has no place for the question is reachable;
+//!   `proxy` has the `mode` and the `engine` of the generation it serves), the generation a rollback would go to now
+//!   (`null` for none), and the CRS of the configuration (see `status`).
 //! - `GET /api/generations`: `{"reachable", "generations"}`, the newest first, each with its `fingerprint`, `made`
-//!   (seconds since the epoch), `mode`, number of `routes`, and whether it is `current` and `serving`.
+//!   (seconds since the epoch), `mode`, `engine`, number of `routes`, and whether it is `current` and `serving`.
 //! - `GET /api/generations/<fingerprint>`: that, and the `load` order, the `files` (path, size, SHA-256) and the
 //!   `routes` of its manifest. 404 for a generation the store does not have.
 //! - `POST /api/generations`: the import (see `import`): the same steps as `rules import`: the files are collected
@@ -40,15 +41,18 @@
 //! last name.
 //!
 //! A switch (activate, rollback): the generation the rules store chooses must be `expect`, the one the client saw
-//! (else 409; the store checks it again when it chooses, under its lock, so that a generation another process chose in
-//! between is not overwritten: also 409), and the proxy must be reachable (else 503, nothing is changed, the history
-//! has an `unreachable` line; a proxy that has no place for the question is 503 too, with no line). Then the
-//! generation is chosen (`activate_if_current` of the store, which verifies it), and the proxy is ordered to switch to
-//! it by its control socket. If the proxy says the switch is under way (`busy`) its state is looked at every 250 ms
-//! until it serves the generation, or has been idle twice without it, or the time the old inspector may take to stop
-//! and 7 s are over; a look that finds no place in the proxy is no end of the wait. The answer and the line of the
-//! history say `switched` (200), `unchanged` (200), `refused` (409), `failed` (502), `unreachable` (503) or
-//! `unconfirmed` (503: the rules store was changed, and the proxy went away or did not say how the switch ended).
+//! (else 409; the store checks it again when it chooses, under its lock, so that a generation another process chose
+//! in between is not overwritten: also 409), the engine of the generation to switch to must be usable here (else 409
+//! with the sentence of the check, audited as denied with the reason `engine`; the store is not touched, so it never
+//! chooses a generation that the proxy would refuse; a manifest that cannot be read is left to the store, which
+//! refuses it when it chooses), and the proxy must be reachable (else 503, nothing is changed,
+//! the history has an `unreachable` line; a proxy that has no place for the question is 503 too, with no line). Then
+//! the generation is chosen (`activate_if_current` of the store, which verifies it), and the proxy is ordered to
+//! switch to it by its control socket. If the proxy says the switch is under way (`busy`) its state is looked at
+//! every 250 ms until it serves the generation, or has been idle twice without it, or the time the old inspector may
+//! take to stop and 7 s are over; a look that finds no place in the proxy is no end of the wait. The answer and the
+//! line of the history say `switched` (200), `unchanged` (200), `refused` (409), `failed` (502), `unreachable` (503)
+//! or `unconfirmed` (503: the rules store was changed, and the proxy went away or did not say how the switch ended).
 //! `chosen` in the answer says whether the rules store chooses the generation now: it does not when nothing was
 //! changed (the proxy could not be reached first), and it does when the switch then was refused, failed or
 //! unconfirmed: the store is not put back. A history line that cannot be written is told by `history` in the answer.
@@ -475,13 +479,16 @@ impl Waf {
             .iter()
             .rev()
             .map(|g| {
-                let (mode, routes) = store
+                let (mode, engine, routes) = store
                     .manifest(g.fingerprint)
-                    .map_or(("unknown", 0), |m| (m.mode().name(), m.routes().len()));
+                    .map_or(("unknown", "unknown", 0), |m| {
+                        (m.mode().name(), m.engine().name(), m.routes().len())
+                    });
                 json!({
                     "fingerprint": g.fingerprint.hex(),
                     "made": g.made,
                     "mode": mode,
+                    "engine": engine,
                     "routes": routes,
                     "current": current == Some(g.fingerprint),
                     "serving": serving == Some(g.fingerprint),
@@ -543,6 +550,7 @@ impl Waf {
                 "fingerprint": fingerprint.hex(),
                 "made": entry.made,
                 "mode": manifest.mode().name(),
+                "engine": manifest.engine().name(),
                 "current": current == Some(fingerprint),
                 "serving": serving == Some(fingerprint),
                 "load": load,
@@ -635,6 +643,15 @@ impl Waf {
             Err(e) => return failed(e),
         };
         let (ids, from_hex) = ((from, to), from.hex());
+        // Before the proxy is asked and before the store chooses: a generation whose engine cannot be used here
+        // would be refused by the proxy, and left as the chosen one it would end the next start. A manifest that
+        // cannot be read is not answered here: the store refuses it when it chooses, and that answer stands.
+        if let Ok(engine) = store.engine(to)
+            && let Err(text) = self.trial.usable(engine)
+        {
+            self.note(caller, action, Outcome::Denied, "engine", &to_hex);
+            return conflict(text);
+        }
         match self.control.status() {
             Seen::State(_) => {}
             Seen::Busy => {

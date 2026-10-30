@@ -281,6 +281,22 @@ const OUTCOMES = {
   other: ['bad', () => t('word.other'), said, null],
 };
 
+// The names of the engines that inspect with the rules of a generation. A word that is not here is shown as the API
+// gave it.
+const ENGINES = {
+  coraza: () => t('engine.coraza'),
+  modsecurity: () => t('engine.modsecurity'),
+};
+
+/** The name of an engine, by the word the API gives. */
+export function engineName(engine) {
+  return Object.hasOwn(ENGINES, engine) ? ENGINES[engine]() : String(engine);
+}
+
+export function engineBadge(engine) {
+  return badge('muted', engineName(engine));
+}
+
 /** The tone of the badge of a word of the proxy's, for the history. */
 export function wordBadge(word) {
   const known = Object.hasOwn(OUTCOMES, word) && SWITCH_WORDS.includes(word);

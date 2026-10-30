@@ -1,15 +1,14 @@
 //! The choice of the generation that a running proxy switches to.
 //!
-//! The proxy reads the rules store when it starts, and again when it is told to switch (SIGUSR1). A switch reads
-//! the chosen generation (`current`), takes the hold on it, asks for its directory and builds the kernel
-//! configuration for it, in this order: the hold comes before the directory, the mode and the routes, so that a
-//! removal that has finished is found by the directory and one that is going on keeps the hold from being taken.
-//! `Switcher` keeps what that takes: the store, the kernel values of the configuration, the generation that runs
-//! with its hold, and, while a
-//! switch is under way, the generation it is for with its hold. When the driver has answered, `finish` keeps the
-//! hold of the generation that serves and gives the other back, so a generation that serves is never without a
-//! hold, and `rules remove` cannot take it from under a running inspector. A refusal is a fixed sentence of the
-//! store or of the configuration, and the proxy goes on with the generation that runs.
+//! The proxy reads the rules store when it starts, and again when it is told to switch (SIGUSR1). A switch reads the
+//! chosen generation (`current`), takes the hold on it, asks for its directory and builds the kernel configuration
+//! for it, in this order: the hold comes before the directory, the engine, the mode and the routes, so that a removal
+//! that has finished is found by the directory and one that is going on keeps the hold from being taken. `Switcher`
+//! keeps what that takes: the store, the kernel values of the configuration, the generation that runs with its hold,
+//! and, while a switch is under way, the generation it is for with its hold. When the driver has answered, `finish`
+//! keeps the hold of the generation that serves and gives the other back, so a generation that serves is never
+//! without a hold, and `rules remove` cannot take it from under a running inspector. A refusal is a fixed sentence of
+//! the store or of the configuration, and the proxy goes on with the generation that runs.
 
 use crate::config::KernelSettings;
 use crate::rules::bundle::{Fingerprint, Mode};
@@ -88,6 +87,10 @@ impl Switcher {
             Ok(dir) => dir,
             Err(e) => return Next::Refused(e.0),
         };
+        let engine = match self.store.engine(generation) {
+            Ok(engine) => engine,
+            Err(e) => return Next::Refused(e.0),
+        };
         let mode = match self.store.mode(generation) {
             Ok(mode) => mode,
             Err(e) => return Next::Refused(e.0),
@@ -96,7 +99,7 @@ impl Switcher {
             Ok(routes) => routes,
             Err(e) => return Next::Refused(e.0),
         };
-        let kernel = match self.settings.for_generation(dir, generation) {
+        let kernel = match self.settings.for_generation(dir, generation, engine) {
             Ok(kernel) => kernel,
             Err(e) => return Next::Refused(e.0),
         };

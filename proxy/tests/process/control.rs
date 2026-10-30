@@ -142,7 +142,7 @@ fn the_control_socket_has_mode_0600_and_switches_only_to_the_generation_that_is_
     assert_eq!(meta.permissions().mode() & 0o777, 0o600);
 
     let first = generation();
-    let status = |generation: &str| json!({"generation": generation, "mode": "block", "phase": "ready", "switching": false, "ready": true});
+    let status = |generation: &str| json!({"generation": generation, "mode": "block", "engine": "coraza", "phase": "ready", "switching": false, "ready": true});
     assert_eq!(ask(&root, "{\"op\":\"status\"}\n"), status(&first));
     assert_eq!(exchange(proxy.port, &get("/reload-probe")).status(), 200);
 
@@ -173,7 +173,7 @@ fn the_control_socket_has_mode_0600_and_switches_only_to_the_generation_that_is_
         "tukuyomi_rules_switches_total{result=\"switched\"} 1".to_string(),
         "tukuyomi_rules_switches_total{result=\"refused\"} 0".to_string(),
         format!(
-            "tukuyomi_rules_generation_info{{generation=\"{}\",mode=\"block\"}} 1",
+            "tukuyomi_rules_generation_info{{generation=\"{}\",mode=\"block\",engine=\"coraza\"}} 1",
             &second[..16]
         ),
         "tukuyomi_record_file_errors_total 0".to_string(),
@@ -235,7 +235,7 @@ fn a_second_proxy_on_the_same_configuration_does_not_take_the_socket_of_a_runnin
     );
     assert_eq!(
         ask(&root, "{\"op\":\"status\"}\n"),
-        json!({"generation": generation(), "mode": "block", "phase": "ready", "switching": false, "ready": true})
+        json!({"generation": generation(), "mode": "block", "engine": "coraza", "phase": "ready", "switching": false, "ready": true})
     );
     finish(proxy, 0);
 }

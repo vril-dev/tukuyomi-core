@@ -12,6 +12,7 @@ import {
   canChange,
   changeLines,
   confirmChange,
+  engineBadge,
   findingsView,
   fingerprint,
   generationState,
@@ -225,10 +226,10 @@ class GenerationsScreen extends Screen {
       items.length === 0
         ? notice('info', t('gen.empty'))
         : table(
-            [t('col.fingerprint'), t('col.made'), t('col.mode'), t('col.routes'), t('col.state'), t('col.actions')],
+            [t('col.fingerprint'), t('col.made'), t('col.mode'), t('col.engine'), t('col.routes'), t('col.state'), t('col.actions')],
             items.map((item) => this.rowOf(item)),
             t('gen.caption'),
-            { tight: [1, 3] },
+            { tight: [1, 4] },
           ),
     );
   }
@@ -243,6 +244,7 @@ class GenerationsScreen extends Screen {
       fingerprint(item.fingerprint),
       utc(item.made),
       modeBadge(item.mode),
+      engineBadge(item.engine),
       String(item.routes),
       states.length === 0 ? '' : el('span', { class: 'badges' }, states),
       this.actions(item, () => {}),
@@ -296,6 +298,7 @@ class GenerationsScreen extends Screen {
         row(t('col.fingerprint'), el('code', { class: 'fp' }, detail.fingerprint)),
         row(t('col.made'), utc(detail.made)),
         row(t('col.mode'), modeBadge(detail.mode)),
+        row(t('col.engine'), engineBadge(detail.engine)),
         row(
           t('col.state'),
           detail.current === true || detail.serving === true
@@ -338,7 +341,7 @@ class GenerationsScreen extends Screen {
   async remove(item) {
     const lines = [
       el('p', {}, t('gen.remove.what')),
-      el('dl', { class: 'kv' }, row(t('col.fingerprint'), el('code', { class: 'fp' }, item.fingerprint)), row(t('col.made'), utc(item.made)), row(t('col.mode'), modeBadge(item.mode))),
+      el('dl', { class: 'kv' }, row(t('col.fingerprint'), el('code', { class: 'fp' }, item.fingerprint)), row(t('col.made'), utc(item.made)), row(t('col.mode'), modeBadge(item.mode)), row(t('col.engine'), engineBadge(item.engine))),
     ];
     const yes = await confirmChange(this.layer, { title: t('gen.remove.title'), lines, confirm: t('gen.remove'), tone: 'danger' });
     if (!yes || !this.alive) return;

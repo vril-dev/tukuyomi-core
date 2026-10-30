@@ -245,6 +245,7 @@ impl<K: Kernel> Core<K> {
             phase: status.phase,
             restarts: self.restarts_before.saturating_add(status.restarts),
             generation: self.active.generation,
+            engine: self.active.engine,
             mode: self.active.mode,
         };
         self.state.send_if_modified(|seen| {
@@ -311,10 +312,11 @@ impl<K: Kernel> Core<K> {
             let _ = reply.send(Switched::No);
             return;
         }
+        let engine = kernel.engine;
         match K::create(kernel) {
             Ok(kernel) => {
                 self.switching = Switching::Starting {
-                    next: Slot::new(generation, mode, kernel),
+                    next: Slot::new(generation, engine, mode, kernel),
                     ready_by: after(Instant::now(), self.limits.ready_wait),
                     routes,
                 };

@@ -435,6 +435,7 @@ fn uploaded_files_make_the_bundle_that_the_same_files_on_disk_make() {
         crs_off: vec!["B-second.conf".into()],
         rules: vec![root.put("mine/a.conf", b"a\n")],
         data: vec![root.put("mine/list.data", b"one\n")],
+        engine: Engine::ModSecurity,
         mode: Mode::Detect,
         routes: Some(root.put("mine/routes.json", routes)),
     })
@@ -444,6 +445,7 @@ fn uploaded_files_make_the_bundle_that_the_same_files_on_disk_make() {
         crs_off: vec!["B-second.conf".into()],
         rules: vec![upload("a.conf", b"a\n")],
         data: vec![upload("list.data", b"one\n")],
+        engine: Engine::ModSecurity,
         mode: Mode::Detect,
         routes: Some(routes.to_vec()),
     })

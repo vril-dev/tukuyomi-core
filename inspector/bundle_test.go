@@ -399,3 +399,33 @@ func TestBundleFS(t *testing.T) {
 		}
 	}
 }
+
+// A manifest of version 4 is the form of a bundle of an engine other than
+// Coraza, which is the engine of this inspector: the engine key is not one that
+// the reader writes again, so the manifest is not the canonical form of
+// anything it knows and is refused. readBundle gives that error, which main
+// reports as a refusal of the rules (exit 11) before the sandbox or any rule is
+// touched. The same holds for a version 4 that names Coraza, which the proxy
+// refuses as well.
+func TestManifestOfVersion4IsRefused(t *testing.T) {
+	g, err := os.ReadFile("testdata/manifest-v4-golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	coraza := bytes.Replace(g, []byte(`"engine":"modsecurity"`), []byte(`"engine":"coraza"`), 1)
+	if bytes.Equal(coraza, g) {
+		t.Fatal("the variant is the golden file")
+	}
+	for name, in := range map[string][]byte{"golden file": g, "engine coraza": coraza} {
+		if _, err := parseManifest(in); err == nil || !strings.Contains(err.Error(), "not in the canonical form") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, manifestName), g, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readBundle(dir); err == nil || !strings.Contains(err.Error(), manifestName+": not in the canonical form") {
+		t.Errorf("readBundle: %v", err)
+	}
+}

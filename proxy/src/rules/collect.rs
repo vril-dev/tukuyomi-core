@@ -31,6 +31,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use tukuyomi_kernel::Engine;
+
 use crate::rules::bundle::{Bundle, BundlePath, MAX_BUNDLE_BYTES, MAX_FILE_BYTES, MAX_FILES, Mode};
 use crate::rules::file_store::read_regular;
 use crate::rules::routes::Routes;
@@ -49,6 +51,8 @@ pub struct Inputs {
     pub rules: Vec<PathBuf>,
     /// Data files that rules read.
     pub data: Vec<PathBuf>,
+    /// The engine that inspects with the rules.
+    pub engine: Engine,
     /// What the rules do to a request they match.
     pub mode: Mode,
     /// The file of the routes: a JSON array of the requests that skip the inspection.
@@ -72,6 +76,7 @@ pub struct Uploads {
     pub rules: Vec<Upload>,
     /// Data files that rules read.
     pub data: Vec<Upload>,
+    pub engine: Engine,
     pub mode: Mode,
     /// The content of the file of the routes.
     pub routes: Option<Vec<u8>>,
@@ -188,13 +193,18 @@ impl Collector {
         Ok(())
     }
 
-    /// The bundle of what was collected, for the rules of `mode` and with `routes`.
-    fn finish(self, mode: Mode, routes: Routes) -> Result<Bundle, CollectError> {
-        Bundle::new(mode, self.files.into_iter().collect(), self.load, routes).map_err(|e| {
-            CollectError {
-                reason: e.0,
-                subject: None,
-            }
+    /// The bundle of what was collected, for the rules of `engine` and `mode` and with `routes`.
+    fn finish(self, engine: Engine, mode: Mode, routes: Routes) -> Result<Bundle, CollectError> {
+        Bundle::new(
+            engine,
+            mode,
+            self.files.into_iter().collect(),
+            self.load,
+            routes,
+        )
+        .map_err(|e| CollectError {
+            reason: e.0,
+            subject: None,
         })
     }
 }
@@ -219,7 +229,7 @@ pub fn collect(inputs: &Inputs) -> Result<Bundle, CollectError> {
         Some(source) => Routes::from_json(&read_input(source)?).or_else(|e| refuse(e.0, source))?,
         None => Routes::default(),
     };
-    collector.finish(inputs.mode, routes)
+    collector.finish(inputs.engine, inputs.mode, routes)
 }
 
 /// Reads the inputs of a request into a bundle: the CRS from its directory, the other files from memory, in the
@@ -245,7 +255,7 @@ pub fn collect_uploads(uploads: Uploads) -> Result<Bundle, CollectError> {
         Some(bytes) => Routes::from_json(bytes).or_else(|e| refuse(e.0, Path::new("routes")))?,
         None => Routes::default(),
     };
-    collector.finish(uploads.mode, routes)
+    collector.finish(uploads.engine, uploads.mode, routes)
 }
 
 /// How an entry of a directory is listed.

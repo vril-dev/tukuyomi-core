@@ -68,8 +68,9 @@ fn a_forwarded_request_has_one_number_in_its_record_its_response_and_the_upstrea
         (&json!(5), true)
     );
     assert_eq!(record["sent"], UPSTREAM_BODY.len());
-    // The rules that gave the verdict: the generation of the store and its mode.
+    // The rules that gave the verdict: the generation of the store, its mode and its engine.
     assert_eq!(record["mode"], "block");
+    assert_eq!(record["engine"], "coraza");
     assert_eq!(record["generation"], generation()[..16]);
     assert_eq!(record["upstream"], "main");
     assert_eq!(record["server"], proxy.upstream.addr().to_string().as_str());
@@ -94,6 +95,7 @@ fn a_blocked_request_is_answered_with_the_number_of_its_record_which_names_the_r
         .conn("the blocked record", |l| blocked_by(l, 9201));
     assert_eq!(record["id"], id.as_str());
     assert_eq!(record["mode"], "block");
+    assert_eq!(record["engine"], "coraza");
     assert_eq!(record["generation"], generation()[..16]);
     assert!(no(&record, "upstream") && no(&record, "server"), "{record}");
     assert_eq!(record["sent"], 0);
@@ -116,7 +118,15 @@ fn a_refused_first_head_is_answered_with_a_number_and_its_record_has_no_text_of_
         is_answer(l, "rejected", 400, "malformed request head")
     });
     assert_eq!(record["id"], id.as_str());
-    for key in ["method", "host", "path", "mode", "generation", "rule"] {
+    for key in [
+        "method",
+        "host",
+        "path",
+        "mode",
+        "engine",
+        "generation",
+        "rule",
+    ] {
         assert!(no(&record, key), "{key} in {record}");
     }
     assert_eq!(record["sent"], 0);

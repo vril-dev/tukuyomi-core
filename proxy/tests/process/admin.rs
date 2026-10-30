@@ -27,7 +27,7 @@ const NEXT: &str = "second password 456";
 
 /// Adds the `admin` object that listens on `port`, with `mfa` optional, and the directory of its store, to the
 /// configuration in `root`.
-fn add_admin(root: &Path, port: u16) {
+pub(crate) fn add_admin(root: &Path, port: u16) {
     fs::DirBuilder::new()
         .mode(0o700)
         .create(root.join("admin"))

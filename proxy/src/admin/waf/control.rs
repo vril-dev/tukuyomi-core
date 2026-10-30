@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::runtime::Builder;
 use tokio::time::timeout;
+use tukuyomi_kernel::Engine;
 
 use crate::rules::bundle::Fingerprint;
 
@@ -49,6 +50,8 @@ pub struct Status {
     /// The generation that serves.
     pub generation: Fingerprint,
     pub mode: &'static str,
+    /// The engine that applies the rules of the generation.
+    pub engine: &'static str,
     pub phase: &'static str,
     /// A switch is under way.
     pub switching: bool,
@@ -60,6 +63,7 @@ impl Status {
         json!({
             "generation": self.generation.hex(),
             "mode": self.mode,
+            "engine": self.engine,
             "phase": self.phase,
             "switching": self.switching,
             "ready": self.ready,
@@ -118,6 +122,7 @@ enum Heard {
 struct StatusLine {
     generation: String,
     mode: String,
+    engine: String,
     phase: String,
     switching: bool,
     ready: bool,
@@ -156,6 +161,7 @@ fn status_of(line: &[u8]) -> Option<Status> {
     Some(Status {
         generation: Fingerprint::from_hex(line.generation.as_bytes())?,
         mode: word(&line.mode, &MODES)?,
+        engine: Engine::parse(&line.engine)?.name(),
         phase: word(&line.phase, &PHASES)?,
         switching: line.switching,
         ready: line.ready,

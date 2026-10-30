@@ -6,10 +6,13 @@
 //! where the inspector can read it and takes the lock of the store, the caller tries the bundle, then `commit`
 //! makes it a generation or `discard` throws it away, and either gives the lock back. `activate` chooses a
 //! generation, `activate_if_current` does so only if the chosen generation is the one the caller saw, `remove`
-//! deletes one that is neither chosen nor held, `list`, `verify`, `mode`, `routes` and `manifest` only read.
+//! deletes one that is neither chosen nor held, `list`, `verify`, `engine`, `mode`, `routes` and `manifest` only
+//! read.
 
 use std::any::Any;
 use std::path::PathBuf;
+
+use tukuyomi_kernel::Engine;
 
 use crate::config::StoreConfig;
 use crate::rules::bundle::{Bundle, Fingerprint, Manifest, Mode};
@@ -94,11 +97,14 @@ pub trait RuleStore {
     fn list(&self) -> Result<Vec<Generation>, StoreError>;
     /// Checks that the manifest of a generation is as its name says and that every file is as the manifest says.
     fn verify(&self, generation: Fingerprint) -> Result<(), StoreError>;
+    /// The engine of a generation, from its manifest, which is read and checked as `verify` checks it. The files are
+    /// not read.
+    fn engine(&self, generation: Fingerprint) -> Result<Engine, StoreError>;
     /// The mode of a generation, from its manifest, which is read and checked as `verify` checks it. The files are
     /// not read.
     fn mode(&self, generation: Fingerprint) -> Result<Mode, StoreError>;
     /// The manifest of a generation, read and checked as `verify` checks it: the files it lists with their sizes and
-    /// digests, the order they are loaded in, the mode and the routes. The files are not read.
+    /// digests, the order they are loaded in, the engine, the mode and the routes. The files are not read.
     fn manifest(&self, generation: Fingerprint) -> Result<Manifest, StoreError>;
     /// The routes of a generation, from its manifest, which is read and checked as `verify` checks it. The files are
     /// not read. The manifest of a generation is the very bytes its name says, so this and `mode` read the same

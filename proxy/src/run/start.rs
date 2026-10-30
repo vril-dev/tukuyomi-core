@@ -240,6 +240,13 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
             return Err(EXIT_FAILED);
         }
     };
+    let engine = match rules.engine(generation) {
+        Ok(engine) => engine,
+        Err(e) => {
+            log.line(&format!("{name}: rules store refused: {}", e.0));
+            return Err(EXIT_FAILED);
+        }
+    };
     let mode = match rules.mode(generation) {
         Ok(mode) => mode,
         Err(e) => {
@@ -254,7 +261,7 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
             return Err(EXIT_FAILED);
         }
     };
-    let kernel = match loaded.kernel.for_generation(dir, generation) {
+    let kernel = match loaded.kernel.for_generation(dir, generation, engine) {
         Ok(kernel) => kernel,
         Err(e) => {
             log.line(&format!("{name}: rules generation refused: {}", e.0));
@@ -262,6 +269,7 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         }
     };
     log.line(&format!("{name}: rules generation {}", generation.hex()));
+    log.line(&format!("{name}: rules engine {}", engine.name()));
     log.line(&format!("{name}: rules mode {}", mode.name()));
     log.line(&format!("{name}: rules routes {}", routes.len()));
     Ok(Prepared {

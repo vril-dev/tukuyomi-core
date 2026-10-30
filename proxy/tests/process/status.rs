@@ -130,7 +130,7 @@ fn metrics_count_a_forwarded_and_a_blocked_request_and_a_scrape_is_no_request() 
         "{open}"
     );
     let info = format!(
-        "tukuyomi_rules_generation_info{{generation=\"{}\",mode=\"block\"}} 1",
+        "tukuyomi_rules_generation_info{{generation=\"{}\",mode=\"block\",engine=\"coraza\"}} 1",
         &generation()[..16]
     );
     assert!(text.lines().any(|have| have == info), "{info} in {text}");

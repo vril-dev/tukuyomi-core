@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use tukuyomi_kernel::Reason;
+use tukuyomi_kernel::{Engine, Reason};
 
 use super::*;
 use crate::log::counters::{Policy, RuleHit};
@@ -13,6 +13,7 @@ fn scrape<'a>(counters: &'a Counters, groups: Vec<(&'a str, u64)>) -> Scrape<'a>
             phase: Phase::Ready,
             restarts: 3,
             generation: Fingerprint::from_hex(&[b'a'; 64]).unwrap(),
+            engine: Engine::Coraza,
             mode: Mode::Detect,
         },
         connections_open: 2,
@@ -93,7 +94,7 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
         "tukuyomi_inspections_waiting 1",
         "tukuyomi_inspector_up 1",
         "tukuyomi_inspector_restarts_total 3",
-        "tukuyomi_rules_generation_info{generation=\"aaaaaaaaaaaaaaaa\",mode=\"detect\"} 1",
+        "tukuyomi_rules_generation_info{generation=\"aaaaaaaaaaaaaaaa\",mode=\"detect\",engine=\"coraza\"} 1",
         "tukuyomi_upstream_failures_total{group=\"api\"} 2",
         "tukuyomi_records_dropped_total 7",
         "tukuyomi_record_write_errors_total 8",

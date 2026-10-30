@@ -310,6 +310,7 @@ impl Supervisor {
         };
         let inc = start.inc;
         let expect = HelloExpect {
+            build: self.cfg.engine.pinned(),
             rules_sha256: &self.cfg.rules_sha256,
             mem_limit: self.cfg.gomemlimit,
             gomaxprocs: self.cfg.gomaxprocs,

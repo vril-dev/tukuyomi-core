@@ -9,6 +9,7 @@ use super::*;
 use crate::log::recording;
 use crate::rules::bundle::Mode;
 use crate::run::signals::tests::runtime;
+use tukuyomi_kernel::Engine;
 
 /// A fresh 0700 directory under the temp directory (`TMPDIR`), removed with everything in it when dropped. Its name is
 /// short because the socket in it has to fit into 107 bytes together with the path of `TMPDIR`.
@@ -50,6 +51,7 @@ fn state(phase: Phase) -> State {
         phase,
         restarts: 0,
         generation: fingerprint(b'a'),
+        engine: Engine::Coraza,
         mode: Mode::Block,
     }
 }
@@ -77,7 +79,7 @@ async fn ask(path: PathBuf, request: Vec<u8>) -> String {
 
 fn status_line(phase: &str, switching: bool, ready: bool) -> String {
     format!(
-        "{{\"generation\":\"{}\",\"mode\":\"block\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready}}}\n",
+        "{{\"generation\":\"{}\",\"mode\":\"block\",\"engine\":\"coraza\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready}}}\n",
         "a".repeat(64)
     )
 }

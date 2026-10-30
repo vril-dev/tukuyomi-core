@@ -13,8 +13,10 @@
 //! At most 4 connections are served at once; one that finds no place is accepted and closed. A client sends one line
 //! of JSON of at most 4 KiB within 2 s, gets one line of JSON (2 s to write it) and is closed. A client that sends no
 //! line in time, or goes away, gets no answer. Both ops are carried out by the main loop (`Order`), which owns the
-//! switcher. `{"op":"status"}` is answered with `{"generation":..,"mode":..,"phase":..,"switching":..,"ready":..}`:
-//! the 64 digits of the generation that serves, what its rules do (`block` or `detect`), the phase of its kernel
+//! switcher. `{"op":"status"}` is answered with
+//! `{"generation":..,"mode":..,"engine":..,"phase":..,"switching":..,"ready":..}`: the 64 digits of the generation
+//! that serves, what its rules do (`block` or `detect`), the engine that applies them (`coraza` or `modsecurity`),
+//! the phase of its kernel
 //! (`starting`, `ready`, `stopping`, `stopped` or `failed`), whether a switch is under way, and whether `/readyz`
 //! says `ready`. `{"op":"switch","expect":"<64 digits>"}` reads the rules store, and if the generation it chooses is
 //! not `expect` it does nothing and answers `refused` (`current changed`). Otherwise it does what SIGUSR1 does and
@@ -95,6 +97,7 @@ pub(super) enum Answer {
     Status {
         generation: Fingerprint,
         mode: &'static str,
+        engine: &'static str,
         phase: &'static str,
         switching: bool,
         ready: bool,
@@ -115,11 +118,12 @@ impl Answer {
             Answer::Status {
                 generation,
                 mode,
+                engine,
                 phase,
                 switching,
                 ready,
             } => format!(
-                "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready}}}\n",
+                "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"engine\":\"{engine}\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready}}}\n",
                 generation.hex()
             ),
             Answer::Switch {
@@ -483,6 +487,7 @@ impl Control {
         Answer::Status {
             generation: state.generation,
             mode: state.mode.name(),
+            engine: state.engine.name(),
             phase: phase_word(state.phase),
             switching,
             ready: self.readiness.check(state.phase).is_ok(),

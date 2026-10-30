@@ -5,9 +5,9 @@
 //! number their requests on their own, so the ids of two slots can be equal, and a result is looked up only in the
 //! table of the slot whose kernel gave it.
 //!
-//! A slot also knows the mode of its generation, and a result is checked against it before it is delivered: a
-//! generation that blocks has no request that is only detected, so a `Detected` from its kernel cannot be what the
-//! rules said. The inspector is a separate process that is not trusted, so such a result is delivered as
+//! A slot also knows the engine and the mode of its generation, and a result is checked against the mode before it is
+//! delivered: a generation that blocks has no request that is only detected, so a `Detected` from its kernel cannot
+//! be what the rules said. The inspector is a separate process that is not trusted, so such a result is delivered as
 //! `Uninspectable` and never as a request that may go on.
 //!
 //! A slot that is retired gives its kernel to a thread of its own, which calls `shutdown`: `shutdown` waits for the
@@ -20,7 +20,9 @@ use std::sync::mpsc::{Receiver, SendError, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Instant;
 
-use tukuyomi_kernel::{Matched, Reason, Refused, ReqId, Request, Shutdown, Status, Verdict};
+use tukuyomi_kernel::{
+    Engine, Matched, Reason, Refused, ReqId, Request, Shutdown, Status, Verdict,
+};
 
 use crate::inspect::driver::{Answer, InspectReq, Judge, Kernel, Outcome, Ticket};
 use crate::rules::bundle::{Fingerprint, Mode};
@@ -56,16 +58,17 @@ fn turned_line(generation: Fingerprint) -> String {
 }
 
 /// Takes the result of every `(id, verdict, matched)` out of the table: sends it to the connection unless `cancel`
-/// was called, and drops the ticket, which gives its permits back. The answer names the `generation` and its `mode`,
-/// the verdict that is delivered and the rules that matched, which are the ones of the result. A `Detected` for a
-/// generation that blocks is sent as `Uninspectable(Protocol)` without the rules it came with: the request is not
-/// let through, and nothing the inspector said about it is believed. The answer is true if there was one, for the
-/// record line of a slot that serves; a slot that is stopped makes none. A result for a request that is not in the
-/// table breaks the promise that every result comes out once.
+/// was called, and drops the ticket, which gives its permits back. The answer names the `generation`, its `engine`
+/// and its `mode`, the verdict that is delivered and the rules that matched, which are the ones of the result. A
+/// `Detected` for a generation that blocks is sent as `Uninspectable(Protocol)` without the rules it came with: the
+/// request is not let through, and nothing the inspector said about it is believed. The answer is true if there was
+/// one, for the record line of a slot that serves; a slot that is stopped makes none. A result for a request that is
+/// not in the table breaks the promise that every result comes out once.
 pub(super) fn deliver(
     pending: &mut BTreeMap<ReqId, Pending>,
     results: &[(ReqId, Verdict, Matched)],
     generation: Fingerprint,
+    engine: Engine,
     mode: Mode,
 ) -> Result<bool, &'static str> {
     let mut turned = false;
@@ -92,6 +95,7 @@ pub(super) fn deliver(
                 outcome: Outcome::Verdict(verdict),
                 by: Some(Judge {
                     generation,
+                    engine,
                     mode,
                     verdict,
                     matched,
@@ -128,6 +132,8 @@ pub(super) fn submit(kernel: &mut impl Kernel, req: &InspectReq) -> Result<ReqId
 /// The kernel of one generation and the requests it holds.
 pub(super) struct Slot<K> {
     pub(super) generation: Fingerprint,
+    /// The engine that inspects with the rules of the generation.
+    pub(super) engine: Engine,
     /// What the rules of the generation do to a request they match.
     pub(super) mode: Mode,
     pub(super) kernel: K,
@@ -141,10 +147,11 @@ pub(super) struct Slot<K> {
 }
 
 impl<K: Kernel> Slot<K> {
-    pub(super) fn new(generation: Fingerprint, mode: Mode, kernel: K) -> Slot<K> {
+    pub(super) fn new(generation: Fingerprint, engine: Engine, mode: Mode, kernel: K) -> Slot<K> {
         let inc = kernel.status().inc;
         Slot {
             generation,
+            engine,
             mode,
             kernel,
             pending: BTreeMap::new(),
@@ -192,7 +199,13 @@ impl<K: Kernel> Slot<K> {
     /// Steps the kernel until a result is ready or `until`, and delivers the results.
     pub(super) fn step(&mut self, until: Instant) -> Result<(), &'static str> {
         let results = self.kernel.poll(until);
-        self.turned |= deliver(&mut self.pending, &results, self.generation, self.mode)?;
+        self.turned |= deliver(
+            &mut self.pending,
+            &results,
+            self.generation,
+            self.engine,
+            self.mode,
+        )?;
         Ok(())
     }
 
@@ -224,7 +237,13 @@ impl<K: Kernel> Slot<K> {
     /// left in the table breaks the promise that every result comes out once.
     pub(super) fn shutdown(&mut self, deadline: Instant) -> Result<Shutdown, &'static str> {
         let done = self.kernel.shutdown(deadline);
-        deliver(&mut self.pending, &done.results, self.generation, self.mode)?;
+        deliver(
+            &mut self.pending,
+            &done.results,
+            self.generation,
+            self.engine,
+            self.mode,
+        )?;
         if !self.pending.is_empty() {
             return Err("request left after shutdown");
         }
@@ -237,6 +256,7 @@ impl<K: Kernel> Slot<K> {
     pub(super) fn retire(self, deadline: Instant) -> Retirement {
         let Slot {
             generation,
+            engine,
             mode,
             kernel,
             pending,
@@ -259,6 +279,7 @@ impl<K: Kernel> Slot<K> {
         }
         Retirement {
             generation,
+            engine,
             mode,
             pending,
             reported,
@@ -277,6 +298,7 @@ fn stop<K: Kernel>(mut kernel: K, deadline: Instant, report: &Sender<Shutdown>) 
 /// A slot whose kernel is being stopped on another thread.
 pub(super) struct Retirement {
     generation: Fingerprint,
+    engine: Engine,
     mode: Mode,
     pending: BTreeMap<ReqId, Pending>,
     reported: Receiver<Shutdown>,
@@ -316,7 +338,13 @@ impl Retirement {
                 clean: false,
             });
         };
-        deliver(&mut self.pending, &done.results, self.generation, self.mode)?;
+        deliver(
+            &mut self.pending,
+            &done.results,
+            self.generation,
+            self.engine,
+            self.mode,
+        )?;
         if !self.pending.is_empty() {
             return Err("request left after shutdown");
         }

@@ -26,10 +26,12 @@ fn judged_by() -> Fingerprint {
     Fingerprint::from_hex(&[b'7'; 64]).unwrap()
 }
 
-/// What a delivered `verdict` of the generation `judged_by` is answered with: the mode of its rules, none matched.
+/// What a delivered `verdict` of the generation `judged_by` is answered with: the engine and the mode of its rules,
+/// none matched.
 fn judge(mode: bundle::Mode, verdict: Verdict) -> Judge {
     Judge {
         generation: judged_by(),
+        engine: Engine::Coraza,
         mode,
         verdict,
         matched: Matched::NONE,
@@ -304,10 +306,16 @@ impl Rig {
             phase: Phase::Starting,
             restarts: 0,
             generation: generation(1),
+            engine: Engine::Coraza,
             mode: bundle::Mode::Block,
         });
         let core = Core::new(
-            Slot::new(generation(1), bundle::Mode::Block, Fake::new()),
+            Slot::new(
+                generation(1),
+                Engine::Coraza,
+                bundle::Mode::Block,
+                Fake::new(),
+            ),
             SharedRoutes::new(Routes::default()),
             rx,
             Signals::Told { _failed: None },
@@ -597,6 +605,7 @@ fn a_result_for_an_unknown_request_is_fatal() {
                 (2, Verdict::Allow, Matched::NONE)
             ],
             judged_by(),
+            Engine::Coraza,
             bundle::Mode::Block
         ),
         unknown
@@ -615,12 +624,19 @@ fn a_result_for_an_unknown_request_is_fatal() {
             &mut pending,
             &[(1, Verdict::Allow, Matched::NONE)],
             judged_by(),
+            Engine::Coraza,
             bundle::Mode::Block
         ),
         unknown
     );
     assert_eq!(
-        deliver(&mut pending, &[], judged_by(), bundle::Mode::Block),
+        deliver(
+            &mut pending,
+            &[],
+            judged_by(),
+            Engine::Coraza,
+            bundle::Mode::Block
+        ),
         Ok(false)
     );
 }
@@ -661,7 +677,14 @@ fn a_verdict_is_delivered_with_the_rules_that_matched_the_request() {
                 cancelled: false,
             },
         );
-        deliver(&mut pending, &[(0, given, matched)], judged_by(), mode).unwrap();
+        deliver(
+            &mut pending,
+            &[(0, given, matched)],
+            judged_by(),
+            Engine::Coraza,
+            mode,
+        )
+        .unwrap();
         let by = Judge {
             matched: want_matched,
             ..judge(mode, want)
@@ -899,6 +922,7 @@ fn a_request_the_kernel_did_not_decide_at_shutdown_is_fatal() {
 /// A kernel configuration for these tests: the values are the tests' own choice, not defaults.
 fn config(root: &Path) -> Config {
     Config {
+        engine: Engine::Coraza,
         inspector: PathBuf::from("/driver-test/inspector"),
         rules: PathBuf::from("/driver-test/rules.conf"),
         rules_sha256: [0; 32],
@@ -1224,6 +1248,7 @@ fn the_state_follows_the_kernel_that_serves_and_its_restarts_add_up_over_a_switc
         phase: Phase::Ready,
         restarts: 0,
         generation: generation(1),
+        engine: Engine::Coraza,
         mode: bundle::Mode::Block,
     };
     assert_eq!(seen(&r), ready);
@@ -1267,4 +1292,32 @@ fn the_state_follows_the_kernel_that_serves_and_its_restarts_add_up_over_a_switc
     r.core.active.kernel.restarts = 1;
     r.core.round().unwrap();
     assert_eq!(seen(&r).restarts, 2);
+}
+
+#[test]
+fn the_engine_of_the_generation_that_serves_is_the_one_of_the_kernel_configuration_of_its_switch() {
+    let mut r = Rig::new(4, 8);
+    r.core.active.kernel.phase = Phase::Ready;
+    r.core.round().unwrap();
+    assert_eq!(r.state.borrow().engine, Engine::Coraza);
+    let (reply, mut told) = oneshot::channel();
+    r.send(Msg::Switch(Switch {
+        generation: generation(2),
+        mode: bundle::Mode::Detect,
+        routes: Routes::default(),
+        kernel: Config {
+            engine: Engine::ModSecurity,
+            ..config(Path::new("/driver-test/switch-root"))
+        },
+        reply,
+    }));
+    r.core.round().unwrap();
+    r.other().phase = Phase::Ready;
+    r.core.round().unwrap();
+    assert_eq!(settle(&mut r, &mut told), Switched::Yes);
+    let seen = *r.state.borrow();
+    assert_eq!(
+        (seen.generation, seen.engine, seen.mode),
+        (generation(2), Engine::ModSecurity, bundle::Mode::Detect)
+    );
 }

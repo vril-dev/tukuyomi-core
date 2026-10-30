@@ -235,3 +235,34 @@ fn the_end_of_a_trial_is_reported_with_the_rule_the_exit_and_the_escaped_line() 
         ]
     );
 }
+
+#[test]
+fn engine_names_the_engine_of_the_bundle_wherever_it_stands_and_is_coraza_when_left_out() {
+    assert_eq!(import(&["--rules", "a.conf"]).0.engine, Engine::Coraza);
+    for text in [
+        ["--engine", "modsecurity", "--rules", "a.conf"],
+        ["--rules", "a.conf", "--engine", "modsecurity"],
+    ] {
+        let (inputs, _) = import(&text);
+        assert_eq!(inputs.engine, Engine::ModSecurity);
+        assert_eq!(inputs.rules, [PathBuf::from("a.conf")]);
+    }
+    let (inputs, _) = import(&["--engine", "coraza", "--rules", "a.conf"]);
+    assert_eq!(inputs.engine, Engine::Coraza);
+    let config = "/etc/tukuyomi.json";
+    assert_eq!(
+        refusal(&["import", config, "--engine", "coraza", "--engine", "coraza"]),
+        "--engine is given twice"
+    );
+    for name in ["", "Coraza", "mod_security", "modsecurity "] {
+        assert_eq!(
+            refusal(&["import", config, "--engine", name]),
+            "--engine is not the name of an engine (coraza or modsecurity)",
+            "{name:?}"
+        );
+    }
+    assert_eq!(
+        refusal(&["import", config, "--engine"]),
+        "an option needs a value that does not start with --"
+    );
+}

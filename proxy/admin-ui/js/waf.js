@@ -9,7 +9,7 @@ import { badge, el, mount, notice } from './dom.js';
 import { screens as generationScreens } from './generations.js';
 import { language, t } from './i18n.js';
 import { screens as importScreens } from './import.js';
-import { generationState } from './parts.js';
+import { engineBadge, generationState } from './parts.js';
 import { screens as recordScreens } from './records.js';
 
 export { generationState };
@@ -50,6 +50,7 @@ function proxyCard(data) {
       { class: 'kv' },
       row(t('status.state'), badge(tone, words())),
       row(t('status.mode'), badge('muted', mode)),
+      row(t('status.engine'), engineBadge(proxy.engine)),
       row(t('status.switching'), proxy.switching ? badge('warn', t('status.switching_on')) : t('status.switching_off')),
     );
   }

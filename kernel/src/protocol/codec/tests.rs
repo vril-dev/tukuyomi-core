@@ -1,4 +1,6 @@
+use super::hello::Hello;
 use super::*;
+use crate::engine::{Build, Engine};
 use std::io;
 
 const GOLDEN: &str = include_str!(concat!(
@@ -176,9 +178,9 @@ fn golden_hello_reads_and_decodes() {
             nonce,
             run: RUN,
             inc: INC,
-            go_version: b"go1.27.2".to_vec(),
-            coraza_version: b"v3.8.1".to_vec(),
-            coraza_sum: b"h1:abc=".to_vec(),
+            toolchain: b"go1.27.2".to_vec(),
+            engine_version: b"v3.8.1".to_vec(),
+            engine_source: b"h1:abc=".to_vec(),
             rules_sha256: sha,
             body_limit: 0x0010_0000,
             mem_limit: 0x1000_0000,
@@ -688,15 +690,15 @@ fn errmsg(class: u8, reserved: u8, code: u16, text: &[u8]) -> Vec<u8> {
     v
 }
 
-fn hello(version: u16, go: &[u8], coraza: &[u8], sum: &[u8]) -> Vec<u8> {
+fn hello(version: u16, toolchain: &[u8], engine: &[u8], source: &[u8]) -> Vec<u8> {
     let mut v = version.to_be_bytes().to_vec();
     v.extend_from_slice(&0x1092u32.to_be_bytes());
     v.extend(0..16u8);
     v.extend_from_slice(&RUN.to_be_bytes());
     v.extend_from_slice(&INC.to_be_bytes());
-    tstr(&mut v, go);
-    tstr(&mut v, coraza);
-    tstr(&mut v, sum);
+    tstr(&mut v, toolchain);
+    tstr(&mut v, engine);
+    tstr(&mut v, source);
     v.extend((0..32u8).map(|i| 0xa0 + i));
     v.extend_from_slice(&0x0010_0000u32.to_be_bytes());
     v.extend_from_slice(&0x1000_0000u64.to_be_bytes());
@@ -910,17 +912,22 @@ fn error_rejects_out_of_range_values_with_the_matching_reason() {
 #[test]
 fn hello_accepts_the_string_boundaries_and_rejects_the_rest() {
     let s = |n: usize| vec![b'x'; n];
-    let lens = |go, coraza, sum| decode_hello(&hello(1, &s(go), &s(coraza), &s(sum)));
+    let lens =
+        |toolchain, engine, source| decode_hello(&hello(1, &s(toolchain), &s(engine), &s(source)));
     let h = lens(64, 64, 128).unwrap();
     let got = (
-        h.go_version.len(),
-        h.coraza_version.len(),
-        h.coraza_sum.len(),
+        h.toolchain.len(),
+        h.engine_version.len(),
+        h.engine_source.len(),
     );
     assert_eq!(got, (64, 64, 128));
-    for (go, coraza, sum) in [(0, 1, 1), (65, 1, 1), (1, 65, 1), (1, 1, 0), (1, 1, 129)] {
+    for (toolchain, engine, source) in [(0, 1, 1), (65, 1, 1), (1, 65, 1), (1, 1, 0), (1, 1, 129)] {
         let why = "string length out of range";
-        assert_eq!(reason(lens(go, coraza, sum)), why, "{go} {coraza} {sum}");
+        assert_eq!(
+            reason(lens(toolchain, engine, source)),
+            why,
+            "{toolchain} {engine} {source}"
+        );
     }
     let why = "hello contract version is not v1";
     for version in [0, 2] {
@@ -1158,16 +1165,25 @@ const MEM: u64 = 256 << 20;
 
 type Mutation = (&'static str, fn(&mut Hello));
 
+/// A stand-in for the pinned build of an engine that has none yet: the table of the engines cannot be replaced, so
+/// the comparison is tried with a build that is given to `check_hello`.
+const OTHER_BUILD: Build = Build {
+    toolchain: b"rustc1.94.1",
+    version: b"v3.0.17",
+    source: b"sha256:0123456789abcdef",
+};
+
 fn good_hello() -> Hello {
+    let coraza = Engine::Coraza.pinned().unwrap();
     Hello {
         version: 1,
         pid: PID,
         nonce: NONCE,
         run: RUN,
         inc: INC,
-        go_version: INSPECTOR_GO_VERSION.to_vec(),
-        coraza_version: INSPECTOR_CORAZA_VERSION.to_vec(),
-        coraza_sum: INSPECTOR_CORAZA_SUM.to_vec(),
+        toolchain: coraza.toolchain.to_vec(),
+        engine_version: coraza.version.to_vec(),
+        engine_source: coraza.source.to_vec(),
         rules_sha256: RULES,
         body_limit: MAX_DECLARED as u32,
         mem_limit: MEM,
@@ -1178,7 +1194,12 @@ fn good_hello() -> Hello {
 }
 
 fn checked(h: &Hello) -> Result<(), &'static str> {
+    checked_against(h, Engine::Coraza.pinned())
+}
+
+fn checked_against(h: &Hello, build: Option<&Build>) -> Result<(), &'static str> {
     let expect = HelloExpect {
+        build,
         rules_sha256: &RULES,
         mem_limit: MEM,
         gomaxprocs: 1,
@@ -1195,13 +1216,15 @@ fn hello_matches_and_every_field_is_checked() {
         ("hello nonce differs", |h| h.nonce[15] ^= 1),
         ("hello run id differs", |h| h.run += 1),
         ("hello incarnation differs", |h| h.inc += 1),
-        ("hello go version differs", |h| {
-            h.go_version = b"go1.27.1".to_vec()
+        ("hello toolchain differs", |h| {
+            h.toolchain = b"go1.27.1".to_vec()
         }),
-        ("hello coraza version differs", |h| {
-            h.coraza_version = b"v3.8.0".to_vec()
+        ("hello engine version differs", |h| {
+            h.engine_version = b"v3.8.0".to_vec()
         }),
-        ("hello coraza sum differs", |h| h.coraza_sum.push(b'x')),
+        ("hello engine source differs", |h| {
+            h.engine_source.push(b'x')
+        }),
         ("hello rules sha256 differs", |h| h.rules_sha256[31] ^= 1),
         ("hello body limit differs", |h| h.body_limit -= 1),
         ("hello memory limit differs", |h| h.mem_limit = 0),
@@ -1214,4 +1237,29 @@ fn hello_matches_and_every_field_is_checked() {
         m(&mut h);
         assert_eq!(checked(&h), Err(want));
     }
+}
+
+#[test]
+fn hello_is_compared_with_the_build_of_the_engine_that_is_expected() {
+    // The HELLO of the Coraza build, against a build of another engine: refused at the first string.
+    assert_eq!(
+        checked_against(&good_hello(), Some(&OTHER_BUILD)),
+        Err("hello toolchain differs")
+    );
+    // The HELLO of that other build is accepted against it, and refused against the Coraza build.
+    let mut other = good_hello();
+    other.toolchain = OTHER_BUILD.toolchain.to_vec();
+    other.engine_version = OTHER_BUILD.version.to_vec();
+    other.engine_source = OTHER_BUILD.source.to_vec();
+    assert_eq!(checked_against(&other, Some(&OTHER_BUILD)), Ok(()));
+    assert_eq!(checked(&other), Err("hello toolchain differs"));
+    // An engine with no pinned build accepts no HELLO.
+    assert_eq!(
+        checked_against(&good_hello(), None),
+        Err("hello engine is not pinned")
+    );
+    assert_eq!(
+        checked_against(&other, Engine::ModSecurity.pinned()),
+        Err("hello engine is not pinned")
+    );
 }

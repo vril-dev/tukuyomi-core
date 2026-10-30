@@ -6,7 +6,9 @@
 //! and its content in the standard base64 with padding), `crs` (true: the CRS of the directory `admin.crs_dir` is
 //! taken; the request never names a directory, and it is refused when the configuration has none), `crs_off` (the
 //! names of the files of the CRS that are not loaded), `routes` (the routes of the bundle, in the form of the file that
-//! `--routes` names), `detect_only` and `accept_block` (as the options of `rules import`). The limits are those of
+//! `--routes` names), `engine` (`coraza`, the default, or `modsecurity`: the option `--engine` of `rules import`;
+//! it is refused with 400 before anything is staged when the engine cannot be used here), `detect_only` and
+//! `accept_block` (as the options of `rules import`). The limits are those of
 //! `rules import`: 128 files, 2 MiB for a file and 8 MiB for all (`collect` checks them); a file of the request that
 //! is over 2 MiB is refused before it is decoded.
 //!
@@ -20,6 +22,7 @@ use std::sync::atomic::AtomicBool;
 use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tukuyomi_kernel::Engine;
 
 use super::{Caller, Waf, Waits, invalid, refused};
 use crate::acme::base64;
@@ -59,6 +62,8 @@ pub struct Body {
     crs_off: Vec<String>,
     #[serde(default)]
     routes: Option<Value>,
+    #[serde(default)]
+    engine: Option<String>,
     #[serde(default)]
     detect_only: bool,
     #[serde(default)]
@@ -123,12 +128,19 @@ impl Body {
             .map(|routes| serde_json::to_vec(&routes))
             .transpose()
             .map_err(|_| refuse("the routes cannot be read"))?;
+        let engine = match self.engine.as_deref() {
+            None => Engine::default(),
+            Some(name) => Engine::parse(name).ok_or_else(|| {
+                refuse("engine is not the name of an engine (coraza or modsecurity)")
+            })?,
+        };
         Ok(Request {
             uploads: Uploads {
                 crs,
                 crs_off: self.crs_off.into_iter().map(OsString::from).collect(),
                 rules: uploads(self.rules)?,
                 data: uploads(self.data)?,
+                engine,
                 mode: if self.detect_only {
                     Mode::Detect
                 } else {
@@ -143,12 +155,17 @@ impl Body {
 
 /// Runs the trial of a staged bundle. The real one starts an inspector; the tests replace it.
 pub trait Trial: Send + Sync {
-    /// Tries `staged`, a bundle with the rules of `mode`; the trial ends early, as a failure, once `stop` is set. A
-    /// sentence: the trial could not be run at all.
+    /// Whether a generation of `engine` can be inspected here: the configuration has an inspector for it and the
+    /// kernel has a pinned build of that inspector. A sentence: it cannot.
+    fn usable(&self, engine: Engine) -> Result<(), &'static str>;
+
+    /// Tries `staged`, a bundle with the rules of `engine` and `mode`; the trial ends early, as a failure, once `stop`
+    /// is set. A sentence: the trial could not be run at all.
     fn run(
         &self,
         staged: &Staged,
         accept_block: bool,
+        engine: Engine,
         mode: Mode,
         stop: &AtomicBool,
     ) -> Result<Finish, &'static str>;
@@ -168,16 +185,21 @@ impl Inspector {
 }
 
 impl Trial for Inspector {
+    fn usable(&self, engine: Engine) -> Result<(), &'static str> {
+        self.kernel.check_engine(engine).map_err(|e| e.0)
+    }
+
     fn run(
         &self,
         staged: &Staged,
         accept_block: bool,
+        engine: Engine,
         mode: Mode,
         stop: &AtomicBool,
     ) -> Result<Finish, &'static str> {
         let kernel = self
             .kernel
-            .for_generation(staged.dir.clone(), staged.fingerprint)
+            .for_generation(staged.dir.clone(), staged.fingerprint, engine)
             .map_err(|e| e.0)?;
         let limits = Limits {
             ready_wait: self.waits.ready,
@@ -242,7 +264,15 @@ impl Waf {
             Ok(request) => request,
             Err(e) => return invalid(e),
         };
-        let (accept_block, mode) = (request.accept_block, request.uploads.mode);
+        let (accept_block, engine, mode) = (
+            request.accept_block,
+            request.uploads.engine,
+            request.uploads.mode,
+        );
+        // Before the files are collected and before anything is staged.
+        if let Err(text) = self.trial.usable(engine) {
+            return Answer::error(StatusCode::BAD_REQUEST, text);
+        }
         let bundle = match collect_uploads(request.uploads) {
             Ok(bundle) => bundle,
             Err(e) => return invalid(e),
@@ -267,7 +297,10 @@ impl Waf {
                 return refused(e);
             }
         };
-        let finish = match self.trial.run(&staged, accept_block, mode, &self.stopping) {
+        let finish = match self
+            .trial
+            .run(&staged, accept_block, engine, mode, &self.stopping)
+        {
             Ok(finish) => finish,
             Err(text) => {
                 let _ = store.discard();

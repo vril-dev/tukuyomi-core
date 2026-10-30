@@ -271,6 +271,7 @@ fn bundle(files: &[(&str, &str)], load: &[&str]) -> Bundle {
         .map(|(name, data)| (path(name), data.as_bytes().to_vec()))
         .collect();
     Bundle::new(
+        Engine::Coraza,
         Mode::Block,
         files,
         load.iter().map(|name| path(name)).collect(),
@@ -384,6 +385,7 @@ fn the_mode_and_the_routes_of_a_generation_are_read_from_its_manifest_and_a_mani
     let table = Routes::new(vec![Route::new(None, "/static/").unwrap()]).unwrap();
     let make = |mode, routes| {
         Bundle::new(
+            Engine::Coraza,
             mode,
             vec![(one.clone(), b"SecRuleEngine On\n".to_vec())],
             vec![one.clone()],

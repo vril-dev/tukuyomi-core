@@ -89,6 +89,7 @@ fn the_writer_gives_the_golden_manifest_and_its_fingerprint() {
     let manifest = Manifest::parse(&bytes).unwrap();
     assert_eq!(manifest.mode(), Mode::Block);
     let rebuilt = Manifest::new(
+        Engine::Coraza,
         manifest.mode(),
         manifest.files().to_vec(),
         manifest.load().to_vec(),
@@ -112,6 +113,7 @@ fn the_writer_gives_the_golden_manifest_of_version_2_and_its_fingerprint() {
     let manifest = Manifest::parse(&bytes).unwrap();
     assert_eq!(manifest.mode(), Mode::Detect);
     let rebuilt = Manifest::new(
+        Engine::Coraza,
         Mode::Detect,
         manifest.files().to_vec(),
         manifest.load().to_vec(),
@@ -129,6 +131,7 @@ fn the_mode_is_in_the_manifest_and_so_in_the_fingerprint_and_only_one_spelling_o
     let one = path("a.conf");
     let make = |mode| {
         Bundle::new(
+            Engine::Coraza,
             mode,
             vec![(one.clone(), b"x".to_vec())],
             vec![one.clone()],
@@ -183,6 +186,7 @@ fn the_writer_gives_the_golden_manifest_of_version_3_and_its_fingerprint() {
     .unwrap();
     assert_eq!(manifest.routes(), &routes);
     let rebuilt = Manifest::new(
+        Engine::Coraza,
         Mode::Block,
         manifest.files().to_vec(),
         manifest.load().to_vec(),
@@ -200,6 +204,7 @@ fn routes_are_in_the_manifest_and_so_in_the_fingerprint_and_only_one_spelling_of
     let one = path("a.conf");
     let make = |mode, routes| {
         Bundle::new(
+            Engine::Coraza,
             mode,
             vec![(one.clone(), b"x".to_vec())],
             vec![one.clone()],
@@ -272,6 +277,7 @@ fn the_test_bundle_of_the_kernel_has_the_manifest_that_the_writer_gives() {
     let conf = path("rules/basic.conf");
     let data = fs::read(format!("{root}/rules/basic.conf")).unwrap();
     let bundle = Bundle::new(
+        Engine::Coraza,
         Mode::Block,
         vec![(conf.clone(), data)],
         vec![conf],
@@ -289,7 +295,14 @@ fn a_bundle_lists_its_files_in_the_order_of_their_paths_and_loads_in_the_given_o
         .map(|name| (path(name), name.as_bytes().to_vec()))
         .to_vec();
     let load = vec![path("rules/b.conf"), path("crs/a.conf")];
-    let bundle = Bundle::new(Mode::Block, files, load.clone(), Routes::default()).unwrap();
+    let bundle = Bundle::new(
+        Engine::Coraza,
+        Mode::Block,
+        files,
+        load.clone(),
+        Routes::default(),
+    )
+    .unwrap();
     let manifest = Manifest::parse(bundle.manifest()).unwrap();
     let listed: Vec<&str> = manifest.files().iter().map(|f| f.path.as_str()).collect();
     assert_eq!(
@@ -304,6 +317,7 @@ fn a_bundle_lists_its_files_in_the_order_of_their_paths_and_loads_in_the_given_o
 fn a_manifest_is_read_only_in_the_one_form() {
     let one = path("a.conf");
     let bundle = Bundle::new(
+        Engine::Coraza,
         Mode::Block,
         vec![(one.clone(), b"x".to_vec())],
         vec![one],
@@ -343,7 +357,8 @@ fn a_manifest_keeps_the_limits_of_a_bundle() {
             .collect()
     };
     let mib = 1u64 << 20;
-    let block = |files, load| Manifest::new(Mode::Block, files, load, Routes::default());
+    let block =
+        |files, load| Manifest::new(Engine::Coraza, Mode::Block, files, load, Routes::default());
     // The file and the total at the limit and one byte past it.
     assert!(block(files(&[2 * mib; 4]), load(&["f000"])).is_ok());
     assert!(block(files(&[2 * mib + 1]), load(&["f000"])).is_err());
@@ -382,6 +397,7 @@ fn a_manifest_over_64_kib_with_routes_is_refused_with_a_sentence_that_names_them
     };
     let make = |routes| {
         Bundle::new(
+            Engine::Coraza,
             Mode::Block,
             vec![(one.clone(), Vec::new())],
             vec![one.clone()],
@@ -402,7 +418,14 @@ fn a_bundle_refuses_a_path_twice_and_a_manifest_over_64_kib() {
     let one = path("a.conf");
     let twice = vec![(one.clone(), Vec::new()), (one.clone(), Vec::new())];
     assert_eq!(
-        Bundle::new(Mode::Block, twice, vec![one], Routes::default()).unwrap_err(),
+        Bundle::new(
+            Engine::Coraza,
+            Mode::Block,
+            twice,
+            vec![one],
+            Routes::default()
+        )
+        .unwrap_err(),
         BundleError("a path is used twice in the bundle")
     );
     // 128 files with paths of 247 bytes, all loaded: the manifest is about 75 KiB.
@@ -414,7 +437,132 @@ fn a_bundle_refuses_a_path_twice_and_a_manifest_over_64_kib() {
         .collect();
     let files = names.iter().map(|n| (n.clone(), Vec::new())).collect();
     assert_eq!(
-        Bundle::new(Mode::Block, files, names, Routes::default()).unwrap_err(),
+        Bundle::new(Engine::Coraza, Mode::Block, files, names, Routes::default()).unwrap_err(),
         BundleError("the manifest of the bundle is over 64 KiB")
     );
+}
+
+#[test]
+fn the_writer_gives_the_golden_manifest_of_version_4_and_its_fingerprint() {
+    let golden = format!(
+        "{}/../inspector/testdata/manifest-v4-golden.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let bytes = fs::read(&golden).unwrap();
+    // The entries and the load order of the golden file, read by the parser; the routes are the writer's own input.
+    let manifest = Manifest::parse(&bytes).unwrap();
+    assert_eq!(
+        (manifest.engine(), manifest.mode()),
+        (Engine::ModSecurity, Mode::Block)
+    );
+    let routes = Routes::new(vec![
+        Route::new(None, "/static/").unwrap(),
+        Route::new(Some("example.test"), "/health").unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(manifest.routes(), &routes);
+    let rebuilt = Manifest::new(
+        Engine::ModSecurity,
+        Mode::Block,
+        manifest.files().to_vec(),
+        manifest.load().to_vec(),
+        routes,
+    )
+    .unwrap();
+    assert_eq!(rebuilt.encode(), bytes);
+    // The fingerprint is what `sha256sum` gives for the file.
+    let sum = fs::read_to_string(format!("{golden}.sha256")).unwrap();
+    assert_eq!(format!("{}\n", Fingerprint::of(&bytes).hex()), sum);
+}
+
+#[test]
+fn the_engine_is_in_the_manifest_and_so_in_the_fingerprint_and_version_4_is_read_only_in_its_one_form()
+ {
+    let one = path("a.conf");
+    let make = |engine, mode| {
+        Bundle::new(
+            engine,
+            mode,
+            vec![(one.clone(), b"x".to_vec())],
+            vec![one.clone()],
+            Routes::default(),
+        )
+        .unwrap()
+    };
+    let (coraza, other) = (
+        make(Engine::Coraza, Mode::Block),
+        make(Engine::ModSecurity, Mode::Block),
+    );
+    // The same files under another engine are another generation. The manifest of Coraza is the one of version 1,
+    // so the fingerprints of the generations that were made before the engine was a key are what they were.
+    assert_ne!(coraza.fingerprint(), other.fingerprint());
+    assert!(coraza.manifest().starts_with(br#"{"version":1,"files":["#));
+    let text = String::from_utf8(other.manifest().to_vec()).unwrap();
+    // Version 4 has the engine, the mode and the routes, the routes also when there are none.
+    assert!(
+        text.starts_with(r#"{"version":4,"engine":"modsecurity","mode":"block","files":["#),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(",\"load\":[\"a.conf\"],\"routes\":[]}\n"),
+        "{text}"
+    );
+    for (bundle, mode) in [
+        (&other, Mode::Block),
+        (&make(Engine::ModSecurity, Mode::Detect), Mode::Detect),
+    ] {
+        let manifest = Manifest::parse(bundle.manifest()).unwrap();
+        assert_eq!(
+            (manifest.engine(), manifest.mode()),
+            (Engine::ModSecurity, mode)
+        );
+        assert!(manifest.routes().is_empty());
+    }
+    let coraza = String::from_utf8(coraza.manifest().to_vec()).unwrap();
+    // Version 4 with the engine Coraza is the form of no bundle, and so is an engine key under another version.
+    let engine = "the engine of the manifest does not fit its version";
+    let refused = [
+        (
+            text.replace(r#""engine":"modsecurity""#, r#""engine":"coraza""#),
+            engine,
+        ),
+        (
+            coraza.replace(r#""version":1,"#, r#""version":1,"engine":"coraza","#),
+            engine,
+        ),
+        (text.replace(r#""version":4"#, r#""version":3"#), engine),
+        (text.replace("modsecurity", "ModSecurity"), engine),
+        (
+            text.replace(r#""engine":"modsecurity""#, r#""engine":null"#),
+            engine,
+        ),
+        (text.replace(r#""engine":"modsecurity","#, ""), engine),
+        (
+            text.replace(r#""version":4"#, r#""version":5"#),
+            "the version of the manifest is not 1, 2, 3 or 4",
+        ),
+    ];
+    for (text, sentence) in &refused {
+        assert_eq!(
+            Manifest::parse(text.as_bytes()),
+            Err(BundleError(sentence)),
+            "{text}"
+        );
+    }
+    // Not the one form: the order of keys, a mode or routes that are left out.
+    let cases = [
+        text.replace(
+            r#""version":4,"engine":"modsecurity""#,
+            r#""engine":"modsecurity","version":4"#,
+        ),
+        text.replace(
+            r#""engine":"modsecurity","mode":"block""#,
+            r#""mode":"block","engine":"modsecurity""#,
+        ),
+        text.replace(r#""mode":"block","#, ""),
+        text.replace(r#","routes":[]"#, ""),
+    ];
+    for text in cases {
+        assert!(Manifest::parse(text.as_bytes()).is_err(), "{text}");
+    }
 }

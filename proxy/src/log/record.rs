@@ -137,6 +137,7 @@ pub struct Request {
     pub upstream: Option<Arc<str>>,
     pub server: Option<SocketAddr>,
     pub mode: Option<&'static str>,
+    pub engine: Option<&'static str>,
     /// The fingerprint of the generation that gave the verdict; the record shows its first 8 bytes.
     pub generation: Option<[u8; 32]>,
     pub rule: Option<i64>,
@@ -233,6 +234,8 @@ struct RequestBody<'a> {
     server: Option<SocketAddr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -383,6 +386,7 @@ fn encode_request(at: SystemTime, r: &Request) -> Option<String> {
             upstream: r.upstream.as_deref(),
             server: r.server,
             mode: r.mode,
+            engine: r.engine,
             generation: r
                 .generation
                 .map(|g| g.iter().take(8).map(|b| format!("{b:02x}")).collect()),

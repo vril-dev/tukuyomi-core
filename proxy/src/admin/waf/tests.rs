@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 use bytes::Bytes;
 use http::HeaderMap;
 use http::header::{CONTENT_TYPE, HeaderValue};
+use tukuyomi_kernel::Engine;
 
 use super::*;
 use crate::acme::base64;
@@ -135,7 +136,7 @@ impl Proxy {
                         hooked();
                     }
                     format!(
-                        r#"{{"generation":"{}","mode":"block","phase":"ready","switching":{},"ready":true}}"#,
+                        r#"{{"generation":"{}","mode":"block","engine":"coraza","phase":"ready","switching":{},"ready":true}}"#,
                         current.hex(),
                         pending.load(Ordering::SeqCst)
                     )
@@ -197,7 +198,22 @@ struct FakeTrial {
 }
 
 impl Trial for FakeTrial {
-    fn run(&self, _: &Staged, _: bool, _: Mode, stop: &AtomicBool) -> Result<Finish, &'static str> {
+    /// As the build is: Coraza has a pinned inspector build, ModSecurity none.
+    fn usable(&self, engine: Engine) -> Result<(), &'static str> {
+        match engine {
+            Engine::Coraza => Ok(()),
+            Engine::ModSecurity => Err("the inspector build of the engine is not pinned"),
+        }
+    }
+
+    fn run(
+        &self,
+        _: &Staged,
+        _: bool,
+        _: Engine,
+        _: Mode,
+        stop: &AtomicBool,
+    ) -> Result<Finish, &'static str> {
         self.runs.fetch_add(1, Ordering::SeqCst);
         let result = match *self.fail.lock().unwrap() {
             _ if stop.load(Ordering::SeqCst) => Err(Failed::Interrupted),
@@ -293,9 +309,10 @@ fn rig_with(with_proxy: bool, records: Option<RecordsConfig>) -> Rig {
     }
 }
 
-fn bundle(n: u32, mode: Mode, routes: Routes) -> Bundle {
+fn bundle(engine: Engine, n: u32, mode: Mode, routes: Routes) -> Bundle {
     let path = BundlePath::parse("rules/r.conf").unwrap();
     Bundle::new(
+        engine,
         mode,
         vec![(path.clone(), format!("SecDebugLogLevel {n}\n").into_bytes())],
         vec![path],
@@ -316,7 +333,13 @@ impl Rig {
 
     /// A generation whose rule file differs by `n`.
     fn make(&self, n: u32) -> Fingerprint {
-        let bundle = bundle(n, Mode::Block, Routes::default());
+        self.make_for(Engine::Coraza, n)
+    }
+
+    /// A generation of `engine` whose rule file differs by `n`. The store takes it whatever the engine is; the
+    /// refusal of an engine that cannot be used is the business of the routes.
+    fn make_for(&self, engine: Engine, n: u32) -> Fingerprint {
+        let bundle = bundle(engine, n, Mode::Block, Routes::default());
         let mut store = self.store();
         store.stage(&bundle).unwrap();
         store.commit().unwrap();
@@ -611,6 +634,49 @@ fn a_generation_that_another_process_chose_after_the_check_is_not_overwritten() 
 }
 
 #[test]
+fn a_generation_whose_manifest_cannot_be_read_or_is_not_sound_is_refused_by_the_store() {
+    let rig = rig(true);
+    let (g1, g2, g3) = (rig.make(1), rig.make(2), rig.make(3));
+    rig.start_on(g1);
+    assert_eq!(rig.activate(g2, g1).body["result"], "switched");
+    let orders = rig.orders().len();
+    let manifest = |generation: Fingerprint| {
+        let generations = rig.dir.path().join("rules").join("generations");
+        generations.join(generation.hex()).join("manifest.json")
+    };
+    // The engine of such a generation is not known here, so the check of the engine does not answer and the store
+    // refuses the generation when it chooses it. The answer is 409 with the sentence of the store, the audit log has
+    // the line of the request and then the failure, and the history has a refused line. The store, the proxy and the
+    // orders to it are as they were.
+    let refused_by_store = |answer: Answer, kind: Kind, to: Fingerprint, sentence: &str| {
+        assert_eq!(answer.status, StatusCode::CONFLICT, "{:?}", answer.body);
+        assert_eq!(answer.body["error"], sentence);
+        let (action, lines) = (kind.word(), rig.lines());
+        assert_eq!(
+            fields(&lines[0], &["action", "result", "reason", "target"]),
+            [action, "failed", "store", to.hex().as_str()]
+        );
+        assert_eq!(fields(&lines[1], &["action", "result"]), [action, "ok"]);
+        assert_eq!(rig.history()[0], (kind, g2, to, Ended::Refused));
+        assert_eq!((rig.current(), rig.serving()), (Some(g2), g2));
+        assert_eq!(rig.orders().len(), orders);
+    };
+
+    // An activation of g3, whose manifest is the one of g1: it does not match the name of g3.
+    fs::write(manifest(g3), fs::read(manifest(g1)).unwrap()).unwrap();
+    let answer = rig.activate(g3, g2);
+    let sentence = "the manifest of the generation does not match its name";
+    refused_by_store(answer, Kind::Activate, g3, sentence);
+
+    // A rollback to g1, whose manifest is gone. The refused activation is no switch, so the history still goes back
+    // to g1.
+    fs::remove_file(manifest(g1)).unwrap();
+    let answer = rig.rollback(g2);
+    let sentence = "the manifest of the generation cannot be read";
+    refused_by_store(answer, Kind::Rollback, g1, sentence);
+}
+
+#[test]
 fn a_proxy_without_a_place_is_asked_again_and_is_busy_only_if_it_still_has_none() {
     let rig = rig(true);
     let (g1, g2, g3) = (rig.make(1), rig.make(2), rig.make(3));
@@ -680,7 +746,7 @@ fn a_switch_whose_end_cannot_be_read_is_unconfirmed_and_a_line_that_cannot_be_wr
     fs::create_dir(up.dir.path().join("admin").join("activations.log")).unwrap();
     let mut other = up.store();
     other
-        .stage(&bundle(9, Mode::Block, Routes::default()))
+        .stage(&bundle(Engine::Coraza, 9, Mode::Block, Routes::default()))
         .unwrap();
     let refused = up.activate(g2, g1);
     assert_eq!(refused.status, StatusCode::CONFLICT);
@@ -747,7 +813,7 @@ fn nothing_is_changed_while_the_audit_log_cannot_take_the_line_or_another_change
     // The lock of the rules store is held by another process.
     let mut other = rig.store();
     other
-        .stage(&bundle(9, Mode::Block, Routes::default()))
+        .stage(&bundle(Engine::Coraza, 9, Mode::Block, Routes::default()))
         .unwrap();
     let busy = rig.activate(g2, g1);
     assert_eq!(busy.status, StatusCode::CONFLICT);
@@ -824,7 +890,7 @@ fn the_status_the_generations_and_one_generation_show_the_store_and_the_proxy() 
         br#"[{"host":"admin.example.test","path":"/api/generations","action":"bypass"}]"#,
     )
     .unwrap();
-    let detect = bundle(2, Mode::Detect, routes);
+    let detect = bundle(Engine::Coraza, 2, Mode::Detect, routes);
     let mut store = rig.store();
     store.stage(&detect).unwrap();
     store.commit().unwrap();
@@ -836,6 +902,7 @@ fn the_status_the_generations_and_one_generation_show_the_store_and_the_proxy() 
     assert_eq!(status.body["reachable"], true);
     assert_eq!(status.body["proxy"]["generation"], g1.hex());
     assert_eq!(status.body["proxy"]["phase"], "ready");
+    assert_eq!(status.body["proxy"]["engine"], "coraza");
     // No switch has been asked for, and the configuration names no CRS.
     assert_eq!(status.body["rollback_to"], Value::Null);
     assert_eq!(status.body["crs"], json!({"available": false, "files": []}));
@@ -849,6 +916,7 @@ fn the_status_the_generations_and_one_generation_show_the_store_and_the_proxy() 
         assert_eq!(item["current"], first);
         assert_eq!(item["serving"], first);
         assert_eq!(item["mode"], if first { "block" } else { "detect" });
+        assert_eq!(item["engine"], "coraza");
         assert_eq!(item["routes"], if first { 0 } else { 1 });
         assert!(item["made"].as_i64().unwrap() > 0);
     }
@@ -860,6 +928,7 @@ fn the_status_the_generations_and_one_generation_show_the_store_and_the_proxy() 
     );
     assert_eq!(one.status, StatusCode::OK);
     assert_eq!(one.body["mode"], "detect");
+    assert_eq!(one.body["engine"], "coraza");
     assert_eq!(one.body["current"], false);
     assert_eq!(one.body["load"], json!(["rules/r.conf"]));
     assert_eq!(one.body["files"][0]["path"], "rules/r.conf");
@@ -1145,4 +1214,54 @@ fn the_table_gives_each_route_its_role_and_a_generation_in_a_path_is_a_star() {
     // waits for a switch (16 s), and a margin.
     let rig = rig(false);
     assert_eq!(rig.waf.longest(), Duration::from_secs(1 + 1 + 14 + 7));
+}
+
+#[test]
+fn a_generation_of_an_engine_that_cannot_be_used_is_refused_at_import_activate_and_rollback() {
+    let rig = rig(true);
+    let (g1, other) = (rig.make(1), rig.make_for(Engine::ModSecurity, 2));
+    rig.start_on(g1);
+    let sentence = "the inspector build of the engine is not pinned";
+    let lines = |rig: &Rig| fields(&rig.lines()[0], &["action", "result", "reason"]).join(" ");
+
+    // An activation: 409 with the sentence, audited as denied. The store, the proxy and the history are untouched.
+    let answer = rig.activate(other, g1);
+    assert_eq!(answer.status, StatusCode::CONFLICT);
+    assert_eq!(answer.body["error"], sentence);
+    assert_eq!(lines(&rig), "activate denied engine");
+    assert_eq!(rig.current(), Some(g1));
+    assert!(rig.orders().is_empty());
+    assert!(rig.history().is_empty());
+
+    // A rollback to it: it is the target of a history that ends at the generation the store chooses.
+    rig.start_on(other);
+    rig.behave(Behavior::Switch);
+    assert_eq!(rig.activate(g1, other).status, StatusCode::OK);
+    assert_eq!((rig.current(), rig.history().len()), (Some(g1), 1));
+    let orders = rig.orders().len();
+    let answer = rig.rollback(g1);
+    assert_eq!(answer.status, StatusCode::CONFLICT);
+    assert_eq!(answer.body["error"], sentence);
+    assert_eq!(lines(&rig), "rollback denied engine");
+    assert_eq!((rig.current(), rig.serving()), (Some(g1), g1));
+    assert_eq!((rig.orders().len(), rig.history().len()), (orders, 1));
+
+    // An import: 400 before anything is staged or tried, for a refused engine and for a name that is none.
+    let rules = json!([{"name": "a.conf", "data": "YQo="}]);
+    let answer = rig.import(&json!({"rules": rules, "engine": "modsecurity"}));
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer.body["error"], sentence);
+    for name in ["Coraza", "", "mod_security"] {
+        let answer = rig.import(&json!({"rules": rules, "engine": name}));
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{name:?}");
+        assert_eq!(
+            answer.body["error"],
+            "engine is not the name of an engine (coraza or modsecurity)"
+        );
+    }
+    assert_eq!(rig.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.store().list().unwrap().len(), 2);
+    // Without the key the engine is Coraza, and the import goes on to its trial.
+    assert_eq!(rig.import(&json!({"rules": rules})).status, StatusCode::OK);
+    assert_eq!(rig.runs.load(Ordering::SeqCst), 1);
 }

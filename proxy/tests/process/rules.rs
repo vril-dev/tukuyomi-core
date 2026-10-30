@@ -27,6 +27,17 @@ type Case = (
 /// but the line of the accepted configuration and the line of the refusal, so that neither the kernel nor an
 /// inspector was started. `rest` names what the root holds besides the configuration.
 fn assert_store_refused(test: &str, edit: impl FnOnce(&Path), rest: &[&str], sentence: &str) {
+    let refusal = format!("start: rules store refused: {sentence}");
+    assert_start_refused(test, edit, rest, &refusal);
+}
+
+/// The same for a start that ends with the line `refusal`, whoever refuses.
+pub(crate) fn assert_start_refused(
+    test: &str,
+    edit: impl FnOnce(&Path),
+    rest: &[&str],
+    refusal: &str,
+) {
     let mut proxy = Proxy::spawn_with(test, Knobs::quick(), edit);
     let started = proxy.started;
     let (status, _) = proxy.wait_exit(started, MARGIN);
@@ -36,8 +47,7 @@ fn assert_store_refused(test: &str, edit: impl FnOnce(&Path), rest: &[&str], sen
         Some(1),
         "exit status {status}; records: {lines:#?}"
     );
-    let refusal = format!("start: rules store refused: {sentence}");
-    assert_eq!(lines, ["start: configuration accepted", refusal.as_str()]);
+    assert_eq!(lines, ["start: configuration accepted", refusal]);
     assert_turned_away(proxy.port);
     let mut files = vec!["config.json"];
     files.extend_from_slice(rest);
@@ -53,6 +63,10 @@ fn a_start_records_the_chosen_generation() {
     let lines = proxy.records.lines();
     let chosen = format!("start: rules generation {}", generation());
     assert!(lines.contains(&chosen), "records: {lines:#?}");
+    assert!(
+        lines.iter().any(|l| l == "start: rules engine coraza"),
+        "records: {lines:#?}"
+    );
     assert!(
         lines.iter().any(|l| l == "start: rules mode block"),
         "records: {lines:#?}"
@@ -162,8 +176,8 @@ fn a_bundle_that_is_imported_and_chosen_is_the_generation_the_proxy_starts_with(
         let listed = rules(root, "list", &[]);
         let fields: Vec<&str> = listed.out.split_whitespace().collect();
         assert_eq!(
-            (listed.code, fields.len(), fields[0], fields[2]),
-            (Some(0), 3, generation().as_str(), "block")
+            (listed.code, fields.len(), fields[0], fields[2], fields[3]),
+            (Some(0), 4, generation().as_str(), "block", "coraza")
         );
         let chosen = rules(root, "activate", &[OsStr::new(&generation())]);
         assert_eq!(
@@ -171,7 +185,11 @@ fn a_bundle_that_is_imported_and_chosen_is_the_generation_the_proxy_starts_with(
             (Some(0), format!("{} current\n", generation()))
         );
         let listed = rules(root, "list", &[]);
-        assert!(listed.out.ends_with(" block current\n"), "{}", listed.out);
+        assert!(
+            listed.out.ends_with(" block coraza current\n"),
+            "{}",
+            listed.out
+        );
 
         // A generation that is not there is refused, and so is a fingerprint of the wrong form.
         let missing = "f".repeat(64);
@@ -273,7 +291,7 @@ fn a_detect_only_generation_lets_a_matched_request_through_and_a_blocking_one_of
             listed
                 .out
                 .lines()
-                .any(|l| l.starts_with(&detect) && l.ends_with(" detect current")),
+                .any(|l| l.starts_with(&detect) && l.ends_with(" detect coraza current")),
             "{}",
             listed.out
         );
@@ -286,6 +304,14 @@ fn a_detect_only_generation_lets_a_matched_request_through_and_a_blocking_one_of
         let listed = rules(root, "list", &[]);
         assert_eq!(listed.code, Some(1), "{}", listed.out);
         assert_eq!(listed_mode(&listed.out, &broken), "unknown");
+        assert!(
+            listed
+                .out
+                .lines()
+                .any(|l| l.starts_with(&broken) && l.ends_with(" unknown unknown")),
+            "{}",
+            listed.out
+        );
         assert_eq!(listed_mode(&listed.out, &detect), "detect");
         let sentence =
             format!("rules list: {broken}: the manifest of the generation cannot be read");
@@ -299,6 +325,7 @@ fn a_detect_only_generation_lets_a_matched_request_through_and_a_blocking_one_of
     let lines = proxy.records.lines();
     for line in [
         format!("start: rules generation {detect}"),
+        "start: rules engine coraza".to_owned(),
         "start: rules mode detect".to_owned(),
     ] {
         assert!(lines.contains(&line), "records: {lines:#?}");
@@ -331,6 +358,10 @@ fn a_detect_only_generation_lets_a_matched_request_through_and_a_blocking_one_of
         .wait_lines("the switch", 1, |l| l == switched.as_str());
     proxy.wait_inspector(Some(before));
     let lines = proxy.records.lines();
+    assert!(
+        lines.iter().any(|l| l == "reload: rules engine coraza"),
+        "records: {lines:#?}"
+    );
     assert!(
         lines.iter().any(|l| l == "reload: rules mode block"),
         "records: {lines:#?}"
@@ -391,12 +422,12 @@ fn a_request_under_a_route_is_forwarded_without_inspection_and_an_ambiguous_one_
                 .unwrap_or_else(|| panic!("{fingerprint} is not listed in {:?}", listed.out))
         };
         assert!(
-            line(&routed).ends_with(" block routes 3 current"),
+            line(&routed).ends_with(" block coraza routes 3 current"),
             "{}",
             line(&routed)
         );
         assert!(
-            line(&generation()).ends_with(" block"),
+            line(&generation()).ends_with(" block coraza"),
             "{}",
             line(&generation())
         );
@@ -408,6 +439,7 @@ fn a_request_under_a_route_is_forwarded_without_inspection_and_an_ambiguous_one_
     let lines = proxy.records.lines();
     for line in [
         format!("start: rules generation {routed}"),
+        "start: rules engine coraza".to_owned(),
         "start: rules mode block".to_owned(),
         "start: rules routes 3".to_owned(),
     ] {

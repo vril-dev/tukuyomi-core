@@ -20,6 +20,7 @@ fn secs(n: u64) -> Duration {
 /// A configuration that passes `Config::check` and is never used to start anything.
 fn cfg() -> Config {
     Config {
+        engine: crate::engine::Engine::Coraza,
         inspector: PathBuf::from("/test-only/inspector"),
         rules: PathBuf::from("/test-only/rules.conf"),
         rules_sha256: [0; 32],

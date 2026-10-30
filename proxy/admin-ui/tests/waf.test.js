@@ -4,8 +4,9 @@ import { test } from 'node:test';
 
 import { ApiError } from '../js/api.js';
 import { actionsOf } from '../js/generations.js';
+import { setLanguage } from '../js/i18n.js';
 import { Ended, LIMITS, checkFiles, checkRoutes, importBody, toBase64, trialBlocked } from '../js/import.js';
-import { canChange, generationState, shortOf, switchOutcome, utc } from '../js/parts.js';
+import { canChange, engineName, generationState, shortOf, switchOutcome, utc } from '../js/parts.js';
 import { Pager, buildQuery, decodeText, summaryOf } from '../js/records.js';
 
 const file = (name, size) => ({ name, size });
@@ -268,4 +269,16 @@ test('every key that a script asks for is named in the call itself, so that the 
     const source = readFileSync(new URL(name, scripts), 'utf8');
     assert.ok(!/\bt\(\s*[^'\s]/.test(source), `${name}: a key that is not a plain string`);
   }
+});
+
+test('an engine is shown by its name in the language, and a word that is not one of ours as it was given', () => {
+  setLanguage('en');
+  assert.equal(engineName('coraza'), 'Coraza');
+  assert.equal(engineName('modsecurity'), 'ModSecurity');
+  setLanguage('ja');
+  assert.equal(engineName('modsecurity'), 'ModSecurity');
+  // A name from the prototype of an object is no engine, and a value that is no word is text.
+  assert.equal(engineName('constructor'), 'constructor');
+  assert.equal(engineName(undefined), 'undefined');
+  setLanguage('en');
 });

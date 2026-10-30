@@ -1,6 +1,7 @@
 use super::*;
 use crate::forward::client_ip::{Access, Country};
 use crate::policy::mmdb::tests::{Record, database, database_of};
+use crate::rules::bundle::Fingerprint;
 use serde_json::Value;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1150,14 +1151,14 @@ fn a_generation_completes_the_kernel_values_and_is_checked_again() {
     ));
     let kernel = loaded
         .kernel
-        .for_generation(dir.clone(), generation)
+        .for_generation(dir.clone(), generation, Engine::Coraza)
         .unwrap();
     assert_eq!(kernel.rules, dir);
     assert_eq!(kernel.rules_sha256, generation.bytes());
     // The kernel checks the directory again: a relative one is refused.
     let result = loaded
         .kernel
-        .for_generation(PathBuf::from("rules"), generation);
+        .for_generation(PathBuf::from("rules"), generation, Engine::Coraza);
     assert_eq!(
         result.err(),
         Some(ConfigError("rules path is not an absolute clean path"))
@@ -2685,4 +2686,104 @@ fn the_rules_store_the_records_the_admin_store_and_the_control_socket_are_in_pla
         apart,
     );
     pass(&[records("dir", "/var/lib/tukuyomi/rules2")]);
+}
+
+/// The `engines` object of the `kernel` object, with the inspector of ModSecurity at `inspector`.
+fn modsecurity(inspector: &str) -> Edit {
+    k(
+        "engines",
+        serde_json::json!({"modsecurity": {"inspector": inspector}}),
+    )
+}
+
+#[test]
+fn the_engines_object_names_the_inspector_of_modsecurity_and_nothing_else() {
+    // It may be left out; when it is there the path is checked as kernel.inspector is checked.
+    pass(&[]);
+    pass(&[modsecurity("/opt/tukuyomi/inspector-modsecurity")]);
+    let long = |n: usize| format!("/{}", "a".repeat(n - 1));
+    pass(&[modsecurity(&long(4095))]);
+    let bad = "kernel.engines.modsecurity.inspector is not an absolute clean path";
+    refuse(&[modsecurity(&long(4096))], bad);
+    for path in [
+        "",
+        "/",
+        "inspector",
+        "/opt/../inspector",
+        "/opt/",
+        "/opt//a",
+        "/opt/./a",
+    ] {
+        refuse(&[modsecurity(path)], bad);
+    }
+    // Only that key, with only that key inside, and an object.
+    let engines = |value: Value| k("engines", value);
+    let unknown = "configuration has an unknown key";
+    refuse(
+        &[engines(serde_json::json!({"coraza": {"inspector": "/x"}}))],
+        unknown,
+    );
+    refuse(
+        &[engines(
+            serde_json::json!({"modsecurity": {"inspector": "/x"}, "coraza": {"inspector": "/x"}}),
+        )],
+        unknown,
+    );
+    refuse(
+        &[engines(
+            serde_json::json!({"modsecurity": {"inspector": "/x", "tmp_root": "/x"}}),
+        )],
+        unknown,
+    );
+    let missing = "configuration has a missing key";
+    refuse(&[engines(serde_json::json!({}))], missing);
+    refuse(&[engines(serde_json::json!({"modsecurity": {}}))], missing);
+    let wrong = "configuration has a value of the wrong type";
+    refuse(&[engines(serde_json::json!([]))], wrong);
+    refuse(&[engines(Value::Null)], wrong);
+    refuse(&[engines(serde_json::json!({"modsecurity": "/x"}))], wrong);
+    refuse(
+        &[engines(
+            serde_json::json!({"modsecurity": {"inspector": 1}}),
+        )],
+        wrong,
+    );
+    // A path in the file is never shown in the sentence.
+    assert_eq!(refusal_of(&doc(&[modsecurity(MARK)])), Some(bad),);
+}
+
+#[test]
+fn an_engine_can_be_used_only_with_an_inspector_in_the_configuration_and_a_pinned_build() {
+    let generation = Fingerprint::from_hex("0123456789abcdef".repeat(4).as_bytes()).unwrap();
+    let dir = PathBuf::from("/var/lib/tukuyomi/rules/generations/a");
+    let plain = parse(BASE.as_bytes()).unwrap().kernel;
+    let named = parse(&doc(&[modsecurity("/opt/tukuyomi/inspector-modsecurity")]))
+        .unwrap()
+        .kernel;
+    // Coraza has the inspector of `kernel.inspector` and a pinned build, whatever else the file has.
+    for settings in [&plain, &named] {
+        assert_eq!(settings.check_engine(Engine::Coraza), Ok(()));
+        let kernel = settings
+            .for_generation(dir.clone(), generation, Engine::Coraza)
+            .unwrap();
+        assert_eq!(kernel.engine, Engine::Coraza);
+        assert_eq!(kernel.inspector, PathBuf::from("/opt/tukuyomi/inspector"));
+    }
+    // ModSecurity: no inspector in the file, or one but no pinned build in this kernel; each has its own sentence.
+    let missing = ConfigError("kernel.engines has no inspector for the engine of the generation");
+    let unpinned = ConfigError("the inspector build of the engine is not pinned");
+    assert_eq!(plain.check_engine(Engine::ModSecurity), Err(missing));
+    assert_eq!(
+        plain
+            .for_generation(dir.clone(), generation, Engine::ModSecurity)
+            .err(),
+        Some(missing)
+    );
+    assert_eq!(named.check_engine(Engine::ModSecurity), Err(unpinned));
+    assert_eq!(
+        named
+            .for_generation(dir, generation, Engine::ModSecurity)
+            .err(),
+        Some(unpinned)
+    );
 }

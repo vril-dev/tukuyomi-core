@@ -430,6 +430,7 @@ impl Session {
             upstream: noted.via.as_ref().map(|via| via.group.clone()),
             server: noted.via.as_ref().and_then(|via| via.server),
             mode: noted.judged.map(|judge| judge.mode.name()),
+            engine: noted.judged.map(|judge| judge.engine.name()),
             generation: noted.judged.map(|judge| judge.generation.bytes()),
             rule: reply.rule,
             matched: noted.judged.map(|judge| judge.matched).unwrap_or_default(),

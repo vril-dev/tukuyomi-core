@@ -32,7 +32,7 @@ fn serve(dir: &Path, reply: Option<String>, hold: Duration) -> (PathBuf, JoinHan
 
 fn status_line(mode: &str) -> String {
     format!(
-        "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"phase\":\"ready\",\"switching\":false,\"ready\":true}}\n",
+        "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"engine\":\"coraza\",\"phase\":\"ready\",\"switching\":false,\"ready\":true}}\n",
         fp(1).hex()
     )
 }
@@ -52,6 +52,7 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
         Status {
             generation: fp(1),
             mode: "detect",
+            engine: "coraza",
             phase: "ready",
             switching: false,
             ready: true

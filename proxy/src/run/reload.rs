@@ -90,6 +90,7 @@ fn begin(
                 return Begun::Changed;
             }
             log.line(&format!("reload: starting generation {}", generation.hex()));
+            log.line(&format!("reload: rules engine {}", kernel.engine.name()));
             log.line(&format!("reload: rules mode {}", mode.name()));
             log.line(&format!("reload: rules routes {}", routes.len()));
             let (reply, told) = oneshot::channel();

@@ -83,7 +83,12 @@ fn slot_with_a_request(mode: Mode, done: Shutdown) -> (Slot<Stub>, oneshot::Rece
         hold: Hold::new(take(), take()),
     };
     let generation = Fingerprint::from_hex(&[b'7'; 64]).unwrap();
-    let mut slot = Slot::new(generation, mode, Stub { done: Some(done) });
+    let mut slot = Slot::new(
+        generation,
+        Engine::ModSecurity,
+        mode,
+        Stub { done: Some(done) },
+    );
     slot.pending.insert(
         0,
         Pending {
@@ -115,12 +120,13 @@ fn a_retired_slot_gets_the_results_of_its_shutdown_and_tells_whether_it_stopped_
 }
 
 /// What a verdict of the slot of `slot_with_a_request` is answered with: the verdict, and the generation of the slot
-/// and the mode of its rules.
+/// with the engine and the mode of its rules.
 fn verdict(verdict: Verdict, mode: Mode) -> Answer {
     Answer {
         outcome: Outcome::Verdict(verdict),
         by: Some(Judge {
             generation: Fingerprint::from_hex(&[b'7'; 64]).unwrap(),
+            engine: Engine::ModSecurity,
             mode,
             verdict,
             matched: Matched::NONE,

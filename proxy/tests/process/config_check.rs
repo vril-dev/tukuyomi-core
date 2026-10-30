@@ -76,7 +76,7 @@ fn a_configuration_that_the_start_would_take_is_accepted_and_nothing_is_started(
     assert_eq!(
         ran.err,
         format!(
-            "config check: configuration accepted\nconfig check: rules generation {}\nconfig check: rules mode block\nconfig check: rules routes 0\n",
+            "config check: configuration accepted\nconfig check: rules generation {}\nconfig check: rules engine coraza\nconfig check: rules mode block\nconfig check: rules routes 0\n",
             generation()
         )
     );

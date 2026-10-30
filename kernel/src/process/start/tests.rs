@@ -74,6 +74,7 @@ fn tmp_dir_refusal(r: Result<StartDir, LaunchError>) -> &'static str {
 fn config(root: &Path, inspector: &str, rules: &str) -> Config {
     let s = Duration::from_secs(1);
     Config {
+        engine: crate::engine::Engine::Coraza,
         inspector: PathBuf::from(inspector),
         rules: PathBuf::from(rules),
         rules_sha256: [0; 32],

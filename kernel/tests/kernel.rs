@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tukuyomi_kernel::{
-    Config, Failure, Matched, Phase, Reason, Refused, ReqId, Request, Status, Supervisor, Verdict,
+    Config, Engine, Failure, Matched, Phase, Reason, Refused, ReqId, Request, Status, Supervisor,
+    Verdict,
 };
 
 const MS: Duration = Duration::from_millis(1);
@@ -42,6 +43,7 @@ const UNAVAILABLE: Verdict = Verdict::Uninspectable(Reason::Unavailable);
 /// A configuration that passes `check` and names nothing that exists.
 fn fake_config() -> Config {
     Config {
+        engine: Engine::Coraza,
         inspector: PathBuf::from("/kernel-test/inspector"),
         rules: PathBuf::from("/kernel-test/rules.conf"),
         rules_sha256: [0; 32],
@@ -535,6 +537,15 @@ fn check_paths() {
     rejected(
         |c| c.inspector = tmp(4096),
         "inspector path is not an absolute clean path",
+    );
+}
+
+#[test]
+fn check_engine_needs_a_pinned_build() {
+    accepted(|c| c.engine = Engine::Coraza);
+    rejected(
+        |c| c.engine = Engine::ModSecurity,
+        "the inspector build of the engine is not pinned",
     );
 }
 

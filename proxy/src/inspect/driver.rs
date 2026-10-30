@@ -11,17 +11,17 @@
 //! comes out.
 //!
 //! The answer on the reply slot is the outcome and, when the outcome is a verdict of a kernel, the generation of that
-//! kernel, the mode of its rules, the verdict as it is delivered and the rules that matched the request as the
-//! verdict says them, so that the record of the request can say which rules judged it and what they matched, and
-//! the counters can tell why a request could not be inspected.
+//! kernel, the engine and the mode of its rules, the verdict as it is delivered and the rules that matched the
+//! request as the verdict says them, so that the record of the request can say which rules judged it and what they
+//! matched, and the counters can tell why a request could not be inspected.
 //!
 //! Each slot keeps the mode of its generation. A generation that blocks never has a request that is only detected,
 //! so a `Detected` that its kernel gives is not believed: the ticket is answered with `Uninspectable`, and the
 //! first time it happens in a slot the driver records one line.
 //!
 //! After every round the driver publishes the `State` of the kernel that serves (its phase, the restarts of the
-//! inspector made so far, and the generation with the mode of its rules) on a `watch` that the main side reads when it
-//! is asked whether the inspector is up; nothing waits for it.
+//! inspector made so far, and the generation with the engine and the mode of its rules) on a `watch` that the main
+//! side reads when it is asked whether the inspector is up; nothing waits for it.
 //!
 //! The routes of the generation that serves are not kept by the slots. A connection matches its request against the
 //! shared table before it makes a ticket, so a request that a route matches never reaches the driver, and nothing
@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tukuyomi_kernel::{
-    Failure, Matched, Phase, Refused, ReqId, Request, Shutdown, Status, Supervisor, Verdict,
+    Engine, Failure, Matched, Phase, Refused, ReqId, Request, Shutdown, Status, Supervisor, Verdict,
 };
 
 use self::core::{Core, Signals};
@@ -101,13 +101,15 @@ pub struct Ticket {
     pub hold: Hold,
 }
 
-/// The generation whose kernel gave a verdict, what its rules do to a request they match, the verdict as it is
-/// delivered and the rules that matched the request, as the verdict says them (none for a verdict that is not an
-/// inspection). The verdict is the one of the outcome in the same answer, so a `Detected` of a generation that
-/// blocks is `Uninspectable` here too. It is kept here because the connection keeps the `Judge` and not the outcome.
+/// The generation whose kernel gave a verdict, the engine of its rules, what they do to a request they match, the
+/// verdict as it is delivered and the rules that matched the request, as the verdict says them (none for a verdict
+/// that is not an inspection). The verdict is the one of the outcome in the same answer, so a `Detected` of a
+/// generation that blocks is `Uninspectable` here too. It is kept here because the connection keeps the `Judge` and
+/// not the outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Judge {
     pub generation: Fingerprint,
+    pub engine: Engine,
     pub mode: bundle::Mode,
     pub verdict: Verdict,
     pub matched: Matched,
@@ -248,12 +250,13 @@ impl Ingress {
 
 /// What the driver tells the main side of the kernel that serves: its phase, the restarts of the inspector made so
 /// far (counting the kernels that served before it, so the number does not fall when another generation takes over),
-/// and the generation and the mode of its rules.
+/// and the generation with the engine and the mode of its rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
     pub phase: Phase,
     pub restarts: u32,
     pub generation: Fingerprint,
+    pub engine: Engine,
     pub mode: bundle::Mode,
 }
 
@@ -280,9 +283,10 @@ pub struct Limits {
 
 /// Starts the driver thread and returns at once, without waiting for the kernel to be ready. `Err` means only
 /// that the thread could not be created. The kernel is created on the thread; a configuration it refuses ends
-/// the driver with `End::Fatal`. `generation` names the rules that `cfg` is for, `mode` is what they do to a
-/// request they match, and `routes` is the shared table of the requests that skip the inspection, which holds the
-/// routes of `generation` already and which the driver replaces when another generation serves.
+/// the driver with `End::Fatal`. `generation` names the rules that `cfg` is for (`cfg.engine` is their engine),
+/// `mode` is what they do to a request they match, and `routes` is the shared table of the requests that skip the
+/// inspection, which holds the routes of `generation` already and which the driver replaces when another generation
+/// serves.
 pub fn start(
     cfg: tukuyomi_kernel::Config,
     generation: Fingerprint,
@@ -292,6 +296,7 @@ pub fn start(
     log: Log,
 ) -> Result<Driver, &'static str> {
     let tick = cfg.tick;
+    let engine = cfg.engine;
     // One intake takes at most every waiting ticket and the stop message. The channel has room for one more, a
     // switch (the main thread has one under way at a time). A count that cannot be added to cannot pass the
     // kernel's configuration check either, so any capacity will do for it.
@@ -304,6 +309,7 @@ pub fn start(
         phase: Phase::Starting,
         restarts: 0,
         generation,
+        engine,
         mode,
     });
     thread::Builder::new()
@@ -314,7 +320,7 @@ pub fn start(
                     ready: ready_tx,
                     failed: failed_tx,
                 };
-                let slot = Slot::new(generation, mode, kernel);
+                let slot = Slot::new(generation, engine, mode, kernel);
                 Core::new(slot, routes, rx, signals, log, limits, tick, take, state_tx)
                     .drive(end_tx);
             }

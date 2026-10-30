@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 mod config;
+mod engine;
 mod process;
 mod protocol;
 mod requests;
 pub use config::{Config, ConfigError};
+pub use engine::Engine;
 pub use protocol::codec::Matched;
 pub use requests::supervisor::{
     Failure, Phase, Reason, Refused, ReqId, Request, Shutdown, Status, Supervisor, Verdict,

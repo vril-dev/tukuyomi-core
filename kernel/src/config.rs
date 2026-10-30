@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::engine::Engine;
 use crate::protocol::codec;
 
 /// Longest accepted time. A guard against a wrong setting, not a recommendation.
@@ -24,7 +25,10 @@ pub(crate) const MAX_RESTARTS: u32 = 1000;
 /// Everything the kernel needs. No `Default`: every value is chosen by the operator and checked by `check`.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Absolute clean path of the Go inspector executable.
+    /// The engine of the generation. Its inspector build is the one that the HELLO has to report, and `check`
+    /// refuses an engine that has none pinned.
+    pub engine: Engine,
+    /// Absolute clean path of the inspector executable of `engine`.
     pub inspector: PathBuf,
     /// Absolute clean path of the rule generation directory (the inspector's only argument).
     pub rules: PathBuf,
@@ -95,6 +99,11 @@ impl Config {
     pub fn check(&self) -> Result<(), ConfigError> {
         if !clean_abs(&self.inspector) {
             return Err(ConfigError("inspector path is not an absolute clean path"));
+        }
+        if self.engine.pinned().is_none() {
+            return Err(ConfigError(
+                "the inspector build of the engine is not pinned",
+            ));
         }
         if !clean_abs(&self.rules) {
             return Err(ConfigError("rules path is not an absolute clean path"));

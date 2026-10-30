@@ -180,7 +180,7 @@ pub(super) fn render(scrape: &Scrape<'_>) -> String {
     page.family(
         "tukuyomi_rules_generation_info",
         "gauge",
-        "The generation of the rules that serves (first 16 digits) and what its rules do; always 1.",
+        "The generation of the rules that serves (first 16 digits), what its rules do and the engine that applies them; always 1.",
     );
     let generation = state.generation.hex();
     page.sample(
@@ -188,6 +188,7 @@ pub(super) fn render(scrape: &Scrape<'_>) -> String {
         &[
             ("generation", generation.get(..16).unwrap_or(&generation)),
             ("mode", state.mode.name()),
+            ("engine", state.engine.name()),
         ],
         1,
     );

@@ -37,6 +37,7 @@ mod bodies;
 mod config_check;
 mod control;
 mod deadlines;
+mod engines;
 mod forwarding;
 mod http2;
 mod inspector;

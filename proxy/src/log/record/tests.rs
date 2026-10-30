@@ -81,6 +81,7 @@ fn request(seen: Option<Seen>) -> Request {
         upstream: Some(Arc::from("web")),
         server: Some("192.0.2.7:8080".parse().unwrap()),
         mode: Some("block"),
+        engine: Some("coraza"),
         generation: Some([0xab; 32]),
         rule: None,
         matched: Matched::NONE,
@@ -119,7 +120,7 @@ fn a_request_record_has_its_fields_in_order_and_leaves_out_what_it_does_not_have
             "\"proto\":\"h2\",\"tls\":true,\"client\":\"2001:db8::1\",",
             "\"method\":\"GET\",\"host\":\"Example.test\",\"path\":\"/a%20b\",",
             "\"class\":\"forwarded\",\"status\":200,\"reason\":\"forwarded\",\"ms\":12,",
-            "\"upstream\":\"web\",\"server\":\"192.0.2.7:8080\",\"mode\":\"block\",",
+            "\"upstream\":\"web\",\"server\":\"192.0.2.7:8080\",\"mode\":\"block\",\"engine\":\"coraza\",",
             "\"generation\":\"abababababababab\",\"body\":10,\"sent\":5}"
         )
     );
@@ -129,6 +130,7 @@ fn a_request_record_has_its_fields_in_order_and_leaves_out_what_it_does_not_have
     bare.upstream = None;
     bare.server = None;
     bare.mode = None;
+    bare.engine = None;
     bare.generation = None;
     bare.body = None;
     let line = encode(SystemTime::UNIX_EPOCH, &Record::Request(Box::new(bare))).unwrap();
@@ -144,6 +146,7 @@ fn a_request_record_has_its_fields_in_order_and_leaves_out_what_it_does_not_have
         "upstream",
         "server",
         "mode",
+        "engine",
         "generation",
         "rule",
         "rules",
