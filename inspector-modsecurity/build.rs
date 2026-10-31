@@ -1,6 +1,7 @@
 //! Builds the C++ bridge and links it with the static libmodsecurity of a prefix that
 //! `scripts/build-modsecurity.sh` made. The prefix is the absolute path in the environment
-//! variable `TUKUYOMI_MODSECURITY_PREFIX`.
+//! variable `TUKUYOMI_MODSECURITY_PREFIX`. Its `include-src` directory holds the header files of the library's
+//! own `src/`, which the bridge reads for the classes that the installed headers leave out.
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -39,17 +40,22 @@ fn main() {
         )),
     };
     let include = Path::new(&prefix).join("include");
+    let private = Path::new(&prefix).join("include-src");
     let lib = Path::new(&prefix).join("lib");
     let archive = lib.join("libmodsecurity.a");
-    if !include.join("modsecurity/modsecurity.h").is_file() || !archive.is_file() {
+    if !include.join("modsecurity/modsecurity.h").is_file()
+        || !private.join("src/variables/variable.h").is_file()
+        || !archive.is_file()
+    {
         stop(&format!(
-            "{PREFIX_VAR} has no include/modsecurity/modsecurity.h and lib/libmodsecurity.a (see scripts/build-modsecurity.sh)"
+            "{PREFIX_VAR} has no include/modsecurity/modsecurity.h, include-src/src/variables/variable.h and lib/libmodsecurity.a (see scripts/build-modsecurity.sh)"
         ));
     }
     println!("cargo:rerun-if-changed={}", archive.display());
+    println!("cargo:rerun-if-changed={}", private.display());
 
-    // The headers of libmodsecurity are read as system headers, so that their warnings
-    // do not show; the warnings of the bridge itself stay on.
+    // The headers of libmodsecurity, and those of its `src/`, are read as system headers, so that their
+    // warnings do not show; the warnings of the bridge itself stay on.
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -59,6 +65,8 @@ fn main() {
         .extra_warnings(true)
         .flag("-isystem")
         .flag(&include)
+        .flag("-isystem")
+        .flag(&private)
         .file("src/bridge.cc");
     let compiler = build.get_compiler();
     let pcre2 = directory_of(compiler.path(), "libpcre2-8.a", "libpcre2-dev");

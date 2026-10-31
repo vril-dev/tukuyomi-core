@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the pinned release of libmodsecurity (ModSecurity v3) as static libraries
-# into a new directory (a prefix): include/modsecurity/*.h and lib/libmodsecurity.a.
+# into a new directory (a prefix): include/modsecurity/*.h and lib/libmodsecurity.a, and
+# include-src/: the header files of the source's own src/ (see the step that copies them).
 #
 # Usage: scripts/build-modsecurity.sh <new prefix directory>
 #
@@ -160,6 +161,10 @@ src="${work}/src/${TOP}"
 
 echo "[MSC] Configuring"
 cd -- "$src"
+# The features that are turned off (curl, Lua, MaxMind, GeoIP, libxml2, LMDB and ssdeep) are part of the
+# protection of the inspector, and not only a saving: with no curl, `SecRemoteRules` and a rule file name that is
+# an address do nothing, and with no Lua, no database file and no XML library there is nothing for a rule to
+# run, to look up or to parse. Do not turn one on without checking the checks of the rule files again.
 step configure "${work}/configure.log" CFLAGS=-O2 CXXFLAGS=-O2 ./configure "--prefix=${dest}" \
   --disable-shared --enable-static --disable-examples --disable-doxygen-doc --disable-debug-logs \
   --with-yajl --without-lmdb --without-curl --without-lua --without-maxmind --without-geoip \
@@ -182,6 +187,20 @@ staged="${stage}${dest}"
 grep -qx "Version: ${VERSION}" "${staged}/lib/pkgconfig/modsecurity.pc" || die "the installed version is not ${VERSION}"
 outside=$(find "$stage" -not -type d -not -path "${staged}/*")
 [[ -z $outside ]] || die "the install wrote outside the prefix"
+
+# The installed headers are the public interface only. They leave out the classes of the variables, of the
+# operators and of the text of an action, which the inspector reads to compare what the library built with what
+# the rule files say. So the header files of src/ (and no other file) are copied into a directory of their own,
+# as they are after configure: the ones of the pinned archive, and config.h, which configure adds. The inspector
+# reads that directory as system headers. It reads private members through them and stops the build when the
+# version of the library is not the one pinned here.
+echo "[MSC] Copying the headers of src/"
+private="${staged}/include-src"
+mkdir -m 0700 -- "$private"
+(cd -- "$src" && find src -type f -name '*.h' -exec cp --parents -t "$private" -- {} +) || die "cannot copy the headers of src/"
+[[ -s ${private}/src/variables/variable.h && -s ${private}/src/run_time_string.h ]] || die "the headers of src/ were not copied"
+stray=$(find "$private" -type f -not -name '*.h')
+[[ -z $stray ]] || die "something other than a header file was copied"
 
 mv -T -- "$staged" "$dest" || die "cannot create ${dest}"
 echo "[MSC] Installed ${VERSION} into ${dest}"
