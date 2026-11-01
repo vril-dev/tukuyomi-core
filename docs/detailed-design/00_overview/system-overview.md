@@ -2,7 +2,7 @@
 
 > **状態: 初期草案**
 >
-> このリポジトリにある製品のコードは、初回の検査核（`kernel/` と `inspector/`）と、`proxy/` にある HTTP・HTTPS の受付と転送、要求の前の方針、記録のファイル、管理のプロセス（管理 API と管理画面）のソースで、ビルド済みの実行ファイル、配布物はまだない。
+> このリポジトリにある製品のコードは、初回の検査核（`kernel/` と `inspector/`）と、ModSecurity の検査プロセス（`inspector-modsecurity/`）と、`proxy/` にある HTTP・HTTPS の受付と転送、要求の前の方針、記録のファイル、管理のプロセス（管理 API と管理画面）のソースで、ビルド済みの実行ファイル、配布物はまだない。
 > 実装済みの範囲は「現在の状態」に示す。それ以外は目標・前提・候補・未決事項である。
 > 「候補」「案」と書いた内容は、採用が決まったものではない。
 
@@ -42,6 +42,7 @@ tukuyomi-core は、tukuyomi（tukuyomi WAF）から派生し、WAF 機能に特
 
 - Rust のライブラリ [`kernel/`](../../../kernel/)。標準ライブラリだけを使う。ライブラリ自身はスレッドを作らず、呼び出し側が回す。この中の監督（`Supervisor`）が、検査プロセスの起動、停止、再起動と、起動ごとの一時ディレクトリを所有する。
 - Go の検査プロセス [`inspector/`](../../../inspector/)。Coraza の Go API を直接使う。初回の検査核は Coraza v3.8.1 に固定している。これは現在のコードが使う版で、版の推奨や DP-09 の手順の決定ではない。
+- ModSecurity の検査プロセス [`inspector-modsecurity/`](../../../inspector-modsecurity/)。Rust と C++ の橋渡しで、libmodsecurity v3.0.17 を静的に結ぶ。ルールセットの世代は、どちらのエンジンで検査するかを持ち、ライブラリは世代のエンジンの検査プロセスを起動する。どちらの検査プロセスも、同じやり取りで話し、下の守りを同じに持つ（[運用リファレンス](../../operations/operator-reference.md) の「ModSecurity の世代」）。
 - 検査プロセスはライブラリが直接起動し、同じホストの中で、引き継いだ Unix domain socket の対（検査プロセスの fd 0）で通信する。ライブラリも検査プロセスも、TCP の待ち受けポートを増やさない。
 - 要求ごとの結果は、許可（`Allow`）、遮断（`Block`）、検査不能（`Uninspectable`）の3つ。検査を完了できなかった要求は、許可にならない。検査できないと分かっている入力は、受け付けの時点で呼び出し側に返し（`Refused`）、許可にしない。たとえば、本文があり Content-Type が `application/x-www-form-urlencoded`、`multipart/form-data`、`application/json`、`application/<名前>+json` のどれでもない要求、Content-Encoding を伴う要求、Transfer-Encoding を伴う要求は、この形で返す。ただし、本文の先頭だけを渡す要求で、Transfer-Encoding が `chunked` の1行だけで Content-Length を持たないものは受け付ける（HTTP/1.1 の chunked の本文の先頭を検査するため）。
 - 再起動の回数は、直近の一定の時間（設定の窓）の中で上限がある。上限に達したら、窓が空くまで起動し直さず、その間に待っている要求は検査不能にする（HTTP では 503）。ルールの誤りなどの決定的な失敗では起動し直さない。

@@ -514,16 +514,15 @@ session は、状態によって使える API が決まる。状態に合わな�
 | `crs` | `true` で `admin.crs_dir` の CRS を使う。要求では path を指定できない。`admin.crs_dir` が無いと 400 |
 | `crs_off` | 読み込まない CRS の `.conf` の名前の配列（`--crs-off` に当たる） |
 | `routes` | 検査しない経路の配列（`--routes` のファイルと同じ形） |
-| `engine` | 検査のエンジンの名前（`--engine` に当たる）。省けば `coraza`。この build が持つエンジンは `coraza` だけ |
+| `engine` | 検査のエンジンの名前（`--engine` に当たる）。`coraza` か `modsecurity`（小文字）。省けば `coraza` |
 | `detect_only` | `true` で検知だけの世代にする |
 | `accept_block` | `true` で、試しの要求が遮断されても失敗にしない |
 
 - 上限と名前の決まりは `rules import` と同じである（[運用リファレンス](operator-reference.md) の「`rules`」）。ファイルは 128 個、1つ 2 MiB、全体 8 MiB まで。2 MiB を超えるファイルは、デコードする前に断る。
-- `engine` がエンジンの名前でないときと、そのエンジンが使えないときは、ファイルを集める前に 400 で断る。何も仮に置かず、試しも流さない。文は次のどれかである。
+- `engine` がエンジンの名前でないときと、そのエンジンが使えないときは、ファイルを集める前に 400 で断る。何も仮に置かず、試しも流さない。文は次のどちらかである。
   - `engine is not the name of an engine (coraza or modsecurity)`
   - `kernel.engines has no inspector for the engine of the generation`（設定に、そのエンジンの検査プロセスが無い）
-  - `the inspector build of the engine is not pinned`（この build が、そのエンジンを持たない）
-- 試しは `rules import` と同じで、管理のプロセスが検査プロセスを1つ起動し、決まった3つの要求（`GET /`、form の `POST /`、JSON の `POST /`）を検査する。`kernel` の値と、`proxy` の `ready_wait_ms`・`inspect_wait_ms`・`stop_inspect_ms`・`drive_slice_ms` を使う。
+- 試しは `rules import` と同じで、管理のプロセスが検査プロセスを1つ起動し、決まった3つの要求（`GET /`、form の `POST /`、JSON の `POST /`）を検査する。検査プロセスは、`engine` のエンジンのもの（`coraza` は `kernel.inspector`、`modsecurity` は `kernel.engines`）である。`kernel` の値と、`proxy` の `ready_wait_ms`・`inspect_wait_ms`・`stop_inspect_ms`・`drive_slice_ms` を使う。
 - 取り込み、選択、戻し、削除は、管理のプロセスの中で1つずつ進む。ほかの変更が進んでいるときは、待たずに 409 `a change of the rules is under way`。命令や別のプロセスが保管場所の lock を持っているときは、409 `the rules store is in use by another command`。
 
 答え:
@@ -552,7 +551,7 @@ session は、状態によって使える API が決まる。状態に合わな�
 
 1. 世代が保管場所にあること（`activate`。無ければ 404 `no such generation`）。戻しは、戻しの先を決める（下）。
 2. 保管場所が選んでいる世代が `expect` と同じこと。違えば 409（変更なし。履歴には書かない。監査に `denied`、reason `expect`）。
-3. 切り替える先の世代のエンジンが使えること。使えなければ、`{"error": <文>}` の 409（変更なし。履歴には書かない。監査に `denied`、reason `engine`）。文は、上の「取り込み」の 400 の `kernel.engines has no inspector for the engine of the generation` か `the inspector build of the engine is not pinned` と同じである。manifest が読めない世代は、ここでは断らず、保管場所が世代を選ぶ段で断る。
+3. 切り替える先の世代のエンジンが使えること。使えなければ、`{"error": <文>}` の 409（変更なし。履歴には書かない。監査に `denied`、reason `engine`）。文は、上の「取り込み」の 400 の `kernel.engines has no inspector for the engine of the generation` と同じである。manifest が読めない世代は、ここでは断らず、保管場所が世代を選ぶ段で断る。
 4. proxy の状態を問う。
    - 届かない: 503 `the proxy cannot be reached`。保管場所は変えず、履歴に `unreachable` を書く（監査にも `denied`、reason `unreachable`）。
    - 接続を受けて何も答えずに閉じる（同時の接続の上限）: 503 `the proxy is busy`。保管場所は変えず、履歴には書かない（監査に `denied`、reason `busy`）。
@@ -677,7 +676,7 @@ session は、状態によって使える API が決まる。状態に合わな�
 |---|---|---|
 | 状態 | viewer 以上 | proxy の状態、選ばれた世代と使っている世代、戻しの先を表示する。切り替えの途中ではないのに2つの世代が違うときは、帯に警告を出す。途中のときは、状態の画面にその旨だけを出す |
 | 世代 | viewer 以上 | 世代の一覧と中身を見る。operator 以上は、選択、proxy の切り替え（選ばれているのに使われていない世代）、削除ができる。選ばれた世代、使われている世代、戻しの先は削除できない |
-| 取り込み | operator 以上 | ブラウザでファイルを選び、CRS の使用と外すファイル、検査しない経路、検知だけを指定して取り込む。上限をブラウザでも数える。試しで遮断されたら、確認を経て「遮断を受け入れて取り込む」ができる。新しい世代は選ばれない |
+| 取り込み | operator 以上 | ブラウザでファイルを選び、検査のエンジン（Coraza か ModSecurity。初めは Coraza）、CRS の使用と外すファイル、検査しない経路、検知だけを指定して取り込む。上限をブラウザでも数える。試しで遮断されたら、確認を経て「遮断を受け入れて取り込む」ができる。新しい世代は選ばれない |
 | 履歴 | viewer 以上 | 切り替えの履歴。operator 以上は、「前の世代に戻す」ができる |
 | 記録 | viewer 以上 | 条件を指定して記録を探し、ページごとに新しい方・古い方へ進む。要求から来た文字は、`%XX` の形のまま表示する。行の詳細で「%XX を読み取った文字も見る」を選ぶと、読み取った文字も見せる |
 | 監査 | operator 以上 | 最新の 200 件 |

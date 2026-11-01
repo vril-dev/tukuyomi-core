@@ -9,7 +9,8 @@
 | もの | 中身 |
 |---|---|
 | `tukuyomi-proxy`（Rust、`proxy/`） | HTTP・HTTPS の受付と転送。検査核（`kernel/`、Rust のライブラリ）を組み込み、検査プロセスの起動・停止・再起動を受け持つ。同じ実行ファイルが、ルールの保管場所の命令（`rules`）、証明書の命令（`acme renew`）、設定の確かめ（`config check`）、管理のプロセス（`admin`）も持つ |
-| `tukuyomi-inspector`（Go、`inspector/`） | Coraza で要求を検査する。proxy が子のプロセスとして起動し、引き継いだ Unix domain socket の対で話す。待ち受けの port は持たない。設定の `kernel.inspector` に書く。Coraza 以外のエンジンの検査プロセスは、省いてよい `kernel.engines` に書く。この build が持つエンジンは Coraza だけである |
+| `tukuyomi-inspector`（Go、`inspector/`） | Coraza で要求を検査する。proxy が子のプロセスとして起動し、引き継いだ Unix domain socket の対で話す。待ち受けの port は持たない。設定の `kernel.inspector` に書く |
+| `tukuyomi-inspector-modsecurity`（Rust と C++、`inspector-modsecurity/`） | ModSecurity v3（libmodsecurity 3.0.17）で要求を検査する。ModSecurity の世代（`rules import --engine modsecurity`）を使うときだけ要り、使わないホストでは省いてよい。proxy が子のプロセスとして起動し、引き継いだ Unix domain socket の対で話す。待ち受けの port は持たない。設定の `kernel.engines.modsecurity.inspector` に書く |
 | 管理のプロセス | 同じ実行ファイルの `tukuyomi-proxy admin <config>`。proxy とは別の unit で動かす。loopback の待ち受けで、管理 API と管理画面（実行ファイルに組み込んである）に答える。ルールの世代の操作と、proxy への切り替えの依頼（制御 socket）をする |
 | 設定ファイル | JSON の1つのファイル。値に既定値はない。鍵は、省けると決まったもの（`acme`、`records`、`access`、`rate_limit`、`geo`、`admin` など）のほかは、すべて書く。proxy と管理のプロセスが同じファイルを読む |
 | ルールの保管場所 | ルールセットの世代を置くディレクトリ（設定の `rules.store.dir`）。`rules import` が世代を作り、`rules activate` が使う世代を選ぶ。管理のプロセスも同じ操作をする |
@@ -32,10 +33,16 @@
   - Linux の版によって、絞れる範囲が違う。どの版で絞ったかは、外からは見えない。
     - TCP の bind と connect まで絞るには、Linux 6.7 以上（Landlock の ABI 4 以上）が要る。それより前の版では、ファイルだけを絞って動く。
     - Linux 6.2 より前（ABI 1・2）では、ファイルの切り詰めを断れない。Linux 6.10 より前（ABI 4 まで）では、デバイスの ioctl を断れない。
+- ModSecurity の検査プロセスを動かすホストに要る共有 library は、libstdc++、libgcc_s、libc、libm だけである。libmodsecurity、YAJL、PCRE2 は実行ファイルに静的に入っているので、入れなくてよい。
 - build に要るもの。
   - Rust 1.94.1 以上（`proxy/Cargo.toml` の `rust-version`）
   - C の compiler（TLS に使う aws-lc-rs が、C のコードを build する）
-  - Go 1.27.2 以上（`inspector/go.mod`）
+  - Go 1.27.2（`inspector/go.mod`）。検査プロセスは、build した Go の版を検査核に知らせる。検査核は、`go1.27.2` のものだけを受け付ける。
+- ModSecurity の検査プロセスを build するときだけ、さらに要るもの。
+  - `rustc` 1.94.1 ちょうど（`rustc -vV` の `release:` の行が `1.94.1`）。proxy と違い、別の版で build した検査プロセスは検査核が受け付けない（下の「ModSecurity の検査プロセス」）。
+  - C と C++ の compiler、make
+  - libyajl-dev と libpcre2-dev（静的 library の `libyajl_s.a` と `libpcre2-8.a`）
+  - bash、curl、sha256sum、tar（libmodsecurity の取得。archive を `BUILD_MODSECURITY_ARCHIVE_FILE` で渡すなら curl は要らない）
 - CRS の取得に要るもの: bash、curl、sha256sum、tar。
 
 ## build
@@ -58,6 +65,45 @@ cd inspector && CGO_ENABLED=0 go build -mod=readonly -o tukuyomi-inspector .
 
 - 検査プロセスは、Landlock などの設定をすべての thread にかけるために、Go の `syscall.AllThreadsSyscall` を使う。cgo を使った実行ファイルでは、この呼び出しが `ENOTSUP` を返すため、検査プロセスは起動を断る（exit 14）。
 - 断った理由の文（「cgo で build された」など）は、検査プロセスの標準出力・標準エラーには出ない。`rules import` の `the inspector said:` の行と、SIGUSR1 の切り替えが失敗したときの `reload: the inspector said:` の行にだけ出る。proxy の起動では、`stop: the kernel failed: Exit(14)` の行だけが出る。
+
+### ModSecurity の検査プロセス
+
+ModSecurity の世代を使うときだけ build する。Coraza の世代だけを使うホストには要らない。先に libmodsecurity（ModSecurity v3.0.17）を、新しいディレクトリ（prefix）に静的 library として build し、その prefix を指して検査プロセスを build する。
+
+```bash
+scripts/build-modsecurity.sh <新しいディレクトリ>
+cd inspector-modsecurity && TUKUYOMI_MODSECURITY_PREFIX=<新しいディレクトリ> cargo build --release --locked
+```
+
+実行ファイルは `inspector-modsecurity/target/release/tukuyomi-inspector-modsecurity` にできる。
+
+`scripts/build-modsecurity.sh` は次のとおり動く。
+
+- 取得する版（3.0.17）と、配布の archive（`modsecurity-v3.0.17.tar.gz`）の sha256（`f283b33d5c21130fd3a15c84a93a1abe12bd1949edaf44288b12af571b671a50`）は、台本の中に固定してある。引数では変えられない。
+- archive は https だけで取り、固定した sha256 と一致してから中を読む。GitHub に届かないホストでは、固定した archive の写しを `BUILD_MODSECURITY_ARCHIVE_FILE` で渡せる。そのときも sha256 などの確かめは同じである。
+- 新しいディレクトリは、まだ無い絶対の path で、英数字と `.`・`_`・`+`・`-` だけで書く。`.` で始まる名前は使えない。相対で書くと、今いる場所からの path にする。
+- 新しいディレクトリの親は、既にあって、流す利用者が書けること。台本は、その隣に一時のディレクトリを作り、最後に1回の名前の変更で新しいディレクトリを置く。
+- 既にあるディレクトリには触らない。途中で失敗したときは何も残らない。
+- 数分かかる。
+- configure は、台本に固定した flag で流す。curl、Lua、MaxMind、GeoIP、libxml2、LMDB、ssdeep は使わず、YAJL と PCRE2 だけを使う。configure の結果がそうならなければ断る。外から規則を取り込む、スクリプトを実行する、データベースを引く、XML を解析する、といった機能をルールに使わせないための守りの一部なので、変えない。
+- prefix には、`include/`、`lib/libmodsecurity.a`、`include-src/`（libmodsecurity の内部の header）、`archive.sha256`（固定した archive の sha256 を書いた1行）ができる。
+
+検査プロセスの build は、次の場合に断る。
+
+- `TUKUYOMI_MODSECURITY_PREFIX` が無い、または絶対の path でない。
+- prefix に `include/modsecurity/modsecurity.h`、`include-src/src/variables/variable.h`、`lib/libmodsecurity.a` のどれかが無い。
+- prefix の `archive.sha256` が読めない、または小文字の16進数64桁の1行でない。
+- C++ の compiler が `libpcre2-8.a`（libpcre2-dev）か `libyajl_s.a`（libyajl-dev）を見つけられない。
+
+検査プロセスは、build した compiler の版、libmodsecurity の版、archive の sha256 を、起動の最初の知らせ（HELLO）で検査核に伝える。検査核は、ModSecurity では次の3つがすべて同じものだけを受け付ける。
+
+| 項目 | 受け付ける値 |
+|---|---|
+| build した compiler | `rustc 1.94.1` |
+| libmodsecurity の版 | `v3.0.17` |
+| archive の sha256 | 上の `f283b33d…b671a50` |
+
+違うと、検査核は `hello toolchain differs`、`hello engine version differs`、`hello engine source differs` のどれかで断り、起動し直さない。proxy の起動では `stop: the kernel failed: Hello("<文>")` の行が、`rules import` では `rules import: the trial failed: the inspector could not be started (Hello("<文>"))` の行が出る。
 
 ### CRS の取得
 
@@ -92,6 +138,7 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
 | 例 | 設定の鍵 | 持ち主と権限 |
 |---|---|---|
 | `/opt/tukuyomi-core/bin/tukuyomi-proxy`、`/opt/tukuyomi-core/bin/tukuyomi-inspector` | `kernel.inspector`（Coraza の検査プロセスの方） | root。サービスの利用者が書き換えられない所に置く |
+| `/opt/tukuyomi-core/bin/tukuyomi-inspector-modsecurity` | `kernel.engines.modsecurity.inspector`（ModSecurity の検査プロセスの方。省いてよい） | root。サービスの利用者が書き換えられない所に置く |
 | `/etc/tukuyomi-core/config.json` | （起動の引数） | root。サービスの利用者が読めること。大きさは 256 KiB まで |
 | `/var/lib/tukuyomi-core/store` | `rules.store.dir` | サービスの利用者。権限は 0700 |
 | `/var/lib/tukuyomi-core/tmp` | `kernel.tmp_root` | サービスの利用者。権限は 0700。setgid は付けない |
@@ -104,6 +151,7 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
 | `/var/lib/tukuyomi-core/crs-4.23.0` | `admin.crs_dir`（管理の API で CRS を取り込むとき） | 「CRS の取得」で作ったディレクトリ。サービスの利用者が読めること |
 | `/etc/tukuyomi-core/country.mmdb` | `geo.country_db` | root。サービスの利用者が読めて、書き換えられない形にする（0644）。proxy は持ち主と権限を確かめない |
 
+- 設定の `kernel.inspector` は、ModSecurity の世代だけを使うホストでも書く（省けない鍵である）。`kernel.engines` は、ModSecurity の世代を使うときだけ書く。書かないと、ModSecurity の世代は取り込めず、選べず、起動でも断られる（[運用リファレンス](../operations/operator-reference.md) の「`kernel`」）。
 - 上の表のディレクトリは、先に作っておく。proxy も命令も、これらは作らない。保管場所の中のもの（`generations/`、`staging/`、`using/` など）は、命令と proxy が作る。管理の置き場の中のものは管理のプロセスが、記録のファイルと制御 socket は proxy が作る。
 - ルールの保管場所、記録のディレクトリ、管理の置き場、制御 socket のあるディレクトリは、別々のディレクトリにする。同じにも、互いの中にも置けない（設定が断られる）。上の表の例は、どれも `/var/lib/tukuyomi-core` の下の別々のディレクトリである。
 - 保管場所、作業場所、記録のディレクトリ、管理の置き場、制御 socket のあるディレクトリは、本物のディレクトリ（link ではない）で、持ち主がプロセスの利用者で、group と other の権限が無いことを確かめる。確かめる時が違う。
@@ -148,6 +196,7 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
    - 取り込みでは、検査プロセスを1つ起動して決まった要求を3つ検査する（試し）。試しに通ったときだけ世代になり、標準出力に `<指紋> created` が出る。同じ中身の世代が既にあれば `already exists` が出る。
    - `--detect-only` を付けると、検知だけの世代になる。規則に当たった要求も通して、記録に残す。最初はこの形で動かし、誤検知を見てから遮断の世代に替えるとよい。
    - 遮断の世代では、試しの要求が1つでも遮断されると、試しに落ちて世代にならない。`crs-setup.conf` を強めたときなどは、記録を見て直すか、`--accept-block` を付ける。
+   - ModSecurity で検査する世代にするには、`--engine modsecurity` を付ける。設定の `kernel.engines` に検査プロセスが要る。試しは、そのエンジンの検査プロセスで流れる。
 4. 世代を選ぶ。
 
    ```bash
@@ -274,7 +323,7 @@ WantedBy=multi-user.target
 - `KillMode=mixed` にする。管理のプロセスは、ルールの取り込みの試しで検査プロセスを起動する。停止の SIGTERM が主プロセスにだけ届けば、管理のプロセスが、動いている試しを終えて、検査プロセスと作業場所を片付ける。
 - 管理のプロセスは、停止の合図（SIGTERM、SIGINT、SIGHUP）を受けると、待ち受けを閉じ、動いている要求を 10 秒まで待つ。`TimeoutStopSec` は、この 10 秒より長くする。取り込みの試しが動いているときのために、その検査プロセスを止める時間（`proxy.stop_inspect_ms` と `kernel.kill_grace_ms`）も足しておく。
 - `LogRateLimitIntervalSec=0` を置く。監査の記録は標準エラー（journal）にも出るので、journald の流量の上限で落ちないようにする。
-- 検査プロセスの実行ファイル（`kernel.inspector`。Coraza でない世代では `kernel.engines` の方）と作業場所（`kernel.tmp_root`）は、proxy と同じものを使う。取り込みの試しの検査プロセスは、proxy と同じに Landlock で自分を絞る。
+- 検査プロセスの実行ファイル（`kernel.inspector`。ModSecurity の世代では `kernel.engines` の方）と作業場所（`kernel.tmp_root`）は、proxy と同じものを使う。取り込みの試しの検査プロセスは、proxy と同じに Landlock で自分を絞る。
 - 管理のプロセスは、`admin.listen` の loopback の address で、平文の HTTP で待つ。1024 以上の port なら、`AmbientCapabilities` は要らない。
 - 設定ファイルは、起動のときに1回だけ読む。設定を変えたら、`config check` で確かめてから、`systemctl restart` で起動し直す。`ExecReload` は置かない（SIGHUP は読み直しではなく、停止である）。
 - proxy が動いていなくても、管理のプロセスは起動する。そのあいだは、世代の切り替えを依頼できない。
@@ -328,7 +377,9 @@ WantedBy=timers.target
 
 検査プロセスは、起動のときに次のとおり自分を絞る。どれもプロセスの全部の thread に、元に戻せない形でかける。
 
-1. ルールセットの世代を読む（この後はファイルを読まない）。読めなければ exit 11 で断る。別のエンジンの世代の manifest も、この検査プロセスは読めず、この exit 11 で断る。
+1. ルールセットの世代を読む。読めなければ exit 11 で断る。別のエンジンの世代の manifest も、この検査プロセスは読めず、この exit 11 で断る。
+   - Coraza の検査プロセスは、この後はファイルを読まない。
+   - ModSecurity の検査プロセスは、確かめたファイルを、起動ごとの一時のディレクトリの中に写す（写せなければ exit 14）。絞った後は、ルールをこの写しから組み、この写しだけを読む。
 2. Landlock の規則を組む。
    - 起動ごとの一時のディレクトリ（作業場所の中に作る）の外のファイルに触れなくする。作業場所の中のほかのディレクトリにも触れない。
    - 一時のディレクトリの中で許すのは、ファイルを作る・書く・読む・切り詰める・消すことだけである。ディレクトリを作る・一覧する、そこから外への名前の変更、プログラムの実行はできない。
@@ -337,7 +388,7 @@ WantedBy=timers.target
 4. `no_new_privs` を付ける。
 5. 最後に Landlock をかける。この時から 2 の制限が効く。
 
-2 から 5 のどれかが失敗したら、検査プロセスは起動を断る（exit 14）。この後で、ルールを Coraza で確かめて組み、要求を受け始める。ルールの確かめや組み立てに失敗したときは exit 11 で断る。
+2 から 5 のどれかが失敗したら、検査プロセスは起動を断る（exit 14）。この後で、ルールをその世代のエンジン（Coraza か ModSecurity）で確かめて組み、要求を受け始める。ルールの確かめや組み立てに失敗したときは exit 11 で断る。ModSecurity の検査プロセスは、ライブラリの準備ができないなど、環境の失敗では exit 14 で断る。
 
 絞れないものもある。
 

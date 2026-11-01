@@ -51,13 +51,13 @@ tukuyomi-proxy config check <config>
   - 通れば、標準出力に `accepted` の1行が出て exit 0 になる。
   - ほかの行は標準エラーに出て、`config check:` で始まる。引数の誤りのときだけ `config:` で始まり、使い方の行が続く。
   - exit code は起動と同じである。
-  - 選んだ世代のエンジンが使えるかも確かめる。使えなければ、`config check: rules generation refused: <理由>` の行を出して exit 1 になる。この build が持つ検査のエンジンは `coraza` だけである（下の「`kernel`」の `engines`）。
+  - 選んだ世代のエンジンが使えるかも確かめる。使えなければ、`config check: rules generation refused: <理由>` の行を出して exit 1 になる。この build が持つ検査のエンジンは `coraza` と `modsecurity` である。`modsecurity` の世代は、設定の `kernel.engines` に検査プロセスがあるときだけ使える（下の「`kernel`」の `engines`）。
 - `geo` があれば、国のデータベースも起動と同じに読んで確かめる（「要求の前の方針」の `geo`）。
 - 確かめないもの:
   - SIGCHLD と file descriptor（上の 1 のうち、root でないこと以外）
   - 作業場所（`kernel.tmp_root`）。検査プロセスを起動するときに確かめる
   - 検査プロセスの実行ファイルが起動できること、Landlock が使えること
-  - ルールが Coraza で組めること（起動のときに確かめる。ルールは `rules import` が試してから世代にする）
+  - ルールが世代のエンジン（Coraza か ModSecurity）で組めること（起動のときに確かめる。ルールは `rules import` が試してから世代にする）
   - 記録のファイルを開けること（上の 6）
   - 待ち受けと監視の待ち受けの port、制御 socket を bind できること
   - systemd の設定
@@ -91,7 +91,7 @@ tukuyomi-proxy rules list <config>
 | `--rules <file>` | 運用者のルールのファイル。何度でも書け、CRS の後に書いた順に読み込む |
 | `--data <file>` | 運用者のルールが読むデータのファイル。ルールセットに入るが、ルールとしては読み込まない |
 | `--routes <file>` | 検査しない経路（bypass）のファイル（下の「検査しない経路」） |
-| `--engine <name>` | 世代の検査のエンジンの名前。省けば `coraza`。この build が持つエンジンは `coraza` だけで、ほかのエンジンの世代は、何も置かずに断る（exit 2） |
+| `--engine <name>` | 世代の検査のエンジンの名前。`coraza` か `modsecurity`（小文字）。省けば `coraza`。これ以外の名前と、設定の `kernel.engines` に検査プロセスが無い `modsecurity` は、何も置かずに断る（exit 2） |
 | `--accept-block` | 試しの要求が遮断されても、試しを失敗にしない（当たった規則は出る） |
 | `--detect-only` | 検知だけの世代にする（下の「検知だけのモード」） |
 
@@ -167,9 +167,10 @@ tukuyomi-proxy admin reset <config> <name>
 - proxy は保管場所を読み、選ばれた世代で新しい検査核と検査プロセスを起動する。新しい方の準備ができたら、新しい要求をそちらへ回す。
   - 古い方は、持っている要求を `stop_inspect` まで検査してから止まる。
   - 新しい方が起動に失敗するか、`ready_wait` の中に準備できなければ、古い方がそのまま検査を続ける。
+  - 新しい検査プロセスは、その世代のエンジンの実行ファイル（Coraza は `kernel.inspector`、ModSecurity は `kernel.engines`）で起動する。エンジンが替わる切り替えも、proxy を止めずにできる。
   - 選ばれた世代のエンジンが使えないときは、切り替えない。`reload: rules store refused: <理由>` の文を出し、古い方がそのまま検査を続ける。`rules activate` と管理のプロセスは、そのような世代を選ばない。
 - 検査しない経路の表は、新しい世代が要求を受け始めるときに一緒に入れ替わる。
-- 切り替えの間は検査プロセスが2つになり、メモリもおよそ2倍になる。CRS 4.23.0 で測った検査プロセスは、1つ約 52 MB だった。
+- 切り替えの間は検査プロセスが2つになり、メモリもおよそ2倍になる。CRS 4.23.0 で測った Coraza の検査プロセスは、1つ約 52 MB だった（ModSecurity の検査プロセスは測っていない）。
 - 合図の処理が入ってから待ち受けを bind するまでの間、切り替えの途中、停止の間に受けた SIGUSR1 は、記録に文を1つ出すだけで何もしない。今と同じ世代が選ばれているときも、その旨の文を出すだけである。
 - 使っている間、proxy は世代の印（保管場所の `using/<指紋>`）に共有の lock を持つ。そのため `rules remove` は、使用中の世代を消せない。
 - 管理のプロセスは、制御 socket でも同じ切り替えを依頼できる（下の「制御 socket」）。切り替えの手順と、`tukuyomi_rules_switches_total` の数え方は SIGUSR1 と同じである。
@@ -610,11 +611,11 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 | 鍵 | 範囲 | 意味 |
 |---|---|---|
-| `inspector` | 絶対の path | Coraza の検査プロセスの実行ファイル |
-| `engines` | 省いてよい。`{"modsecurity": {"inspector": <絶対の path>}}` の形で、どちらの段の鍵も要る。path は 4095 バイトまで | Coraza 以外のエンジンの検査プロセスの実行ファイル。この build が持つエンジンは `coraza` だけなので、ここに書いても、`coraza` でない世代は、取り込み、選択、起動のどれでも断る |
+| `inspector` | 絶対の path | Coraza の検査プロセスの実行ファイル。省けない鍵で、ModSecurity の世代だけを使うホストでも書く |
+| `engines` | 省いてよい。`{"modsecurity": {"inspector": <絶対の path>}}` の形で、どちらの段の鍵も要る。path は 4095 バイトまで | ModSecurity の検査プロセスの実行ファイル。`modsecurity` の世代を使うときに起動する。省くと、`modsecurity` の世代は、取り込み、選択、起動のどれでも `kernel.engines has no inspector for the engine of the generation` で断る |
 | `tmp_root` | 絶対の path、3840 バイトまで | 起動ごとの作業場所を作る親。本物のディレクトリで、持ち主が proxy の利用者、group と other の権限が無く、setgid が無いこと |
-| `gomaxprocs` | 1〜65535 | 検査プロセスの `GOMAXPROCS` |
-| `gomemlimit` | 1〜9223372036854775807（バイト） | 検査プロセスの `GOMEMLIMIT` |
+| `gomaxprocs` | 1〜65535 | 検査プロセスの `GOMAXPROCS`。ModSecurity の検査プロセスは、1つの thread で動くので使わない（受けた値を最初の知らせで返すだけ） |
+| `gomemlimit` | 1〜9223372036854775807（バイト） | 検査プロセスの `GOMEMLIMIT`。ModSecurity の検査プロセスは、使わない（受けた値を最初の知らせで返すだけで、メモリの上限にはならない） |
 | `slots` | 1〜4 | 同時に検査する要求の数 |
 | `wait_queue` | 1 以上、`max_conns` 以下 | 検査の枠を待つ要求の数 |
 | `records` | `slots + wait_queue` 以上 | 同時に持つ要求の記録の数。最上位の `records`（記録のファイル）とは別の鍵である |
@@ -702,7 +703,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 | 依頼 | 答え |
 |---|---|
-| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "ready"}`。使っている世代の指紋（64 桁）、その世代のモード（`block`、`detect`）、その世代のエンジン（この build では `coraza`）、検査核の段（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、`/readyz` が `ready` と答える状態か |
+| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "ready"}`。使っている世代の指紋（64 桁）、その世代のモード（`block`、`detect`）、その世代のエンジン（`coraza` か `modsecurity`）、検査核の段（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、`/readyz` が `ready` と答える状態か |
 | `{"op":"switch","expect":"<指紋 64 桁>"}` | ルールの保管場所が今選んでいる世代が `expect` と同じときだけ、SIGUSR1 と同じ切り替えをする。切り替えが終わってから、`{"result", "reason"?, "generation"}` で答える。`generation` は、答えるときに使っている世代である |
 | ほかの行 | `{"result":"error","reason":..}`。`reason` は `line too long`、`malformed request`、`unknown op`、`bad expect` |
 
@@ -784,7 +785,8 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 ## ルールセットと世代
 
 - 世代は、`rules import` が作るルールセットの一式で、指紋（manifest の sha256）で呼ぶ。作った後は変えない。
-- 世代は、ルールを検査するエンジンも持つ（`rules import --engine`。省けば `coraza`）。同じファイルでも、エンジンが違えば manifest が変わり、別の世代（別の指紋）になる。この build が持つエンジンは `coraza` だけで、ほかのエンジンの世代は断られる。
+- 世代は、ルールを検査するエンジンも持つ（`rules import --engine`。省けば `coraza`）。この build が持つエンジンは `coraza`（Coraza）と `modsecurity`（ModSecurity v3）である。同じファイルでも、エンジンが違えば manifest が変わり、別の世代（別の指紋）になる。`modsecurity` の世代は、設定の `kernel.engines` に検査プロセスがあるときだけ、取り込み、選択、起動ができる。
+- 「検査プロセスが足す決まり」は、Coraza の世代の決まりである。ModSecurity の世代の決まりは、「ModSecurity の世代」にある。
 - 保管場所の中身:
   - `generations/<指紋>/`: 世代
   - `current`: 選んだ世代
@@ -800,7 +802,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 - `rules import --detect-only` で作った世代は、規則に当たった要求も通す。要求の記録は class `forwarded`、reason `detected by a rule` で、`rule` に当たった規則の id が入る。
 - 遮断の世代と同じルールのファイルで、遮断するかどうかだけが違う。最初はこの形で動かし、誤検知を見て除外を足してから、遮断の世代を取り込み直すとよい。
 - 検知だけの世代でも、下の「検査プロセスが足す決まり」の規則は遮断する。
-- 検知だけの世代は、ルールの前と後に印の規則（id 4000010、4000011）を足す。運用者の規則でこれを消したり飛ばしたりすると、その要求は検査できないとして 503 になる。黙って遮断や素通しにはならない。
+- Coraza の検知だけの世代は、ルールの前と後に印の規則（id 4000010、4000011）を足す。運用者の規則でこれを消したり飛ばしたりすると、その要求は検査できないとして 503 になる。黙って遮断や素通しにはならない。ModSecurity の世代は、印の規則を足さない。
 
 ### 検査プロセスが足す決まり
 
@@ -814,17 +816,68 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
   - `ctl:ruleEngine`・`ctl:requestBodyAccess`・`ctl:requestBodyLimit`
   - `@inspectFile`・`@rbl`・`setenv:`
   - 変数の名前 `reserved_body_cut`
-- 運用者の規則が本文の処理（`ctl:requestBodyProcessor` など）を替えたり、上の規則を実行時に外したりして、検査が終わったと確かめられない要求は、503 になる。
+- 運用者の規則が本文の処理（`ctl:requestBodyProcessor` など）を替えたり、上の規則を実行時に外したりして、検査が終わったと確かめられない要求は、503 になる。ModSecurity の世代で、ほかに検査できないとする要求は、「ModSecurity の世代」にある。
 
 ### 運用者に任せていること
 
 - `ctl:ruleRemoveById`、`SecRuleRemoveById` などで遮断の規則をわざと外すことは、運用者の方針として断らない。
-- ただし `SecRuleRemoveByMsg` は、前に `SecMarker` があると Coraza が異常終了し、ルールセットが組めない（exit 11）。CRS は `SecMarker` を多く使うので、CRS と一緒には使えない。
+- ただし Coraza の世代では、`SecRuleRemoveByMsg` は、前に `SecMarker` があると Coraza が異常終了し、ルールセットが組めない（exit 11）。CRS は `SecMarker` を多く使うので、CRS と一緒には使えない。
 - 取り込みと検査プロセスが捕まえるのは、marker の事故（無い marker や前にある marker への `skipAfter`、名前の打ち違い）だけである。
 - Coraza の推奨の設定にある、`REQBODY_ERROR`・`MULTIPART_STRICT_ERROR` を見る規則（200002、200003）を運用者が足すと、先頭で切った本文も遮断する。本文の途中で切ると、解析が失敗することがあるためである。
   - 検査プロセスの規則 4000001 は、切った本文の解析の失敗では遮断しない。
   - CRS 4.23.0 には、これに当たる規則は無い。
 - CRS の既定は、`application/<名前>+json` の本文を遮断する。受けるなら、取り込みの前に `crs-setup.conf` で受け付ける型に足す。
+
+### ModSecurity の世代
+
+`rules import --engine modsecurity` で作る世代は、libmodsecurity（ModSecurity v3.0.17）で要求を検査する。検査プロセスは別の実行ファイル（`tukuyomi-inspector-modsecurity`）で、設定の `kernel.engines.modsecurity.inspector` に書く（[実行ファイルの build と配置](../build/binary-deployment.md)）。取り込みの手順、試し、`--detect-only`、検査しない経路、CRS の取り込みは、Coraza の世代と同じである。
+
+検査プロセスが足す決まり（運用者のルールで替えることはできない）:
+
+- 検査の engine は On、本文は読む、JSON の入れ子は 64 段まで。この3つは、検査プロセスが運用者のルールより先に設定する。ModSecurity は最初に設定された値を使うので、ルールに `SecRuleEngine`・`SecRequestBodyAccess`・`SecRequestBodyJsonDepthLimit` を書いても効かない。
+- 本文と引数の上限は、ModSecurity には設定せず、検査プロセスが自分で数える。引数の数は、query、form の本文、JSON の本文のそれぞれで 1000 までで、超えると規則 4000002 で遮断する（JSON は、値の数と空でない配列の数を別々に数える）。multipart の本文は数えない。
+- 規則の id 4000001〜4000011 は、検査プロセスのために空けてある。運用者の規則が使うと、モードを問わず、その世代のルールセットは組めない。ModSecurity の世代は、検知だけの世代でも印の規則（4000010、4000011）を足さない。
+- 規則の id 4000001（本文の解析の失敗）、4000002（引数の数の上限）、4000003（URI の解析の失敗）で遮断する。検知だけの世代でも遮断する。4000001 は、検査する長さで切った本文では遮断しない。
+
+取り込みの試しで、検査プロセスは、ルールのファイルを読んで確かめる。次のものがあると、検査プロセスは起動を断り（exit 11）、取り込みは失敗する。標準エラーの `rules import: the inspector said:` の行（管理 API では `trial` の `detail`）に、理由の文と、ルールのファイルの名前が出る。ModSecurity が読める書き方でも、確かめられる決まった書き方でなければ断るので、害の無いルールを断ることがある。
+
+- ファイル: 行の終わりに CR がある（CRLF の改行）、NUL を含む、最後が改行で終わらない。
+- 書き方: 決まった書き方でないもの。たとえば、`phase:'request'` のように phase を引用符で囲んだもの。
+- 指示: 使えるのは、`SecRule`、`SecAction`、`SecDefaultAction`、`SecMarker`、`SecRuleRemoveById`・`SecRuleRemoveByTag`・`SecRuleRemoveByMsg`、`SecRuleUpdateTargetById`・`SecRuleUpdateTargetByTag`・`SecRuleUpdateTargetByMsg`、`SecRuleEngine`・`SecRequestBodyAccess`・`SecRequestBodyJsonDepthLimit`（受け付けるが効かない）、`SecComponentSignature`、`SecAuditEngine Off`、応答の本文の指示（`SecResponseBodyAccess`・`SecResponseBodyLimit`・`SecResponseBodyLimitAction`・`SecResponseBodyMimeType`・`SecResponseBodyMimeTypesClear`）である。ほかは断る。たとえば次のものである。
+  - `Include`、名前が `SecRemoteRules` で始まる指示、`SecIgnoreRuleCompilationErrors`
+  - 名前が `SecAuditLog`・`SecDebugLog`・`SecUpload` で始まる指示、`SecTmpSaveUploadedFiles`、`SecDataDir`、`SecTmpDir`
+  - 本文と引数の上限を決める指示（`SecRequestBodyLimit`・`SecRequestBodyNoFilesLimit`・`SecRequestBodyLimitAction`・`SecRequestBodyInMemoryLimit`・`SecArgumentsLimit`）
+  - ModSecurity が知らない指示
+- アクション: 使えるのは、`accuracy`・`allow`・`auditlog`・`block`・`capture`・`chain`・`ctl`・`deny`・`drop`・`expirevar`・`id`・`initcol`・`log`・`logdata`・`maturity`・`msg`・`multiMatch`・`noauditlog`・`nolog`・`pass`・`phase`・`redirect`・`rev`・`setrsc`・`setsid`・`setuid`・`setvar`・`severity`・`skip`・`skipAfter`・`status`・`t`・`tag`・`ver`・`xmlns` である。`exec` と `setenv` を含め、ほかは断る。
+  - `ctl` で使えるのは、`auditEngine`・`auditLogParts`・`forceRequestBodyVariable`・`parseXmlIntoArgs`・`requestBodyProcessor`・`ruleRemoveById`・`ruleRemoveByTag`・`ruleRemoveTargetById`・`ruleRemoveTargetByTag` である。`ruleEngine`・`requestBodyAccess`・`requestBodyLimit` を含め、ほかは断る。
+  - 要求を止めるアクション（`deny`・`drop`・`redirect`・`block`）と `nolog`・`noauditlog` を、同じ規則に書くと断る。どの規則が止めたかが分からなくなるためである。`SecDefaultAction` に `nolog`・`noauditlog` や `skipAfter` を書くことも断る。
+  - `skipAfter` が指す `SecMarker` が、その後ろ（同じファイルか、後に読み込むファイル）に無いときは断る。
+- 演算子: `@inspectFile`・`@rbl`・`@validateDTD`・`@validateSchema`・`@fuzzyHash`・`@geoLookup`・`@gsbLookup`・`@rsub`・`@validateHash` は断る。ファイルを読む演算子（`@pmFromFile`・`@pmf`・`@ipMatchFromFile`・`@ipMatchF`）は、ルールセットの中にあるファイルを、英数字・`.`・`_`・`-` だけの path で書いたときだけ使える。path は、ルールセットの中の path（`rules/<名前>` など）か、そのルールのファイルのあるディレクトリからの path である。
+- 変数と長さ: 変数 `ENV` は断る。1つの変数の並びは 256 個まで、`chain` でつなぐ規則は 64 個までである。
+- 文字の並び: 上の読み取りとは別に、規則の文字から空白と引用符を除き、大小を区別せずに、`ctl:ruleEngine`・`ctl:requestBodyAccess`・`ctl:requestBodyLimit`・`exec:`・`setenv:`・`@inspectFile`・`@rbl`・`@validateDTD`・`@validateSchema`・`@fuzzyHash` を探す。`msg` の中にあっても断る。
+- 読み取りとの食い違い: 検査プロセスは、ModSecurity が組んだ規則を、読み取った内容と照らす。食い違うルールは断る。
+
+`ctl:ruleRemoveById` や `SecRuleRemoveById` などで遮断の規則をわざと外すことは、Coraza の世代と同じく、運用者の方針として断らない。
+
+Coraza の世代と違うところは次のとおりである。同じルールと要求でも、結果が違うことがある。
+
+1. 検知だけの世代では、運用者の規則が要求を止める判定をした後、ModSecurity は、その phase の残りの規則だけを飛ばす。そのため、記録の `rules`（当たった規則）と `score` が、Coraza の世代より短く、小さくなることがある。
+2. 検査する長さで切った本文の解析が失敗したとき、ModSecurity は、解析が止まった所から後の本文を、規則に渡さない。`Content-Type` の parameter のせいで解析が始まらないとき（たとえば `Boundary=` を大文字で書いたとき）は、本文を何も渡さない。切っていない本文は、解析が失敗すれば 4000001 で遮断する。
+3. 入れ子が 62〜64 段の JSON の本文は、ModSecurity では止まらず、Coraza では止まる。65 段からは、どちらも止まる（決まりの上限は 64 段である）。
+4. `multiMatch` を付けた、要求を止める規則と、`msg` の無い、要求を止める `SecAction` は、ModSecurity では、それが止めた要求がすべて検査できない扱いになる。503 になり、proxy は通さない。
+5. `ARGS:/re/` のように、変数の選択に書いた正規表現が失敗しても、ModSecurity は失敗の印を残さない。そのため、要求は検査できない扱いにならない。
+6. `@verifyCC`・`@verifyCPF`・`@verifySSN` の失敗も、5 と同じで、失敗の印を残さない（CRS は使わない）。`@rx` の失敗は、検査できない扱いにする。
+7. JSON の本文の値は、`ARGS` にだけ入り、`ARGS_POST` には入らない（CRS は `ARGS` を読む）。
+8. `REQUEST_URI` は、`%XX` をほどいた URL である（ほどく前の形は `REQUEST_URI_RAW`）。そのため、`REQUEST_URI` を見る規則は、path の中にある `%XX` で符号化した攻撃に、Coraza の世代では当たらなくても、ModSecurity の世代では当たることがある。
+9. 終わりの境界が無い multipart の本文は、ModSecurity では本文の解析の失敗として、4000001 で遮断する（切った本文を除く）。Coraza は通す。
+
+次の要求は、ModSecurity の世代では検査できない扱いになり、503 になる。Coraza の世代ではそうならない。
+
+- 規則の正規表現が失敗したか、match の回数の上限に当たった要求（5 と 6 のものを除く）。
+- 境界が空の multipart の本文（`boundary=` や `boundary=""`）。ModSecurity は、この本文を何も解析せず、そのことも知らせないためである。
+- `Content-Type` を2つ以上持つ空でない本文。ただし、proxy が先に 415 で断る（「本文の型」）ので、検査プロセスまでは届かない。
+
+本文の処理を替えるなどで、検査が終わったと確かめられない要求が 503 になることは、Coraza の世代と同じである（「検査プロセスが足す決まり」）。
 
 ### 検査しない経路
 
@@ -1089,7 +1142,7 @@ client へ答えを書いた要求ごとに1件出る。head の拒否、redirec
 | `reason` | 決まった英語の語句（例: `malformed request head`、`body over the limit`、`inspection queue full`、`upstream connection failed`、`denied by access`、`too many requests`） |
 | `ms` | かかった時間（ミリ秒） |
 | `upstream`、`server` | 上流の組の名前と、最後に試した server の address（試していなければ `server` は無い） |
-| `mode`、`engine`、`generation` | 判定したルールの世代のモード（`block` か `detect`）と、そのエンジン（この build では `coraza`）と、世代の指紋の先頭16桁。検査しなかった要求には無い |
+| `mode`、`engine`、`generation` | 判定したルールの世代のモード（`block` か `detect`）と、そのエンジン（`coraza` か `modsecurity`）と、世代の指紋の先頭16桁。検査しなかった要求には無い |
 | `rule` | 遮断した規則、または検知だけのモードで当たった規則の id |
 | `rules` | ほかに当たった規則の id。評価の順に16個まで。記録しない規則（`nolog`）と、検査プロセスが足す決まり（4000001〜4000011）は入らない |
 | `rules_more` | 16個より多く当たったとき `true` |
