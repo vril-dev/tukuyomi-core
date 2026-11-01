@@ -19,13 +19,20 @@
 //! restricted: a second thread would be left as free as it was.
 //!
 //! The unsafe code of this crate is here and in `ffi`. Each block says why it is sound.
+//!
+//! The rest of this module is the other calls that the start of the process needs and that safe Rust does not have,
+//! each a small function: the check of the connection that the kernel gave as descriptor 0 and the taking of it as
+//! a stream (`check_peer`, `inherited_stream`), the user id (`effective_uid`), the signals (`set_signals`) and the
+//! alarm that ends the process (`set_deadline`), and the clearing of the environment (`clear_environment`).
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use libc::{c_int, c_long, c_ulong};
 
@@ -101,7 +108,7 @@ unsafe extern "C" {
     fn tzset();
 }
 
-/// Why the process could not be restricted. The text holds no path.
+/// Why the process could not be restricted or set up. The text holds no path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The process has more than one thread.
@@ -371,6 +378,206 @@ fn drop_capabilities() -> Result<(), Error> {
         unsafe { libc::syscall(libc::SYS_capset, &raw const header, data.as_ptr(), NONE) };
     if dropped != 0 {
         return Err(Error::call("drop capabilities"));
+    }
+    Ok(())
+}
+
+/// The user id that the process acts as.
+pub fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no argument and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// The descriptor on which the kernel hands the connection over.
+const INHERITED_FD: RawFd = 0;
+const INT_LEN: libc::socklen_t = size_of::<c_int>() as libc::socklen_t;
+const CRED_LEN: libc::socklen_t = size_of::<libc::ucred>() as libc::socklen_t;
+
+/// Why a descriptor is not the connection of the process that started this one. The text holds no path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerError {
+    /// The descriptor is not a socket.
+    NotSocket,
+    /// The socket is not a unix stream socket.
+    NotUnixStream,
+    /// The user id of the peer is not ours.
+    Uid,
+    /// The peer is not the process that started this one.
+    Parent,
+    /// The connection was taken already.
+    Taken,
+    /// A system call failed: its name and its errno.
+    Call { call: &'static str, errno: c_int },
+}
+
+impl fmt::Display for PeerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PeerError::NotSocket => f.write_str("fd is not a socket"),
+            PeerError::NotUnixStream => f.write_str("fd is not a unix stream socket"),
+            PeerError::Uid => f.write_str("peer uid differs"),
+            PeerError::Parent => f.write_str("peer pid is not the parent"),
+            PeerError::Taken => f.write_str("the connection was taken already"),
+            PeerError::Call { call, errno } => {
+                write!(f, "{call}: {}", io::Error::from_raw_os_error(*errno))
+            }
+        }
+    }
+}
+
+impl std::error::Error for PeerError {}
+
+/// An option of the socket `fd` that is an integer, or the errno of the failure.
+fn socket_option(fd: RawFd, option: c_int) -> Result<c_int, c_int> {
+    let mut value: c_int = 0;
+    let mut length = INT_LEN;
+    // SAFETY: `value` is a live integer, and `length` is its size and a live integer.
+    let read = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            (&raw mut value).cast(),
+            &raw mut length,
+        )
+    };
+    if read != 0 {
+        return Err(last_errno());
+    }
+    if length != INT_LEN {
+        return Err(libc::EINVAL);
+    }
+    Ok(value)
+}
+
+/// Requires `fd` to be a connected unix stream socket whose peer is the process that started this one, with our
+/// user id. The peer is the one that made the pair, which is the parent when the parent started this process
+/// directly. Nothing is changed.
+pub fn check_peer(fd: RawFd) -> Result<(), PeerError> {
+    let call = |call: &'static str| move |errno| PeerError::Call { call, errno };
+    let domain = match socket_option(fd, libc::SO_DOMAIN) {
+        Ok(domain) => domain,
+        Err(libc::ENOTSOCK) => return Err(PeerError::NotSocket),
+        Err(errno) => return Err(call("socket domain")(errno)),
+    };
+    let kind = socket_option(fd, libc::SO_TYPE).map_err(call("socket type"))?;
+    if domain != libc::AF_UNIX || kind != libc::SOCK_STREAM {
+        return Err(PeerError::NotUnixStream);
+    }
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = CRED_LEN;
+    // SAFETY: `cred` is a live struct, and `length` is its size and a live integer.
+    let read = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &raw mut length,
+        )
+    };
+    if read != 0 {
+        return Err(call("peer credentials")(last_errno()));
+    }
+    if length != CRED_LEN {
+        return Err(call("peer credentials")(libc::EINVAL));
+    }
+    if cred.uid != effective_uid() {
+        return Err(PeerError::Uid);
+    }
+    if u32::try_from(cred.pid) != Ok(std::os::unix::process::parent_id()) {
+        return Err(PeerError::Parent);
+    }
+    Ok(())
+}
+
+/// Set once the connection is taken.
+static INHERITED_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// Takes the connection of the kernel, descriptor 0, as the stream of the session, in blocking mode. The descriptor
+/// is checked as `check_peer` does. It is taken once: the stream owns the descriptor and closes it, so a second
+/// owner is refused.
+pub fn inherited_stream() -> Result<UnixStream, PeerError> {
+    check_peer(INHERITED_FD)?;
+    if INHERITED_TAKEN.swap(true, Ordering::SeqCst) {
+        return Err(PeerError::Taken);
+    }
+    // SAFETY: `check_peer` asked the descriptor for its socket options, so it is open, and this is the only place
+    // that makes an owner of it, once. Standard input of this process is not read.
+    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(INHERITED_FD) });
+    stream.set_nonblocking(false).map_err(|e| PeerError::Call {
+        call: "blocking mode",
+        errno: e.raw_os_error().unwrap_or(libc::EIO),
+    })?;
+    Ok(stream)
+}
+
+/// The exit code that the alarm ends the process with: set by `set_signals`, read by the handler of SIGALRM.
+static DEADLINE_EXIT: AtomicI32 = AtomicI32::new(0);
+
+/// The handler of SIGALRM: ends the process at once with the exit code of `set_signals`. It does nothing else, so it
+/// uses nothing that is unsafe in a handler: an atomic and `_exit`.
+extern "C" fn end_at_deadline(_signal: c_int) {
+    // SAFETY: `_exit` is safe to call in a signal handler. It ends the process without running anything else.
+    unsafe { libc::_exit(DEADLINE_EXIT.load(Ordering::Relaxed)) }
+}
+
+/// Sets how the process answers a signal, whatever it was started with: a disposition that is ignored and a signal
+/// that is blocked are both passed on by exec. SIGUSR1 and SIGUSR2 are ignored (a reload of the service sends them
+/// to the whole process group), SIGPIPE is ignored so that a write to a closed connection fails with an error, and
+/// SIGTERM, SIGINT and SIGHUP end the process. SIGALRM ends it with `deadline_exit` (see `set_deadline`). No signal
+/// is blocked.
+pub fn set_signals(deadline_exit: i32) -> Result<(), Error> {
+    DEADLINE_EXIT.store(deadline_exit, Ordering::Relaxed);
+    let handler: extern "C" fn(c_int) = end_at_deadline;
+    for (signal, how) in [
+        (libc::SIGUSR1, libc::SIG_IGN),
+        (libc::SIGUSR2, libc::SIG_IGN),
+        (libc::SIGPIPE, libc::SIG_IGN),
+        (libc::SIGTERM, libc::SIG_DFL),
+        (libc::SIGINT, libc::SIG_DFL),
+        (libc::SIGHUP, libc::SIG_DFL),
+        (libc::SIGALRM, handler as *const () as libc::sighandler_t),
+    ] {
+        // SAFETY: `signal` takes a signal number and SIG_IGN, SIG_DFL or the address of a handler with the
+        // signature of `end_at_deadline`.
+        if unsafe { libc::signal(signal, how) } == libc::SIG_ERR {
+            return Err(Error::call("signal"));
+        }
+    }
+    let mut none = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `none` is room for a signal set, which `sigemptyset` fills in; `sigprocmask` then reads it and passes
+    // no pointer for the old mask.
+    let unblocked = unsafe {
+        libc::sigemptyset(none.as_mut_ptr()) == 0
+            && libc::sigprocmask(libc::SIG_SETMASK, none.as_ptr(), std::ptr::null_mut()) == 0
+    };
+    if unblocked {
+        Ok(())
+    } else {
+        Err(Error::call("signal mask"))
+    }
+}
+
+/// Has the process ended with the exit code of `set_signals` after `seconds`, unless this is called again before:
+/// 0 cancels it. The alarm of a process is one, so a call replaces the one that is pending.
+pub fn set_deadline(seconds: u32) {
+    // SAFETY: `alarm` takes a plain integer. What it returns, the seconds that were left, is not needed.
+    unsafe { libc::alarm(seconds) };
+}
+
+/// Removes every variable from the environment. The process must have one thread: nothing else reads or changes the
+/// environment while it is emptied, and the values that `std::env` hands out are copies.
+pub fn clear_environment() -> Result<(), Error> {
+    one_thread()?;
+    // SAFETY: `clearenv` takes no argument. Nothing holds a reference into the environment (see above), and with one
+    // thread nothing else uses it at the same time.
+    if unsafe { libc::clearenv() } != 0 {
+        return Err(Error::call("clear the environment"));
     }
     Ok(())
 }

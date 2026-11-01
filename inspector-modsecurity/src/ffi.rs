@@ -14,6 +14,7 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::{Mutex, PoisonError};
 
 use libc::{c_char, c_int};
@@ -29,6 +30,20 @@ struct RawRules {
     _opaque: [u8; 0],
 }
 
+#[repr(C)]
+struct RawTransaction {
+    _opaque: [u8; 0],
+}
+
+/// One rule that matched, as `tkv_tx_messages` writes it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawMessage {
+    id: i64,
+    severity: i32,
+    disruptive: i32,
+}
+
 // The codes that `tkv_rules_add_file` and `tkv_rules_add_text` return, and the numbers that
 // `tkv_rules_settings` gives for the rule engine and for a setting that was not set.
 const ADDED: c_int = 0;
@@ -37,6 +52,15 @@ const ENGINE_OFF: c_int = 0;
 const ENGINE_DETECTION_ONLY: c_int = 1;
 const ENGINE_ON: c_int = 2;
 const NOT_SET: c_int = 3;
+
+// What `tkv_tx_append_body` returns when the library took fewer bytes than it was given, and the numbers of the
+// request body processors.
+const SHORT: c_int = 3;
+const PROCESSOR_NONE: c_int = 0;
+const PROCESSOR_URL_ENCODED: c_int = 1;
+const PROCESSOR_MULTIPART: c_int = 2;
+const PROCESSOR_JSON: c_int = 3;
+const PROCESSOR_OTHER: c_int = 4;
 
 // What `tkv_rules_check` found.
 const FOUND_NOTHING: c_int = 0;
@@ -79,6 +103,67 @@ unsafe extern "C" {
         length: *mut usize,
     ) -> c_int;
     fn tkv_rules_free(rules: *mut RawRules);
+    fn tkv_tx_new(
+        engine: *mut RawEngine,
+        rules: *mut RawRules,
+        id: *const c_char,
+    ) -> *mut RawTransaction;
+    fn tkv_tx_free(tx: *mut RawTransaction);
+    fn tkv_tx_connection(
+        tx: *mut RawTransaction,
+        client: *const c_char,
+        client_port: c_int,
+        server: *const c_char,
+        server_port: c_int,
+    ) -> c_int;
+    fn tkv_tx_uri(
+        tx: *mut RawTransaction,
+        uri: *const u8,
+        uri_length: usize,
+        method: *const c_char,
+        version: *const c_char,
+    ) -> c_int;
+    fn tkv_tx_header(
+        tx: *mut RawTransaction,
+        name: *const u8,
+        name_length: usize,
+        value: *const u8,
+        value_length: usize,
+    ) -> c_int;
+    fn tkv_tx_request_headers(tx: *mut RawTransaction) -> c_int;
+    fn tkv_tx_set_processor(tx: *mut RawTransaction, processor: c_int) -> c_int;
+    fn tkv_tx_append_body(tx: *mut RawTransaction, bytes: *const u8, length: usize) -> c_int;
+    fn tkv_tx_request_body(tx: *mut RawTransaction) -> c_int;
+    fn tkv_tx_logging(tx: *mut RawTransaction) -> c_int;
+    fn tkv_tx_intervention(
+        tx: *mut RawTransaction,
+        taken: *mut c_int,
+        status: *mut c_int,
+        redirect: *mut c_int,
+    ) -> c_int;
+    fn tkv_tx_state(
+        tx: *const RawTransaction,
+        engine_on: *mut c_int,
+        body_access: *mut c_int,
+        processor: *mut c_int,
+        request_error: *mut c_int,
+        processor_error: *mut c_int,
+        pcre_limit: *mut c_int,
+        pcre_error: *mut c_int,
+    ) -> c_int;
+    fn tkv_tx_messages(
+        tx: *const RawTransaction,
+        buffer: *mut RawMessage,
+        capacity: usize,
+        count: *mut usize,
+    ) -> c_int;
+    fn tkv_tx_score(
+        tx: *mut RawTransaction,
+        buffer: *mut u8,
+        capacity: usize,
+        length: *mut usize,
+        present: *mut c_int,
+    ) -> c_int;
 }
 
 /// A failure of the library. It says what failed and nothing of the paths or the rules.
@@ -93,6 +178,10 @@ pub enum Error {
     /// The library refused the rules file or the text: it could not be read, or a rule in it is
     /// wrong.
     Rules,
+    /// A value of the request holds a NUL byte where the library reads a C string.
+    Value,
+    /// The library took fewer bytes of the request body than it was given.
+    Short,
     /// Any other failure.
     Internal,
 }
@@ -104,6 +193,8 @@ impl Error {
             Error::Path => "the path of the rules file holds a NUL byte",
             Error::Text => "the text of rules holds a NUL byte",
             Error::Rules => "the engine library refused the rules",
+            Error::Value => "a value of the request holds a NUL byte",
+            Error::Short => "the engine library took less of the request body than it was given",
             Error::Internal => "the engine library failed",
         }
     }
@@ -348,6 +439,350 @@ impl Drop for Rules {
     fn drop(&mut self) {
         // SAFETY: `raw` came from `tkv_rules_new` and is freed only here.
         unsafe { tkv_rules_free(self.raw.as_ptr()) }
+    }
+}
+
+/// The request body processors that the inspector sets and that the library reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Processor {
+    /// No processor: the library parses no body.
+    None,
+    UrlEncoded,
+    Multipart,
+    Json,
+    /// A processor that a rule put in place and that this build of the library does not parse with (XML). It is
+    /// read and never set.
+    Other,
+}
+
+impl Processor {
+    fn number(self) -> c_int {
+        match self {
+            Processor::None => PROCESSOR_NONE,
+            Processor::UrlEncoded => PROCESSOR_URL_ENCODED,
+            Processor::Multipart => PROCESSOR_MULTIPART,
+            Processor::Json => PROCESSOR_JSON,
+            Processor::Other => PROCESSOR_OTHER,
+        }
+    }
+
+    fn from_number(number: c_int) -> Option<Processor> {
+        match number {
+            PROCESSOR_NONE => Some(Processor::None),
+            PROCESSOR_URL_ENCODED => Some(Processor::UrlEncoded),
+            PROCESSOR_MULTIPART => Some(Processor::Multipart),
+            PROCESSOR_JSON => Some(Processor::Json),
+            PROCESSOR_OTHER => Some(Processor::Other),
+            _ => None,
+        }
+    }
+}
+
+/// What a transaction holds that has to be known before a request is let through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransactionState {
+    /// The rule engine of this transaction is on (a rule can change it for one transaction).
+    pub engine_on: bool,
+    /// The request body is read, so the rules of phase 2 run on it.
+    pub body_access: bool,
+    /// The processor that would parse the request body now.
+    pub processor: Processor,
+    /// The flag `REQBODY_ERROR` is set.
+    pub request_error: bool,
+    /// The flag `REQBODY_PROCESSOR_ERROR` is set.
+    pub processor_error: bool,
+    /// The flag `MSC_PCRE_LIMITS_EXCEEDED` is set: a regular expression gave up, and the library took its rule
+    /// as not matched.
+    pub pcre_limit: bool,
+    /// The flag `MSC_PCRE_ERROR` is set: a regular expression failed for any reason, which includes giving up, and
+    /// the library took its rule as not matched.
+    pub pcre_error: bool,
+}
+
+/// A rule that matched and was logged. The library keeps no other, so a rule with `nolog` is not among them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Message {
+    pub id: i64,
+    /// The severity of the rule; `None` when the rule has none.
+    pub severity: Option<i32>,
+    /// The rule stopped the request: a deny, a drop or a redirect ran in it.
+    pub disruptive: bool,
+}
+
+/// What the rules left to stop the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Intervention {
+    /// The status the rule gave.
+    pub status: i32,
+    /// It is a redirect.
+    pub redirect: bool,
+}
+
+/// One request in the library. It holds the engine and the rules it was made with, which the library keeps
+/// pointers to for as long as the transaction lives, so they are freed after it and never before.
+pub struct EngineTransaction {
+    raw: NonNull<RawTransaction>,
+    _engine: Rc<Engine>,
+    _rules: Rc<Rules>,
+}
+
+/// How many bytes of the anomaly score are read. A real score is a few digits.
+const SCORE_CAPACITY: usize = 4096;
+
+impl EngineTransaction {
+    /// Makes the transaction of one request. `id` is the name that the library gives it.
+    pub fn new(
+        engine: &Rc<Engine>,
+        rules: &Rc<Rules>,
+        id: &str,
+    ) -> Result<EngineTransaction, Error> {
+        let id = CString::new(id).map_err(|_| Error::Value)?;
+        // SAFETY: the engine and the rules are live, and the new value keeps them alive; `id` is a
+        // NUL-terminated string that outlives the call, which copies it.
+        let raw = unsafe { tkv_tx_new(engine.raw.as_ptr(), rules.raw.as_ptr(), id.as_ptr()) };
+        NonNull::new(raw)
+            .map(|raw| EngineTransaction {
+                raw,
+                _engine: Rc::clone(engine),
+                _rules: Rc::clone(rules),
+            })
+            .ok_or(Error::Create)
+    }
+
+    /// The connection of the request. The library reads the addresses as C strings, so one that holds a NUL byte
+    /// is refused.
+    pub fn connection(
+        &mut self,
+        client: &[u8],
+        client_port: u16,
+        server: &[u8],
+        server_port: u16,
+    ) -> Result<(), Error> {
+        let client = CString::new(client).map_err(|_| Error::Value)?;
+        let server = CString::new(server).map_err(|_| Error::Value)?;
+        // SAFETY: `raw` is a live transaction and both strings are NUL-terminated and outlive the call.
+        let code = unsafe {
+            tkv_tx_connection(
+                self.raw.as_ptr(),
+                client.as_ptr(),
+                c_int::from(client_port),
+                server.as_ptr(),
+                c_int::from(server_port),
+            )
+        };
+        done(code)
+    }
+
+    /// The request line. `version` is what follows `HTTP/`. The library reads the URI up to a NUL byte, if it
+    /// holds one.
+    pub fn uri(&mut self, uri: &[u8], method: &[u8], version: &[u8]) -> Result<(), Error> {
+        let method = CString::new(method).map_err(|_| Error::Value)?;
+        let version = CString::new(version).map_err(|_| Error::Value)?;
+        // SAFETY: `raw` is a live transaction, `uri` is a slice of the length given, and the two strings are
+        // NUL-terminated; all outlive the call.
+        let code = unsafe {
+            tkv_tx_uri(
+                self.raw.as_ptr(),
+                uri.as_ptr(),
+                uri.len(),
+                method.as_ptr(),
+                version.as_ptr(),
+            )
+        };
+        done(code)
+    }
+
+    /// One request header; a NUL byte in the name or the value is kept.
+    pub fn header(&mut self, name: &[u8], value: &[u8]) -> Result<(), Error> {
+        // SAFETY: `raw` is a live transaction and the two slices have the lengths given.
+        let code = unsafe {
+            tkv_tx_header(
+                self.raw.as_ptr(),
+                name.as_ptr(),
+                name.len(),
+                value.as_ptr(),
+                value.len(),
+            )
+        };
+        done(code)
+    }
+
+    /// Phase 1: the rules of the request headers.
+    pub fn request_headers(&mut self) -> Result<(), Error> {
+        // SAFETY: `raw` is a live transaction.
+        done(unsafe { tkv_tx_request_headers(self.raw.as_ptr()) })
+    }
+
+    /// Puts the request body processor in place (`None` leaves the library with none), whatever the headers or a
+    /// rule said before. `Other` cannot be set.
+    pub fn set_processor(&mut self, processor: Processor) -> Result<(), Error> {
+        // SAFETY: `raw` is a live transaction; the bridge refuses a number it does not know.
+        done(unsafe { tkv_tx_set_processor(self.raw.as_ptr(), processor.number()) })
+    }
+
+    /// Appends a part of the request body. `Error::Short` when the library took less than it was given.
+    pub fn append_body(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        // SAFETY: `raw` is a live transaction and `bytes` is a slice of the length given.
+        match unsafe { tkv_tx_append_body(self.raw.as_ptr(), bytes.as_ptr(), bytes.len()) } {
+            ADDED => Ok(()),
+            SHORT => Err(Error::Short),
+            _ => Err(Error::Internal),
+        }
+    }
+
+    /// Phase 2: the library parses the body and runs the rules of the request body. A body that does not parse
+    /// is not an error of this call: it sets the flags that `state` reads.
+    pub fn request_body(&mut self) -> Result<(), Error> {
+        // SAFETY: `raw` is a live transaction.
+        done(unsafe { tkv_tx_request_body(self.raw.as_ptr()) })
+    }
+
+    /// The logging phase, which ends a transaction.
+    pub fn logging(&mut self) -> Result<(), Error> {
+        // SAFETY: `raw` is a live transaction.
+        done(unsafe { tkv_tx_logging(self.raw.as_ptr()) })
+    }
+
+    /// Takes what the rules left to stop the request, if they left something. The library forgets what was taken:
+    /// the next call gives only what a rule did after this one.
+    pub fn intervention(&mut self) -> Result<Option<Intervention>, Error> {
+        let (mut taken, mut status, mut redirect) = (0, 0, 0);
+        // SAFETY: `raw` is a live transaction and the three pointers point to integers that live for the call.
+        let code = unsafe {
+            tkv_tx_intervention(self.raw.as_ptr(), &mut taken, &mut status, &mut redirect)
+        };
+        done(code)?;
+        match taken {
+            0 => Ok(None),
+            1 => Ok(Some(Intervention {
+                status,
+                redirect: redirect == 1,
+            })),
+            _ => Err(Error::Internal),
+        }
+    }
+
+    /// What the transaction holds before a request may be let through.
+    pub fn state(&self) -> Result<TransactionState, Error> {
+        let (mut engine_on, mut body_access, mut processor) = (0, 0, 0);
+        let (mut request_error, mut processor_error) = (0, 0);
+        let (mut pcre_limit, mut pcre_error) = (0, 0);
+        // SAFETY: `raw` is a live transaction and the seven pointers point to integers that live for the call.
+        let code = unsafe {
+            tkv_tx_state(
+                self.raw.as_ptr(),
+                &mut engine_on,
+                &mut body_access,
+                &mut processor,
+                &mut request_error,
+                &mut processor_error,
+                &mut pcre_limit,
+                &mut pcre_error,
+            )
+        };
+        done(code)?;
+        let flag = |value: c_int| match value {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::Internal),
+        };
+        Ok(TransactionState {
+            engine_on: flag(engine_on)?,
+            body_access: flag(body_access)?,
+            processor: Processor::from_number(processor).ok_or(Error::Internal)?,
+            request_error: flag(request_error)?,
+            processor_error: flag(processor_error)?,
+            pcre_limit: flag(pcre_limit)?,
+            pcre_error: flag(pcre_error)?,
+        })
+    }
+
+    /// The rules that matched and were logged, in the order they ran.
+    pub fn messages(&self) -> Result<Vec<Message>, Error> {
+        let mut count = 0;
+        // SAFETY: `raw` is a live transaction; with no buffer the call only writes `count`, a live integer.
+        let code =
+            unsafe { tkv_tx_messages(self.raw.as_ptr(), std::ptr::null_mut(), 0, &mut count) };
+        done(code)?;
+        let mut buffer = vec![
+            RawMessage {
+                id: 0,
+                severity: 0,
+                disruptive: 0
+            };
+            count
+        ];
+        let mut again = 0;
+        // SAFETY: `raw` is a live transaction, `buffer` holds `count` entries, and `again` is a live integer.
+        let code = unsafe {
+            tkv_tx_messages(
+                self.raw.as_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut again,
+            )
+        };
+        done(code)?;
+        if again != count {
+            return Err(Error::Internal);
+        }
+        buffer
+            .iter()
+            .map(|raw| {
+                Ok(Message {
+                    id: raw.id,
+                    severity: (raw.severity >= 0).then_some(raw.severity),
+                    disruptive: match raw.disruptive {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(Error::Internal),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// The value of the TX variable that holds the anomaly score, as text; `None` when there is none. A value
+    /// longer than `SCORE_CAPACITY` is cut.
+    pub fn score(&self) -> Result<Option<Vec<u8>>, Error> {
+        let mut text = vec![0u8; SCORE_CAPACITY];
+        let (mut length, mut present) = (0, 0);
+        // SAFETY: `raw` is a live transaction, `text` holds `SCORE_CAPACITY` bytes, and the two pointers point
+        // to integers that live for the call.
+        let code = unsafe {
+            tkv_tx_score(
+                self.raw.as_ptr(),
+                text.as_mut_ptr(),
+                text.len(),
+                &mut length,
+                &mut present,
+            )
+        };
+        done(code)?;
+        match present {
+            0 => Ok(None),
+            1 => {
+                text.truncate(length.min(SCORE_CAPACITY));
+                Ok(Some(text))
+            }
+            _ => Err(Error::Internal),
+        }
+    }
+}
+
+impl Drop for EngineTransaction {
+    fn drop(&mut self) {
+        // SAFETY: `raw` came from `tkv_tx_new` and is freed only here, before the engine and the rules it points
+        // to, which are dropped after this.
+        unsafe { tkv_tx_free(self.raw.as_ptr()) }
+    }
+}
+
+/// The result of a call that only says whether it worked.
+fn done(code: c_int) -> Result<(), Error> {
+    match code {
+        ADDED => Ok(()),
+        _ => Err(Error::Internal),
     }
 }
 

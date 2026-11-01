@@ -94,10 +94,20 @@ fn hello_frame() -> Vec<u8> {
     encode_hello(RUN, INC, &hello).unwrap()
 }
 
-/// Serves one end of a socket pair on a thread and returns the other end, after the HELLO was read from it.
+/// Serves one end of a socket pair on a thread and returns the other end, after the HELLO was read from it. The alarm
+/// does nothing: these tests have no handler for SIGALRM.
 fn start(
     script: Script,
     close_deadline: Duration,
+) -> (UnixStream, JoinHandle<Ended>, Arc<Mutex<Log>>) {
+    start_with(script, close_deadline, |_| {})
+}
+
+/// `start` with the hook that `serve` is given for the alarm.
+fn start_with(
+    script: Script,
+    close_deadline: Duration,
+    alarm: impl Fn(u32) + Send + 'static,
 ) -> (UnixStream, JoinHandle<Ended>, Arc<Mutex<Log>>) {
     let (a, b) = pair();
     let (fake, log) = Fake::new(script);
@@ -110,6 +120,7 @@ fn start(
             &hello,
             Table::new(fake, RUN, INC),
             close_deadline,
+            alarm,
         )
     });
     assert_eq!(read_out(&b).unwrap().kind, 0x01, "HELLO first");
@@ -205,4 +216,53 @@ fn a_frame_that_breaks_the_protocol_ends_the_session() {
         "{}",
         ended.why
     );
+}
+
+/// A hook for the alarm that keeps the seconds of each call, and the calls it kept.
+fn alarm_calls() -> (Arc<Mutex<Vec<u32>>>, impl Fn(u32) + Send + 'static) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&calls);
+    (calls, move |seconds| record.lock().unwrap().push(seconds))
+}
+
+// The alarm is set for the closing after a loss: right before it, with the seconds of the deadline rounded up and at
+// least 1, and taken off (0) right after it.
+#[test]
+fn the_alarm_is_set_for_the_closing_after_a_loss_and_taken_off_after_it() {
+    // The lowest value (an alarm of 0 seconds is no alarm), an exact number of seconds, and the first value past it.
+    for (deadline, seconds) in [
+        (Duration::ZERO, 1),
+        (Duration::from_secs(3), 3),
+        (Duration::from_millis(3001), 4),
+    ] {
+        let (calls, alarm) = alarm_calls();
+        let (peer, session, _) = start_with(Script::default(), deadline, alarm);
+        write(&peer, KIND_TX_BEGIN, 1, 1, &begin_payload(0));
+        assert_eq!(read_out(&peer).unwrap().kind, 0x20);
+        drop(peer);
+        session.join().unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [seconds, 0],
+            "deadline {deadline:?}"
+        );
+    }
+}
+
+// A session that ends with BYE closes its transaction while the connection is alive, and sets no alarm.
+#[test]
+fn a_session_that_ends_with_bye_sets_no_alarm() {
+    let (calls, alarm) = alarm_calls();
+    let (peer, session, log) = start_with(Script::default(), Duration::from_secs(1), alarm);
+    write(&peer, KIND_TX_BEGIN, 1, 1, &begin_payload(0));
+    assert_eq!(read_out(&peer).unwrap().kind, 0x20);
+    write(&peer, KIND_DRAIN, 0, 0, b"");
+    write(&peer, KIND_BODY_END, 1, 2, b"");
+    assert_eq!(read_out(&peer).unwrap().kind, 0x20);
+    write(&peer, KIND_TX_END, 1, 3, &[1]);
+    assert_eq!(read_out(&peer).unwrap().kind, 0x22);
+    assert_eq!(read_out(&peer).unwrap().kind, 0x03);
+    assert_eq!(session.join().unwrap().code, EXIT_OK);
+    assert_eq!(log.lock().unwrap().closes, 1);
+    assert!(calls.lock().unwrap().is_empty());
 }

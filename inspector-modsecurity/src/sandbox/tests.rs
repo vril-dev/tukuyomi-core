@@ -9,6 +9,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 /// A directory under the temporary directory, removed when it goes out of scope. `tmp` in it is the directory that
 /// stays reachable, and `outside` is a file next to it.
@@ -270,4 +271,168 @@ fn a_process_with_more_than_one_thread_is_refused_and_nothing_is_restricted() {
     // Nothing was restricted: a file outside the directory could be opened, and a file in it created.
     assert_eq!(fs::read(scratch.outside()).unwrap(), b"readable");
     fs::write(scratch.0.join("made"), "x").unwrap();
+}
+
+// A descriptor that is not a unix stream socket is refused, and so is a socket whose peer is not the parent of the
+// process: a pair that this process made has this process as its peer, and this process is not its own parent.
+#[test]
+fn a_descriptor_that_is_not_the_connection_of_the_parent_is_refused() {
+    let (reader, _writer) = io::pipe().unwrap();
+    assert_eq!(check_peer(reader.as_raw_fd()), Err(PeerError::NotSocket));
+    let (datagram, _other) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    assert_eq!(
+        check_peer(datagram.as_raw_fd()),
+        Err(PeerError::NotUnixStream)
+    );
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    assert_eq!(check_peer(ours.as_raw_fd()), Err(PeerError::Parent));
+    assert!(matches!(
+        check_peer(-1),
+        Err(PeerError::Call {
+            errno: libc::EBADF,
+            ..
+        })
+    ));
+}
+
+// The end of a pair that the parent made is accepted by the process that the parent started, and it is taken as the
+// stream of the session, once, in blocking mode whatever the mode was.
+#[test]
+fn the_connection_of_the_parent_is_accepted_and_taken_once_in_blocking_mode() {
+    let (parent, child) = UnixStream::pair().unwrap();
+    child.set_nonblocking(true).unwrap();
+    let (report, status) = in_a_process_of_one_thread(|| {
+        let checked = check_peer(child.as_raw_fd());
+        // SAFETY: both descriptors are open; the copy is made on descriptor 0, which this process does not use.
+        assert_eq!(unsafe { libc::dup2(child.as_raw_fd(), 0) }, 0);
+        let first = inherited_stream();
+        let blocking = first.as_ref().is_ok_and(|stream| {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let start = std::time::Instant::now();
+            let mut byte = [0u8; 1];
+            let result = std::io::Read::read(&mut &*stream, &mut byte);
+            result.is_err() && start.elapsed() >= Duration::from_millis(150)
+        });
+        let second = inherited_stream().err();
+        format!(
+            "checked={checked:?}\nfirst={}\nblocking={blocking}\nsecond={second:?}",
+            first.is_ok()
+        )
+    });
+    drop(parent);
+    assert_eq!(
+        report.lines().collect::<Vec<_>>(),
+        [
+            "checked=Ok(())",
+            "first=true",
+            "blocking=true",
+            "second=Some(Taken)"
+        ],
+        "status {status}"
+    );
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "status {status}"
+    );
+}
+
+// The signals are set whatever the process was started with: the ones that are ignored stay alive, and SIGTERM ends it
+// even when it was started ignoring it and with it blocked.
+#[test]
+fn the_signals_are_set_as_the_contract_says_whatever_the_process_was_started_with() {
+    let (report, status) = in_a_process_of_one_thread(|| {
+        set_signals(13).unwrap();
+        for signal in [libc::SIGUSR1, libc::SIGUSR2, libc::SIGPIPE] {
+            // SAFETY: `raise` takes a signal number; these signals are ignored.
+            assert_eq!(unsafe { libc::raise(signal) }, 0);
+        }
+        "alive".to_owned()
+    });
+    assert_eq!(report, "alive");
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "status {status}"
+    );
+
+    let (report, status) = in_a_process_of_one_thread(|| {
+        let mut term = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: `term` is room for a signal set that `sigemptyset` fills in before the others read it; SIGTERM is
+        // ignored and blocked as a parent may leave it.
+        unsafe {
+            libc::sigemptyset(term.as_mut_ptr());
+            libc::sigaddset(term.as_mut_ptr(), libc::SIGTERM);
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::sigprocmask(libc::SIG_BLOCK, term.as_ptr(), std::ptr::null_mut());
+        }
+        set_signals(13).unwrap();
+        // SAFETY: `raise` takes a signal number; SIGTERM ends the process.
+        unsafe { libc::raise(libc::SIGTERM) };
+        "alive".to_owned()
+    });
+    assert_eq!(report, "");
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM,
+        "status {status}"
+    );
+}
+
+// The alarm ends the process with the exit code that was given, and a call with 0 takes it back.
+#[test]
+fn the_deadline_ends_the_process_with_its_exit_code_unless_it_is_taken_back() {
+    let (report, status) = in_a_process_of_one_thread(|| {
+        set_signals(13).unwrap();
+        set_deadline(1);
+        thread::sleep(Duration::from_secs(10));
+        "alive".to_owned()
+    });
+    assert_eq!(report, "");
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 13,
+        "status {status}"
+    );
+
+    let (report, status) = in_a_process_of_one_thread(|| {
+        set_signals(13).unwrap();
+        set_deadline(1);
+        set_deadline(0);
+        thread::sleep(Duration::from_secs(2));
+        "alive".to_owned()
+    });
+    assert_eq!(report, "alive");
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "status {status}"
+    );
+}
+
+// The environment is emptied in a process of one thread, and refused, with nothing removed, where there are several.
+#[test]
+fn the_environment_is_emptied_only_by_a_process_of_one_thread() {
+    let (report, status) = in_a_process_of_one_thread(|| {
+        // SAFETY: the process has one thread, so nothing else reads or changes the environment.
+        unsafe { std::env::set_var("TKV_PROBE", "x") };
+        let cleared = clear_environment();
+        format!(
+            "cleared={cleared:?}\nvariables={}\nprobe={:?}",
+            std::env::vars_os().count(),
+            std::env::var_os("TKV_PROBE")
+        )
+    });
+    assert_eq!(
+        report.lines().collect::<Vec<_>>(),
+        ["cleared=Ok(())", "variables=0", "probe=None"],
+        "status {status}"
+    );
+
+    let (release, wait) = mpsc::channel::<()>();
+    let waiting = thread::spawn(move || {
+        let _ = wait.recv();
+    });
+    let refused = clear_environment();
+    release.send(()).unwrap();
+    waiting.join().unwrap();
+    assert_eq!(refused, Err(Error::Threads));
+    assert!(std::env::var_os("PATH").is_some());
 }

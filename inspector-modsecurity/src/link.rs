@@ -13,6 +13,10 @@
 //! frame and handles it completely, and writes the answer, before it reads the next. A frame never waits behind
 //! another, the depth is never reached, and ERROR 24 (queue overflow) is never sent. What the kernel sends in the
 //! meantime waits in the buffer of the socket.
+//!
+//! When the connection is lost, closing every open transaction has one window of time in total. The caller of `serve`
+//! gives it the alarm that ends the process when the window is over: `serve` sets it right before the closing and takes
+//! it off right after, and at no other time.
 #![forbid(unsafe_code)]
 
 use std::io::{self, ErrorKind, Read, Write};
@@ -144,10 +148,22 @@ enum Over {
     Lost(String),
 }
 
+/// The whole seconds of `d` for an alarm: rounded up, so that the alarm never goes off before `d` is over, and at least
+/// 1, because an alarm of 0 seconds is no alarm.
+fn alarm_seconds(d: Duration) -> u32 {
+    let seconds = d.as_secs().saturating_add(u64::from(d.subsec_nanos() > 0));
+    u32::try_from(seconds).unwrap_or(u32::MAX).max(1)
+}
+
 /// Runs the session on `stream` until BYE is written or the connection is lost. `hello` is the encoded HELLO, sent
-/// first. After a loss every open transaction is closed without CLOSED; the exit code is `EXIT_LOST_TIMEOUT` when that
-/// took longer than `close_deadline`. The closing runs on this thread, so a call into the inspection that never returns
-/// is not cut off here.
+/// first. After a loss every open transaction is closed without CLOSED, and all of them together have `close_deadline`;
+/// the exit code is `EXIT_LOST_TIMEOUT` when that took longer.
+///
+/// The closing runs on this thread and is measured when it has ended, so that measure cannot see a close that never
+/// returns. `alarm` is for that: `serve` calls it with the seconds of `close_deadline` (see `alarm_seconds`) right
+/// before the closing and with 0 right after it, and the caller has the alarm end the process when its time is up. It
+/// is called at no other time: while the connection is alive, and on the way to BYE, a slow close takes the time it
+/// takes. This module sets no signal itself, so its tests need no handler for one and pass a hook that does nothing.
 pub fn serve<I: Inspection>(
     stream: UnixStream,
     run: u64,
@@ -155,6 +171,7 @@ pub fn serve<I: Inspection>(
     hello: &[u8],
     mut table: Table<I>,
     close_deadline: Duration,
+    alarm: impl Fn(u32),
 ) -> Ended {
     let mut dup_drains = 0;
     let over = session(&stream, run, inc, hello, &mut table, &mut dup_drains);
@@ -164,7 +181,9 @@ pub fn serve<I: Inspection>(
         Over::Drained => (EXIT_OK, "drained".to_string()),
         Over::Lost(why) => {
             let start = Instant::now();
+            alarm(alarm_seconds(close_deadline));
             table.connection_lost();
+            alarm(0);
             let in_time = start.elapsed() <= close_deadline;
             (
                 if in_time {

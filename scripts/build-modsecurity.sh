@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build the pinned release of libmodsecurity (ModSecurity v3) as static libraries
-# into a new directory (a prefix): include/modsecurity/*.h and lib/libmodsecurity.a, and
-# include-src/: the header files of the source's own src/ (see the step that copies them).
+# into a new directory (a prefix): include/modsecurity/*.h and lib/libmodsecurity.a,
+# include-src/: the header files of the source's own src/ (see the step that copies
+# them), and archive.sha256: the pinned sha256 of the archive, which the build of the
+# inspector reads.
 #
 # Usage: scripts/build-modsecurity.sh <new prefix directory>
 #
@@ -201,6 +203,10 @@ mkdir -m 0700 -- "$private"
 [[ -s ${private}/src/variables/variable.h && -s ${private}/src/run_time_string.h ]] || die "the headers of src/ were not copied"
 stray=$(find "$private" -type f -not -name '*.h')
 [[ -z $stray ]] || die "something other than a header file was copied"
+
+# The inspector reports the hash of the source of the engine, and its build takes it from this file. It is the
+# sha256 that was checked above, one line of 64 lowercase hexadecimal digits.
+printf '%s\n' "$SHA256" >"${staged}/archive.sha256" || die "cannot write the sha256 of the archive"
 
 mv -T -- "$staged" "$dest" || die "cannot create ${dest}"
 echo "[MSC] Installed ${VERSION} into ${dest}"

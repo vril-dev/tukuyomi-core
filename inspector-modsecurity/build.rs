@@ -2,11 +2,20 @@
 //! `scripts/build-modsecurity.sh` made. The prefix is the absolute path in the environment
 //! variable `TUKUYOMI_MODSECURITY_PREFIX`. Its `include-src` directory holds the header files of the library's
 //! own `src/`, which the bridge reads for the classes that the installed headers leave out.
+//!
+//! The inspector says which toolchain built it and the hash of the source of the engine in its HELLO. Both are
+//! fixed here and compiled in: the toolchain as `rustc <release>`, from the `release:` line of `rustc -vV` of the
+//! compiler that builds the crate, and the hash as the line of the file `archive.sha256` that the script of the
+//! prefix wrote. A prefix without that file is refused.
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 const PREFIX_VAR: &str = "TUKUYOMI_MODSECURITY_PREFIX";
+const SHA256_FILE: &str = "archive.sha256";
+/// The longest toolchain string of a HELLO is 64 bytes; `rustc ` takes 6 of them.
+const MAX_RELEASE: usize = 58;
 
 fn stop(why: &str) -> ! {
     eprintln!("{why}");
@@ -27,6 +36,45 @@ fn directory_of(compiler: &Path, file: &str, package: &str) -> PathBuf {
             "{file} was not found by the C++ compiler (install {package})"
         )),
     }
+}
+
+/// The sha256 of the archive of the library: the one line of `file`, 64 lowercase hexadecimal digits.
+fn archive_sha256(file: &Path) -> String {
+    let text = fs::read_to_string(file).unwrap_or_else(|e| {
+        stop(&format!(
+            "cannot read {SHA256_FILE} of the prefix ({e}); build the prefix again with scripts/build-modsecurity.sh"
+        ))
+    });
+    let line = text.strip_suffix('\n').unwrap_or(&text);
+    if line.len() == 64 && line.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+        line.to_owned()
+    } else {
+        stop(&format!(
+            "{SHA256_FILE} of the prefix is not one line of 64 lowercase hexadecimal digits"
+        ))
+    }
+}
+
+/// `rustc <release>` for the compiler that cargo builds with, from the `release:` line of `rustc -vV`.
+fn toolchain() -> String {
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| stop("RUSTC is not set"));
+    let output = Command::new(rustc)
+        .arg("-vV")
+        .output()
+        .unwrap_or_else(|e| stop(&format!("cannot run rustc -vV: {e}")));
+    if !output.status.success() {
+        stop("rustc -vV failed");
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let release = text
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .unwrap_or_else(|| stop("rustc -vV has no release line"));
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+');
+    if release.is_empty() || release.len() > MAX_RELEASE || !release.chars().all(plain) {
+        stop("the release of rustc is not a plain version string");
+    }
+    format!("rustc {release}")
 }
 
 fn main() {
@@ -53,6 +101,13 @@ fn main() {
     }
     println!("cargo:rerun-if-changed={}", archive.display());
     println!("cargo:rerun-if-changed={}", private.display());
+    let sha256_file = Path::new(&prefix).join(SHA256_FILE);
+    println!("cargo:rerun-if-changed={}", sha256_file.display());
+    println!("cargo:rustc-env=TKV_BUILD_TOOLCHAIN={}", toolchain());
+    println!(
+        "cargo:rustc-env=TKV_BUILD_ENGINE_SOURCE={}",
+        archive_sha256(&sha256_file)
+    );
 
     // The headers of libmodsecurity, and those of its `src/`, are read as system headers, so that their
     // warnings do not show; the warnings of the bridge itself stay on.

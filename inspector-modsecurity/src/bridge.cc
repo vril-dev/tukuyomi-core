@@ -64,12 +64,15 @@
 
 #include <modsecurity/audit_log.h>
 #include <modsecurity/debug_log.h>
+#include <modsecurity/intervention.h>
 #include <modsecurity/modsecurity.h>
 #include <modsecurity/rule_marker.h>
+#include <modsecurity/rule_message.h>
 #include <modsecurity/rule_with_actions.h>
 #include <modsecurity/rule_with_operator.h>
 #include <modsecurity/rules_exceptions.h>
 #include <modsecurity/rules_set.h>
+#include <modsecurity/transaction.h>
 
 #include "src/actions/disruptive/redirect.h"
 #include "src/actions/expire_var.h"
@@ -1054,6 +1057,86 @@ void describe_settings(Out &out, modsecurity::RulesSet &rules) {
   }
 }
 
+
+// ---- The transactions of requests ----
+//
+// A transaction of the library is one request. The functions below make one, feed it a request in the
+// order the library expects (connection, URI, headers, phase 1, body, phase 2), and read what the
+// inspection needs afterwards. They use the public members of `Transaction` (and of the classes it
+// holds) that are named here; no private member is read for them:
+//
+//   Transaction::m_rules                  the set of rules the transaction was made with
+//   Transaction::m_requestBodyAccess      the transaction's own setting of whether the body is read
+//   Transaction::m_requestBodyProcessor   the processor that a ctl action (or the inspector) chose: JSON or XML
+//   Transaction::m_requestBodyType        the processor that the Content-Type headers (or the inspector) chose:
+//                                         URL-encoded or multipart
+//   Transaction::m_variableReqbodyProcessor, m_variableReqbodyError, m_variableReqbodyProcessorError,
+//   m_variableMscPcreError, m_variableMscPcreLimitsExceeded
+//                                         the variables of the same names, read as the transaction holds them
+//                                         (the TX collection holds a copy of the limit flag, which a rule can write)
+//   Transaction::m_variableOffset         where the library puts the next value it sets
+//   Transaction::m_requestBody            the request body so far, only to see how much of a chunk was taken
+//   Transaction::m_rulesMessages          the rules that matched and were logged (a nolog rule leaves none)
+//   Transaction::m_collections            the TX collection, for the anomaly score
+//   RuleMessage::m_rule, m_severity, m_isDisruptive
+//   RuleWithActions::m_ruleId, hasSeverity()
+//
+// The library decides how to read a body from two members and not one: the processor (JSON, XML) is
+// tried first, and when it is not set the type (multipart, URL-encoded) that the Content-Type headers
+// gave. The inspector sets both, so that the Content-Type it chose decides and a rule of the operator cannot
+// change how the body is parsed, and reads both back to see what the library would do now.
+
+// The request body processors, as the fixed numbers that the Rust side reads and writes.
+constexpr int kProcessorNone = 0;
+constexpr int kProcessorUrlEncoded = 1;
+constexpr int kProcessorMultipart = 2;
+constexpr int kProcessorJson = 3;
+constexpr int kProcessorOther = 4;
+
+// What tkv_tx_append_body returns when the library took fewer bytes than it was given.
+constexpr int kShort = 3;
+
+// The TX variable in which the common rule sets add up the score of a request.
+constexpr const char *kScoreVariable = "blocking_inbound_anomaly_score";
+
+// The processor that the library would parse the body with now: what it tries in its own order.
+int effective_processor(const modsecurity::Transaction &tx) {
+  using modsecurity::Transaction;
+  if (tx.m_requestBodyProcessor == Transaction::JSONRequestBody) {
+    return kProcessorJson;
+  }
+  if (tx.m_requestBodyProcessor != Transaction::UnknownFormat) {
+    // XML, which this build of the library does not parse.
+    return kProcessorOther;
+  }
+  switch (tx.m_requestBodyType) {
+    case Transaction::UnknownFormat:
+      return kProcessorNone;
+    case Transaction::MultiPartRequestBody:
+      return kProcessorMultipart;
+    case Transaction::WWWFormUrlEncoded:
+      return kProcessorUrlEncoded;
+    default:
+      return kProcessorOther;
+  }
+}
+
+// Whether the transaction reads the request body, as the library decides it before the rules of phase 2: the
+// setting of the rules, which a ctl action can turn the other way for one transaction.
+bool body_is_read(const modsecurity::Transaction &tx) {
+  using modsecurity::RulesSetProperties;
+  if (tx.m_rules->m_secRequestBodyAccess == RulesSetProperties::FalseConfigBoolean) {
+    return tx.m_requestBodyAccess == RulesSetProperties::TrueConfigBoolean;
+  }
+  return tx.m_requestBodyAccess != RulesSetProperties::FalseConfigBoolean;
+}
+
+// A flag variable is set when it holds anything but "0". It is empty until something sets it (the body
+// processors set the two body flags, the form processor does not).
+bool flag_is_set(const modsecurity::AnchoredVariable &variable) {
+  return !variable.m_value.empty() && variable.m_value != "0";
+}
+
 }  // namespace
 
 extern "C" {
@@ -1207,6 +1290,232 @@ void tkv_rules_free(modsecurity::RulesSet *rules) noexcept {
   try {
     modsecurity::msc_rules_cleanup(rules);
   } catch (...) {
+  }
+}
+
+// The array that tkv_tx_messages fills: one entry for each rule that matched and was logged. Rust reads the same
+// layout.
+struct tkv_message {
+  int64_t id;
+  int32_t severity;  // -1 when the rule has none
+  int32_t disruptive;
+};
+
+// Makes the transaction of one request; `id` is copied. Null when it could not be made.
+modsecurity::Transaction *tkv_tx_new(modsecurity::ModSecurity *engine, modsecurity::RulesSet *rules,
+                                     const char *id) noexcept {
+  try {
+    return modsecurity::msc_new_transaction_with_id(engine, rules, id, nullptr);
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+void tkv_tx_free(modsecurity::Transaction *tx) noexcept {
+  try {
+    modsecurity::msc_transaction_cleanup(tx);
+  } catch (...) {
+  }
+}
+
+// The connection of the request. 0 when the library took it, 2 otherwise.
+int tkv_tx_connection(modsecurity::Transaction *tx, const char *client, int client_port,
+                      const char *server, int server_port) noexcept {
+  try {
+    return tx->processConnection(client, client_port, server, server_port) ? kOk : kFailed;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// The request line: the library wants C strings. The URI is given with its length and read up to
+// the first NUL byte, which no URI the inspector lets through holds (the inspector blocks it as a URI that
+// cannot be parsed). `version` is what follows `HTTP/` in the protocol of the request line.
+int tkv_tx_uri(modsecurity::Transaction *tx, const uint8_t *uri, size_t uri_length,
+               const char *method, const char *version) noexcept {
+  try {
+    const std::string text(reinterpret_cast<const char *>(uri), uri_length);
+    return tx->processURI(text.c_str(), method, version) ? kOk : kFailed;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// One request header. Names and values are taken with their lengths: a NUL byte in one is kept.
+int tkv_tx_header(modsecurity::Transaction *tx, const uint8_t *name, size_t name_length,
+                  const uint8_t *value, size_t value_length) noexcept {
+  try {
+    return tx->addRequestHeader(name, name_length, value, value_length) ? kOk : kFailed;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// Phase 1: the rules of the request headers.
+int tkv_tx_request_headers(modsecurity::Transaction *tx) noexcept {
+  try {
+    return tx->processRequestHeaders() ? kOk : kFailed;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// Puts the request body processor in place, in both members that decide it (see above), and sets the
+// variable REQBODY_PROCESSOR to match, as the ctl action of the same name does. None leaves the library
+// with no processor, so that it parses no body. 0 when it is done, 2 for a number that is not one of the
+// four that can be set.
+int tkv_tx_set_processor(modsecurity::Transaction *tx, int processor) noexcept {
+  using modsecurity::Transaction;
+  try {
+    const char *name = nullptr;
+    Transaction::RequestBodyType processor_member = Transaction::UnknownFormat;
+    Transaction::RequestBodyType type_member = Transaction::UnknownFormat;
+    switch (processor) {
+      case kProcessorNone:
+        break;
+      case kProcessorUrlEncoded:
+        name = "URLENCODED";
+        type_member = Transaction::WWWFormUrlEncoded;
+        break;
+      case kProcessorMultipart:
+        name = "MULTIPART";
+        type_member = Transaction::MultiPartRequestBody;
+        break;
+      case kProcessorJson:
+        name = "JSON";
+        processor_member = Transaction::JSONRequestBody;
+        break;
+      default:
+        return kFailed;
+    }
+    tx->m_requestBodyProcessor = processor_member;
+    tx->m_requestBodyType = type_member;
+    if (name != nullptr) {
+      tx->m_variableReqbodyProcessor.set(name, tx->m_variableOffset);
+    }
+    return kOk;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// Appends a part of the request body. 0 when the library took all of it, 3 when it took less (it does so
+// at a body limit, which the rules never set), 2 for any other failure.
+int tkv_tx_append_body(modsecurity::Transaction *tx, const uint8_t *bytes, size_t length) noexcept {
+  try {
+    const std::streamoff before = tx->m_requestBody.tellp();
+    const bool accepted = tx->appendRequestBody(bytes, length);
+    const std::streamoff after = tx->m_requestBody.tellp();
+    if (before < 0 || after < before) {
+      return kFailed;
+    }
+    if (!accepted || static_cast<uint64_t>(after - before) != length) {
+      return kShort;
+    }
+    return kOk;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// Phase 2: parses the body and runs the rules of the request body. A body that does not parse is not a
+// failure of this call: it sets the flags that tkv_tx_state reads.
+int tkv_tx_request_body(modsecurity::Transaction *tx) noexcept {
+  try {
+    return tx->processRequestBody() ? kOk : kFailed;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// The logging phase, which ends a transaction.
+int tkv_tx_logging(modsecurity::Transaction *tx) noexcept {
+  try {
+    return tx->processLogging() ? kOk : kFailed;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// Takes the intervention that the rules left, if there is one: `taken` says whether there was, `status` is the
+// status the rule gave it, `redirect` whether it is a redirect. The library forgets an intervention that was
+// taken, so the next call gives only a new one. The text of the intervention (its log line and the URL of a
+// redirect) holds values of the request and is freed here, unread. 0 when it was asked, 2 otherwise.
+int tkv_tx_intervention(modsecurity::Transaction *tx, int *taken, int *status, int *redirect) noexcept {
+  try {
+    modsecurity::ModSecurityIntervention it;
+    modsecurity::intervention::clean(&it);
+    const bool disruptive = tx->intervention(&it);
+    *taken = disruptive ? 1 : 0;
+    *status = it.status;
+    *redirect = it.url != nullptr ? 1 : 0;
+    modsecurity::intervention::free(&it);
+    return kOk;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// What the inspection checks before it lets a request through: whether the rule engine of the transaction is
+// on, whether the body is read, the processor that would parse it, and the four flags: the two of the body, and
+// the two of a regular expression (one that gave up, and one that failed for any reason, which includes the
+// first). 0 when all were read, 2 otherwise.
+int tkv_tx_state(const modsecurity::Transaction *tx, int *engine_on, int *body_access, int *processor,
+                 int *request_error, int *processor_error, int *pcre_limit, int *pcre_error) noexcept {
+  try {
+    *engine_on = tx->getRuleEngineState() == modsecurity::RulesSetProperties::EnabledRuleEngine ? 1 : 0;
+    *body_access = body_is_read(*tx) ? 1 : 0;
+    *processor = effective_processor(*tx);
+    *request_error = flag_is_set(tx->m_variableReqbodyError) ? 1 : 0;
+    *processor_error = flag_is_set(tx->m_variableReqbodyProcessorError) ? 1 : 0;
+    *pcre_limit = flag_is_set(tx->m_variableMscPcreLimitsExceeded) ? 1 : 0;
+    *pcre_error = flag_is_set(tx->m_variableMscPcreError) ? 1 : 0;
+    return kOk;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// The rules that matched and were logged, in the order they ran: `count` is how many, and when `buffer` holds
+// `capacity` entries, which is enough, they are written to it. A caller that does not know the count calls
+// with no buffer first. 0 when it was read, 2 otherwise.
+int tkv_tx_messages(const modsecurity::Transaction *tx, tkv_message *buffer, size_t capacity,
+                    size_t *count) noexcept {
+  try {
+    *count = tx->m_rulesMessages.size();
+    if (buffer != nullptr && capacity >= *count) {
+      size_t at = 0;
+      for (const modsecurity::RuleMessage &message : tx->m_rulesMessages) {
+        buffer[at].id = message.m_rule.m_ruleId;
+        buffer[at].severity = message.m_rule.hasSeverity() ? message.m_severity : -1;
+        buffer[at].disruptive = message.m_isDisruptive ? 1 : 0;
+        at++;
+      }
+    }
+    return kOk;
+  } catch (...) {
+    return kFailed;
+  }
+}
+
+// The value of the TX variable that holds the anomaly score: `present` says whether there is one, `length` is
+// its length, and the first `capacity` bytes of it are written to `buffer`. 0 when it was read, 2 otherwise.
+int tkv_tx_score(modsecurity::Transaction *tx, uint8_t *buffer, size_t capacity, size_t *length,
+                 int *present) noexcept {
+  try {
+    modsecurity::collection::Collection *tx_collection = tx->m_collections.m_tx_collection;
+    if (tx_collection == nullptr) {
+      return kFailed;
+    }
+    const std::unique_ptr<std::string> value = tx_collection->resolveFirst(kScoreVariable);
+    *present = value ? 1 : 0;
+    *length = value ? value->size() : 0;
+    if (value && buffer != nullptr) {
+      std::memcpy(buffer, value->data(), std::min(capacity, value->size()));
+    }
+    return kOk;
+  } catch (...) {
+    return kFailed;
   }
 }
 

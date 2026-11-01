@@ -234,3 +234,106 @@ fn the_settings_are_read_back_and_the_first_addition_that_sets_one_keeps_it() {
         .unwrap();
     assert_eq!(rules.settings().unwrap().engine, EngineState::DetectionOnly);
 }
+
+/// An engine and rules that read the request body, with `text` after them.
+fn engine_and_rules(text: &str) -> (Rc<Engine>, Rc<Rules>) {
+    let mut rules = Rules::new().unwrap();
+    rules
+        .add_text("SecRuleEngine On\nSecRequestBodyAccess On\n")
+        .unwrap();
+    if !text.is_empty() {
+        rules.add_text(text).unwrap();
+    }
+    (Rc::new(Engine::new().unwrap()), Rc::new(rules))
+}
+
+#[test]
+fn the_processor_that_is_put_in_place_is_the_one_that_is_read_back() {
+    let (engine, rules) = engine_and_rules("");
+    let mut tx = EngineTransaction::new(&engine, &rules, "0000000000000001").unwrap();
+    assert_eq!(tx.state().unwrap().processor, Processor::None);
+    // The headers alone make the library parse a multipart body.
+    tx.header(b"Content-Type", b"multipart/form-data; boundary=x")
+        .unwrap();
+    assert_eq!(tx.state().unwrap().processor, Processor::Multipart);
+    for processor in [
+        Processor::Json,
+        Processor::UrlEncoded,
+        Processor::Multipart,
+        Processor::None,
+    ] {
+        tx.set_processor(processor).unwrap();
+        assert_eq!(tx.state().unwrap().processor, processor);
+    }
+    // One that a rule put in place cannot be set from here.
+    assert_eq!(tx.set_processor(Processor::Other), Err(Error::Internal));
+    let state = tx.state().unwrap();
+    assert!(state.engine_on && state.body_access);
+    assert!(
+        !state.request_error && !state.processor_error && !state.pcre_limit && !state.pcre_error
+    );
+}
+
+#[test]
+fn an_intervention_is_taken_once_and_what_a_rule_leaves_later_is_new() {
+    let rules = "\
+SecRule REQUEST_URI \"@contains attack\" \"id:1,phase:1,deny,log,severity:3\"\n\
+SecRule ARGS \"@contains attack\" \"id:2,phase:2,deny,status:418,log\"\n\
+SecRule ARGS \"@contains attack\" \"id:3,phase:2,pass,nolog\"\n";
+    let (engine, rules) = engine_and_rules(rules);
+    let mut tx = EngineTransaction::new(&engine, &rules, "0000000000000002").unwrap();
+    tx.connection(b"192.0.2.10", 49152, b"192.0.2.1", 80)
+        .unwrap();
+    tx.uri(b"/?q=attack", b"GET", b"1.1").unwrap();
+    tx.request_headers().unwrap();
+    assert_eq!(
+        tx.intervention(),
+        Ok(Some(Intervention {
+            status: 403,
+            redirect: false
+        }))
+    );
+    assert_eq!(tx.intervention(), Ok(None));
+    // The rules of phase 2 still run once the stop of phase 1 was taken, and the second stop is a new one.
+    tx.request_body().unwrap();
+    assert_eq!(
+        tx.intervention(),
+        Ok(Some(Intervention {
+            status: 418,
+            redirect: false
+        }))
+    );
+    // Rules that matched with `nolog` leave no message.
+    assert_eq!(
+        tx.messages().unwrap(),
+        [
+            Message {
+                id: 1,
+                severity: Some(3),
+                disruptive: true
+            },
+            Message {
+                id: 2,
+                severity: None,
+                disruptive: true
+            }
+        ]
+    );
+    assert_eq!(tx.score(), Ok(None));
+}
+
+#[test]
+fn a_value_with_a_nul_byte_is_refused_before_the_library_sees_it() {
+    let (engine, rules) = engine_and_rules("");
+    let mut tx = EngineTransaction::new(&engine, &rules, "0000000000000003").unwrap();
+    assert_eq!(
+        tx.connection(b"192.0.2.\x0010", 1, b"192.0.2.1", 80),
+        Err(Error::Value)
+    );
+    assert_eq!(tx.uri(b"/", b"G\0T", b"1.1"), Err(Error::Value));
+    assert_eq!(tx.uri(b"/", b"GET", b"1\0.1"), Err(Error::Value));
+    // A header keeps a NUL byte, and the library reads a target up to one.
+    assert_eq!(tx.header(b"X-A", b"a\0b"), Ok(()));
+    assert_eq!(tx.uri(b"/a\0b", b"GET", b"1.1"), Ok(()));
+    assert!(EngineTransaction::new(&engine, &rules, "a\0b").is_err());
+}
