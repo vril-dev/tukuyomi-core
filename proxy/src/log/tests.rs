@@ -238,3 +238,99 @@ fn flush_on_a_stopped_or_stalled_logger_returns_false_within_its_wait() {
     assert!(!log.flush(Duration::MAX));
     assert!(start.elapsed() < Duration::from_secs(2));
 }
+
+#[test]
+fn a_seat_keeps_its_place_so_that_its_record_is_queued_when_the_queue_is_full() {
+    let (log, items) = open(3);
+    let seat = log.seat().expect("a free place");
+    // The two places that are left fill up, and what comes after is dropped.
+    for n in 0..4 {
+        log.line(&format!("line {n}"));
+    }
+    assert_eq!(log.dropped(), 2);
+    assert!(log.seat().is_none());
+    // The record with the seat is not dropped.
+    log.record_in(seat, request(None));
+    assert_eq!(log.dropped(), 2);
+    let counts = log.counts.clone();
+    drop(log);
+    let mut sink = Sink::default();
+    run(&items, &counts, Format::Json, &mut sink);
+    let text = sink.text();
+    assert_eq!(text.matches("\"type\":\"request\"").count(), 1, "{text}");
+    assert_eq!(text.matches("\"type\":\"line\"").count(), 2, "{text}");
+}
+
+#[test]
+fn a_seat_that_is_dropped_or_whose_record_finds_no_logger_gives_its_place_back() {
+    let (log, items) = open(2);
+    let seat = log.seat().expect("a free place");
+    log.line("kept");
+    assert!(log.seat().is_none());
+    log.line("no place");
+    assert_eq!(log.dropped(), 1);
+    drop(seat);
+    log.line("the place is back");
+    assert_eq!(log.dropped(), 1);
+    assert_eq!(queued(&items), "kept");
+    assert_eq!(queued(&items), "the place is back");
+
+    // The logger is gone: the record is counted, the place does not stay taken, and the logger is not healthy.
+    let (log, items) = open(2);
+    let seat = log.seat().expect("a free place");
+    drop(items);
+    assert!(log.healthy());
+    log.record_in(seat, request(None));
+    assert_eq!(log.dropped(), 1);
+    assert!(!log.healthy());
+    assert!(log.seat().is_some());
+}
+
+#[test]
+fn the_logger_gives_a_place_back_when_it_takes_an_item_out_of_the_queue() {
+    let (log, items) = open(4);
+    let counts = log.counts.clone();
+    thread::spawn(move || run(&items, &counts, Format::Json, &mut Vec::new()));
+    log.line("first");
+    assert!(log.flush(Duration::from_secs(10)));
+    // Every place is free again.
+    assert_eq!(log.counts.taken.load(Ordering::Acquire), 0);
+    assert_eq!(log.dropped(), 0);
+}
+
+#[test]
+fn seats_take_at_most_half_of_the_places_and_a_record_sent_with_its_seat_frees_the_seat() {
+    let (log, _items) = open(8);
+    let mut seats: Vec<Seat> = (0..4).map(|_| log.seat().expect("a free seat")).collect();
+    assert!(log.seat().is_none());
+    assert!(!log.admitting());
+    // The other half of the places is for what needs no seat.
+    for n in 0..4 {
+        log.line(&format!("line {n}"));
+    }
+    assert_eq!(log.dropped(), 0);
+    log.line("one too many");
+    assert_eq!(log.dropped(), 1);
+    // A seat that is dropped is free again, with its place.
+    drop(seats.pop());
+    assert!(log.seat().is_some());
+    // A record sent with its seat frees the seat; its place is the item's, so the queue is as full as before.
+    log.record_in(seats.pop().expect("a seat"), request(None));
+    assert_eq!(log.counts.seats.load(Ordering::Acquire), 2);
+    assert_eq!(log.counts.taken.load(Ordering::Acquire), 7);
+    // One more seat fits, and then the queue has no place, though the seats are below their limit.
+    let last = log.seat();
+    assert!(last.is_some());
+    assert!(log.seat().is_none());
+}
+
+#[test]
+fn the_logger_is_not_healthy_once_its_thread_has_ended() {
+    let (log, _items) = open(4);
+    assert!(log.healthy());
+    assert!(log.admit().is_ok());
+    drop(Ending(log.counts.clone()));
+    assert!(!log.healthy());
+    assert!(!log.admitting());
+    assert!(matches!(log.admit(), Err(Unkept::Failing)));
+}

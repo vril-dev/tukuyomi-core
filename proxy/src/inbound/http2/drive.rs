@@ -74,7 +74,7 @@ use super::frames::Watch;
 use super::head::{build, upstream_uri};
 use crate::config::{Http2Config, ProxyConfig};
 use crate::inbound::answer::{Abort, Noted, Reply, answer};
-use crate::inbound::conn::{Ctx, Handled, Scheme, after, peer_gone};
+use crate::inbound::conn::{Ctx, Handled, Scheme, Unanswered, after, peer_gone};
 use crate::inbound::head::{Limits, Reject};
 use crate::inbound::session::{
     Progress, Proto, Session, Summary, Tracked, close_write, first_head_by, linger, lock,
@@ -464,6 +464,7 @@ async fn request(
         }
     };
     let conn = session.conn(head, start);
+    let _unanswered = Unanswered::new(&conn, &session, start);
     let Handled {
         noted,
         response,

@@ -89,7 +89,7 @@ use super::password::hex;
 use super::server::{Answer, Gate, Handler, Req, Route, json_body};
 use super::store::AdminStore;
 use super::users::Role;
-use crate::config::{AdminConfig, Loaded, ProxyConfig, RecordsConfig, StoreConfig};
+use crate::config::{AdminConfig, Loaded, ProxyConfig, Records, StoreConfig};
 use crate::log::escaped;
 use crate::rules::bundle::Fingerprint;
 use crate::rules::collect::CollectError;
@@ -238,7 +238,7 @@ pub struct Config<'a> {
     pub control: &'a Path,
     /// The directory of the CRS, if the configuration names one.
     pub crs_dir: Option<&'a Path>,
-    pub records: Option<&'a RecordsConfig>,
+    pub records: Option<&'a Records>,
     pub waits: Waits,
 }
 
@@ -349,7 +349,7 @@ pub struct Waf {
     rules: StoreConfig,
     control: Control,
     crs_dir: Option<PathBuf>,
-    records: Option<RecordsConfig>,
+    records: Option<Records>,
     waits: Waits,
     store: Arc<dyn AdminStore>,
     audit: Arc<AuditLog>,

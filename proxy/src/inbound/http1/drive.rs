@@ -48,7 +48,7 @@ use tukuyomi_kernel::limits;
 use super::gate::{Finish, Gate, Link, Settings, Taken};
 use crate::forward::tunnel::Tunnel;
 use crate::inbound::answer::{Abort, Noted, Out, Reply, answer, close_after};
-use crate::inbound::conn::{Conn, Ctx, Handled, Scheme, after};
+use crate::inbound::conn::{Conn, Ctx, Handled, Scheme, Unanswered, after};
 use crate::inbound::head::Reject;
 use crate::inbound::session::{
     End, Progress, Proto, Session, Summary, Tracked, close_write, first_head_by, linger, lock,
@@ -236,6 +236,7 @@ impl Serving {
             return Ok(self.respond(noted, answer(400), Then::Close, false, Instant::now()));
         };
         let conn = self.session.conn(head, start);
+        let _unanswered = Unanswered::new(&conn, &self.session, start);
         let Handled {
             noted,
             response,

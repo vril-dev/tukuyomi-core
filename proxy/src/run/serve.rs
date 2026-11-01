@@ -15,7 +15,7 @@ use super::status::{self, Readiness, View};
 use super::stop::{Cause, stop};
 use super::{EXIT_FAILED, control};
 use crate::config::{
-    AdminConfig, ForwardConfig, PolicyConfig, ProxyConfig, StatusConfig, addresses,
+    AdminConfig, ForwardConfig, Keep, PolicyConfig, ProxyConfig, StatusConfig, addresses,
 };
 use crate::forward::group::Upstreams;
 use crate::inbound::challenge::Challenge;
@@ -50,6 +50,7 @@ pub(super) async fn run(
     status: Option<StatusConfig>,
     admin: Option<AdminConfig>,
     policy: PolicyConfig,
+    keep: Keep,
     log: Log,
 ) -> u8 {
     let signals = match Signals::install() {
@@ -131,6 +132,7 @@ pub(super) async fn run(
         access: policy.access,
         country: policy.country,
         rate_limit: policy.rate_limit.as_ref().map(RateLimit::new),
+        keep,
     });
     let readiness = Arc::new(Readiness::new());
     if let Some(bound) = control_socket {

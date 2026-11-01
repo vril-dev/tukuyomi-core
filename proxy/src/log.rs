@@ -17,19 +17,39 @@
 //! well, after the standard error. A line that the file does not take is lost for the file only and is counted apart
 //! (`Log::file_errors`). What was queued before the file was handed over is not written to it. The text form never
 //! has a record file.
+//!
+//! Every item in the queue takes one of its `LOG_QUEUE` places, and one that finds none is dropped. A request whose
+//! record must not be dropped for a full queue takes its place before it is let in (`Log::seat`), holds it as a
+//! `Seat` while the request is served, and queues its record with it (`Log::record_in`), which cannot fail for lack
+//! of room. The logger gives a place back when it takes the item out of the queue, and a seat that is dropped gives
+//! its place back. Seats take at most half of the places, so that the records of the other routes and the lines of
+//! the process still find room while many requests that need their record kept are in flight.
+//!
+//! The logger keeps one fact for the requests that need their record kept: whether the last write to the record
+//! file went through (`Log::healthy`). A write that fails makes it false and the next write that goes through makes
+//! it true again; the file is opened again a second after a failure, by the first line that comes after that. It is
+//! false for good once the logger is gone: its thread has ended, or the queue finds no receiver. With a shipper the
+//! logger's handle also knows how far behind the shipper is (`ship`). `Log::admit` lets a request in, with a seat,
+//! or says which of the three stops it; `Log::admitting` tells whether it would.
+//!
+//! If the record file has a sync interval the logger makes the lines written to it reach the disk when the oldest
+//! of them has waited that long, also when no line comes after them, and when it is asked to flush. A sync that fails
+//! is counted with the lines the file did not take and makes the logger unhealthy like a write that fails.
 
 use std::io::{self, Write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use self::record::Record;
 use self::sink::RecordFile;
+use crate::config::Records;
 
 pub mod counters;
 pub mod record;
+pub mod ship;
 pub mod sink;
 pub(crate) mod time;
 
@@ -63,15 +83,128 @@ enum Item {
     Flush(SyncSender<()>),
 }
 
-/// The items that could not be written, counted by the callers and by the logger.
-#[derive(Default)]
+/// The places of the queue, the items that could not be written (counted by the callers and by the logger) and what
+/// the logger knows of the record file.
 struct Counts {
+    /// The places the queue has.
+    places: usize,
+    /// The places that are taken: by the items in the queue and by the seats that wait for their records.
+    taken: AtomicUsize,
+    /// The seats that wait for their records; at most `seat_places`.
+    seats: AtomicUsize,
+    /// The most seats there are: half of the places.
+    seat_places: usize,
     /// Items that did not fit into the queue, found no logger, or were too long once encoded.
     dropped: AtomicU64,
     /// Lines that the logger could not write.
     write_errors: AtomicU64,
-    /// Lines that the logger could not write to the record file.
+    /// Lines that the logger could not write to the record file, and syncs of it that failed.
     file_errors: AtomicU64,
+    /// The last write to the record file, or the last sync of it, failed, or the logger is gone.
+    failing: AtomicBool,
+    /// How far behind the shipper is: there if the configuration has a shipper (`Log::watch_ship`).
+    lag: OnceLock<ship::Lag>,
+}
+
+impl Counts {
+    fn new(places: usize) -> Counts {
+        Counts {
+            places,
+            taken: AtomicUsize::new(0),
+            seats: AtomicUsize::new(0),
+            seat_places: places / 2,
+            dropped: AtomicU64::new(0),
+            write_errors: AtomicU64::new(0),
+            file_errors: AtomicU64::new(0),
+            failing: AtomicBool::new(false),
+            lag: OnceLock::new(),
+        }
+    }
+
+    /// Takes one place of the queue if one is free.
+    fn take_place(&self) -> bool {
+        self.taken
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
+                (taken < self.places).then_some(taken + 1)
+            })
+            .is_ok()
+    }
+
+    /// Gives one place back.
+    fn give_place(&self) {
+        let _ = self
+            .taken
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
+                Some(taken.saturating_sub(1))
+            });
+    }
+
+    /// Takes a seat, and the place that goes with it, if both are free.
+    fn take_seat(&self) -> bool {
+        let seat = self
+            .seats
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |seats| {
+                (seats < self.seat_places).then_some(seats + 1)
+            });
+        if seat.is_err() {
+            return false;
+        }
+        if self.take_place() {
+            return true;
+        }
+        self.give_seat();
+        false
+    }
+
+    /// Gives one seat back; its place stays taken.
+    fn give_seat(&self) {
+        let _ = self
+            .seats
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |seats| {
+                Some(seats.saturating_sub(1))
+            });
+    }
+
+    /// Whether a seat is free now, with a place for it.
+    fn seat_free(&self) -> bool {
+        self.seats.load(Ordering::Acquire) < self.seat_places
+            && self.taken.load(Ordering::Acquire) < self.places
+    }
+
+    /// Notes that the queue did not take an item: its place goes back, and a queue without a receiver means that
+    /// the logger is gone, which makes the logger unhealthy for good.
+    fn not_taken(&self, why: &TrySendError<Item>) {
+        self.give_place();
+        if matches!(why, TrySendError::Disconnected(_)) {
+            self.failing.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// A place of the queue that is kept for one record, so that the record is not dropped for a full queue. The place
+/// and the seat go back when the seat is dropped. When the record is queued with it (`Log::record_in`) the place
+/// passes to the item and only the seat goes back.
+pub struct Seat(Option<Arc<Counts>>);
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        if let Some(counts) = self.0.take() {
+            counts.give_seat();
+            counts.give_place();
+        }
+    }
+}
+
+/// Why a request that needs its record kept is not let in (`Log::admit`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unkept {
+    /// The last write to the record file failed, or the logger is gone.
+    Failing,
+    /// The shipper is so far behind that records would be deleted before it ships them, or how far it is is not
+    /// known.
+    Behind,
+    /// All the seats are taken, or the queue has no place for one.
+    Full,
 }
 
 /// A handle to the record queue. Sending never waits.
@@ -109,13 +242,56 @@ impl Log {
         });
     }
 
-    fn send(&self, item: Item) {
-        match self.queue.try_send(item) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                self.counts.dropped.fetch_add(1, Ordering::Relaxed);
-            }
+    /// Queues one typed record with the seat that was taken for it. It is not dropped for a full queue; it is when
+    /// there is no logger, and then it is counted.
+    pub fn record_in(&self, mut seat: Seat, record: Record) {
+        // The seat is spent, and its place passes to the item: the logger gives it back when it takes the item out
+        // of the queue.
+        if let Some(counts) = seat.0.take() {
+            counts.give_seat();
         }
+        self.put(Item::Record {
+            at: SystemTime::now(),
+            record,
+        });
+    }
+
+    /// Takes a place of the queue for a record that is to come, without waiting. None: all the seats are taken, or
+    /// the queue is full.
+    pub fn seat(&self) -> Option<Seat> {
+        self.counts
+            .take_seat()
+            .then(|| Seat(Some(self.counts.clone())))
+    }
+
+    /// Queues the item if a place is free, else drops it and counts it.
+    fn send(&self, item: Item) {
+        if self.counts.take_place() {
+            self.put(item);
+        } else {
+            self.counts.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Puts an item whose place is taken into the queue. An item that the queue does not take gives its place back
+    /// and is counted.
+    fn put(&self, item: Item) {
+        if let Err(why) = self.queue.try_send(item) {
+            self.counts.not_taken(&why);
+            self.counts.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Puts an item into the queue if a place is free. False: it is not in the queue, and nothing is counted.
+    fn try_put(&self, item: Item) -> bool {
+        if !self.counts.take_place() {
+            return false;
+        }
+        if let Err(why) = self.queue.try_send(item) {
+            self.counts.not_taken(&why);
+            return false;
+        }
+        true
     }
 
     /// Items dropped so far.
@@ -128,15 +304,56 @@ impl Log {
         self.counts.write_errors.load(Ordering::Relaxed)
     }
 
-    /// Lines that could not be written to the record file so far.
+    /// Lines that could not be written to the record file so far, and syncs of it that failed.
     pub fn file_errors(&self) -> u64 {
         self.counts.file_errors.load(Ordering::Relaxed)
+    }
+
+    /// Whether the last write to the record file went through and the logger is there. True before anything was
+    /// written to it and while there is no record file.
+    pub fn healthy(&self) -> bool {
+        !self.counts.failing.load(Ordering::Acquire)
+    }
+
+    /// Whether the shipper, if there is one, is so far behind that records would be deleted before it ships them,
+    /// or how far it is is not known.
+    fn behind(&self) -> bool {
+        self.counts.lag.get().is_some_and(ship::Lag::behind)
+    }
+
+    /// Lets in a request that needs its record kept: the record file takes records, the shipper, if there is one,
+    /// is not so far behind that records would be deleted before it ships them, and a seat is free. The seat, or
+    /// what stops the request, in that order.
+    pub fn admit(&self) -> Result<Seat, Unkept> {
+        if !self.healthy() {
+            return Err(Unkept::Failing);
+        }
+        if self.behind() {
+            return Err(Unkept::Behind);
+        }
+        self.seat().ok_or(Unkept::Full)
+    }
+
+    /// Whether `admit` would let in a request now.
+    pub fn admitting(&self) -> bool {
+        self.healthy() && !self.behind() && self.counts.seat_free()
+    }
+
+    /// How much of the record files the shipper has not shipped; none: the configuration has no shipper.
+    pub fn unshipped(&self) -> Option<ship::Unshipped> {
+        self.counts.lag.get().map(ship::Lag::unshipped)
+    }
+
+    /// Starts to look once a second at where the shipper of the configuration has got to (see `ship`). The first look
+    /// is made before this returns.
+    pub fn watch_ship(&self, config: &Records) -> Result<(), &'static str> {
+        ship::watch(&self.counts, config)
     }
 
     /// Hands the record file to the logger, which writes every line it writes to the standard error to it from then
     /// on (the items queued before are not). False: the queue did not take the file, and it is closed.
     pub fn attach(&self, file: RecordFile) -> bool {
-        self.queue.try_send(Item::File(Box::new(file))).is_ok()
+        self.try_put(Item::File(Box::new(file)))
     }
 
     /// Asks the logger to write what it has; true if it answered within `wait`. A marker that does not fit into
@@ -146,7 +363,7 @@ impl Log {
             return false;
         };
         let (ack, answer) = sync_channel(1);
-        if self.queue.try_send(Item::Flush(ack)).is_err() {
+        if !self.try_put(Item::Flush(ack)) {
             return false;
         }
         answer
@@ -155,12 +372,12 @@ impl Log {
     }
 }
 
-/// A queue of `capacity` items and the handle that fills it.
-fn open(capacity: usize) -> (Log, Receiver<Item>) {
-    let (queue, items) = sync_channel(capacity);
+/// A queue of `places` items and the handle that fills it.
+fn open(places: usize) -> (Log, Receiver<Item>) {
+    let (queue, items) = sync_channel(places);
     let log = Log {
         queue,
-        counts: Arc::new(Counts::default()),
+        counts: Arc::new(Counts::new(places)),
     };
     (log, items)
 }
@@ -172,10 +389,50 @@ fn write_line<W: Write>(out: &mut W, counts: &Counts, file: &mut Option<RecordFi
     if out.write_all(line.as_bytes()).is_err() {
         counts.write_errors.fetch_add(1, Ordering::Relaxed);
     }
+    if let Some(file) = file {
+        let kept = file.append(line.as_bytes());
+        counts.failing.store(!kept, Ordering::Release);
+        if kept {
+            if let Some(lag) = counts.lag.get() {
+                lag.wrote(line.len());
+            }
+        } else {
+            counts.file_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Makes the lines of the record file that are not on the disk yet reach it. A sync that fails is counted with the
+/// lines that the file did not take, and makes the logger unhealthy.
+fn sync_file(counts: &Counts, file: &mut Option<RecordFile>) {
     if let Some(file) = file
-        && !file.append(line.as_bytes())
+        && !file.sync_pending(Instant::now())
     {
         counts.file_errors.fetch_add(1, Ordering::Relaxed);
+        counts.failing.store(true, Ordering::Release);
+    }
+}
+
+/// The next item of the queue; none when every handle is gone. While the record file has lines that wait to be
+/// synced, this waits no longer than they may, and syncs when the time comes.
+fn next(items: &Receiver<Item>, counts: &Counts, file: &mut Option<RecordFile>) -> Option<Item> {
+    loop {
+        let Some(due) = file.as_ref().and_then(RecordFile::sync_due) else {
+            return items.recv().ok();
+        };
+        let now = Instant::now();
+        if due <= now {
+            sync_file(counts, file);
+            continue;
+        }
+        match items.recv_timeout(due - now) {
+            Ok(item) => return Some(item),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                sync_file(counts, file);
+                return None;
+            }
+        }
     }
 }
 
@@ -199,7 +456,8 @@ fn write_encoded<W: Write>(
 fn run<W: Write>(items: &Receiver<Item>, counts: &Counts, format: Format, out: &mut W) {
     let mut reported = 0;
     let mut file = None;
-    while let Ok(item) = items.recv() {
+    while let Some(item) = next(items, counts, &mut file) {
+        counts.give_place();
         let mut ack = None;
         match item {
             Item::Line { at, text } => match format {
@@ -211,12 +469,15 @@ fn run<W: Write>(items: &Receiver<Item>, counts: &Counts, format: Format, out: &
             Item::Record { at, record } => {
                 write_encoded(out, counts, &mut file, record::encode(at, &record));
             }
-            Item::File(next) => {
+            Item::File(opened) => {
                 if format == Format::Json {
-                    file = Some(*next);
+                    file = Some(*opened);
                 }
             }
-            Item::Flush(answer) => ack = Some(answer),
+            Item::Flush(answer) => {
+                sync_file(counts, &mut file);
+                ack = Some(answer);
+            }
         }
         let total = counts.dropped.load(Ordering::Relaxed);
         if total > reported {
@@ -246,13 +507,25 @@ fn run<W: Write>(items: &Receiver<Item>, counts: &Counts, format: Format, out: &
     }
 }
 
+/// Makes the logger unhealthy when its thread ends, whether `run` returns or panics: nothing is written after that.
+struct Ending(Arc<Counts>);
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        self.0.failing.store(true, Ordering::Release);
+    }
+}
+
 /// Starts the logger thread.
 pub fn start_logger(format: Format) -> Result<Log, &'static str> {
     let (log, items) = open(LOG_QUEUE);
-    let counts = log.counts.clone();
+    let ending = Ending(log.counts.clone());
     thread::Builder::new()
         .name("logger".into())
-        .spawn(move || run(&items, &counts, format, &mut io::stderr()))
+        .spawn(move || {
+            let ending = ending;
+            run(&items, &ending.0, format, &mut io::stderr());
+        })
         .map_err(|_| "cannot start the logger thread")?;
     Ok(log)
 }
@@ -261,13 +534,18 @@ pub fn start_logger(format: Format) -> Result<Log, &'static str> {
 #[cfg(test)]
 pub fn recording() -> (Log, Lines) {
     let (log, items) = open(LOG_QUEUE);
-    (log, Lines(Arc::new(std::sync::Mutex::new(items))))
+    let counts = log.counts.clone();
+    let items = Arc::new(std::sync::Mutex::new(items));
+    (log, Lines { items, counts })
 }
 
 /// The queue of a handle that `recording` made.
 #[cfg(test)]
 #[derive(Clone)]
-pub struct Lines(Arc<std::sync::Mutex<Receiver<Item>>>);
+pub struct Lines {
+    items: Arc<std::sync::Mutex<Receiver<Item>>>,
+    counts: Arc<Counts>,
+}
 
 #[cfg(test)]
 impl Lines {
@@ -275,12 +553,13 @@ impl Lines {
     /// would drop for its length fails the test.
     pub fn take(&self) -> Vec<serde_json::Value> {
         let items = self
-            .0
+            .items
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         items
             .try_iter()
             .filter_map(|item| {
+                self.counts.give_place();
                 let line = match item {
                     Item::Line { at, text } => record::encode_line(at, &text),
                     Item::Record { at, record } => record::encode(at, &record),

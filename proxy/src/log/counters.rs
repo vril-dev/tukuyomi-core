@@ -219,6 +219,9 @@ pub struct Counters {
     pub open: Arc<Open>,
     /// The TLS handshakes that failed or were not finished in time.
     pub tls_failures: Counter,
+    /// The requests of a route whose records are required that were answered with 503 for want of a place to keep
+    /// their record.
+    pub records_refused: Counter,
     /// When the process started, in seconds since the epoch of Unix time.
     started: u64,
 }
@@ -243,6 +246,7 @@ impl Counters {
             accepted: Counter::default(),
             open: Arc::new(Open::default()),
             tls_failures: Counter::default(),
+            records_refused: Counter::default(),
             started: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),

@@ -18,15 +18,18 @@
 //! path of at most 3840 bytes; the file is not read here. `server_name` is a name of the form of a server name, and
 //! TLS has to be able to use it; without it each server is checked for its own name (so every name of a server of such
 //! a group must be one TLS can use), or, written as an IP literal, for its address.
-//! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?}`.
+//! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?,
+//! "records"?}`.
 //! The `host` and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access`
 //! and `rewrite` are the networks and countries that may use the route and the edits it makes (see `rewrite`).
 //! `stream` is `{"idle_ms", "total_ms", "websocket"}`, all three present: a response on the route may last `total_ms`
 //! from its head at the most (1 ms to 24 h) while the upstream may be silent for `idle_ms` (1 ms up to `total_ms`) and
-//! `websocket` tells whether a WebSocket handshake is let through. `max_body` is the most bytes a request body may have on the route
+//! `websocket` tells whether a WebSocket handshake is let through. `records` is `best_effort`, `required` or `security`
+//! and says how the records of the requests of the route are kept (see `records`); left out, `records.keep` holds.
+//! `max_body` is the most bytes a request body may have on the route
 //! (0: none); it is not above the `max_body` of the proxy, which the route can only lower. `default_upstream` is the group that serves a request no route
 //! holds for, or the empty string, and then such a request is answered with 404. The default group has no
-//! `access`, no `rewrite`, no `stream` and no `max_body`. The `path` of a route that has an access list is in its canonical
+//! `access`, no `rewrite`, no `stream`, no `max_body` and no `records`. The `path` of a route that has an access list is in its canonical
 //! form (see `route`): its escapes are in uppercase and none stands for a byte that a path holds as it is, for a
 //! request is held to the list of the route that its path in canonical form meets, and would not meet this one. If
 //! any route has an access list, no route has a port in its `host`: the client writes the port, and a request that
@@ -42,8 +45,11 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::{Deserializer, Error, MapAccess, Visitor};
 
+use super::records;
 use super::rewrite::{self, RawAccess, RawRewrite};
-use super::{ConfigError, MAX_CONN_MS, MAX_STORE_DIR, Object, clean_abs, ensure, millis, same};
+use super::{
+    ConfigError, MAX_CONN_MS, MAX_STORE_DIR, Object, RouteKeep, clean_abs, ensure, millis, same,
+};
 use crate::forward::client_ip::Access;
 use crate::forward::rewrite::Rewrite;
 use crate::forward::tls::{self, Client, Settings};
@@ -106,11 +112,13 @@ pub struct RouteConfig {
     pub stream: Option<Stream>,
     /// The most bytes a request body on this route may have, if that is less than `max_body` of the proxy.
     pub max_body: Option<usize>,
+    /// How the records of the requests of this route are kept, if the route says; else `records.keep` holds.
+    pub records: Option<RouteKeep>,
 }
 
 impl RouteConfig {
-    /// A route to the group at index `group` that turns nobody away, edits nothing, has no `stream` and no limit
-    /// of its own on the body.
+    /// A route to the group at index `group` that turns nobody away, edits nothing, has no `stream`, no limit of its
+    /// own on the body and no word on its records.
     pub fn plain(group: usize) -> RouteConfig {
         RouteConfig {
             group,
@@ -118,6 +126,7 @@ impl RouteConfig {
             rewrite: Rewrite::default(),
             stream: None,
             max_body: None,
+            records: None,
         }
     }
 }
@@ -220,6 +229,8 @@ struct RawRoute {
     stream: Option<Object<RawStream>>,
     #[serde(default, deserialize_with = "super::present")]
     max_body: Option<usize>,
+    #[serde(default, deserialize_with = "super::present")]
+    records: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -460,6 +471,11 @@ pub(super) fn check(
                 rewrite: rewrite::rewrite(route.path.as_deref(), route.rewrite)?,
                 stream: stream(route.stream)?,
                 max_body: route.max_body,
+                records: route
+                    .records
+                    .as_deref()
+                    .map(records::route_keep)
+                    .transpose()?,
             },
         ));
     }

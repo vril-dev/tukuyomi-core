@@ -3,6 +3,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::*;
+use crate::config::Keep;
 use crate::log::{Format, open, run};
 
 /// A fresh 0700 directory under the temp directory (`TMPDIR`), removed with everything in it when dropped.
@@ -37,11 +38,14 @@ fn scratch() -> TestDir {
 /// The name of the file in use while the older files are renamed up by one.
 const MOVING: &str = "records.rotating";
 
-fn config(dir: &Path, file_bytes: u64, files: usize) -> RecordsConfig {
-    RecordsConfig {
+fn config(dir: &Path, file_bytes: u64, files: usize) -> Records {
+    Records {
         dir: dir.to_path_buf(),
         file_bytes,
         files,
+        keep: Keep::BestEffort,
+        sync_ms: None,
+        ship: None,
     }
 }
 
@@ -150,6 +154,33 @@ fn an_existing_file_is_continued_and_rotated_when_the_next_line_does_not_fit() {
 }
 
 #[test]
+fn a_file_that_ends_in_the_middle_of_a_line_gets_a_line_feed_before_the_next_line() {
+    let dir = scratch();
+    let half = &line(2)[..10];
+    fs::write(
+        dir.path().join("records.log"),
+        format!("{}{half}", lines(&[0, 1])),
+    )
+    .unwrap();
+    let mut file = opened(dir.path(), 4096, 2);
+    assert!(file.append(line(3).as_bytes()));
+    let expected = format!("{}{half}\n{}", lines(&[0, 1]), line(3));
+    assert_eq!(read(dir.path(), "records.log"), expected);
+    // A file that ends with a line feed gets nothing, and neither does an empty one.
+    drop(file);
+    let mut file = opened(dir.path(), 4096, 2);
+    assert!(file.append(line(4).as_bytes()));
+    assert_eq!(
+        read(dir.path(), "records.log"),
+        format!("{expected}{}", line(4))
+    );
+    let empty = scratch();
+    let mut file = opened(empty.path(), 4096, 2);
+    assert!(file.append(line(0).as_bytes()));
+    assert_eq!(read(empty.path(), "records.log"), line(0));
+}
+
+#[test]
 fn the_directory_and_the_file_are_looked_at_before_anything_is_written() {
     let dir = scratch();
     let refused = |dir: &Path| RecordFile::open(&config(dir, 100, 2)).err();
@@ -174,6 +205,7 @@ fn the_directory_and_the_file_are_looked_at_before_anything_is_written() {
     // A link, a FIFO or a directory in place of the file; the FIFO must not make the open wait.
     let file = dir.path().join("records.log");
     let cannot = Some("the record file cannot be opened");
+    let not_regular = Some("the record file is not a regular file of this user");
     symlink("/dev/null", &file).unwrap();
     assert_eq!(refused(dir.path()), cannot);
     fs::remove_file(&file).unwrap();
@@ -183,7 +215,7 @@ fn the_directory_and_the_file_are_looked_at_before_anything_is_written() {
         .arg(&file)
         .status();
     assert!(made.unwrap().success());
-    assert_eq!(refused(dir.path()), cannot);
+    assert_eq!(refused(dir.path()), not_regular);
     fs::remove_file(&file).unwrap();
     fs::create_dir(&file).unwrap();
     assert_eq!(refused(dir.path()), cannot);
@@ -434,4 +466,89 @@ fn the_files_of_another_stem_are_named_and_rotated_by_it() {
     assert_eq!(names(dir.path()), ["audit.1.log", "audit.log"]);
     assert_eq!(read(dir.path(), "audit.1.log"), lines(&[0, 1, 2]));
     assert_eq!(read(dir.path(), "audit.log"), lines(&[3]));
+}
+
+/// Waits until `cond` holds; the logger runs on a thread of its own.
+fn until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A record file whose file in use takes every write and fails every sync: `/dev/null` is not a file that `fsync`
+/// can be called on.
+fn unsyncable(dir: &Path, sync_every: Duration) -> RecordFile {
+    let mut file = opened(dir, 4096, 2);
+    file.sync_every = Some(sync_every);
+    file.current = Some(Current {
+        file: OpenOptions::new().write(true).open("/dev/null").unwrap(),
+        size: 0,
+        id: (0, 0),
+    });
+    file
+}
+
+#[test]
+fn the_logger_is_unhealthy_after_a_write_to_the_file_fails_and_healthy_after_one_goes_through() {
+    let dir = scratch();
+    let (log, items) = open(16);
+    let counts = log.counts.clone();
+    std::thread::spawn(move || run(&items, &counts, Format::Json, &mut Vec::new()));
+    assert!(log.healthy());
+    assert!(log.attach(full(dir.path(), 100, 2)));
+    log.line("one");
+    assert!(log.flush(Duration::from_secs(10)));
+    assert!(!log.healthy());
+    assert_eq!(log.file_errors(), 1);
+    // A file that takes the next line makes it healthy again.
+    assert!(log.attach(opened(dir.path(), 4096, 2)));
+    log.line("two");
+    assert!(log.flush(Duration::from_secs(10)));
+    assert!(log.healthy());
+    assert_eq!(log.file_errors(), 1);
+}
+
+#[test]
+fn lines_wait_for_a_sync_no_longer_than_the_interval_and_a_failed_sync_closes_the_file() {
+    let dir = scratch();
+    let mut file = opened(dir.path(), 4096, 2);
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    // Without an interval nothing waits.
+    assert!(file.append_at(line(0).as_bytes(), t0));
+    assert_eq!(file.sync_due(), None);
+    // With one, the oldest line that is not synced decides when.
+    file.sync_every = Some(ms(50));
+    assert_eq!(file.sync_due(), None);
+    assert!(file.append_at(line(1).as_bytes(), t0));
+    assert!(file.append_at(line(2).as_bytes(), t0 + ms(30)));
+    assert_eq!(file.sync_due(), Some(t0 + ms(50)));
+    assert!(file.sync_pending(t0 + ms(50)));
+    assert_eq!(file.sync_due(), None);
+    assert!(file.append_at(line(3).as_bytes(), t0 + ms(100)));
+    assert_eq!(file.sync_due(), Some(t0 + ms(150)));
+
+    // A sync that fails closes the file, and the next line opens it again a second later.
+    let mut file = unsyncable(dir.path(), ms(50));
+    assert!(file.append_at(line(4).as_bytes(), t0));
+    assert!(!file.sync_pending(t0 + ms(50)));
+    assert!(file.current.is_none());
+    assert_eq!(file.sync_due(), None);
+    assert!(!file.append_at(line(5).as_bytes(), t0 + ms(60)));
+    assert!(file.append_at(line(6).as_bytes(), t0 + ms(1050)));
+}
+
+#[test]
+fn the_logger_syncs_the_file_when_the_interval_has_passed_also_when_no_line_follows() {
+    let dir = scratch();
+    let (log, items) = open(16);
+    let counts = log.counts.clone();
+    std::thread::spawn(move || run(&items, &counts, Format::Json, &mut Vec::new()));
+    assert!(log.attach(unsyncable(dir.path(), Duration::from_millis(50))));
+    log.line("one");
+    // The write went through; the sync that follows it by itself fails, and the logger says so.
+    until("the sync to fail", || !log.healthy());
+    assert_eq!(log.file_errors(), 1);
 }

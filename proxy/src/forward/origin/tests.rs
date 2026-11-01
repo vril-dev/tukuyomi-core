@@ -16,7 +16,7 @@ use tokio::time::{sleep, timeout};
 
 use super::head::{check_head, check_switch};
 use super::*;
-use crate::config::{ForwardConfig, ProxyConfig};
+use crate::config::{ForwardConfig, Keep, ProxyConfig};
 use crate::forward::client_ip::Access;
 use crate::forward::connect::connect_error;
 use crate::forward::group::Upstreams;
@@ -95,6 +95,7 @@ pub(in crate::forward) fn ctx_of(forward: &ForwardConfig, cfg: ProxyConfig) -> C
         access: Access::default(),
         country: None,
         rate_limit: None,
+        keep: Keep::BestEffort,
         cfg,
     }
 }

@@ -73,15 +73,15 @@ use hyper::body::Incoming;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 
-use self::fault::upstream_stop;
-use crate::config::{ProxyConfig, STREAM_HOLD, Stream};
+use self::fault::{PEER_CLOSED, upstream_stop};
+use crate::config::{Keep, ProxyConfig, STREAM_HOLD, Stream};
 use crate::forward::client_ip::{self, Access, Cidr, Country};
 use crate::forward::group::{Route, Upstreams};
 use crate::forward::origin::{self, Forward, OriginBody};
 use crate::forward::tunnel::{self, Record, Tunnel};
 use crate::inbound::answer::{
-    Abort, Decision, Noted, Out, Passed, Reply, Sizes, Stop, Via, answer, answer_after, decide,
-    text,
+    Abort, Decision, Keeping, Noted, Out, Passed, Reply, Sizes, Stop, Via, answer, answer_after,
+    decide, text,
 };
 use crate::inbound::challenge::{Challenge, Proof};
 use crate::inbound::head::{Head, Reject};
@@ -98,15 +98,18 @@ use crate::policy::{self, RateLimit, Refusal};
 use crate::rules::routes::SharedRoutes;
 
 mod fault;
+mod keep;
 
 pub(super) use self::fault::peer_gone;
+pub(super) use self::keep::Unanswered;
 
 /// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
 /// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, the
 /// upstream groups with the routes to them and the connections that wait to be used again, the way to the driver,
 /// the TLS of the listeners that end it, the answer to the challenge of the CA, if the configuration has `acme`, the
 /// numbers of the requests, the networks and countries that may not use the proxy at all, the country database if some
-/// list of countries needs one, the rate limit if the configuration has one, and the counters that `/metrics` shows.
+/// list of countries needs one, the rate limit if the configuration has one, what a route does with a request whose
+/// record cannot be kept when it does not say (`records.keep`), and the counters that `/metrics` shows.
 pub struct Ctx {
     pub cfg: ProxyConfig,
     pub budget: Arc<Semaphore>,
@@ -125,6 +128,8 @@ pub struct Ctx {
     pub country: Option<Geo>,
     /// The `rate_limit` of the configuration, if it has one.
     pub rate_limit: Option<RateLimit>,
+    /// What a route without `records` does when the record of a request cannot be kept.
+    pub keep: Keep,
 }
 
 /// How the listener that took a connection carries its requests: over plain HTTP, or over TLS, with the hosts of the
@@ -197,6 +202,8 @@ pub(super) struct Conn {
     sizes: Mutex<Option<Sizes>>,
     /// The generation whose rules gave a verdict, and that verdict, set when one did.
     judged: Mutex<Option<Judge>>,
+    /// How the record is kept (see `keep`), set once the route is found.
+    keeping: Mutex<Keeping>,
 }
 
 /// The first bytes of a body, which `read_body` holds, and the rest of it if the body goes on.
@@ -258,6 +265,7 @@ impl Conn {
             via: Mutex::new(None),
             sizes: Mutex::new(None),
             judged: Mutex::new(None),
+            keeping: Mutex::new(Keeping::default()),
         }
     }
 
@@ -300,28 +308,14 @@ impl Conn {
                 None,
             ),
         };
-        let via = self
-            .via
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let body = self
-            .sizes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let judged = self
-            .judged
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let mut noted = self.noted(reply);
+        // A request whose client went away while its body was read is kept on a route that keeps only some records,
+        // as one that is dropped before its answer is (`unanswered`).
+        if reply.reason == PEER_CLOSED {
+            noted.keeping.only_security = false;
+        }
         Handled {
-            noted: Noted {
-                via,
-                body,
-                judged,
-                ..Noted::new(self.request.clone(), reply, self.client.ip()).of(&self.head)
-            },
+            noted,
             response,
             tunnel,
             stream,
@@ -418,7 +412,9 @@ impl Conn {
         let passed = if bypass {
             self.bypassed()
         } else {
-            self.ask(headers, field_bytes, &body, cut).await?
+            self.ask(headers, field_bytes, &body, cut)
+                .await
+                .inspect_err(|_| self.inspection_stopped())?
         };
         if Instant::now() >= self.request_by {
             return Err(Reply::failed(503, "request time used up").into());
@@ -499,7 +495,8 @@ impl Conn {
     /// some route has an access list, every route that the request could be taken for, however it is written, has to
     /// allow the client (see `Upstreams::accesses`); if none has, nobody is turned away and that is not asked. On a
     /// connection that ended TLS the `Host` has to be covered by the certificate of the handshake first, or the
-    /// answer is 421: the client may not use a connection for a site that its certificate does not stand for.
+    /// answer is 421: the client may not use a connection for a site that its certificate does not stand for. Last
+    /// comes the admission of a request that needs its record kept (see `keep`).
     fn route(&self) -> Result<Route<'_>, Stop> {
         let client = self.client.ip();
         let ctx = &self.ctx;
@@ -521,6 +518,7 @@ impl Conn {
         let route = upstreams
             .find(host, target)
             .ok_or_else(|| self.turned_away(404, "no route matches"))?;
+        let keeps = self.keep_by(&route);
         if upstreams.guarded()
             && !upstreams
                 .accesses(host, target)
@@ -537,6 +535,7 @@ impl Conn {
         {
             return Err(self.turned_away(413, "body over the limit of the route"));
         }
+        self.admit_records(keeps)?;
         Ok(route)
     }
 
@@ -712,7 +711,7 @@ impl Conn {
         if self.gauge.over() {
             Stop::Reply(Reply::rejected(413, "body over the limit on the wire"))
         } else if peer_gone(e) {
-            Stop::Close("peer closed during the body")
+            Stop::Close(PEER_CLOSED)
         } else {
             Stop::Reply(Reply::rejected(400, "malformed body"))
         }

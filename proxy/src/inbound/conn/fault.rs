@@ -7,6 +7,9 @@ use crate::forward::origin::OriginError;
 use crate::inbound::answer::{Reply, Stop};
 use crate::inbound::upload::{Cause, Fate};
 
+/// The reason of the record of a request whose client went away before it came to an answer.
+pub(super) const PEER_CLOSED: &str = "peer closed during the body";
+
 /// What the failure of the exchange with the upstream means for the client. `fate` is there if the body of the request
 /// was passed on while the client sent it: part of it may have gone to the upstream already, so a failure that comes
 /// after the request was sent says so, unless all of the body had been handed on by then: the failure is then the
@@ -41,7 +44,7 @@ fn cause_stop(cause: Cause) -> Stop {
         Cause::Over => Stop::Close("body over the limit while it was sent on"),
         Cause::Trailers => Reply::rejected(400, "request trailers not supported").into(),
         Cause::Wire => Reply::rejected(413, "body over the limit on the wire").into(),
-        Cause::Gone => Stop::Close("peer closed during the body"),
+        Cause::Gone => Stop::Close(PEER_CLOSED),
         Cause::Malformed => Reply::rejected(400, "malformed body").into(),
     }
 }

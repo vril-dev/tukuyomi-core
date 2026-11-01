@@ -17,6 +17,7 @@ use crate::admin::audit::Append;
 use crate::admin::file_store::FileAdminStore;
 use crate::admin::file_store::tests::{TestDir, scratch};
 use crate::admin::waf::history::Activation;
+use crate::config::Keep;
 use crate::log;
 use crate::log::sink::RecordFile;
 use crate::rules::bundle::{Bundle, BundlePath, Mode};
@@ -260,7 +261,7 @@ fn rig(with_proxy: bool) -> Rig {
     rig_with(with_proxy, None)
 }
 
-fn rig_with(with_proxy: bool, records: Option<RecordsConfig>) -> Rig {
+fn rig_with(with_proxy: bool, records: Option<Records>) -> Rig {
     let dir = scratch();
     fs::DirBuilder::new()
         .mode(0o700)
@@ -1028,10 +1029,13 @@ fn the_records_route_reads_the_record_files_or_says_that_there_are_none() {
     let dir = scratch();
     let record = json!({"ts": "2026-10-25T08:00:00.000Z", "type": "request", "id": "0123456789abcdef-3", "path": "/a%20b"});
     fs::write(dir.path().join("records.log"), format!("{record}\n")).unwrap();
-    let config = RecordsConfig {
+    let config = Records {
         dir: dir.path().to_path_buf(),
         file_bytes: 1 << 20,
         files: 2,
+        keep: Keep::BestEffort,
+        sync_ms: None,
+        ship: None,
     };
     let rig = rig_with(false, Some(config));
     let found = rig.get(Op::Records, "/api/records", "id=0123456789abcdef-3");

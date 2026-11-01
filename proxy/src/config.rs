@@ -16,8 +16,8 @@
 //! file. Then the values are checked in a fixed order and the first broken rule is returned: the `proxy` bounds, the
 //! `status` object against the listeners (before `forward`, for no server may be at its address), the `forward`
 //! values (see `forward`; the names of the servers are not looked up here, `forward::resolve` does that when the proxy
-//! starts), the `rules.store` values, the `acme` object with the certificates that have `acme`, the `records` object,
-//! the `access`, `rate_limit` and `geo` objects (see `policy`) and that `geo` is there if a list of countries is, the
+//! starts), the `rules.store` values, the `acme` object with the certificates that have `acme`, the `records` object
+//! (and that the `records` of the routes suit it), the `access`, `rate_limit` and `geo` objects (see `policy`) and that `geo` is there if a list of countries is, the
 //! `admin` object against the listeners and the status listener, the directories and the control socket against
 //! each other (see `places`), the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's
 //! own check, and last the relations between the `proxy` and `kernel` objects.
@@ -86,7 +86,7 @@ pub use listeners::{
 };
 pub use policy::{GeoConfig, PolicyConfig, RateLimitConfig};
 pub(crate) use records::MAX_RECORD_FILES;
-pub use records::RecordsConfig;
+pub use records::{Driver, Keep, Records, RouteKeep, Ship};
 pub use status::StatusConfig;
 
 const MAX_FILE: u64 = 256 * 1024;
@@ -177,7 +177,7 @@ pub struct Loaded {
     /// There if the file has the `status` object.
     pub status: Option<StatusConfig>,
     /// There if the file has the `records` object.
-    pub records: Option<RecordsConfig>,
+    pub records: Option<Records>,
     /// What turns a request away before its route is looked for: the `access`, `rate_limit` and `geo` objects.
     pub policy: PolicyConfig,
     /// There if the file has the `admin` object.
@@ -597,6 +597,7 @@ fn build(file: RawFile) -> Result<Loaded, ConfigError> {
 
     let acme = acme::check(a, &listeners)?;
     let records = records::check(rec)?;
+    records::consistent(records.as_ref(), &forward)?;
     let policy = policy::check(ac, rl, ge)?;
     ensure(
         policy.geo.is_some() || !uses_countries(&policy, &forward),

@@ -4,9 +4,10 @@
 //! `RecordFile::open` looks at the directory (a real directory owned by this user without group or other bits, as for
 //! the rules store) and opens `records.log` in it for append, made with mode 0600 when it is not there; a link, a FIFO,
 //! a directory or a file of another user is refused, and a file that is there with group or other bits is set to 0600
-//! before anything is written to it. The logger gets the file through its queue (`Log::attach`) and writes to it every
-//! line it writes to the standard error, one write for each line and after the standard error. What was queued before
-//! the file was handed over is not in it.
+//! before anything is written to it. A file whose last line is not complete (a crash or a power cut left it in the
+//! middle of a line) gets a line feed first, so that the next line is not joined to the half line. The logger gets the
+//! file through its queue (`Log::attach`) and writes to it every line it writes to the standard error, one write for
+//! each line and after the standard error. What was queued before the file was handed over is not in it.
 //!
 //! The same file keeps the audit log of the admin process (see `admin::audit`), under the stem `audit` in place of
 //! `records`: `audit.log`, `audit.N.log` and `audit.rotating`. What is written here of the names holds for it with
@@ -31,14 +32,19 @@
 //! again by the first line that comes a second or more after the failure, so a disk that fails is tried once a
 //! second at most. The directory is looked at again, as at the start, before the file is opened again and before a
 //! rotation. A write that failed part way is cut off at the size the file had, so no half line stays in it.
+//!
+//! A file that has a sync interval (`sync_ms` of the configuration) remembers when the oldest line that was written
+//! and not yet synced was written (`sync_due`), and the logger makes those lines reach the disk then
+//! (`sync_pending`). A rotation syncs the file it renames first, for the lines in it are not in the new file. A sync
+//! that fails closes the file like a write that fails.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::config::{MAX_RECORD_FILES, RecordsConfig};
+use crate::config::{MAX_RECORD_FILES, Records};
 use crate::rules::file_store::{O_NOCTTY, O_NOFOLLOW, O_NONBLOCK};
 use crate::run::host;
 
@@ -47,7 +53,7 @@ const RETRY: Duration = Duration::from_secs(1);
 /// The least time between two looks at the path of the file in use, a look before a rotation apart.
 const LOOK: Duration = Duration::from_secs(1);
 /// The stem of the names of the record files.
-const RECORDS: &str = "records";
+pub(crate) const RECORDS: &str = "records";
 
 /// The file in use, its size, and its device and inode.
 struct Current {
@@ -71,6 +77,10 @@ pub struct RecordFile {
     failed: Option<Instant>,
     /// When the path of the file in use was last looked at.
     looked: Instant,
+    /// How long written lines may wait for a sync; none: the operating system decides.
+    sync_every: Option<Duration>,
+    /// When the oldest line that was written and not yet synced was written.
+    unsynced: Option<Instant>,
 }
 
 /// The path of file number `n`: `<stem>.log` for 0 and `<stem>.<n>.log` for the files of earlier lines.
@@ -82,12 +92,19 @@ pub(crate) fn name(dir: &Path, stem: &str, n: usize) -> PathBuf {
     }
 }
 
+/// The path that the file in use has while it is rotated, between the first rename and the last: `<stem>.rotating`.
+pub(crate) fn rotating(dir: &Path, stem: &str) -> PathBuf {
+    dir.join(format!("{stem}.rotating"))
+}
+
 /// Opens `<stem>.log` for append, made when it is not there, and looks at it. It is opened like every file that is
 /// read from the rules store: a link is not followed, a FIFO does not make the open wait, a terminal does not become
 /// the controlling terminal, and what is not a regular file of `uid` is refused. The mode of a file that was there
-/// with group or other bits is set to 0600 on the open file.
+/// with group or other bits is set to 0600 on the open file, and its last line is completed if it is not (see
+/// `end_line`).
 fn open_current(dir: &Path, stem: &str, uid: u32) -> Result<Current, &'static str> {
     let file = OpenOptions::new()
+        .read(true)
         .append(true)
         .create(true)
         .mode(0o600)
@@ -104,11 +121,31 @@ fn open_current(dir: &Path, stem: &str, uid: u32) -> Result<Current, &'static st
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|_| "the mode of the record file cannot be set")?;
     }
+    let size = end_line(&file, meta.len())?;
     Ok(Current {
         file,
-        size: meta.len(),
+        size,
         id: (meta.dev(), meta.ino()),
     })
+}
+
+/// Writes a line feed to `file`, which is `size` bytes long, if its last line does not end with one: a crash or a
+/// power cut can leave a file in the middle of a line, and the next line would be joined to it. The size the file has
+/// then.
+fn end_line(file: &File, size: u64) -> Result<u64, &'static str> {
+    let Some(last) = size.checked_sub(1) else {
+        return Ok(size);
+    };
+    let mut byte = [0u8; 1];
+    file.read_exact_at(&mut byte, last)
+        .map_err(|_| "the end of the record file cannot be read")?;
+    if byte[0] == b'\n' {
+        return Ok(size);
+    }
+    (&*file)
+        .write_all(b"\n")
+        .map_err(|_| "the end of the record file cannot be completed")?;
+    Ok(size.saturating_add(1))
 }
 
 /// Whether `<stem>.log` is the file that `current` has open: the same device and inode, looked at with `lstat`, so
@@ -120,8 +157,12 @@ fn at_path(dir: &Path, stem: &str, current: &Current) -> bool {
 
 impl RecordFile {
     /// Looks at the directory and opens the file in use. A refusal is a sentence.
-    pub fn open(config: &RecordsConfig) -> Result<RecordFile, &'static str> {
-        RecordFile::open_in(RECORDS, &config.dir, config.file_bytes, config.files)
+    pub fn open(config: &Records) -> Result<RecordFile, &'static str> {
+        let mut file = RecordFile::open_in(RECORDS, &config.dir, config.file_bytes, config.files)?;
+        file.sync_every = config
+            .sync_ms
+            .map(|ms| Duration::from_millis(u64::from(ms)));
+        Ok(file)
     }
 
     /// The same for the files that begin with `stem`, in `dir`: `file_bytes` and `files` are as in the `records`
@@ -141,6 +182,8 @@ impl RecordFile {
             current: None,
             failed: None,
             looked: Instant::now(),
+            sync_every: None,
+            unsynced: None,
         };
         file.current = Some(file.reopen()?);
         file.remove_extra();
@@ -152,6 +195,23 @@ impl RecordFile {
         self.current
             .as_ref()
             .is_some_and(|current| current.file.sync_data().is_ok())
+    }
+
+    /// When the lines that were written and not yet synced have to be synced: the file has a sync interval and has
+    /// such lines.
+    pub fn sync_due(&self) -> Option<Instant> {
+        self.unsynced?.checked_add(self.sync_every?)
+    }
+
+    /// Makes the lines that were written and not yet synced reach the disk. False: they did not, and the file is
+    /// closed, to be opened again a second later by a line. A file that is closed has nothing to sync.
+    pub fn sync_pending(&mut self, now: Instant) -> bool {
+        if self.unsynced.take().is_none() || self.current.is_none() || self.sync() {
+            return true;
+        }
+        self.current = None;
+        self.failed = Some(now);
+        false
     }
 
     /// Writes `line`, which ends with its line feed, in one write. False: the file did not take it.
@@ -176,7 +236,12 @@ impl RecordFile {
             }
         }
         if full {
-            // The file is closed before it is renamed.
+            // The lines of this file that are not synced are not in the next one; the file is closed before it is
+            // renamed.
+            if self.unsynced.take().is_some() && current.file.sync_data().is_err() {
+                self.failed = Some(now);
+                return false;
+            }
             drop(current);
             let Some(next) = self.rotate() else {
                 self.failed = Some(now);
@@ -193,6 +258,9 @@ impl RecordFile {
         current.size = current.size.saturating_add(len);
         self.current = Some(current);
         self.failed = None;
+        if self.sync_every.is_some() {
+            self.unsynced.get_or_insert(now);
+        }
         true
     }
 
@@ -228,7 +296,7 @@ impl RecordFile {
     /// back. None: a rename or the open failed.
     fn rotate(&self) -> Option<Current> {
         host::private_dir(&self.dir, self.uid).ok()?;
-        let moving = self.dir.join(format!("{}.rotating", self.stem));
+        let moving = rotating(&self.dir, self.stem);
         fs::rename(name(&self.dir, self.stem, 0), &moving).ok()?;
         if self.shift(&moving).is_err() {
             let _ = fs::rename(&moving, name(&self.dir, self.stem, 0));

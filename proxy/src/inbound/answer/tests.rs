@@ -164,3 +164,129 @@ fn a_body_is_shown_by_its_length() {
     assert_eq!(Sizes::whole(None, 12).lengths(), Some((12, None)));
     assert_eq!(Sizes::whole(Some(30), 12).lengths(), Some((30, None)));
 }
+
+#[test]
+fn a_route_with_security_keeps_what_a_rule_the_inspection_or_a_policy_decided() {
+    use crate::rules::bundle::{Fingerprint, Mode};
+    use tukuyomi_kernel::{Engine, Matched};
+
+    // `stopped` tells that the inspection did not let the request through (see `conn::keep`).
+    let noted = |reply: Reply, verdict: Option<Verdict>, stopped: bool| {
+        let mut noted = Noted::new("id".to_string(), reply, "203.0.113.9".parse().unwrap());
+        noted.keeping.stopped = stopped;
+        noted.judged = verdict.map(|verdict| Judge {
+            generation: Fingerprint::from_hex(&[b'a'; 64]).unwrap(),
+            engine: Engine::Coraza,
+            mode: Mode::Block,
+            verdict,
+            matched: Matched::NONE,
+        });
+        noted
+    };
+    let block = Verdict::Block {
+        phase: 1,
+        rule_id: 9201,
+        status: 403,
+    };
+    let wild = Verdict::Block {
+        phase: 1,
+        rule_id: 9201,
+        status: 99,
+    };
+    let detected = Verdict::Detected {
+        rule_id: 9201,
+        status: 403,
+    };
+    let answer = |verdict| match decide(Outcome::Verdict(verdict)) {
+        Decision::Answer(reply) => reply,
+        Decision::Pass(_) => panic!("not an answer"),
+    };
+    let lost = Verdict::Uninspectable(Reason::InspectorLost);
+    for (what, kept) in [
+        (noted(answer(block), Some(block), true), true),
+        // A block whose status is out of range is answered with 500, and a rule decided it all the same.
+        (noted(answer(wild), Some(wild), true), true),
+        // A detection goes on to the upstream, and its record is kept whatever the upstream answers.
+        (
+            noted(
+                Reply::forwarded(200, Passed::Detected { rule: 9201 }),
+                Some(detected),
+                false,
+            ),
+            true,
+        ),
+        (
+            noted(
+                Reply::failed(502, "upstream unavailable"),
+                Some(detected),
+                false,
+            ),
+            true,
+        ),
+        (
+            noted(
+                Reply::failed(503, "request time used up"),
+                Some(detected),
+                false,
+            ),
+            true,
+        ),
+        (
+            noted(Reply::failed(503, "inspector lost"), Some(lost), true),
+            true,
+        ),
+        // The inspection could not be asked or did not answer: there is no verdict.
+        (
+            noted(Reply::failed(503, "no inspection permit"), None, true),
+            true,
+        ),
+        (
+            noted(Reply::failed(503, "inspection unavailable"), None, true),
+            true,
+        ),
+        (noted(Reply::refused(Refusal::Access), None, false), true),
+        (
+            noted(Reply::refused(Refusal::RateLimit(3)), None, false),
+            true,
+        ),
+        (
+            noted(Reply::rejected(403, "denied by route access"), None, false),
+            true,
+        ),
+        (
+            noted(
+                Reply::forwarded(200, Passed::Allowed),
+                Some(Verdict::Allow),
+                false,
+            ),
+            false,
+        ),
+        (
+            noted(
+                Reply::failed(502, "upstream unavailable"),
+                Some(Verdict::Allow),
+                false,
+            ),
+            false,
+        ),
+        (
+            noted(Reply::forwarded(200, Passed::Bypassed), None, false),
+            false,
+        ),
+        (
+            noted(Reply::failed(502, "upstream unavailable"), None, false),
+            false,
+        ),
+        (
+            noted(Reply::rejected(400, "malformed request head"), None, false),
+            false,
+        ),
+        (
+            noted(Reply::rejected(413, "body over the limit"), None, false),
+            false,
+        ),
+        (noted(Reply::NONE, None, false), false),
+    ] {
+        assert_eq!(what.security(), kept, "{:?}", what.reply);
+    }
+}

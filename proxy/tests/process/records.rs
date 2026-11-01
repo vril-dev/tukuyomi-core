@@ -1,8 +1,11 @@
 //! The records of requests in a real process: the number of a request is the same in its record, in the response
-//! to the client and in the request that the upstream gets, and what the record shows of the request.
+//! to the client and in the request that the upstream gets, what the record shows of the request, and what a route
+//! does when the record of a request cannot be kept (`records` of the route).
 
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::Path;
+use std::thread::sleep;
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -300,4 +303,154 @@ fn a_records_directory_that_others_can_reach_ends_the_start_before_the_inspector
     proxy.clear_root(&["config.json", STORE, "rec"]);
     proxy.upstream.stop();
     assert_eq!(proxy.upstream.connections(), 0);
+}
+
+/// Replaces the `routes` of the configuration in the test root `root`.
+fn set_routes(root: &Path, routes: Value) {
+    let path = root.join("config.json");
+    let text = fs::read_to_string(&path).expect("read the configuration");
+    let mut config: Value = serde_json::from_str(&text).expect("parse the configuration");
+    config["forward"]["routes"] = routes;
+    fs::write(&path, config.to_string()).expect("write the configuration");
+}
+
+/// The value of the sample `name` (with its labels) on the page of the status listener at `port`.
+fn metric(port: u16, name: &str) -> u64 {
+    let reply = exchange(port, &get("/metrics"));
+    let text = String::from_utf8(reply.message().body).expect("the page is text");
+    text.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or_else(|| panic!("no {name} in {text}"))
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_required_route_is_answered_with_503_while_the_record_file_cannot_be_written_and_passes_again_after()
+ {
+    let status = free_port();
+    let proxy = Proxy::start_with("records_required", Knobs::quick(), |root| {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.join("rec"))
+            .expect("make the directory of the records");
+        // `/must/` keeps its records for certain; the rest of the site does not.
+        set_routes(
+            root,
+            json!([{ "path": "/must/", "upstream": "main", "records": "required" }]),
+        );
+        add_object(
+            root,
+            "records",
+            json!({ "dir": root.join("rec").to_string_lossy(), "file_bytes": 1 << 20, "files": 2, "sync_ms": 100 }),
+        );
+        add_object(
+            root,
+            "status",
+            json!({ "listen": format!("127.0.0.1:{status}") }),
+        );
+    });
+    let rec = proxy.root().join("rec");
+    let mut passed = 0;
+    let reply = exchange(proxy.port, &get("/must/a"));
+    assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
+    passed += 1;
+    assert_eq!(metric(status, "tukuyomi_records_healthy"), 1);
+    assert_eq!(metric(status, "tukuyomi_records_refused_total"), 0);
+
+    // A directory where the file was: the open file is not at its path any more, and the path cannot be opened.
+    // The proxy sees it at the first write a second after the last look; the requests until then pass.
+    fs::rename(rec.join("records.log"), rec.join("moved.log")).expect("move the file away");
+    fs::create_dir(rec.join("records.log")).expect("put a directory in its place");
+    let deadline = Instant::now() + 30 * SEC;
+    let refused = loop {
+        let reply = exchange(proxy.port, &get("/must/a"));
+        match reply.status() {
+            200 => passed += 1,
+            503 => break reply,
+            other => panic!("status {other}: {:?}", reply.text()),
+        }
+        assert!(Instant::now() < deadline, "no request was turned away");
+        sleep(100 * MS);
+    };
+    assert_empty_answer(&refused, 503);
+    let id = response_number(&refused);
+    let record = proxy.records.conn("the refused record", |l| {
+        is_answer(l, "failed", 503, "records cannot be kept")
+    });
+    assert_eq!(record["id"], id.as_str());
+    assert!(no(&record, "upstream") && no(&record, "rule"), "{record}");
+    assert!(metric(status, "tukuyomi_records_refused_total") >= 1);
+    assert_eq!(metric(status, "tukuyomi_records_healthy"), 0);
+    assert_eq!(metric(status, "tukuyomi_records_admitting"), 0);
+    // The rest of the site is best effort: it goes through while the file fails.
+    let other = exchange(proxy.port, &get("/ok"));
+    assert_eq!(other.status(), 200, "answer: {:?}", other.text());
+    passed += 1;
+
+    // The cause is removed. The record of a request that is turned away opens the file again, a second after the
+    // failure at the latest, and the requests pass again.
+    fs::remove_dir(rec.join("records.log")).expect("remove the directory");
+    let deadline = Instant::now() + 30 * SEC;
+    loop {
+        let reply = exchange(proxy.port, &get("/must/a"));
+        if reply.status() == 200 {
+            passed += 1;
+            break;
+        }
+        assert_empty_answer(&reply, 503);
+        assert!(Instant::now() < deadline, "no request passed again");
+        sleep(100 * MS);
+    }
+    assert_eq!(metric(status, "tukuyomi_records_healthy"), 1);
+    assert_eq!(metric(status, "tukuyomi_records_admitting"), 1);
+    let reply = exchange(proxy.port, &get("/must/b"));
+    assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
+    passed += 1;
+    fs::remove_dir_all(&rec).expect("remove the records");
+    proxy.finish(passed);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_security_route_writes_the_record_of_a_blocked_request_and_not_that_of_a_forwarded_one() {
+    let status = free_port();
+    let proxy = Proxy::start_with("records_security", Knobs::quick(), |root| {
+        set_routes(root, json!([{ "upstream": "main", "records": "security" }]));
+        add_object(
+            root,
+            "status",
+            json!({ "listen": format!("127.0.0.1:{status}") }),
+        );
+    });
+    let forwarded = exchange(proxy.port, &get("/ok"));
+    assert_eq!(forwarded.status(), 200, "answer: {:?}", forwarded.text());
+    let blocked = exchange(proxy.port, &get("/block-probe/x"));
+    assert_empty_answer(&blocked, 403);
+    let id = response_number(&blocked);
+    let record = proxy
+        .records
+        .conn("the blocked record", |l| blocked_by(l, 9201));
+    assert_eq!(record["id"], id.as_str());
+    // Both answers are counted, and the record of the forwarded one was never written.
+    let forwarded_counted = "tukuyomi_requests_total{class=\"forwarded\"}";
+    let deadline = Instant::now() + 30 * SEC;
+    while metric(status, forwarded_counted) != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the forwarded request is not counted"
+        );
+        sleep(50 * MS);
+    }
+    assert_eq!(
+        metric(status, "tukuyomi_requests_total{class=\"blocked\"}"),
+        1
+    );
+    let requests: Vec<Value> = proxy
+        .records
+        .all()
+        .into_iter()
+        .filter(|r| r["type"] == "request")
+        .collect();
+    assert_eq!(requests, [record]);
+    proxy.finish(1);
 }

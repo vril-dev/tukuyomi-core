@@ -4,6 +4,7 @@ use tukuyomi_kernel::{Engine, Reason};
 
 use super::*;
 use crate::log::counters::{Policy, RuleHit};
+use crate::log::ship::Unshipped;
 use crate::rules::bundle::{Fingerprint, Mode};
 
 fn scrape<'a>(counters: &'a Counters, groups: Vec<(&'a str, u64)>) -> Scrape<'a> {
@@ -26,6 +27,9 @@ fn scrape<'a>(counters: &'a Counters, groups: Vec<(&'a str, u64)>) -> Scrape<'a>
         records_dropped: 7,
         record_write_errors: 8,
         record_file_errors: 9,
+        records_healthy: true,
+        records_admitting: true,
+        records_unshipped: Some(Unshipped::Bytes(11)),
     }
 }
 
@@ -53,6 +57,8 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
     counters.add_uninspectable(Reason::InspectorLost);
     counters.add_policy_refusal(Policy::Access);
     counters.accepted.add();
+    counters.records_refused.add();
+    counters.records_refused.add();
     let text = render(&scrape(&counters, vec![("main", 0), ("api", 2)]));
 
     let mut families = HashSet::new();
@@ -74,8 +80,8 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
             samples += 1;
         }
     }
-    assert_eq!(families.len(), 22);
-    assert!(samples >= 22, "{samples}");
+    assert_eq!(families.len(), 26);
+    assert!(samples >= 26, "{samples}");
 
     for line in [
         "tukuyomi_requests_total{class=\"forwarded\"} 1",
@@ -99,9 +105,32 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
         "tukuyomi_records_dropped_total 7",
         "tukuyomi_record_write_errors_total 8",
         "tukuyomi_record_file_errors_total 9",
+        "tukuyomi_records_refused_total 2",
+        "tukuyomi_records_healthy 1",
+        "tukuyomi_records_admitting 1",
+        "tukuyomi_records_unshipped_bytes 11",
     ] {
         assert!(text.lines().any(|have| have == line), "{line} in {text}");
     }
+}
+
+#[test]
+fn the_health_of_the_records_is_1_or_0_and_the_unshipped_bytes_are_there_only_with_a_shipper() {
+    let counters = Counters::start();
+    let mut seen = scrape(&counters, Vec::new());
+    seen.records_healthy = false;
+    assert!(render(&seen).contains("\ntukuyomi_records_healthy 0\n"));
+    // Whether a request that needs its record kept is let in is a fact of its own.
+    seen.records_admitting = false;
+    assert!(render(&seen).contains("\ntukuyomi_records_admitting 0\n"));
+    // A shipper whose position cannot be read: the family, and no sample.
+    seen.records_unshipped = Some(Unshipped::Unknown);
+    let text = render(&seen);
+    assert!(text.contains("# TYPE tukuyomi_records_unshipped_bytes gauge\n"));
+    assert!(!text.contains("\ntukuyomi_records_unshipped_bytes "));
+    // No shipper: nothing of it.
+    seen.records_unshipped = None;
+    assert!(!render(&seen).contains("tukuyomi_records_unshipped_bytes"));
 }
 
 #[test]

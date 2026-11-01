@@ -1994,10 +1994,13 @@ fn the_records_object_is_left_out_or_has_a_clean_dir_a_size_and_a_count() {
     let loaded = parse(&doc(&[records("files", 64)])).unwrap();
     assert_eq!(
         loaded.records,
-        Some(RecordsConfig {
+        Some(Records {
             dir: PathBuf::from("/var/lib/tukuyomi/records"),
             file_bytes: 1 << 20,
             files: 64,
+            keep: Keep::BestEffort,
+            sync_ms: None,
+            ship: None,
         })
     );
 
@@ -2039,6 +2042,202 @@ fn the_records_object_is_left_out_or_has_a_clean_dir_a_size_and_a_count() {
         &[("", "records", Value::Null)],
         "configuration has a value of the wrong type",
     );
+}
+
+/// The `records` object with these keys changed or added.
+fn records_keys(keys: &[(&'static str, Value)]) -> Edit {
+    let mut object = serde_json::json!({ "dir": "/var/lib/tukuyomi/records", "file_bytes": 1 << 20, "files": 2 });
+    for (key, value) in keys {
+        object[*key] = value.clone();
+    }
+    ("", "records", object)
+}
+
+/// A `ship` object with every key.
+fn ship_object() -> Value {
+    serde_json::json!({
+        "db_driver": "pgsql",
+        "db_dsn_file": "/etc/tukuyomi/records-db.dsn",
+        "batch": 100,
+        "interval_ms": 1000,
+        "retention_days": 90,
+    })
+}
+
+/// The `records` object with the key of its `ship` object changed.
+fn ship(key: &'static str, value: impl Into<Value>) -> Edit {
+    let mut object = ship_object();
+    object[key] = value.into();
+    records("ship", object)
+}
+
+/// The `records` of the first route of the file.
+fn route_records(value: impl Into<Value>) -> Edit {
+    ("/forward/routes/0", "records", value.into())
+}
+
+#[test]
+fn the_keep_sync_and_ship_keys_of_records_are_left_out_or_checked_at_their_limits() {
+    let kept = |edits: &[Edit]| parse(&doc(edits)).unwrap().records.unwrap();
+    let plain = kept(&[records("files", 2)]);
+    assert_eq!(
+        (plain.keep, plain.sync_ms, plain.ship),
+        (Keep::BestEffort, None, None)
+    );
+
+    pass(&[records("keep", "best_effort")]);
+    assert_eq!(kept(&[records("keep", "required")]).keep, Keep::Required);
+    for bad in ["", "Required", "security", "none"] {
+        refuse(
+            &[records("keep", bad)],
+            "records keep is not best_effort or required",
+        );
+    }
+    let sync = "records sync_ms is not 1 to 60000";
+    assert_eq!(kept(&[records("sync_ms", 1)]).sync_ms, Some(1));
+    assert_eq!(kept(&[records("sync_ms", 60_000)]).sync_ms, Some(60_000));
+    refuse(&[records("sync_ms", 0)], sync);
+    refuse(&[records("sync_ms", 60_001)], sync);
+
+    assert_eq!(
+        kept(&[ship("batch", 10_000)]).ship,
+        Some(Ship {
+            driver: Driver::Pgsql,
+            dsn_file: PathBuf::from("/etc/tukuyomi/records-db.dsn"),
+            batch: 10_000,
+            interval_ms: 1000,
+            retention_days: 90,
+        })
+    );
+    assert_eq!(
+        kept(&[ship("db_driver", "mysql")])
+            .ship
+            .map(|ship| ship.driver),
+        Some(Driver::Mysql)
+    );
+    refuse(
+        &[ship("db_driver", "sqlite")],
+        "records ship db_driver is not pgsql or mysql",
+    );
+    let batch = "records ship batch is not 1 to 10000";
+    pass(&[ship("batch", 1)]);
+    refuse(&[ship("batch", 0)], batch);
+    refuse(&[ship("batch", 10_001)], batch);
+    let interval = "records ship interval_ms is not 100 to 60000";
+    pass(&[ship("interval_ms", 100)]);
+    pass(&[ship("interval_ms", 60_000)]);
+    refuse(&[ship("interval_ms", 99)], interval);
+    refuse(&[ship("interval_ms", 60_001)], interval);
+    let days = "records ship retention_days is not 0 to 3650";
+    pass(&[ship("retention_days", 0)]);
+    pass(&[ship("retention_days", 3650)]);
+    refuse(&[ship("retention_days", 3651)], days);
+    let dsn = "records ship db_dsn_file is not an absolute clean path of at most 3840 bytes";
+    pass(&[ship("db_dsn_file", format!("/{}", "d".repeat(3839)))]);
+    refuse(
+        &[ship("db_dsn_file", format!("/{}", "d".repeat(3840)))],
+        dsn,
+    );
+    for bad in ["db.dsn", "/etc/../db.dsn", "/etc/db.dsn/", "/"] {
+        refuse(&[ship("db_dsn_file", bad)], dsn);
+    }
+
+    // Every key of `ship`, an object, and never null.
+    refuse(
+        &[records(
+            "ship",
+            serde_json::json!({"db_driver": "pgsql", "db_dsn_file": "/etc/db.dsn", "batch": 1, "interval_ms": 100}),
+        )],
+        "configuration has a missing key",
+    );
+    refuse(&[ship("pool", 3)], "configuration has an unknown key");
+    let wrong = "configuration has a value of the wrong type";
+    refuse(&[ship("batch", Value::Null)], wrong);
+    for key in ["ship", "keep", "sync_ms"] {
+        refuse(&[records(key, Value::Null)], wrong);
+    }
+    refuse(&[records("sync_ms", -1)], wrong);
+}
+
+#[test]
+fn a_route_records_is_best_effort_required_or_security_and_required_needs_the_records_object() {
+    let routes = |edits: &[Edit]| parse(&doc(edits)).unwrap().forward.routes;
+    assert!(routes(&[]).targets().all(|route| route.records.is_none()));
+    for (text, keep) in [
+        ("best_effort", RouteKeep::BestEffort),
+        ("required", RouteKeep::Required),
+        ("security", RouteKeep::Security),
+    ] {
+        let edits = [records("files", 2), route_records(text)];
+        assert!(
+            routes(&edits)
+                .targets()
+                .all(|route| route.records == Some(keep))
+        );
+    }
+    refuse(
+        &[records("files", 2), route_records("always")],
+        "a route records is not best_effort, required or security",
+    );
+    refuse(
+        &[route_records(Value::Null)],
+        "configuration has a value of the wrong type",
+    );
+    // Without the records object a route can keep as the standard error does, or keep little, not more.
+    pass(&[route_records("best_effort")]);
+    pass(&[route_records("security")]);
+    refuse(
+        &[route_records("required")],
+        "a route has records required while the file has no records object",
+    );
+}
+
+#[test]
+fn with_a_shipper_and_some_records_required_there_are_three_files_or_more() {
+    let few = "records files is below 3 while ship is there and some records are required";
+    let shipped = |files: u64, keep: &str| {
+        records_keys(&[
+            ("files", files.into()),
+            ("keep", keep.into()),
+            ("ship", ship_object()),
+        ])
+    };
+    // `keep` as required.
+    refuse(&[shipped(2, "required")], few);
+    pass(&[shipped(3, "required")]);
+    // A route as required.
+    refuse(&[shipped(2, "best_effort"), route_records("required")], few);
+    pass(&[shipped(3, "best_effort"), route_records("required")]);
+    // Nothing required, or a route that keeps only little: two files do.
+    pass(&[shipped(2, "best_effort")]);
+    pass(&[shipped(2, "best_effort"), route_records("security")]);
+    // Without a shipper two files do.
+    pass(&[records_keys(&[("keep", "required".into())])]);
+}
+
+#[test]
+fn the_records_of_a_route_win_over_keep_and_a_route_without_them_follows_keep() {
+    for (route, keep, want) in [
+        (None, Keep::BestEffort, RouteKeep::BestEffort),
+        (None, Keep::Required, RouteKeep::Required),
+        (
+            Some(RouteKeep::Security),
+            Keep::Required,
+            RouteKeep::Security,
+        ),
+        (
+            Some(RouteKeep::BestEffort),
+            Keep::Required,
+            RouteKeep::BestEffort,
+        ),
+        (
+            Some(RouteKeep::Required),
+            Keep::BestEffort,
+            RouteKeep::Required,
+        ),
+    ] {
+        assert_eq!(keep.for_route(route), want, "{route:?} {keep:?}");
+    }
 }
 
 // ---- access and rate_limit ----

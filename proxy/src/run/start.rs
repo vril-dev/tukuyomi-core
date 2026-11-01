@@ -12,7 +12,7 @@ use super::serve::run;
 use crate::acme;
 use crate::admin;
 use crate::config::{
-    self, AdminConfig, ForwardConfig, PolicyConfig, ProxyConfig, RecordsConfig, StatusConfig,
+    self, AdminConfig, ForwardConfig, Keep, PolicyConfig, ProxyConfig, Records, StatusConfig,
     addresses,
 };
 use crate::forward::resolve;
@@ -111,7 +111,16 @@ pub fn start(log: &Log) -> u8 {
             log.line("start: record file refused: the logger did not take it");
             return EXIT_FAILED;
         }
+        if records.ship.is_some()
+            && let Err(why) = log.watch_ship(records)
+        {
+            log.line(&format!("start: shipper refused: {why}"));
+            return EXIT_FAILED;
+        }
     }
+    let keep = records
+        .as_ref()
+        .map_or(Keep::BestEffort, |records| records.keep);
     let Some(ids) = RequestIds::new() else {
         log.line("start: no random number is available for the request numbers");
         return EXIT_FAILED;
@@ -140,6 +149,7 @@ pub fn start(log: &Log) -> u8 {
         status,
         admin,
         policy,
+        keep,
         log.clone(),
     ))
 }
@@ -159,7 +169,7 @@ struct Prepared {
     /// Where the status listener is bound, if the configuration has one.
     status: Option<StatusConfig>,
     /// Where the record file is kept, if the configuration has one.
-    records: Option<RecordsConfig>,
+    records: Option<Records>,
     /// The admin process settings, if the configuration has them; the proxy binds its control socket.
     admin: Option<AdminConfig>,
     /// The `access` and the `rate_limit` of the configuration.

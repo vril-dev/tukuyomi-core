@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use super::{AdminConfig, AdminStoreConfig, ConfigError, RecordsConfig, ensure};
+use super::{AdminConfig, AdminStoreConfig, ConfigError, Records, ensure};
 
 /// Whether `a` and `b` are the same path or one is inside the other.
 fn overlap(a: &Path, b: &Path) -> bool {
@@ -17,7 +17,7 @@ fn overlap(a: &Path, b: &Path) -> bool {
 /// Checks the places against each other. `rules` is the rules store `dir`.
 pub(super) fn separate(
     rules: &Path,
-    records: Option<&RecordsConfig>,
+    records: Option<&Records>,
     admin: Option<&AdminConfig>,
 ) -> Result<(), ConfigError> {
     let mut places = vec![rules];

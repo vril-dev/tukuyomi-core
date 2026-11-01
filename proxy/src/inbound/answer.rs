@@ -18,6 +18,7 @@ use crate::forward::origin::OriginBody;
 use crate::inbound::head::{Head, Reject};
 use crate::inbound::upload::Fate;
 use crate::inspect::driver::{Judge, Outcome};
+use crate::log::Seat;
 use crate::log::counters::RuleHit;
 use crate::log::record::Seen;
 use crate::policy::Refusal;
@@ -150,6 +151,12 @@ impl Reply {
     /// The request was turned away by the policy of the configuration (see `policy`).
     pub(super) fn refused(refusal: Refusal) -> Reply {
         Reply::rejected(refusal.status(), refusal.reason())
+    }
+
+    /// A policy turned the request away: the `access` or the `rate_limit` of the configuration, or the access list of
+    /// the route (see `policy`). No other answer is a rejection with 403 or 429.
+    pub(super) fn policy_refused(&self) -> bool {
+        self.class == Class::Rejected && matches!(self.status, 403 | 429)
     }
 
     /// What a rule did to the request, if one decided it: it blocked it, or it matched while the rules only detect.
@@ -307,11 +314,30 @@ impl Sizes {
     }
 }
 
+/// How the record of a request is kept (see `conn::keep`).
+#[derive(Default)]
+pub(super) struct Keeping {
+    /// The place in the queue of the records that is kept for the record of a request of a route whose records are
+    /// required. It is held from the admission of the request until its record is queued.
+    pub(super) seat: Option<Seat>,
+    /// The route keeps only the records of the requests that `Noted::security` picks.
+    pub(super) only_security: bool,
+    /// The request was turned away because the shipper is behind: its answer is counted, and no record is written
+    /// for it, for it would use up the room that is left before the records not yet shipped are deleted.
+    pub(super) counted_only: bool,
+    /// The request got as far as the end of the choice of its route (see `conn::keep`): from then on it waits for
+    /// its body, the inspection or the upstream, and its service can be dropped before it comes to an answer.
+    pub(super) admitted: bool,
+    /// The inspection did not let the request through: a rule blocked it, it could not be inspected, or it could
+    /// not be asked or did not answer.
+    pub(super) stopped: bool,
+}
+
 /// What the record shows of a request besides the time it took: its number, its reply, the address of the client it
 /// is recorded under, its method, `Host` and path if its head passed the check, the upstream it went to, if it got as
 /// far as that, the size of its body, if it has one, and the generation whose rules gave a verdict, with that verdict
-/// and the rules that matched the request, if any did. The record shows the generation, the mode and the rules; the
-/// counters read the verdict. Only numbers, fixed texts, the name of a group from the configuration,
+/// and the rules that matched the request, if any did, and how the record is kept. The record shows the generation, the
+/// mode and the rules; the counters read the verdict. Only numbers, fixed texts, the name of a group from the configuration,
 /// addresses in their canonical forms and the request's own text as the record writes it (see `log::record`), so
 /// nothing the peer sent gets in as it is.
 pub(super) struct Noted {
@@ -322,6 +348,7 @@ pub(super) struct Noted {
     pub(super) via: Option<Via>,
     pub(super) body: Option<Sizes>,
     pub(super) judged: Option<Judge>,
+    pub(super) keeping: Keeping,
 }
 
 impl Noted {
@@ -335,7 +362,21 @@ impl Noted {
             via: None,
             body: None,
             judged: None,
+            keeping: Keeping::default(),
         }
+    }
+
+    /// Whether the inspection decided something about the request, or could not: a rule blocked it, a rule matched
+    /// while the rules only detect, it could not be inspected, or it got no verdict because the inspection was full,
+    /// gone or too slow; or whether a policy turned it away. These are the requests whose record a route with
+    /// `security` writes. The answer that the request got does not matter: a request that a rule matched is one
+    /// whichever status it ends with.
+    pub(super) fn security(&self) -> bool {
+        self.keeping.stopped
+            || self
+                .judged
+                .is_some_and(|judge| !matches!(judge.verdict, Verdict::Allow))
+            || self.reply.policy_refused()
     }
 
     /// The same, for a request whose head passed the check.

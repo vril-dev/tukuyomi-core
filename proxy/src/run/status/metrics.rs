@@ -12,6 +12,7 @@ use tukuyomi_kernel::Phase;
 
 use crate::inspect::driver::State;
 use crate::log::counters::Counters;
+use crate::log::ship::Unshipped;
 
 /// Everything the page is made of.
 pub(super) struct Scrape<'a> {
@@ -34,6 +35,12 @@ pub(super) struct Scrape<'a> {
     pub(super) records_dropped: u64,
     pub(super) record_write_errors: u64,
     pub(super) record_file_errors: u64,
+    /// Whether the last write to the record file went through, and the logger is there.
+    pub(super) records_healthy: bool,
+    /// Whether a request of a route whose records are required would be let in now.
+    pub(super) records_admitting: bool,
+    /// How much of the record files the shipper has not shipped; none: there is no shipper.
+    pub(super) records_unshipped: Option<Unshipped>,
 }
 
 /// A label value with `\`, `"` and the line feed escaped.
@@ -225,9 +232,37 @@ pub(super) fn render(scrape: &Scrape<'_>) -> String {
     page.single(
         "tukuyomi_record_file_errors_total",
         "counter",
-        "Records that could not be written to the record file.",
+        "Records that could not be written to the record file, and syncs of it that failed.",
         scrape.record_file_errors,
     );
+    page.single(
+        "tukuyomi_records_refused_total",
+        "counter",
+        "Requests answered with 503 because their record could not be kept, on routes whose records are required.",
+        counters.records_refused.get(),
+    );
+    page.single(
+        "tukuyomi_records_healthy",
+        "gauge",
+        "1 if the last write to the record file went through and the logger is there, otherwise 0.",
+        u8::from(scrape.records_healthy),
+    );
+    page.single(
+        "tukuyomi_records_admitting",
+        "gauge",
+        "1 if a request of a route whose records are required would be let in now, 0 if it would be answered with 503.",
+        u8::from(scrape.records_admitting),
+    );
+    if let Some(unshipped) = scrape.records_unshipped {
+        page.family(
+            "tukuyomi_records_unshipped_bytes",
+            "gauge",
+            "Bytes of the record files that the shipper has not shipped yet; no sample while that is not known.",
+        );
+        if let Unshipped::Bytes(bytes) = unshipped {
+            page.sample("tukuyomi_records_unshipped_bytes", &[], bytes);
+        }
+    }
     page.single(
         "tukuyomi_start_time_seconds",
         "gauge",

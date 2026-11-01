@@ -254,6 +254,7 @@ impl Rig {
             access: Access::default(),
             country: None,
             rate_limit: None,
+            keep: Keep::BestEffort,
         });
         let (driver, full) = match mode {
             Mode::Answer(outcome) => (Some(driver(rx, Some(outcome))), None),

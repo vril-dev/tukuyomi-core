@@ -33,7 +33,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tokio::time::Instant;
 
-use crate::config::{ForwardConfig, GroupConfig, ProxyConfig, RouteConfig, ServerConfig, Stream};
+use crate::config::{
+    ForwardConfig, GroupConfig, ProxyConfig, RouteConfig, RouteKeep, ServerConfig, Stream,
+};
 use crate::forward::client_ip::Access;
 use crate::forward::pool::Pool;
 use crate::forward::rewrite::Rewrite;
@@ -52,13 +54,16 @@ pub struct Upstreams {
 }
 
 /// The route a request takes: the group it goes to, how it edits the request and the response, the times of a
-/// response that may take long, and the limit on the body of a request that is lower than the proxy's.
+/// response that may take long, the limit on the body of a request that is lower than the proxy's, and how the
+/// records of its requests are kept.
 #[derive(Clone, Copy)]
 pub struct Route<'a> {
     pub group: &'a Group,
     pub rewrite: &'a Rewrite,
     pub stream: Option<&'a Stream>,
     pub max_body: Option<usize>,
+    /// How the records of its requests are kept, if the route says; the default route does not.
+    pub records: Option<RouteKeep>,
 }
 
 impl Upstreams {
@@ -92,6 +97,7 @@ impl Upstreams {
             rewrite: &found.rewrite,
             stream: found.stream.as_ref(),
             max_body: found.max_body,
+            records: found.records,
         })
     }
 

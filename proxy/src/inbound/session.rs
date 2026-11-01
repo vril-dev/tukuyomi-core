@@ -15,7 +15,7 @@
 //! given to the connection or was cut off, and has a number (`RequestIds`) that the record and the response (in an
 //! `X-Request-ID` field) share. That includes the answer to a first head that was refused, the answers of a listener
 //! that redirects, and the answer to a stream whose head could not be made. The counters that `/metrics` shows (see
-//! `log::counters`) are added when the record is queued. The record has the address of the client that the
+//! `log::counters`) are added when the answer is noted, before its record is queued. The record has the address of the client that the
 //! inspection was told (see `conn`); a record that is written before a request has been read has the
 //! address of the peer, and no method, `Host` or path, which are written only when the head of the request passed
 //! the head check. A request that was sent to an upstream has the group and the server in its record, and one that
@@ -391,14 +391,18 @@ impl Session {
     }
 
     /// Writes the record of a request, under the client address that `noted` has. `sent` is the number of bytes of
-    /// the body of the response that were handed on.
+    /// the body of the response that were handed on. The answer is counted whatever its route does with the record:
+    /// a route with `security` writes no record of a request that no rule, no inspection and no policy decided, and
+    /// that was not dropped before its answer, a request that the lag of the shipper turned away writes none, and the
+    /// record of a route with `required` is queued with the seat that its request took (see `conn::keep`). A response
+    /// whose record is not written still counts in `recorded`: it was answered, so its connection does not write a
+    /// record of its own for it, and a refusal that is only counted writes nothing at all.
     pub(super) fn note(&self, noted: &mut Noted, start: Instant, sent: u64) {
         let reply = noted.reply;
         #[cfg(test)]
         {
             *lock(&self.last) = reply;
         }
-        self.recorded.fetch_add(1, Ordering::Relaxed);
         // The counters are added before the record is queued, so a record that has been seen is counted.
         let counters = &self.ctx.counters;
         counters.add_request(reply.class.name());
@@ -414,8 +418,15 @@ impl Session {
                 self.id, reply.reason
             ));
         }
+        let security = noted.security();
+        let keeping = std::mem::take(&mut noted.keeping);
+        self.recorded.fetch_add(1, Ordering::Relaxed);
+        // A route that keeps only some records writes no other; the answer is counted all the same.
+        if keeping.counted_only || (keeping.only_security && !security) {
+            return;
+        }
         let lengths = noted.body.as_ref().and_then(Sizes::lengths);
-        self.ctx.log.record(Record::Request(Box::new(Request {
+        let record = Record::Request(Box::new(Request {
             id: std::mem::take(&mut noted.id),
             conn: self.id,
             listener: self.listener,
@@ -437,7 +448,11 @@ impl Session {
             body: lengths.map(|(length, _)| length),
             inspected: lengths.and_then(|(_, inspected)| inspected),
             sent,
-        })));
+        }));
+        match keeping.seat {
+            Some(seat) => self.ctx.log.record_in(seat, record),
+            None => self.ctx.log.record(record),
+        }
     }
 
     /// What came of the connection: the reply of the last response, and `line` for its end.

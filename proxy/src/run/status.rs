@@ -160,6 +160,9 @@ impl Source for View {
             records_dropped: ctx.log.dropped(),
             record_write_errors: ctx.log.write_errors(),
             record_file_errors: ctx.log.file_errors(),
+            records_healthy: ctx.log.healthy(),
+            records_admitting: ctx.log.admitting(),
+            records_unshipped: ctx.log.unshipped(),
         })
     }
 }

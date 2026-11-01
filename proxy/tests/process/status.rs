@@ -109,6 +109,9 @@ fn metrics_count_a_forwarded_and_a_blocked_request_and_a_scrape_is_no_request() 
         "tukuyomi_records_dropped_total 0",
         "tukuyomi_record_write_errors_total 0",
         "tukuyomi_record_file_errors_total 0",
+        "tukuyomi_records_refused_total 0",
+        "tukuyomi_records_healthy 1",
+        "tukuyomi_records_admitting 1",
     ] {
         assert!(text.lines().any(|have| have == line), "{line} in {text}");
     }
@@ -146,8 +149,10 @@ fn metrics_count_a_forwarded_and_a_blocked_request_and_a_scrape_is_no_request() 
     let mut unique = helped.clone();
     unique.sort();
     unique.dedup();
-    assert_eq!(helped.len(), 22, "{helped:?}");
-    assert_eq!((unique.len(), &typed), (22, &helped));
+    // There is no shipper here, so the family of its distance is not there.
+    assert_eq!(helped.len(), 25, "{helped:?}");
+    assert_eq!((unique.len(), &typed), (25, &helped));
+    assert!(!text.contains("tukuyomi_records_unshipped_bytes"), "{text}");
 
     // The scrape and the other pages were not requests: the two records are the only ones.
     assert_eq!(page(port, "/healthz").0, 200);
