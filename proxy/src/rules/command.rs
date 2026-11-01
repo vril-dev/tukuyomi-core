@@ -16,8 +16,8 @@
 //! a rule matches is let through and the match is reported, and the trial passes on such a match and writes a line
 //! for each; without it the bundle blocks. With `--engine` the bundle is for that engine (`coraza`, the default, or
 //! `modsecurity`): its rules are inspected by that engine, and the import is refused, before anything is staged,
-//! when the configuration has no inspector for the engine or this build has no pinned build of it
-//! (`KernelSettings::check_engine`). With `--routes` the bundle has the routes of the file, a JSON array of
+//! when the configuration has no inspector for the engine (`KernelSettings::check_engine`). With `--routes` the
+//! bundle has the routes of the file, a JSON array of
 //! `{"host": "<host>", "path": "<path>", "action": "bypass"}` (`host` is optional, no other key is taken): a request
 //! that a route matches is not inspected and goes on to the upstream. The routes are checked as the module `routes`
 //! says, and a running proxy takes them when it switches to the generation. `activate` chooses a generation, which

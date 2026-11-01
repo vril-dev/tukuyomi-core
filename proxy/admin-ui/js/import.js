@@ -11,6 +11,7 @@ import { t } from './i18n.js';
 import {
   bytesText,
   confirmChange,
+  engineName,
   fingerprint,
   handoff,
   labelled,
@@ -24,6 +25,8 @@ import {
   working,
 } from './parts.js';
 
+/** The engines that an import can ask for, by the words the API takes. Coraza is first: it is the default. */
+export const ENGINES = ['coraza', 'modsecurity'];
 /** The limits of the API: files in all, bytes of a file, bytes of all the files, routes. */
 export const LIMITS = { files: 128, file: 2 * 1024 * 1024, total: 8 * 1024 * 1024, routes: 256 };
 /** The name of a file as a bundle holds it: one name, no path, letters, digits and `._-`, not starting with a dot. */
@@ -103,8 +106,10 @@ export function toBase64(bytes) {
 }
 
 /** The body of the request to import. `rules` and `data` hold `{ name, data }` with the data in base64. */
-export function importBody({ rules, data, crs, crsOff, routes, detectOnly, acceptBlock }) {
-  const body = {};
+export function importBody({ engine, rules, data, crs, crsOff, routes, detectOnly, acceptBlock }) {
+  // A missing engine would be left out of the JSON, and the server would take Coraza for it.
+  if (!ENGINES.includes(engine)) throw new RangeError(`not an engine: ${engine}`);
+  const body = { engine };
   if (rules.length > 0) body.rules = rules;
   if (data.length > 0) body.data = data;
   if (crs) {
@@ -254,6 +259,11 @@ class ImportScreen {
     this.offer = el('div', { class: 'stack' });
     this.results = el('div', { class: 'stack', 'aria-live': 'polite' });
     this.layer = el('div');
+    this.engine = el(
+      'select',
+      { class: 'input', name: 'engine', on: { change: () => this.changed() } },
+      ENGINES.map((name) => el('option', { value: name, selected: name === ENGINES[0] }, engineName(name))),
+    );
     this.routes = el('textarea', { class: 'input mono', rows: '6', spellcheck: 'false', autocapitalize: 'none', on: { input: () => this.changed() } });
     this.detect = checkbox(t('import.detect'), (checked) => {
       this.detectOnly = checked;
@@ -272,6 +282,7 @@ class ImportScreen {
           },
         },
       },
+      labelled(t('import.engine'), this.engine, t('import.engine_hint')),
       this.group(t('import.rules'), t('import.rules_hint'), this.picker(this.rules), this.rulesBox),
       this.group(t('import.data'), t('import.data_hint'), this.picker(this.data), this.dataBox),
       this.group(t('import.crs'), null, this.crsBox),
@@ -471,6 +482,7 @@ class ImportScreen {
       const rules = await read(this.rules);
       const data = await read(this.data);
       return importBody({
+        engine: this.engine.value,
         rules,
         data,
         crs: this.crs,

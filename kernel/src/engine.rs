@@ -4,7 +4,7 @@
 //! A generation names its engine, and the host starts the inspector of that engine. The kernel knows the engines by
 //! name (`parse`, `name`) and, in this code and in no configuration, the build of the inspector it accepts for each
 //! (`pinned`): the HELLO of an inspector has to report exactly that build, so an inspector of another engine or of
-//! another build is refused at its start. An engine without a pinned build cannot be started (`Config::check`).
+//! another build is refused at its start. Every engine has a build, and a new engine is given its build with it.
 #![forbid(unsafe_code)]
 
 /// The engine that inspects the requests of a generation.
@@ -32,6 +32,14 @@ const CORAZA: Build = Build {
     source: b"h1:dMV55FbMR2vOks/acrT43RShR+VkzU6jwp+XPdxay8o=",
 };
 
+/// Rust's toolchain, the libmodsecurity release and the SHA-256 of its source archive. Change these together with the
+/// toolchain that builds the inspector and with `VERSION` and `SHA256` in `scripts/build-modsecurity.sh`.
+const MODSECURITY: Build = Build {
+    toolchain: b"rustc 1.94.1",
+    version: b"v3.0.17",
+    source: b"f283b33d5c21130fd3a15c84a93a1abe12bd1949edaf44288b12af571b671a50",
+};
+
 impl Engine {
     /// The engine that `name` names: the lowercase name, exactly.
     pub fn parse(name: &str) -> Option<Engine> {
@@ -50,11 +58,11 @@ impl Engine {
         }
     }
 
-    /// The inspector build that the kernel accepts for the engine, or none if no build is pinned yet.
-    pub(crate) fn pinned(self) -> Option<&'static Build> {
+    /// The inspector build that the kernel accepts for the engine.
+    pub(crate) fn pinned(self) -> &'static Build {
         match self {
-            Engine::Coraza => Some(&CORAZA),
-            Engine::ModSecurity => None,
+            Engine::Coraza => &CORAZA,
+            Engine::ModSecurity => &MODSECURITY,
         }
     }
 }

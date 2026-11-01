@@ -2,18 +2,19 @@
 //! listener, and the admin process over the same configuration and the same rules store. An owner is made with
 //! `admin bootstrap` and logs in. A second generation is imported from uploaded rule files (the real inspector
 //! tries it), activated (the proxy switches, which its `/metrics` and a request show), found in the history and
-//! rolled back. The record of a request of the proxy is found by its number through the API. A second test, with no
-//! proxy, shows that a generation of an engine that this build cannot use is refused by the import and the activation.
+//! rolled back. The record of a request of the proxy is found by its number through the API. Two more tests, with no
+//! proxy, show that a generation of an engine that the configuration has no inspector for is refused by the import and
+//! the activation, and that an import for the engine ModSecurity passes its trial where the configuration has one.
 
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde_json::{Value, json};
 
 use crate::admin::{Admin, OWNER, add_admin, bootstrap, cookie_of, json_of};
-use crate::engines::{NOT_PINNED, add_generation, current, name_inspector};
+use crate::engines::{NOT_NAMED, add_generation, current};
 use crate::support::*;
 
 /// `data` in the standard base64 with padding.
@@ -69,6 +70,34 @@ impl Session<'_> {
         assert_eq!(status["reachable"], true);
         status["proxy"]["generation"].as_str().unwrap().to_owned()
     }
+
+    /// The fingerprint and the engine of every generation, as the list gives them.
+    fn engines(&self) -> Vec<(String, String)> {
+        let list = self.get("/api/generations");
+        let text = |g: &Value, key: &str| g[key].as_str().unwrap().to_owned();
+        let items = list["generations"].as_array().unwrap();
+        items
+            .iter()
+            .map(|g| (text(g, "fingerprint"), text(g, "engine")))
+            .collect()
+    }
+}
+
+/// Makes the owner `alice` in the test root `root`, starts the admin process on `port` and logs in. Returns the
+/// process and the cookie and the CSRF token of the session.
+fn log_in(root: &Path, port: u16) -> (Admin, String, String) {
+    let made = bootstrap(root, "alice", &format!("{OWNER}\n"));
+    assert_eq!(made.code, Some(0), "{}", made.err);
+    let admin = Admin::start(root, port);
+    let login = admin.call(
+        "POST",
+        "/api/login",
+        &[("Content-Type", "application/json")],
+        &json!({"name": "alice", "password": OWNER}).to_string(),
+    );
+    assert_eq!(login.status(), 200);
+    let csrf = json_of(&login)["csrf"].as_str().unwrap().to_owned();
+    (admin, cookie_of(&login), csrf)
 }
 
 fn metrics(port: u16) -> String {
@@ -333,42 +362,24 @@ fn an_owner_imports_activates_and_rolls_back_a_generation_and_finds_the_record_o
 
 #[test]
 #[ignore = "needs a built inspector"]
-fn a_generation_of_an_engine_that_cannot_be_used_is_refused_by_the_import_and_the_activation() {
+fn a_generation_of_an_engine_with_no_inspector_in_the_configuration_is_refused_by_the_import_and_the_activation()
+ {
     // No proxy runs, so an activation that got past the check of the engine would be 503, not 409.
     let port = free_port();
     let idle = Idle::new("admin_engine", &Knobs::quick(), |root| {
-        add_admin(root, port);
-        name_inspector(root);
+        add_admin(root, port)
     });
     let root = idle.root();
     let other = add_generation(root);
     let (first, chosen) = (generation(), current(root));
-    let made = bootstrap(root, "alice", &format!("{OWNER}\n"));
-    assert_eq!(made.code, Some(0), "{}", made.err);
-    let mut admin = Admin::start(root, port);
-    let login = admin.call(
-        "POST",
-        "/api/login",
-        &[("Content-Type", "application/json")],
-        &json!({"name": "alice", "password": OWNER}).to_string(),
-    );
-    assert_eq!(login.status(), 200);
+    let (mut admin, cookie, csrf) = log_in(root, port);
     {
         let session = Session {
             admin: &admin,
-            cookie: cookie_of(&login),
-            csrf: json_of(&login)["csrf"].as_str().unwrap().to_owned(),
+            cookie,
+            csrf,
         };
-        let engines = || -> Vec<(String, String)> {
-            let list = session.get("/api/generations");
-            let text = |g: &Value, key: &str| g[key].as_str().unwrap().to_owned();
-            let items = list["generations"].as_array().unwrap();
-            items
-                .iter()
-                .map(|g| (text(g, "fingerprint"), text(g, "engine")))
-                .collect()
-        };
-        let before = engines();
+        let before = session.engines();
         assert_eq!(before.len(), 2, "{before:?}");
         for (name, engine) in [(&first, "coraza"), (&other, "modsecurity")] {
             assert!(
@@ -384,8 +395,8 @@ fn a_generation_of_an_engine_that_cannot_be_used_is_refused_by_the_import_and_th
         });
         let (status, refused) = session.post("/api/generations", &body);
         assert_eq!(status, 400, "{refused}");
-        assert_eq!(refused["error"], NOT_PINNED);
-        assert_eq!(engines(), before);
+        assert_eq!(refused["error"], NOT_NAMED);
+        assert_eq!(session.engines(), before);
 
         // An activation of the one that is in the store is 409 with the sentence, and the store still chooses the
         // generation it chose.
@@ -394,7 +405,7 @@ fn a_generation_of_an_engine_that_cannot_be_used_is_refused_by_the_import_and_th
             &json!({"generation": other, "expect": first}),
         );
         assert_eq!(status, 409, "{refused}");
-        assert_eq!(refused["error"], NOT_PINNED);
+        assert_eq!(refused["error"], NOT_NAMED);
         assert_eq!(current(root), chosen);
         assert_eq!(session.get("/api/status")["current"], first.as_str());
         let audit = session.get("/api/audit");
@@ -407,6 +418,46 @@ fn a_generation_of_an_engine_that_cannot_be_used_is_refused_by_the_import_and_th
             }),
             "{audit}"
         );
+    }
+    assert_eq!(admin.stop().code(), Some(0));
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn an_import_for_the_engine_modsecurity_passes_its_trial_and_the_list_gives_the_engine_of_the_generation()
+ {
+    let port = free_port();
+    let idle = Idle::new("admin_modsec", &Knobs::quick(), |root| {
+        add_admin(root, port);
+        name_modsecurity_inspector(root);
+    });
+    let (mut admin, cookie, csrf) = log_in(idle.root(), port);
+    {
+        let session = Session {
+            admin: &admin,
+            cookie,
+            csrf,
+        };
+        // The inspector of the engine tries the rules, and the generation is made.
+        let body = json!({
+            "rules": [{"name": "basic.conf", "data": b64(&fs::read(rules_file()).unwrap())}],
+            "engine": "modsecurity",
+        });
+        let (status, imported) = session.post("/api/generations", &body);
+        assert_eq!(status, 200, "{imported}");
+        assert_eq!(
+            (&imported["result"], &imported["trial"]["passed"]),
+            (&json!("created"), &json!(true))
+        );
+        let made = imported["fingerprint"].as_str().unwrap().to_owned();
+        let engines = session.engines();
+        assert_eq!(engines.len(), 2, "{engines:?}");
+        for (name, engine) in [(&generation(), "coraza"), (&made, "modsecurity")] {
+            assert!(
+                engines.contains(&(name.clone(), engine.to_owned())),
+                "{engines:?}"
+            );
+        }
     }
     assert_eq!(admin.stop().code(), Some(0));
 }

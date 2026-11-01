@@ -284,6 +284,15 @@ fn a_start_that_fails_ends_the_trial_with_its_detail_and_without_a_request() {
 }
 
 #[test]
+fn a_start_that_stops_before_it_fails_ends_the_trial_with_the_failure() {
+    let failure = Phase::Failed(Failure::Exit(11));
+    let mut kernel = Fake::new(&[Phase::Stopping, failure], &[]);
+    let finish = go(&mut kernel, true);
+    assert_eq!(finish.result, Err(Failed::Start(Failure::Exit(11))));
+    assert_eq!((kernel.sent.len(), kernel.shutdowns), (0, 1));
+}
+
+#[test]
 fn an_inspector_that_is_not_ready_in_time_or_a_request_without_a_verdict_fails() {
     let mut kernel = Fake::new(&[Phase::Starting], &[]);
     assert_eq!(go(&mut kernel, false).result, Err(Failed::NotReady));

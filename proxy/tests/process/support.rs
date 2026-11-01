@@ -71,6 +71,11 @@ pub(crate) fn rules_file() -> PathBuf {
         .join("basic.conf")
 }
 
+/// The directory of the Core Rule Set, as `scripts/fetch-crs.sh` makes it, which `rules import` takes as `--crs`.
+pub(crate) fn crs_dir() -> PathBuf {
+    PathBuf::from(var("TUKUYOMI_TEST_CRS"))
+}
+
 /// The directory of that generation, in the store of the test root `root`.
 pub(crate) fn generation_dir(root: &Path) -> PathBuf {
     root.join(STORE).join("generations").join(generation())
@@ -879,6 +884,17 @@ pub(crate) fn add_object(root: &Path, key: &str, value: Value) {
     fs::write(&path, config.to_string()).expect("write the configuration");
 }
 
+/// Names the built inspector of ModSecurity as `kernel.engines.modsecurity.inspector` in the configuration in the test
+/// root `root`, so that a generation of that engine can be used.
+pub(crate) fn name_modsecurity_inspector(root: &Path) {
+    let path = root.join("config.json");
+    let text = fs::read_to_string(&path).expect("read the configuration");
+    let mut config: Value = serde_json::from_str(&text).expect("parse the configuration");
+    config["kernel"]["engines"] =
+        json!({"modsecurity": {"inspector": var("TUKUYOMI_TEST_INSPECTOR_MODSECURITY")}});
+    fs::write(&path, config.to_string()).expect("write the configuration");
+}
+
 pub(crate) fn run_kill(signal: &str, pid: u32) {
     let status = Command::new("kill")
         .arg("-s")
@@ -905,10 +921,12 @@ pub(crate) fn children_of(pid: u32) -> Vec<u32> {
         .collect()
 }
 
-/// Whether the process runs the inspector executable of this test.
+/// Whether the process runs an inspector executable of this test: the one of Coraza or the one of ModSecurity.
 pub(crate) fn is_inspector(pid: u32) -> bool {
-    let wanted = fs::canonicalize(var("TUKUYOMI_TEST_INSPECTOR")).expect("the inspector path");
-    fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == wanted)
+    let coraza = fs::canonicalize(var("TUKUYOMI_TEST_INSPECTOR")).expect("the inspector path");
+    let modsecurity = fs::canonicalize(var("TUKUYOMI_TEST_INSPECTOR_MODSECURITY"))
+        .expect("the path of the inspector of ModSecurity");
+    fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == coraza || exe == modsecurity)
 }
 
 /// The bytes the process has read so far, from `/proc/<pid>/io`.

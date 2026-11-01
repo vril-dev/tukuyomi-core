@@ -2753,14 +2753,14 @@ fn the_engines_object_names_the_inspector_of_modsecurity_and_nothing_else() {
 }
 
 #[test]
-fn an_engine_can_be_used_only_with_an_inspector_in_the_configuration_and_a_pinned_build() {
+fn an_engine_can_be_used_only_with_an_inspector_in_the_configuration() {
     let generation = Fingerprint::from_hex("0123456789abcdef".repeat(4).as_bytes()).unwrap();
     let dir = PathBuf::from("/var/lib/tukuyomi/rules/generations/a");
     let plain = parse(BASE.as_bytes()).unwrap().kernel;
     let named = parse(&doc(&[modsecurity("/opt/tukuyomi/inspector-modsecurity")]))
         .unwrap()
         .kernel;
-    // Coraza has the inspector of `kernel.inspector` and a pinned build, whatever else the file has.
+    // Coraza has the inspector of `kernel.inspector`, whatever else the file has.
     for settings in [&plain, &named] {
         assert_eq!(settings.check_engine(Engine::Coraza), Ok(()));
         let kernel = settings
@@ -2769,9 +2769,8 @@ fn an_engine_can_be_used_only_with_an_inspector_in_the_configuration_and_a_pinne
         assert_eq!(kernel.engine, Engine::Coraza);
         assert_eq!(kernel.inspector, PathBuf::from("/opt/tukuyomi/inspector"));
     }
-    // ModSecurity: no inspector in the file, or one but no pinned build in this kernel; each has its own sentence.
+    // ModSecurity has an inspector only if the file names one, and then the kernel configuration for it has that one.
     let missing = ConfigError("kernel.engines has no inspector for the engine of the generation");
-    let unpinned = ConfigError("the inspector build of the engine is not pinned");
     assert_eq!(plain.check_engine(Engine::ModSecurity), Err(missing));
     assert_eq!(
         plain
@@ -2779,11 +2778,13 @@ fn an_engine_can_be_used_only_with_an_inspector_in_the_configuration_and_a_pinne
             .err(),
         Some(missing)
     );
-    assert_eq!(named.check_engine(Engine::ModSecurity), Err(unpinned));
+    assert_eq!(named.check_engine(Engine::ModSecurity), Ok(()));
+    let kernel = named
+        .for_generation(dir, generation, Engine::ModSecurity)
+        .unwrap();
+    assert_eq!(kernel.engine, Engine::ModSecurity);
     assert_eq!(
-        named
-            .for_generation(dir, generation, Engine::ModSecurity)
-            .err(),
-        Some(unpinned)
+        kernel.inspector,
+        PathBuf::from("/opt/tukuyomi/inspector-modsecurity")
     );
 }

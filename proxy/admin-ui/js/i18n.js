@@ -233,6 +233,8 @@ const ja = {
   'history.rollback.what': '保管場所が選ぶ世代を、下のように変えます。続けて、プロキシをその世代に切り替えます。答えが来るまで時間がかかることがあります。',
 
   'import.title': 'ルールの取り込み',
+  'import.engine': 'エンジン',
+  'import.engine_hint': 'ルールを読み込んで検査するエンジンです。試しも、このエンジンの検査プロセスで行います。',
   'import.intro': 'ルールのファイルから、新しい世代を作ります。作る前に、検査プロセスを起動してルールを読み込ませ、試しの要求で確かめます（試し）。新しい世代は選ばれません。使うには、世代の画面で選択してください。',
   'import.rules': 'ルールのファイル',
   'import.rules_hint': '表示の順に読み込まれます。CRS を使うときは、CRS のファイルが先に読み込まれます。',
@@ -433,7 +435,6 @@ const ja = {
   'the version of the manifest is not 1, 2, 3 or 4': 'マニフェストの版が 1・2・3・4 のどれでもありません。',
   'the engine of the manifest does not fit its version': 'マニフェストのエンジンが、その版に合いません。',
   'engine is not the name of an engine (coraza or modsecurity)': 'エンジンの名前は coraza か modsecurity にしてください。',
-  'the inspector build of the engine is not pinned': 'このエンジンの検査プロセスは、この製品ではまだ使えません。',
   'kernel.engines has no inspector for the engine of the generation': '設定の kernel.engines に、この世代のエンジンの検査プロセスがありません。',
   'a path is malformed': 'パスの形が正しくありません。',
   'a sha256 is malformed': 'sha256 の形が正しくありません。',
@@ -839,6 +840,8 @@ const en = {
   'history.rollback.what': 'The rules store will choose the generation below instead of the current one, and then the proxy will switch to it. It may take a while until the answer comes.',
 
   'import.title': 'Import rules',
+  'import.engine': 'Engine',
+  'import.engine_hint': 'The engine that loads the rules and inspects with them. The trial runs on the inspector of this engine too.',
   'import.intro': 'Makes a new generation from rule files. Before it is made, an inspector is started with the rules and given test requests (the trial). The new generation is not chosen; choose it on the Generations screen to use it.',
   'import.rules': 'Rule files',
   'import.rules_hint': 'They are loaded in the order shown. The files of the CRS, if used, are loaded first.',
@@ -1039,7 +1042,6 @@ const en = {
   'the version of the manifest is not 1, 2, 3 or 4': 'The version of the manifest is not 1, 2, 3 or 4.',
   'the engine of the manifest does not fit its version': 'The engine of the manifest does not fit its version.',
   'engine is not the name of an engine (coraza or modsecurity)': 'The name of the engine is not coraza or modsecurity.',
-  'the inspector build of the engine is not pinned': 'This build does not accept an inspector for this engine yet.',
   'kernel.engines has no inspector for the engine of the generation': 'The configuration has no inspector for the engine of this generation (kernel.engines).',
   'a path is malformed': 'A path is not in the right form.',
   'a sha256 is malformed': 'A sha256 is not in the right form.',

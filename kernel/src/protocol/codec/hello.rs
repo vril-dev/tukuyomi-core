@@ -79,12 +79,12 @@ pub(crate) fn decode_hello(p: &[u8]) -> Result<Hello, ContentError> {
 /// What a valid HELLO contains besides the start's own pid, run, incarnation and nonce. `build` is the inspector
 /// build that the kernel accepts for the engine of the generation (`Engine::pinned`): a HELLO reports the toolchain
 /// that built the inspector, the version of the engine and the hash of its source, and a HELLO that reports any other
-/// build is refused. No build (an engine with none pinned) refuses every HELLO. The rules sha256 comes from the
-/// configuration. Go hashes the bytes of the bundle's `manifest.json` it read, checks each file the manifest names
-/// against the sha256 it gives and builds the WAF from the bytes it checked, so HELLO ties the loaded rules to
-/// `rules_sha256`. `mem_limit` is `GOMEMLIMIT` and `gomaxprocs` is `GOMAXPROCS`, as the inspector reports them.
+/// build is refused. The rules sha256 comes from the configuration. The inspector hashes the bytes of the bundle's
+/// `manifest.json` it read, checks each file the manifest names against the sha256 it gives and builds its rules from
+/// the bytes it checked, so HELLO ties the loaded rules to `rules_sha256`. `mem_limit` and `gomaxprocs` are the
+/// `GOMEMLIMIT` and `GOMAXPROCS` that the kernel gave the inspector, as it reports them back.
 pub(crate) struct HelloExpect<'a> {
-    pub build: Option<&'a Build>,
+    pub build: &'a Build,
     pub rules_sha256: &'a [u8; 32],
     pub mem_limit: u64,
     pub gomaxprocs: u16,
@@ -117,16 +117,13 @@ pub(crate) fn check_hello(
     if h.inc != inc {
         return Err("hello incarnation differs");
     }
-    let Some(build) = exp.build else {
-        return Err("hello engine is not pinned");
-    };
-    if h.toolchain != build.toolchain {
+    if h.toolchain != exp.build.toolchain {
         return Err("hello toolchain differs");
     }
-    if h.engine_version != build.version {
+    if h.engine_version != exp.build.version {
         return Err("hello engine version differs");
     }
-    if h.engine_source != build.source {
+    if h.engine_source != exp.build.source {
         return Err("hello engine source differs");
     }
     if h.rules_sha256 != *exp.rules_sha256 {

@@ -12,14 +12,14 @@ use std::process::{Command, Stdio};
 use crate::support::*;
 
 /// How the command ended, and what it wrote.
-struct Ran {
-    code: Option<i32>,
-    out: String,
-    err: String,
+pub(crate) struct Ran {
+    pub(crate) code: Option<i32>,
+    pub(crate) out: String,
+    pub(crate) err: String,
 }
 
 /// Runs `tukuyomi-proxy config check <the configuration of the root>` and waits for it.
-fn config_check(idle: &Idle) -> Ran {
+pub(crate) fn config_check(idle: &Idle) -> Ran {
     let output = Command::new(env!("CARGO_BIN_EXE_tukuyomi-proxy"))
         .arg("config")
         .arg("check")

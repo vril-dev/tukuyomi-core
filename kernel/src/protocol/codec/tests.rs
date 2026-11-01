@@ -1,6 +1,6 @@
 use super::hello::Hello;
 use super::*;
-use crate::engine::{Build, Engine};
+use crate::engine::Engine;
 use std::io;
 
 const GOLDEN: &str = include_str!(concat!(
@@ -1165,25 +1165,18 @@ const MEM: u64 = 256 << 20;
 
 type Mutation = (&'static str, fn(&mut Hello));
 
-/// A stand-in for the pinned build of an engine that has none yet: the table of the engines cannot be replaced, so
-/// the comparison is tried with a build that is given to `check_hello`.
-const OTHER_BUILD: Build = Build {
-    toolchain: b"rustc1.94.1",
-    version: b"v3.0.17",
-    source: b"sha256:0123456789abcdef",
-};
-
-fn good_hello() -> Hello {
-    let coraza = Engine::Coraza.pinned().unwrap();
+/// The HELLO that the inspector of `engine` sends for the start that these tests make.
+fn hello_of(engine: Engine) -> Hello {
+    let build = engine.pinned();
     Hello {
         version: 1,
         pid: PID,
         nonce: NONCE,
         run: RUN,
         inc: INC,
-        toolchain: coraza.toolchain.to_vec(),
-        engine_version: coraza.version.to_vec(),
-        engine_source: coraza.source.to_vec(),
+        toolchain: build.toolchain.to_vec(),
+        engine_version: build.version.to_vec(),
+        engine_source: build.source.to_vec(),
         rules_sha256: RULES,
         body_limit: MAX_DECLARED as u32,
         mem_limit: MEM,
@@ -1193,13 +1186,17 @@ fn good_hello() -> Hello {
     }
 }
 
-fn checked(h: &Hello) -> Result<(), &'static str> {
-    checked_against(h, Engine::Coraza.pinned())
+fn good_hello() -> Hello {
+    hello_of(Engine::Coraza)
 }
 
-fn checked_against(h: &Hello, build: Option<&Build>) -> Result<(), &'static str> {
+fn checked(h: &Hello) -> Result<(), &'static str> {
+    checked_against(h, Engine::Coraza)
+}
+
+fn checked_against(h: &Hello, engine: Engine) -> Result<(), &'static str> {
     let expect = HelloExpect {
-        build,
+        build: engine.pinned(),
         rules_sha256: &RULES,
         mem_limit: MEM,
         gomaxprocs: 1,
@@ -1241,25 +1238,16 @@ fn hello_matches_and_every_field_is_checked() {
 
 #[test]
 fn hello_is_compared_with_the_build_of_the_engine_that_is_expected() {
-    // The HELLO of the Coraza build, against a build of another engine: refused at the first string.
+    // The HELLO of each build is accepted for its own engine, and refused for the other one at the first string.
+    let (coraza, modsecurity) = (hello_of(Engine::Coraza), hello_of(Engine::ModSecurity));
+    assert_eq!(checked_against(&coraza, Engine::Coraza), Ok(()));
+    assert_eq!(checked_against(&modsecurity, Engine::ModSecurity), Ok(()));
     assert_eq!(
-        checked_against(&good_hello(), Some(&OTHER_BUILD)),
+        checked_against(&modsecurity, Engine::Coraza),
         Err("hello toolchain differs")
     );
-    // The HELLO of that other build is accepted against it, and refused against the Coraza build.
-    let mut other = good_hello();
-    other.toolchain = OTHER_BUILD.toolchain.to_vec();
-    other.engine_version = OTHER_BUILD.version.to_vec();
-    other.engine_source = OTHER_BUILD.source.to_vec();
-    assert_eq!(checked_against(&other, Some(&OTHER_BUILD)), Ok(()));
-    assert_eq!(checked(&other), Err("hello toolchain differs"));
-    // An engine with no pinned build accepts no HELLO.
     assert_eq!(
-        checked_against(&good_hello(), None),
-        Err("hello engine is not pinned")
-    );
-    assert_eq!(
-        checked_against(&other, Engine::ModSecurity.pinned()),
-        Err("hello engine is not pinned")
+        checked_against(&coraza, Engine::ModSecurity),
+        Err("hello toolchain differs")
     );
 }

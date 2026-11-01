@@ -21,11 +21,21 @@ fn an_engine_is_read_by_its_lowercase_name_only_and_gives_that_name_back() {
 }
 
 #[test]
-fn only_coraza_has_a_pinned_build_so_far() {
-    let coraza = Engine::Coraza.pinned().unwrap();
+fn each_engine_has_the_pinned_build_of_its_inspector() {
     assert_eq!(
-        (coraza.toolchain, coraza.version),
-        (&b"go1.27.2"[..], &b"v3.8.1"[..])
+        Engine::Coraza.pinned(),
+        &Build {
+            toolchain: b"go1.27.2",
+            version: b"v3.8.1",
+            source: b"h1:dMV55FbMR2vOks/acrT43RShR+VkzU6jwp+XPdxay8o=",
+        }
     );
-    assert_eq!(Engine::ModSecurity.pinned(), None);
+    assert_eq!(
+        Engine::ModSecurity.pinned(),
+        &Build {
+            toolchain: b"rustc 1.94.1",
+            version: b"v3.0.17",
+            source: b"f283b33d5c21130fd3a15c84a93a1abe12bd1949edaf44288b12af571b671a50",
+        }
+    );
 }

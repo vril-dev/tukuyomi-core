@@ -9,10 +9,12 @@
 //! connection open instead and read each response by its length.
 //!
 //! These tests need the environment variables `TUKUYOMI_TEST_INSPECTOR` (the built inspector),
+//! `TUKUYOMI_TEST_INSPECTOR_MODSECURITY` (the built inspector of the engine ModSecurity),
 //! `TUKUYOMI_TEST_RULES` (the directory of the rule bundle), `TUKUYOMI_TEST_RULES_SHA256` (the SHA-256 of the
 //! `manifest.json` of that bundle, 64 hex digits) and `TUKUYOMI_TEST_TMP` (the parent of the per-test 0700 roots).
-//! They fail when one is missing: a skipped real-process test must never look like a pass. Run them with
-//! `-- --ignored`.
+//! The test that imports the Core Rule Set needs `TUKUYOMI_TEST_CRS` as well (the directory that
+//! `scripts/fetch-crs.sh` makes). They fail when one is missing: a skipped real-process test must never look like a
+//! pass. Run them with `-- --ignored`.
 //!
 //! The rules store of a test is `store/` in its root. It holds the files of the bundle as the generation named by
 //! the hash, in `store/generations/<hash>/`, and `store/current`, which chooses that generation. A test that
@@ -42,6 +44,7 @@ mod forwarding;
 mod http2;
 mod inspector;
 mod keepalive;
+mod modsecurity;
 mod policy;
 mod records;
 mod refusals;

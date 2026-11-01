@@ -5,7 +5,7 @@
 //! left out. When it is there it has the one key `modsecurity`, whose value has the one key `inspector`: an absolute
 //! clean path, by the rule that `kernel.inspector` follows. The file is not looked at here; the start of the
 //! inspector does that. A generation of an engine can be used only if the configuration has an inspector for the
-//! engine and the kernel has a pinned build of that inspector (`KernelSettings::check_engine`).
+//! engine (`KernelSettings::check_engine`).
 
 use std::path::PathBuf;
 
@@ -75,8 +75,8 @@ impl KernelSettings {
         Ok(kernel)
     }
 
-    /// Whether a generation of `engine` can be used here: the configuration has an inspector for the engine and the
-    /// kernel has a pinned build of that inspector. A fixed sentence says which of the two is missing.
+    /// Whether a generation of `engine` can be used here: the configuration has an inspector for the engine, and the
+    /// kernel accepts the settings with it. A fixed sentence says why not.
     pub fn check_engine(&self, engine: Engine) -> Result<(), ConfigError> {
         self.for_engine(engine)?
             .check()

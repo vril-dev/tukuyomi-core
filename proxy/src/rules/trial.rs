@@ -280,8 +280,10 @@ fn ready(
         match kernel.status().phase {
             Phase::Ready => return Ok(()),
             Phase::Failed(why) => return Err(Failed::Start(why)),
-            Phase::Starting => {}
-            Phase::Stopping | Phase::Stopped => return Err(Failed::NotReady),
+            // A start that the inspector refused passes through Stopping while the kernel reaps it, and is Failed
+            // after that: the trial waits for the failure, which says why, until the deadline.
+            Phase::Starting | Phase::Stopping => {}
+            Phase::Stopped => return Err(Failed::NotReady),
         }
         let now = Instant::now();
         if now >= deadline {

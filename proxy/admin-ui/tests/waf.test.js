@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { ApiError } from '../js/api.js';
 import { actionsOf } from '../js/generations.js';
 import { setLanguage } from '../js/i18n.js';
-import { Ended, LIMITS, checkFiles, checkRoutes, importBody, toBase64, trialBlocked } from '../js/import.js';
+import { ENGINES, Ended, LIMITS, checkFiles, checkRoutes, importBody, toBase64, trialBlocked } from '../js/import.js';
 import { canChange, engineName, generationState, shortOf, switchOutcome, utc } from '../js/parts.js';
 import { Pager, buildQuery, decodeText, summaryOf } from '../js/records.js';
 
@@ -73,9 +73,11 @@ test('the bytes of a file go as the standard base64 with padding, and the body l
     assert.equal(toBase64(bytes), Buffer.from(bytes).toString('base64'), String(size));
   }
   const part = { name: 'a.conf', data: 'eA==' };
-  const plain = { rules: [part], data: [], crs: false, crsOff: ['x.conf'], routes: null, detectOnly: false, acceptBlock: false };
-  assert.deepEqual(importBody(plain), { rules: [part] });
-  assert.deepEqual(importBody({ ...plain, crs: true, detectOnly: true, routes: [{ path: '/x', action: 'bypass' }] }), {
+  const plain = { engine: 'coraza', rules: [part], data: [], crs: false, crsOff: ['x.conf'], routes: null, detectOnly: false, acceptBlock: false };
+  // The engine goes in every body, the default one as well.
+  assert.deepEqual(importBody(plain), { engine: 'coraza', rules: [part] });
+  assert.deepEqual(importBody({ ...plain, engine: 'modsecurity', crs: true, detectOnly: true, routes: [{ path: '/x', action: 'bypass' }] }), {
+    engine: 'modsecurity',
     rules: [part],
     crs: true,
     crs_off: ['x.conf'],
@@ -83,6 +85,8 @@ test('the bytes of a file go as the standard base64 with padding, and the body l
     detect_only: true,
   });
   assert.equal(importBody({ ...plain, acceptBlock: true }).accept_block, true);
+  assert.throws(() => importBody({ ...plain, engine: undefined }), RangeError);
+  assert.throws(() => importBody({ ...plain, engine: 'Coraza' }), RangeError);
 });
 
 test('a trial that failed because a rule blocked a probe is told from the other failures', () => {
@@ -269,6 +273,15 @@ test('every key that a script asks for is named in the call itself, so that the 
     const source = readFileSync(new URL(name, scripts), 'utf8');
     assert.ok(!/\bt\(\s*[^'\s]/.test(source), `${name}: a key that is not a plain string`);
   }
+});
+
+test('the import form offers Coraza, the default, and ModSecurity, each by its name in both languages', () => {
+  assert.deepEqual(ENGINES, ['coraza', 'modsecurity']);
+  for (const language of ['en', 'ja']) {
+    setLanguage(language);
+    assert.deepEqual(ENGINES.map(engineName), ['Coraza', 'ModSecurity']);
+  }
+  setLanguage('en');
 });
 
 test('an engine is shown by its name in the language, and a word that is not one of ours as it was given', () => {

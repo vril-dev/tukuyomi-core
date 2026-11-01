@@ -155,8 +155,8 @@ impl Body {
 
 /// Runs the trial of a staged bundle. The real one starts an inspector; the tests replace it.
 pub trait Trial: Send + Sync {
-    /// Whether a generation of `engine` can be inspected here: the configuration has an inspector for it and the
-    /// kernel has a pinned build of that inspector. A sentence: it cannot.
+    /// Whether a generation of `engine` can be inspected here: the configuration has an inspector for it. A
+    /// sentence: it cannot.
     fn usable(&self, engine: Engine) -> Result<(), &'static str>;
 
     /// Tries `staged`, a bundle with the rules of `engine` and `mode`; the trial ends early, as a failure, once `stop`

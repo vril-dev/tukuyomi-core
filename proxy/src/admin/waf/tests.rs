@@ -198,11 +198,14 @@ struct FakeTrial {
 }
 
 impl Trial for FakeTrial {
-    /// As the build is: Coraza has a pinned inspector build, ModSecurity none.
+    /// As the configuration is: Coraza has its inspector, `kernel.inspector`, and ModSecurity has none in
+    /// `kernel.engines`.
     fn usable(&self, engine: Engine) -> Result<(), &'static str> {
         match engine {
             Engine::Coraza => Ok(()),
-            Engine::ModSecurity => Err("the inspector build of the engine is not pinned"),
+            Engine::ModSecurity => {
+                Err("kernel.engines has no inspector for the engine of the generation")
+            }
         }
     }
 
@@ -1221,7 +1224,7 @@ fn a_generation_of_an_engine_that_cannot_be_used_is_refused_at_import_activate_a
     let rig = rig(true);
     let (g1, other) = (rig.make(1), rig.make_for(Engine::ModSecurity, 2));
     rig.start_on(g1);
-    let sentence = "the inspector build of the engine is not pinned";
+    let sentence = "kernel.engines has no inspector for the engine of the generation";
     let lines = |rig: &Rig| fields(&rig.lines()[0], &["action", "result", "reason"]).join(" ");
 
     // An activation: 409 with the sentence, audited as denied. The store, the proxy and the history are untouched.

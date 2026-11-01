@@ -5,6 +5,9 @@
 //! `TUKUYOMI_TEST_RULES` (the rule bundle directory), `TUKUYOMI_TEST_RULES_SHA256` (the SHA-256 of its
 //! `manifest.json`, 64 hex digits) and `TUKUYOMI_TEST_TMP` (the parent of the per-test 0700 roots) and FAIL when
 //! one is missing: a skipped real-process test must never look like a pass. Run them with `-- --include-ignored`.
+//! The tests of the engine ModSecurity also read `TUKUYOMI_TEST_INSPECTOR_MODSECURITY` (the ModSecurity
+//! inspector). They make a generation of that engine from the files of `TUKUYOMI_TEST_RULES`, and take its
+//! fingerprint from `sha256sum`.
 //!
 //! The values below are the test's own choices for this check, not defaults or recommendations. The limits of
 //! `Config::check` are written out as numbers on purpose: the constants are not public.
@@ -14,6 +17,7 @@ use std::fs::{self, DirBuilder};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tukuyomi_kernel::{
@@ -100,6 +104,9 @@ struct Run {
     /// Declared after `sup` on purpose: the fields are dropped in declaration order, so the root is removed only
     /// after the Supervisor has stopped its inspector and removed its per-start directory.
     root: Option<TestDir>,
+    /// The rules that the test made for itself, held to be removed with the run. Not in `root`, which has to be empty
+    /// at the end.
+    _rules: Option<TestDir>,
     submitted: Vec<ReqId>,
     got: Vec<(ReqId, Verdict, Matched)>,
 }
@@ -110,6 +117,7 @@ impl Run {
             sup: Supervisor::new(cfg)
                 .unwrap_or_else(|e| panic!("the test configuration is refused: {e:?}")),
             root,
+            _rules: None,
             submitted: Vec::new(),
             got: Vec::new(),
         }
@@ -541,12 +549,9 @@ fn check_paths() {
 }
 
 #[test]
-fn check_engine_needs_a_pinned_build() {
+fn check_accepts_each_engine() {
     accepted(|c| c.engine = Engine::Coraza);
-    rejected(
-        |c| c.engine = Engine::ModSecurity,
-        "the inspector build of the engine is not pinned",
-    );
+    accepted(|c| c.engine = Engine::ModSecurity);
 }
 
 #[test]
@@ -699,6 +704,67 @@ fn real_config(root: &Path, sha256: [u8; 32]) -> Config {
     c
 }
 
+/// The SHA-256 of a file, as `sha256sum` gives it. The kernel has no hash of its own: the operator gives it the
+/// fingerprint of a generation.
+fn sha256_of(path: &Path) -> [u8; 32] {
+    let out = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run sha256sum: {e}"));
+    assert!(out.status.success(), "sha256sum failed");
+    let text = String::from_utf8(out.stdout).expect("sha256sum prints text");
+    parse_sha256(
+        text.split_whitespace()
+            .next()
+            .expect("sha256sum prints a hash"),
+    )
+}
+
+/// A generation of the engine ModSecurity, made from the files of the generation in `TUKUYOMI_TEST_RULES` in a
+/// directory of its own: the same rule file, and a manifest of version 4 that names the engine. Returns the
+/// directory and the fingerprint of the manifest.
+fn modsecurity_rules(test: &str) -> (TestDir, [u8; 32]) {
+    let source = PathBuf::from(var("TUKUYOMI_TEST_RULES"));
+    let manifest = fs::read_to_string(source.join("manifest.json"))
+        .expect("read the manifest of the test rules");
+    let body = manifest
+        .strip_prefix(r#"{"version":1,"files":"#)
+        .and_then(|rest| rest.strip_suffix("]}\n"))
+        .expect("the manifest of the test rules is of version 1");
+    let dir = make_root(&format!("{test}-rules"));
+    DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path().join("rules"))
+        .expect("make the rules directory");
+    let file = Path::new("rules").join("basic.conf");
+    fs::copy(source.join(&file), dir.path().join(&file)).expect("copy the rule file");
+    let manifest = dir.path().join("manifest.json");
+    let text = format!(
+        r#"{{"version":4,"engine":"modsecurity","mode":"block","files":{body}],"routes":[]}}{}"#,
+        "\n"
+    );
+    fs::write(&manifest, text).expect("write the manifest");
+    let sha256 = sha256_of(&manifest);
+    (dir, sha256)
+}
+
+/// A run of the ModSecurity inspector of the environment on the generation that `modsecurity_rules` makes. `edit`
+/// changes the configuration before the run starts.
+fn modsecurity_run(test: &str, edit: impl FnOnce(&mut Config)) -> Run {
+    let (rules, sha256) = modsecurity_rules(test);
+    let root = make_root(test);
+    let mut cfg = fake_config();
+    cfg.engine = Engine::ModSecurity;
+    cfg.inspector = PathBuf::from(var("TUKUYOMI_TEST_INSPECTOR_MODSECURITY"));
+    cfg.rules = rules.path().to_path_buf();
+    cfg.rules_sha256 = sha256;
+    cfg.tmp_root = root.path().to_path_buf();
+    edit(&mut cfg);
+    let mut run = Run::new(cfg, Some(root));
+    run._rules = Some(rules);
+    run
+}
+
 /// A run whose inspector does not exist: every start fails at spawn, before any process exists.
 fn absent_inspector_run(test: &str, edit: impl FnOnce(&mut Config)) -> Run {
     let root = make_root(test);
@@ -754,25 +820,92 @@ fn uri_rule_blocks_in_phase_1() {
     finish_stopped(run);
 }
 
-#[test]
-#[ignore = "needs a built inspector"]
-fn a_different_rules_hash_fails_at_hello_without_restart() {
-    let mut sha = parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256"));
-    sha[31] ^= 1;
-    let root = make_root("wrong_sha");
-    let mut run = Run::new(real_config(root.path(), sha), Some(root));
+/// The end of a test whose inspector is refused at its HELLO for `why`: the failure is final (no restart), the request
+/// that waited is unavailable, and nothing is left behind.
+fn finish_refused_at_hello(mut run: Run, why: &'static str) {
     let hs = [header(b"Host", b"example.test")];
     let id = run.submit(&request(b"GET", b"/", &hs, b""));
     run.wait_for("the failure at HELLO", |r| {
         r.got.len() == 1 && matches!(r.sup.status().phase, Phase::Failed(_))
     });
-    let want = Phase::Failed(Failure::Hello("hello rules sha256 differs"));
+    let want = Phase::Failed(Failure::Hello(why));
     let st = run.sup.status();
     assert_eq!((st.phase, st.restarts), (want, 0));
     assert_eq!(run.verdict(id), UNAVAILABLE);
     // The reason stays after the shutdown, and nothing is left behind.
     let (st, bye) = run.finish();
     assert_eq!((st.phase, st.restarts, bye), (want, 0, false));
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_different_rules_hash_fails_at_hello_without_restart() {
+    let mut sha = parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256"));
+    sha[31] ^= 1;
+    let root = make_root("wrong_sha");
+    let run = Run::new(real_config(root.path(), sha), Some(root));
+    finish_refused_at_hello(run, "hello rules sha256 differs");
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn an_inspector_of_the_other_engine_fails_at_hello_without_restart() {
+    // The Coraza inspector with its own rules, under a configuration for the engine ModSecurity.
+    let sha = parse_sha256(&var("TUKUYOMI_TEST_RULES_SHA256"));
+    let root = make_root("other_coraza");
+    let mut cfg = real_config(root.path(), sha);
+    cfg.engine = Engine::ModSecurity;
+    finish_refused_at_hello(Run::new(cfg, Some(root)), "hello toolchain differs");
+    // The ModSecurity inspector with the generation of its engine, under a configuration for Coraza.
+    let run = modsecurity_run("other_msc", |c| c.engine = Engine::Coraza);
+    finish_refused_at_hello(run, "hello toolchain differs");
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn modsecurity_allows_a_normal_get_and_blocks_a_uri_rule_in_phase_1() {
+    let mut run = modsecurity_run("msc_uri", |_| {});
+    let hs = [header(b"Host", b"example.test")];
+    let normal = run.submit(&request(b"GET", b"/", &hs, b""));
+    let blocked = run.submit(&request(b"GET", b"/block-probe/x", &hs, b""));
+    run.wait_results(2);
+    assert_eq!(run.verdict(normal), Verdict::Allow);
+    assert_eq!(
+        run.verdict(blocked),
+        Verdict::Block {
+            phase: 1,
+            rule_id: 9201,
+            status: 403
+        }
+    );
+    finish_stopped(run);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn modsecurity_blocks_a_urlencoded_body_rule_in_phase_2() {
+    let mut run = modsecurity_run("msc_body", |_| {});
+    let mut post = |body: &[u8]| {
+        let cl = body.len().to_string();
+        let hs = [
+            header(b"Host", b"example.test"),
+            header(b"Content-Type", URLENCODED),
+            header(b"Content-Length", cl.as_bytes()),
+        ];
+        run.submit(&request(b"POST", b"/submit", &hs, body))
+    };
+    let (blocked, passed) = (post(b"probe=block"), post(b"probe=pass"));
+    run.wait_results(2);
+    assert_eq!(
+        run.verdict(blocked),
+        Verdict::Block {
+            phase: 2,
+            rule_id: 9202,
+            status: 403
+        }
+    );
+    assert_eq!(run.verdict(passed), Verdict::Allow);
+    finish_stopped(run);
 }
 
 #[test]
