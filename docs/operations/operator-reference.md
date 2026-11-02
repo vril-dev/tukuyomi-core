@@ -510,7 +510,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 - `server_name` は、小文字の名前で、TLS が使える形であること。あれば、server をその名前で確かめる。無ければ、書いた名前で確かめる。IP の literal で書いた server は、その address で確かめる。
 - 上流へは TLS 1.2 と 1.3 で、ALPN は `http/1.1` だけである（上流へ HTTP/2 は話さない）。client の証明書は送らない。
 
-経路は `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?}` である。
+経路は `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?, "records"?}` である。
 
 | 鍵 | 意味 |
 |---|---|
@@ -521,6 +521,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 | `rewrite` | 上流へ送る要求と、返す応答の書き換え（下） |
 | `stream` | `{"idle_ms", "total_ms", "websocket"}`。3つとも書く（下の「長い応答と WebSocket」） |
 | `max_body` | その経路の本文の上限。`proxy.max_body` 以下で、下げることしかできない。0 なら本文を受けない |
+| `records` | `best_effort`、`required`、`security` のどれか。その経路の要求の記録の残し方。省けば `records.keep` に従う（下の「記録」の「記録の残し方」） |
 
 - 経路は、要求の `Host` と、target の最初の `?` までを、受けたバイトのまま比べる。
   - デコードや整形はしない。path の英字の大小は区別する。
@@ -530,7 +531,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 - 当たる経路のうち、最も詳しいものを使う。
   - 先に host で決める。名前が wildcard より先、長い wildcard が短いものより先、port のある経路が無いものより先、host のある経路が無いものより先である。
   - 次に path で決める。その path だけの経路が接頭辞より先、長い接頭辞が短いものより先、path のある経路が無いものより先である。
-- 既定の組には、`access`・`rewrite`・`stream`・`max_body` は無い。
+- 既定の組には、`access`・`rewrite`・`stream`・`max_body`・`records` は無い。既定の組へ回る要求の記録は、`records.keep` に従う。
 - 経路を引く前に、全体の `access`・`rate_limit` と、TLS の接続の `Host` の確かめがある（下の「要求の前の方針」の「要求の確かめの順」）。
 - 経路を引いた後、本文を読む前と検査の前に、次を答える。
   - どの経路にも当たらず既定の組も無い: 404
@@ -754,6 +755,8 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 | 国の一覧（全体の `access` と経路の `access` の `deny_countries`・`allow_countries`）があれば `geo` もある | 国を引くデータベースが要る |
 | `rules.store.dir`、`records.dir`、`admin.store.dir`、`admin.control` のあるディレクトリは、互いに同じでなく、どれも他の中にない。`admin.control` 自身は前の3つの中にない | 一方の回しや書き換えが、他方の中身を置き換えないため |
 | `admin.listen` は `proxy.listeners` と `status.listen` に重ならない | 同じ port を2つの待ち受けで bind できない |
+| 経路の `records` が `required` なら `records` がある | 残す先のファイルが要る |
+| `records.ship` があり、`records.keep` か経路の `records` に `required` があれば `records.files ≥ 3` | 送り手の遅れで断る閾値（ファイル `files − 2` 個分）が 0 にならないため |
 
 - 時間の関係は `_ms` を外した名前で書いた。
 
@@ -1110,7 +1113,7 @@ proxy が返すすべての応答（上流の応答、遮断、head の拒否、
 
 ## 記録
 
-記録は、標準エラーに1行1件の JSON で出る（systemd では journal）。設定に `records` があれば、同じ行をファイルにも書く（下の「記録のファイル」）。短い命令（`config check`・`rules`・`acme`・`admin bootstrap`・`admin reset`）の出力は、人が読む文の行のままである。
+記録は、標準エラーに1行1件の JSON で出る（systemd では journal）。設定に `records` があれば、同じ行をファイルにも書く（下の「記録のファイル」）。さらに `records.ship` があれば、別のプロセス（記録の送り手）がファイルの行を PostgreSQL か MySQL へ送る（下の「記録の送り手」）。記録を残せないときに要求を通すか断るかは、経路ごとに選べる（下の「記録の残し方」）。短い命令（`config check`・`rules`・`acme`・`admin bootstrap`・`admin reset`）の出力は、人が読む文の行のままである。
 
 どの記録も、次の2つの項目で始まる。値の無い項目は書かない（`null` にしない）。
 
@@ -1205,22 +1208,26 @@ query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）�
 - どちらの数も、監視の `/metrics` で見られる（`tukuyomi_records_dropped_total`、`tukuyomi_record_write_errors_total`）。標準エラーが詰まっている間は、記録では知らせられない。
 - 1件は 4 KiB 未満で、切らない（項目の上限からこの大きさを超えない）。
 - 記録のファイル（`records`）に書けないときは、その行がファイルに入らないだけで、標準エラーには出る。数は `tukuyomi_record_file_errors_total` で見られる（下の「記録のファイル」）。
+- ここまでは、記録を残せなくても要求を通す既定の扱い（`best_effort`）である。記録を残せないときに要求を断る経路も選べる（下の「記録の残し方」）。
 
 ### 記録のファイル（`records`）
 
 設定に `records` を書くと、標準エラーに出す記録と同じ行を、ディレクトリのファイルにも書く。省けば、記録は標準エラーだけに出る。管理のプロセスは、このファイルを読んで記録を引く。
 
 ```text
-{"dir", "file_bytes", "files"}
+{"dir", "file_bytes", "files", "keep"?, "sync_ms"?, "ship"?}
 ```
 
-3つとも書く。
+`dir`、`file_bytes`、`files` は必ず書く。
 
 | 鍵 | 範囲 | 意味 |
 |---|---|---|
 | `dir` | 絶対の path、3840 バイトまで | ファイルを置くディレクトリ。proxy は作らないので、先に作る。本物のディレクトリで、持ち主が proxy の利用者、group と other の権限が無いこと |
 | `file_bytes` | 1 MiB〜1 GiB | 1つのファイルの大きさ。使用中のファイルがこれを超える行は、次のファイルから書く |
-| `files` | 2〜64 | 残すファイルの数（使用中のものを含む） |
+| `files` | 2〜64 | 残すファイルの数（使用中のものを含む）。`ship` があり、`keep` か経路の `records` に `required` があるときは 3 以上 |
+| `keep` | `best_effort`、`required` | 自分の `records` を持たない経路と既定の組の、記録の残し方（下の「記録の残し方」）。省けば `best_effort` |
+| `sync_ms` | 1〜60000 | 書いた行をディスクへ同期する（fsync）間隔の上限。省けば同期せず、OS に任せる（下の「入る行」） |
+| `ship` | `{"db_driver", "db_dsn_file", "batch", "interval_ms", "retention_days"}` | 記録の送り手の設定（下の「記録の送り手」）。proxy は送り手を動かさず、送り手の遅れを見るだけである |
 
 - 使うディスクは、多くても `file_bytes × files` である。1件は 4 KiB 未満なので、1つのファイルが `file_bytes` を超えることは無い。
 - 名前と回し:
@@ -1231,21 +1238,180 @@ query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）�
   - `files` を小さくして起動し直すと、`records.<files>.log` 以降の古いファイルは、持ち主が proxy の利用者の普通のファイルなら、起動のときと回すたびに消す（`records.63.log` まで）。
 - 開き方:
   - `records.log` は、無ければ 0600 で作り、追記で開く。link、FIFO、ディレクトリ、別の利用者のファイルは断る。group か other の権限があるファイルは、書く前に 0600 にする。
+  - 最後の行が改行で終わっていないファイル（書いている途中で落ちたときなど）には、先に改行を書く。次の行が途中の行とつながらないようにするためである。
   - 起動のときに開けなければ、`start: record file refused: <理由>` の文を出し、検査プロセスを起動せずに止まる（exit 1）。
 - 入る行:
   - 標準エラーに出す行を、すべて同じ形で、1行ごとに1回の write で書く。標準エラーの後に書く。
   - ファイルを開く前に出た行（設定の確かめからルールの世代までの `start:` の文）は入らない。
-  - ディスクへの同期（fsync）はしない。
+  - `sync_ms` が無ければ、ディスクへの同期（fsync）はしない。電源が落ちると、OS がまだディスクに書いていない行は失われる。
+  - `sync_ms` があれば、同期していない行のうち最も古いものが `sync_ms` だけ待ったときに、ファイルを同期する。後に行が来なくても同期する。回す前にも、改名するファイルを同期する。電源が落ちて失うのは、最後の同期より後の行である。同期の失敗は、書き込みの失敗と同じに扱う（下の「書けないとき」）。
 - ファイルが外から動かされたとき: `records.log` の path は、1秒に1回まで確かめる（回す前にも確かめる）。path にファイルが無いとき、または開いているのと別のファイルのときは、開いているファイルを閉じる。その行はファイルに入らず、`tukuyomi_record_file_errors_total` に数える。次の行が `records.log` を新しく作って開く。
 - 書けないとき:
   - 書き込み、open、改名が失敗すると、その行はファイルに入らず、ファイルを閉じて、`tukuyomi_record_file_errors_total` に数える。標準エラーには出る。要求の処理は待たない。
   - 閉じている間に来た行も、ファイルに入らず、同じに数える。失敗から1秒以上後に来た最初の行が、開き直す。ディスクが壊れたままでも、試すのは1秒に1回までである。
   - 途中まで書けた行は、書く前の大きさまで切り戻す。
+  - 同期（`sync_ms`）が失敗したときも、ファイルを閉じて、同じ数に数える。
   - ディレクトリは、開き直す前と回す前に、起動のときと同じに確かめる。
+- 送り手（`ship`）があれば、送り手が同じディレクトリに `ship.state`（送った位置）を置き、書き換えの間だけ `ship.state.new` を置く。proxy は `ship.state` を読むだけで、どちらも消さない。
+
+### 記録の残し方（`keep` と経路の `records`）
+
+経路ごとに、記録を残せないときの扱いと、残す記録を選べる。経路の `records` を書かなければ、全体の `records.keep` に従う。`records.keep` を書かなければ `best_effort` である。
+
+| 値 | 記録を残せないとき | 書く記録 |
+|---|---|---|
+| `best_effort` | 記録を捨てて数え、要求は通す（上の「書けないとき」） | すべて |
+| `required` | その経路の新しい要求を 503 で断る | すべて |
+| `security` | `best_effort` と同じ | 規則が判定した要求（遮断と、検知だけのモードで当たったもの）、検査できなかった要求（検査プロセスに頼めなかった 503 を含む）、受け付けた後に答えの前に切れた要求（下）だけ。普通に通した要求の記録は書かない |
+
+`required` の経路は、次の3つがそろうときだけ要求を受け付ける。
+
+1. 記録のファイルへの最後の書き込み（と同期）が通っていて、記録を書く thread が動いている。
+2. 送り手（`ship`）があるなら、送り手がまだ送っていないバイト数が、ファイル `files − 2` 個分（`file_bytes × (files − 2)`）より少ない。送っていない記録が回しで消える前に断るためである。送り手の遅れが分からないとき（`ship.state` が読めない、形が違う、90 秒より前に書かれた、記録のファイルのどれでもないファイルを指す）も断る。`files` が 3 より少ないときは、遅れでは断らない。
+3. 記録の待ち行列に席が空いている。席は、待ち行列の 1024 のうち 512 までである。`required` の経路の要求を同時に 512 より多く受け付けると、それを超えた要求は 503 になる。
+
+- 断った要求には 503 で答え、`tukuyomi_records_refused_total` に数える。断った要求の記録（reason は `records cannot be kept`）は「できる限り」で書く。ただし、送り手の遅れで断ったときは、その記録は書かずに数えるだけにする。送っていない記録が回しで消えるまでの余白を、断った記録で使わないためである。
+- 受け付けた要求は、本文を読む前に席を取り、記録を待ち行列に入れるまで持つ。その要求の記録は、待ち行列が満ちても捨てない。
+- 受け付けた後に書き込みが失敗したら、数えて、それより後の `required` の要求を断る。書き込みは失敗の1秒後から試し直し、通れば受け付けに戻る。
+- 送り手の遅れは、proxy が `ship.state` を1秒に1回読み、その位置より後のバイト数（指すファイルの残りと、それより新しいファイル）に、読んだ後に書いたバイトを足して見積もる。閾値より少なくなれば、受け付けに戻る。
+- 記録は応答を送り終えた後に書く。そのため `required` は、client に答える前に記録があることは約束しない。次の2つの記録は抜けることがある。
+  - 書き込みが失敗し始めたときに、受け付け済みだった要求の記録
+  - 電源が落ちたときの、最後の同期より後の記録（`sync_ms` が無ければ OS に任せる）
+- `required` を使うには `records` が要る。`ship` と `required` を両方使うときは、`files` を 3 以上にする（上の「値どうしの関係」）。
+
+経路を決める前、または本文を読まずに答える次の要求は、経路の値と `records.keep` にかかわらず、記録を「できる限り」で書く。どれも上流へ何も送らない答えである。
+
+- 全体の `access` の 403 と `rate_limit` の 429
+- TLS の接続で、証明書が `Host` を持たない要求の 421
+- どの経路にも当たらず、既定の組も無い要求の 404
+- head の確かめで断った要求、https への redirect、ACME の challenge の答え
+- 経路の `access` の 403 と、経路の `max_body` の 413
+- 接続の記録（`connection`）と tunnel の記録（`tunnel`）
+
+受け付けた後に答えの前に切れた要求（HTTP/1.1 で client が接続を閉じた、HTTP/2 で stream を reset した）と、本文の途中で client が去った要求は、どの経路でも記録を書く。上流に届いたかもしれないためである。
 
 ### 記録を読める人
 
-記録には、client の address と path が入る。journal を読める利用者（root と、Ubuntu では `adm`・`systemd-journal` の組の利用者）は、それを読める。組に入れる人を絞る。保存の期間と容量は journald の設定で決める（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。記録のファイル（`records`）は 0600 で、0700 のディレクトリにある。読めるのは、proxy の利用者と root である。管理のプロセスは、同じ利用者としてこのファイルを読み、管理の利用者に見せる（[管理リファレンス](admin-reference.md)）。
+記録には、client の address と path が入る。journal を読める利用者（root と、Ubuntu では `adm`・`systemd-journal` の組の利用者）は、それを読める。組に入れる人を絞る。保存の期間と容量は journald の設定で決める（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。記録のファイル（`records`）は 0600 で、0700 のディレクトリにある。読めるのは、proxy の利用者と root である。管理のプロセスは、同じ利用者としてこのファイルを読み、管理の利用者に見せる（[管理リファレンス](admin-reference.md)）。送り手を使うときは、DB の表にも同じ記録が入る。表を読める DB の利用者も絞る。
+
+## 記録の送り手
+
+記録の送り手（`tukuyomi-records-ship`）は、proxy の記録のファイルを読み、行を PostgreSQL か MySQL の表へ順に入れる、別のプロセスである。proxy は送り手を動かさず、DB にもつながない。DB につなぐ部品と DB のパスワードは、送り手の実行ファイルとプロセスにだけある。build と unit は [実行ファイルの build と配置](../build/binary-deployment.md) にある。試したのは PostgreSQL 16・18 と MySQL 8.0 である。
+
+### 送り手の起動
+
+```text
+tukuyomi-records-ship <config>
+```
+
+- `<config>` は proxy と同じ設定ファイルで、絶対の path で書く。proxy と同じ確かめで読み、`records.ship` が要る。無ければ `records-ship: configuration refused: there is no records.ship object` の行を出して終わる。
+- proxy と同じ利用者で動かす。root では動かない（user id の4つのどれかが 0 なら断る）。記録のディレクトリが、この利用者の本物のディレクトリで、group と other の権限が無いことも確かめる。`ship.state` をそこに書くためである。
+- 記録のディレクトリのファイルシステムは、ファイルの生まれた時刻（`statx` の btime）を返すこと。送り手は、記録のファイルを inode と生まれた時刻の組で見分ける（ファイルシステムは、消したファイルの inode の番号をすぐに使い回す）。返さないファイルシステムでは、送り手は起動を断り、proxy は遅れを「分からない」として `required` の要求を断る。
+- 起動の順は、設定、記録のディレクトリ、接続の文字列のファイル（下）、合図の受け付け、`NOTIFY_SOCKET` があれば `READY=1` である。DB には最初の回でつなぐ。届かない DB は、動いている間に止まったときと同じに、待って試し直す。
+
+| exit | とき |
+|---|---|
+| 0 | SIGTERM、SIGINT、SIGHUP で止まった。動いている1回分を終えてから止まり、`STOPPING=1` を送る |
+| 1 | 接続の文字列が読めない、または断られた。DB がログインを断った（下の「送り手の誤り」）。そのほかの失敗 |
+| 2 | 引数の誤り、設定が断られた |
+
+- 止める合図は、DB を呼んでいる間は待たされる。1回の呼び出しは 30 秒まで（つなぐのは 10 秒まで）で、1回分の中に呼び出しが数回あるので、止まるまでに長いと1〜2分かかる。SIGKILL で止めても、次の起動は DB に残った位置から続ける。行と位置は、同じ transaction で DB に入るためである。
+
+### `records.ship`
+
+```text
+{"db_driver", "db_dsn_file", "batch", "interval_ms", "retention_days"}
+```
+
+5つとも書く。
+
+| 鍵 | 範囲 | 意味 |
+|---|---|---|
+| `db_driver` | `pgsql`、`mysql` | 送る DB の種類 |
+| `db_dsn_file` | 絶対の path、3840 バイトまで | 接続の文字列のファイル（下）。proxy はこのファイルを開かない |
+| `batch` | 1〜10000 | 1つの transaction に入れる行の数の上限 |
+| `interval_ms` | 100〜60000 | 送る行が無かったときに、次の回まで待つ時間。失敗の後に待つ時間の始まりでもある |
+| `retention_days` | 0〜3650 | DB に残す日数。0 なら消さない |
+
+```json
+"records": {
+  "dir": "/var/lib/tukuyomi-core/records",
+  "file_bytes": 16777216,
+  "files": 8,
+  "sync_ms": 1000,
+  "ship": {
+    "db_driver": "pgsql",
+    "db_dsn_file": "/etc/tukuyomi-core/records-db.dsn",
+    "batch": 500,
+    "interval_ms": 1000,
+    "retention_days": 90
+  }
+}
+```
+
+### 接続の文字列（`db_dsn_file`）
+
+接続の文字列はパスワードを含むので、設定ファイルには書かず、別のファイルに置く。
+
+- 普通のファイルで、持ち主が送り手の利用者、group と other の権限が無いこと（0600）。16 KiB まで、UTF-8 の文字である。断るときの文には、ファイルの名前も中身も入れない。
+- PostgreSQL: `host=db.example.com port=5432 user=tukuyomi_ship password=<パスワード> dbname=records` の形か、`postgresql://` の URL（`tokio-postgres` の形）。表は、接続の `search_path` の最初の schema に作る。
+  - 同じホストの PostgreSQL には、unix socket と peer 認証（OS の利用者の名前と同じ名前の role）でつなげば、パスワードが要らない。例: `host=/var/run/postgresql user=tukuyomi dbname=tukuyomi_records sslmode=disable`。
+- MySQL: `mysql://<利用者>:<パスワード>@<host>:<port>/<DB の名前>` の URL（`mysql_async` 0.37 の形）。DB の名前が要り、表はその DB に作る。URL の中で記号を使う値は、percent-encoding で書く。
+
+TLS は次のとおりである。
+
+| | PostgreSQL | MySQL |
+|---|---|---|
+| 書かないとき | TLS。証明書と名前を確かめる | TLS。証明書と名前を確かめる |
+| 受け付ける指定 | `sslmode=require`、`verify-ca`、`verify-full`。どれも証明書と名前を確かめる（`require` でも確かめる） | `require_ssl=true`、`verify_ca=true`、`verify_identity=true` |
+| 断る指定 | `sslmode=prefer`、`allow`（相手が TLS を断ると平文に落ちる） | `verify_ca=false`、`verify_identity=false`（確かめを外す） |
+| 平文 | `sslmode=disable` と書いたときだけ（loopback や unix socket 向け） | `require_ssl=false` と書いたときだけ。unix socket（`socket`）は、このときだけ使える |
+
+- 証明書を確かめる認証局は、システムのものである。環境の `SSL_CERT_FILE` が指すファイル、無ければ distribution の置き場の bundle（Debian・Ubuntu、Fedora・Red Hat、openSUSE）を読む。接続の文字列では、認証局のファイルを指せない。自前の認証局の証明書は、`SSL_CERT_FILE` で渡す。
+- TLS を出さない server には、つながない。
+- MySQL では、server が名乗る unix socket へ移らず、接続の文字列の address のままつなぐ。
+
+### 送り手の表
+
+送り手は、DB につないだときに表を探し、無い表だけを作る。
+
+| 表 | 中身 |
+|---|---|
+| `tukuyomi_records` | 記録の行ごとに1つ。`id`（通し番号）、`ts`、`type`、`request_id`、`client`、`method`、`host`、`path`、`class`、`status`、`reason`、`ms`、`upstream`、`mode`、`engine`、`generation`、`rule`、`rules`（文字列）、`score`、`body`、`sent`、`raw`（行そのもの）、`line_hash`（行の SHA-256。UNIQUE） |
+| `tukuyomi_records_state` | 記録のディレクトリ（`source`、`records.dir` の path）ごとの、送った位置（`inode`、`born`、`offset`、`lost_lines`、`updated`） |
+| `tukuyomi_records_schema` | 表の形の版（今は 1） |
+
+- 索引は、`ts`、`(type, ts)`、`request_id`、`rule` にある。
+- 表がそろっていて版の行があれば、何も作らないので、送り手の DB の利用者に表を作る権限は要らない。作る権限を渡したくないときは、作る権限のある利用者で送り手を一度動かして表を作らせ、その後で送り手の利用者を替える。表を手で作るときは、送り手が作る形（`records-ship/src/store/pgsql.rs`、`records-ship/src/store/mysql.rs` の `CREATE TABLE`）のとおりに作り、版の表に 1 の行も入れる。版の行が無いと、送り手は表を作ろうとして、作る権限を求める。
+- 版の表に、この送り手より新しい版があれば断る（`the schema of the database is newer than this program`）。
+- 1つの記録のディレクトリには、送り手を1つだけ動かす。位置は `records.dir` の path で分けるので、別のホストの proxy を同じ表へ送るときは、`records.dir` の path を変えるか、別の schema や DB にする。
+- PostgreSQL: 表を作る間は advisory lock を取る。
+- MySQL: 表は InnoDB、文字は `utf8mb4`、照合順序は `utf8mb4_bin`、行の形は `DYNAMIC` で作り、時刻は UTC の `DATETIME(3)` である。接続ごとに `sql_mode` を厳しい形（`STRICT_ALL_TABLES` を含む）にし、時間帯を UTC にする。表を作る間は `GET_LOCK` を取る。server の `max_allowed_packet` は 2 MiB 以上にする（1つの `INSERT` に 100 行まで入る）。`records.dir` の path は 512 文字までにする。越えると、送り手は `a value does not fit the database` の行を出して止まる。
+
+### 送り方
+
+- 1回で、記録のファイルの行を `batch` 個まで読み、1つの transaction で、行を入れて位置の表を進める。commit の後に `ship.state` を書く。送り手が落ちても、次の回は DB の位置から続ける。
+- `batch` 個そろった回の後はすぐ次の回へ進み、送る行が無かった回の後は `interval_ms` 待つ。失敗の後は、待つ時間を `interval_ms` から倍にして1分まで延ばし、うまくいった回の後に戻す。
+- DB に届かない間と、送る行が無い間も、`ship.state` を1秒に1回は書き直す。proxy は、それで送り手が動いていることを知る。
+- 記録のファイルは、名前ではなく inode と生まれた時刻で追う。回しで改名されても、続きから読む。使用中のファイルの最後の、改行の無い行は、proxy が書いている途中かもしれないので、次の回に回す。
+- すべての type の行を送る。type を知っている JSON の object の行は、その項目を同じ名前の列に入れる（無い項目と、型の違う項目の列は空）。ほかの行は type `unknown` で入れる。行そのものは、いつも `raw` に残る。
+- 列の長さは proxy が書く上限に合わせ、長い値は切る（`method` 32、`host` 255、`path` 1024、`request_id` 128 バイト）。UTF-8 でない行は、`raw` では不正なバイトを U+FFFD にする（`line_hash` は元のバイトの hash）。
+- `line_hash` が UNIQUE なので、二重に送った行は1つになる。同じバイト列の行も1つになる。
+- `retention_days` があれば、1分に1回、それより古い行を 1000 行まで消す（1000 行消せたときは続けて消す）。古さは記録の `ts`（proxy の時計）で決める。
+
+### 送れない記録
+
+- 送り手が読む前に、回しで消えた記録のファイルの行は失われる。
+  - 送り手が開いていたファイルなら、失われた行を数えて位置の `lost_lines` に足し、`records-ship: a record file was removed before it was shipped, <数> lines lost` の行を出す。
+  - 送り手が開く前に消えたファイル（DB に長く届かない間に、proxy が `files` より多く回したときなど）の行は、数えられない。`lines may be lost` を含む行だけを出す。この行は、何も失われていないときにも出ることがある。
+- proxy の `required` の経路は、そうなる前に要求を断る（上の「記録の残し方」）。`best_effort` と `security` の経路は断らない。
+- 記録のファイルを切り詰めない（logrotate の `copytruncate` など）。送り手は、切り詰めたファイルを同じファイルと見て、その先頭の行を送らないことがある。回しは proxy が自分でする。
+
+### 送り手の誤り
+
+- 送り手の記録は、proxy と同じ1行1件の JSON（type `line`、文は `records-ship:` で始まる）で、標準エラーに出る。文には、接続の文字列、記録、server の文の値を入れない。DB の誤りは、決まった文と、server が返した SQLSTATE である（例: `records-ship: the database refused or failed a request (SQLSTATE 42000)`）。
+- DB がログインを断ったとき（PostgreSQL の SQLSTATE が 28 で始まるもの、MySQL の 1045）は、待っても直らないので、`records-ship: stop: the login is refused, which waiting does not mend` の行を出して終わる（exit 1）。
+- ほかの断りは、上の間を置いて試し直し、そのたびに行を出す。DB が無い、DB への権限が無い、MySQL の、その host からの接続を許さない（1130）・アカウントが lock されている（3118）なども、これに入る。
 
 ## 監視
 
@@ -1289,7 +1455,11 @@ query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）�
 | `tukuyomi_upstream_failures_total` | counter | `group` | 上流の組の server の失敗 |
 | `tukuyomi_records_dropped_total` | counter | | 捨てた記録（上の「書けないとき」） |
 | `tukuyomi_record_write_errors_total` | counter | | 書き込みに失敗した記録 |
-| `tukuyomi_record_file_errors_total` | counter | | 記録のファイルに書けなかった記録（上の「記録のファイル」） |
+| `tukuyomi_record_file_errors_total` | counter | | 記録のファイルに書けなかった記録と、失敗した同期（上の「記録のファイル」） |
+| `tukuyomi_records_refused_total` | counter | | `required` の経路で、記録を残せないために 503 で断った要求（上の「記録の残し方」） |
+| `tukuyomi_records_healthy` | gauge | | 記録のファイルへの最後の書き込みが通り、記録を書く thread が動いていれば 1、でなければ 0 |
+| `tukuyomi_records_admitting` | gauge | | `required` の経路の要求を今受け付けるなら 1、断るなら 0（上の「記録の残し方」の3つ）。`required` の経路が無くても出る |
+| `tukuyomi_records_unshipped_bytes` | gauge | | 送り手がまだ送っていない、記録のファイルのバイト数。`records.ship` があるときだけ出る。送り手の遅れが分からない間は、値が無い |
 | `tukuyomi_start_time_seconds` | gauge | | 起動した時刻（Unix 時間の秒） |
 
 ### systemd への知らせ

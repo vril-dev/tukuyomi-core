@@ -11,17 +11,19 @@
 | `tukuyomi-proxy`（Rust、`proxy/`） | HTTP・HTTPS の受付と転送。検査核（`kernel/`、Rust のライブラリ）を組み込み、検査プロセスの起動・停止・再起動を受け持つ。同じ実行ファイルが、ルールの保管場所の命令（`rules`）、証明書の命令（`acme renew`）、設定の確かめ（`config check`）、管理のプロセス（`admin`）も持つ |
 | `tukuyomi-inspector`（Go、`inspector/`） | Coraza で要求を検査する。proxy が子のプロセスとして起動し、引き継いだ Unix domain socket の対で話す。待ち受けの port は持たない。設定の `kernel.inspector` に書く |
 | `tukuyomi-inspector-modsecurity`（Rust と C++、`inspector-modsecurity/`） | ModSecurity v3（libmodsecurity 3.0.17）で要求を検査する。ModSecurity の世代（`rules import --engine modsecurity`）を使うときだけ要り、使わないホストでは省いてよい。proxy が子のプロセスとして起動し、引き継いだ Unix domain socket の対で話す。待ち受けの port は持たない。設定の `kernel.engines.modsecurity.inspector` に書く |
+| `tukuyomi-records-ship`（Rust、`records-ship/`） | 記録の送り手。proxy の記録のファイルの行を、PostgreSQL か MySQL の表へ送る。記録を DB へ送るときだけ要り、送らないホストでは省いてよい。proxy とは別の unit で、同じ設定ファイルを読む。待ち受けの port は持たない |
 | 管理のプロセス | 同じ実行ファイルの `tukuyomi-proxy admin <config>`。proxy とは別の unit で動かす。loopback の待ち受けで、管理 API と管理画面（実行ファイルに組み込んである）に答える。ルールの世代の操作と、proxy への切り替えの依頼（制御 socket）をする |
 | 設定ファイル | JSON の1つのファイル。値に既定値はない。鍵は、省けると決まったもの（`acme`、`records`、`access`、`rate_limit`、`geo`、`admin` など）のほかは、すべて書く。proxy と管理のプロセスが同じファイルを読む |
 | ルールの保管場所 | ルールセットの世代を置くディレクトリ（設定の `rules.store.dir`）。`rules import` が世代を作り、`rules activate` が使う世代を選ぶ。管理のプロセスも同じ操作をする |
 | 検査プロセスの作業場所 | 起動ごとの一時のディレクトリを作る親（設定の `kernel.tmp_root`） |
 | 証明書と鍵 | TLS の待ち受けのもの。`acme renew` で発行・更新するか、運用者が置く |
-| 記録のファイル | 標準エラーに出す記録の写しを置くディレクトリ（設定の `records.dir`）。proxy が書き、管理のプロセスが読む |
+| 記録のファイル | 標準エラーに出す記録の写しを置くディレクトリ（設定の `records.dir`）。proxy が書き、管理のプロセスと送り手が読む。送り手は、送った位置（`ship.state`）もここに書く |
+| 接続の文字列のファイル | 送り手が DB につなぐ文字列（パスワードを含む）のファイル（設定の `records.ship.db_dsn_file`）。送り手だけが読む |
 | 管理の置き場 | 管理のプロセスが利用者・API の token・監査の記録・切り替えの履歴を置くディレクトリ（設定の `admin.store.dir`） |
 | 制御 socket | proxy が管理のプロセスの依頼を受ける Unix domain socket（設定の `admin.control`） |
 | 国のデータベース | 国の一覧（`access`）が使う、MaxMind DB の形式のファイル（設定の `geo.country_db`）。運用者が用意する |
 
-検査プロセスと管理のプロセスは、proxy と同じ利用者で動く。
+検査プロセス、管理のプロセス、送り手は、proxy と同じ利用者で動く。
 
 ## 要るもの
 
@@ -44,6 +46,9 @@
   - libyajl-dev と libpcre2-dev（静的 library の `libyajl_s.a` と `libpcre2-8.a`）
   - bash、curl、sha256sum、tar（libmodsecurity の取得。archive を `BUILD_MODSECURITY_ARCHIVE_FILE` で渡すなら curl は要らない）
 - CRS の取得に要るもの: bash、curl、sha256sum、tar。
+- 記録を DB へ送るときだけ要るもの。
+  - PostgreSQL か MySQL の server。試したのは PostgreSQL 16・18 と MySQL 8.0 である。
+  - 記録のディレクトリのファイルシステムが、ファイルの生まれた時刻（`statx` の btime）を返すこと。試したのは ext4 だけである。
 
 ## build
 
@@ -105,6 +110,16 @@ cd inspector-modsecurity && TUKUYOMI_MODSECURITY_PREFIX=<新しいディレク�
 
 違うと、検査核は `hello toolchain differs`、`hello engine version differs`、`hello engine source differs` のどれかで断り、起動し直さない。proxy の起動では `stop: the kernel failed: Hello("<文>")` の行が、`rules import` では `rules import: the trial failed: the inspector could not be started (Hello("<文>"))` の行が出る。
 
+### 記録の送り手
+
+記録を DB へ送るときだけ build する。`records-ship/` で build する。proxy のライブラリも一緒に build される。
+
+```bash
+cd records-ship && cargo build --release --locked
+```
+
+実行ファイルは `records-ship/target/release/tukuyomi-records-ship` にできる。要るものは proxy と同じである（Rust 1.94.1 以上と C の compiler）。
+
 ### CRS の取得
 
 CRS（OWASP Core Rule Set）は同梱しない。`scripts/fetch-crs.sh` で取得する。サービスの利用者で流す。
@@ -132,6 +147,7 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
 - 専用の利用者を作り、サービスも命令もその利用者で流す。たとえば `sudo -u tukuyomi tukuyomi-proxy ...` とする。
 - root で `acme renew` を流すと、作った鍵を別の利用者の proxy が読めないので、これも断る。
 - 管理のプロセス（`admin`）と、その短い命令（`admin bootstrap`・`admin reset`）も、同じ利用者で流す。ルールの保管場所、記録のディレクトリ、制御 socket は、その利用者だけが使える（0700）ためである。別の利用者で動かすと、どれも使えない。
+- 記録の送り手も、同じ利用者で動かす。記録のディレクトリを読み、そこに `ship.state` を書くためである。送り手も root では動かない。
 
 置き場の例を次に示す。
 
@@ -139,13 +155,15 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
 |---|---|---|
 | `/opt/tukuyomi-core/bin/tukuyomi-proxy`、`/opt/tukuyomi-core/bin/tukuyomi-inspector` | `kernel.inspector`（Coraza の検査プロセスの方） | root。サービスの利用者が書き換えられない所に置く |
 | `/opt/tukuyomi-core/bin/tukuyomi-inspector-modsecurity` | `kernel.engines.modsecurity.inspector`（ModSecurity の検査プロセスの方。省いてよい） | root。サービスの利用者が書き換えられない所に置く |
+| `/opt/tukuyomi-core/bin/tukuyomi-records-ship` | （送り手の unit。省いてよい） | root。サービスの利用者が書き換えられない所に置く |
 | `/etc/tukuyomi-core/config.json` | （起動の引数） | root。サービスの利用者が読めること。大きさは 256 KiB まで |
 | `/var/lib/tukuyomi-core/store` | `rules.store.dir` | サービスの利用者。権限は 0700 |
 | `/var/lib/tukuyomi-core/tmp` | `kernel.tmp_root` | サービスの利用者。権限は 0700。setgid は付けない |
 | `/var/lib/tukuyomi-core/tls/` | 証明書の `cert_file`・`key_file` | サービスの利用者（`acme renew` が書く） |
 | `/var/lib/tukuyomi-core/acme/account.key` | `acme.account_key_file` | `acme renew` が初めての実行のときに作る（0600） |
 | `/var/lib/tukuyomi-core/challenges` | `acme.challenge_dir` | サービスの利用者 |
-| `/var/lib/tukuyomi-core/records` | `records.dir` | サービスの利用者。権限は 0700。中の `records.log` などは proxy が 0600 で作る |
+| `/var/lib/tukuyomi-core/records` | `records.dir` | サービスの利用者。権限は 0700。中の `records.log` などは proxy が、`ship.state` は送り手が、0600 で作る |
+| `/etc/tukuyomi-core/records-db.dsn` | `records.ship.db_dsn_file`（送り手を使うとき） | サービスの利用者が持ち主で、権限は 0600。設定ファイルと違い、root の持ち物にしない（送り手が、持ち主と権限を確かめる） |
 | `/var/lib/tukuyomi-core/admin` | `admin.store.dir` | サービスの利用者。権限は 0700。中の `users/`・`tokens/`・`audit/` などは管理のプロセスが作る |
 | `/var/lib/tukuyomi-core/control` | `admin.control` のあるディレクトリ（例の socket は `/var/lib/tukuyomi-core/control/proxy.sock`） | サービスの利用者。権限は 0700。socket は proxy が 0600 で作る。socket の path は 107 バイトまで |
 | `/var/lib/tukuyomi-core/crs-4.23.0` | `admin.crs_dir`（管理の API で CRS を取り込むとき） | 「CRS の取得」で作ったディレクトリ。サービスの利用者が読めること |
@@ -226,6 +244,7 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
    - 作る利用者の役割は `owner` である。成功すると `created owner <名前>` が出る。管理の置き場に利用者が1人でもいれば、断られる（exit 1）。
    - 管理のプロセスの起動の前でも後でも流せる。パスワードを忘れた利用者には `admin reset` を使う。
    - 管理 API、役割、画面は [管理リファレンス](../operations/admin-reference.md) にある。
+8. 記録を DB へ送るときは、DB の利用者と DB を用意し、接続の文字列のファイルをサービスの利用者の持ち物の 0600 で置き、設定に `records.ship` を書いて、送り手の unit を起動する（下の「記録の送り手」）。表は、送り手が最初につないだときに作る。表の権限と接続の文字列の形は [運用リファレンス](../operations/operator-reference.md) の「記録の送り手」にある。
 
 ## systemd
 
@@ -329,6 +348,44 @@ WantedBy=multi-user.target
 - proxy が動いていなくても、管理のプロセスは起動する。そのあいだは、世代の切り替えを依頼できない。
 - 外から使うときは、proxy の TLS の待ち受けの経路から、`admin.listen` の address へ転送する。`admin.listen` は、上流の server にしてよい（[運用リファレンス](../operations/operator-reference.md) の「`admin`」）。経路の書き方は [管理リファレンス](../operations/admin-reference.md) の「外から使う」に、画面と API の使い方は同じ文書にある。
 - 記録は journal に入り、監査の記録は管理の置き場の `audit/` にも書く。
+
+### 記録の送り手
+
+記録を DB へ送るときは、送り手を proxy とは別の unit で動かす。同じ設定ファイル、同じ利用者である。unit の例を示す。
+
+```ini
+# tukuyomi-core-records-ship.service
+[Unit]
+Description=tukuyomi-core records shipper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=tukuyomi
+Group=tukuyomi
+ExecStart=/opt/tukuyomi-core/bin/tukuyomi-records-ship /etc/tukuyomi-core/config.json
+KillSignal=SIGTERM
+TimeoutStopSec=150
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/tukuyomi-core
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- `Type=notify` にする。送り手は、起動の確かめを終えた後に `READY=1` を、停止の始めに `STOPPING=1` を送る。DB には `READY=1` の後につなぐ。届かない DB は待って試し直すので、DB の unit の後に並べなくてよい。
+- `TimeoutStopSec` は長めにする。止める合図は DB を呼んでいる間は待たされ、止まるまでに長いと1〜2分かかる。それより短くて SIGKILL になっても、行と位置は同じ transaction で DB に入るので、次の起動は続きから送る。
+- 記録のディレクトリ（`ship.state` を書く）は、`ReadWritePaths` の中に置く。
+- DB がログインを断ると、送り手は exit 1 で終わり、`Restart=on-failure` により `RestartSec` ごとに起動し直す。接続の文字列を直すまで、これを繰り返す。
+- DB の server の証明書を自前の認証局で出したときは、その証明書のファイルを `Environment=SSL_CERT_FILE=<path>` で渡す。
+- 設定ファイルと接続の文字列のファイルは、起動のときに1回だけ読む。変えたら、`systemctl restart` で起動し直す。`ExecReload` は置かない（SIGHUP は停止である）。
+- proxy が動いていなくても、送り手は起動し、ファイルにある記録を送る。proxy は、送り手が動いていないこと（`ship.state` が 90 秒より古い）を、`required` の経路の要求を断ることで示す。
+- 送り手の記録は journal に入る。
 
 ### 証明書の更新の timer
 

@@ -11,8 +11,8 @@ tukuyomi-core の設計文書を置くディレクトリ。tukuyomi-core は、t
 | [システム概要](detailed-design/00_overview/system-overview.md) | 目的、現在の状態、前提・候補・未決定の区別、検討の対象とする範囲、用語 |
 | [アーキテクチャ概要](detailed-design/00_overview/architecture.md) | 構成の候補、責務の分担、障害の影響範囲、要求処理の流れの例、設計上の義務、状態 × 操作、採用判断に必要な検証の候補 |
 | [設計方針・制約](detailed-design/00_overview/design-principles.md) | 設計原則とその適用、検査モードと技術障害の区別、fail-closed の適用範囲、記録と管理機能の扱い、移植と前例、版の方針 |
-| [実行ファイルの build と配置](build/binary-deployment.md) | 要るもの、build、CRS の取得、利用者と置き場、国のデータベース、初めて起動する手順、systemd の例（管理のプロセスを含む）、検査プロセスの絞り |
-| [運用リファレンス](operations/operator-reference.md) | 命令、合図、停止、設定ファイルの鍵と値どうしの関係、本文と予算、ルールセットと世代、要求の扱い、要求の前の方針（全体の許可・拒否、流量の制限、国のデータベース）、記録の行と記録のファイル、監視、ACME |
+| [実行ファイルの build と配置](build/binary-deployment.md) | 要るもの、build、CRS の取得、利用者と置き場、国のデータベース、初めて起動する手順、systemd の例（管理のプロセスと記録の送り手を含む）、検査プロセスの絞り |
+| [運用リファレンス](operations/operator-reference.md) | 命令、合図、停止、設定ファイルの鍵と値どうしの関係、本文と予算、ルールセットと世代、要求の扱い、要求の前の方針（全体の許可・拒否、流量の制限、国のデータベース）、記録の行と記録のファイル、記録の残し方、記録の送り手（PostgreSQL・MySQL）、監視、ACME |
 | [管理リファレンス](operations/admin-reference.md) | 管理のプロセスの命令と待ち受け、設定の `admin`、外から使う経路、利用者と役割、ログインと第二要素、API の token、監査、世代の操作、切り替えの履歴、記録の読み出し、管理画面、API の path の一覧 |
 
 未決事項は設計文書の末尾に表でまとめ、文書をまたいで一意な ID を付けている（システム概要は OV-、アーキテクチャ概要は AR-、設計方針・制約は DP-）。
