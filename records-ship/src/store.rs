@@ -1,5 +1,5 @@
 //! The database side, behind one trait: the connection, the position of the shipping, the batches, and the removal
-//! of old rows. A driver is one implementation (`pgsql`).
+//! of old rows. A driver is one implementation (`pgsql`, `mysql`).
 //!
 //! A batch is the rows of some lines and the position they lead to, and the database makes both durable in one
 //! transaction. The position is held against the one that the caller expects: if the database has another (another
@@ -14,7 +14,9 @@ use std::fmt;
 use crate::follow::Position;
 use crate::row::Row;
 
+pub mod mysql;
 pub mod pgsql;
+mod roots;
 
 pub const CONNECT: &str = "cannot connect to the database";
 pub const CERTIFICATE: &str = "the certificate of the database server is not accepted";
@@ -29,6 +31,9 @@ pub const VALUE: &str = "a value does not fit the database";
 pub const DSN: &str = "the connection string of the database is not valid";
 pub const SSLMODE: &str = "the sslmode of the connection string is prefer or allow, which fall back to plain text: \
                            write require, or disable for a server on this host";
+pub const UNVERIFIED: &str = "the connection string turns off the check of the certificate or of the name of the \
+                              database server: remove verify_ca=false and verify_identity=false, or write \
+                              require_ssl=false for a server on this host";
 pub const FILES: &str = "cannot read the record files";
 
 /// Why the database could not be used.

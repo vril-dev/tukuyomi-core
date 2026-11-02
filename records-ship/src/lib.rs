@@ -18,8 +18,8 @@
 //! The parts, one file each: `run` (the process: arguments, configuration, signals, notices to the service
 //! manager), `dsn` (the file with the connection string), `files` (the record files and the position file as the
 //! proxy names and writes them), `follow` (the reader of the record files, by inode, birth time and offset, through rotations),
-//! `row` (a line as the columns of the table), `store` (the database behind a trait, and `store::pgsql`), and `ship`
-//! (the loop that ties them together).
+//! `row` (a line as the columns of the table), `store` (the database behind a trait, and its drivers `store::pgsql` and
+//! `store::mysql`), and `ship` (the loop that ties them together).
 //!
 //! The shipper runs as a process of its own, apart from the proxy: the database client and its dependencies are in
 //! this executable and not in the one that takes requests from outside, and the password of the database is known

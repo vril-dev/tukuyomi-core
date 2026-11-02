@@ -34,6 +34,7 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, NoTls};
 use tukuyomi_proxy::log::ship::Identity;
 
+use super::roots::refused_certificate;
 use super::{
     CERTIFICATE, CLOSED, CONNECT, DSN, Error, FAILED, LOGIN, MOVED, NEWER, SSLMODE, Store, VALUE,
 };
@@ -212,24 +213,6 @@ impl Drop for PgStore {
     fn drop(&mut self) {
         self.driver.abort();
     }
-}
-
-/// Whether an error is the refusal of the certificate of the server: the cause is a TLS error of that kind.
-fn refused_certificate(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut cause = Some(error);
-    while let Some(error) = cause {
-        let tls = error.downcast_ref::<rustls::Error>().or_else(|| {
-            error
-                .downcast_ref::<std::io::Error>()?
-                .get_ref()?
-                .downcast_ref::<rustls::Error>()
-        });
-        if let Some(tls) = tls {
-            return matches!(tls, rustls::Error::InvalidCertificate(_));
-        }
-        cause = error.source();
-    }
-    false
 }
 
 /// The error of a request: the SQLSTATE if the server answered, else what the kind of the failure says.

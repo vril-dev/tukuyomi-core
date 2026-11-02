@@ -1,29 +1,14 @@
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-use tukuyomi_proxy::log::ship::{Identity, Position as State};
+use tukuyomi_proxy::log::ship::Position as State;
 use tukuyomi_records_ship::files;
-use tukuyomi_records_ship::follow::Position;
 use tukuyomi_records_ship::row::Row;
 use tukuyomi_records_ship::store::{MOVED, Store};
 
-use super::support::{Database, Records, connect, lines, raws, shipper, until_idle};
-
-fn rows(from: usize, to: usize) -> Vec<Row> {
-    (from..to)
-        .map(|n| Row::of(format!("row {n}").as_bytes()))
-        .collect()
-}
-
-fn at(offset: u64) -> Position {
-    Position {
-        identity: Identity { inode: 7, born: 8 },
-        offset,
-        lost_lines: 0,
-    }
-}
+use super::support::{Database, Records, at, connect, lines, raws, rows, shipper, until_idle};
 
 #[test]
-#[ignore = "needs a PostgreSQL server"]
+#[ignore = "needs a MySQL server"]
 fn a_batch_and_its_position_are_stored_together_or_not_at_all() {
     let db = Database::new();
     db.run(async {
@@ -70,50 +55,95 @@ fn a_batch_and_its_position_are_stored_together_or_not_at_all() {
         );
         assert_eq!(db.count().await, 5);
         assert_eq!(store.position().await.unwrap(), Some(at(70)));
-        // A position without rows.
+        // A position without rows, and the same position again: it is not taken for another.
+        assert_eq!(store.commit(Some(at(70)), at(70), &[]).await.unwrap(), 0);
         assert_eq!(store.commit(Some(at(70)), at(70), &[]).await.unwrap(), 0);
     });
 }
 
 #[test]
-#[ignore = "needs a PostgreSQL server"]
+#[ignore = "needs a MySQL server"]
+fn a_batch_of_many_rows_is_stored_in_order_and_once() {
+    let db = Database::new();
+    db.run(async {
+        let mut store = connect(&db).await;
+        // More rows than one statement takes: the rows go in several, in one transaction.
+        assert_eq!(store.commit(None, at(1), &rows(0, 250)).await.unwrap(), 250);
+        let expected: Vec<String> = (0..250).map(|n| format!("row {n}")).collect();
+        assert_eq!(db.raws().await, expected);
+        // Sent again, none is stored, in each of the statements.
+        assert_eq!(
+            store
+                .commit(Some(at(1)), at(2), &rows(0, 250))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.count().await, 250);
+    });
+}
+
+#[test]
+#[ignore = "needs a MySQL server"]
 fn lines_that_a_database_could_refuse_are_stored_and_do_not_stop_the_batch() {
     let db = Database::new();
     db.run(async {
         let mut store = connect(&db).await;
+        let long_invalid = b"\xff".repeat(4096);
         let bad: Vec<Row> = [
             &b"\xff\xfe not utf-8"[..],
+            &long_invalid[..],
             br#"{"type":"request","ts":"0000-01-01T00:00:00.000Z","client":"999.1.1.1","status":99999999999,"path":"/a\u0000b","rules":["x"]}"#,
             br#"{"type":"request","ts":"2026-13-45T25:61:61.000Z","id":"\u0000","host":"h"}"#,
             br#"{"ts":"2026-10-25T08:00:00.123Z","type":"request","client":"::ffff:192.0.2.1","status":403,"rules":[942100],"rule":942100}"#,
+            br#"{"ts":"9999-12-31T23:59:59.999Z","type":"line","line":"last"}"#,
+            br#"{"ts":"1000-01-01T00:00:00.000Z","type":"line","line":"first"}"#,
+            br#"{"ts":"0999-12-31T23:59:59.999Z","type":"line","line":"before"}"#,
             b"",
             b"{}",
         ]
         .iter()
         .map(|line| Row::of(line))
         .collect();
-        assert_eq!(store.commit(None, at(10), &bad).await.unwrap(), 6);
-        assert_eq!(db.count().await, 6);
+        assert_eq!(store.commit(None, at(10), &bad).await.unwrap(), 10);
+        assert_eq!(db.count().await, 10);
         assert_eq!(
-            db.text("SELECT host(client) || ' ' || rules || ' ' || status FROM {s}.tukuyomi_records WHERE rule = 942100")
+            db.text("SELECT CONCAT(client, ' ', rules, ' ', status) FROM tukuyomi_records WHERE rule = 942100")
                 .await,
             "192.0.2.1 [942100] 403"
         );
         assert_eq!(
-            db.text("SELECT count(*) FILTER (WHERE \"type\" = 'unknown') || ' ' || count(*) FILTER (WHERE \"type\" = 'request') FROM {s}.tukuyomi_records")
+            db.text("SELECT CONCAT(SUM(`type` = 'unknown'), ' ', SUM(`type` = 'request'), ' ', SUM(`type` = 'line')) FROM tukuyomi_records")
                 .await,
-            "3 3"
+            "4 3 3"
         );
+        // The times at the ends of what the type holds are kept; one before it is the time the server stored it at.
+        assert_eq!(
+            db.text("SELECT DATE_FORMAT(MAX(ts), '%Y-%m-%d %H:%i:%s.%f') FROM tukuyomi_records")
+                .await,
+            "9999-12-31 23:59:59.999000"
+        );
+        assert_eq!(
+            db.text("SELECT CAST(SUM(ts = '1000-01-01 00:00:00.000') AS CHAR) FROM tukuyomi_records")
+                .await,
+            "1"
+        );
+        assert_eq!(
+            db.text("SELECT CAST(SUM(ts < '1000-01-02') AS CHAR) FROM tukuyomi_records")
+                .await,
+            "1"
+        );
+        // The longest line is kept whole.
+        assert_eq!(db.raws().await[1].chars().count(), 4096);
     });
 }
 
 #[test]
-#[ignore = "needs a PostgreSQL server"]
+#[ignore = "needs a MySQL server"]
 fn a_request_number_of_any_length_is_cut_and_the_batch_is_stored() {
     let db = Database::new();
     db.run(async {
         let mut store = connect(&db).await;
-        // Text that does not compress, so that the database cannot shrink it below the limit of an index row.
         let mut state = 7u64;
         let id: String = (0..3000)
             .map(|_| {
@@ -125,7 +155,7 @@ fn a_request_number_of_any_length_is_cut_and_the_batch_is_stored() {
         let rows = [Row::of(b"{\"type\":\"line\"}"), Row::of(long.as_bytes()), Row::of(b"after")];
         assert_eq!(store.commit(None, at(5000), &rows).await.unwrap(), 3);
         assert_eq!(
-            db.text("SELECT length(request_id)::text FROM {s}.tukuyomi_records WHERE request_id IS NOT NULL")
+            db.text("SELECT CAST(CHAR_LENGTH(request_id) AS CHAR) FROM tukuyomi_records WHERE request_id IS NOT NULL")
                 .await,
             "128"
         );
@@ -135,7 +165,7 @@ fn a_request_number_of_any_length_is_cut_and_the_batch_is_stored() {
 }
 
 #[test]
-#[ignore = "needs a PostgreSQL server"]
+#[ignore = "needs a MySQL server"]
 fn a_replay_stores_nothing_twice() {
     let db = Database::new();
     let records = Records::new();
@@ -159,7 +189,7 @@ fn a_replay_stores_nothing_twice() {
         );
         // The database forgets the position (a restore from a copy, a table emptied): the files are shipped from the
         // start again, and the table keeps each line once.
-        db.exec("DELETE FROM {s}.tukuyomi_records_state").await;
+        db.exec("DELETE FROM tukuyomi_records_state").await;
         let mut second = shipper(&records, 3, 0, db.settings());
         until_idle(&mut second).await;
         assert_eq!(db.raws().await, raws(0, 7));
@@ -172,43 +202,7 @@ fn a_replay_stores_nothing_twice() {
 }
 
 #[test]
-#[ignore = "needs a PostgreSQL server"]
-fn rotations_while_shipping_lose_and_repeat_nothing() {
-    let db = Database::new();
-    let records = Records::new();
-    records.write("records.log", &lines(0, 5));
-    db.run(async {
-        let mut shipper = shipper(&records, 2, 0, db.settings());
-        // Two batches, then a rotation with lines still unread in the old file.
-        assert_eq!(shipper.turn().await, Duration::ZERO);
-        assert_eq!(db.count().await, 2);
-        records.rotate();
-        records.append("records.log", &lines(5, 9));
-        assert_eq!(shipper.turn().await, Duration::ZERO);
-        // A second rotation: the first file is now the second one, the second is the first.
-        records.rotate();
-        records.append("records.log", &lines(9, 12));
-        records.append(
-            "records.log",
-            "{\"ts\":\"2026-10-25T08:00:00.123Z\",\"type\":\"li",
-        );
-        until_idle(&mut shipper).await;
-        assert_eq!(db.raws().await, raws(0, 12));
-        let position = shipper.follower().position().unwrap();
-        assert_eq!(position.lost_lines, 0);
-        assert_eq!(
-            position.identity,
-            Identity::of(&std::fs::metadata(records.path("records.log")).unwrap()).unwrap()
-        );
-        // The line that was half written is shipped when it is whole.
-        records.append("records.log", "ne\",\"line\":\"n12\"}\n");
-        until_idle(&mut shipper).await;
-        assert_eq!(db.raws().await, raws(0, 13));
-    });
-}
-
-#[test]
-#[ignore = "needs a PostgreSQL server"]
+#[ignore = "needs a MySQL server"]
 fn old_rows_are_removed_and_recent_ones_stay() {
     let db = Database::new();
     let records = Records::new();

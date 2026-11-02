@@ -12,7 +12,14 @@ use super::signals::Signals;
 use crate::dsn;
 use crate::ship::{HEARTBEAT, Settings, Shipper};
 use crate::store::Store;
+use crate::store::mysql::{self, MyStore};
 use crate::store::pgsql::{self, PgStore};
+
+/// The settings of the database that `db_driver` names. The settings of PostgreSQL are the larger, and boxed.
+enum Database {
+    Pgsql(Box<pgsql::Settings>),
+    Mysql(mysql::Settings),
+}
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_FAILED: u8 = 1;
@@ -54,10 +61,6 @@ fn run(path: &Path, log: &Log) -> u8 {
         return EXIT_USAGE;
     };
     log.line("records-ship: configuration accepted");
-    if !matches!(ship.driver, Driver::Pgsql) {
-        log.line("records-ship: db_driver mysql is not supported yet");
-        return EXIT_USAGE;
-    }
     let uid = match host::fs_uid() {
         Ok(uid) => uid,
         Err(text) => {
@@ -82,8 +85,14 @@ fn run(path: &Path, log: &Log) -> u8 {
     };
     // The position of the shipping is kept under the directory of the records it follows.
     let source = records.dir.to_string_lossy().into_owned();
-    let database = match pgsql::Settings::parse(&dsn, &source) {
-        Ok(settings) => settings,
+    let parsed = match ship.driver {
+        Driver::Pgsql => {
+            pgsql::Settings::parse(&dsn, &source).map(|s| Database::Pgsql(Box::new(s)))
+        }
+        Driver::Mysql => mysql::Settings::parse(&dsn, &source).map(Database::Mysql),
+    };
+    let database = match parsed {
+        Ok(database) => database,
         Err(e) => {
             log.line(&format!("records-ship: {e}"));
             return EXIT_FAILED;
@@ -110,7 +119,10 @@ fn run(path: &Path, log: &Log) -> u8 {
             return EXIT_FAILED;
         }
     };
-    runtime.block_on(serve::<PgStore>(settings, database, log))
+    match database {
+        Database::Pgsql(database) => runtime.block_on(serve::<PgStore>(settings, *database, log)),
+        Database::Mysql(database) => runtime.block_on(serve::<MyStore>(settings, database, log)),
+    }
 }
 
 /// Ships until a signal asks for the stop, and stops. The first turn connects; a database that is away is waited

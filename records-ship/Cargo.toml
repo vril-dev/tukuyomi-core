@@ -17,6 +17,7 @@ path = "src/main.rs"
 tukuyomi-proxy = { path = "../proxy" }
 tokio = { version = "1.53.3", default-features = false, features = ["rt", "net", "time", "sync", "signal", "io-util"] }
 tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
+mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust", "rustls-tls", "aws-lc-rs"] }
 tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["aws-lc-rs"] }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 serde_json = "1.0.154"
