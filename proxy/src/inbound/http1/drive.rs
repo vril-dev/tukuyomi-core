@@ -96,7 +96,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let (serving, mut gate) = Serving::start(stream, peer, local, ctx, listener, accept, scheme);
-    if let Err(reject) = gate.first_head(first_head_by(&ctx.cfg, accept)).await {
+    if let Err(reject) = gate.first_head(first_head_by(&ctx.setup.cfg, accept)).await {
         return serving.refuse(&mut gate, reject).await;
     }
     let end = serving.drive(&mut gate).await;
@@ -119,7 +119,7 @@ impl Serving {
         scheme: Scheme,
     ) -> (Arc<Serving>, Gate<T>) {
         let link = Link::new(accept);
-        let (gate, gauge) = Gate::new(stream, Settings::new(&ctx.cfg), link.clone(), accept);
+        let (gate, gauge) = Gate::new(stream, Settings::new(&ctx.setup.cfg), link.clone(), accept);
         let serving = Arc::new(Serving {
             session: Session::new(ctx, peer, local, listener, Proto::H1, accept, scheme, gauge),
             link,
@@ -140,7 +140,7 @@ impl Serving {
         T: AsyncRead + AsyncWrite + Unpin,
     {
         let ctx = &self.session.ctx;
-        let cfg = &ctx.cfg;
+        let cfg = &ctx.setup.cfg;
         let service = {
             let serving = self.clone();
             service_fn(move |req: Request<Incoming>| {
@@ -159,10 +159,10 @@ impl Serving {
             .max_header_size(cfg.max_head_bytes)
             .max_buf_size(cfg.max_head_bytes.max(8192))
             .title_case_headers(true);
-        let mut stop = ctx.ingress.watch();
+        let mut stop = ctx.shared.ingress.watch();
         let mut changed = pin!(stop.changed());
         // A call to drain the connections that wait for a request: it counts only if this one waits for one.
-        let mut calls = ctx.ingress.drained();
+        let mut calls = ctx.shared.ingress.drained();
         let link = self.link.clone();
         let mut drained = pin!(async move {
             loop {
@@ -229,7 +229,7 @@ impl Serving {
         let Some(Taken { head, start }) = self.link.take_for(&parts) else {
             // Hyper made a request of bytes that the head check did not pass as that request.
             let noted = Noted::new(
-                self.session.ctx.ids.mint(),
+                self.session.ctx.shared.ids.mint(),
                 Reply::rejected(400, "the two parsers disagree"),
                 self.session.peer.ip(),
             );
@@ -270,7 +270,7 @@ impl Serving {
     /// long: it is the last.
     fn then(&self, conn: &Conn, n: u64, long: bool) -> Then {
         let ctx = &self.session.ctx;
-        let cfg = &ctx.cfg;
+        let cfg = &ctx.setup.cfg;
         let head = conn.head();
         let spent = n >= u64::try_from(cfg.keepalive_requests).unwrap_or(u64::MAX)
             || self.session.accept.elapsed() >= cfg.keepalive_time;
@@ -281,7 +281,7 @@ impl Serving {
             || head.upgrade()
             || long
             || cfg.keepalive_timeout.is_zero();
-        if closing || spent || ctx.ingress.is_closed() {
+        if closing || spent || ctx.shared.ingress.is_closed() {
             Then::Close
         } else {
             Then::Keep
@@ -318,8 +318,8 @@ impl Serving {
         T: AsyncRead + AsyncWrite + Unpin,
     {
         let session = &self.session;
-        let cfg = &session.ctx.cfg;
-        let id = session.ctx.ids.mint();
+        let cfg = &session.ctx.setup.cfg;
+        let id = session.ctx.shared.ids.mint();
         let Some(answer) = reject.response(&id) else {
             let reply = Reply {
                 reason: reject.reason(),
@@ -348,7 +348,7 @@ impl Serving {
             return;
         }
         let session = &self.session;
-        let cfg = &session.ctx.cfg;
+        let cfg = &session.ctx.setup.cfg;
         let lingers = self.closing.load(Ordering::Acquire) || gate.failure().is_some();
         let by = after(Instant::now(), cfg.response_idle).min(session.conn_by());
         let sock = gate.stream();
@@ -378,8 +378,10 @@ impl Serving {
     {
         let rest = gate.take_rest();
         let sock = gate.stream();
-        tunnel.run(&mut *sock, rest, &self.session.ctx.cfg).await;
-        let by = after(Instant::now(), self.session.ctx.cfg.response_idle);
+        tunnel
+            .run(&mut *sock, rest, &self.session.ctx.setup.cfg)
+            .await;
+        let by = after(Instant::now(), self.session.ctx.setup.cfg.response_idle);
         let _ = timeout_at(by, close_write(sock)).await;
     }
 

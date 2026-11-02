@@ -45,7 +45,7 @@ impl Conn {
     /// route with `security` is marked at once, so that the answers of the lists of the route are among those it
     /// writes.
     pub(super) fn keep_by(&self, route: &Route<'_>) -> RouteKeep {
-        let keeps = self.ctx.keep.for_route(route.records);
+        let keeps = self.ctx.setup.keep.for_route(route.records);
         if keeps == RouteKeep::Security {
             self.keeping
                 .lock()
@@ -59,10 +59,10 @@ impl Conn {
     /// is let in is marked, for the record of one that is dropped before its answer (see `Unanswered`).
     pub(super) fn admit_records(&self, keeps: RouteKeep) -> Result<(), Stop> {
         let seat = if keeps == RouteKeep::Required {
-            match self.ctx.log.admit() {
+            match self.ctx.shared.log.admit() {
                 Ok(seat) => Some(seat),
                 Err(why) => {
-                    self.ctx.counters.records_refused.add();
+                    self.ctx.shared.counters.records_refused.add();
                     self.note_empty_body();
                     self.keeping
                         .lock()

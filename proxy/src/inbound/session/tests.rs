@@ -301,7 +301,7 @@ fn an_idle_connection_closes_after_the_wait_and_at_once_when_the_stop_begins() {
         assert_eq!(responses(&client, 1).await.0[0].status, 403);
         sleep(Duration::from_millis(100)).await;
         let began = StdInstant::now();
-        rig.ctx.ingress.close();
+        rig.ctx.shared.ingress.close();
         assert!(read_all(&client).await.is_empty());
         assert!(began.elapsed() < 5 * SEC);
         assert_eq!(rig.finish(task).await.len(), 1);
@@ -309,7 +309,7 @@ fn an_idle_connection_closes_after_the_wait_and_at_once_when_the_stop_begins() {
         // A request that starts after the stop has no way to the driver, and its answer ends the connection.
         let rig = Rig::new(kept(), Mode::Answer(BLOCK)).await;
         let (client, task) = rig.connect().await;
-        rig.ctx.ingress.close();
+        rig.ctx.shared.ingress.close();
         put(&client, &get("/late")).await;
         let answer = parse_response(&read_all(&client).await);
         assert_eq!(answer.status, 503);
@@ -409,7 +409,7 @@ fn a_drain_closes_the_connection_that_waits_for_a_request_and_leaves_one_that_is
         assert_eq!(responses(&client, 1).await.0[0].status, 403);
         sleep(Duration::from_millis(100)).await;
         let began = StdInstant::now();
-        rig.ctx.ingress.drain();
+        rig.ctx.shared.ingress.drain();
         assert!(read_all(&client).await.is_empty());
         assert!(began.elapsed() < 5 * SEC);
         assert_eq!(rig.finish(task).await.len(), 1);
@@ -422,7 +422,7 @@ fn a_drain_closes_the_connection_that_waits_for_a_request_and_leaves_one_that_is
         let second = get("/2");
         put(&client, &second[..10]).await;
         sleep(Duration::from_millis(100)).await;
-        rig.ctx.ingress.drain();
+        rig.ctx.shared.ingress.drain();
         sleep(Duration::from_millis(100)).await;
         put(&client, &second[10..]).await;
         let (answers, closed) = responses(&client, 1).await;
@@ -722,7 +722,7 @@ fn a_handshake_gets_its_101_and_the_bytes_go_both_ways_in_order_also_after_the_s
         peer.send(b"second").await;
         assert_eq!(peer.take(6).await, b"second");
         // The stop does not end a tunnel.
-        rig.ctx.ingress.close();
+        rig.ctx.shared.ingress.close();
         let big: Vec<u8> = (0..40_000u32).map(|n| (n % 251) as u8).collect();
         peer.send(&big).await;
         assert_eq!(peer.take(big.len()).await, big);
@@ -757,7 +757,7 @@ fn a_stop_while_the_handshake_waits_for_the_upstream_does_not_change_its_101() {
         sleep(Duration::from_millis(100)).await;
         // The request is under way: hyper is not told to wind the connection down, or it would add its own
         // `Connection: close` to the 101.
-        rig.ctx.ingress.close();
+        rig.ctx.shared.ingress.close();
         let head = parse_response(&peer.head().await);
         assert_eq!(head.status, 101);
         assert_eq!(head.all("connection"), ["upgrade"]);
@@ -1611,7 +1611,7 @@ fn a_redirect_listener_turns_away_what_the_policy_turns_away_instead_of_redirect
         let (head, body) = answered(&rig, 2, proof).await;
         assert_eq!((head.status, body), (200, b"abc.def".to_vec()));
         assert_eq!(
-            rig.ctx.counters.policy_refusals.samples(),
+            rig.ctx.shared.counters.policy_refusals.samples(),
             [("access", 2), ("rate_limit", 0)]
         );
         let lines = rig.lines.take();
@@ -1644,7 +1644,7 @@ fn a_redirect_listener_turns_away_what_the_policy_turns_away_instead_of_redirect
         let (head, _) = answered(&rig, 2, proof).await;
         assert_eq!(head.status, 200);
         assert_eq!(
-            rig.ctx.counters.policy_refusals.samples(),
+            rig.ctx.shared.counters.policy_refusals.samples(),
             [("access", 0), ("rate_limit", 1)]
         );
         let lines = rig.lines.take();

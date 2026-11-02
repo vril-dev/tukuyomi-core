@@ -50,7 +50,7 @@ fn a_required_route_turns_a_request_away_while_the_queue_has_no_place_for_its_re
             (RouteKeep::Security, 403),
         ] {
             let rig = Rig::with(config(), Mode::Answer(BLOCK), &keeping(records)).await;
-            let log = rig.ctx.log.clone();
+            let log = rig.ctx.shared.log.clone();
             for _ in 0..LOG_QUEUE {
                 log.line("fill");
             }
@@ -60,7 +60,7 @@ fn a_required_route_turns_a_request_away_while_the_queue_has_no_place_for_its_re
             let response = parse_response(&read_all(&client).await);
             assert_eq!(response.status, status, "{records:?}");
             let refused = u64::from(records == RouteKeep::Required);
-            assert_eq!(rig.ctx.counters.records_refused.get(), refused);
+            assert_eq!(rig.ctx.shared.counters.records_refused.get(), refused);
             // The record of the answer found no place, as any record does.
             assert_eq!(log.dropped(), 1, "{records:?}");
             let seen = rig.finish(task).await;
@@ -74,7 +74,7 @@ fn a_request_of_a_required_route_gets_a_place_when_the_queue_is_read_and_its_rec
  {
     run(async {
         let rig = Rig::with(config(), Mode::Answer(BLOCK), &keeping(RouteKeep::Required)).await;
-        let (log, lines) = (rig.ctx.log.clone(), rig.lines.clone());
+        let (log, lines) = (rig.ctx.shared.log.clone(), rig.lines.clone());
         for _ in 0..LOG_QUEUE {
             log.line("fill");
         }
@@ -122,12 +122,12 @@ fn a_request_that_the_lag_of_the_shipper_turns_away_is_counted_and_has_no_record
             sync_ms: None,
             ship: None,
         };
-        rig.ctx.log.watch_ship(&records).unwrap();
+        rig.ctx.shared.log.watch_ship(&records).unwrap();
         let lines = rig.lines.clone();
         let (client, task) = rig.connect().await;
         put(&client, GET).await;
         assert_eq!(parse_response(&read_all(&client).await).status, 503);
-        assert_eq!(rig.ctx.counters.records_refused.get(), 1);
+        assert_eq!(rig.ctx.shared.counters.records_refused.get(), 1);
         rig.finish(task).await;
         let records = lines.take();
         assert!(requests(records.clone()).is_empty(), "{records:?}");
@@ -145,13 +145,13 @@ fn a_request_that_was_let_in_and_is_dropped_before_its_answer_has_a_record_whate
             RouteKeep::Security,
         ] {
             let rig = Rig::with(config(), Mode::Hold, &keeping(records)).await;
-            let (log, lines) = (rig.ctx.log.clone(), rig.lines.clone());
-            let free = rig.ctx.inspect.available_permits();
+            let (log, lines) = (rig.ctx.shared.log.clone(), rig.lines.clone());
+            let free = rig.ctx.shared.inspect.available_permits();
             let (client, task) = rig.connect().await;
             put(&client, GET_OPEN).await;
             // The request is with the inspection, which does not answer; then the client goes away.
             let by = Instant::now() + Duration::from_secs(20);
-            while rig.ctx.inspect.available_permits() == free {
+            while rig.ctx.shared.inspect.available_permits() == free {
                 assert!(
                     Instant::now() < by,
                     "{records:?}: the request did not arrive"

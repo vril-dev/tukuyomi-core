@@ -11,22 +11,24 @@ use flate2::write::GzEncoder;
 use tokio::io::AsyncWrite;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle as Served;
 use tokio::time::{sleep, timeout};
 use tukuyomi_kernel::{Matched, Reason, Verdict};
 
 use super::*;
-use crate::config::{ForwardConfig, RouteConfig};
+use crate::config::{ForwardConfig, Keep, PolicyConfig, ProxyConfig, RouteConfig};
 use crate::inbound::challenge::Challenge;
 use crate::inbound::http1::run as run_session;
-use crate::inbound::session::{serve, serve_on};
+use crate::inbound::session::{RequestIds, serve, serve_on};
 use crate::inbound::transport::tls::Tls;
-use crate::inspect::driver::Outcome;
+use crate::inspect::driver::{Ingress, Outcome};
 use crate::log::counters::Counters;
 use crate::log::{Lines, recording};
+use crate::policy::RateLimit;
 use crate::route::{Rule, Table};
 use crate::rules::bundle::{self, Fingerprint};
-use crate::rules::routes::{Route, Routes};
+use crate::rules::routes::{Route, Routes, SharedRoutes};
 
 pub(in crate::inbound) const FORM: &str = "application/x-www-form-urlencoded";
 const BUDGET: usize = 1 << 20;
@@ -239,22 +241,26 @@ impl Rig {
             PERMITS + 1
         });
         let (log, lines) = recording();
-        let ctx = Arc::new(Ctx {
-            upstreams: Upstreams::new(forward, &cfg),
-            cfg,
+        let shared = Arc::new(Shared {
             budget,
             inspect: Arc::new(Semaphore::new(PERMITS)),
             routes: SharedRoutes::new(Routes::default()),
             log,
             ingress: Arc::new(Ingress::new(tx.clone())),
-            tls,
-            challenge: None,
             ids: RequestIds::new().unwrap(),
             counters: Counters::start(),
-            access: Access::default(),
-            country: None,
-            rate_limit: None,
-            keep: Keep::BestEffort,
+            setup: SharedSetup::new(Setup::new(
+                cfg,
+                forward,
+                tls,
+                None,
+                PolicyConfig::default(),
+                Keep::BestEffort,
+            )),
+        });
+        let ctx = Arc::new(Ctx {
+            setup: shared.setup.current(),
+            shared,
         });
         let (driver, full) = match mode {
             Mode::Answer(outcome) => (Some(driver(rx, Some(outcome))), None),
@@ -278,12 +284,46 @@ impl Rig {
         }
     }
 
-    /// The same rig, answering the challenge of the CA as `challenge` says.
-    pub(in crate::inbound) fn with_challenge(mut self, challenge: Challenge) -> Rig {
-        Arc::get_mut(&mut self.ctx)
-            .expect("no connection has started")
-            .challenge = Some(challenge);
+    /// The same rig, with the setup that `change` makes of this one. No connection has started.
+    fn amended(mut self, change: impl FnOnce(&mut Setup)) -> Rig {
+        let ctx = Arc::try_unwrap(self.ctx).unwrap_or_else(|_| panic!("no connection has started"));
+        let shared =
+            Arc::try_unwrap(ctx.shared).unwrap_or_else(|_| panic!("no connection has started"));
+        let Shared {
+            budget,
+            inspect,
+            routes,
+            log,
+            ingress,
+            ids,
+            counters,
+            setup: current,
+        } = shared;
+        // The shared state held the setup too; with it gone, the context holds the setup alone.
+        drop(current);
+        let mut setup =
+            Arc::try_unwrap(ctx.setup).unwrap_or_else(|_| panic!("no connection has started"));
+        change(&mut setup);
+        let shared = Arc::new(Shared {
+            budget,
+            inspect,
+            routes,
+            log,
+            ingress,
+            ids,
+            counters,
+            setup: SharedSetup::new(setup),
+        });
+        self.ctx = Arc::new(Ctx {
+            setup: shared.setup.current(),
+            shared,
+        });
         self
+    }
+
+    /// The same rig, answering the challenge of the CA as `challenge` says.
+    pub(in crate::inbound) fn with_challenge(self, challenge: Challenge) -> Rig {
+        self.amended(|setup| setup.challenge = Some(challenge))
     }
 
     /// A client connects and the connection is served in the background.
@@ -314,7 +354,7 @@ impl Rig {
             .await
             .expect("the connection ended")
             .unwrap();
-        self.ctx.ingress.close();
+        self.ctx.shared.ingress.close();
         drop(self.tx.take());
         // The driver stops when the last sender is gone. The streams of an HTTP/2 connection are tasks of their own
         // that drop theirs when they next run, so the runtime must not be blocked while it waits.
@@ -332,10 +372,10 @@ impl Rig {
             None => Vec::new(),
         };
         assert_eq!(
-            self.ctx.budget.available_permits(),
-            self.ctx.cfg.max_buffered_bytes
+            self.ctx.shared.budget.available_permits(),
+            self.ctx.setup.cfg.max_buffered_bytes
         );
-        assert_eq!(self.ctx.inspect.available_permits(), PERMITS);
+        assert_eq!(self.ctx.shared.inspect.available_permits(), PERMITS);
         seen
     }
 }
@@ -511,25 +551,25 @@ fn count(samples: &[(&str, u64)], label: &str) -> u64 {
 fn the_counters_have_the_class_the_rule_and_the_reason_of_an_answer() {
     run(async {
         let ctx = counted(BLOCK).await;
-        let requests = ctx.counters.requests.samples();
+        let requests = ctx.shared.counters.requests.samples();
         assert_eq!(count(&requests, "blocked"), 1);
         assert_eq!(requests.iter().map(|&(_, n)| n).sum::<u64>(), 1);
         assert_eq!(
-            ctx.counters.rule_hits.samples(),
+            ctx.shared.counters.rule_hits.samples(),
             [("block", 1), ("detect", 0)]
         );
-        let reasons = ctx.counters.uninspectable.samples();
+        let reasons = ctx.shared.counters.uninspectable.samples();
         assert!(reasons.iter().all(|&(_, n)| n == 0), "{reasons:?}");
 
         // The kernel could not inspect the request: the answer is a failure, and the reason is counted, not a rule.
         let lost = Outcome::Verdict(Verdict::Uninspectable(Reason::InspectorLost));
         let ctx = counted(lost).await;
-        assert_eq!(count(&ctx.counters.requests.samples(), "failed"), 1);
-        let reasons = ctx.counters.uninspectable.samples();
+        assert_eq!(count(&ctx.shared.counters.requests.samples(), "failed"), 1);
+        let reasons = ctx.shared.counters.uninspectable.samples();
         assert_eq!(count(&reasons, "inspector_lost"), 1);
         assert_eq!(reasons.iter().map(|&(_, n)| n).sum::<u64>(), 1);
         assert_eq!(
-            ctx.counters.rule_hits.samples(),
+            ctx.shared.counters.rule_hits.samples(),
             [("block", 0), ("detect", 0)]
         );
     });
@@ -580,10 +620,11 @@ fn the_inspection_is_told_the_client_that_a_trusted_peer_names_and_the_peer_othe
 async fn routed(mode: Mode, used_up: bool, path: &str) -> (u16, Vec<Seen>) {
     let rig = Rig::new(config(), mode).await;
     let table = Routes::new(vec![Route::new(None, "/static/").unwrap()]).unwrap();
-    rig.ctx.routes.replace(table);
+    rig.ctx.shared.routes.replace(table);
     let permits = u32::try_from(PERMITS).unwrap();
     let held = used_up.then(|| {
         rig.ctx
+            .shared
             .inspect
             .clone()
             .try_acquire_many_owned(permits)
@@ -1292,14 +1333,14 @@ use crate::config::RateLimitConfig;
 impl Rig {
     /// The same rig, with this `access` and this `rate_limit` in force.
     pub(in crate::inbound) fn with_policy(
-        mut self,
+        self,
         access: Access,
         rate_limit: Option<RateLimit>,
     ) -> Rig {
-        let ctx = Arc::get_mut(&mut self.ctx).expect("no connection has started");
-        ctx.access = access;
-        ctx.rate_limit = rate_limit;
-        self
+        self.amended(|setup| {
+            setup.access = access;
+            setup.rate_limit = rate_limit;
+        })
     }
 }
 
@@ -1417,12 +1458,15 @@ fn a_client_over_the_rate_limit_gets_429_with_retry_after_and_a_body_that_is_not
         assert_eq!(response.all("retry-after"), ["1"]);
         assert_eq!(response.all("connection"), ["close"]);
 
-        let counters = &rig.ctx.counters;
+        let counters = &rig.ctx.shared.counters;
         assert_eq!(
             counters.policy_refusals.samples(),
             [("access", 0), ("rate_limit", 2)]
         );
-        assert_eq!(rig.ctx.rate_limit.as_ref().map(RateLimit::keys), Some(1));
+        assert_eq!(
+            rig.ctx.setup.rate_limit.as_ref().map(RateLimit::keys),
+            Some(1)
+        );
         let seen = rig.finish(third).await;
         assert_eq!(seen.len(), 1);
         let refused = lines
@@ -1454,7 +1498,7 @@ fn a_request_the_access_of_the_configuration_turns_away_is_recorded_as_rejected_
         drop(client);
         assert!(rig.finish(task).await.is_empty());
         assert_eq!(
-            ctx.counters.policy_refusals.samples(),
+            ctx.shared.counters.policy_refusals.samples(),
             [("access", 1), ("rate_limit", 0)]
         );
         let reasons: Vec<_> = lines
@@ -1481,10 +1525,8 @@ use crate::policy::mmdb::tests::{Record, database};
 
 impl Rig {
     /// The same rig, with this country database.
-    pub(in crate::inbound) fn with_countries(mut self, geo: Geo) -> Rig {
-        let ctx = Arc::get_mut(&mut self.ctx).expect("no connection has started");
-        ctx.country = Some(geo);
-        self
+    pub(in crate::inbound) fn with_countries(self, geo: Geo) -> Rig {
+        self.amended(|setup| setup.country = Some(geo))
     }
 }
 

@@ -96,7 +96,7 @@ async fn serve_ok(sock: TcpStream, seen: Arc<Mutex<Vec<Seen>>>, pause: Duration)
 
 /// The connections that wait for the one server.
 fn idle(ctx: &Ctx) -> usize {
-    ctx.upstreams.group(0).server(0).pool().waiting()
+    ctx.setup.upstreams.group(0).server(0).pool().waiting()
 }
 
 /// A configuration that keeps connections.
@@ -395,7 +395,7 @@ fn a_failure_on_a_waiting_connection_that_is_not_sent_again_does_not_leave_the_s
         let sent = request(&ctx, "POST", &[("Host", "h.test")], b"abc");
         assert_eq!(refused(send(sent, &ctx, far()).await), OriginError::Send);
         // One failure would leave the server out; this one was not counted.
-        let group = ctx.upstreams.group(0);
+        let group = ctx.setup.upstreams.group(0);
         let picked: Vec<usize> = (0..4)
             .filter_map(|_| group.pick(Tried::default(), Instant::now()))
             .collect();

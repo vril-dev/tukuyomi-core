@@ -39,7 +39,7 @@ pub(in crate::inbound) async fn redirect_to(
     accept: Instant,
     https_port: u16,
 ) -> Summary {
-    let cfg = &ctx.cfg;
+    let cfg = &ctx.setup.cfg;
     let (serving, mut gate) =
         Serving::start(sock, peer, local, ctx, listener, accept, Scheme::Http);
     let session = &serving.session;
@@ -49,12 +49,13 @@ pub(in crate::inbound) async fn redirect_to(
     let Some(Taken { head, .. }) = serving.link.take_first() else {
         return serving.refuse(&mut gate, Reject::BadRequest).await;
     };
-    let id = ctx.ids.mint();
+    let id = ctx.shared.ids.mint();
     // The client is found as on the other listeners: the peer, or what a trusted peer says. The policy judges it and
     // every record of the listener names it.
     let client = client_of(&head, peer, &cfg.trusted_proxies);
     // The bytes that are written, and how many of them are the body.
     let (reply, bytes, sent) = match ctx
+        .setup
         .challenge
         .as_ref()
         .and_then(|challenge| challenge.proof(&head))
@@ -66,16 +67,20 @@ pub(in crate::inbound) async fn redirect_to(
         }
         Some(Proof::Missing) => (Reply::answered(404), not_redirected(&id), 0),
         None => match policy::check(
-            &ctx.access,
-            ctx.rate_limit.as_ref(),
-            &ctx.counters,
+            &ctx.setup.access,
+            ctx.setup.rate_limit.as_ref(),
+            &ctx.shared.counters,
             client.ip(),
             country_of(ctx, client.ip()),
         ) {
             Err(refusal) => (Reply::refused(refusal), turned_away(refusal, &id), 0),
             Ok(()) => {
-                let name = host_name(head.host()).filter(|name| ctx.tls.serves(name));
-                let routed = ctx.upstreams.find(head.host(), head.target()).is_some();
+                let name = host_name(head.host()).filter(|name| ctx.setup.tls.serves(name));
+                let routed = ctx
+                    .setup
+                    .upstreams
+                    .find(head.host(), head.target())
+                    .is_some();
                 match name {
                     Some(name) if routed => (
                         Reply::redirected(),

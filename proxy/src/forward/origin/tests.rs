@@ -16,10 +16,9 @@ use tokio::time::{sleep, timeout};
 
 use super::head::{check_head, check_switch};
 use super::*;
-use crate::config::{ForwardConfig, Keep, ProxyConfig};
-use crate::forward::client_ip::Access;
+use crate::config::{ForwardConfig, Keep, PolicyConfig, ProxyConfig};
 use crate::forward::connect::connect_error;
-use crate::forward::group::Upstreams;
+use crate::inbound::conn::{Setup, Shared, SharedSetup};
 use crate::inbound::session::RequestIds;
 use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::Ingress;
@@ -81,22 +80,26 @@ pub(in crate::forward) fn ctx(upstream: SocketAddr, cfg: ProxyConfig) -> Ctx {
 pub(in crate::forward) fn ctx_of(forward: &ForwardConfig, cfg: ProxyConfig) -> Ctx {
     // The forwarding never reaches the driver: nobody receives on this channel.
     let (to_driver, _) = std::sync::mpsc::sync_channel(1);
-    Ctx {
-        upstreams: Upstreams::new(forward, &cfg),
+    let shared = Arc::new(Shared {
         budget: Arc::new(Semaphore::new(cfg.max_buffered_bytes)),
         inspect: Arc::new(Semaphore::new(1)),
         routes: SharedRoutes::new(Routes::default()),
         log: start_logger(Format::Json).unwrap(),
         ingress: Arc::new(Ingress::new(to_driver)),
-        tls: Tls::none(),
-        challenge: None,
         ids: RequestIds::new().unwrap(),
         counters: Counters::start(),
-        access: Access::default(),
-        country: None,
-        rate_limit: None,
-        keep: Keep::BestEffort,
-        cfg,
+        setup: SharedSetup::new(Setup::new(
+            cfg,
+            forward,
+            Tls::none(),
+            None,
+            PolicyConfig::default(),
+            Keep::BestEffort,
+        )),
+    });
+    Ctx {
+        setup: shared.setup.current(),
+        shared,
     }
 }
 
@@ -115,9 +118,15 @@ pub(in crate::forward) fn run<F: Future>(body: F) -> F::Output {
 
 /// Forwards to the one group of `ctx`, and returns what came of it.
 pub(in crate::forward) async fn send(f: Forward, ctx: &Ctx, by: Instant) -> Outcome {
-    forward(f, ctx.upstreams.group(0), &Rewrite::default(), ctx, by)
-        .await
-        .result
+    forward(
+        f,
+        ctx.setup.upstreams.group(0),
+        &Rewrite::default(),
+        ctx,
+        by,
+    )
+    .await
+    .result
 }
 
 /// Far enough away to play no part.
@@ -138,6 +147,7 @@ fn fields(pairs: &[(&str, &str)]) -> HeaderMap {
 
 fn hold(ctx: &Ctx, bytes: &[u8]) -> Arc<BodyHold> {
     let permit = ctx
+        .shared
         .budget
         .clone()
         .try_acquire_many_owned(u32::try_from(bytes.len()).unwrap())
@@ -345,7 +355,7 @@ pub(in crate::forward) async fn collect(mut body: OriginBody) -> (Vec<u8>, usize
 
 async fn budget_back(ctx: &Ctx) {
     timeout(Duration::from_secs(5), async {
-        while ctx.budget.available_permits() != ctx.cfg.max_buffered_bytes {
+        while ctx.shared.budget.available_permits() != ctx.setup.cfg.max_buffered_bytes {
             sleep(Duration::from_millis(10)).await;
         }
     })
@@ -981,7 +991,7 @@ fn a_connection_that_cannot_be_made_goes_on_to_the_next_server_for_any_method() 
             let ctx = ctx_of(&ForwardConfig::of(&[dead, live]), config());
             let sent = forward(
                 bare(&ctx, method),
-                ctx.upstreams.group(0),
+                ctx.setup.upstreams.group(0),
                 &Rewrite::default(),
                 &ctx,
                 far(),
@@ -1003,7 +1013,7 @@ fn a_request_that_was_sent_goes_on_only_if_it_does_no_harm_when_sent_twice() {
             let ctx = ctx_of(&ForwardConfig::of(&[silent, live]), config());
             let sent = forward(
                 bare(&ctx, method),
-                ctx.upstreams.group(0),
+                ctx.setup.upstreams.group(0),
                 &Rewrite::default(),
                 &ctx,
                 far(),
@@ -1036,7 +1046,7 @@ fn each_server_is_tried_once_and_a_group_with_none_to_try_is_unavailable() {
             counts.push(seen);
         }
         let ctx = ctx_of(&ForwardConfig::of(&addresses), config());
-        let group = ctx.upstreams.group(0);
+        let group = ctx.setup.upstreams.group(0);
         let tried = |counts: &[Arc<AtomicUsize>]| -> Vec<usize> {
             counts.iter().map(|c| c.load(Ordering::SeqCst)).collect()
         };
@@ -1100,7 +1110,7 @@ fn gives(group: &Group) -> Vec<usize> {
 async fn held_up(slow: SocketAddr, cfg: ProxyConfig, by: Instant, own: bool) {
     let (live, up) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
     let ctx = ctx_of(&ForwardConfig::of(&[slow, live]), cfg);
-    let group = ctx.upstreams.group(0);
+    let group = ctx.setup.upstreams.group(0);
     let sent = forward(bare(&ctx, "GET"), group, &Rewrite::default(), &ctx, by).await;
     if own {
         assert_eq!(sent.server, Some(live));
@@ -1150,7 +1160,7 @@ fn a_request_time_that_is_used_up_before_the_first_try_asks_no_server_and_is_lat
     run(async {
         let (mute, seen) = mute().await;
         let ctx = ctx_of(&ForwardConfig::of(&[mute]), config());
-        let group = ctx.upstreams.group(0);
+        let group = ctx.setup.upstreams.group(0);
         let sent = forward(
             bare(&ctx, "GET"),
             group,
@@ -1229,7 +1239,7 @@ where
     let (first, _) = upstream(serve).await;
     let (second, _) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
     let ctx = ctx_of(&ForwardConfig::of(&[first, second]), cfg);
-    let group = ctx.upstreams.group(0);
+    let group = ctx.setup.upstreams.group(0);
     let sent = forward(bare(&ctx, "GET"), group, &Rewrite::default(), &ctx, far()).await;
     let went_on = sent.server == Some(second);
     let result = sent.result.map(|response| response.status().as_u16());
@@ -1374,7 +1384,7 @@ fn a_route_with_edits_sends_the_edited_request_and_edits_the_head_of_the_respons
         let ctx = ctx(addr, config());
         let mut f = request(&ctx, "GET", &[("Host", "app.test"), ("X-Drop", "d")], b"");
         f.uri = "/api/x?debug=1&keep=1".parse().unwrap();
-        let group = ctx.upstreams.group(0);
+        let group = ctx.setup.upstreams.group(0);
         let sent = forward(f, group, &edits(), &ctx, far()).await;
         let response = sent.result.unwrap();
         assert_eq!(only(response.headers(), "x-served-by"), [b"edge"]);
@@ -1408,7 +1418,7 @@ fn a_request_whose_edits_cannot_be_made_is_not_sent_and_no_server_is_blamed() {
         f.uri = format!("/{}", "a".repeat(tukuyomi_kernel::limits::URI - 11))
             .parse()
             .unwrap();
-        let group = ctx.upstreams.group(0);
+        let group = ctx.setup.upstreams.group(0);
         let sent = forward(f, group, &rewrite, &ctx, far()).await;
         assert_eq!(sent.server, None);
         assert_eq!(refused(sent.result), OriginError::Send);

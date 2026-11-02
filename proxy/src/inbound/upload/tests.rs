@@ -216,7 +216,7 @@ async fn through(
 ) -> Done {
     let rig = Rig::with(cfg, mode, forward).await;
     if let Some(routes) = routes {
-        rig.ctx.routes.replace(routes);
+        rig.ctx.shared.routes.replace(routes);
     }
     let (client, task) = rig.connect().await;
     put(&client, request).await;
@@ -463,7 +463,7 @@ fn an_upstream_that_reads_the_whole_body_and_never_answers_fails_the_request_aft
             drop(client);
             let lines = rig.lines.clone();
             // The server is blamed, as for a request whose body is held.
-            assert!(rig.ctx.upstreams.group(0).left_out(0));
+            assert!(rig.ctx.setup.upstreams.group(0).left_out(0));
             let _ = rig.finish(task).await;
             assert!(
                 record_with(
@@ -512,7 +512,7 @@ fn a_client_that_is_silent_for_longer_than_the_body_time_between_two_reads_is_cu
         assert_eq!(parse_response(&raw).status, 408);
         drop(client);
         let lines = rig.lines.clone();
-        assert!(!rig.ctx.upstreams.group(0).left_out(0));
+        assert!(!rig.ctx.setup.upstreams.group(0).left_out(0));
         let _ = rig.finish(task).await;
         assert!(record_with(&lines.take(), "rejected", 408, "body not received in time").is_some());
         assert!(!got.await.unwrap().complete);
@@ -542,7 +542,7 @@ fn a_client_that_pauses_for_longer_than_the_silence_of_the_upstream_connection_b
         let raw = read_all(&client).await;
         assert_eq!(parse_response(&raw).status, 200);
         drop(client);
-        assert!(!rig.ctx.upstreams.group(0).left_out(0));
+        assert!(!rig.ctx.setup.upstreams.group(0).left_out(0));
         let _ = rig.finish(task).await;
         let got = got.await.unwrap();
         assert!(got.complete);
@@ -565,7 +565,7 @@ fn a_client_that_goes_away_in_the_middle_of_the_rest_of_the_body_ends_the_reques
         assert!(read_all(&client).await.is_empty());
         drop(client);
         let lines = rig.lines.clone();
-        assert!(!rig.ctx.upstreams.group(0).left_out(0));
+        assert!(!rig.ctx.setup.upstreams.group(0).left_out(0));
         let _ = rig.finish(task).await;
         let lines = lines.take();
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -621,7 +621,7 @@ fn the_end_of_the_request_time_during_the_rest_of_the_body_is_503_and_the_server
         assert_eq!(parse_response(&raw).status, 503);
         drop(client);
         let lines = rig.lines.clone();
-        assert!(!rig.ctx.upstreams.group(0).left_out(0));
+        assert!(!rig.ctx.setup.upstreams.group(0).left_out(0));
         let _ = rig.finish(task).await;
         assert!(record_with(&lines.take(), "failed", 503, "request time used up").is_some());
         assert!(!got.await.unwrap().complete);

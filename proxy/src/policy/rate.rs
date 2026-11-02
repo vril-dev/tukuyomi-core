@@ -29,7 +29,7 @@
 //! 40 bytes, and an entry of the hash map with the room it keeps free), so the table at the most `keys` is about 100
 //! MB.
 //!
-//! The table is behind a `std::sync::Mutex` in the context that the connections share. The runtime of the
+//! The table is behind a `std::sync::Mutex` in the setup that the connections hold. The runtime of the
 //! connections has one thread, so the lock is not contended; it is held for constant work and never across an await.
 
 use std::collections::HashMap;

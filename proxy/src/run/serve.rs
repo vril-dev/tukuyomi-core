@@ -17,16 +17,14 @@ use super::{EXIT_FAILED, control};
 use crate::config::{
     AdminConfig, ForwardConfig, Keep, PolicyConfig, ProxyConfig, StatusConfig, addresses,
 };
-use crate::forward::group::Upstreams;
 use crate::inbound::challenge::Challenge;
-use crate::inbound::conn::Ctx;
+use crate::inbound::conn::{Ctx, Setup, Shared, SharedSetup};
 use crate::inbound::session::{self, RequestIds};
 use crate::inbound::transport::accept::{Acceptor, Arrival};
 use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::{self, Driver, Ingress, Limits, Msg};
 use crate::log::Log;
 use crate::log::counters::{Counters, SwitchResult};
-use crate::policy::RateLimit;
 use crate::rules::bundle::{Fingerprint, Mode};
 use crate::rules::routes::{Routes, SharedRoutes};
 use crate::rules::switch::Switcher;
@@ -116,23 +114,24 @@ pub(super) async fn run(
         state,
     } = driver;
     let mut waits = Waits::new(signals, ready, failed, end);
-    // What the connections share. They take a sender from its handle for every request, and the stop closes it.
-    let ctx = Arc::new(Ctx {
-        cfg: proxy.clone(),
+    // What the connections share. They take a sender from its handle for every request, and the stop closes it. Each
+    // connection takes the setup that is current when it starts.
+    let shared = Arc::new(Shared {
         budget: Arc::new(Semaphore::new(proxy.max_buffered_bytes)),
         inspect: Arc::new(Semaphore::new(wait_queue)),
         routes: routes.clone(),
-        upstreams: Upstreams::new(&forward, &proxy),
         log: log.clone(),
         ingress: Arc::new(Ingress::new(ingress.clone())),
-        tls,
-        challenge,
         ids,
         counters: Counters::start(),
-        access: policy.access,
-        country: policy.country,
-        rate_limit: policy.rate_limit.as_ref().map(RateLimit::new),
-        keep,
+        setup: SharedSetup::new(Setup::new(
+            proxy.clone(),
+            &forward,
+            tls,
+            challenge,
+            policy,
+            keep,
+        )),
     });
     let readiness = Arc::new(Readiness::new());
     if let Some(bound) = control_socket {
@@ -146,12 +145,19 @@ pub(super) async fn run(
         ));
     }
     if let Some(listener) = status_listener {
-        let view = View::new(ctx.clone(), wait_queue, state, readiness.clone());
+        let view = View::new(
+            shared.clone(),
+            wait_queue,
+            proxy.max_buffered_bytes,
+            state,
+            readiness.clone(),
+        );
         waits.status = Some(status::serve(listener, Arc::new(view)));
     }
     let cause = until_stop(
         &mut waits,
-        &ctx,
+        &shared,
+        &proxy,
         &ingress,
         &mut switcher,
         &readiness,
@@ -165,7 +171,7 @@ pub(super) async fn run(
         waits,
         cause,
         ingress,
-        &ctx.ingress,
+        &shared.ingress,
         &proxy,
         kill_grace,
         &log,
@@ -174,16 +180,19 @@ pub(super) async fn run(
 }
 
 /// Waits for the kernel, binds, and accepts until something asks for a stop. Returns that cause. Once the listeners
-/// are bound `readiness` and `notify` say so.
+/// are bound `readiness` and `notify` say so. The wait for the kernel and the number of connections are those of
+/// `proxy`, which hold for the life of the process; the listeners are those of the setup that is current when they
+/// are bound.
 async fn until_stop(
     waits: &mut Waits,
-    ctx: &Arc<Ctx>,
+    shared: &Arc<Shared>,
+    proxy: &ProxyConfig,
     ingress: &SyncSender<Msg>,
     switcher: &mut Switcher,
     readiness: &Readiness,
     notify: &Notify,
 ) -> Cause {
-    let (proxy, log) = (&ctx.cfg, &ctx.log);
+    let log = &shared.log;
     let Some(ready_by) = Instant::now().checked_add(proxy.ready_wait) else {
         return Cause::Late;
     };
@@ -203,11 +212,11 @@ async fn until_stop(
     log.line("start: the kernel is ready");
 
     let permits = Arc::new(Semaphore::new(proxy.max_conns));
-    let acceptor =
-        match Acceptor::bind(&addresses(&proxy.listeners), permits, ctx.ingress.clone()).await {
-            Ok(acceptor) => acceptor,
-            Err(_) => return Cause::Bind,
-        };
+    let listeners = addresses(&shared.setup.current().cfg.listeners);
+    let acceptor = match Acceptor::bind(&listeners, permits, shared.ingress.clone()).await {
+        Ok(acceptor) => acceptor,
+        Err(_) => return Cause::Bind,
+    };
     waits.accept = Some(acceptor);
     readiness.bound();
     log.line("start: listening");
@@ -215,17 +224,17 @@ async fn until_stop(
 
     loop {
         match waits.wait(None).await {
-            Event::Conn(arrival) => spawn_connection(&mut waits.conns, arrival, ctx, log),
+            Event::Conn(arrival) => spawn_connection(&mut waits.conns, arrival, shared, log),
             Event::AcceptErr(Some(errno)) => log.line(&format!("accept: failed, errno {errno}")),
             Event::AcceptErr(None) => log.line("accept: failed"),
             Event::Joined(done) => note_joined(done, log),
-            Event::Reload => reload(waits, switcher, ingress, &ctx.counters, log),
-            Event::Certificates => reload_certificates(ctx),
+            Event::Reload => reload(waits, switcher, ingress, &shared.counters, log),
+            Event::Certificates => reload_certificates(shared, &shared.setup.current()),
             Event::Control(order) => {
-                control_order(order, waits, switcher, ingress, &ctx.counters, log);
+                control_order(order, waits, switcher, ingress, &shared.counters, log);
             }
             Event::Switched(switched) => {
-                ctx.counters.add_switch(if switched {
+                shared.counters.add_switch(if switched {
                     SwitchResult::Switched
                 } else {
                     SwitchResult::Failed
@@ -244,10 +253,10 @@ async fn until_stop(
     }
 }
 
-/// Starts one connection. The permit lives as long as the connection and goes back when it ends or is aborted; so
-/// does the count of the connections that are open.
-fn spawn_connection(conns: &mut JoinSet<()>, arrival: Arrival, ctx: &Arc<Ctx>, log: &Log) {
-    ctx.counters.accepted.add();
+/// Starts one connection, with the setup that is current now, which it keeps to its end. The permit lives as long as
+/// the connection and goes back when it ends or is aborted; so does the count of the connections that are open.
+fn spawn_connection(conns: &mut JoinSet<()>, arrival: Arrival, shared: &Arc<Shared>, log: &Log) {
+    shared.counters.accepted.add();
     let Arrival {
         sock,
         peer,
@@ -261,8 +270,11 @@ fn spawn_connection(conns: &mut JoinSet<()>, arrival: Arrival, ctx: &Arc<Ctx>, l
             return;
         }
     };
-    let ctx = ctx.clone();
-    let counted = ctx.counters.open.count();
+    let ctx = Arc::new(Ctx {
+        shared: shared.clone(),
+        setup: shared.setup.current(),
+    });
+    let counted = shared.counters.open.count();
     conns.spawn(async move {
         let _permit = permit;
         let _counted = counted;

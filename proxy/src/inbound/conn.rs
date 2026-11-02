@@ -70,67 +70,35 @@ use bytes::{Bytes, BytesMut};
 use http::{Response, request::Parts};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tokio::time::{Instant, timeout_at};
 
 use self::fault::{PEER_CLOSED, upstream_stop};
-use crate::config::{Keep, ProxyConfig, STREAM_HOLD, Stream};
-use crate::forward::client_ip::{self, Access, Cidr, Country};
-use crate::forward::group::{Route, Upstreams};
+use crate::config::{STREAM_HOLD, Stream};
+use crate::forward::client_ip::{self, Cidr, Country};
+use crate::forward::group::Route;
 use crate::forward::origin::{self, Forward, OriginBody};
 use crate::forward::tunnel::{self, Record, Tunnel};
 use crate::inbound::answer::{
     Abort, Decision, Keeping, Noted, Out, Passed, Reply, Sizes, Stop, Via, answer, answer_after,
     decide, text,
 };
-use crate::inbound::challenge::{Challenge, Proof};
+use crate::inbound::challenge::Proof;
 use crate::inbound::head::{Head, Reject};
 use crate::inbound::represent::{Represented, gunzip, represent};
-use crate::inbound::session::RequestIds;
 use crate::inbound::transport::io::Gauge;
-use crate::inbound::transport::tls::{Hosts, Tls};
+use crate::inbound::transport::tls::Hosts;
 use crate::inbound::upload::{Fate, Terms, Upload};
-use crate::inspect::driver::{Answer, BodyHold, Hold, Ingress, InspectReq, Judge, Msg, Ticket};
-use crate::log::Log;
-use crate::log::counters::Counters;
-use crate::policy::country::Geo;
-use crate::policy::{self, RateLimit, Refusal};
-use crate::rules::routes::SharedRoutes;
+use crate::inspect::driver::{Answer, BodyHold, Hold, InspectReq, Judge, Msg, Ticket};
+use crate::policy::{self, Refusal};
 
+mod ctx;
 mod fault;
 mod keep;
 
+pub use self::ctx::{Ctx, Setup, Shared, SharedSetup};
 pub(super) use self::fault::peer_gone;
 pub(super) use self::keep::Unanswered;
-
-/// What every connection shares: the configuration, the byte budget of held bodies and of the kernel's copies,
-/// the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves, the
-/// upstream groups with the routes to them and the connections that wait to be used again, the way to the driver,
-/// the TLS of the listeners that end it, the answer to the challenge of the CA, if the configuration has `acme`, the
-/// numbers of the requests, the networks and countries that may not use the proxy at all, the country database if some
-/// list of countries needs one, the rate limit if the configuration has one, what a route does with a request whose
-/// record cannot be kept when it does not say (`records.keep`), and the counters that `/metrics` shows.
-pub struct Ctx {
-    pub cfg: ProxyConfig,
-    pub budget: Arc<Semaphore>,
-    pub inspect: Arc<Semaphore>,
-    pub routes: SharedRoutes,
-    pub upstreams: Upstreams,
-    pub log: Log,
-    pub ingress: Arc<Ingress>,
-    pub tls: Tls,
-    pub challenge: Option<Challenge>,
-    pub ids: RequestIds,
-    pub counters: Counters,
-    /// The `access` of the configuration: asked of every request before its route is looked for.
-    pub access: Access,
-    /// The country database, there if some list of countries of the `access` or of a route needs one.
-    pub country: Option<Geo>,
-    /// The `rate_limit` of the configuration, if it has one.
-    pub rate_limit: Option<RateLimit>,
-    /// What a route without `records` does when the record of a request cannot be kept.
-    pub keep: Keep,
-}
 
 /// How the listener that took a connection carries its requests: over plain HTTP, or over TLS, with the hosts of the
 /// certificate that the handshake used.
@@ -164,7 +132,8 @@ pub(super) fn client_of(head: &Head, peer: SocketAddr, trusted: &[Cidr]) -> Sock
 
 /// The country of the client at `client`, which is `Country::Unknown` if there is no database, for then no list asks.
 pub(super) fn country_of(ctx: &Ctx, client: IpAddr) -> Country {
-    ctx.country
+    ctx.setup
+        .country
         .as_ref()
         .map_or(Country::Unknown, |geo| geo.country(client))
 }
@@ -246,7 +215,7 @@ impl Conn {
         gauge: Gauge,
         request_by: Instant,
     ) -> Conn {
-        let client = client_of(&head, peer, &ctx.cfg.trusted_proxies);
+        let client = client_of(&head, peer, &ctx.setup.cfg.trusted_proxies);
         Conn {
             ctx: ctx.clone(),
             id,
@@ -260,7 +229,7 @@ impl Conn {
             gauge,
             request_by,
             head_end: Instant::now(),
-            ingress: Mutex::new(ctx.ingress.sender()),
+            ingress: Mutex::new(ctx.shared.ingress.sender()),
             read_done: Arc::new(AtomicBool::new(false)),
             via: Mutex::new(None),
             sizes: Mutex::new(None),
@@ -329,7 +298,7 @@ impl Conn {
         if !matches!(self.scheme, Scheme::Http) {
             return None;
         }
-        let proof = self.ctx.challenge.as_ref()?.proof(&self.head)?;
+        let proof = self.ctx.setup.challenge.as_ref()?.proof(&self.head)?;
         self.note_empty_body();
         let (reply, response) = match proof {
             Proof::Found(body) => (
@@ -349,9 +318,10 @@ impl Conn {
     /// Everything up to the response of the upstream, and how the request was let through.
     async fn exchange(&self, parts: Parts, body: Incoming) -> Result<Answered, Stop> {
         let route = self.route()?;
-        let cfg = &self.ctx.cfg;
+        let cfg = &self.ctx.setup.cfg;
         let bypass = self
             .ctx
+            .shared
             .routes
             .current()
             .matches(self.head.host(), self.head.target());
@@ -470,7 +440,7 @@ impl Conn {
     fn record(&self) -> Record {
         let via = self.via.lock().unwrap_or_else(PoisonError::into_inner);
         Record {
-            log: self.ctx.log.clone(),
+            log: self.ctx.shared.log.clone(),
             id: self.request.clone(),
             conn: self.id,
             client: self.client.ip(),
@@ -483,7 +453,7 @@ impl Conn {
     /// the stop has begun no tunnel starts: the handshake goes on as any request does.
     fn websocket<'a>(&self, route: &Route<'a>) -> Option<&'a Stream> {
         route.stream.filter(|stream| {
-            stream.websocket && self.head.websocket() && !self.ctx.ingress.is_closed()
+            stream.websocket && self.head.websocket() && !self.ctx.shared.ingress.is_closed()
         })
     }
 
@@ -501,9 +471,9 @@ impl Conn {
         let client = self.client.ip();
         let ctx = &self.ctx;
         policy::check(
-            &ctx.access,
-            ctx.rate_limit.as_ref(),
-            &ctx.counters,
+            &ctx.setup.access,
+            ctx.setup.rate_limit.as_ref(),
+            &ctx.shared.counters,
             client,
             self.country,
         )
@@ -514,7 +484,7 @@ impl Conn {
         {
             return Err(self.turned_away(421, "host not covered by the certificate"));
         }
-        let upstreams = &self.ctx.upstreams;
+        let upstreams = &self.ctx.setup.upstreams;
         let route = upstreams
             .find(host, target)
             .ok_or_else(|| self.turned_away(404, "no route matches"))?;
@@ -563,7 +533,14 @@ impl Conn {
     fn take(&self, n: usize) -> Result<OwnedSemaphorePermit, Stop> {
         u32::try_from(n)
             .ok()
-            .and_then(|n| self.ctx.budget.clone().try_acquire_many_owned(n).ok())
+            .and_then(|n| {
+                self.ctx
+                    .shared
+                    .budget
+                    .clone()
+                    .try_acquire_many_owned(n)
+                    .ok()
+            })
             .ok_or_else(|| Reply::failed(503, "byte budget exhausted").into())
     }
 
@@ -604,7 +581,7 @@ impl Conn {
         let mut data = BytesMut::with_capacity(declared.min(keep));
         let mut rest = Bytes::new();
         let mut ended = false;
-        let by = stage(self.head_end, self.ctx.cfg.body_read, self.request_by);
+        let by = stage(self.head_end, self.ctx.setup.cfg.body_read, self.request_by);
         loop {
             if goes_on && data.len() == keep {
                 break;
@@ -669,7 +646,7 @@ impl Conn {
         let terms = Terms {
             length: self.head.content_length(),
             max: u64::try_from(limit).unwrap_or(u64::MAX),
-            gap: self.ctx.cfg.body_read,
+            gap: self.ctx.setup.cfg.body_read,
             by: self.request_by,
         };
         let held = u64::try_from(data.len()).unwrap_or(u64::MAX);
@@ -743,6 +720,7 @@ impl Conn {
     ) -> Result<Passed, Stop> {
         let permit = self
             .ctx
+            .shared
             .inspect
             .clone()
             .try_acquire_owned()
@@ -779,7 +757,11 @@ impl Conn {
             }
         }
         drop(sender);
-        let by = stage(Instant::now(), self.ctx.cfg.inspect_wait, self.request_by);
+        let by = stage(
+            Instant::now(),
+            self.ctx.setup.cfg.inspect_wait,
+            self.request_by,
+        );
         let Answer { outcome, by } = match timeout_at(by, verdict).await {
             Err(_) => return Err(Reply::failed(503, "inspection wait expired").into()),
             Ok(Err(_)) => return Err(Reply::failed(503, "inspection driver gone").into()),

@@ -292,7 +292,7 @@ fn a_server_whose_handshake_fails_is_a_failed_server_that_is_counted_and_the_req
             let ctx = ctx_of(&both, config());
             let sent = forward(
                 bare(&ctx, "GET"),
-                ctx.upstreams.group(0),
+                ctx.setup.upstreams.group(0),
                 &Rewrite::default(),
                 &ctx,
                 far(),
@@ -377,7 +377,7 @@ fn a_group_without_tls_speaks_plain_and_a_group_with_it_speaks_tls() {
 async fn forward_to(ctx: &Ctx, group: usize) -> http::Response<OriginBody> {
     let sent = forward(
         bare(ctx, "GET"),
-        ctx.upstreams.group(group),
+        ctx.setup.upstreams.group(group),
         &Rewrite::default(),
         ctx,
         far(),

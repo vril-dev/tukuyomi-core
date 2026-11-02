@@ -36,7 +36,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 use tukuyomi_kernel::Phase;
 
-use crate::inbound::conn::Ctx;
+use crate::inbound::conn::Shared;
 use crate::inbound::session::send_and_close;
 use crate::inspect::driver::State;
 use crate::policy::RateLimit;
@@ -107,26 +107,31 @@ pub(super) trait Source: Send + Sync + 'static {
     fn metrics(&self) -> String;
 }
 
-/// What the proxy shares with the listener: the connections' context, the state that the driver publishes and what
-/// the main side says.
+/// What the proxy shares with the listener: what the connections share, the state that the driver publishes and what
+/// the main side says. The numbers that depend on the setup are read from the setup that is current when the page is
+/// made.
 pub(super) struct View {
-    ctx: Arc<Ctx>,
-    /// The inspection permits `ctx` holds were made for this many waiting inspections.
+    shared: Arc<Shared>,
+    /// The inspection permits `shared` holds were made for this many waiting inspections.
     wait_queue: usize,
+    /// The byte budget `shared` holds was made for this many bytes.
+    max_buffered_bytes: usize,
     state: watch::Receiver<State>,
     readiness: Arc<Readiness>,
 }
 
 impl View {
     pub(super) fn new(
-        ctx: Arc<Ctx>,
+        shared: Arc<Shared>,
         wait_queue: usize,
+        max_buffered_bytes: usize,
         state: watch::Receiver<State>,
         readiness: Arc<Readiness>,
     ) -> View {
         View {
-            ctx,
+            shared,
             wait_queue,
+            max_buffered_bytes,
             state,
             readiness,
         }
@@ -140,29 +145,29 @@ impl Source for View {
     }
 
     fn metrics(&self) -> String {
-        let ctx = &self.ctx;
+        let shared = &self.shared;
+        let setup = shared.setup.current();
         let state = *self.state.borrow();
         metrics::render(&metrics::Scrape {
-            counters: &ctx.counters,
+            counters: &shared.counters,
             state,
-            connections_open: ctx.counters.open.get(),
-            permit_waits: ctx.ingress.drains(),
-            body_buffer_bytes: ctx
-                .cfg
+            connections_open: shared.counters.open.get(),
+            permit_waits: shared.ingress.drains(),
+            body_buffer_bytes: self
                 .max_buffered_bytes
-                .saturating_sub(ctx.budget.available_permits()),
+                .saturating_sub(shared.budget.available_permits()),
             inspections_waiting: self
                 .wait_queue
-                .saturating_sub(ctx.inspect.available_permits()),
-            upstream_failures: ctx.upstreams.failures().collect(),
-            rate_limit_keys: ctx.rate_limit.as_ref().map_or(0, RateLimit::keys),
-            rate_limit_evicted: ctx.rate_limit.as_ref().map_or(0, RateLimit::evicted),
-            records_dropped: ctx.log.dropped(),
-            record_write_errors: ctx.log.write_errors(),
-            record_file_errors: ctx.log.file_errors(),
-            records_healthy: ctx.log.healthy(),
-            records_admitting: ctx.log.admitting(),
-            records_unshipped: ctx.log.unshipped(),
+                .saturating_sub(shared.inspect.available_permits()),
+            upstream_failures: setup.upstreams.failures().collect(),
+            rate_limit_keys: setup.rate_limit.as_ref().map_or(0, RateLimit::keys),
+            rate_limit_evicted: setup.rate_limit.as_ref().map_or(0, RateLimit::evicted),
+            records_dropped: shared.log.dropped(),
+            record_write_errors: shared.log.write_errors(),
+            record_file_errors: shared.log.file_errors(),
+            records_healthy: shared.log.healthy(),
+            records_admitting: shared.log.admitting(),
+            records_unshipped: shared.log.unshipped(),
         })
     }
 }

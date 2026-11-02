@@ -247,7 +247,7 @@ pub(in crate::inbound) async fn run<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let cfg = &ctx.cfg;
+    let cfg = &ctx.setup.cfg;
     let head_by = first_head_by(cfg, accept);
     let (mut watch, gauge) = Watch::new(
         stream,
@@ -310,7 +310,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let ctx = &session.ctx;
-    let cfg = &ctx.cfg;
+    let cfg = &ctx.setup.cfg;
     let service = {
         let (session, life) = (session.clone(), life.clone());
         let limits = Limits {
@@ -319,10 +319,10 @@ where
         };
         service_fn(move |req: Request<Incoming>| {
             // A stream that begins too late has no guard, and `request` turns it away.
-            let guard = life.enter(&session.ctx.cfg, session.accept);
+            let guard = life.enter(&session.ctx.setup.cfg, session.accept);
             Watched {
                 inner: Box::pin(request(session.clone(), limits, req, guard)),
-                log: session.ctx.log.clone(),
+                log: session.ctx.shared.log.clone(),
                 id: session.id,
             }
         })
@@ -341,10 +341,10 @@ where
         .auto_date_header(true)
         .max_pending_accept_reset_streams(PENDING_RESETS)
         .max_local_error_reset_streams(LOCAL_ERROR_RESETS);
-    let mut stop = ctx.ingress.watch();
+    let mut stop = ctx.shared.ingress.watch();
     let mut changed = pin!(stop.changed());
     // A call to drain the connections: it counts only if none of the streams of this one is open.
-    let mut calls = ctx.ingress.drained();
+    let mut calls = ctx.shared.ingress.drained();
     let idle = life.clone();
     let mut drained = pin!(async move {
         loop {
@@ -358,7 +358,7 @@ where
     let mut conn = pin!(server.serve_connection(TokioIo::new(&mut *watch), service));
     // The connection is wound down once, and `life.told` has the instant. A stop that began before this is not seen
     // by `changed`.
-    let mut down = ctx.ingress.is_closed();
+    let mut down = ctx.shared.ingress.is_closed();
     let mut by = session.conn_by();
     let mut limit = pin!(sleep_until(by));
     let mut wait = pin!(sleep_until(by));
@@ -459,7 +459,7 @@ async fn request(
         Ok(head) => head,
         Err(reject) => {
             let reply = Reply::of(reject);
-            let noted = Noted::new(session.ctx.ids.mint(), reply, session.peer.ip());
+            let noted = Noted::new(session.ctx.shared.ids.mint(), reply, session.peer.ip());
             return Ok(session.track(noted, answer(reply.status), start, guard));
         }
     };

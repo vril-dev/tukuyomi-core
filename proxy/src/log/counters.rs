@@ -198,8 +198,8 @@ impl<const N: usize> Family<N> {
     }
 }
 
-/// Everything the process counts for `/metrics`. Shared by the connections (through `Ctx`), the signal handlers and the
-/// status listener; every number is read and written one at a time.
+/// Everything the process counts for `/metrics`. Shared by the connections (through `Shared`), the signal handlers and
+/// the status listener; every number is read and written one at a time.
 pub struct Counters {
     /// The requests that were answered, by `class` of their record.
     pub requests: Family<7>,

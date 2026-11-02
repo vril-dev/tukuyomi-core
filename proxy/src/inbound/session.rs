@@ -186,7 +186,7 @@ pub async fn serve_on(
     ctx: Arc<Ctx>,
     listener: usize,
 ) {
-    match ctx.cfg.listeners.get(listener).map(|l| &l.kind) {
+    match ctx.setup.cfg.listeners.get(listener).map(|l| &l.kind) {
         Some(ListenerKind::Plain) => serve(sock, peer, local, ctx, listener).await,
         Some(ListenerKind::Tls(tls)) => {
             let http2 = tls.http2;
@@ -224,9 +224,14 @@ async fn serve_tls(
     http2: Option<Http2Config>,
 ) {
     let accept = Instant::now();
-    let summary = match ctx.tls.handshake(listener) {
+    let summary = match ctx.setup.tls.handshake(listener) {
         Some(handshake) => {
-            match timeout_at(first_head_by(&ctx.cfg, accept), handshake.accept(sock)).await {
+            match timeout_at(
+                first_head_by(&ctx.setup.cfg, accept),
+                handshake.accept(sock),
+            )
+            .await
+            {
                 Ok(Ok((stream, hosts))) => {
                     let h2 = stream.get_ref().1.alpn_protocol() == Some(&b"h2"[..]);
                     match (h2, http2) {
@@ -242,11 +247,11 @@ async fn serve_tls(
                     }
                 }
                 Ok(Err(_)) => {
-                    ctx.counters.tls_failures.add();
+                    ctx.shared.counters.tls_failures.add();
                     Summary::unserved("tls handshake failed")
                 }
                 Err(_) => {
-                    ctx.counters.tls_failures.add();
+                    ctx.shared.counters.tls_failures.add();
                     Summary::unserved("tls handshake not finished in time")
                 }
             }
@@ -273,7 +278,7 @@ async fn serve_redirect(
 /// The record of the type `connection` that the end of a connection adds, if it has to.
 fn finish(ctx: &Ctx, summary: Summary, accept: Instant, peer: SocketAddr, listener: usize) {
     if let Some(reply) = summary.line {
-        ctx.log.record(Record::Connection(Connection {
+        ctx.shared.log.record(Record::Connection(Connection {
             conn: summary.id,
             listener,
             client: peer.ip(),
@@ -320,7 +325,7 @@ impl Session {
             accept,
             listener,
             proto,
-            conn_by: Mutex::new(after(accept, ctx.cfg.conn_total)),
+            conn_by: Mutex::new(after(accept, ctx.setup.cfg.conn_total)),
             gauge,
             recorded: AtomicU64::new(0),
             #[cfg(test)]
@@ -337,13 +342,13 @@ impl Session {
         Conn::new(
             &self.ctx,
             self.id,
-            self.ctx.ids.mint(),
+            self.ctx.shared.ids.mint(),
             head,
             self.peer,
             self.local,
             self.scheme.clone(),
             self.gauge.clone(),
-            after(start, self.ctx.cfg.request_total),
+            after(start, self.ctx.setup.cfg.request_total),
         )
     }
 
@@ -358,7 +363,7 @@ impl Session {
             *conn_by = (*conn_by).max(by);
         }
         self.gauge
-            .restart(stream.total.max(self.ctx.cfg.conn_total));
+            .restart(stream.total.max(self.ctx.setup.cfg.conn_total));
     }
 
     /// The response as it goes to hyper, with exactly one `X-Request-ID` field, the number of its request (also in
@@ -404,7 +409,7 @@ impl Session {
             *lock(&self.last) = reply;
         }
         // The counters are added before the record is queued, so a record that has been seen is counted.
-        let counters = &self.ctx.counters;
+        let counters = &self.ctx.shared.counters;
         counters.add_request(reply.class.name());
         if let Some(hit) = reply.hit() {
             counters.add_rule_hit(hit);
@@ -413,7 +418,7 @@ impl Session {
             counters.add_uninspectable(reason);
         }
         if reply.internal {
-            self.ctx.log.line(&format!(
+            self.ctx.shared.log.line(&format!(
                 "conn {}: internal fault: {}",
                 self.id, reply.reason
             ));
@@ -450,8 +455,8 @@ impl Session {
             sent,
         }));
         match keeping.seat {
-            Some(seat) => self.ctx.log.record_in(seat, record),
-            None => self.ctx.log.record(record),
+            Some(seat) => self.ctx.shared.log.record_in(seat, record),
+            None => self.ctx.shared.log.record(record),
         }
     }
 

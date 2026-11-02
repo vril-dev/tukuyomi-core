@@ -551,7 +551,7 @@ fn the_stop_winds_the_connection_down() {
         wire.until(|f| f.kind == HEADERS && f.stream == 1)
             .await
             .expect("an answer");
-        rig.ctx.ingress.close();
+        rig.ctx.shared.ingress.close();
         let goaway = wire.until(|f| f.kind == GOAWAY).await.expect("a goaway");
         assert_eq!(error_code(&goaway), 0);
         assert!(wire.until(|_| false).await.is_none());

@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 
 use super::control::{Answer, Order, Outcome};
 use super::signals::Waits;
-use crate::inbound::conn::Ctx;
+use crate::inbound::conn::{Setup, Shared};
 use crate::inbound::transport::tls::Files;
 use crate::inspect::driver::{Msg, Switch};
 use crate::log::Log;
@@ -161,22 +161,24 @@ fn answer_status(waits: &Waits, reply: oneshot::Sender<Answer>) {
     }
 }
 
-/// SIGUSR2: reads the certificate and key files of the TLS listeners again. They all replace the ones in use, or none
-/// does; the result is a record line, and the proxy goes on as it is.
-pub(super) fn reload_certificates(ctx: &Ctx) {
-    ctx.log.line("reload: SIGUSR2");
-    match ctx.tls.reload(&ctx.cfg.listeners, &Files) {
+/// SIGUSR2: reads the certificate and key files of the TLS listeners of `setup`, the one that is current, again. They
+/// all replace the ones in use, or none does; the result is a record line, and the proxy goes on as it is.
+pub(super) fn reload_certificates(shared: &Shared, setup: &Setup) {
+    shared.log.line("reload: SIGUSR2");
+    match setup.tls.reload(&setup.cfg.listeners, &Files) {
         Ok(()) => {
-            ctx.counters.add_reload(ReloadResult::Replaced);
-            ctx.log.line("reload: certificates replaced");
-            for place in ctx.tls.waiting() {
-                ctx.log
+            shared.counters.add_reload(ReloadResult::Replaced);
+            shared.log.line("reload: certificates replaced");
+            for place in setup.tls.waiting() {
+                shared
+                    .log
                     .line(&format!("reload: tls certificate not issued yet ({place})"));
             }
         }
         Err(refusal) => {
-            ctx.counters.add_reload(ReloadResult::Refused);
-            ctx.log
+            shared.counters.add_reload(ReloadResult::Refused);
+            shared
+                .log
                 .line(&format!("reload: certificates refused: {refusal}"));
         }
     }

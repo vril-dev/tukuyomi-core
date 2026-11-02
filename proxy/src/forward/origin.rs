@@ -332,7 +332,7 @@ pub async fn forward(
     ctx: &Ctx,
     by: Instant,
 ) -> Dispatched {
-    let cfg = &ctx.cfg;
+    let cfg = &ctx.setup.cfg;
     let Forward {
         method,
         uri,
