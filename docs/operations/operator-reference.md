@@ -61,6 +61,7 @@ tukuyomi-proxy config check <config>
   - 記録のファイルを開けること（上の 6）
   - 待ち受けと監視の待ち受けの port、制御 socket を bind できること
   - systemd の設定
+  - 動いている proxy が SIGHUP の読み直しで断る理由（動いている間に変えられない鍵の違い、新しい待ち受けの bind。下の「SIGHUP（設定の読み直し）」）
 - この命令が書くものは1つだけである。起動と同じく、選んだ世代を使う印を保管場所の `using/` に作る（まだ無いとき）。命令が終われば、印の lock は外れる。
 - サービスと同じ利用者で流す。別の利用者では、保管場所の持ち主の確かめや、鍵のファイルの読みで断られる。
 
@@ -130,7 +131,7 @@ tukuyomi-proxy acme renew <config>
   - `failed` の証明書は、ファイルを前のまま残す。
 - CA から受けたものは、問題の文書の `type` だけを記録に出す。
 - SIGINT と SIGTERM で、challenge のファイルを消してすぐ終わる。
-- 動いている proxy は、新しい証明書に気づかない。命令の後に SIGUSR2 を送る（`systemctl reload`）。
+- 動いている proxy は、新しい証明書に気づかない。命令の後に SIGUSR2 を送る（`systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`）。
 - exit code は次のとおりである。
   - 0: すべてが `renewed` か `valid`
   - 1: 1つでも `failed`、止められた、流せない、root で流した
@@ -154,13 +155,51 @@ tukuyomi-proxy admin reset <config> <name>
 
 ## 合図
 
-合図は proxy の主プロセスだけに送る。検査プロセスは、SIGUSR1・SIGUSR2 は無視するが、SIGTERM・SIGINT・SIGHUP が届くと終わる。systemd では `systemctl reload`（unit の `ExecReload` が主プロセスに SIGUSR2 を送るとき）か `systemctl kill --kill-whom=main` を使う。
+合図は proxy の主プロセスだけに送る。検査プロセスは、SIGUSR1・SIGUSR2 は無視するが、SIGTERM・SIGINT・SIGHUP が届くと終わる。systemd では `systemctl reload`（unit の `ExecReload` が `config check` の後に主プロセスへ SIGHUP を送るとき）か `systemctl kill --kill-whom=main` を使う。
 
 | 合図 | すること |
 |---|---|
-| SIGTERM、SIGINT、SIGHUP | 止まる（下の「停止」） |
+| SIGTERM、SIGINT | 止まる（下の「停止」） |
+| SIGHUP | 設定ファイルを読み直し、止まらずに新しい設定に替える |
 | SIGUSR1 | ルールの保管場所が今選んでいる世代へ切り替える |
 | SIGUSR2 | すべての TLS の待ち受けの証明書と鍵のファイルを読み直す |
+
+SIGHUP で止まる前の版から入れ替えるときは、新しい実行ファイルを入れてから unit を替える（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。前の版は SIGHUP で止まる。
+
+### SIGHUP（設定の読み直し）
+
+- 起動のときと同じ path の設定ファイルを、別の thread で読み直す。起動の段のうち、ルールの保管場所より前の段（設定、上流の server の名前の解決と `ca_file`、待ち受けの証明書と鍵、ACME の challenge、`geo` の国のデータベース）を同じ確かめで流し、行の頭は `reload:` になる。
+- すべてが通り、動いている間に変えられない鍵（下）がどれも起動のときと同じなら、新しい設定に一度に替える。最後に `reload: configuration replaced <ファイルの SHA-256>` の文を出す。どのファイルが効いているかは、この SHA-256 で確かめる。
+- どこかで断られたら、何も替えず、理由の文を出す（`reload: configuration refused: <理由>`、`reload: upstream refused: <理由>`、`reload: tls refused: <理由>` など）。断った文に、ファイルの値は出さない。
+- 通っても断っても、`tukuyomi_config_reloads_total` に数える（`replaced`、`refused`）。
+- 替わるもの:
+  - `proxy` の鍵（下の変えられない鍵を除く）、待ち受け（足す、外す、並べ替える、TLS と証明書、`http2`、`redirect`）
+  - `forward`（上流の組と経路）。上流の server の名前は、読み直すたびに引き直す
+  - 上流の組の `ca_file`、待ち受けの証明書と鍵、ACME の challenge
+  - 全体の `access`・`rate_limit`・`geo`（国のデータベースを読み直す）
+  - `records.keep`
+- 動いている間に変えられない鍵: `proxy.max_conns`、`max_buffered_bytes`、`drive_slice_ms`、`ready_wait_ms`、`stop_inspect_ms`、`stop_wait_ms`、`records`（`keep` を除く全部と、有る無し）、`status`、`admin`、`rules.store`、`kernel`（全部）。どれかが起動のときと違う設定は、全体を断る（`reload: configuration refused: <鍵> cannot change while running`）。替えるときは起動し直す。
+  - `records`・`status`・`admin`・`rules.store`・`kernel` は、管理のプロセスと記録の送り手も同じファイルから起動のときに読むので、proxy だけが替えると値がずれる。
+- 接続:
+  - 替えた後に受けた接続は、新しい設定を使う。開いている接続は、受けたときの設定を使い続け、次のように閉じる。要求は断らない。
+  - HTTP/1.1: 答えた後で次の要求を待っている接続は、すぐ閉じる。答えの途中の接続は、その答えに `Connection: close` を付けて閉じる。受けたばかりの接続と、次の要求の head を受けかけの接続は、その要求に答えてから閉じる。
+  - HTTP/2: `GOAWAY` を送り、開いている stream が終わってから閉じる。
+  - WebSocket の tunnel と、経路の `stream` の答えは、前の設定のまま自分の期限まで続く。
+- 待ち受け:
+  - 新しい設定の address のうち、今は待っていないものを、替える前にすべて bind する。1つでも bind できなければ、全体を断る（`reload: configuration refused: listener <番号> cannot be bound`。番号は新しい設定の中の位置で、1 から数える）。
+  - 今もある address は、同じ socket のまま新しい並びの位置へ移る。その address への接続は断られない。
+  - 消えた address は、替えた後に閉じる。そこでまだ始まっていない接続（system の backlog にあるもの、接続の枠を待っているもの）は切れる。開いている接続は上のとおり続く。
+  - 今待っている address と重なる address は bind できず、全体を断る。たとえば `0.0.0.0:8080` で待っているときの `127.0.0.1:8080`（逆も同じ）、`127.0.0.1:8080` のときの `[::ffff:127.0.0.1]:8080` である。替えるときは、外す読み直しと足す読み直しに分けるか、起動し直す。
+  - 記録の `listener` は、その接続を受けたときの設定の中の番号である。並びを替えた後は、同じ番号が別の待ち受けを指すことがある。
+- 持ち越すもの:
+  - 流量の制限の表は、新旧の両方に `rate_limit` があり、`keys`・`rate`・`burst` がどれも同じなら続く（`exempt_cidrs` は新しい値を使う）。どれかが違うか、片方に無ければ、新しい表で 0 から数え、`reload: rate limit table started anew` の文を出す。
+  - 上流の組の外れの印と失敗の数、上流への待機中の接続、待ち受けの TLS の session は作り直す。`tukuyomi_upstream_failures_total` は 0 から数え直す。
+  - ルールの世代には触れない。動いている世代はそのままで、保管場所も読まない（世代を替えるのは SIGUSR1）。
+- 同じ中身のファイルでも、上のとおり作り直し、待っている接続を閉じる。
+- 読み直しの途中に受けた SIGHUP は、`reload: a configuration reload is in progress, ignored` の文を出すだけである。合図の処理が入ってから待ち受けを bind するまでの間と、停止の間に受けた SIGHUP も、文を1つ出すだけである。
+- 読み直しの途中に受けた SIGUSR2 は、読み直しが終わった後（替えたときも断ったときも）に、今の設定の証明書を読む。`reload: SIGUSR2` の文は、そのときに出る。
+- 読み直しの途中に停止が始まったら、読み直しは捨てる。
+- SIGHUP の処理が入る前（起動の 6 より前）に届いた SIGHUP は、ほかの合図と同じく proxy を終わらせる。
 
 ### SIGUSR1（世代の切り替え）
 
@@ -180,20 +219,16 @@ tukuyomi-proxy admin reset <config> <name>
 - 読み直したすべての証明書と鍵が確かめに通ったときだけ、まとめて入れ替える（確かめの中身は下の `proxy.listeners` の `cert_file`・`key_file`）。入れ替えた後に始まる handshake から、新しいものを使う。開いている接続は、今のものを使い続ける。
 - 1つでも通らなければ、どれも入れ替えず、どれが通らなかったかの文を記録に出す。
 - `acme` を持つ証明書でファイルが無いものは、断る理由にならない。行を出して handshake から外し、ファイルができた後の SIGUSR2 で使い始める。動いている間にファイルを消してから SIGUSR2 を送ると、その証明書も handshake から外れ、その host への接続は失敗する。
-- 上流の組の CA のファイルは、SIGUSR2 では読み直さない。
+- 上流の組の CA のファイルは、SIGUSR2 では読み直さない（SIGHUP で読み直す）。
+- 証明書と鍵だけを読ませたいとき（ACME の更新の後など）は、SIGHUP でなく SIGUSR2 を送る。SIGHUP は設定ファイル全体を読むので、書きかけの設定を拾うことがある。
 - 合図の処理が入ってから待ち受けを bind するまでの間と、停止の間に受けた SIGUSR2 は、記録に文を1つ出すだけである。SIGUSR1 とは関係しない。
 
 ### 読み直さないもの
 
 次のものは起動のときに読み、proxy を起動し直すまでそのままである。
 
-- 上流の組と経路（設定の `forward`）
-- 上流の server の名前を引いた address
-- 上流の組の CA のファイル
-- 待ち受けと、その証明書の host
-- 全体の `access`・`rate_limit`・`geo`（`geo` で読んだ国のデータベースを含む）。流量の制限が数えた client は、起動し直すと 0 から数え直す
-- `records`（記録のファイルの場所と大きさ）
-- `admin`（制御 socket の path を含む）
+- 上の「SIGHUP（設定の読み直し）」の、動いている間に変えられない鍵（`records` の場所と大きさ、`status`、`admin` の制御 socket の path、`rules.store`、`kernel` など）
+- 管理のプロセスと記録の送り手は、設定を読み直さない（どちらも SIGHUP では止まる）。設定を替えたら、それらは起動し直す（[管理リファレンス](admin-reference.md)、下の「記録の送り手」）。
 
 ## 停止
 
@@ -419,12 +454,12 @@ TLS の待ち受け（HTTP/2 と ACME の証明書）、https への redirect �
 |---|---|---|
 | `min_version` | `"1.2"`、`"1.3"` | 受ける TLS の最も古い版。TLS 1.3 はいつも受ける |
 | `certificates` | 1〜16 個 | `{"cert_file", "key_file", "hosts", "acme"?}` |
-| `cert_file`、`key_file` | 絶対の path、3840 バイトまで | 証明書の chain と秘密鍵のファイル。起動のときと SIGUSR2 で読む |
+| `cert_file`、`key_file` | 絶対の path、3840 バイトまで | 証明書の chain と秘密鍵のファイル。起動のとき、SIGHUP と SIGUSR2 で読む |
 | `hosts` | 1〜64 個 | 証明書が受け持つ名前（小文字の英字・数字・`-`・`.`）か、`*.` と名前。IP の literal は書けない。1つの待ち受けの中で同じ host は1回だけ |
 | `acme` | `{"renew_before_days"}`（1〜60） | `acme renew` で発行・更新する証明書の印。host に `*.` は書けない。ファイルは起動のときに無くてもよい |
 | `http2` | object | HTTP/2 を受ける（下の `http2`）。無ければ HTTP/1.1 だけ |
 
-- `cert_file` と `key_file` は、起動のときと SIGUSR2 で、次を確かめる。
+- `cert_file` と `key_file` は、起動のとき、SIGHUP と SIGUSR2 で、次を確かめる。
   - どちらも 1 MiB までの普通のファイルである。
   - 証明書のファイルは PEM の証明書を 1〜10 枚持ち、先頭が host の証明書である。鍵のファイルは鍵をちょうど1つ持つ。
   - 鍵が先頭の証明書と対になり、先頭の証明書が `hosts` のすべてを受け持つ。
@@ -469,7 +504,7 @@ TLS の待ち受け（HTTP/2 と ACME の証明書）、https への redirect �
 
 | 鍵 | 範囲 | 意味 |
 |---|---|---|
-| `resolve_timeout_ms` | 1 ms〜3600 s | 起動のときに、上流の server の名前を引き終える時間 |
+| `resolve_timeout_ms` | 1 ms〜3600 s | 起動のときと SIGHUP の読み直しで、上流の server の名前を引き終える時間 |
 | `upstreams` | 1〜64 組 | 組の名前（1〜64 文字の英字・数字・`-`・`_`）から `{"servers", "tls"?}` へ |
 | `routes` | 0〜1024 個 | 要求の `Host` と path から組を選ぶ経路 |
 | `default_upstream` | 組の名前か空の文字列 | どの経路にも当たらない要求の組。空なら、そうした要求は 404 |
@@ -484,10 +519,10 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 | `fail_timeout_ms` | 1 ms〜3600 s | 上の失敗を数える時間と、外す時間 |
 | `backup` | true、false | ほかのどの server も使えないときだけ使う |
 
-- 名前は起動のときに1回だけ引き、その後は引き直さない（SIGUSR1 でも引き直さない）。
-  - 名前の address が変わったら（コンテナの名前など）、proxy の起動し直しが要る。
+- 名前は起動のときと SIGHUP の読み直しのたびに引き、その間は引き直さない（SIGUSR1 でも引き直さない）。
+  - 名前の address が変わったら（コンテナの名前など）、SIGHUP で読み直す。
   - 名前の address はどれも、書いた server と同じ値を持つ、組の server になる。名前を引いた後で、組の server は 64 個までである。
-  - 名前が引けないとき、address が無いとき、未指定・multicast・待ち受けの address を指すとき、時間の中に引き終わらないときは、起動しない。
+  - 名前が引けないとき、address が無いとき、未指定・multicast・待ち受けの address を指すとき、時間の中に引き終わらないときは、起動しない。SIGHUP の読み直しでは、その設定を断る。
 - server は、使える server の中から、重みに合わせて順に選ぶ（smooth weighted round robin）。
 - 組の server が1つだけなら、外さない。組のどの server も使えないときは、何も試さずに 502 にする。
 - 次のときは、server の失敗として数える。
@@ -506,7 +541,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 組の `tls` は `{"ca_file", "server_name"?}` である。
 
 - 組のすべての server へ、TLS でつなぐ。server の証明書は必ず確かめ、確かめを外す設定は無い。
-- `ca_file` は、信じる root の証明書を持つ PEM のファイルである。絶対の path で 3840 バイトまで、ファイルは 1 MiB までで、1〜100 枚を持つ。起動のときに1回だけ読む。
+- `ca_file` は、信じる root の証明書を持つ PEM のファイルである。絶対の path で 3840 バイトまで、ファイルは 1 MiB までで、1〜100 枚を持つ。起動のときと SIGHUP の読み直しで読む（SIGUSR2 では読まない）。
 - `server_name` は、小文字の名前で、TLS が使える形であること。あれば、server をその名前で確かめる。無ければ、書いた名前で確かめる。IP の literal で書いた server は、その address で確かめる。
 - 上流へは TLS 1.2 と 1.3 で、ALPN は `http/1.1` だけである（上流へ HTTP/2 は話さない）。client の証明書は送らない。
 
@@ -972,7 +1007,7 @@ proxy が返すすべての応答（上流の応答、遮断、head の拒否、
 
 ## 要求の前の方針
 
-設定ファイルの最上位の `access`、`rate_limit`、`geo` は、経路を探す前に要求を断る方針を決める。3つとも省いてよく、省いた方針は無い。値は起動のときに読み、proxy を起動し直すまで変わらない。
+設定ファイルの最上位の `access`、`rate_limit`、`geo` は、経路を探す前に要求を断る方針を決める。3つとも省いてよく、省いた方針は無い。値は起動のときと SIGHUP の読み直しで読む（上の「SIGHUP（設定の読み直し）」）。
 
 ### 要求の確かめの順
 
@@ -1067,7 +1102,7 @@ proxy が返すすべての応答（上流の応答、遮断、head の拒否、
   - 要求のたびに、表の古い方から最大 4 client を調べ、count が残っていないもの（待ち時間が過ぎたもの）を外す。count が残っていない client は新しい client と同じ扱いなので、外しても結果は変わらない。
   - 表が満ちていて、いちばん古い client の count がまだ残っているときは、その client を外して、新しい client の場所を作る。外された client は、次に来たときに新しい client として始まり、また `burst + 1` 件まで通る。つまり、その client の制限が一度ゆるむ。新しい client が、場所が無いために断られることは無い。
   - 外した数は `tukuyomi_rate_limit_evicted_total` に、数えている client の数は `tukuyomi_rate_limit_keys` に出る。多くの address から要求が来ると、実際の client の count が外れてゆるむ。`keys` は、同時に来る client の数より十分大きくする。
-  - 表は proxy のメモリの中にあり、起動し直すと空になる。
+  - 表は proxy のメモリの中にあり、起動し直すと空になる。SIGHUP の読み直しでは、`keys`・`rate`・`burst` がどれも同じなら続き、どれかが違えば空から数える。
 - 断った要求は、`tukuyomi_policy_refusals_total` の `rate_limit` に数える。記録の `reason` は `too many requests` である。
 
 ### 国のデータベース（`geo`）
@@ -1108,8 +1143,8 @@ proxy が返すすべての応答（上流の応答、遮断、head の拒否、
     - 国のデータベースである。`database_type` に `Country` を含むか、ISO コードを持つ記録が1つ以上ある。
   - 国の一覧があれば、proxy と管理のプロセスは、確かめたファイルの全体をメモリに持つ。どの命令も読むたびに全体を確かめるので、大きいファイルでは時間とメモリを使う。
   - 国の一覧がどこにも無ければ、読んで確かめた後で使わずに捨てる。国の一覧があって `geo` が無い設定は断る（`access has a list of countries while geo is left out`）。
-  - 起動の後は読み直さない。替えるときは、proxy を起動し直す。
-- 替える手順: 新しいファイルを別の名前で置き、`country_db` と `sha256` を1回の置き換えで書き換え、`config check` で確かめてから、proxy を起動し直す。管理のプロセスも、起動のときに設定とデータベースを確かめるので、その後に起動し直す。同じ名前のファイルだけを替えて `sha256` が合わないと、その間に流す命令と、起動し直したプロセスは、設定を断る。
+  - proxy は、起動のときと SIGHUP の読み直しのたびに読む。その間は読み直さない。読み直すたびに全体を確かめるので、大きいファイルでは読み直しのたびに時間とメモリを使う。
+- 替える手順: 新しいファイルを別の名前で置き、`country_db` と `sha256` を1回の置き換えで書き換え、`config check` で確かめてから、proxy に読み直させる（SIGHUP、`systemctl reload`）。管理のプロセスは、起動のときに設定とデータベースを確かめるので、その後に起動し直す。同じ名前のファイルだけを替えて `sha256` が合わないと、その間に流す命令と、起動し直したプロセスは設定を断り、proxy の読み直しも断られる。
 
 ## 記録
 
@@ -1193,7 +1228,7 @@ query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）�
 | 文 | とき |
 |---|---|
 | `start: ...` | 起動の各段（`start: rules generation <指紋>`、`start: rules engine <名前>`、`start: rules mode <block か detect>`、`start: rules generation refused: <理由>`、`start: the kernel is ready`、`start: listening`、`start: record file refused: <理由>`、`start: control socket refused: <理由>` など） |
-| `reload: ...` | SIGUSR1・SIGUSR2 を受けたこと、切り替え（SIGUSR1 と制御 socket。始めるときに `reload: rules engine <名前>`、断られたときに `reload: rules store refused: <理由>`）と証明書の入れ替えの結果 |
+| `reload: ...` | SIGHUP・SIGUSR1・SIGUSR2 を受けたこと、設定の読み直しの各段と結果（`reload: configuration replaced <SHA-256>`、`reload: configuration refused: <理由>`、`reload: rate limit table started anew` など。上の「SIGHUP（設定の読み直し）」）、切り替え（SIGUSR1 と制御 socket。始めるときに `reload: rules engine <名前>`、断られたときに `reload: rules store refused: <理由>`）と証明書の入れ替えの結果 |
 | `control: switch ...` | 制御 socket の切り替えの依頼への答え（上の「制御 socket」） |
 | `driver: inspector incarnation changed, inc <回>, restarts <回>` | 検査プロセスが起動し直した |
 | `conn <番号>: internal fault: <理由>` | proxy の中の不整合 |
@@ -1452,7 +1487,8 @@ TLS は次のとおりである。
 | `tukuyomi_rules_generation_info` | gauge | `generation`（指紋の先頭16桁）、`mode`、`engine` | 要求を受けている世代。値はいつも 1 |
 | `tukuyomi_rules_switches_total` | counter | `result`（`switched`、`refused`、`failed`） | SIGUSR1 と制御 socket による世代の切り替え |
 | `tukuyomi_certificate_reloads_total` | counter | `result`（`replaced`、`refused`） | SIGUSR2 による証明書の読み直し |
-| `tukuyomi_upstream_failures_total` | counter | `group` | 上流の組の server の失敗 |
+| `tukuyomi_config_reloads_total` | counter | `result`（`replaced`、`refused`） | SIGHUP による設定の読み直し。読み直しの途中に受けて捨てた SIGHUP は数えない |
+| `tukuyomi_upstream_failures_total` | counter | `group` | 上流の組の server の失敗。SIGHUP の読み直しで、0 から数え直す |
 | `tukuyomi_records_dropped_total` | counter | | 捨てた記録（上の「書けないとき」） |
 | `tukuyomi_record_write_errors_total` | counter | | 書き込みに失敗した記録 |
 | `tukuyomi_record_file_errors_total` | counter | | 記録のファイルに書けなかった記録と、失敗した同期（上の「記録のファイル」） |
@@ -1500,12 +1536,12 @@ TLS は次のとおりである。
    ```
 
    `2.1 renewed` のような行が出る。
-4. `systemctl reload tukuyomi-core.service`（SIGUSR2）で、proxy が証明書を使い始める。
+4. `systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`（SIGUSR2）で、proxy が証明書を使い始める。
 5. 試験用の CA で通ったら、本番の CA へ替える。
    - 試験用の CA の証明書は、期限が来ていないので、そのままでは置き換わらない（`valid`）。その証明書の `cert_file` と `key_file` を消す。
    - `directory_url` を本番の CA のものに替える。CA の API の server 証明書の root が違うなら、`ca_file` も替える。
-   - もう一度 `acme renew` を流してから、SIGUSR2 を送る。ファイルを消してから `acme renew` が終わるまでの間に SIGUSR2 を送ると（ほかの `systemctl reload` も含む）、その証明書は handshake から外れる。この順を守れば、その間も proxy は読み込み済みの証明書を使い続ける。
-   - `directory_url`・`ca_file`・`contact_email` など、`acme` の多くの鍵は命令だけが読むので、proxy の起動し直しは要らない。`challenge_dir` と、`acme` を持つ証明書の host は proxy も起動のときに読むので、替えたときは起動し直す。
+   - もう一度 `acme renew` を流してから、SIGUSR2 を送る。ファイルを消してから `acme renew` が終わるまでの間に SIGUSR2 を送ると（証明書も読む SIGHUP の読み直しも含む）、その証明書は handshake から外れる。この順を守れば、その間も proxy は読み込み済みの証明書を使い続ける。
+   - `directory_url`・`ca_file`・`contact_email` など、`acme` の多くの鍵は命令だけが読むので、proxy の起動し直しは要らない。`challenge_dir` と、`acme` を持つ証明書の host は proxy も読むので、替えたときは proxy に読み直させる（SIGHUP、`systemctl reload`）。
 6. 毎日の timer を置く（[実行ファイルの build と配置](../build/binary-deployment.md) の「証明書の更新の timer」）。
 
 ### 注意

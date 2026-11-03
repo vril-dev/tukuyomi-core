@@ -16,9 +16,9 @@
 | 制御 socket | 設定の `admin.control`。proxy が作る Unix domain socket。管理のプロセスが proxy の状態を問い、世代の切り替えを依頼する（proxy 側は [運用リファレンス](operator-reference.md) の「制御 socket」） |
 | 記録のファイル | 設定の `records.dir`。proxy が記録の写しを置く。管理のプロセスが読み出す（[運用リファレンス](operator-reference.md) の「記録のファイル（`records`）」） |
 
-- 管理のプロセスと proxy は、同じ設定ファイルを読む。どちらも起動のときに1回だけ読み、読み直さない。
+- 管理のプロセスと proxy は、同じ設定ファイルを読む。管理のプロセスは起動のときに1回だけ読み、読み直さない。proxy は SIGHUP で読み直すが、`admin` は動いている間に変えられない鍵である（[運用リファレンス](operator-reference.md) の「SIGHUP（設定の読み直し）」）。
   - proxy が `admin` から使う鍵は `listen` と `control` だけである。ほかの鍵は、同じファイルを両方が受け入れるか両方が断るように、proxy も範囲を確かめるだけである。
-  - `admin` の鍵を変えたら、管理のプロセスを起動し直す。`listen` と `control` を変えたときは、proxy も起動し直す。
+  - `admin` の鍵を変えたら、管理のプロセスを起動し直す。proxy は、`admin` の違う設定の読み直しを断るので、proxy も起動し直す。
 - 管理のプロセスは、proxy が止まっていても動く。止まっている間も、世代と記録の読み出し、取り込み、利用者の管理は使える。proxy に依頼する世代の切り替えと戻しだけは、proxy に届かなければ断る（下の「世代の操作」）。
 - 設定に `admin` が無ければ、管理のプロセスは起動せず（exit 2）、proxy は制御 socket を作らない。
 

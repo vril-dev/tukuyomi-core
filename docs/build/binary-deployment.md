@@ -198,7 +198,7 @@ proxy は root では動かない。起動もすべての命令も、プロセ�
   sha256sum /etc/tukuyomi-core/country.mmdb
   ```
 
-- 替えるときは、新しいファイルを別の名前で置き、設定の `geo.country_db` と `geo.sha256` を1回の置き換えで書き換える。`config check` で確かめてから、proxy と管理のプロセスを起動し直す。データベースは、起動の後は読み直さない。
+- 替えるときは、新しいファイルを別の名前で置き、設定の `geo.country_db` と `geo.sha256` を1回の置き換えで書き換える。`config check` で確かめてから、proxy に読み直させ（`systemctl reload`）、管理のプロセスを起動し直す。proxy は、起動のときと読み直しのたびにデータベースを読む。管理のプロセスは、起動の後は読み直さない。
 - 設定の鍵と、国の決め方（private な address や、IPv4 だけのデータベースの IPv6 は `UNKNOWN`）は [運用リファレンス](../operations/operator-reference.md) の「要求の前の方針」にある。
 
 ## 初めて起動する手順
@@ -261,7 +261,8 @@ Type=notify
 User=tukuyomi
 Group=tukuyomi
 ExecStart=/opt/tukuyomi-core/bin/tukuyomi-proxy /etc/tukuyomi-core/config.json
-ExecReload=/bin/kill -USR2 $MAINPID
+ExecReload=/opt/tukuyomi-core/bin/tukuyomi-proxy config check /etc/tukuyomi-core/config.json
+ExecReload=/bin/kill -HUP $MAINPID
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStartSec=90
@@ -295,8 +296,18 @@ WantedBy=multi-user.target
 - 合図は proxy の主プロセスだけに送る（`ExecReload` の `$MAINPID`、または `systemctl kill --kill-whom=main`）。
   - `--kill-whom=main` を付けない `systemctl kill` は、検査プロセスにも合図を送る。
   - 検査プロセスは、SIGUSR1・SIGUSR2 は無視するが、SIGTERM・SIGINT・SIGHUP が届くと終わる。
-- proxy は、SIGHUP でも止まる（読み直しではない）。
-- `systemctl reload` は SIGUSR2 を送り、証明書と鍵を読み直す。
+- `systemctl reload` は、2つの `ExecReload` を順に流す。`config check` が通ったときだけ SIGHUP を送り、proxy は設定ファイルを読み直して、止まらずに新しい設定に替える（[運用リファレンス](../operations/operator-reference.md) の「SIGHUP（設定の読み直し）」）。
+  - `config check` が断る設定では、SIGHUP は送られず、`systemctl reload` が失敗を返す。
+  - `config check` が通ると、`systemctl reload` は SIGHUP を送った所で成功を返し、読み直しの終わりを待たない。動いている proxy だけが断る理由（動いている間に変えられない鍵の違い、新しい待ち受けの bind）では、`systemctl reload` は成功を返す。結果は、記録の `reload: configuration replaced <SHA-256>` と `reload: configuration refused: <理由>` の文と、`/metrics` の `tukuyomi_config_reloads_total` で見る。
+  - 選んでいる世代を `config check` が断る間は、`systemctl reload` も断られる（読み直しそのものは世代に触れない）。
+- 設定を変える手順: ファイルを書き換え（別の名前に書いてから、1回の置き換えで差し替える）、`systemctl reload tukuyomi-core.service` を流し、記録の文で結果を見る。動いている間に変えられない鍵を替えたときは、`systemctl restart` で起動し直す。管理のプロセスと記録の送り手は読み直さないので、それらが読む鍵を替えたら起動し直す。
+- 入れ替えの順: SIGHUP で止まる前の版から入れ替えるときは、新しい実行ファイルを入れて起動し直してから、unit の `ExecReload` を替えて `systemctl daemon-reload` を流す（両方を替えてから起動し直してもよい）。前の版のまま新しい unit で `systemctl reload` を流すと、前の版は SIGHUP で止まる。exit 0 で止まるので、`Restart=on-failure` でも起動し直さない。
+- 証明書と鍵だけを読ませる（SIGUSR2）ときは、次のように送る。
+
+  ```bash
+  systemctl kill -s SIGUSR2 --kill-whom=main tukuyomi-core.service
+  ```
+
 - ルールセットの世代の切り替え（SIGUSR1）は、次のように送る。
 
   ```bash
@@ -344,7 +355,7 @@ WantedBy=multi-user.target
 - `LogRateLimitIntervalSec=0` を置く。監査の記録は標準エラー（journal）にも出るので、journald の流量の上限で落ちないようにする。
 - 検査プロセスの実行ファイル（`kernel.inspector`。ModSecurity の世代では `kernel.engines` の方）と作業場所（`kernel.tmp_root`）は、proxy と同じものを使う。取り込みの試しの検査プロセスは、proxy と同じに Landlock で自分を絞る。
 - 管理のプロセスは、`admin.listen` の loopback の address で、平文の HTTP で待つ。1024 以上の port なら、`AmbientCapabilities` は要らない。
-- 設定ファイルは、起動のときに1回だけ読む。設定を変えたら、`config check` で確かめてから、`systemctl restart` で起動し直す。`ExecReload` は置かない（SIGHUP は読み直しではなく、停止である）。
+- 管理のプロセスは、設定ファイルを起動のときに1回だけ読む（proxy と違い、SIGHUP で読み直さない）。設定を変えたら、`config check` で確かめてから、`systemctl restart` で起動し直す。`ExecReload` は置かない（管理のプロセスの SIGHUP は、停止である）。
 - proxy が動いていなくても、管理のプロセスは起動する。そのあいだは、世代の切り替えを依頼できない。
 - 外から使うときは、proxy の TLS の待ち受けの経路から、`admin.listen` の address へ転送する。`admin.listen` は、上流の server にしてよい（[運用リファレンス](../operations/operator-reference.md) の「`admin`」）。経路の書き方は [管理リファレンス](../operations/admin-reference.md) の「外から使う」に、画面と API の使い方は同じ文書にある。
 - 記録は journal に入り、監査の記録は管理の置き場の `audit/` にも書く。
@@ -383,7 +394,7 @@ WantedBy=multi-user.target
 - 記録のディレクトリ（`ship.state` を書く）は、`ReadWritePaths` の中に置く。
 - DB がログインを断ると、送り手は exit 1 で終わり、`Restart=on-failure` により `RestartSec` ごとに起動し直す。接続の文字列を直すまで、これを繰り返す。
 - DB の server の証明書を自前の認証局で出したときは、その証明書のファイルを `Environment=SSL_CERT_FILE=<path>` で渡す。
-- 設定ファイルと接続の文字列のファイルは、起動のときに1回だけ読む。変えたら、`systemctl restart` で起動し直す。`ExecReload` は置かない（SIGHUP は停止である）。
+- 設定ファイルと接続の文字列のファイルは、起動のときに1回だけ読む（proxy と違い、SIGHUP で読み直さない）。変えたら、`systemctl restart` で起動し直す。`ExecReload` は置かない（送り手の SIGHUP は停止である）。
 - proxy が動いていなくても、送り手は起動し、ファイルにある記録を送る。proxy は、送り手が動いていないこと（`ship.state` が 90 秒より古い）を、`required` の経路の要求を断ることで示す。
 - 送り手の記録は journal に入る。
 
@@ -403,7 +414,7 @@ Type=oneshot
 User=tukuyomi
 Group=tukuyomi
 ExecStart=/opt/tukuyomi-core/bin/tukuyomi-proxy acme renew /etc/tukuyomi-core/config.json
-ExecStartPost=+/bin/systemctl reload tukuyomi-core.service
+ExecStartPost=+/bin/systemctl kill --kill-whom=main -s SIGUSR2 tukuyomi-core.service
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -424,9 +435,10 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-- 命令の後の `systemctl reload` で、proxy が新しい証明書を読む。動いている proxy は、命令が証明書を書いたことに気づかない。
-- `ExecStartPost` の先頭の `+` は、reload を root で流すための印である。命令そのものはサービスの利用者で流れる。
-- 証明書の1つでも `failed` だと、命令は exit 1 で終わり、`ExecStartPost` は流れない。そのときは、ほかに更新できた証明書も、次に reload するまで使われない。
+- 命令の後の SIGUSR2 で、proxy が新しい証明書を読む。動いている proxy は、命令が証明書を書いたことに気づかない。
+  - `systemctl reload` を使わないのは、SIGHUP が設定ファイル全体を読み直すためである。timer が流れたときに書きかけの設定を拾わないように、証明書と鍵だけを読む SIGUSR2 を送る。
+- `ExecStartPost` の先頭の `+` は、`systemctl kill` を root で流すための印である。命令そのものはサービスの利用者で流れる。
+- 証明書の1つでも `failed` だと、命令は exit 1 で終わり、`ExecStartPost` は流れない。そのときは、ほかに更新できた証明書も、次に SIGUSR2 か SIGHUP を送るまで使われない。
 - 同じ設定で `acme renew` を2つ同時に流してはいけない。止める仕組みが無い。systemd の timer は重ならないが、cron などで流すときは重ならないようにする。
 - 初めての発行の手順は [運用リファレンス](../operations/operator-reference.md) の「ACME」にある。
 
