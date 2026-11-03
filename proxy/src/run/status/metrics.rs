@@ -212,6 +212,12 @@ pub(super) fn render(scrape: &Scrape<'_>) -> String {
         &counters.reloads.samples(),
     );
     page.labelled(
+        "tukuyomi_config_reloads_total",
+        "Readings of the configuration file again, by how they ended.",
+        "result",
+        &counters.config_reloads.samples(),
+    );
+    page.labelled(
         "tukuyomi_upstream_failures_total",
         "Failures of the servers of an upstream group.",
         "group",

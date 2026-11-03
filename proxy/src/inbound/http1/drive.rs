@@ -10,12 +10,15 @@
 //! said `Connection: close` or has an `Upgrade` line (the gate reads nothing behind such a head); the route of the
 //! request has a `stream`, so the response may take long and is the last one; `keepalive_timeout` is 0; the
 //! connection has served `keepalive_requests` requests or has lived `keepalive_time`; the body of the request was
-//! not read to its end when the answer was given; the stop has begun (an idle connection is closed at once, one
-//! with a request under way after its response). A response that closes the connection says `Connection: close`,
-//! so the client knows. The 101 of a WebSocket does not: it ends the connection by itself, and once that head has
-//! been passed hyper is not told to wind the connection down, for it would add a `Connection: close` of its own to
-//! the 101. A connection that waits for its next request is also closed at once when the accept side runs out of
-//! connection permits (`Ingress::drain`); one that is in a request is left alone.
+//! not read to its end when the answer was given; the stop has begun, or the setup that the connection holds has been
+//! replaced because the configuration was read again (one that has served a request and waits for the next is closed at
+//! once, one with a request under way after its response, and one that holds part of its next head, or has answered
+//! nothing yet, serves that request and is closed after its response, for hyper is given a head only when it is
+//! complete; a replaced setup turns no request away). A response that closes the connection says `Connection: close`,
+//! so the client knows. The 101 of a WebSocket does not: it ends the connection by itself, and once that head has been
+//! passed hyper is not told to wind the connection down, for it would add a `Connection: close` of its own to the 101.
+//! A connection that waits for its next request is also closed at once when the accept side runs out of connection
+//! permits (`Ingress::drain`); one that is in a request is left alone.
 //!
 //! A response from a route with a `stream` that is not a 101 may last longer than the connection time: when its
 //! head is ready, the end of the connection becomes the later of the old end and `total` after the head, and the
@@ -130,11 +133,13 @@ impl Serving {
         (serving, gate)
     }
 
-    /// Lets hyper serve the connection to its end. The stop makes hyper close the connection when it is idle, and
-    /// after the response of the request under way otherwise, unless the last head has an `Upgrade` line: nothing
-    /// follows that, and hyper would add `Connection: close` to a 101. A stop that began before this is seen by
-    /// `then`. If a 101 was given, hyper must not have read a byte behind the handshake (the gate gives it none),
-    /// or the connection ends in an error.
+    /// Lets hyper serve the connection to its end. The stop, and the replacement of the setup, make hyper close the
+    /// connection when it is idle, and after the response of the request under way otherwise, unless the last head has
+    /// an `Upgrade` line: nothing follows that, and hyper would add `Connection: close` to a 101. A replacement does so
+    /// only for a connection that has answered a request and waits for the next one, or has a request under way
+    /// (`Link::kept`, `Link::answering`); the response to any other request ends the connection (`then`). A stop or a
+    /// replacement that began before this is seen by `then`. If a 101 was given, hyper must not have read a byte behind
+    /// the handshake (the gate gives it none), or the connection ends in an error.
     async fn drive<T>(self: &Arc<Self>, gate: &mut Gate<T>) -> End
     where
         T: AsyncRead + AsyncWrite + Unpin,
@@ -161,6 +166,15 @@ impl Serving {
             .title_case_headers(true);
         let mut stop = ctx.shared.ingress.watch();
         let mut changed = pin!(stop.changed());
+        // The setup of the connection may be replaced. The connection is wound down then if it has answered a request
+        // and waits for the next one, or has a request under way. One that holds part of its next head is left, for
+        // the gate gives hyper a head only when it is complete, so hyper takes such a connection for an idle one and
+        // would drop that request unanswered; the response to it ends the connection (see `then`). So does the
+        // response to the first request of a connection that has answered nothing yet, as one that began with a setup
+        // that was replaced already: nothing is done for it here.
+        let mut replaced = ctx.setup.watch();
+        let mut retired = pin!(replaced.changed());
+        let mut gone = false;
         // A call to drain the connections that wait for a request: it counts only if this one waits for one.
         let mut calls = ctx.shared.ingress.drained();
         let link = self.link.clone();
@@ -178,8 +192,14 @@ impl Serving {
         let mut by = self.session.conn_by();
         let mut limit = pin!(sleep_until(by));
         let ended = poll_fn(|cx| {
+            let wind = !told && !gone && retired.as_mut().poll(cx).is_ready() && {
+                gone = true;
+                self.link.kept() || self.link.answering()
+            };
             if !told
-                && (changed.as_mut().poll(cx).is_ready() || drained.as_mut().poll(cx).is_ready())
+                && (changed.as_mut().poll(cx).is_ready()
+                    || wind
+                    || drained.as_mut().poll(cx).is_ready())
             {
                 told = true;
                 if !self.link.last() {
@@ -281,7 +301,7 @@ impl Serving {
             || head.upgrade()
             || long
             || cfg.keepalive_timeout.is_zero();
-        if closing || spent || ctx.shared.ingress.is_closed() {
+        if closing || spent || ctx.shared.ingress.is_closed() || ctx.setup.is_retired() {
             Then::Close
         } else {
             Then::Keep

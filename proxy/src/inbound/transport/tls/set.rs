@@ -1,5 +1,5 @@
-//! The TLS of all the listeners together: what is read when the proxy starts, what is looked up for a connection,
-//! and what SIGUSR2 replaces.
+//! The TLS of all the listeners together: what is read when the proxy starts and each time it reads the configuration
+//! file again, what is looked up for a connection, and what SIGUSR2 replaces.
 //!
 //! `Tls::load` reads and checks every certificate of every TLS listener and makes the handshake of each; one that
 //! fails refuses the start, except a certificate with `acme` whose files do not exist yet, which waits (`waiting`).

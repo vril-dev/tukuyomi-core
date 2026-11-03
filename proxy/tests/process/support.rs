@@ -24,7 +24,7 @@ pub(crate) const JSON: &str = "application/json";
 /// The largest body the proxy is configured to take, which is also the largest body the kernel accepts.
 pub(crate) const MAX_BODY: usize = 1 << 20;
 /// The inspector has read a body frame (64 KiB) once its read counter has grown by this much.
-const FRAME: u64 = 64 * 1024;
+pub(crate) const FRAME: u64 = 64 * 1024;
 /// The body of the upstream's answer.
 pub(crate) const UPSTREAM_BODY: &str = "hello-from-upstream";
 /// The longest head the proxy reads from the upstream, interim answers included (`upstream_head_wire`).
@@ -930,7 +930,7 @@ pub(crate) fn is_inspector(pid: u32) -> bool {
 }
 
 /// The bytes the process has read so far, from `/proc/<pid>/io`.
-fn read_chars(pid: u32) -> Option<u64> {
+pub(crate) fn read_chars(pid: u32) -> Option<u64> {
     fs::read_to_string(format!("/proc/{pid}/io"))
         .ok()?
         .lines()
@@ -1151,8 +1151,10 @@ impl Proxy {
         sock
     }
 
-    /// Sends the signal (`TERM`, `INT` or `HUP`) and returns the time just before it was sent. The proxy takes
-    /// its own time for the stop after that, so a time counted from here is never shorter than the proxy's.
+    /// Sends the signal (`TERM` or `INT`, which stop the proxy; `HUP`, `USR1` or `USR2`, which read the configuration
+    /// file, the rules store or the certificates again) and returns the time just before it was sent. The proxy takes
+    /// its own time for the stop after a signal that stops it, so a time counted from here is never shorter than the
+    /// proxy's.
     pub(crate) fn signal(&self, signal: &str) -> Instant {
         let at = Instant::now();
         run_kill(signal, self.pid);

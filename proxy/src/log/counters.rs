@@ -115,7 +115,7 @@ impl SwitchResult {
     }
 }
 
-/// How the reading of the certificate and key files again ended.
+/// How the reading of the certificate and key files, or of the configuration file, again ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReloadResult {
     Replaced,
@@ -213,6 +213,8 @@ pub struct Counters {
     pub switches: Family<3>,
     /// The readings of the certificate files again, by how they ended.
     pub reloads: Family<2>,
+    /// The readings of the configuration file again, by how they ended.
+    pub config_reloads: Family<2>,
     /// The connections that were accepted.
     pub accepted: Counter,
     /// The connections that are open now.
@@ -240,6 +242,10 @@ impl Counters {
                 SwitchResult::Failed.label(),
             ]),
             reloads: Family::new([
+                ReloadResult::Replaced.label(),
+                ReloadResult::Refused.label(),
+            ]),
+            config_reloads: Family::new([
                 ReloadResult::Replaced.label(),
                 ReloadResult::Refused.label(),
             ]),
@@ -276,6 +282,10 @@ impl Counters {
 
     pub fn add_reload(&self, result: ReloadResult) {
         self.reloads.add(result.label());
+    }
+
+    pub fn add_config_reload(&self, result: ReloadResult) {
+        self.config_reloads.add(result.label());
     }
 
     /// The time the process started, in seconds since the epoch of Unix time.

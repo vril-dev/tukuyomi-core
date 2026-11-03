@@ -14,10 +14,10 @@
 //! certificate has 1 to 64 hosts, each a name (lowercase letters, digits, `-` and `.`, in labels of 1 to 63 bytes of
 //! which the last starts with a letter, 253 bytes at most, so no IP literal) or `*.` and a name, which stands for any
 //! one label in front of the name. A host is written once in a listener. The files are not read here:
-//! `inbound::transport::tls` reads them when the proxy starts. A certificate may also have `acme`,
-//! `{"renew_before_days"}` (1 to 60): the command `acme renew` issues it and keeps it renewed (see `acme`, and
-//! `acme` of the configuration), so its hosts are names only (no `*.`), and its files may not exist yet when the proxy
-//! starts. `tls` may also have `http2`, an object that turns
+//! `inbound::transport::tls` reads them when the proxy starts and each time it reads the configuration file again. A
+//! certificate may also have `acme`, `{"renew_before_days"}` (1 to 60): the command `acme renew` issues it and keeps
+//! it renewed (see `acme`, and `acme` of the configuration), so its hosts are names only (no `*.`), and its files may
+//! not exist yet when the proxy starts. `tls` may also have `http2`, an object that turns
 //! HTTP/2 on for the listener and has five keys, all of them required: `max_streams` (1 to 256, the streams a client
 //! may have open at once), `stream_window` (65535 to 1 MiB, the receive window of a stream), `connection_window`
 //! (65535 to 4 MiB, the receive window of the connection), `max_header_list` (1 KiB to four times `max_head_bytes`,

@@ -13,6 +13,7 @@ use tokio::time::{Instant, timeout_at};
 use tukuyomi_kernel::Failure;
 
 use super::control::{Control, Order};
+use super::start::Parts;
 use super::status::Status;
 use crate::inbound::transport::accept::{Accepted, Acceptor, Arrival};
 use crate::inspect::driver::{End, Switched};
@@ -64,12 +65,20 @@ impl Source {
 pub(super) enum Event {
     Ready(Result<(), Failure>),
     Signal(&'static str),
+    /// SIGHUP.
+    Configuration,
     /// SIGUSR1.
     Reload,
     /// SIGUSR2.
     Certificates,
     /// The driver answered a switch: whether the new generation serves.
     Switched(bool),
+    /// The thread that reads the configuration file again answered: the parts it made, or none if it refused the file
+    /// (it wrote the line that says why).
+    Configured(Option<Box<Parts>>),
+    /// The thread that reads the configuration file again ended without an answer. This is no cause of a stop: the
+    /// thread has nothing to do with the requests that are served.
+    ConfigurationLost,
     /// An order from the control socket.
     Control(Order),
     Failed(Failure),
@@ -96,6 +105,8 @@ pub(super) struct Waits {
     failed: Option<oneshot::Receiver<Failure>>,
     /// The answer to the switch that is under way, if there is one.
     pub(super) switch: Option<oneshot::Receiver<Switched>>,
+    /// The answer of the thread that reads the configuration file again, if one is under way.
+    pub(super) config: Option<oneshot::Receiver<Option<Box<Parts>>>>,
     end: Option<oneshot::Receiver<End>>,
     pub(super) accept: Option<Acceptor>,
     pub(super) status: Option<Status>,
@@ -119,6 +130,7 @@ impl Waits {
             ready: Some(ready),
             failed: Some(failed),
             switch: None,
+            config: None,
             end: Some(end),
             accept: None,
             status: None,
@@ -143,14 +155,13 @@ impl Waits {
             self.ready = None;
             return Poll::Ready(answer.map_or(Event::Lost(Source::Ready), Event::Ready));
         }
-        for (name, stream) in [
-            ("SIGTERM", &mut self.term),
-            ("SIGINT", &mut self.int),
-            ("SIGHUP", &mut self.hup),
-        ] {
+        for (name, stream) in [("SIGTERM", &mut self.term), ("SIGINT", &mut self.int)] {
             if stream.poll_recv(cx).is_ready() {
                 return Poll::Ready(Event::Signal(name));
             }
+        }
+        if self.hup.poll_recv(cx).is_ready() {
+            return Poll::Ready(Event::Configuration);
         }
         if self.usr1.poll_recv(cx).is_ready() {
             return Poll::Ready(Event::Reload);
@@ -171,6 +182,12 @@ impl Waits {
             return Poll::Ready(answer.map_or(Event::Lost(Source::Switch), |switched| {
                 Event::Switched(switched == Switched::Yes)
             }));
+        }
+        if let Some(config) = self.config.as_mut()
+            && let Poll::Ready(answer) = Pin::new(config).poll(cx)
+        {
+            self.config = None;
+            return Poll::Ready(answer.map_or(Event::ConfigurationLost, Event::Configured));
         }
         if let Some(control) = self.control.as_mut()
             && let Poll::Ready(order) = control.poll_order(cx)

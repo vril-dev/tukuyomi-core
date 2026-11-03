@@ -555,6 +555,19 @@ fn the_end_is_shown_only_when_every_answer_is_given_and_what_was_written_is_flus
     });
 }
 
+#[test]
+fn a_connection_is_kept_only_when_a_response_is_complete_and_it_waits_for_the_next_request() {
+    let link = Link::new(Instant::now());
+    // Nothing has been answered yet: the gate may wait for the first byte, and the connection is not kept.
+    link.set_waiting(true);
+    assert!(link.waiting() && !link.kept());
+    link.done(Instant::now());
+    assert!(link.kept());
+    // A byte of the next head has come.
+    link.set_waiting(false);
+    assert!(!link.waiting() && !link.kept());
+}
+
 /// A stream that takes no byte from a write until the test gives it room.
 struct Paced {
     inner: TcpStream,

@@ -150,8 +150,8 @@ fn metrics_count_a_forwarded_and_a_blocked_request_and_a_scrape_is_no_request() 
     unique.sort();
     unique.dedup();
     // There is no shipper here, so the family of its distance is not there.
-    assert_eq!(helped.len(), 25, "{helped:?}");
-    assert_eq!((unique.len(), &typed), (25, &helped));
+    assert_eq!(helped.len(), 26, "{helped:?}");
+    assert_eq!((unique.len(), &typed), (26, &helped));
     assert!(!text.contains("tukuyomi_records_unshipped_bytes"), "{text}");
 
     // The scrape and the other pages were not requests: the two records are the only ones.

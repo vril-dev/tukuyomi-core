@@ -51,7 +51,7 @@ pub(super) fn check(raw: Option<Object<RawEngines>>) -> Result<Engines, ConfigEr
 
 /// The kernel values of the file, checked. The rules directory and fingerprint come from the rules store at
 /// start-up, and the engine and its inspector from the generation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelSettings(pub(super) tukuyomi_kernel::Config, Engines);
 
 impl KernelSettings {

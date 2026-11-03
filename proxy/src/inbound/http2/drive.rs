@@ -20,7 +20,9 @@
 //! these happens: the connection has served `keepalive_requests` streams or has lived `keepalive_time`, counted
 //! when a stream begins (the streams that the client sent in the same write are taken, so the number is a measure
 //! and the hard limit is `max_streams`); `keepalive_timeout` is 0 (after the first stream begins); the response of
-//! a route with a `stream` is ready, which is then the last one; the stop has begun; the accept side calls to drain
+//! a route with a `stream` is ready, which is then the last one; the stop has begun; the setup that the connection
+//! holds has been replaced because the configuration was read again (the streams that are open finish, and none is
+//! turned away before the client has been told); the accept side calls to drain
 //! the connections and none of its streams is open; or no stream is open and none has begun in the time that a
 //! connection waits for the first one (the same time as the first head of a plain connection) or, after the last
 //! stream ended, for `keepalive_timeout`.
@@ -343,6 +345,8 @@ where
         .max_local_error_reset_streams(LOCAL_ERROR_RESETS);
     let mut stop = ctx.shared.ingress.watch();
     let mut changed = pin!(stop.changed());
+    let mut replaced = ctx.setup.watch();
+    let mut retired = pin!(replaced.changed());
     // A call to drain the connections: it counts only if none of the streams of this one is open.
     let mut calls = ctx.shared.ingress.drained();
     let idle = life.clone();
@@ -357,8 +361,8 @@ where
     });
     let mut conn = pin!(server.serve_connection(TokioIo::new(&mut *watch), service));
     // The connection is wound down once, and `life.told` has the instant. A stop that began before this is not seen
-    // by `changed`.
-    let mut down = ctx.shared.ingress.is_closed();
+    // by `changed`, nor is a replacement of the setup by `retired`.
+    let mut down = ctx.shared.ingress.is_closed() || ctx.setup.is_retired();
     let mut by = session.conn_by();
     let mut limit = pin!(sleep_until(by));
     let mut wait = pin!(sleep_until(by));
@@ -371,6 +375,7 @@ where
             if life.told.get().is_none()
                 && (down
                     || changed.as_mut().poll(cx).is_ready()
+                    || retired.as_mut().poll(cx).is_ready()
                     || drained.as_mut().poll(cx).is_ready()
                     || life.wind_down.load(Ordering::Acquire))
             {

@@ -23,7 +23,7 @@ pub(crate) const MAX_TMP_ROOT: usize = 3840;
 pub(crate) const MAX_RESTARTS: u32 = 1000;
 
 /// Everything the kernel needs. No `Default`: every value is chosen by the operator and checked by `check`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     /// The engine of the generation. Its inspector build is the one that the HELLO has to report.
     pub engine: Engine,

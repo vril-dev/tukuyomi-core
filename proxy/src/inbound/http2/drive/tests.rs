@@ -560,6 +560,37 @@ fn the_stop_winds_the_connection_down() {
 }
 
 #[test]
+fn a_replaced_setup_winds_the_connection_down_also_when_it_was_replaced_before_the_connection_began()
+ {
+    run(async {
+        let pki = Pki::new();
+        for before in [false, true] {
+            let rig = h2_rig(&pki, kept(), Mode::Answer(BLOCK), &routed_to_h_test()).await;
+            if before {
+                rig.ctx.setup.retire();
+            }
+            let (tcp, task) = rig.connect_on(0).await;
+            let mut wire = Wire::open(&pki, tcp).await;
+            // The stream is not turned away: it is answered, and then the connection ends.
+            wire.send(&request(1, "www.a.example", END_HEADERS | END_STREAM))
+                .await;
+            wire.until(|f| f.kind == HEADERS && f.stream == 1)
+                .await
+                .expect("an answer");
+            rig.ctx.setup.retire();
+            assert!(wire.until(|_| false).await.is_none());
+            let goaway = wire
+                .seen
+                .iter()
+                .find(|f| f.kind == GOAWAY)
+                .expect("a goaway");
+            assert_eq!(error_code(goaway), 0);
+            rig.finish(task).await;
+        }
+    });
+}
+
+#[test]
 fn a_preface_or_a_header_block_that_does_not_come_in_time_closes_the_connection_with_one_line() {
     run(async {
         let pki = Pki::new();

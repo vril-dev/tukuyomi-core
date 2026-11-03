@@ -1,11 +1,12 @@
-//! Making the upstream groups whole when the proxy starts: the name of a server becomes its addresses.
+//! Making the upstream groups whole when the proxy starts and each time it reads the configuration file again: the
+//! name of a server becomes its addresses.
 //!
-//! The names are looked up once, here, and never again, so a name that comes to have other addresses later is not
-//! followed: the proxy has to be started again. One thread looks the names up, one after the other, in the order of
-//! the file, and a name with a port that is written more than once is looked up once. The caller waits for all of them
-//! until one deadline, `resolve_timeout` after the start. A lookup of the system cannot be stopped, so when the
-//! deadline passes the thread is left to end by itself, and the proxy does not start. The lookup is an argument, so
-//! that a test can replace it.
+//! The names are looked up here each time the file is read, and not between, so a name that comes to have other
+//! addresses later is not followed until the file is read again (at the next start, or at SIGHUP). One thread looks
+//! the names up, one after the other, in the order of the file, and a name with a port that is written more than once
+//! is looked up once. The caller waits for all of them until one deadline, `resolve_timeout` after the call. A lookup
+//! of the system cannot be stopped, so when the deadline passes the thread is left to end by itself, and the file is
+//! refused. The lookup is an argument, so that a test can replace it.
 //!
 //! Each address of a name is a server of its group with the weight, `max_fails`, `fail_timeout` and `backup` of the
 //! server that was written, and the servers are in the place of the name. An address that a name has more than once

@@ -45,6 +45,9 @@ impl Cause {
             Event::Lost(source) => Some(Cause::Lost(source)),
             Event::Late => Some(Cause::Late),
             Event::Ready(Ok(()))
+            | Event::Configuration
+            | Event::Configured(_)
+            | Event::ConfigurationLost
             | Event::Reload
             | Event::Certificates
             | Event::Switched(_)
@@ -104,11 +107,14 @@ impl Stop {
                 log.line(&format!("stop: the kernel failed: {failure:?}"));
             }
             Event::Joined(done) => note_joined(done, log),
+            Event::Configuration => log.line("reload: configuration ignored while stopping"),
             Event::Reload => log.line("reload: ignored while stopping"),
             Event::Certificates => log.line("reload: certificates ignored while stopping"),
             Event::Lost(_)
             | Event::Ready(_)
             | Event::Switched(_)
+            | Event::Configured(_)
+            | Event::ConfigurationLost
             | Event::Control(_)
             | Event::Late
             | Event::Conn(_)

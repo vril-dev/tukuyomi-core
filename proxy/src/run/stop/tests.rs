@@ -194,7 +194,7 @@ fn the_stop_exits_one_unless_the_end_is_clean_and_the_cause_is_not_a_failure() {
         assert_eq!(
             stop(
                 f.waits,
-                Cause::Signal("SIGHUP"),
+                Cause::Signal("SIGTERM"),
                 tx,
                 &connections,
                 &cfg,

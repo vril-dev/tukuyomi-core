@@ -319,6 +319,69 @@ fn an_idle_connection_closes_after_the_wait_and_at_once_when_the_stop_begins() {
 }
 
 #[test]
+fn a_replaced_setup_closes_a_connection_that_waits_and_serves_the_first_request_of_one_that_began_with_it()
+ {
+    run(async {
+        // A connection that waits for its next request is closed.
+        let rig = Rig::new(kept(), Mode::Answer(BLOCK)).await;
+        let (client, task) = rig.connect().await;
+        put(&client, &get("/1")).await;
+        assert_eq!(responses(&client, 1).await.0[0].status, 403);
+        sleep(Duration::from_millis(100)).await;
+        let began = StdInstant::now();
+        rig.ctx.setup.retire();
+        assert!(read_all(&client).await.is_empty());
+        assert!(began.elapsed() < 5 * SEC);
+        assert_eq!(rig.finish(task).await.len(), 1);
+
+        // A connection that holds a setup that was replaced before it began is not turned away: its first request
+        // reaches the driver, and the answer to it ends the connection.
+        let rig = Rig::new(kept(), Mode::Answer(BLOCK)).await;
+        rig.ctx.setup.retire();
+        let (client, task) = rig.connect().await;
+        put(&client, &get("/first")).await;
+        let answer = parse_response(&read_all(&client).await);
+        assert_eq!(answer.status, 403);
+        assert_eq!(answer.all("connection"), ["close"]);
+        assert_eq!(rig.finish(task).await.len(), 1);
+
+        // The same when the setup is replaced after the connection began and before its first byte has come.
+        let rig = Rig::new(kept(), Mode::Answer(BLOCK)).await;
+        let (client, task) = rig.connect().await;
+        sleep(Duration::from_millis(100)).await;
+        rig.ctx.setup.retire();
+        sleep(Duration::from_millis(100)).await;
+        put(&client, &get("/first")).await;
+        let answer = parse_response(&read_all(&client).await);
+        assert_eq!(answer.status, 403);
+        assert_eq!(answer.all("connection"), ["close"]);
+        assert_eq!(rig.finish(task).await.len(), 1);
+    });
+}
+
+#[test]
+fn a_replaced_setup_leaves_a_connection_that_holds_part_of_a_head_to_answer_that_request_and_end_after_it()
+ {
+    run(async {
+        let rig = Rig::new(kept(), Mode::Answer(BLOCK)).await;
+        let (client, task) = rig.connect().await;
+        put(&client, &get("/1")).await;
+        assert_eq!(responses(&client, 1).await.0[0].status, 403);
+        // Part of the next head has come when the setup is replaced: hyper is not given it yet, and would take the
+        // connection for an idle one and drop the request.
+        put(&client, b"GET /2 HTTP/1.1\r\nHost: h\r\n").await;
+        sleep(Duration::from_millis(200)).await;
+        rig.ctx.setup.retire();
+        sleep(Duration::from_millis(200)).await;
+        put(&client, b"\r\n").await;
+        let answer = parse_response(&read_all(&client).await);
+        assert_eq!(answer.status, 403);
+        assert_eq!(answer.all("connection"), ["close"]);
+        assert_eq!(rig.finish(task).await.len(), 2);
+    });
+}
+
+#[test]
 fn an_answer_before_the_body_was_read_closes_the_connection_but_the_client_still_reads_it() {
     run(async {
         // A chunked body that is over the limit answers 413 half way. The client goes on sending, and its bytes

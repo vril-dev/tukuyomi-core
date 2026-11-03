@@ -1,6 +1,7 @@
 //! The runtime part of the start: the signal handlers, the status listener, the control socket, the driver, the wait
 //! for the kernel to be ready, the listeners, and the accept side until something asks for a stop.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 
@@ -9,7 +10,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::Instant;
 
 use super::notify::Notify;
-use super::reload::{control_order, control_while_starting, reload, reload_certificates};
+use super::reload::{Fixed, Reloader, control_order, control_while_starting, reload};
 use super::signals::{Event, Signals, Waits};
 use super::status::{self, Readiness, View};
 use super::stop::{Cause, stop};
@@ -49,6 +50,8 @@ pub(super) async fn run(
     admin: Option<AdminConfig>,
     policy: PolicyConfig,
     keep: Keep,
+    path: PathBuf,
+    fixed: Fixed,
     log: Log,
 ) -> u8 {
     let signals = match Signals::install() {
@@ -131,8 +134,10 @@ pub(super) async fn run(
             challenge,
             policy,
             keep,
+            None,
         )),
     });
+    let mut reloader = Reloader::new(path, fixed);
     let readiness = Arc::new(Readiness::new());
     if let Some(bound) = control_socket {
         let switch_wait = proxy.ready_wait.saturating_add(control::SWITCH_MARGIN);
@@ -160,6 +165,7 @@ pub(super) async fn run(
         &proxy,
         &ingress,
         &mut switcher,
+        &mut reloader,
         &readiness,
         &notify,
     )
@@ -183,12 +189,16 @@ pub(super) async fn run(
 /// are bound `readiness` and `notify` say so. The wait for the kernel and the number of connections are those of
 /// `proxy`, which hold for the life of the process; the listeners are those of the setup that is current when they
 /// are bound.
+// One argument for each part of what the loop waits for and carries out; a struct of them would only repeat their
+// names.
+#[allow(clippy::too_many_arguments)]
 async fn until_stop(
     waits: &mut Waits,
     shared: &Arc<Shared>,
     proxy: &ProxyConfig,
     ingress: &SyncSender<Msg>,
     switcher: &mut Switcher,
+    reloader: &mut Reloader,
     readiness: &Readiness,
     notify: &Notify,
 ) -> Cause {
@@ -199,6 +209,7 @@ async fn until_stop(
     loop {
         match waits.wait(Some(ready_by)).await {
             Event::Ready(Ok(())) => break,
+            Event::Configuration => log.line("reload: configuration ignored while starting"),
             Event::Reload => log.line("reload: ignored while starting"),
             Event::Certificates => log.line("reload: certificates ignored while starting"),
             Event::Control(order) => control_while_starting(order, waits, switcher, log),
@@ -228,8 +239,11 @@ async fn until_stop(
             Event::AcceptErr(Some(errno)) => log.line(&format!("accept: failed, errno {errno}")),
             Event::AcceptErr(None) => log.line("accept: failed"),
             Event::Joined(done) => note_joined(done, log),
+            Event::Configuration => reloader.hangup(waits, &shared.counters, log),
+            Event::Configured(parts) => reloader.answered(parts, shared),
+            Event::ConfigurationLost => reloader.unanswered(shared),
             Event::Reload => reload(waits, switcher, ingress, &shared.counters, log),
-            Event::Certificates => reload_certificates(shared, &shared.setup.current()),
+            Event::Certificates => reloader.certificates(waits, shared),
             Event::Control(order) => {
                 control_order(order, waits, switcher, ingress, &shared.counters, log);
             }

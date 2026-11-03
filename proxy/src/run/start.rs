@@ -1,19 +1,21 @@
 //! The start of the process, before the runtime runs: the arguments, which of the short commands (`rules`, `acme`,
 //! `config`) the process is, whether it is the admin process or one of its commands `admin bootstrap` and `admin
 //! reset` (see `admin`), and the steps from the configuration to the kernel configuration (`prepare`), which
-//! `config check` runs as well.
+//! `config check` runs as well. The steps before the rules store (`read_parts`) are run again when the proxy reads
+//! the configuration file again.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use super::host;
+use super::reload::Fixed;
 use super::serve::run;
 use crate::acme;
 use crate::admin;
 use crate::config::{
-    self, AdminConfig, ForwardConfig, Keep, PolicyConfig, ProxyConfig, Records, StatusConfig,
-    addresses,
+    self, AdminConfig, ForwardConfig, Keep, KernelSettings, PolicyConfig, ProxyConfig, Records,
+    StatusConfig, StoreConfig, addresses,
 };
 use crate::forward::resolve;
 use crate::inbound::challenge::Challenge;
@@ -95,6 +97,7 @@ pub fn start(log: &Log) -> u8 {
         records,
         admin,
         policy,
+        fixed,
     } = match prepare(&path, "start", log) {
         Ok(prepared) => prepared,
         Err(code) => return code,
@@ -150,6 +153,8 @@ pub fn start(log: &Log) -> u8 {
         admin,
         policy,
         keep,
+        path,
+        fixed,
         log.clone(),
     ))
 }
@@ -174,12 +179,35 @@ struct Prepared {
     admin: Option<AdminConfig>,
     /// The `access` and the `rate_limit` of the configuration.
     policy: PolicyConfig,
+    /// The values that a reading of the file again may not change.
+    fixed: Fixed,
 }
 
-/// The steps of start-up from the configuration to the kernel configuration of the chosen generation, the hold on it
-/// included. `name` is at the head of each line: `start` for the start, `config check` for the command of that name.
-/// A refusal is a line, and its exit code is the error.
-fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
+/// What the steps before the rules store give: the configuration with the addresses of the upstream servers in it, the
+/// TLS of the listeners and the answer to the challenge of the CA. The proxy builds its setup of them at the start
+/// and again when it reads the file again.
+pub(super) struct Parts {
+    pub(super) proxy: ProxyConfig,
+    pub(super) forward: ForwardConfig,
+    pub(super) tls: Tls,
+    pub(super) challenge: Option<Challenge>,
+    pub(super) kernel: KernelSettings,
+    pub(super) store: StoreConfig,
+    pub(super) status: Option<StatusConfig>,
+    pub(super) records: Option<Records>,
+    pub(super) admin: Option<AdminConfig>,
+    pub(super) policy: PolicyConfig,
+    /// The values that a reading of the file again may not change, as this file has them.
+    pub(super) fixed: Fixed,
+    /// The SHA-256 of the bytes of the file.
+    pub(super) sha256: [u8; 32],
+}
+
+/// The steps of start-up before the rules store: the configuration, the lookup of the names of the upstream servers,
+/// the files of the TLS listeners and the challenge of the CA. `name` is at the head of each line: `start` for the
+/// start, `config check` for the command of that name, `reload` for a reading of the file again. A refusal is a line,
+/// and its exit code is the error.
+pub(super) fn read_parts(path: &Path, name: &str, log: &Log) -> Result<Parts, u8> {
     let loaded = match config::load(path) {
         Ok(loaded) => loaded,
         Err(e) => {
@@ -188,6 +216,7 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         }
     };
     log.line(&format!("{name}: configuration accepted"));
+    let fixed = Fixed::of(&loaded);
     // A server may not have an address the proxy listens on, the one of the status listener included.
     let mut listening = addresses(&loaded.proxy.listeners);
     listening.extend(loaded.status.map(|status| status.listen));
@@ -214,7 +243,28 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         log.line(&format!("{name}: tls certificate not issued yet ({place})"));
     }
     let challenge = Challenge::new(loaded.acme.as_ref(), &loaded.proxy.listeners);
-    let rules = match store::open(&loaded.store) {
+    Ok(Parts {
+        proxy: loaded.proxy,
+        forward,
+        tls,
+        challenge,
+        kernel: loaded.kernel,
+        store: loaded.store,
+        status: loaded.status,
+        records: loaded.records,
+        admin: loaded.admin,
+        policy: loaded.policy,
+        fixed,
+        sha256: loaded.sha256,
+    })
+}
+
+/// The steps of start-up from the configuration to the kernel configuration of the chosen generation, the hold on it
+/// included. `name` is at the head of each line: `start` for the start, `config check` for the command of that name.
+/// A refusal is a line, and its exit code is the error.
+fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
+    let parts = read_parts(path, name, log)?;
+    let rules = match store::open(&parts.store) {
         Ok(rules) => rules,
         Err(e) => {
             log.line(&format!("{name}: rules store refused: {}", e.0));
@@ -271,7 +321,7 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
             return Err(EXIT_FAILED);
         }
     };
-    let kernel = match loaded.kernel.for_generation(dir, generation, engine) {
+    let kernel = match parts.kernel.for_generation(dir, generation, engine) {
         Ok(kernel) => kernel,
         Err(e) => {
             log.line(&format!("{name}: rules generation refused: {}", e.0));
@@ -283,19 +333,20 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
     log.line(&format!("{name}: rules mode {}", mode.name()));
     log.line(&format!("{name}: rules routes {}", routes.len()));
     Ok(Prepared {
-        proxy: loaded.proxy,
-        forward,
-        tls,
-        challenge,
+        proxy: parts.proxy,
+        forward: parts.forward,
+        tls: parts.tls,
+        challenge: parts.challenge,
         kernel,
         generation,
         mode,
         routes,
-        switcher: Switcher::new(rules, loaded.kernel, generation, hold),
-        status: loaded.status,
-        records: loaded.records,
-        admin: loaded.admin,
-        policy: loaded.policy,
+        switcher: Switcher::new(rules, parts.kernel, generation, hold),
+        status: parts.status,
+        records: parts.records,
+        admin: parts.admin,
+        policy: parts.policy,
+        fixed: parts.fixed,
     })
 }
 

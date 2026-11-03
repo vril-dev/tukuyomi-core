@@ -1,4 +1,5 @@
 use super::*;
+use crate::run::stop::Cause;
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 
@@ -78,5 +79,28 @@ fn a_wait_returns_the_answer_to_a_switch_once() {
             f.waits.wait(after(2000)).await,
             Event::Lost(Source::Switch)
         ));
+    });
+}
+
+#[test]
+fn a_wait_returns_the_answer_of_a_configuration_reload_once_and_a_lost_answer_is_no_cause_of_a_stop()
+ {
+    runtime().block_on(async {
+        let mut f = fixture();
+        let (reply, told) = oneshot::channel();
+        f.waits.config = Some(told);
+        assert!(reply.send(None).is_ok());
+        assert!(matches!(
+            f.waits.wait(after(2000)).await,
+            Event::Configured(None)
+        ));
+        assert!(matches!(f.waits.wait(after(30)).await, Event::Late));
+
+        let (reply, told) = oneshot::channel::<Option<Box<Parts>>>();
+        f.waits.config = Some(told);
+        drop(reply);
+        let event = f.waits.wait(after(2000)).await;
+        assert!(matches!(event, Event::ConfigurationLost));
+        assert!(Cause::of(event).is_none());
     });
 }

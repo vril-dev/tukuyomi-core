@@ -8,16 +8,15 @@
 //! failures are not counted), `fail_timeout_ms` is the time a failing server is left out, and `backup` tells that the
 //! server is used only when no other one can be. An IP literal is not the address of a listener, the status listener
 //! included (nor a loopback address at the port of one, if that is an unspecified address), and is not unspecified or
-//! a multicast address. A
-//! name is 1 to 253 bytes of lowercase letters, digits, `-`, `_` and `.`, in labels of 1 to 63 bytes of which the last
-//! starts with a letter (an OS takes `127.1` or `0x7f000001` for an address, not for a name); the port is 1 to 65535
-//! without a leading zero. The configuration does not look a name up: that is done once, when the proxy starts (see
-//! `forward::resolve`), and each address of a name is a server of the group.
-//! `tls` of a group is `{"ca_file", "server_name"?}`: every server of the group is then reached over TLS, and its
-//! certificate is checked against the authorities in `ca_file` (see `forward::tls`). `ca_file` is an absolute clean
-//! path of at most 3840 bytes; the file is not read here. `server_name` is a name of the form of a server name, and
-//! TLS has to be able to use it; without it each server is checked for its own name (so every name of a server of such
-//! a group must be one TLS can use), or, written as an IP literal, for its address.
+//! a multicast address. A name is 1 to 253 bytes of lowercase letters, digits, `-`, `_` and `.`, in labels of 1 to 63
+//! bytes of which the last starts with a letter (an OS takes `127.1` or `0x7f000001` for an address, not for a name);
+//! the port is 1 to 65535 without a leading zero. The configuration does not look a name up: that is done when the
+//! proxy starts and each time it reads the file again (see `forward::resolve`), and each address of a name is a
+//! server of the group. `tls` of a group is `{"ca_file", "server_name"?}`: every server of the group is then reached
+//! over TLS, and its certificate is checked against the authorities in `ca_file` (see `forward::tls`). `ca_file` is
+//! an absolute clean path of at most 3840 bytes; the file is not read here. `server_name` is a name of the form of a
+//! server name, and TLS has to be able to use it; without it each server is checked for its own name (so every name
+//! of a server of such a group must be one TLS can use), or, written as an IP literal, for its address.
 //! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?,
 //! "records"?}`.
 //! The `host` and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access`
@@ -65,7 +64,7 @@ const MAX_NAME: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Address {
     Literal(SocketAddr),
-    /// A name, which is looked up when the proxy starts, and a port.
+    /// A name, which is looked up when the proxy starts and each time it reads the file again, and a port.
     Name {
         name: String,
         port: u16,

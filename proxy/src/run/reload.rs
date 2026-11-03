@@ -1,6 +1,11 @@
 //! SIGUSR1 and SIGUSR2: the switch to the generation that the rules store chooses now, and the reading of the
 //! certificate and key files again. The orders of the control socket are carried out here too: a status is
 //! answered, and a switch is the switch of SIGUSR1 once the store chooses the generation that the order expects.
+//! SIGHUP, the reading of the configuration file again, is in `config`, with the values that it may not change in
+//! `fixed`.
+
+mod config;
+mod fixed;
 
 use std::sync::mpsc::SyncSender;
 
@@ -15,6 +20,9 @@ use crate::log::Log;
 use crate::log::counters::{Counters, ReloadResult, SwitchResult};
 use crate::rules::bundle::Fingerprint;
 use crate::rules::switch::{Next, Switcher};
+
+pub(super) use config::Reloader;
+pub(super) use fixed::Fixed;
 
 /// What a try to switch came to.
 enum Begun {

@@ -22,7 +22,7 @@ fn reusing() -> Knobs {
 }
 
 /// Reads one response with a `Content-Length` from a connection that stays open: its head and exactly its body.
-fn read_response(sock: &mut TcpStream) -> Message {
+pub(crate) fn read_response(sock: &mut TcpStream) -> Message {
     sock.set_read_timeout(Some(30 * SEC))
         .expect("set the read timeout");
     let mut raw = Vec::new();

@@ -60,7 +60,8 @@ fn digit(c: u8) -> Option<u8> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// The lowercase hexadecimal digits of `bytes`.
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

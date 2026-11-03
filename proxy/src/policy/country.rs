@@ -9,11 +9,11 @@
 //! address is looked at as the IPv4 address it holds. The country comes only from the address that
 //! `forward::client_ip` finds for the client, never from a header of the client.
 //!
-//! `Geo::open` checks a database whole when the proxy starts: the tree and the metadata (see `mmdb`), and then every
-//! record that the tree leads to, which `mmdb::Value::check` must accept and which must be a map, with a map for its
-//! `country` and its `registered_country` if it has them. A database needs `Country` in its `database_type`, or else at
-//! least one record with an ISO code, so that a database of something else (the networks of providers, say) is not
-//! taken for one of countries.
+//! `Geo::open` checks a database whole when the proxy starts and each time it reads the configuration file again: the
+//! tree and the metadata (see `mmdb`), and then every record that the tree leads to, which `mmdb::Value::check` must
+//! accept and which must be a map, with a map for its `country` and its `registered_country` if it has them. A
+//! database needs `Country` in its `database_type`, or else at least one record with an ISO code, so that a database
+//! of something else (the networks of providers, say) is not taken for one of countries.
 
 use std::fmt;
 use std::net::IpAddr;

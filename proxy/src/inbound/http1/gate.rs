@@ -223,6 +223,20 @@ impl Link {
         self.lock().waiting
     }
 
+    /// The connection was kept after a response and waits for a next request: a response is complete, and `waiting`.
+    pub fn kept(&self) -> bool {
+        let shared = self.lock();
+        shared.waiting && shared.completed > 0
+    }
+
+    /// A request was passed, hyper has taken it, and its response is not complete. A head that is still in the queue
+    /// is not counted: hyper may not have read it yet.
+    pub fn answering(&self) -> bool {
+        let shared = self.lock();
+        let queued = u64::try_from(shared.queue.len()).unwrap_or(u64::MAX);
+        shared.released.saturating_sub(shared.completed) > queued
+    }
+
     /// A head with an `Upgrade` line was passed, so no more heads come: the connection ends after the response to
     /// it, or becomes a tunnel.
     pub fn last(&self) -> bool {

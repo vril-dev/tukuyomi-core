@@ -48,6 +48,7 @@ mod modsecurity;
 mod policy;
 mod records;
 mod refusals;
+mod reload;
 mod rewrite;
 mod rules;
 mod status;

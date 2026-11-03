@@ -2,9 +2,10 @@
 //! {..}}, "acme": {..}, "status": {..}, "records": {..}, "access": {..}, "rate_limit": {..}, "geo": {..}, "admin":
 //! {..}}`; every value is chosen by the operator and checked here.
 //!
-//! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs. Every key must be present (a
-//! route may leave out its `host`, its `path`, its `access`, its `rewrite`, its `stream` and its `max_body`; `access`
-//! and `rewrite` have no key that must be present, see `rewrite`, and a `stream` has all three; an upstream group may leave out its
+//! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs; the result keeps the
+//! SHA-256 of the bytes that were read. Every key must be present (a route may leave out its `host`, its `path`,
+//! its `access`, its `rewrite`, its `stream` and its `max_body`; `access` and `rewrite` have no key that must be
+//! present, see `rewrite`, and a `stream` has all three; an upstream group may leave out its
 //! `tls`, which may leave out its `server_name`; a listener may leave out its `tls` and its `redirect`, and the `tls`
 //! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
 //! may leave out `acme`, which it must have if and only if a certificate has one, see `acme`, and `status`, which
@@ -61,6 +62,7 @@ use tukuyomi_kernel::Engine;
 use tukuyomi_kernel::limits::{BODY, HEADER_TOTAL};
 
 use crate::forward::client_ip::Cidr;
+use crate::rules::bundle::sha256;
 
 mod acme;
 mod admin;
@@ -182,6 +184,8 @@ pub struct Loaded {
     pub policy: PolicyConfig,
     /// There if the file has the `admin` object.
     pub admin: Option<AdminConfig>,
+    /// The SHA-256 of the bytes that were read: what the running proxy shows of the file it follows.
+    pub sha256: [u8; 32],
 }
 
 /// Where the rule generations are kept, as the file names it.
@@ -359,7 +363,7 @@ fn parse(bytes: &[u8]) -> Result<Loaded, ConfigError> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| ConfigError("configuration file is not UTF-8"))?;
     let Object(file): Object<RawFile> = serde_json::from_str(text).map_err(|e| refusal(&e))?;
-    build(file)
+    build(file, sha256(bytes))
 }
 
 /// The fixed sentence for a deserialization fault. The text of the fault is only used to tell the kinds apart.
@@ -457,7 +461,7 @@ fn inspect_floor(kernel: &tukuyomi_kernel::Config, slice: Duration) -> Option<Du
         .checked_add(steps)
 }
 
-fn build(file: RawFile) -> Result<Loaded, ConfigError> {
+fn build(file: RawFile, sha256: [u8; 32]) -> Result<Loaded, ConfigError> {
     let RawFile {
         proxy: Object(p),
         forward: Object(f),
@@ -762,6 +766,7 @@ fn build(file: RawFile) -> Result<Loaded, ConfigError> {
         records,
         policy,
         admin,
+        sha256,
     })
 }
 

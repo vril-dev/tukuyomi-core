@@ -138,3 +138,41 @@ fn the_extremes_of_rate_and_burst_and_of_the_clock_do_not_overflow() {
         }
     }
 }
+
+#[test]
+fn a_limit_that_follows_another_counting_the_same_way_goes_on_with_its_clients_and_one_that_does_not_starts_empty()
+ {
+    let config = |rate: u32, burst: u32, keys: usize, exempt: &[&str]| RateLimitConfig {
+        rate,
+        burst,
+        keys,
+        exempt: exempt.iter().map(|net| Cidr::parse(net).unwrap()).collect(),
+    };
+    let first = RateLimit::new(&config(1, 0, 1024, &[]));
+    let client = ip("192.0.2.1");
+    assert_eq!(first.admit_at(client, 0), Ok(()));
+    assert_eq!(first.admit_at(client, 0), Err(1));
+
+    // The same keys, rate and burst: the client is still counted, and has used its turn.
+    let same =
+        RateLimit::following(&config(1, 0, 1024, &[]), &first).expect("the same way of counting");
+    assert!(same.continues(&first));
+    assert_eq!(same.keys(), 1);
+    assert_eq!(same.admit_at(client, 0), Err(1));
+    // The networks that are exempt are those of the new configuration.
+    let exempt = RateLimit::following(&config(1, 0, 1024, &["192.0.2.0/24"]), &first).unwrap();
+    assert_eq!(exempt.admit_at(client, 0), Ok(()));
+
+    // Another number of keys, another rate or another burst: the table is not carried, and a new limit has no client.
+    for other in [
+        config(1, 0, 2048, &[]),
+        config(100, 0, 1024, &[]),
+        config(1, 100, 1024, &[]),
+    ] {
+        assert!(RateLimit::following(&other, &first).is_none());
+    }
+    let anew = RateLimit::new(&config(100, 0, 1024, &[]));
+    assert!(!anew.continues(&first));
+    assert_eq!(anew.keys(), 0);
+    assert_eq!(anew.admit_at(client, 0), Ok(()));
+}

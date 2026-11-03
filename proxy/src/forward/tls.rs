@@ -1,13 +1,14 @@
 //! TLS to the servers of an upstream group.
 //!
 //! A group may have `tls`, `{"ca_file", "server_name"?}` (see `config`). Every server of such a group is reached
-//! over TLS, and the certificate of the server is always checked: there is no way to turn that off. The only roots
-//! of trust are the certificates of `ca_file`, a regular file of at most 1 MiB that holds 1 to 100 certificates in
-//! PEM, each of which must be usable as a trust anchor. The file is read once, when the proxy starts (see
-//! `resolve`), and never again. A server is checked for `server_name` if the group has one, else for the name it is
-//! written with, else, if it is written as an IP literal, for that address. The name is also what the server is told
-//! to be reached by (the server name of TLS), unless it is an address. TLS 1.2 and 1.3 are spoken, `http/1.1` is the
-//! only protocol of ALPN, no certificate is sent, and the resuming of sessions is what rustls does by default: the
+//! over TLS, and the certificate of the server is always checked: there is no way to turn that off. The only
+//! roots of trust are the certificates of `ca_file`, a regular file of at most 1 MiB that holds 1 to 100
+//! certificates in PEM, each of which must be usable as a trust anchor. The file is read when the proxy starts
+//! and each time it reads the configuration file again (see `resolve`), and not between: SIGUSR2 does not read
+//! it. A server is checked for `server_name` if the group has one, else for the name it is written with, else,
+//! if it is written as an IP literal, for that address. The name is also what the server is told to be reached
+//! by (the server name of TLS), unless it is an address. TLS 1.2 and 1.3 are spoken, `http/1.1` is the only
+//! protocol of ALPN, no certificate is sent, and the resuming of sessions is what rustls does by default: the
 //! servers of a group share one configuration and so their sessions.
 //!
 //! The settings are made into a `Client` when the names of the servers are looked up: the configuration of TLS, and

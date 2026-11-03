@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use tukuyomi_kernel::{Engine, Reason};
 
 use super::*;
-use crate::log::counters::{Policy, RuleHit};
+use crate::log::counters::{Policy, ReloadResult, RuleHit};
 use crate::log::ship::Unshipped;
 use crate::rules::bundle::{Fingerprint, Mode};
 
@@ -56,6 +56,7 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
     counters.add_rule_hit(RuleHit::Block);
     counters.add_uninspectable(Reason::InspectorLost);
     counters.add_policy_refusal(Policy::Access);
+    counters.add_config_reload(ReloadResult::Refused);
     counters.accepted.add();
     counters.records_refused.add();
     counters.records_refused.add();
@@ -80,8 +81,8 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
             samples += 1;
         }
     }
-    assert_eq!(families.len(), 26);
-    assert!(samples >= 26, "{samples}");
+    assert_eq!(families.len(), 27);
+    assert!(samples >= 27, "{samples}");
 
     for line in [
         "tukuyomi_requests_total{class=\"forwarded\"} 1",
@@ -91,6 +92,8 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
         "tukuyomi_uninspectable_total{reason=\"inspector_lost\"} 1",
         "tukuyomi_policy_refusals_total{policy=\"access\"} 1",
         "tukuyomi_policy_refusals_total{policy=\"rate_limit\"} 0",
+        "tukuyomi_config_reloads_total{result=\"replaced\"} 0",
+        "tukuyomi_config_reloads_total{result=\"refused\"} 1",
         "tukuyomi_rate_limit_keys 12",
         "tukuyomi_rate_limit_evicted_total 13",
         "tukuyomi_connections_accepted_total 1",

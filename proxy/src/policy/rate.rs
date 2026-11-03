@@ -31,10 +31,16 @@
 //!
 //! The table is behind a `std::sync::Mutex` in the setup that the connections hold. The runtime of the
 //! connections has one thread, so the lock is not contended; it is held for constant work and never across an await.
+//! When the configuration is read again and its `keys`, `rate` and `burst` are the same, the new limit uses the table
+//! and the time of the old one (`RateLimit::following`), so the clients that are counted go on being counted; the
+//! networks that are exempt are those of the new configuration. A number is a time counted with the `gap` and the
+//! `tolerance` of the limit that set it, so with another rate or burst it would keep a debt that the new values do not
+//! give (a client that made 101 requests at a rate of 1 and a burst of 100 would be refused for about 100 seconds at a
+//! rate of 100): the new limit then counts from nothing, as after a start.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use crate::config::RateLimitConfig;
@@ -210,18 +216,47 @@ pub struct RateLimit {
     tolerance: u64,
     /// The time that every number is counted from.
     start: Instant,
-    table: Mutex<Table>,
+    table: Arc<Mutex<Table>>,
 }
 
 impl RateLimit {
     pub fn new(config: &RateLimitConfig) -> RateLimit {
+        RateLimit::with(
+            config,
+            Instant::now(),
+            Arc::new(Mutex::new(Table::new(config.keys))),
+        )
+    }
+
+    /// The limit of `config` that goes on counting the clients of `earlier`, with its table and its time, and with the
+    /// networks that are exempt in `config`. `None` unless it counts as `earlier` does: the table holds as many
+    /// clients as `config.keys` says, and the gap and the tolerance, which a number is counted with, are the same.
+    pub fn following(config: &RateLimitConfig, earlier: &RateLimit) -> Option<RateLimit> {
+        let room = earlier
+            .table
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .max;
+        let limit = RateLimit::with(config, earlier.start, Arc::clone(&earlier.table));
+        (room == config.keys.max(1)
+            && limit.gap == earlier.gap
+            && limit.tolerance == earlier.tolerance)
+            .then_some(limit)
+    }
+
+    /// Whether this limit counts the clients of `earlier`: the two have the table in common.
+    pub fn continues(&self, earlier: &RateLimit) -> bool {
+        Arc::ptr_eq(&self.table, &earlier.table)
+    }
+
+    fn with(config: &RateLimitConfig, start: Instant, table: Arc<Mutex<Table>>) -> RateLimit {
         let gap = NANOS.div_ceil(u64::from(config.rate).max(1));
         RateLimit {
             exempt: config.exempt.clone(),
             gap,
             tolerance: u64::from(config.burst).saturating_mul(gap),
-            start: Instant::now(),
-            table: Mutex::new(Table::new(config.keys)),
+            start,
+            table,
         }
     }
 

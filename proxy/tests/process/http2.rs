@@ -53,8 +53,8 @@ pub(crate) fn add_listener(root: &Path, port: u16, files: &(PathBuf, PathBuf)) {
 
 /// One connection of an HTTP/2 client, with the runtime that drives it.
 pub(crate) struct Client {
-    runtime: Runtime,
-    send: SendRequest<Full<Bytes>>,
+    pub(crate) runtime: Runtime,
+    pub(crate) send: SendRequest<Full<Bytes>>,
 }
 
 impl Client {

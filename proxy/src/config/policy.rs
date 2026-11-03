@@ -13,13 +13,15 @@
 //! - `exempt_cidrs` is a list of at most 256 networks (written as for `trusted_proxies`) whose requests are not
 //!   counted at all, such as a monitoring tool; left out, it is empty.
 //!
-//! `geo` is `{"country_db", "sha256"}`, both present: the country database that the lists of countries need (see
-//! `policy::country`). `country_db` is an absolute clean path of a file in the MaxMind DB format, and `sha256` is the
-//! SHA-256 of that file as 64 lower-case hexadecimal digits. A list of countries in `access`, here or in a route, needs
-//! `geo`; without it the file is refused. `GeoConfig::open` reads the file when the proxy starts (`config::load` calls
-//! it, so `config check` does too): a regular file that is not a link, at most 256 MiB, read whole, whose SHA-256 is the
-//! one written here, and which `policy::country::Geo::open` accepts. The database is kept only if some list of
-//! countries is there to use it. It is not read again: to change it, start the proxy again.
+//! `geo` is `{"country_db", "sha256"}`, both present: the country database that the lists of countries need
+//! (see `policy::country`). `country_db` is an absolute clean path of a file in the MaxMind DB format, and
+//! `sha256` is the SHA-256 of that file as 64 lower-case hexadecimal digits. A list of countries in `access`,
+//! here or in a route, needs `geo`; without it the file is refused. `GeoConfig::open` reads the file when the
+//! proxy starts and each time it reads the configuration file again (`config::load` calls it, so `config check`
+//! does too): a regular file that is not a link, at most 256 MiB, read whole, whose SHA-256 is the one written
+//! here, and which `policy::country::Geo::open` accepts. The database is kept only if some list of countries is
+//! there to use it. It is not read between: to change it, write the SHA-256 of the new file in the
+//! configuration file, and have the proxy read that file again.
 //!
 //! The address that counts is the client of the request, as `forward::client_ip` finds it: the peer, or what a
 //! trusted proxy says in `X-Forwarded-For`.

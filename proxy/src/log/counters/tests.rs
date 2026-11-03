@@ -31,6 +31,7 @@ fn a_label_outside_its_list_is_not_counted() {
     counters.add_rule_hit(RuleHit::Detect);
     counters.add_switch(SwitchResult::Refused);
     counters.add_reload(ReloadResult::Replaced);
+    counters.add_config_reload(ReloadResult::Refused);
     let requests = counters.requests.samples();
     assert_eq!(requests[0], ("forwarded", 2));
     assert_eq!(requests.iter().map(|&(_, count)| count).sum::<u64>(), 2);
@@ -42,6 +43,10 @@ fn a_label_outside_its_list_is_not_counted() {
     assert_eq!(
         counters.reloads.samples(),
         [("replaced", 1), ("refused", 0)]
+    );
+    assert_eq!(
+        counters.config_reloads.samples(),
+        [("replaced", 0), ("refused", 1)]
     );
     assert_eq!(
         (counters.accepted.get(), counters.tls_failures.get()),
