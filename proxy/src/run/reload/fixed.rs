@@ -2,17 +2,16 @@
 //!
 //! They are the sizes and the times that the main loop, the byte budget and the driver took at the start
 //! (`proxy.max_conns`, `max_buffered_bytes`, `drive_slice_ms`, `ready_wait_ms`, `stop_inspect_ms` and
-//! `stop_wait_ms`), the addresses the proxy listens on (their number, their order and each address), and the objects
-//! that the other processes read from the same file when they start: `records` (everything but its `keep`, which each
-//! setup has of its own), `status`, `admin`, `rules.store` and `kernel`. A file that has another value for one of them
-//! is refused whole, and the refusal names the first of them, in this order, by its place in the file. It never shows
-//! a value.
+//! `stop_wait_ms`), and the objects that the other processes read from the same file when they start: `records`
+//! (everything but its `keep`, which each setup has of its own), `status`, `admin`, `rules.store` and `kernel`. A file
+//! that has another value for one of them is refused whole, and the refusal names the first of them, in this order, by
+//! its place in the file. It never shows a value. The listeners are not among them: a file may add, remove and reorder
+//! them (see `config`).
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::config::{
-    AdminConfig, Keep, KernelSettings, Loaded, Records, StatusConfig, StoreConfig, addresses,
+    AdminConfig, Keep, KernelSettings, Loaded, Records, StatusConfig, StoreConfig,
 };
 
 /// The values of one configuration file that a reading of the file again may not change.
@@ -23,7 +22,6 @@ pub(in crate::run) struct Fixed {
     ready_wait: Duration,
     stop_inspect: Duration,
     stop_wait: Duration,
-    listeners: Vec<SocketAddr>,
     /// With `keep` made the same in every file, so that a file that differs in nothing else is the same.
     records: Option<Records>,
     status: Option<StatusConfig>,
@@ -43,7 +41,6 @@ impl Fixed {
             ready_wait: proxy.ready_wait,
             stop_inspect: proxy.stop_inspect,
             stop_wait: proxy.stop_wait,
-            listeners: addresses(&proxy.listeners),
             records: loaded.records.clone().map(|records| Records {
                 keep: Keep::BestEffort,
                 ..records
@@ -73,7 +70,6 @@ impl Fixed {
                 self.stop_inspect == other.stop_inspect,
             ),
             ("proxy.stop_wait_ms", self.stop_wait == other.stop_wait),
-            ("proxy.listeners", self.listeners == other.listeners),
             ("records", self.records == other.records),
             ("status", self.status == other.status),
             ("admin", self.admin == other.admin),

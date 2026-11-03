@@ -3,11 +3,11 @@
 //! The configuration file of a test is written again before the signal: the second upstream of the test stands for the
 //! new target of the route, the first for the old one. The status listener is added so that `/readyz` and `/metrics`
 //! can be asked. The connections that wait are kept (`keepalive_timeout_ms`), and a request that is under way is a slow
-//! inspection (see `main`).
+//! inspection (see `main`). The tests of the listeners change the listeners of the file instead.
 
 use std::fs;
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::sync::mpsc::TryRecvError;
 use std::thread;
@@ -97,6 +97,28 @@ fn start(test: &str, knobs: Knobs) -> (Proxy, u16) {
         );
     });
     (proxy, status)
+}
+
+/// Adds a plain listener at `port` to the listeners of the configuration.
+fn add_plain(config: &mut Value, port: u16) {
+    config["proxy"]["listeners"]
+        .as_array_mut()
+        .expect("the listeners")
+        .push(json!({ "address": format!("127.0.0.1:{port}") }));
+}
+
+/// A proxy with the status listener and a second plain listener, and the ports of the two.
+fn start_two(test: &str, knobs: Knobs) -> (Proxy, u16, u16) {
+    let (status, second) = (free_port(), free_port());
+    let proxy = Proxy::start_with(test, knobs, |root| {
+        add_object(
+            root,
+            "status",
+            json!({ "listen": format!("127.0.0.1:{status}") }),
+        );
+        rewrite(root, |config| add_plain(config, second));
+    });
+    (proxy, status, second)
 }
 
 #[test]
@@ -293,4 +315,120 @@ fn an_h2_connection_gets_a_goaway_at_sighup_and_a_stream_that_is_open_still_gets
     drop(client);
     assert!(alive(&proxy));
     proxy.finish(1);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_listener_that_is_added_answers_and_the_one_before_it_goes_on_answering() {
+    let (proxy, status) = start("reload_add_listener", Knobs::quick());
+    let added = free_port();
+    rewrite(proxy.root(), |config| add_plain(config, added));
+    proxy.signal("HUP");
+    proxy.records.wait_lines("the replacement", 1, |l| {
+        l.starts_with("reload: configuration replaced ")
+    });
+
+    assert_eq!(exchange(added, &get("/added")).status(), 200);
+    assert_eq!(exchange(proxy.port, &get("/before")).status(), 200);
+    assert_eq!(proxy.upstream.requests().len(), 2);
+    assert_eq!(reloads(status, "replaced"), "1");
+    assert_eq!(reloads(status, "refused"), "0");
+    proxy.finish(2);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_listener_that_is_removed_turns_new_connections_away_and_answers_the_request_begun_on_it() {
+    let (proxy, status, second) = start_two("reload_remove_listener", Knobs::slow());
+    // The request is being inspected, which takes seconds, on the first listener, which the file leaves out.
+    let mut sock = proxy.start_slow(&post_form("/submit", &padded_form("ok", MAX_BODY)));
+    rewrite(proxy.root(), |config| {
+        config["proxy"]["listeners"] = json!([{ "address": format!("127.0.0.1:{second}") }]);
+    });
+    proxy.signal("HUP");
+    proxy.records.wait_lines("the replacement", 1, |l| {
+        l.starts_with("reload: configuration replaced ")
+    });
+    assert_eq!(reloads(status, "replaced"), "1");
+
+    // The address that is gone turns new connections away, and the one that stays answers, now as the first.
+    assert_turned_away(proxy.port);
+    assert_eq!(exchange(second, &get("/still")).status(), 200);
+    // The request that began before gets its answer on its connection, which is closed after it.
+    let answer = read_response(&mut sock);
+    assert_eq!(answer.status(), 200, "answer: {:?}", answer.start);
+    assert_eq!(answer.body, UPSTREAM_BODY.as_bytes());
+    assert!(read_to_close(&mut sock).is_empty());
+    proxy.finish(2);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn an_address_that_cannot_be_bound_refuses_the_whole_file_and_nothing_is_replaced() {
+    let knobs = Knobs {
+        upstreams: 2,
+        ..Knobs::quick()
+    };
+    let (proxy, status, second) = start_two("reload_unbindable", knobs);
+    // Something else holds the last address of the file; the address before it can be bound.
+    let held = TcpListener::bind("127.0.0.1:0").expect("bind the address to hold");
+    let held_port = held.local_addr().expect("the held address").port();
+    let (free, other) = (free_port(), proxy.others[0].addr());
+    rewrite(proxy.root(), |config| {
+        point_at(config, other);
+        add_plain(config, free);
+        add_plain(config, held_port);
+    });
+    proxy.signal("HUP");
+    proxy.records.wait_lines("the refusal", 1, |l| {
+        l == "reload: configuration refused: listener 4 cannot be bound"
+    });
+
+    assert!(alive(&proxy));
+    assert_eq!(reloads(status, "refused"), "1");
+    assert_eq!(reloads(status, "replaced"), "0");
+    // The address that was bound before the one that failed is closed again.
+    TcpListener::bind(("127.0.0.1", free)).expect("the address is free again");
+    // The addresses of the file that runs answer, and the old target serves.
+    assert_eq!(exchange(proxy.port, &get("/first")).status(), 200);
+    assert_eq!(exchange(second, &get("/second")).status(), 200);
+    assert_eq!(proxy.upstream.requests().len(), 2);
+    assert!(proxy.others[0].requests().is_empty());
+    drop(held);
+    proxy.finish(2);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn listeners_in_another_order_answer_each_as_its_own_plain_or_tls_listener() {
+    let mut pki = Pki::new("reload_swap_listeners");
+    let files = pki.issue("a", &["a.example", "*.a.example"]);
+    let (tls, status) = (free_port(), free_port());
+    let proxy = Proxy::start_with("reload_swap_listeners", Knobs::quick(), |root| {
+        add_object(
+            root,
+            "status",
+            json!({ "listen": format!("127.0.0.1:{status}") }),
+        );
+        add_listener(root, tls, &files);
+    });
+    // The plain listener is the first of the file and the one that ends TLS the second; the file turns them round.
+    rewrite(proxy.root(), |config| {
+        config["proxy"]["listeners"]
+            .as_array_mut()
+            .expect("the listeners")
+            .reverse();
+    });
+    proxy.signal("HUP");
+    proxy.records.wait_lines("the replacement", 1, |l| {
+        l.starts_with("reload: configuration replaced ")
+    });
+
+    assert_eq!(exchange(proxy.port, &get("/plain")).status(), 200);
+    let mut client = Client::connect(&pki, tls);
+    assert_eq!(client.get_fields("/tls").0, 200);
+    drop(client);
+    assert_eq!(reloads(status, "replaced"), "1");
+    assert_eq!(reloads(status, "refused"), "0");
+    proxy.finish(2);
 }

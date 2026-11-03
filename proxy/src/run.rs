@@ -41,29 +41,37 @@
 //! before they are a generation), that the listeners and the status address can be bound, that the record file can
 //! be opened and that the control socket can be bound.
 //!
-//! SIGHUP reads the configuration file again, the one the proxy was started with, on a thread of its own: the steps
-//! of the start before the rules store, with their lines headed `reload:`. When the file passes them, and none of the
-//! values that cannot change while the proxy runs differs from the ones it had at the start, the proxy makes a setup
-//! of it and puts it in the place of the old one in a single step. Those values are `proxy.max_conns`,
-//! `max_buffered_bytes`, `drive_slice_ms`, `ready_wait_ms`, `stop_inspect_ms` and `stop_wait_ms`, the addresses of
-//! the listeners (their number, their order and each address), `records` but for its `keep`, `status`, `admin`,
-//! `rules.store` and `kernel`. A setup is what the configuration gives the connections: the other values of `proxy`,
-//! the upstream groups and the routes to them (the names of the servers are looked up again, and the CA files of the
-//! groups that have `tls` are read again), the TLS of the listeners with the hosts of their certificates (the
-//! certificate and key files are read again) and the answer to the challenge of the CA, the `access`, the
-//! `rate_limit` and the country database (see `policy`), and the `records.keep`. A connection that starts after that
-//! takes the new setup. A connection that is open keeps the setup it started with for its requests, and is wound
+//! SIGHUP reads the configuration file again, the one the proxy was started with, on a thread of its own: the steps of
+//! the start before the rules store, with their lines headed `reload:`. When the file passes them, and none of the
+//! values that cannot change while the proxy runs differs from the ones it had at the start, the proxy binds the
+//! addresses of the listeners that are new, makes a setup of the file and puts it in the place of the old one in a
+//! single step, with the listeners put in the order of the file. Those values are `proxy.max_conns`,
+//! `max_buffered_bytes`, `drive_slice_ms`, `ready_wait_ms`, `stop_inspect_ms`, `stop_wait_ms`, `records` but for its
+//! `keep`, `status`, `admin`, `rules.store` and `kernel`. A setup is what the configuration gives the connections: the
+//! other values of `proxy`, the upstream groups and the routes to them (the names of the servers are looked up again,
+//! and the CA files of the groups that have `tls` are read again), the TLS of the listeners with the hosts of their
+//! certificates (the certificate and key files are read again) and the answer to the challenge of the CA, the `access`,
+//! the `rate_limit` and the country database (see `policy`), and the `records.keep`. A connection that starts after
+//! that takes the new setup. A connection that is open keeps the setup it started with for its requests, and is wound
 //! down: an HTTP/1.1 connection that waits for its next request is closed, one with a request under way, or with part
-//! of the head of the next one, is closed after its response, and an HTTP/2 connection is told with a `GOAWAY` and
-//! ends when its open streams are done. No request is turned away for that. A tunnel (a WebSocket that the proxy
-//! copies) and a response of a route with a `stream` go on until their own time. The clients that the rate limit
-//! counts go on being counted when the old and the new configuration both have a `rate_limit` with the same `keys`,
-//! `rate` and `burst`; otherwise the new limit counts from nothing, and a line says so. The rules store is not read,
-//! and the generation that serves is not touched. A file that is refused anywhere (it is not valid, a name cannot be
-//! looked up, a certificate or key file is refused, a value that cannot change differs) changes nothing, and a line
-//! says why. Both ends are counted in `tukuyomi_config_reloads_total`. SIGHUP is a line and nothing else while a
-//! reading is under way, before the listeners are bound and while the proxy stops. SIGUSR2 while a reading is under
-//! way reads the certificate files when the reading has ended, for the setup that is current then. A thread that
+//! of the head of the next one, is closed after its response, and an HTTP/2 connection is told with a `GOAWAY` and ends
+//! when its open streams are done. No request is turned away for that. A tunnel (a WebSocket that the proxy copies) and
+//! a response of a route with a `stream` go on until their own time. The clients that the rate limit counts go on being
+//! counted when the old and the new configuration both have a `rate_limit` with the same `keys`, `rate` and `burst`;
+//! otherwise the new limit counts from nothing, and a line says so. The listeners can be added, removed and put in
+//! another order. A listener whose address is still in the file keeps its socket, wherever it is now, so nobody is
+//! refused at it; the listener of a new address is bound before anything is replaced, all of them or none; the listener
+//! of an address that is gone is closed, which cuts the connections that have not started there (the ones still in the
+//! backlog of the system, and the one that waits for a permit), while a connection that is open goes on as above. An
+//! address that overlaps one in use, such as `127.0.0.1:8080` for `0.0.0.0:8080` (or the other way round), cannot be
+//! bound, and the file is refused: that change takes two readings, or a restart. An address written another way for the
+//! same socket, such as `[::ffff:127.0.0.1]:8080` for `127.0.0.1:8080`, counts as another address, cannot be bound
+//! while the first is in use, and so refuses the file like an overlap. The rules store is not read, and the generation
+//! that serves is not touched. A file that is refused anywhere (it is not valid, a name cannot be looked up, a
+//! certificate or key file is refused, a value that cannot change differs, an address cannot be bound) changes nothing,
+//! and a line says why. Both ends are counted in `tukuyomi_config_reloads_total`. SIGHUP is a line and nothing else
+//! while a reading is under way, before the listeners are bound and while the proxy stops. SIGUSR2 while a reading is
+//! under way reads the certificate files when the reading has ended, for the setup that is current then. A thread that
 //! cannot be started, or that ends without an answer, is a refusal and no cause of a stop; an answer that comes while
 //! the proxy stops is dropped.
 //!

@@ -1,6 +1,7 @@
 use std::future::poll_fn;
 use std::sync::mpsc::sync_channel;
 
+use tokio::io::AsyncReadExt;
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::timeout;
 
@@ -55,7 +56,7 @@ fn a_connection_permit_is_taken_before_accept_and_a_shortage_drains_the_idle() {
         let permits = Arc::new(Semaphore::new(1));
         let shared = ingress();
         let mut told = shared.drained();
-        let mut acceptor = Acceptor::new(vec![listener], permits.clone(), shared);
+        let mut acceptor = Acceptor::new(vec![(addr, listener)], permits.clone(), shared);
         let _first = TcpStream::connect(addr).await.unwrap();
         let _second = TcpStream::connect(addr).await.unwrap();
         let _third = TcpStream::connect(addr).await.unwrap();
@@ -88,7 +89,7 @@ fn the_listeners_share_the_permits_and_take_turns() {
         let permits = Arc::new(Semaphore::new(1));
         let shared = ingress();
         let mut told = shared.drained();
-        let mut acceptor = Acceptor::new(vec![a, b], permits.clone(), shared);
+        let mut acceptor = Acceptor::new(vec![(a_addr, a), (b_addr, b)], permits.clone(), shared);
         let _x = TcpStream::connect(b_addr).await.unwrap();
         let first = conn(&mut acceptor).await;
         assert_eq!(first.listener, 1);
@@ -114,7 +115,11 @@ fn the_listeners_share_the_permits_and_take_turns() {
 
         // With permits to spare, a listener with a long backlog does not keep the other one waiting.
         let ((a, a_addr), (b, b_addr)) = (listener().await, listener().await);
-        let mut acceptor = Acceptor::new(vec![a, b], Arc::new(Semaphore::new(8)), ingress());
+        let mut acceptor = Acceptor::new(
+            vec![(a_addr, a), (b_addr, b)],
+            Arc::new(Semaphore::new(8)),
+            ingress(),
+        );
         let mut keep = Vec::new();
         for _ in 0..3 {
             keep.push(TcpStream::connect(a_addr).await.unwrap());
@@ -146,5 +151,71 @@ fn the_first_address_that_cannot_be_bound_ends_the_bind() {
         assert_eq!(both.listeners.len(), 2);
         drop(taken);
         assert!(next(&mut both, 100).await.is_none());
+    });
+}
+
+#[test]
+fn an_address_that_stays_keeps_its_socket_and_the_connections_come_out_with_the_new_place() {
+    runtime().block_on(async {
+        let ((a, a_addr), (b, b_addr), (c, c_addr)) =
+            (listener().await, listener().await, listener().await);
+        let (_taken, taken_addr) = listener().await;
+        let mut acceptor = Acceptor::new(
+            vec![(a_addr, a), (b_addr, b)],
+            Arc::new(Semaphore::new(8)),
+            ingress(),
+        );
+        // Only an address that no listener is bound to is bound, and the place of the first one that cannot be
+        // bound is the result.
+        assert!(
+            acceptor
+                .bind_new(&[b_addr, a_addr])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            acceptor.bind_new(&[b_addr, taken_addr, a_addr]).await.err(),
+            Some(1)
+        );
+
+        // A connection that is in the backlog of an address that stays comes out of the same socket, at the place
+        // the address has now. `c` stands for the listener that was bound for an address that is new.
+        let _x = TcpStream::connect(a_addr).await.unwrap();
+        let _y = TcpStream::connect(b_addr).await.unwrap();
+        acceptor.arrange(&[b_addr, c_addr, a_addr], vec![(c_addr, c)]);
+        let _z = TcpStream::connect(c_addr).await.unwrap();
+        // Each connection is paired with the address it came in on.
+        let mut places = Vec::new();
+        for _ in 0..3 {
+            let arrival = conn(&mut acceptor).await;
+            places.push((arrival.sock.local_addr().unwrap(), arrival.listener));
+        }
+        places.sort();
+        let mut want = [(b_addr, 0), (c_addr, 1), (a_addr, 2)];
+        want.sort();
+        assert_eq!(places, want);
+    });
+}
+
+#[test]
+fn the_connection_that_waits_at_an_address_that_is_gone_is_closed_and_the_other_one_moves() {
+    runtime().block_on(async {
+        let ((a, a_addr), (b, b_addr)) = (listener().await, listener().await);
+        let permits = Arc::new(Semaphore::new(1));
+        let mut acceptor = Acceptor::new(vec![(a_addr, a), (b_addr, b)], permits, ingress());
+        let _client = TcpStream::connect(a_addr).await.unwrap();
+        let held = conn(&mut acceptor).await;
+        // The only permit is in use, so one connection waits at each listener.
+        let mut gone = TcpStream::connect(a_addr).await.unwrap();
+        let _stays = TcpStream::connect(b_addr).await.unwrap();
+        assert!(next(&mut acceptor, 150).await.is_none());
+
+        acceptor.arrange(&[b_addr], Vec::new());
+        let mut byte = [0u8; 1];
+        let read = timeout(Duration::from_secs(5), gone.read(&mut byte)).await;
+        assert_eq!(read.expect("the connection is closed").unwrap(), 0);
+        drop(held.permit);
+        assert_eq!(conn(&mut acceptor).await.listener, 0);
     });
 }

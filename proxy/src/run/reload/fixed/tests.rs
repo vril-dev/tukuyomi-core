@@ -53,18 +53,21 @@ fn a_file_with_another_value_that_cannot_change_is_refused_by_the_first_such_key
         c["records"]["keep"] = json!("required");
     });
     assert_eq!(running.first_difference(&required), None);
+    // So do a file with another address of the listener and a file with a listener more: the listeners may change.
+    let moved = fixed_after(&dir, "moved.json", |c| {
+        c["proxy"]["listeners"][0]["address"] = json!("127.0.0.1:8081");
+    });
+    assert_eq!(running.first_difference(&moved), None);
+    let added = fixed_after(&dir, "added.json", |c| {
+        c["proxy"]["listeners"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"address": "127.0.0.1:8082"}));
+    });
+    assert_eq!(running.first_difference(&added), None);
 
-    let cases: [(&str, Edit); 7] = [
+    let cases: [(&str, Edit); 5] = [
         ("proxy.max_conns", |c| c["proxy"]["max_conns"] = json!(2048)),
-        ("proxy.listeners", |c| {
-            c["proxy"]["listeners"][0]["address"] = json!("127.0.0.1:8081");
-        }),
-        ("proxy.listeners", |c| {
-            c["proxy"]["listeners"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"address": "127.0.0.1:8082"}));
-        }),
         ("records", |c| {
             c["records"]["dir"] = json!("/var/lib/tukuyomi/other-records");
         }),

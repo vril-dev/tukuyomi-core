@@ -13,11 +13,18 @@
 //! permits go to the waiting connections in turn, the listener after the last one served first. When the system runs
 //! out of descriptors, memory or buffers, the accepts pause for a while.
 //!
-//! The listeners are bound in the order of the configuration, and the first one that cannot be bound ends the
-//! start: the ones bound before it are closed.
+//! The listeners are bound in the order of the configuration, and the first one that cannot be bound ends the start:
+//! the ones bound before it are closed. When the configuration file is read again, the addresses that no listener is
+//! bound to are bound the same way (`bind_new`) before anything is replaced, and then the listeners are put in the
+//! order of the new file (`arrange`): a listener whose address is still there keeps its socket, and the connection that
+//! waits at it, wherever it is in the new order; the listeners of the addresses that are gone are closed, and with them
+//! the connection that waits at each for a permit (the connections still in the backlog of the system are cut as well).
+//! An address is the same only when it is equal as written, so one written another way for the same socket, such as
+//! `[::ffff:127.0.0.1]:8080` for `127.0.0.1:8080`, is a new one and cannot be bound while the first is in use.
 
 use std::future::Future;
 use std::io;
+use std::mem;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -63,6 +70,8 @@ type Taken = (TcpStream, SocketAddr, usize);
 /// The accept side.
 pub struct Acceptor {
     listeners: Vec<TcpListener>,
+    /// The address each listener is bound to, as the configuration writes it.
+    addresses: Vec<SocketAddr>,
     /// Where the next look starts.
     start: usize,
     permits: Arc<Semaphore>,
@@ -76,13 +85,15 @@ pub struct Acceptor {
 
 impl Acceptor {
     pub fn new(
-        listeners: Vec<TcpListener>,
+        listeners: Vec<(SocketAddr, TcpListener)>,
         permits: Arc<Semaphore>,
         ingress: Arc<Ingress>,
     ) -> Acceptor {
+        let (addresses, listeners): (Vec<_>, Vec<_>) = listeners.into_iter().unzip();
         Acceptor {
             waiting: listeners.iter().map(|_| None).collect(),
             listeners,
+            addresses,
             start: 0,
             permits,
             ingress,
@@ -100,9 +111,54 @@ impl Acceptor {
     ) -> io::Result<Acceptor> {
         let mut listeners = Vec::with_capacity(addresses.len());
         for address in addresses {
-            listeners.push(TcpListener::bind(address).await?);
+            listeners.push((*address, TcpListener::bind(address).await?));
         }
         Ok(Acceptor::new(listeners, permits, ingress))
+    }
+
+    /// Binds, in order, every address of `addresses` that no listener is bound to. The first failure is the result,
+    /// as the place of its address in `addresses` (from 0), and the listeners bound before it are closed.
+    pub async fn bind_new(
+        &self,
+        addresses: &[SocketAddr],
+    ) -> Result<Vec<(SocketAddr, TcpListener)>, usize> {
+        let mut bound = Vec::new();
+        for (at, address) in addresses.iter().enumerate() {
+            if !self.addresses.contains(address) {
+                let listener = TcpListener::bind(address).await.map_err(|_| at)?;
+                bound.push((*address, listener));
+            }
+        }
+        Ok(bound)
+    }
+
+    /// Puts the listeners in the order of `addresses`. A listener whose address is still there is moved, not closed,
+    /// and so is the connection that waits at it; `bound` (from `bind_new`) gives the listeners of the addresses that
+    /// are new. The listeners of the addresses that are gone are closed, and the connections that wait at them. The
+    /// permit that is held and the wait for a permit stay as they are.
+    pub fn arrange(&mut self, addresses: &[SocketAddr], bound: Vec<(SocketAddr, TcpListener)>) {
+        let earlier = mem::take(&mut self.addresses)
+            .into_iter()
+            .zip(mem::take(&mut self.listeners))
+            .zip(mem::take(&mut self.waiting))
+            .map(|((address, listener), waiting)| (address, listener, waiting));
+        let added = bound
+            .into_iter()
+            .map(|(address, listener)| (address, listener, None));
+        let mut kept: Vec<_> = earlier
+            .chain(added)
+            .filter_map(|entry| {
+                let at = addresses.iter().position(|address| *address == entry.0)?;
+                Some((at, entry))
+            })
+            .collect();
+        kept.sort_by_key(|(at, _)| *at);
+        for (_, (address, listener, waiting)) in kept {
+            self.addresses.push(address);
+            self.listeners.push(listener);
+            self.waiting.push(waiting);
+        }
+        self.start %= self.listeners.len().max(1);
     }
 
     pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Accepted> {

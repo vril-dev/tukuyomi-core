@@ -3,10 +3,12 @@
 //! The steps before the rules store (`start::read_parts`, which the start takes too) run on a thread of their own,
 //! for the lookup of the names of the upstream servers and the country database take time that the main loop does not
 //! have. The thread answers with what it made, and the main loop checks that none of the values that cannot change
-//! while the proxy runs (see `fixed`) differs, builds the new setup of it, and puts it in place of the old one in a
-//! single step. A file that is refused anywhere leaves everything as it is. The old setup is retired: the connections
-//! that hold it wind down after the request they serve, and the ones that are idle end. The rules store is not read,
-//! so the generation that serves stays as it is.
+//! while the proxy runs (see `fixed`) differs, binds the addresses of the listeners that no listener of the accept side
+//! has, builds the new setup of it, and puts it in place of the old one in a single step, with the listeners of the
+//! accept side put in the order of the file. A file that is refused anywhere, or has an address that cannot be bound,
+//! leaves everything as it is. The listeners of the addresses that are gone are closed, and the old setup is retired:
+//! the connections that hold it wind down after the request they serve, and the ones that are idle end. The rules store
+//! is not read, so the generation that serves stays as it is.
 
 use std::path::PathBuf;
 use std::thread;
@@ -14,8 +16,9 @@ use std::thread;
 use tokio::sync::oneshot;
 
 use super::{Fixed, reload_certificates};
-use crate::config::Keep;
+use crate::config::{Keep, addresses};
 use crate::inbound::conn::{Setup, Shared};
+use crate::inbound::transport::accept::Acceptor;
 use crate::log::Log;
 use crate::log::counters::{Counters, ReloadResult};
 use crate::rules::bundle::hex;
@@ -64,11 +67,26 @@ impl Reloader {
     }
 
     /// The answer of the thread: `None` if it refused the file and said why. Otherwise the parts replace those of the
-    /// setup that is current, if no value that cannot change differs.
-    pub(in crate::run) fn answered(&mut self, parts: Option<Box<Parts>>, shared: &Shared) {
-        match parts {
-            Some(parts) => self.replace(*parts, shared),
-            None => shared.counters.add_config_reload(ReloadResult::Refused),
+    /// setup that is current, and the listeners of the accept side follow them, if no value that cannot change differs
+    /// and every address that is new can be bound.
+    pub(in crate::run) async fn answered(
+        &mut self,
+        parts: Option<Box<Parts>>,
+        waits: &mut Waits,
+        shared: &Shared,
+    ) {
+        match (parts, waits.accept.as_mut()) {
+            (Some(parts), Some(acceptor)) => self.replace(*parts, acceptor, shared).await,
+            // The thread is only started once the listeners are bound, so this cannot be; the file is refused all the
+            // same.
+            (Some(_), None) => {
+                shared.counters.add_config_reload(ReloadResult::Refused);
+                shared
+                    .log
+                    .line("reload: configuration refused: the listeners are not bound yet");
+            }
+            // The thread refused the file and said why.
+            (None, _) => shared.counters.add_config_reload(ReloadResult::Refused),
         }
         self.ended(shared);
     }
@@ -92,9 +110,12 @@ impl Reloader {
         }
     }
 
-    /// Builds the setup of `parts` and makes it the current one, with the rate limit of the old setup going on if it
-    /// can. The old setup is retired.
-    fn replace(&self, parts: Parts, shared: &Shared) {
+    /// Binds the addresses of the listeners of `parts` that `acceptor` has not, builds the setup of `parts` and makes
+    /// it the current one, with the rate limit of the old setup going on if it can. The listeners of `acceptor` are
+    /// put in the order of the file in the same step, so a connection that is accepted from then on is numbered by the
+    /// listeners of the setup it takes. The listeners of the addresses that are gone are closed, and the old setup is
+    /// retired.
+    async fn replace(&self, parts: Parts, acceptor: &mut Acceptor, shared: &Shared) {
         if let Some(key) = self.fixed.first_difference(&parts.fixed) {
             shared.counters.add_config_reload(ReloadResult::Refused);
             shared.log.line(&format!(
@@ -102,6 +123,18 @@ impl Reloader {
             ));
             return;
         }
+        let listening = addresses(&parts.proxy.listeners);
+        let bound = match acceptor.bind_new(&listening).await {
+            Ok(bound) => bound,
+            Err(at) => {
+                shared.counters.add_config_reload(ReloadResult::Refused);
+                shared.log.line(&format!(
+                    "reload: configuration refused: listener {} cannot be bound",
+                    at + 1
+                ));
+                return;
+            }
+        };
         let keep = parts
             .records
             .as_ref()
@@ -123,6 +156,7 @@ impl Reloader {
         if setup.rate_limit.is_some() && !carried {
             shared.log.line("reload: rate limit table started anew");
         }
+        acceptor.arrange(&listening, bound);
         shared.setup.replace(setup);
         earlier.retire();
         shared.counters.add_config_reload(ReloadResult::Replaced);

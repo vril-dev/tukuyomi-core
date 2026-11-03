@@ -188,7 +188,7 @@ pub(super) async fn run(
 /// Waits for the kernel, binds, and accepts until something asks for a stop. Returns that cause. Once the listeners
 /// are bound `readiness` and `notify` say so. The wait for the kernel and the number of connections are those of
 /// `proxy`, which hold for the life of the process; the listeners are those of the setup that is current when they
-/// are bound.
+/// are bound, and a reading of the configuration file again can add, remove and reorder them.
 // One argument for each part of what the loop waits for and carries out; a struct of them would only repeat their
 // names.
 #[allow(clippy::too_many_arguments)]
@@ -240,7 +240,7 @@ async fn until_stop(
             Event::AcceptErr(None) => log.line("accept: failed"),
             Event::Joined(done) => note_joined(done, log),
             Event::Configuration => reloader.hangup(waits, &shared.counters, log),
-            Event::Configured(parts) => reloader.answered(parts, shared),
+            Event::Configured(parts) => reloader.answered(parts, waits, shared).await,
             Event::ConfigurationLost => reloader.unanswered(shared),
             Event::Reload => reload(waits, switcher, ingress, &shared.counters, log),
             Event::Certificates => reloader.certificates(waits, shared),
