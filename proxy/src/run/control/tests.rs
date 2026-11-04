@@ -77,10 +77,25 @@ async fn ask(path: PathBuf, request: Vec<u8>) -> String {
     String::from_utf8(out).unwrap()
 }
 
+/// Figures that every one of them differs from the others, so that a swapped pair shows.
+fn figures() -> Figures {
+    Figures {
+        uptime_ms: 1_234,
+        requests: 50,
+        blocked: 3,
+        policy_refused: 2,
+        upstream_failures: 4,
+        config: [0xab; 32],
+        config_replaced: 5,
+        config_refused: 1,
+    }
+}
+
 fn status_line(phase: &str, switching: bool, ready: bool) -> String {
     format!(
-        "{{\"generation\":\"{}\",\"mode\":\"block\",\"engine\":\"coraza\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready}}}\n",
-        "a".repeat(64)
+        "{{\"generation\":\"{}\",\"mode\":\"block\",\"engine\":\"coraza\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready},\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"config_reloads\":{{\"replaced\":5,\"refused\":1}}}}\n",
+        "a".repeat(64),
+        "ab".repeat(32)
     )
 }
 
@@ -166,7 +181,7 @@ fn a_status_and_a_switch_go_to_the_main_loop_and_its_answers_to_the_client() {
         let Some(Order::Status(reply)) = control.orders.recv().await else {
             panic!("no status order");
         };
-        reply.send(control.status(false)).unwrap();
+        reply.send(control.status(false, figures())).unwrap();
         assert_eq!(client.await.unwrap(), status_line("ready", false, true));
 
         // A kernel that failed is not ready, and a switch under way is told.
@@ -175,7 +190,7 @@ fn a_status_and_a_switch_go_to_the_main_loop_and_its_answers_to_the_client() {
         let Some(Order::Status(reply)) = control.orders.recv().await else {
             panic!("no status order");
         };
-        reply.send(control.status(true)).unwrap();
+        reply.send(control.status(true, figures())).unwrap();
         assert_eq!(client.await.unwrap(), status_line("failed", true, false));
 
         // A switch is answered when the main loop says so, with the generation that serves then.
@@ -288,7 +303,7 @@ fn a_line_that_is_not_a_request_is_answered_with_a_word_and_never_reaches_the_ma
         let Some(Order::Status(reply)) = control.orders.recv().await else {
             panic!("no status order");
         };
-        reply.send(control.status(false)).unwrap();
+        reply.send(control.status(false, figures())).unwrap();
         assert_eq!(client.await.unwrap(), status_line("ready", false, true));
     });
 }

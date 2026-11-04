@@ -3,12 +3,13 @@
 // owner removes. Each change asks first and then tells how it ended. A user cannot be removed, only disabled, and the
 // API refuses an owner's changes to its own account (the role, the state, the password and the second factor), so
 // the screen does not offer them. A screen is `{ id, title, least, mount }`; `mount(ctx, root)` draws into `root` and
-// gives back a function that undoes what it set up. Nothing runs when the module is loaded.
+// gives back `{ stop }`. Nothing runs when the module is loaded.
 
-import { badge, el, mount, notice } from './dom.js';
-import { t } from './i18n.js';
-import { ROLES, passwordFits, tokenLines, tokenTable, when } from './account.js';
-import { confirmChange, labelled, openSheet, pageHead, row, table } from './parts.js';
+import { badge, button, buttonClass, el, mount, notice, result } from './dom.js';
+import { w } from './i18n.js';
+import { ROLES, passwordFits, tokenLines, tokenTable } from './account.js';
+import { Field, checkFields, confirmChange, emptyField, hashOf, instantOf, kv, openDialog, pageHead, panel, restoreFocus, row, textInput, timeView } from './parts.js';
+import { Table } from './table.js';
 
 /** The name of a user: 1 to 32 characters of a-z, 0-9, dot, underscore and hyphen. */
 const NAME = /^[a-z0-9._-]{1,32}$/;
@@ -33,20 +34,25 @@ export function userProblem({ name, role, password }) {
 function roleSelect(current) {
   return el(
     'select',
-    { class: 'input', name: 'role' },
+    { class: 'tc-select', name: 'role' },
     ROLES.map((role) => el('option', { value: role, selected: role === current }, role)),
   );
 }
 
-const PROBLEMS = {
-  name: () => t('users.p_name'),
-  role: () => t('users.p_role'),
-  password: () => t('users.p_password'),
+/** The tone and the words of each state of a user that the list shows. */
+const STATES = {
+  you: ['info', () => w('badge.you')],
+  disabled: ['bad', () => w('badge.disabled')],
+  mfa: ['ok', () => w('badge.mfa')],
+  must_change: ['warn', () => w('badge.must_change')],
 };
+
+const emptyOr = (value, problem) => (value === '' ? emptyField() : problem);
 
 class UsersScreen {
   constructor(ctx, root) {
     this.ctx = ctx;
+    this.root = root;
     this.alive = true;
     this.reads = 0;
     this.users = null;
@@ -54,22 +60,39 @@ class UsersScreen {
     this.usersError = null;
     this.tokensError = null;
     this.layer = el('div');
-    this.results = el('div', { class: 'notes', 'aria-live': 'polite' });
-    this.reloadButton = el('button', { type: 'button', class: 'btn', on: { click: () => this.load() } }, t('screen.reload'));
-    this.usersBox = el('section', { class: 'card' });
-    this.tokensBox = el('section', { class: 'card' });
+    this.results = el('div', { class: 'tc-notes tc-stack', 'aria-live': 'polite' });
+    this.reloadButton = button('', w('screen.reload'), () => this.load());
+    this.usersBox = el('div', { class: 'tc-stack' });
+    this.tokensBox = el('div', { class: 'tc-stack' });
+    this.table = new Table({
+      caption: w('users.caption'),
+      rowKey: (user) => String(user.name),
+      empty: { title: w('users.empty') },
+      columns: [
+        { key: 'name', label: w('col.name'), value: (user) => String(user.name) },
+        { key: 'role', label: w('col.role'), value: (user) => String(user.role), cell: (user) => badge('muted', String(user.role)) },
+        { key: 'state', label: w('col.state'), value: (user) => this.stateWords(user).join(' '), cell: (user) => this.stateBadges(user) },
+        { key: 'created', label: w('col.created'), value: (user) => instantOf(user.created), tight: true, cell: (user) => timeView(user.created) },
+        { key: 'changed', label: w('col.changed'), value: (user) => instantOf(user.changed), tight: true, cell: (user) => timeView(user.changed) },
+        {
+          key: 'actions',
+          label: w('col.actions'),
+          value: () => '',
+          sortable: false,
+          filter: false,
+          cell: (user) => button('small', w('users.manage'), () => this.manage(user), { 'aria-label': w('users.manage_named', { name: String(user.name) }) }),
+        },
+      ],
+    });
+    this.tokenTable = tokenTable({ owner: true, remove: (token) => this.removeToken(token) });
     mount(
       root,
-      el(
-        'div',
-        { class: 'stack' },
-        pageHead(t('users.title'), this.reloadButton),
-        el('p', { class: 'muted' }, t('users.intro')),
-        this.results,
-        this.createCard(),
-        this.usersBox,
-        this.tokensBox,
-      ),
+      pageHead(w('users.title'), this.reloadButton),
+      el('p', { class: 'tc-intro' }, w('users.intro')),
+      this.results,
+      this.createPanel(),
+      this.usersBox,
+      this.tokensBox,
       this.layer,
     );
     this.draw();
@@ -94,6 +117,7 @@ class UsersScreen {
       this.tokensError = null;
     } else this.tokensError = tokens.reason;
     this.draw();
+    restoreFocus(this.root, this.root.querySelector('h1'));
   }
 
   draw() {
@@ -103,111 +127,97 @@ class UsersScreen {
 
   // ---- a new user ----
 
-  createCard() {
-    const name = el('input', { class: 'input', type: 'text', name: 'new-user', maxlength: '32', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', required: true });
-    const role = roleSelect('viewer');
-    const password = el('input', { class: 'input', type: 'password', name: 'new-password', maxlength: '128', autocomplete: 'new-password', required: true });
-    const messages = el('div', { class: 'notes', 'aria-live': 'polite' });
-    const submit = el('button', { type: 'submit', class: 'btn btn-primary' }, t('users.create'));
-    return el(
-      'section',
-      { class: 'card' },
-      el('h2', {}, t('users.create_title')),
+  createPanel() {
+    const name = new Field(w('login.name'), textInput({ name: 'new-user', maxlength: '32', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false' }), { required: true, hint: w('users.name_hint') });
+    const role = new Field(w('col.role'), roleSelect('viewer'), { hint: w('users.role_hint') });
+    const password = new Field(w('users.password'), textInput({ type: 'password', name: 'new-password', maxlength: '128', autocomplete: 'new-password' }), { required: true, hint: w('users.password_hint') });
+    const messages = el('div', { class: 'tc-notes tc-stack', 'aria-live': 'polite' });
+    const submit = button('primary', w('users.create'), null, { type: 'submit' });
+    return panel(
+      w('users.create_title'),
+      [],
       el(
         'form',
         {
-          class: 'stack',
+          class: 'tc-form tc-form--wide',
+          novalidate: true,
           on: {
             submit: async (event) => {
               event.preventDefault();
               if (submit.disabled) return;
-              const typed = { name: name.value, role: role.value, password: password.value };
+              const typed = { name: name.control.value, role: role.control.value, password: password.control.value };
               const problem = userProblem(typed);
-              if (problem !== null) {
-                mount(messages, notice('bad', PROBLEMS[problem]()));
-                return;
-              }
-              const lines = [
-                el('p', {}, t('users.create_what')),
-                el('dl', { class: 'kv' }, row(t('col.name'), typed.name), row(t('col.role'), typed.role)),
+              const entries = [
+                [name, emptyOr(typed.name, problem === 'name' ? w('users.p_name') : null)],
+                [role, problem === 'role' ? w('users.p_role') : null],
+                [password, emptyOr(typed.password, problem === 'password' ? w('users.p_password') : null)],
               ];
-              const yes = await confirmChange(this.layer, { title: t('users.create_title'), lines, confirm: t('users.create') });
-              if (!yes || !this.alive) return;
-              await this.ctx.guarded(submit, async () => {
-                let error = null;
-                try {
-                  await this.ctx.api.call('POST', '/api/users', typed);
-                } catch (failure) {
-                  error = failure;
-                }
-                password.value = '';
-                if (!this.alive) return;
-                if (error === null) {
-                  name.value = '';
-                  mount(messages);
-                  mount(this.results, notice('ok', t('users.created', { name: typed.name })));
-                } else {
-                  mount(messages, notice('bad', this.ctx.describe(error, { change: true })));
-                }
-                await this.load();
+              if (!checkFields(entries)) return;
+              const yes = await confirmChange(this.layer, {
+                title: w('users.create_ask'),
+                lines: [el('p', {}, w('users.create_what')), kv(row(w('col.name'), typed.name), row(w('col.role'), typed.role))],
+                confirm: w('users.create'),
               });
+              if (!yes || !this.alive) return;
+              await this.ctx.guarded(
+                submit,
+                async () => {
+                  let error = null;
+                  try {
+                    await this.ctx.api.call('POST', '/api/users', typed);
+                  } catch (failure) {
+                    error = failure;
+                  }
+                  password.control.value = '';
+                  if (!this.alive) return;
+                  if (error === null) {
+                    name.control.value = '';
+                    mount(messages);
+                    mount(this.results, result('ok', w('users.created_title'), w('users.created', { name: typed.name })));
+                  } else {
+                    mount(messages, notice('bad', this.ctx.describe(error, { change: true })));
+                  }
+                  await this.load();
+                },
+                w('users.create_busy'),
+              );
             },
           },
         },
         messages,
-        el(
-          'div',
-          { class: 'fields' },
-          labelled(t('login.name'), name, t('users.name_hint')),
-          labelled(t('col.role'), role, t('users.role_hint')),
-          labelled(t('users.password'), password, t('users.password_hint')),
-        ),
-        el('div', { class: 'actions' }, submit),
+        el('div', { class: 'tc-fields' }, name.node, role.node, password.node),
+        el('div', { class: 'tc-actions' }, submit),
       ),
     );
   }
 
   // ---- the users ----
 
-  drawUsers() {
-    const users = this.users;
-    let content;
-    if (users === null) {
-      content = this.usersError === null ? notice('info', t('account.loading')) : notice('bad', t('users.failed'), ' ', this.ctx.describe(this.usersError));
-    } else {
-      content = [
-        this.usersError === null ? null : notice('bad', t('users.failed'), ' ', this.ctx.describe(this.usersError)),
-        table(
-          [t('col.name'), t('col.role'), t('col.state'), t('col.created'), t('col.changed'), t('col.actions')],
-          users.map((user) => [
-            String(user.name),
-            badge('muted', String(user.role)),
-            el(
-              'span',
-              { class: 'badges' },
-              user.name === this.ctx.user.name ? badge('muted', t('badge.you')) : null,
-              user.disabled === true ? badge('bad', t('badge.disabled')) : null,
-              user.mfa === true ? badge('ok', t('badge.mfa')) : null,
-              user.must_change === true ? badge('warn', t('badge.must_change')) : null,
-            ),
-            when(user.created),
-            when(user.changed),
-            el(
-              'button',
-              { type: 'button', class: 'btn btn-small', 'aria-label': t('users.manage_named', { name: String(user.name) }), on: { click: () => this.manage(user) } },
-              t('users.manage'),
-            ),
-          ]),
-          t('users.caption'),
-          { tight: [3, 4] },
-        ),
-      ];
-    }
-    mount(this.usersBox, el('h2', {}, t('users.list')), content);
+  stateWords(user) {
+    return [
+      user.name === this.ctx.user.name ? 'you' : null,
+      user.disabled === true ? 'disabled' : null,
+      user.mfa === true ? 'mfa' : null,
+      user.must_change === true ? 'must_change' : null,
+    ].filter((word) => word !== null);
   }
 
-  /** Asks, sends the change, and tells how it ended; then reads the lists again. `sheet` is closed when it is sent. */
-  async change({ title, lines, confirm, tone = 'primary', call, done }, sheet = null) {
+  stateBadges(user) {
+    const words = this.stateWords(user);
+    return words.length === 0 ? null : el('span', { class: 'tc-badges' }, words.map((word) => badge(STATES[word][0], STATES[word][1]())));
+  }
+
+  drawUsers() {
+    this.table.update({ rows: this.users ?? [], loading: this.users === null && this.usersError === null });
+    this.table.node.hidden = this.users === null && this.usersError !== null;
+    mount(
+      this.usersBox,
+      panel(w('users.list'), [], this.usersError === null ? null : notice('bad', w('users.failed'), ' ', this.ctx.describe(this.usersError)), this.table.node),
+    );
+  }
+
+  /** Asks, sends the change, and tells how it ended; then reads the lists again. `dialog` is closed when it is sent. */
+  async change({ title, lines, confirm, tone = 'primary', call, done }, dialog = null) {
     const yes = await confirmChange(this.layer, { title, lines, confirm, tone });
     if (!yes || !this.alive) return;
     let error = null;
@@ -217,184 +227,145 @@ class UsersScreen {
       error = failure;
     }
     if (!this.alive) return;
-    if (sheet !== null) sheet.close();
-    mount(this.results, error === null ? notice('ok', done) : notice(error.kind === 'conflict' || error.kind === 'unknown' ? 'warn' : 'bad', this.ctx.describe(error, { change: true })));
+    if (dialog !== null) dialog.close();
+    mount(this.results, error === null ? result('ok', w('users.done_title'), done) : notice(error.kind === 'conflict' || error.kind === 'unknown' ? 'warn' : 'bad', this.ctx.describe(error, { change: true })));
     await this.load();
   }
 
   manage(user) {
     const can = userActions(user, this.ctx.user.name);
-    const sheet = openSheet(this.layer, t('users.sheet'));
+    const dialog = openDialog(this.layer, w('users.sheet'));
     const name = encodeURIComponent(user.name);
-    const person = el(
-      'dl',
-      { class: 'kv' },
-      row(t('col.name'), String(user.name)),
-      row(t('col.role'), badge('muted', String(user.role))),
-      row(t('col.created'), when(user.created)),
-      row(t('col.changed'), when(user.changed)),
+    const person = kv(
+      row(w('col.name'), String(user.name)),
+      row(w('col.role'), badge('muted', String(user.role))),
+      row(w('col.created'), timeView(user.created)),
+      row(w('col.changed'), timeView(user.changed)),
     );
     if (can.self) {
-      mount(sheet.body, person, notice('info', t('users.self')), el('a', { class: 'btn', href: '#/account', on: { click: () => sheet.close() } }, t('users.self_open')));
+      mount(dialog.body, person, notice('info', w('users.self')), el('a', { class: buttonClass(''), href: hashOf('account'), on: { click: () => dialog.close() } }, w('users.self_open')));
       return;
     }
-    const parts = [person, this.roleSection(user, name, sheet)];
-    parts.push(this.stateSection(user, name, can.toggle, sheet));
-    parts.push(this.passwordSection(user, name, sheet));
-    parts.push(this.mfaSection(user, name, can.resetMfa, sheet));
-    mount(sheet.body, ...parts);
+    mount(dialog.body, person, this.roleSection(user, name, dialog), this.stateSection(user, name, can.toggle, dialog), this.passwordSection(user, name, dialog), this.mfaSection(user, name, can.resetMfa, dialog));
   }
 
-  roleSection(user, name, sheet) {
-    const role = roleSelect(user.role);
-    const messages = el('div', { class: 'notes', 'aria-live': 'polite' });
+  roleSection(user, name, dialog) {
+    const field = new Field(w('col.role'), roleSelect(user.role), { hint: w('users.role_hint') });
     const start = () => {
-      if (role.value === user.role) {
-        mount(messages, notice('info', t('users.role_same')));
+      const chosen = field.control.value;
+      if (chosen === user.role) {
+        field.invalid(w('users.role_same'));
+        field.control.focus();
         return;
       }
-      const lowered = ROLES.indexOf(role.value) < ROLES.indexOf(user.role);
-      this.ctx.guarded(button, () =>
+      field.valid();
+      const lowered = ROLES.indexOf(chosen) < ROLES.indexOf(user.role);
+      this.ctx.guarded(change, () =>
         this.change(
           {
-            title: t('users.role_title'),
-            lines: [
-              el('p', {}, t('users.role_what', { name: user.name, from: user.role, to: role.value })),
-              el('p', { class: 'small' }, lowered ? t('users.role_lowered') : t('users.role_raised')),
-            ],
-            confirm: t('users.role_change'),
-            call: () => this.ctx.api.call('PUT', `/api/users/${name}`, { role: role.value }),
-            done: t('users.role_done', { name: user.name, to: role.value }),
+            title: w('users.role_title'),
+            lines: [el('p', {}, w('users.role_what', { name: user.name, from: user.role, to: chosen })), el('p', { class: 'tc-muted tc-small' }, lowered ? w('users.role_lowered') : w('users.role_raised'))],
+            confirm: w('users.role_change'),
+            call: () => this.ctx.api.call('PUT', `/api/users/${name}`, { role: chosen }),
+            done: w('users.role_done', { name: user.name, to: chosen }),
           },
-          sheet,
+          dialog,
         ),
       );
     };
-    const button = el('button', { type: 'button', class: 'btn', on: { click: start } }, t('users.role_change'));
-    return el('section', { class: 'card' }, el('h3', {}, t('col.role')), messages, labelled(t('col.role'), role, t('users.role_hint')), el('div', { class: 'actions' }, button));
+    const change = button('', w('users.role_change'), start);
+    return el('section', { class: 'tc-stack' }, el('h3', {}, w('col.role')), field.node, el('div', { class: 'tc-actions' }, change));
   }
 
-  stateSection(user, name, toggle, sheet) {
+  stateSection(user, name, toggle, dialog) {
     const disabling = toggle === 'disable';
-    const button = el(
-      'button',
-      {
-        type: 'button',
-        class: disabling ? 'btn btn-danger' : 'btn btn-primary',
-        on: {
-          click: () =>
-            this.ctx.guarded(button, () =>
-              this.change(
-                {
-                  title: disabling ? t('users.disable_title') : t('users.enable_title'),
-                  lines: [el('p', {}, disabling ? t('users.disable_what', { name: user.name }) : t('users.enable_what', { name: user.name }))],
-                  confirm: disabling ? t('users.disable') : t('users.enable'),
-                  tone: disabling ? 'danger' : 'primary',
-                  call: () => this.ctx.api.call('PUT', `/api/users/${name}`, { disabled: disabling }),
-                  done: disabling ? t('users.disable_done', { name: user.name }) : t('users.enable_done', { name: user.name }),
-                },
-                sheet,
-              ),
-            ),
-        },
-      },
-      disabling ? t('users.disable') : t('users.enable'),
+    const act = button(
+      disabling ? 'danger' : '',
+      disabling ? w('users.disable') : w('users.enable'),
+      () =>
+        this.ctx.guarded(act, () =>
+          this.change(
+            {
+              title: disabling ? w('users.disable_title') : w('users.enable_title'),
+              lines: [el('p', {}, disabling ? w('users.disable_what', { name: user.name }) : w('users.enable_what', { name: user.name }))],
+              confirm: disabling ? w('users.disable') : w('users.enable'),
+              tone: disabling ? 'danger' : 'primary',
+              call: () => this.ctx.api.call('PUT', `/api/users/${name}`, { disabled: disabling }),
+              done: disabling ? w('users.disable_done', { name: user.name }) : w('users.enable_done', { name: user.name }),
+            },
+            dialog,
+          ),
+        ),
     );
-    return el('section', { class: 'card' }, el('h3', {}, t('col.state')), el('p', { class: 'muted small' }, disabling ? t('users.disable_hint') : t('users.enable_hint')), el('div', { class: 'actions' }, button));
+    return el('section', { class: 'tc-stack' }, el('h3', {}, w('col.state')), el('p', { class: 'tc-muted tc-small' }, disabling ? w('users.disable_hint') : w('users.enable_hint')), el('div', { class: 'tc-actions' }, act));
   }
 
-  passwordSection(user, name, sheet) {
-    const password = el('input', { class: 'input', type: 'password', name: 'reset-password', maxlength: '128', autocomplete: 'new-password' });
-    const messages = el('div', { class: 'notes', 'aria-live': 'polite' });
+  passwordSection(user, name, dialog) {
+    const field = new Field(w('password.new'), textInput({ type: 'password', name: 'reset-password', maxlength: '128', autocomplete: 'new-password' }), { required: true, hint: w('users.password_reset_hint') });
     const start = () => {
-      const typed = password.value;
-      if (!passwordFits(typed)) {
-        mount(messages, notice('bad', t('users.p_password')));
-        return;
-      }
-      password.value = '';
-      this.ctx.guarded(button, () =>
+      const typed = field.control.value;
+      if (!checkFields([[field, emptyOr(typed, passwordFits(typed) ? null : w('users.p_password'))]])) return;
+      field.control.value = '';
+      this.ctx.guarded(set, () =>
         this.change(
           {
-            title: t('users.password_title'),
-            lines: [el('p', {}, t('users.password_what', { name: user.name }))],
-            confirm: t('users.password_set'),
+            title: w('users.password_ask'),
+            lines: [el('p', {}, w('users.password_what', { name: user.name }))],
+            confirm: w('users.password_set'),
             call: () => this.ctx.api.call('POST', `/api/users/${name}/password`, { password: typed }),
-            done: t('users.password_done', { name: user.name }),
+            done: w('users.password_done', { name: user.name }),
           },
-          sheet,
+          dialog,
         ),
       );
     };
-    const button = el('button', { type: 'button', class: 'btn', on: { click: start } }, t('users.password_set'));
-    return el(
-      'section',
-      { class: 'card' },
-      el('h3', {}, t('users.password_title')),
-      el('p', { class: 'muted small' }, t('users.password_reset_hint')),
-      messages,
-      labelled(t('password.new'), password),
-      el('div', { class: 'actions' }, button),
-    );
+    const set = button('', w('users.password_set'), start);
+    return el('section', { class: 'tc-stack' }, el('h3', {}, w('users.password_title')), field.node, el('div', { class: 'tc-actions' }, set));
   }
 
-  mfaSection(user, name, allowed, sheet) {
-    let content = el('p', { class: 'muted' }, t('users.mfa_none'));
+  mfaSection(user, name, allowed, dialog) {
+    let content = el('p', { class: 'tc-muted' }, w('users.mfa_none'));
     if (allowed) {
-      const button = el(
-        'button',
-        {
-          type: 'button',
-          class: 'btn',
-          on: {
-            click: () =>
-              this.ctx.guarded(button, () =>
-                this.change(
-                  {
-                    title: t('users.mfa_title'),
-                    lines: [el('p', {}, t('users.mfa_what', { name: user.name }))],
-                    confirm: t('users.mfa_reset'),
-                    call: () => this.ctx.api.call('DELETE', `/api/users/${name}/mfa`),
-                    done: t('users.mfa_done', { name: user.name }),
-                  },
-                  sheet,
-                ),
-              ),
-          },
-        },
-        t('users.mfa_reset'),
+      const reset = button('danger', w('users.mfa_reset'), () =>
+        this.ctx.guarded(reset, () =>
+          this.change(
+            {
+              title: w('users.mfa_ask'),
+              lines: [el('p', {}, w('users.mfa_what', { name: user.name }))],
+              confirm: w('users.mfa_reset'),
+              tone: 'danger',
+              call: () => this.ctx.api.call('DELETE', `/api/users/${name}/mfa`),
+              done: w('users.mfa_done', { name: user.name }),
+            },
+            dialog,
+          ),
+        ),
       );
-      content = el('div', { class: 'actions' }, button);
+      content = el('div', { class: 'tc-actions' }, reset);
     }
-    return el('section', { class: 'card' }, el('h3', {}, t('users.mfa_title')), el('p', { class: 'muted small' }, t('users.mfa_hint')), content);
+    return el('section', { class: 'tc-stack' }, el('h3', {}, w('users.mfa_title')), el('p', { class: 'tc-muted tc-small' }, w('users.mfa_hint')), content);
   }
 
   // ---- the tokens of everyone ----
 
   drawTokens() {
     const tokens = this.tokens;
-    let content;
-    if (tokens === null) {
-      content = this.tokensError === null ? notice('info', t('account.loading')) : notice('bad', t('tokens.failed'), ' ', this.ctx.describe(this.tokensError));
-    } else if (tokens.length === 0) {
-      content = el('p', { class: 'muted' }, t('tokens.empty'));
-    } else {
-      content = [
-        this.tokensError === null ? null : notice('bad', t('tokens.failed'), ' ', this.ctx.describe(this.tokensError)),
-        tokenTable(tokens, { owner: true, remove: (token) => this.removeToken(token) }),
-      ];
-    }
-    mount(this.tokensBox, el('h2', {}, t('tokens.all_title')), el('p', { class: 'muted' }, t('tokens.all_intro')), content);
+    this.tokenTable.update({ rows: tokens ?? [], loading: tokens === null && this.tokensError === null });
+    this.tokenTable.node.hidden = tokens === null && this.tokensError !== null;
+    mount(
+      this.tokensBox,
+      panel(w('tokens.all_title'), [], el('p', { class: 'tc-muted' }, w('tokens.all_intro')), this.tokensError === null ? null : notice('bad', w('tokens.failed'), ' ', this.ctx.describe(this.tokensError)), this.tokenTable.node),
+    );
   }
 
   removeToken(token) {
     return this.change({
-      title: t('tokens.delete_title'),
+      title: w('tokens.delete_title'),
       lines: tokenLines(token, { owner: true }),
-      confirm: t('tokens.delete'),
+      confirm: w('tokens.delete'),
       tone: 'danger',
       call: () => this.ctx.api.call('DELETE', `/api/tokens/${encodeURIComponent(token.id)}`),
-      done: t('tokens.deleted', { name: String(token.name) }),
+      done: w('tokens.deleted', { name: String(token.name) }),
     });
   }
 }
@@ -402,7 +373,7 @@ class UsersScreen {
 function mountUsers(ctx, root) {
   const screen = new UsersScreen(ctx, root);
   screen.load();
-  return () => screen.stop();
+  return { stop: () => screen.stop() };
 }
 
-export const screens = [{ id: 'users', title: () => t('nav.users'), least: 'owner', mount: mountUsers }];
+export const screens = [{ id: 'users', title: w('nav.users'), least: 'owner', mount: mountUsers }];

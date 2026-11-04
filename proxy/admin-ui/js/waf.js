@@ -1,130 +1,175 @@
-// The screens of the WAF. This file has the status: the state of the proxy, the rule generation that the rules store
-// chooses and the one that the proxy serves (with a warning when they differ), and the generation that a rollback
-// would choose. The other screens are in `generations.js` (the generations, the history and the rollback),
-// `import.js` and `records.js` (the records and the audit log), and `screens` puts them in the order of the menu. A
-// screen is `{ id, title, least, mount }`; `mount(ctx, root)` draws into `root` and gives back a function that undoes
-// what it set up. Nothing runs when the module is loaded.
+// The screens of the WAF. This file has the overview: the numbers of the proxy since it started, its state, the rule
+// generation that the rules store chooses and the one that the proxy serves (with a warning when they differ), the
+// generation that a rollback would choose, and the settings file that is in force. The other screens are in
+// `generations.js` (the generations, the history and the rollback), `import.js` and `records.js` (the records and the
+// audit log); `app.js` puts them in the order of the menu. A screen is `{ id, title, least, mount }`; `mount(ctx, root)`
+// draws into `root` and gives back `{ stop }` (and `show(route)` when the address of the screen can change in it). Nothing runs when the
+// module is loaded.
 
-import { badge, el, mount, notice } from './dom.js';
+import { badge, button, el, mount, notice } from './dom.js';
 import { screens as generationScreens } from './generations.js';
-import { language, t } from './i18n.js';
+import { formatNumber, lazy, t, w } from './i18n.js';
 import { screens as importScreens } from './import.js';
-import { engineBadge, generationState } from './parts.js';
+import { engineBadge, fingerprintView, generationState, hashOf, isFingerprint, kv, modeName, pageHead, panel, row, stat, timeView } from './parts.js';
 import { screens as recordScreens } from './records.js';
 
 export { generationState };
 
-// The tone and the words of each phase of the proxy, and the words of each mode. A value that is not here is shown as
-// the API gave it.
+// The tone and the words of each phase of the proxy. A value that is not here is shown as the API gave it.
 const PHASES = {
-  starting: ['warn', () => t('phase.starting')],
-  ready: ['ok', () => t('phase.ready')],
-  stopping: ['warn', () => t('phase.stopping')],
-  stopped: ['bad', () => t('phase.stopped')],
-  failed: ['bad', () => t('phase.failed')],
-};
-const MODES = {
-  block: () => t('mode.block'),
-  detect: () => t('mode.detect'),
+  starting: ['warn', () => w('phase.starting')],
+  ready: ['ok', () => w('phase.ready')],
+  stopping: ['warn', () => w('phase.stopping')],
+  stopped: ['bad', () => w('phase.stopped')],
+  failed: ['bad', () => w('phase.failed')],
 };
 
-function row(label, value) {
-  return [el('dt', {}, label), el('dd', {}, value)];
+const SECOND = 1000;
+
+/** The time since the proxy started in the two largest units that it has: `3 days 4 hours`, `4 hours 12 minutes`, `12 minutes 8 seconds`, `35 seconds`. */
+export function uptimeText(ms) {
+  const total = Math.floor(ms / SECOND);
+  const [days, hours, minutes, seconds] = [Math.floor(total / 86400), Math.floor((total % 86400) / 3600), Math.floor((total % 3600) / 60), total % 60];
+  if (days > 0) return t('uptime.dh', { d: formatNumber(days), h: hours });
+  if (hours > 0) return t('uptime.hm', { h: hours, m: minutes });
+  if (minutes > 0) return t('uptime.ms', { m: minutes, s: seconds });
+  return t('uptime.s', { s: seconds });
 }
 
-function fingerprint(hex) {
-  return typeof hex === 'string' ? el('code', { class: 'fp' }, hex) : el('span', { class: 'muted' }, t('status.none'));
+/** The number a field of the proxy's state holds, or null when the proxy gave none (an old proxy, or none that answered). */
+export function countOf(data, key) {
+  const value = data?.proxy?.[key];
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-function proxyCard(data) {
-  const proxy = data.proxy;
-  let content;
-  if (proxy === null || typeof proxy !== 'object') {
-    content =
-      data.reachable === false ? notice('bad', t('status.unreachable')) : notice('warn', t('status.busy'));
-  } else {
-    const [tone, words] = Object.hasOwn(PHASES, proxy.phase) ? PHASES[proxy.phase] : ['muted', () => String(proxy.phase)];
-    const mode = Object.hasOwn(MODES, proxy.mode) ? MODES[proxy.mode]() : String(proxy.mode);
-    content = el(
-      'dl',
-      { class: 'kv' },
-      row(t('status.state'), badge(tone, words())),
-      row(t('status.mode'), badge('muted', mode)),
-      row(t('status.engine'), engineBadge(proxy.engine)),
-      row(t('status.switching'), proxy.switching ? badge('warn', t('status.switching_on')) : t('status.switching_off')),
-    );
-  }
-  return el('section', { class: 'card' }, el('h2', {}, t('status.proxy')), content);
+/** Why a number of the overview is missing: the proxy cannot be reached, it had no room to answer, or it gives no such number. */
+function reasonFor(data) {
+  if (data.reachable === false) return w('overview.reason_unreachable');
+  if (data.proxy === null || typeof data.proxy !== 'object') return w('overview.reason_busy');
+  return w('overview.reason_old');
 }
 
-function generationsCard(data) {
-  const state = generationState(data);
-  const serving = data.proxy?.generation;
-  let verdict = null;
-  if (state === 'same') verdict = notice('ok', t('status.same'));
-  if (state === 'differ') verdict = notice('warn', t('status.differ'));
-  if (state === 'switching') verdict = notice('info', t('status.differ_switching'));
-  return el(
-    'section',
-    { class: 'card' },
-    el('h2', {}, t('status.generations')),
+function overviewStats(data) {
+  const reason = reasonFor(data);
+  const count = (key) => countOf(data, key);
+  const number = (key) => {
+    const value = count(key);
+    return value === null ? '—' : lazy(() => formatNumber(value));
+  };
+  const missing = (key, sub = null) => (count(key) === null ? reason : sub);
+  const uptime = count('uptime_ms');
+  const failures = count('upstream_failures');
+  const reloads = data.proxy?.config_reloads;
+  const reloadsKnown = reloads !== null && typeof reloads === 'object' && Number.isFinite(reloads.replaced) && Number.isFinite(reloads.refused);
+  return [
     el(
-      'dl',
-      { class: 'kv' },
-      row(t('status.chosen'), fingerprint(data.current)),
-      row(
-        t('status.serving'),
-        typeof serving === 'string' ? fingerprint(serving) : el('span', { class: 'muted' }, t('status.unknown')),
+      'div',
+      { class: 'tc-stats' },
+      stat(w('overview.requests'), number('requests'), missing('requests', uptime === null ? null : lazy(() => t('overview.since', { time: uptimeText(uptime) })))),
+      stat(w('overview.blocked'), number('blocked'), missing('blocked', w('overview.blocked_note'))),
+      stat(w('overview.policy'), number('policy_refused'), missing('policy_refused', w('overview.policy_note'))),
+      stat(
+        w('overview.failures'),
+        number('upstream_failures'),
+        missing('upstream_failures', [failures === 0 ? badge('ok', w('overview.failures_none')) : badge('warn', w('overview.failures_some')), w('overview.failures_note')]),
       ),
     ),
+    el(
+      'div',
+      { class: 'tc-stats' },
+      stat(w('overview.uptime'), uptime === null ? '—' : lazy(() => uptimeText(uptime)), uptime === null ? reason : null),
+      stat(
+        w('overview.reloads'),
+        reloadsKnown ? lazy(() => formatNumber(reloads.replaced)) : '—',
+        reloadsKnown ? lazy(() => t('overview.reloads_refused', { n: formatNumber(reloads.refused) })) : reason,
+      ),
+    ),
+  ];
+}
+
+function proxyPanel(data) {
+  const proxy = data.proxy;
+  if (proxy === null || typeof proxy !== 'object') {
+    return panel(w('status.proxy'), [], data.reachable === false ? notice('bad', w('status.unreachable')) : notice('warn', w('status.busy')));
+  }
+  const [tone, words] = Object.hasOwn(PHASES, proxy.phase) ? PHASES[proxy.phase] : ['muted', () => String(proxy.phase)];
+  return panel(
+    w('status.proxy'),
+    [badge(tone, words())],
+    kv(
+      row(w('status.mode'), badge('muted', lazy(() => modeName(proxy.mode)))),
+      row(w('status.engine'), engineBadge(proxy.engine)),
+      row(w('status.switching'), proxy.switching ? badge('warn', w('status.switching_on')) : w('status.switching_off')),
+    ),
+  );
+}
+
+function generationLine(value) {
+  if (!isFingerprint(value)) return typeof value === 'string' ? value : w('status.unknown');
+  return el('span', { class: 'tc-actions' }, fingerprintView(value), el('a', { class: 'tc-link', href: hashOf('generations', { id: value }) }, w('overview.open')));
+}
+
+function generationsPanel(data) {
+  const state = generationState(data);
+  let verdict = null;
+  if (state === 'same') verdict = notice('ok', w('status.same'));
+  if (state === 'differ') verdict = notice('warn', w('status.differ'));
+  if (state === 'switching') verdict = notice('info', w('status.differ_switching'));
+  const target = data.rollback_to;
+  return panel(
+    w('status.generations'),
+    [],
+    kv(
+      row(w('status.chosen'), data.current === null || data.current === undefined ? w('status.none') : generationLine(data.current)),
+      row(w('status.serving'), generationLine(data.proxy?.generation ?? null)),
+      row(w('status.rollback'), typeof target === 'string' ? generationLine(target) : w('status.rollback_none')),
+    ),
+    typeof target === 'string' ? el('p', { class: 'tc-muted tc-small' }, w('status.rollback_note')) : null,
     verdict,
   );
 }
 
-function rollbackCard(data) {
-  const target = data.rollback_to;
-  const content =
-    typeof target === 'string'
-      ? [el('p', {}, fingerprint(target)), el('p', { class: 'muted small' }, t('status.rollback_note'))]
-      : el('p', { class: 'muted' }, t('status.rollback_none'));
-  return el('section', { class: 'card' }, el('h2', {}, t('status.rollback')), content);
+function configPanel(data) {
+  const reason = reasonFor(data);
+  const config = data.proxy?.config;
+  return panel(
+    w('overview.config'),
+    [],
+    kv(row(w('overview.config_sha'), isFingerprint(config) ? fingerprintView(config, { whole: true }) : el('span', { class: 'tc-muted' }, '—', ' ', reason))),
+    el('p', { class: 'tc-muted tc-small' }, w('overview.config_note')),
+  );
 }
 
-function clock(at) {
-  return new Intl.DateTimeFormat(language(), { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(at);
-}
-
-function mountStatus(ctx, root) {
-  const reload = el('button', { type: 'button', class: 'btn', on: { click: () => ctx.refreshStatus() } }, t('status.reload'));
-  const stamp = el('p', { class: 'muted small' });
-  const body = el('div', { class: 'stack' });
-  mount(root, el('div', { class: 'page-head' }, el('h1', {}, t('status.title')), reload), stamp, body);
+function mountOverview(ctx, root) {
+  const reload = button('', w('status.reload'), () => ctx.refreshStatus());
+  const stamp = el('p', { class: 'tc-muted tc-small' });
+  const body = el('div', { class: 'tc-stack tc-stack--wide' });
+  mount(root, pageHead(w('overview.title'), reload), stamp, body);
 
   const draw = (status) => {
     reload.disabled = status.busy;
     reload.setAttribute('aria-busy', String(status.busy));
-    mount(stamp, status.at === null ? '' : t('status.read_at', { time: clock(status.at) }));
+    mount(stamp, status.at === null ? null : [w('status.read_at'), ' ', timeView(status.at.getTime())]);
+    const failed = status.error === null ? null : notice('bad', w('status.failed'), ' ', ctx.describe(status.error));
     if (status.data === null) {
-      mount(body, status.error === null ? notice('info', t('status.loading')) : notice('bad', t('status.failed'), ' ', ctx.describe(status.error)));
+      mount(body, status.error === null ? notice('info', w('status.loading')) : failed);
       return;
     }
     mount(
       body,
-      status.error === null ? null : notice('bad', t('status.failed'), ' ', ctx.describe(status.error)),
-      proxyCard(status.data),
-      generationsCard(status.data),
-      rollbackCard(status.data),
+      failed,
+      overviewStats(status.data),
+      el('div', { class: 'tc-overview' }, proxyPanel(status.data), generationsPanel(status.data), configPanel(status.data)),
     );
   };
   const stop = ctx.onStatus(draw);
   draw(ctx.status());
-  return stop;
+  return { stop };
 }
 
-const statusScreen = { id: 'status', title: () => t('nav.status'), least: 'viewer', mount: mountStatus };
-
-// The order of the menu.
-const ORDER = ['status', 'generations', 'import', 'history', 'records', 'audit'];
-const ALL = [statusScreen, ...generationScreens, ...importScreens, ...recordScreens];
-
-export const screens = ORDER.map((id) => ALL.find((screen) => screen.id === id));
+export const screens = [
+  { id: 'overview', title: w('nav.overview'), least: 'viewer', mount: mountOverview },
+  ...generationScreens,
+  ...importScreens,
+  ...recordScreens,
+];

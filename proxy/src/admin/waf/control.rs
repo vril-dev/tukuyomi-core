@@ -17,7 +17,11 @@
 //! anything is another case: the proxy has no place for it (it serves 4 connections at once). A status question that
 //! meets it is asked once more after 250 ms, and then the answer is `Seen::Busy`; a switch order that meets it is
 //! `Reply::Busy`, which is also what the order of a switch that goes on is. A line is taken only if it has the fields
-//! of an answer, 64 digits for the generation and one of the words of the proxy for the rest.
+//! of an answer, 64 digits for the generation and one of the words of the proxy for the rest. The figures of a status
+//! (`uptime_ms`, `requests`, `blocked`, `policy_refused`, `upstream_failures`, `config` and `config_reloads`) are not
+//! needed for that: a proxy of an older version does not send them, and each one that is missing is `None`. One that
+//! is there and is not what it should be (a number; for `config`, 64 lowercase digits) makes the line one that is not
+//! the proxy's.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -31,7 +35,7 @@ use tokio::runtime::Builder;
 use tokio::time::timeout;
 use tukuyomi_kernel::Engine;
 
-use crate::rules::bundle::Fingerprint;
+use crate::rules::bundle::{Fingerprint, hex};
 
 /// The longest line of an answer in bytes, its line feed included.
 const LINE_MAX: usize = 4096;
@@ -56,6 +60,28 @@ pub struct Status {
     /// A switch is under way.
     pub switching: bool,
     pub ready: bool,
+    // The figures that a proxy adds to its state; a figure that the proxy does not send is `None`.
+    /// The milliseconds since the proxy started.
+    pub uptime_ms: Option<u64>,
+    /// The answers written to clients, of every class.
+    pub requests: Option<u64>,
+    /// The requests that a rule blocked.
+    pub blocked: Option<u64>,
+    /// The requests that the access list or the rate limit turned away.
+    pub policy_refused: Option<u64>,
+    /// The failures of the servers of the upstream groups of the configuration in force.
+    pub upstream_failures: Option<u64>,
+    /// The SHA-256 of the configuration file in force.
+    pub config: Option<[u8; 32]>,
+    /// The readings of the configuration file again, by how they ended.
+    pub config_reloads: Option<Reloads>,
+}
+
+/// The readings of the configuration file again, by how they ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub struct Reloads {
+    pub replaced: u64,
+    pub refused: u64,
 }
 
 impl Status {
@@ -67,15 +93,25 @@ impl Status {
             "phase": self.phase,
             "switching": self.switching,
             "ready": self.ready,
+            "uptime_ms": self.uptime_ms,
+            "requests": self.requests,
+            "blocked": self.blocked,
+            "policy_refused": self.policy_refused,
+            "upstream_failures": self.upstream_failures,
+            "config": self.config.map(|sha256| hex(&sha256)),
+            "config_reloads": self.config_reloads.map(|reloads| json!({
+                "replaced": reloads.replaced,
+                "refused": reloads.refused,
+            })),
         })
     }
 }
 
 /// What a question about the state of the proxy found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Seen {
-    /// The state of the proxy.
-    State(Status),
+    /// The state of the proxy. It is boxed: with its figures it is much larger than the other two.
+    State(Box<Status>),
     /// The proxy takes the connection and closes it without an answer: it has no place for it just now.
     Busy,
     /// The proxy cannot be reached.
@@ -84,16 +120,16 @@ pub enum Seen {
 
 impl Seen {
     /// The state, if it was read.
-    pub fn state(self) -> Option<Status> {
+    pub fn state(&self) -> Option<Status> {
         match self {
-            Seen::State(status) => Some(status),
+            Seen::State(status) => Some(**status),
             Seen::Busy | Seen::Unreachable => None,
         }
     }
 
     /// Whether there is a proxy that takes connections: a busy one is not unreachable.
-    pub fn reachable(self) -> bool {
-        self != Seen::Unreachable
+    pub fn reachable(&self) -> bool {
+        *self != Seen::Unreachable
     }
 }
 
@@ -126,6 +162,14 @@ struct StatusLine {
     phase: String,
     switching: bool,
     ready: bool,
+    // The figures: a field that is missing is `None`.
+    uptime_ms: Option<u64>,
+    requests: Option<u64>,
+    blocked: Option<u64>,
+    policy_refused: Option<u64>,
+    upstream_failures: Option<u64>,
+    config: Option<String>,
+    config_reloads: Option<Reloads>,
 }
 
 #[derive(Deserialize)]
@@ -165,6 +209,16 @@ fn status_of(line: &[u8]) -> Option<Status> {
         phase: word(&line.phase, &PHASES)?,
         switching: line.switching,
         ready: line.ready,
+        uptime_ms: line.uptime_ms,
+        requests: line.requests,
+        blocked: line.blocked,
+        policy_refused: line.policy_refused,
+        upstream_failures: line.upstream_failures,
+        config: match line.config {
+            Some(text) => Some(Fingerprint::from_hex(text.as_bytes())?.bytes()),
+            None => None,
+        },
+        config_reloads: line.config_reloads,
     })
 }
 
@@ -200,7 +254,9 @@ impl Control {
             heard = self.ask(STATUS, self.ask_wait);
         }
         match heard {
-            Heard::Line(line) => status_of(&line).map_or(Seen::Unreachable, Seen::State),
+            Heard::Line(line) => {
+                status_of(&line).map_or(Seen::Unreachable, |status| Seen::State(Box::new(status)))
+            }
             Heard::Closed => Seen::Busy,
             Heard::Nothing => Seen::Unreachable,
         }

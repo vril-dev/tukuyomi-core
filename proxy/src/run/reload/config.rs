@@ -142,6 +142,7 @@ impl Reloader {
         let earlier = shared.setup.current();
         let setup = Setup::new(
             parts.proxy,
+            parts.sha256,
             &parts.forward,
             parts.tls,
             parts.challenge,

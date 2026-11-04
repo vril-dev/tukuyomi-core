@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { ApiError } from '../js/api.js';
-import { Enrollment, Held, ROLES, codeToSend, inGroups, passwordProblem, rolesUpTo, tokenProblem, when } from '../js/account.js';
+import { Enrollment, Held, ROLES, codeToSend, inGroups, passwordProblem, rolesUpTo, tokenProblem } from '../js/account.js';
 import { userActions, userProblem } from '../js/users.js';
 
 const SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
@@ -52,12 +52,6 @@ test('the code of the second factor is sent as six digits, or as a recovery code
   assert.equal(inGroups('ABCDEFGHIJKLMNOP'), 'ABCD EFGH IJKL MNOP');
   assert.equal(inGroups('ABCDEFGHIJ'), 'ABCD EFGH IJ');
   assert.equal(inGroups(''), '');
-});
-
-test('the times of accounts are milliseconds', () => {
-  assert.equal(when(1_700_000_000_000), '2023-11-14 22:13:20Z');
-  assert.equal(when(0), '1970-01-01 00:00:00Z');
-  assert.equal(when(null), 'null');
 });
 
 test('the secret and the recovery codes live in the state of the setup only, and are gone when it is cleared', () => {

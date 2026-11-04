@@ -1,27 +1,45 @@
-// The start of the page: the language and the theme, the session, the gates and the screens.
+// The start of the page: the language, the theme and the way times are written, the session, the gates and the shell
+// with its menu, its bar and its screens.
 //
 // A user is in one of these places, and only that place is drawn (see `gateOf`): the sign-in, the code of the second
 // factor, the change of the password that must be changed, the setup of the second factor that must be set up, or the
 // shell with its screens. The screens are not started, and the API is not asked for anything else, until the gate is
-// open. The CSRF token lives in the `Api` object in memory; the only things kept in the browser are the language and
-// the theme. Nothing runs when the module is loaded, except the start of the page when there is one.
+// open. The CSRF token lives in the `Api` object in memory; the only things kept in the browser are the language, the
+// theme and the way times are written. A change of the language or of the way times are written works the words out
+// again where they stand (see `retranslate`) and draws nothing again, so that what was typed or chosen stays. The
+// address of a screen is the hash of the page: `#/<screen>`, `#/<screen>/<id>` and `#/<screen>?<key>=<value>`; a value
+// in it is checked before it is used. Nothing runs when the module is loaded, except the start of the page when there
+// is one.
 
 import { screens as accountScreens, forgetHeld, mfaSetup, passwordForm } from './account.js';
 import { Api, ApiError, gateOf } from './api.js';
-import { badge, el, mount, notice, setText } from './dom.js';
-import { LANGUAGES, language, pickLanguage, sentence, setLanguage, t } from './i18n.js';
+import { badge, button, el, mount, notice, retranslate } from './dom.js';
+import { LANGUAGES, language, lazy, pickLanguage, sentence, setLanguage, t, w } from './i18n.js';
 import { forgetEnded } from './import.js';
+import { Field, checkFields, clock, emptyField, hashOf, textInput } from './parts.js';
 import { screens as userScreens } from './users.js';
 import { generationState, screens as wafScreens } from './waf.js';
 
-const KEYS = { language: 'tukuyomi_admin_language', theme: 'tukuyomi_admin_theme' };
+const KEYS = { language: 'tukuyomi_admin_language', theme: 'tukuyomi_admin_theme', time: 'tukuyomi_admin_time' };
 const THEMES = ['auto', 'light', 'dark'];
 const THEME_WORDS = { auto: () => t('theme.auto'), light: () => t('theme.light'), dark: () => t('theme.dark') };
 const ROLES = ['viewer', 'operator', 'owner'];
 /** How long the server keeps a session that waits for the code of the second factor. */
 const CODE_WAIT_MS = 5 * 60 * 1000;
-/** The screens in the order of the menu; the page offers those that the role of the user may open. */
-const screens = [...wafScreens, ...accountScreens, ...userScreens];
+
+/**
+ * The menu: groups of screens, in the order they are shown. The group of the overview has no name. The groups of the
+ * stages to come (forwarding, policy, protection) are added here, with their screens, when the screens exist.
+ */
+const GROUPS = [
+  { label: null, screens: ['overview'] },
+  { label: w('nav.group.waf'), screens: ['generations', 'import', 'history'] },
+  { label: w('nav.group.records'), screens: ['records', 'audit'] },
+  { label: w('nav.group.admin'), screens: ['account', 'users'] },
+];
+const ALL = [...wafScreens, ...accountScreens, ...userScreens];
+/** The screens in the order of the menu. */
+const screens = GROUPS.flatMap((group) => group.screens.map((id) => ALL.find((screen) => screen.id === id)));
 
 function recall(key) {
   try {
@@ -40,10 +58,46 @@ function remember(key, value) {
   }
 }
 
-/** The screen that a hash (`#/status`) names, or the first of `ids` when it names none. */
-export function routeOf(hash, ids) {
-  const name = hash.replace(/^#\/?/, '').split(/[/?]/)[0];
-  return ids.includes(name) ? name : ids[0];
+// ---- the address ----
+
+/**
+ * What a hash names. `known` says, for each screen, how to check the value after its name (`id`: a function) and the
+ * keys after `?` (`query`: a function for each key that is allowed). Gives `{ screen, id, query, invalid }`: `screen`
+ * is null when the hash names none of ours; `id` and `query` hold the values that passed; `invalid` lists what was
+ * dropped (`id`, `path` for a part too many, `key` for a key that is not known, or the name of a known key), so that
+ * the page can say that something was. A name that came from the address is never kept in it.
+ */
+export function parseRoute(hash, known) {
+  const text = String(hash).replace(/^#\/?/, '');
+  const mark = text.indexOf('?');
+  const [name, id, ...rest] = (mark < 0 ? text : text.slice(0, mark)).split('/');
+  if (!Object.hasOwn(known, name)) return { screen: null, id: null, query: {}, invalid: [] };
+  const spec = known[name];
+  const invalid = [];
+  let value = null;
+  if (id !== undefined && id !== '') {
+    let decoded = null;
+    try {
+      decoded = decodeURIComponent(id);
+    } catch {
+      decoded = null;
+    }
+    if (decoded !== null && typeof spec.id === 'function' && spec.id(decoded)) value = decoded;
+    else invalid.push('id');
+  }
+  if (rest.length > 0) invalid.push('path');
+  const query = {};
+  for (const [key, entry] of new URLSearchParams(mark < 0 ? '' : text.slice(mark + 1))) {
+    const check = spec.query !== undefined && Object.hasOwn(spec.query, key) ? spec.query[key] : null;
+    // The name of a key that the screen does not know is not kept: it came from the address, and it is not shown.
+    if (check === null) invalid.push('key');
+    else if (Object.hasOwn(query, key)) invalid.push(key);
+    else if (entry !== '') {
+      if (check(entry)) query[key] = entry;
+      else invalid.push(key);
+    }
+  }
+  return { screen: name, id: value, query, invalid };
 }
 
 /**
@@ -64,7 +118,7 @@ class App {
   constructor(root) {
     this.root = root;
     this.api = new Api();
-    this.api.onSessionLost = () => this.showLogin(() => t('login.ended'));
+    this.api.onSessionLost = () => this.showLogin(w('login.ended'));
     this.user = null;
     this.status = { data: null, error: null, at: null, busy: false };
     this.listeners = new Set();
@@ -72,13 +126,11 @@ class App {
     this.teardown = [];
     /** Counts the views: an answer that comes after the view it was asked for has gone is dropped. */
     this.epoch = 0;
-    this.redraw = () => this.boot();
-    /** True while the page is drawn again only for the language: what a screen holds to show once is kept. */
-    this.redrawing = false;
     this.codeBy = 0;
+    this.title = lazy(() => t('app.name'));
     const saved = recall(KEYS.theme);
     this.theme = THEMES.includes(saved) ? saved : 'auto';
-    this.fields = 0;
+    clock.utc = recall(KEYS.time) === 'utc';
   }
 
   // ---- what every view shares ----
@@ -99,58 +151,64 @@ class App {
     else root.dataset.theme = this.theme;
   }
 
+  setTitle(words) {
+    this.title = words;
+    globalThis.document.title = String(words);
+  }
+
+  /** The words are worked out again for the language, and nothing is drawn again. */
   chooseLanguage(code) {
     setLanguage(code);
     remember(KEYS.language, code);
     globalThis.document.documentElement.lang = code;
-    this.redrawing = true;
-    try {
-      this.redraw();
-    } finally {
-      this.redrawing = false;
-    }
+    retranslate();
+    globalThis.document.title = String(this.title);
   }
 
-  cycleTheme(button) {
+  cycleTheme() {
     this.theme = THEMES[(THEMES.indexOf(this.theme) + 1) % THEMES.length];
     remember(KEYS.theme, this.theme === 'auto' ? null : this.theme);
     this.applyTheme();
-    setText(button, this.themeWords());
+    retranslate();
   }
 
-  themeWords() {
-    return `${t('theme.label')}: ${THEME_WORDS[this.theme]()}`;
+  toggleTime() {
+    clock.utc = !clock.utc;
+    remember(KEYS.time, clock.utc ? 'utc' : null);
+    retranslate();
   }
 
-  /** The language choice and the theme button. */
+  /** The language choice, the theme button and the button for the way times are written. */
   tools() {
     const select = el(
       'select',
-      { 'aria-label': t('bar.language'), on: { change: () => this.chooseLanguage(select.value) } },
+      { class: 'tc-select tc-select--auto', 'aria-label': w('bar.language'), on: { change: () => this.chooseLanguage(select.value) } },
       LANGUAGES.map((code) => el('option', { value: code, selected: code === language() }, code === 'ja' ? '日本語' : 'English')),
     );
-    const theme = el('button', { type: 'button', class: 'btn', on: { click: () => this.cycleTheme(theme) } }, this.themeWords());
-    return el('div', { class: 'tools' }, select, theme);
+    const nextTheme = () => THEMES[(THEMES.indexOf(this.theme) + 1) % THEMES.length];
+    const theme = button('quiet small', lazy(() => `${t('theme.label')}: ${THEME_WORDS[this.theme]()}`), () => this.cycleTheme(), {
+      'aria-label': lazy(() => t('theme.change', { now: THEME_WORDS[this.theme](), next: THEME_WORDS[nextTheme()]() })),
+    });
+    const timeWords = () => (clock.utc ? t('time.utc') : t('time.local'));
+    const time = button('quiet small', lazy(() => `${t('time.label')}: ${timeWords()}`), () => this.toggleTime(), {
+      'aria-label': lazy(() => t('time.change', { now: timeWords() })),
+    });
+    return el('div', { class: 'tc-bar__tools' }, select, theme, time);
   }
 
-  /** A labelled input: the row to place and the input itself. */
-  field(label, attributes) {
-    this.fields += 1;
-    const id = `field-${this.fields}`;
-    const input = el('input', { id, class: 'input', ...attributes });
-    return { row: el('div', { class: 'field' }, el('label', { for: id }, label), input), input };
-  }
-
-  /** Runs `task` with the button held down and marked busy, so that a second click does nothing. */
-  async guarded(button, task) {
-    button.disabled = true;
-    button.setAttribute('aria-busy', 'true');
+  /** Runs `task` with the button held down and marked busy, so that a second click does nothing. `busy` are the words it shows meanwhile. */
+  async guarded(control, task, busy = null) {
+    const saved = busy === null ? null : [...control.childNodes];
+    control.disabled = true;
+    control.setAttribute('aria-busy', 'true');
+    if (busy !== null) mount(control, busy);
     try {
       await task();
     } finally {
-      if (button.isConnected) {
-        button.disabled = false;
-        button.removeAttribute('aria-busy');
+      if (control.isConnected) {
+        control.disabled = false;
+        control.removeAttribute('aria-busy');
+        if (saved !== null) control.replaceChildren(...saved);
       }
     }
   }
@@ -166,30 +224,30 @@ class App {
       await this.api.logout();
     } catch (error) {
       if (error instanceof ApiError && error.kind === 'session') return;
-      if (this.live(epoch)) mount(messages, notice('bad', t('logout.failed')));
+      if (this.live(epoch)) mount(messages, notice('bad', w('logout.failed')));
       return;
     }
     this.showLogin();
   }
 
   /** A button that signs out; a failure is told in `messages`. */
-  signOutButton(label, className, messages) {
-    const button = el('button', { type: 'button', class: className, on: { click: () => this.guarded(button, () => this.signOut(messages)) } }, label);
-    return button;
+  signOutButton(label, kinds, messages) {
+    const out = button(kinds, label, () => this.guarded(out, () => this.signOut(messages)));
+    return out;
   }
 
-  /** The page of a gate: a card in the middle of the screen. */
+  /** The page of a gate: a panel in the middle of the screen. */
   gatePage(title, ...children) {
-    this.root.className = 'auth';
-    globalThis.document.title = `${title} - ${t('app.name')}`;
+    this.root.className = 'tc-gate';
+    this.setTitle(lazy(() => `${title} - ${t('app.name')}`));
     mount(
       this.root,
-      el('div', { class: 'auth-top' }, this.tools()),
+      el('div', { class: 'tc-gate__top' }, this.tools()),
       el(
         'main',
-        { class: 'auth-card card stack', id: 'main' },
-        el('div', { class: 'brand' }, el('img', { src: '/ui/favicon.svg', alt: '', width: '28', height: '28' }), el('span', {}, t('app.name'))),
-        el('h1', {}, title),
+        { class: 'tc-panel tc-gate__card', id: 'main' },
+        el('span', { class: 'tc-gate__brand' }, w('app.name')),
+        el('h1', { tabindex: '-1' }, title),
         ...children,
       ),
     );
@@ -200,9 +258,8 @@ class App {
   async boot() {
     this.leave();
     const epoch = this.epoch;
-    this.redraw = () => this.boot();
-    this.root.className = 'auth';
-    mount(this.root, el('p', { class: 'plain', role: 'status' }, t('app.loading')));
+    this.root.className = 'tc-gate';
+    mount(this.root, el('p', { class: 'tc-muted', role: 'status' }, w('app.loading')));
     let answer;
     try {
       answer = await this.api.call('GET', '/api/session', undefined, { auth: false });
@@ -211,7 +268,7 @@ class App {
       if (error instanceof ApiError && error.status === 401) this.showLogin();
       else if (error instanceof ApiError && error.status === 403 && error.sentence === 'second factor required') {
         // A session that waits for its code cannot be taken up again: the CSRF token was only in the page.
-        this.showLogin(() => t('login.step_lost'));
+        this.showLogin(w('login.step_lost'));
       } else this.showFailure(error);
       return;
     }
@@ -220,19 +277,14 @@ class App {
 
   showFailure(error) {
     this.leave();
-    this.redraw = () => this.showFailure(error);
-    this.gatePage(
-      t('app.failed'),
-      notice('bad', describe(error)),
-      el('button', { type: 'button', class: 'btn btn-primary', on: { click: () => this.boot() } }, t('app.retry')),
-    );
+    this.gatePage(w('app.failed'), notice('bad', this.describing(error)), button('primary', w('app.retry'), () => this.boot()));
   }
 
   /** Goes to the place that the answer of a sign-in or of the session says. */
   enter(answer) {
     const gate = gateOf(answer);
     if (gate === 'login' || typeof answer.name !== 'string' || !ROLES.includes(answer.role)) {
-      this.showLogin(gate === 'login' ? () => t('error.generic') : undefined);
+      this.showLogin(gate === 'login' ? w('error.generic') : undefined);
       return;
     }
     this.user = { name: answer.name, role: answer.role };
@@ -244,6 +296,10 @@ class App {
     else this.showShell(true);
   }
 
+  describing(error, options) {
+    return lazy(() => describe(error, options));
+  }
+
   // ---- the gates ----
 
   showLogin(why) {
@@ -253,123 +309,119 @@ class App {
     this.user = null;
     this.api.csrf = null;
     this.status = { data: null, error: null, at: null, busy: false };
-    this.redraw = () => this.showLogin(why);
     const epoch = this.epoch;
-    const messages = el('div', { class: 'stack', 'aria-live': 'polite' }, why ? notice('info', why()) : null);
-    const name = this.field(t('login.name'), {
-      type: 'text', name: 'username', autocomplete: 'username', maxlength: '32', required: true, autocapitalize: 'none', spellcheck: 'false',
-    });
-    const password = this.field(t('login.password'), {
-      type: 'password', name: 'password', autocomplete: 'current-password', maxlength: '128', required: true,
-    });
-    const submit = el('button', { type: 'submit', class: 'btn btn-primary' }, t('login.submit'));
+    const messages = el('div', { class: 'tc-stack', 'aria-live': 'polite' }, why ? notice('info', why) : null);
+    const name = new Field(w('login.name'), textInput({ name: 'username', autocomplete: 'username', maxlength: '32', autocapitalize: 'none', spellcheck: 'false' }), { required: true });
+    const password = new Field(w('login.password'), textInput({ type: 'password', name: 'password', autocomplete: 'current-password', maxlength: '128' }), { required: true });
+    const submit = button('primary', w('login.submit'), null, { type: 'submit' });
     const form = el(
       'form',
       {
-        class: 'stack',
+        class: 'tc-form',
+        novalidate: true,
         on: {
           submit: async (event) => {
             event.preventDefault();
             if (submit.disabled) return;
-            const typed = { name: name.input.value.trim(), password: password.input.value };
-            password.input.value = '';
-            await this.guarded(submit, async () => {
-              try {
-                this.enter(await this.api.call('POST', '/api/login', typed, { auth: false }));
-              } catch (error) {
-                if (!this.live(epoch)) return;
-                mount(messages, notice('bad', describe(error)));
-                password.input.focus();
-              }
-            });
+            const typed = { name: name.control.value.trim(), password: password.control.value };
+            if (!checkFields([[name, typed.name === '' ? emptyField() : null], [password, typed.password === '' ? emptyField() : null]])) return;
+            password.control.value = '';
+            await this.guarded(
+              submit,
+              async () => {
+                try {
+                  this.enter(await this.api.call('POST', '/api/login', typed, { auth: false }));
+                } catch (error) {
+                  if (!this.live(epoch)) return;
+                  mount(messages, notice('bad', this.describing(error)));
+                  password.control.focus();
+                }
+              },
+              w('login.busy'),
+            );
           },
         },
       },
-      name.row,
-      password.row,
+      name.node,
+      password.node,
       submit,
     );
-    this.gatePage(t('login.title'), messages, form);
-    name.input.focus();
+    this.gatePage(w('login.title'), messages, form);
+    name.control.focus();
   }
 
   showCode(recovery) {
     this.leave();
-    this.redraw = () => this.showCode(recovery);
     const epoch = this.epoch;
     const left = this.codeBy - Date.now();
     if (left <= 0) {
-      this.showLogin(() => t('login.step_expired'));
+      this.showLogin(w('login.step_expired'));
       return;
     }
-    const timer = setTimeout(() => this.showLogin(() => t('login.step_expired')), left);
+    const timer = setTimeout(() => this.showLogin(w('login.step_expired')), left);
     this.teardown.push(() => clearTimeout(timer));
-    const messages = el('div', { class: 'stack', 'aria-live': 'polite' });
-    const code = this.field(recovery ? t('mfa.recovery') : t('mfa.code'), {
-      type: 'text',
-      name: 'code',
-      autocomplete: 'one-time-code',
-      autocapitalize: 'none',
-      spellcheck: 'false',
-      required: true,
-      maxlength: recovery ? '64' : '8',
-      inputmode: recovery ? 'text' : 'numeric',
-    });
-    const submit = el('button', { type: 'submit', class: 'btn btn-primary' }, t('mfa.submit'));
+    const messages = el('div', { class: 'tc-stack', 'aria-live': 'polite' });
+    const code = new Field(
+      recovery ? w('mfa.recovery') : w('mfa.code'),
+      textInput({ name: 'code', autocomplete: 'one-time-code', autocapitalize: 'none', spellcheck: 'false', maxlength: recovery ? '64' : '8', inputmode: recovery ? 'text' : 'numeric' }),
+      { required: true },
+    );
+    const submit = button('primary', w('mfa.submit'), null, { type: 'submit' });
     const form = el(
       'form',
       {
-        class: 'stack',
+        class: 'tc-form',
+        novalidate: true,
         on: {
           submit: async (event) => {
             event.preventDefault();
             if (submit.disabled) return;
             // The server takes a recovery code only in capital letters (A to Z and 2 to 7, as it made them).
-            const spaced = code.input.value.replace(/\s+/g, '');
+            const spaced = code.control.value.replace(/\s+/g, '');
             const typed = recovery ? spaced.replace(/[a-z]/g, (letter) => letter.toUpperCase()) : spaced;
-            code.input.value = '';
-            await this.guarded(submit, async () => {
-              try {
-                this.enter(await this.api.call('POST', '/api/login/mfa', recovery ? { recovery: typed } : { code: typed }, { auth: false }));
-              } catch (error) {
-                if (!this.live(epoch)) return;
-                if (error instanceof ApiError && error.status === 401 && error.sentence !== 'invalid credentials') {
-                  // The session that waited for the code is gone.
-                  this.showLogin(() => t('login.step_expired'));
-                  return;
+            if (!checkFields([[code, typed === '' ? emptyField() : null]])) return;
+            code.control.value = '';
+            await this.guarded(
+              submit,
+              async () => {
+                try {
+                  this.enter(await this.api.call('POST', '/api/login/mfa', recovery ? { recovery: typed } : { code: typed }, { auth: false }));
+                } catch (error) {
+                  if (!this.live(epoch)) return;
+                  if (error instanceof ApiError && error.status === 401 && error.sentence !== 'invalid credentials') {
+                    // The session that waited for the code is gone.
+                    this.showLogin(w('login.step_expired'));
+                    return;
+                  }
+                  const wrong = error instanceof ApiError && error.status === 401;
+                  mount(messages, notice('bad', wrong ? w('mfa.invalid') : this.describing(error)));
+                  code.control.focus();
                 }
-                const wrong = error instanceof ApiError && error.status === 401;
-                mount(messages, notice('bad', wrong ? t('mfa.invalid') : describe(error)));
-                code.input.focus();
-              }
-            });
+              },
+              w('mfa.busy'),
+            );
           },
         },
       },
-      code.row,
+      code.node,
       submit,
     );
-    const other = el(
-      'button',
-      { type: 'button', class: 'btn btn-link', on: { click: () => this.showCode(!recovery) } },
-      recovery ? t('mfa.use_code') : t('mfa.use_recovery'),
-    );
-    const back = this.signOutButton(t('mfa.back'), 'btn btn-link', messages);
-    this.gatePage(t('mfa.title'), el('p', {}, recovery ? t('mfa.intro_recovery') : t('mfa.intro')), messages, form, el('div', { class: 'actions' }, other, back));
-    code.input.focus();
+    const other = button('quiet', recovery ? w('mfa.use_code') : w('mfa.use_recovery'), () => this.showCode(!recovery));
+    const back = this.signOutButton(w('mfa.back'), 'quiet', messages);
+    this.gatePage(w('mfa.title'), el('p', {}, recovery ? w('mfa.intro_recovery') : w('mfa.intro')), messages, form, el('div', { class: 'tc-actions' }, other, back));
+    code.control.focus();
   }
 
   showPassword() {
     this.leave();
-    this.redraw = () => this.showPassword();
-    const messages = el('div', { class: 'notes', 'aria-live': 'polite' });
+    const messages = el('div', { class: 'tc-notes tc-stack', 'aria-live': 'polite' });
     const form = passwordForm(this.formContext(), {
       username: this.user.name,
       messages,
-      onChanged: () => this.afterRenewal(() => t('login.changed')),
+      onChanged: () => this.afterRenewal(w('login.changed')),
     });
-    const out = this.signOutButton(t('bar.logout'), 'btn btn-link', messages);
-    this.gatePage(t('password.title'), el('p', {}, t('password.intro')), messages, form.node, el('div', { class: 'actions' }, out));
+    const out = this.signOutButton(w('bar.logout'), 'quiet', messages);
+    this.gatePage(w('password.title'), el('p', {}, w('password.intro')), messages, form.node, el('div', { class: 'tc-actions' }, out));
     form.focus();
   }
 
@@ -379,7 +431,7 @@ class App {
    */
   async afterRenewal(lost) {
     try {
-      if (this.api.csrf === null) this.showLogin(() => t('login.ended'));
+      if (this.api.csrf === null) this.showLogin(w('login.ended'));
       else this.enter(await this.api.call('GET', '/api/session'));
     } catch (error) {
       // A 401 has taken the page to the sign-in already. Any other failure must not read as a failed change.
@@ -389,12 +441,11 @@ class App {
 
   showSetup() {
     this.leave();
-    this.redraw = () => this.showSetup();
-    const messages = el('div', { class: 'notes', 'aria-live': 'polite' });
-    const setup = mfaSetup(this.formContext(), { onDone: () => this.afterRenewal(() => t('login.mfa_changed')) });
+    const messages = el('div', { class: 'tc-notes tc-stack', 'aria-live': 'polite' });
+    const setup = mfaSetup(this.formContext(), { onDone: () => this.afterRenewal(w('login.mfa_changed')) });
     this.teardown.push(() => setup.stop());
-    const out = this.signOutButton(t('bar.logout'), 'btn btn-link', messages);
-    this.gatePage(t('setup.title'), notice('info', t('setup.body')), messages, setup.node, el('div', { class: 'actions' }, out));
+    const out = this.signOutButton(w('bar.logout'), 'quiet', messages);
+    this.gatePage(w('setup.title'), notice('info', w('setup.body')), messages, setup.node, el('div', { class: 'tc-actions' }, out));
   }
 
   // ---- the shell and its screens ----
@@ -406,9 +457,9 @@ class App {
 
   async refreshStatus() {
     if (this.status.busy) return;
-    // The status belongs to the session, not to the view: a read goes on when the language is switched, and the view
-    // that is shown when it ends gets the answer. Only a sign-in puts a new status in its place (`showLogin`), and then
-    // the answer for the old session is dropped, with its busy state gone.
+    // The status belongs to the session, not to the view: a read goes on when the user goes to another screen, and the
+    // view that is shown when it ends gets the answer. Only a sign-in puts a new status in its place (`showLogin`), and
+    // then the answer for the old session is dropped, with its busy state gone.
     const asked = { ...this.status, busy: true };
     this.status = asked;
     this.publish();
@@ -431,9 +482,8 @@ class App {
   formContext() {
     return {
       api: this.api,
-      describe,
-      guarded: (button, task) => this.guarded(button, task),
-      redrawing: () => this.redrawing,
+      describe: (error, options) => this.describing(error, options),
+      guarded: (control, task, busy) => this.guarded(control, task, busy),
     };
   }
 
@@ -448,30 +498,68 @@ class App {
         return () => this.listeners.delete(listener);
       },
       toLogin: (why) => this.showLogin(why),
+      /** Goes to a hash: a new place in the history, so that the back button comes back to where the user was. */
+      navigate: (hash) => {
+        globalThis.location.hash = hash;
+      },
     };
+  }
+
+  /** The menu: the groups, with a link for each screen that the role allows. */
+  menu(available, links) {
+    return GROUPS.map((group) => {
+      const mine = group.screens.map((id) => available.find((screen) => screen.id === id)).filter((screen) => screen !== undefined);
+      if (mine.length === 0) return null;
+      return el(
+        'div',
+        { class: 'tc-nav__group' },
+        group.label === null ? null : el('span', { class: 'tc-nav__label' }, group.label),
+        mine.map((screen) => {
+          const link = el('a', { href: hashOf(screen.id), 'data-screen': screen.id }, screen.title);
+          links.push(link);
+          return link;
+        }),
+      );
+    });
   }
 
   showShell(reload) {
     this.leave();
-    this.redraw = () => this.showShell(false);
     const available = this.allowed();
-    const main = el('main', { class: 'main', id: 'main', tabindex: '-1' });
-    const links = available.map((screen) => el('a', { href: `#/${screen.id}`, 'data-screen': screen.id }, screen.title()));
-    const warning = el('a', { class: 'chip chip-warn', href: '#/status', hidden: true }, t('bar.warning'));
-    const alerts = el('div', { class: 'alerts', 'aria-live': 'polite' });
+    const known = Object.fromEntries(available.map((screen) => [screen.id, screen.route ?? {}]));
+    const main = el('main', { class: 'tc-main', id: 'main', tabindex: '-1' });
+    const links = [];
+    const nav = el('nav', { class: 'tc-nav', id: 'menu', 'aria-label': w('nav.menu') }, el('span', { class: 'tc-nav__brand' }, w('app.name')), this.menu(available, links));
+    const warning = el('a', { class: 'tc-badge tc-badge--warn', href: hashOf('overview') }, w('bar.warning'));
+    warning.hidden = true;
+    const alerts = el('div', { class: 'tc-alerts tc-stack', 'aria-live': 'polite' });
+    const place = el('p', { class: 'tc-bar__place' });
+    const toggle = el('button', { type: 'button', class: 'tc-btn tc-btn--small tc-bar__menu', 'aria-expanded': 'false', 'aria-controls': 'menu' }, w('nav.menu'));
+    const setOpen = (open) => {
+      nav.className = open ? 'tc-nav tc-nav--open' : 'tc-nav';
+      toggle.setAttribute('aria-expanded', String(open));
+    };
+    toggle.addEventListener('click', () => setOpen(toggle.getAttribute('aria-expanded') !== 'true'));
+    nav.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && toggle.getAttribute('aria-expanded') === 'true') {
+        setOpen(false);
+        toggle.focus();
+      }
+    });
     const bar = el(
       'header',
-      { class: 'bar' },
-      el('div', { class: 'brand' }, el('img', { src: '/ui/favicon.svg', alt: '', width: '24', height: '24' }), el('span', {}, t('app.name'))),
+      { class: 'tc-bar' },
+      toggle,
+      place,
+      el('span', { class: 'tc-bar__spacer' }),
       warning,
-      el('span', { class: 'spacer' }),
-      el('span', { class: 'who' }, el('span', {}, this.user.name), badge('muted', this.user.role)),
+      el('span', { class: 'tc-bar__user' }, el('span', {}, this.user.name), badge('muted', this.user.role)),
       this.tools(),
-      this.signOutButton(t('bar.logout'), 'btn', alerts),
+      el('span', { class: 'tc-bar__out' }, this.signOutButton(w('bar.logout'), 'quiet', alerts)),
     );
-    const skip = el('button', { type: 'button', class: 'skip', on: { click: () => main.focus() } }, t('app.skip'));
-    this.root.className = 'shell';
-    mount(this.root, skip, bar, alerts, el('div', { class: 'layout' }, el('nav', { class: 'nav', 'aria-label': t('nav.menu') }, links), main));
+    const skip = button('', w('app.skip'), () => main.focus(), { class: 'tc-btn tc-skip' });
+    this.root.className = 'tc-shell';
+    mount(this.root, skip, nav, el('div', { class: 'tc-content' }, bar, alerts, main));
 
     const show = (status) => {
       warning.hidden = generationState(status.data) !== 'differ';
@@ -479,27 +567,38 @@ class App {
     this.listeners.add(show);
     show(this.status);
 
-    let stop = null;
-    const route = (first) => {
-      const id = routeOf(globalThis.location.hash, available.map((screen) => screen.id));
-      if (globalThis.location.hash !== `#/${id}`) globalThis.history.replaceState(null, '', `#/${id}`);
+    let current = null;
+    const go = (first) => {
+      const parsed = parseRoute(globalThis.location.hash, known);
+      const id = parsed.screen ?? available[0].id;
       const screen = available.find((candidate) => candidate.id === id);
-      if (stop !== null) stop();
-      stop = screen.mount(this.context(), main) ?? null;
+      const canonical = hashOf(id, { id: parsed.id, query: parsed.query });
+      if (globalThis.location.hash !== canonical) globalThis.history.replaceState(null, '', canonical);
+      mount(alerts, parsed.invalid.length === 0 ? null : notice('warn', w('route.dropped')));
+      const route = { id: parsed.id, query: parsed.query };
+      if (current !== null && current.id === id && typeof current.controller.show === 'function') {
+        current.controller.show(route);
+      } else {
+        if (current !== null) current.controller.stop();
+        current = { id, controller: screen.mount(this.context(), main, route) ?? { stop() {} } };
+        const group = GROUPS.find((item) => item.screens.includes(id));
+        mount(place, group?.label ? [el('span', { class: 'tc-muted' }, group.label), el('span', { class: 'tc-muted', 'aria-hidden': 'true' }, '/')] : null, el('strong', {}, screen.title));
+        if (!first) main.querySelector('h1')?.focus();
+      }
       for (const link of links) {
-        if (link.dataset.screen === id) link.setAttribute('aria-current', 'page');
+        if (link.getAttribute('data-screen') === id) link.setAttribute('aria-current', 'page');
         else link.removeAttribute('aria-current');
       }
-      globalThis.document.title = `${screen.title()} - ${t('app.name')}`;
-      if (!first) main.focus({ preventScroll: true });
+      setOpen(false);
+      this.setTitle(lazy(() => `${screen.title.text()} - ${t('app.name')}`));
     };
-    const onHash = () => route(false);
+    const onHash = () => go(false);
     globalThis.addEventListener('hashchange', onHash);
     this.teardown.push(() => {
       globalThis.removeEventListener('hashchange', onHash);
-      if (stop !== null) stop();
+      if (current !== null) current.controller.stop();
     });
-    route(true);
+    go(true);
     if (reload) this.refreshStatus();
   }
 }

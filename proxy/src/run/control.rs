@@ -14,22 +14,28 @@
 //! of JSON of at most 4 KiB within 2 s, gets one line of JSON (2 s to write it) and is closed. A client that sends no
 //! line in time, or goes away, gets no answer. Both ops are carried out by the main loop (`Order`), which owns the
 //! switcher. `{"op":"status"}` is answered with
-//! `{"generation":..,"mode":..,"engine":..,"phase":..,"switching":..,"ready":..}`: the 64 digits of the generation
-//! that serves, what its rules do (`block` or `detect`), the engine that applies them (`coraza` or `modsecurity`),
-//! the phase of its kernel
-//! (`starting`, `ready`, `stopping`, `stopped` or `failed`), whether a switch is under way, and whether `/readyz`
-//! says `ready`. `{"op":"switch","expect":"<64 digits>"}` reads the rules store, and if the generation it chooses is
-//! not `expect` it does nothing and answers `refused` (`current changed`). Otherwise it does what SIGUSR1 does and
-//! answers when the switch has ended, `{"result":..,"generation":..}` with the generation that serves then and, when
-//! the result is not `switched`, a `reason`: `unchanged` (`already serving`), `refused` (`current changed`,
+//! `{"generation":..,"mode":..,"engine":..,"phase":..,"switching":..,"ready":..}`: the 64 digits of the generation that
+//! serves, what its rules do (`block` or `detect`), the engine that applies them (`coraza` or `modsecurity`), the phase
+//! of its kernel (`starting`, `ready`, `stopping`, `stopped` or `failed`), whether a switch is under way, and whether
+//! `/readyz` says `ready`. The same object holds the figures of the proxy: `uptime_ms` (the milliseconds since the
+//! proxy started), `requests` (the answers written to clients, of every class), `blocked` (the requests a rule
+//! blocked), `policy_refused` (the requests the access list or the rate limit turned away), `upstream_failures` (the
+//! failures of the servers of every upstream group of the configuration in force; they start from 0 when a reading of
+//! the configuration file again replaces it, as they do in `/metrics`), `config` (the 64 digits of the SHA-256 of the
+//! configuration file in force) and `config_reloads` (`{"replaced":..,"refused":..}`, the readings of the configuration
+//! file again by how they ended). The counts are those that `/metrics` shows; an answer without the figures is the
+//! answer of an older proxy. `{"op":"switch","expect":"<64 digits>"}` reads the rules store, and if the generation it
+//! chooses is not `expect` it does nothing and answers `refused` (`current changed`). Otherwise it does what SIGUSR1
+//! does and answers when the switch has ended, `{"result":..,"generation":..}` with the generation that serves then
+//! and, when the result is not `switched`, a `reason`: `unchanged` (`already serving`), `refused` (`current changed`,
 //! `store refused`), `failed` (`driver did not take the order`, `not switched`) or `busy` (`starting`, `switch under
 //! way`, `too many orders`, `stopping`). A switch is waited for as long as the kernel may take to be ready and a
-//! margin; a client that has waited that long gets `busy` and `switch under way`, and the switch goes on. A line
-//! that is not a request gets `{"result":"error","reason":..}` with `line too long`, `malformed request`, `unknown
-//! op` or `bad expect`, and a status that the main loop does not answer within 2 s gets `no answer`. Each answer to a
-//! switch order is one line in the records (`control: switch ..`), the busy answers of the connection itself included
-//! (the queue of orders is full, the wait is over, the order was dropped); an order that gets such an answer and then
-//! ends gets a second line when it ends.
+//! margin; a client that has waited that long gets `busy` and `switch under way`, and the switch goes on. A line that
+//! is not a request gets `{"result":"error","reason":..}` with `line too long`, `malformed request`, `unknown op` or
+//! `bad expect`, and a status that the main loop does not answer within 2 s gets `no answer`. Each answer to a switch
+//! order is one line in the records (`control: switch ..`), the busy answers of the connection itself included (the
+//! queue of orders is full, the wait is over, the order was dropped); an order that gets such an answer and then ends
+//! gets a second line when it ends.
 
 use std::fs;
 use std::future::poll_fn;
@@ -55,7 +61,7 @@ use super::status::Readiness;
 use crate::inbound::session::send_and_close;
 use crate::inspect::driver::State;
 use crate::log::Log;
-use crate::rules::bundle::Fingerprint;
+use crate::rules::bundle::{Fingerprint, hex};
 
 /// The most connections served at once; another one is accepted and closed.
 const SEATS: usize = 4;
@@ -91,6 +97,27 @@ impl Outcome {
     }
 }
 
+/// The figures of the proxy that a status answer holds besides its state: what `/metrics` shows of the same, taken
+/// when the answer is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Figures {
+    /// The milliseconds since the proxy started.
+    pub(super) uptime_ms: u64,
+    /// The answers written to clients, of every class.
+    pub(super) requests: u64,
+    /// The requests that a rule blocked.
+    pub(super) blocked: u64,
+    /// The requests that the access list or the rate limit turned away.
+    pub(super) policy_refused: u64,
+    /// The failures of the servers of every upstream group of the configuration in force.
+    pub(super) upstream_failures: u64,
+    /// The SHA-256 of the configuration file in force.
+    pub(super) config: [u8; 32],
+    /// The readings of the configuration file again, by how they ended.
+    pub(super) config_replaced: u64,
+    pub(super) config_refused: u64,
+}
+
 /// The answer to a line, as the connection writes it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Answer {
@@ -101,6 +128,7 @@ pub(super) enum Answer {
         phase: &'static str,
         switching: bool,
         ready: bool,
+        figures: Figures,
     },
     Switch {
         outcome: Outcome,
@@ -111,7 +139,7 @@ pub(super) enum Answer {
 }
 
 impl Answer {
-    /// The line of JSON with its line feed. Every value is a fixed word, a boolean or hexadecimal digits, so
+    /// The line of JSON with its line feed. Every value is a fixed word, a boolean, a number or hexadecimal digits, so
     /// nothing needs to be escaped.
     fn line(&self) -> String {
         match self {
@@ -122,9 +150,18 @@ impl Answer {
                 phase,
                 switching,
                 ready,
+                figures,
             } => format!(
-                "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"engine\":\"{engine}\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready}}}\n",
-                generation.hex()
+                "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"engine\":\"{engine}\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready},\"uptime_ms\":{},\"requests\":{},\"blocked\":{},\"policy_refused\":{},\"upstream_failures\":{},\"config\":\"{}\",\"config_reloads\":{{\"replaced\":{},\"refused\":{}}}}}\n",
+                generation.hex(),
+                figures.uptime_ms,
+                figures.requests,
+                figures.blocked,
+                figures.policy_refused,
+                figures.upstream_failures,
+                hex(&figures.config),
+                figures.config_replaced,
+                figures.config_refused
             ),
             Answer::Switch {
                 outcome,
@@ -481,8 +518,8 @@ impl Control {
         self.orders.poll_recv(cx)
     }
 
-    /// The answer to a status order. `switching`: a switch is under way.
-    pub(super) fn status(&self, switching: bool) -> Answer {
+    /// The answer to a status order. `switching`: a switch is under way. `figures` are read by the caller.
+    pub(super) fn status(&self, switching: bool, figures: Figures) -> Answer {
         let state = *self.state.borrow();
         Answer::Status {
             generation: state.generation,
@@ -491,6 +528,7 @@ impl Control {
             phase: phase_word(state.phase),
             switching,
             ready: self.readiness.check(state.phase).is_ok(),
+            figures,
         }
     }
 

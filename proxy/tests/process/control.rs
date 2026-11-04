@@ -64,6 +64,43 @@ fn ask(root: &Path, request: &str) -> Value {
     serde_json::from_str(&out).expect("the answer is a line of JSON")
 }
 
+/// The answer to a status question, which is what the proxy is doing and its figures.
+fn status(root: &Path) -> Value {
+    ask(root, "{\"op\":\"status\"}\n")
+}
+
+/// What a status answer says of what the proxy is doing: the answer without its figures, which are looked at here. No
+/// test here sends SIGHUP, so no reading of the configuration file again has ended: both counts are 0.
+fn state(mut answer: Value) -> Value {
+    let fields = answer.as_object_mut().expect("the answer is an object");
+    for key in [
+        "uptime_ms",
+        "requests",
+        "blocked",
+        "policy_refused",
+        "upstream_failures",
+    ] {
+        let figure = fields
+            .remove(key)
+            .unwrap_or_else(|| panic!("{key} is missing"));
+        assert!(figure.is_u64(), "{key}: {figure}");
+    }
+    let config = fields.remove("config").expect("config is missing");
+    let digits = config.as_str().expect("config is text");
+    assert!(
+        digits.len() == 64
+            && digits
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "config: {digits}"
+    );
+    let reloads = fields
+        .remove("config_reloads")
+        .expect("config_reloads is missing");
+    assert_eq!(reloads, json!({"replaced": 0, "refused": 0}));
+    answer
+}
+
 fn switch(root: &Path, expect: &str) -> Value {
     ask(
         root,
@@ -142,13 +179,13 @@ fn the_control_socket_has_mode_0600_and_switches_only_to_the_generation_that_is_
     assert_eq!(meta.permissions().mode() & 0o777, 0o600);
 
     let first = generation();
-    let status = |generation: &str| json!({"generation": generation, "mode": "block", "engine": "coraza", "phase": "ready", "switching": false, "ready": true});
-    assert_eq!(ask(&root, "{\"op\":\"status\"}\n"), status(&first));
+    let running = |generation: &str| json!({"generation": generation, "mode": "block", "engine": "coraza", "phase": "ready", "switching": false, "ready": true});
+    assert_eq!(state(status(&root)), running(&first));
     assert_eq!(exchange(proxy.port, &get("/reload-probe")).status(), 200);
 
     // The store chooses the second generation; the one that runs does not change by that.
     let second = choose_second(&root);
-    assert_eq!(ask(&root, "{\"op\":\"status\"}\n"), status(&first));
+    assert_eq!(state(status(&root)), running(&first));
 
     // An order that expects another generation than the one the store chooses changes nothing.
     let changed = |serving: &str| json!({"result": "refused", "reason": "current changed", "generation": serving});
@@ -167,7 +204,7 @@ fn the_control_socket_has_mode_0600_and_switches_only_to_the_generation_that_is_
         json!({"result": "switched", "generation": second})
     );
     proxy.wait_inspector(Some(before));
-    assert_eq!(ask(&root, "{\"op\":\"status\"}\n"), status(&second));
+    assert_eq!(state(status(&root)), running(&second));
     let page = metrics(status_port);
     for line in [
         "tukuyomi_rules_switches_total{result=\"switched\"} 1".to_string(),
@@ -193,6 +230,16 @@ fn the_control_socket_has_mode_0600_and_switches_only_to_the_generation_that_is_
         json!({"result": "unchanged", "reason": "already serving", "generation": second})
     );
     assert_eq!(switch(&root, &first), changed(&second));
+    // The figures count what the proxy has answered: four requests, one of them blocked by a rule.
+    let deadline = Instant::now() + MARGIN;
+    loop {
+        let answer = status(&root);
+        if answer["blocked"] == 1 && answer["requests"].as_u64() >= Some(4) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the figures: {answer}");
+        std::thread::sleep(10 * MS);
+    }
     assert_eq!(
         ask(&root, "{\"op\":\"nothing\"}\n"),
         json!({"result": "error", "reason": "unknown op"})
@@ -234,7 +281,7 @@ fn a_second_proxy_on_the_same_configuration_does_not_take_the_socket_of_a_runnin
         "the socket was replaced"
     );
     assert_eq!(
-        ask(&root, "{\"op\":\"status\"}\n"),
+        state(status(&root)),
         json!({"generation": generation(), "mode": "block", "engine": "coraza", "phase": "ready", "switching": false, "ready": true})
     );
     finish(proxy, 0);

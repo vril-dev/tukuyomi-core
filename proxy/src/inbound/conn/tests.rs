@@ -251,6 +251,7 @@ impl Rig {
             counters: Counters::start(),
             setup: SharedSetup::new(Setup::new(
                 cfg,
+                [0; 32],
                 forward,
                 tls,
                 None,

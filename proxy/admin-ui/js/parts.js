@@ -1,15 +1,18 @@
-// Parts that the screens of the WAF share: who may change the rules, how a generation is shown, the state of a change
-// that is under way, what a switch of the proxy answers and what it means for the user, and the sheets and the
-// confirmations that the screens open. Nothing runs when the module is loaded.
+// Parts that the screens share: who may change the rules, how a generation and a time are shown, the face of a screen
+// (its head, a panel, a number), the fields of a form with their errors, the dialogs that confirm a change, the state
+// of a change that is under way, and what a switch of the proxy answers and what it means for the user. Texts that have
+// words of the page in them are `Words` (see `dom.js`). Nothing runs when the module is loaded.
 
 import { ApiError } from './api.js';
-import { badge, el, notice, setText } from './dom.js';
-import { t } from './i18n.js';
+import { badge, button, el, mount, notice, result } from './dom.js';
+import { language, lazy, t, w } from './i18n.js';
 
 /** Whether a user of this role may import, choose, roll back and remove (the API checks it again). */
 export function canChange(role) {
   return role === 'operator' || role === 'owner';
 }
+
+// ---- generations, sizes and times ----
 
 const FINGERPRINT = /^[0-9a-f]{64}$/;
 const SHORT = 12;
@@ -24,13 +27,6 @@ export function shortOf(value) {
   return isFingerprint(value) ? value.slice(0, SHORT) : value;
 }
 
-/** `seconds` since the epoch as UTC text (`2026-10-28 09:30:00Z`); the value as it is when it is not a time. */
-export function utc(seconds) {
-  const date = typeof seconds === 'number' ? new Date(seconds * 1000) : null;
-  if (date === null || Number.isNaN(date.getTime())) return String(seconds);
-  return `${date.toISOString().slice(0, 19).replace('T', ' ')}Z`;
-}
-
 /** A size in bytes as text, in the unit that reads best. */
 export function bytesText(size) {
   if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) return String(size);
@@ -39,43 +35,72 @@ export function bytesText(size) {
   return `${(size / (1024 * 1024)).toFixed(2)} MiB`;
 }
 
-/** The two nodes of a line of a list of names and values (`dl`). */
-export function row(label, value) {
-  return [el('dt', {}, label), el('dd', {}, value)];
-}
+/** How times are written: in the time of the user's own place (the default), or in UTC. The bar of the page switches it. */
+export const clock = { utc: false };
 
 /**
- * How the generation that the rules store chooses compares with the one that the proxy serves, from the answer of
- * `GET /api/status`: `same`; `switching` (they differ while a switch is under way); `differ`; or `unknown` when the
- * proxy did not say which it serves (it cannot be reached, or has no room to answer).
+ * Milliseconds since the epoch of a time given as a number (`unit` is `ms`, or `s` for seconds) or as a text of the
+ * form of RFC 3339; null when the value is no time.
  */
-export function generationState(data) {
-  const proxy = data?.proxy ?? null;
-  if (proxy === null || typeof proxy !== 'object') return 'unknown';
-  if (data.current === proxy.generation) return 'same';
-  return proxy.switching === true ? 'switching' : 'differ';
+export function instantOf(value, unit = 'ms') {
+  let ms = null;
+  if (typeof value === 'number') ms = unit === 's' ? value * 1000 : value;
+  else if (typeof value === 'string') ms = Date.parse(value);
+  return ms !== null && Number.isFinite(new Date(ms).getTime()) ? ms : null;
 }
 
-/**
- * A generation that one screen asks the screen of the generations to open, when the user follows a link from
- * another screen. The hash of the page names a screen only, so the fingerprint waits here until the screen is drawn.
- */
-class Handoff {
-  #fingerprint = null;
+const pad = (number) => String(number).padStart(2, '0');
 
-  set(fingerprint) {
-    this.#fingerprint = isFingerprint(fingerprint) ? fingerprint : null;
+function zoneName(date) {
+  try {
+    const part = new Intl.DateTimeFormat(language() === 'ja' ? 'ja-JP' : 'en-US', { timeZoneName: 'short' })
+      .formatToParts(date)
+      .find((item) => item.type === 'timeZoneName');
+    if (part !== undefined) return part.value;
+  } catch {
+    // The place has no name for its zone here: the offset says it.
   }
-
-  /** The fingerprint that was handed over, once. */
-  take() {
-    const fingerprint = this.#fingerprint;
-    this.#fingerprint = null;
-    return fingerprint;
-  }
+  const offset = -date.getTimezoneOffset();
+  return `UTC${offset < 0 ? '-' : '+'}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`;
 }
 
-export const handoff = new Handoff();
+/** The one way a time is written: `2026-11-04 16:33:56（JST）`, or with `（UTC）` when `utc` is true. */
+export function timeText(ms, utc) {
+  const date = new Date(ms);
+  const part = utc
+    ? [date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate(), date.getUTCHours(), date.getUTCMinutes(), date.getUTCSeconds()]
+    : [date.getFullYear(), date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds()];
+  const [year, month, day, hour, minute, second] = part;
+  const stamp = `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}:${pad(second)}`;
+  const zone = utc ? 'UTC' : zoneName(date);
+  return language() === 'ja' ? `${stamp}（${zone}）` : `${stamp} (${zone})`;
+}
+
+/** A time for a screen: written the way the bar says, and the other way as its title. A value that is no time is text. */
+export function timeView(value, unit = 'ms') {
+  const ms = instantOf(value, unit);
+  if (ms === null) return el('span', {}, String(value ?? ''));
+  return el(
+    'time',
+    { datetime: new Date(ms).toISOString(), title: lazy(() => timeText(ms, !clock.utc)) },
+    lazy(() => timeText(ms, clock.utc)),
+  );
+}
+
+/** The words of a time, for a place that takes words (not an element). */
+export function timeWords(value, unit = 'ms') {
+  const ms = instantOf(value, unit);
+  return ms === null ? String(value ?? '') : lazy(() => timeText(ms, clock.utc));
+}
+
+// ---- the face of a screen ----
+
+/** The hash of a screen, with the id and the query that it holds (`#/records/<id>?status=403`). */
+export function hashOf(screen, { id = null, query = {} } = {}) {
+  const pairs = Object.entries(query).filter(([, entry]) => entry !== '' && entry !== null && entry !== undefined);
+  const search = pairs.map(([key, entry]) => `${encodeURIComponent(key)}=${encodeURIComponent(entry)}`).join('&');
+  return `#/${screen}${id === null ? '' : `/${encodeURIComponent(id)}`}${search === '' ? '' : `?${search}`}`;
+}
 
 let serial = 0;
 
@@ -85,89 +110,301 @@ export function nextId(prefix) {
   return `${prefix}-${serial}`;
 }
 
-/** A labelled control: the row to place. `hint` is a line of help below the control. */
-export function labelled(label, control, hint = null) {
-  const id = nextId('w');
-  control.setAttribute('id', id);
+/** The two nodes of a line of a list of names and values (`dl`). */
+export function row(label, value) {
+  return [el('dt', {}, label), el('dd', {}, value)];
+}
+
+/** A list of names and values; `rows` are made by `row`. */
+export function kv(...rows) {
+  return el('dl', { class: 'tc-kv' }, rows);
+}
+
+/** The head of a screen: its name, which a change of the screen moves the focus to, and what the user does there. */
+export function pageHead(title, ...actions) {
   return el(
     'div',
-    { class: 'field' },
-    el('label', { for: id }, label),
-    control,
-    hint === null ? null : el('p', { class: 'muted small' }, hint),
+    { class: 'tc-page-head' },
+    el('h1', { tabindex: '-1' }, title),
+    actions.length === 0 ? null : el('div', { class: 'tc-actions' }, ...actions),
   );
-}
-
-/** A generation's fingerprint: its first digits, and the whole of it when the user asks. */
-export function fingerprint(value) {
-  if (!isFingerprint(value)) {
-    return typeof value === 'string' ? el('code', { class: 'fp' }, value) : el('span', { class: 'muted' }, t('status.none'));
-  }
-  let whole = false;
-  const code = el('code', { class: 'fp', title: value }, shortOf(value));
-  const toggle = el(
-    'button',
-    {
-      type: 'button',
-      class: 'btn btn-link small',
-      'aria-expanded': 'false',
-      on: {
-        click: () => {
-          whole = !whole;
-          setText(code, whole ? value : shortOf(value));
-          setText(toggle, whole ? t('fp.short') : t('fp.whole'));
-          toggle.setAttribute('aria-expanded', String(whole));
-        },
-      },
-    },
-    t('fp.whole'),
-  );
-  return el('span', { class: 'fp-view' }, code, toggle);
-}
-
-/** The head of a screen: its title and what the user does there (buttons). */
-export function pageHead(title, ...actions) {
-  return el('div', { class: 'page-head' }, el('h1', {}, title), actions.length === 0 ? null : el('div', { class: 'actions' }, ...actions));
 }
 
 /**
- * A table of `rows` (arrays of cells: nodes, text or numbers) under the `columns` (their names), with a `caption` for
- * a reader of the screen. The cells of the columns in `tight` are kept on one line; those of the columns in `wide`
- * are broken anywhere, which a long unbroken text needs. On a narrow screen each row is a block with the name of the
- * column before each cell, and a cell with nothing in it is left out.
+ * A panel with a title, the state and the operations of the panel next to the title (`head`), and the content. Gives
+ * `{ node, heading }`; the heading takes the focus when the panel is opened by a change of the address.
  */
-export function table(columns, rows, caption, { tight = [], wide = [] } = {}) {
-  const kind = (at) => (tight.includes(at) ? 'tight' : wide.includes(at) ? 'wide' : null);
+export function panelWith(title, head, ...children) {
+  const id = nextId('panel');
+  const heading = el('h2', { class: 'tc-panel__title', id, tabindex: '-1' }, title);
+  const node = el(
+    'section',
+    { class: 'tc-panel', 'aria-labelledby': id },
+    el('div', { class: 'tc-panel__head' }, heading, head.length === 0 ? null : el('span', { class: 'tc-actions' }, ...head)),
+    ...children,
+  );
+  return { node, heading };
+}
+
+export function panel(title, head, ...children) {
+  return panelWith(title, head, ...children).node;
+}
+
+/** A number of the overview: its name, the number (or words that say why there is none) and a line below it. */
+export function stat(label, value, sub = null) {
   return el(
     'div',
-    { class: 'table-wrap' },
-    el(
-      'table',
-      { class: 'grid' },
-      el('caption', { class: 'sr' }, caption),
-      el('thead', {}, el('tr', {}, columns.map((name) => el('th', { scope: 'col' }, name)))),
-      el(
-        'tbody',
-        {},
-        rows.map((cells) => el('tr', {}, cells.map((cell, at) => el('td', { 'data-label': columns[at], class: kind(at) }, cell)))),
-      ),
-    ),
+    { class: 'tc-stat' },
+    el('span', { class: 'tc-stat__label' }, label),
+    el('span', { class: 'tc-stat__value' }, value),
+    sub === null ? null : el('span', { class: 'tc-stat__sub' }, sub),
   );
+}
+
+/** A check box with its words, and a line of help below them. */
+export function choice(label, input, hint = null) {
+  return el(
+    'label',
+    { class: 'tc-choice' },
+    input,
+    el('span', {}, label, hint === null ? null : el('span', { class: 'tc-hint' }, hint)),
+  );
+}
+
+export function checkbox(onChange = null) {
+  const input = el('input', { type: 'checkbox', class: 'tc-check' });
+  if (onChange !== null) input.addEventListener('change', () => onChange(input.checked));
+  return input;
+}
+
+/** The text input of a form. */
+export function textInput(attributes = {}) {
+  return el('input', { class: 'tc-input', type: 'text', ...attributes });
+}
+
+// ---- the fields of a form ----
+
+/**
+ * One field of a form: its name, the control, a line of help, and the place of the error. `invalid(words)` shows the
+ * error under the control and ties it to the control (`aria-invalid`, `aria-describedby`); `valid()` takes it away.
+ */
+export class Field {
+  constructor(label, control, { hint = null, required = false } = {}) {
+    const id = nextId('field');
+    this.control = control;
+    this.hintId = hint === null ? null : `${id}-hint`;
+    this.errorId = `${id}-error`;
+    control.setAttribute('id', id);
+    if (required) control.setAttribute('aria-required', 'true');
+    if (this.hintId !== null) control.setAttribute('aria-describedby', this.hintId);
+    this.hint = hint === null ? null : el('span', { class: 'tc-hint', id: this.hintId }, hint);
+    this.error = el('span', { class: 'tc-error', id: this.errorId });
+    this.error.hidden = true;
+    this.node = el(
+      'div',
+      { class: 'tc-field' },
+      el('label', { class: 'tc-label', for: id }, label, required ? el('span', { class: 'tc-req' }, w('field.required')) : null),
+      control,
+      this.hint,
+      this.error,
+    );
+  }
+
+  invalid(words) {
+    mount(this.error, words);
+    this.error.hidden = false;
+    if (this.hint !== null) this.hint.hidden = true;
+    this.control.setAttribute('aria-invalid', 'true');
+    this.control.setAttribute('aria-describedby', this.errorId);
+  }
+
+  valid() {
+    mount(this.error);
+    this.error.hidden = true;
+    if (this.hint !== null) this.hint.hidden = false;
+    this.control.removeAttribute('aria-invalid');
+    if (this.hintId === null) this.control.removeAttribute('aria-describedby');
+    else this.control.setAttribute('aria-describedby', this.hintId);
+  }
+}
+
+/**
+ * Shows what is wrong with each field of a form and puts the focus on the first field that is wrong. `entries` are
+ * `[field, words]`, with null for a field that is right. Gives true when none is wrong.
+ */
+export function checkFields(entries) {
+  let first = null;
+  for (const [field, words] of entries) {
+    if (words === null) {
+      field.valid();
+    } else {
+      field.invalid(words);
+      first ??= field;
+    }
+  }
+  if (first !== null) first.control.focus();
+  return first === null;
+}
+
+/** The words for a field that is empty and must not be. */
+export function emptyField() {
+  return w('field.empty');
+}
+
+// ---- copying ----
+
+/** A small button that puts `text()` on the clipboard and says in short words whether that worked; on a failure the text of `target` is selected. */
+export function copyButton(text, target = null) {
+  const status = el('span', { class: 'tc-small tc-muted', role: 'status' });
+  const copy = button('small', w('copy.button'), async () => {
+    try {
+      await globalThis.navigator.clipboard.writeText(text());
+      mount(status, w('copy.done'));
+    } catch {
+      if (target !== null) globalThis.getSelection?.()?.selectAllChildren(target);
+      mount(status, w('copy.failed'));
+    }
+  });
+  return el('span', { class: 'tc-actions' }, copy, status);
+}
+
+/** A fingerprint: its first 12 digits, and the whole of it as the title and by the copy button (`whole`: all of it is shown). */
+export function fingerprintView(value, { whole = false, copy = true } = {}) {
+  if (!isFingerprint(value)) {
+    return typeof value === 'string' ? el('code', {}, value) : el('span', { class: 'tc-muted' }, w('status.none'));
+  }
+  const code = el('code', { title: value }, whole ? value : `${shortOf(value)}…`);
+  return el('span', { class: 'tc-fp' }, code, copy ? copyButton(() => value, code) : null);
+}
+
+// ---- dialogs ----
+
+// Where the focus was when a dialog was opened: the button, or the row that holds it.
+const opener = { node: null, row: null };
+
+function remember() {
+  const active = globalThis.document.activeElement ?? null;
+  const memo = { node: active, row: active?.closest?.('[data-row]')?.getAttribute('data-row') ?? null };
+  // A dialog opened from inside another one leaves the place of the first: that is where the screen's focus goes back to.
+  if (active?.closest?.('dialog') === null || active?.closest === undefined) {
+    opener.node = memo.node;
+    opener.row = memo.row;
+  }
+  return memo;
+}
+
+/** Forgets the place of a dialog that was closed with no change made: nothing is to be drawn again, so no focus is to be put back later. */
+function forget(memo) {
+  if (opener.node === memo.node && opener.row === memo.row) {
+    opener.node = null;
+    opener.row = null;
+  }
+}
+
+/**
+ * Puts the focus back where a dialog was opened, when the dialog is closed or the screen was drawn again after it: on
+ * the button, or when that is gone on its row in `root`, or else on `fallback` (a heading).
+ */
+export function restoreFocus(root, fallback = null) {
+  const { node, row: key } = opener;
+  if (node === null && key === null) return;
+  opener.node = null;
+  opener.row = null;
+  const active = globalThis.document.activeElement;
+  if (active !== null && active !== globalThis.document.body && root.contains(active)) return;
+  if (node !== null && node.isConnected) {
+    node.focus();
+    return;
+  }
+  const line = key === null ? null : [...root.querySelectorAll('[data-row]')].find((item) => item.getAttribute('data-row') === key);
+  (line ?? fallback)?.focus();
+}
+
+function dialogOf(layer, heading, wide, body, foot) {
+  const dialog = el(
+    'dialog',
+    { class: wide ? 'tc-dialog tc-dialog--wide' : 'tc-dialog', 'aria-labelledby': heading },
+    el('div', { class: 'tc-dialog__body' }, body),
+    el('div', { class: 'tc-dialog__foot' }, foot),
+  );
+  layer.append(dialog);
+  return dialog;
+}
+
+/**
+ * A grid of what a change turns from and to: `head` are the names of the two columns, and each of `rows` is `{ label,
+ * now, after, changed }`; the value that changes is bold.
+ */
+export function diffView(head, rows) {
+  return el(
+    'div',
+    { class: 'tc-diff' },
+    el('span', { class: 'tc-diff__head' }),
+    el('span', { class: 'tc-diff__head' }, head[0]),
+    el('span', { class: 'tc-diff__head' }, head[1]),
+    rows.map((line) => [
+      el('span', { class: 'tc-muted' }, line.label),
+      el('span', {}, line.now),
+      el('span', { class: line.changed ? 'tc-diff__changed' : '' }, line.after),
+    ]),
+  );
+}
+
+/**
+ * Asks the user to confirm a change before it is made. `lines` say what changes (nodes), `diff` is a `diffView`. It
+ * gives true when the user confirms and false when the user cancels or presses Escape; the focus starts on the cancel
+ * button, and a click beside the dialog does not cancel it. `tone` is `danger` for a change that cannot be undone.
+ */
+export function confirmChange(layer, { title, lines = [], diff = null, confirm, tone = 'primary' }) {
+  return new Promise((resolve) => {
+    const memo = remember();
+    const heading = nextId('confirm');
+    const cancel = button('', w('confirm.cancel'), () => dialog.close('no'), { autofocus: true });
+    const yes = button(tone === 'danger' ? 'danger-solid' : 'primary', confirm, () => dialog.close('yes'));
+    const dialog = dialogOf(layer, heading, false, [el('h2', { class: 'tc-dialog__title', id: heading }, title), ...lines, diff], [cancel, yes]);
+    dialog.addEventListener('close', () => {
+      const answer = dialog.returnValue === 'yes';
+      dialog.remove();
+      resolve(answer);
+      if (!answer) forget(memo);
+      if (memo.node !== null && memo.node.isConnected) memo.node.focus();
+    });
+    dialog.showModal();
+    cancel.focus();
+  });
+}
+
+/**
+ * Opens a modal dialog in `layer` with `title` and `content` (nodes), for a thing that is done in more than one step.
+ * The keyboard stays in it, and Escape or the button closes it. Gives `{ close, body }`: `close` is for the screen when what the dialog was for is done; `body` is where the content goes.
+ */
+export function openDialog(layer, title, ...content) {
+  const memo = remember();
+  const heading = nextId('dialog');
+  const body = el('div', { class: 'tc-stack' }, ...content);
+  const dialog = dialogOf(layer, heading, true, [el('h2', { class: 'tc-dialog__title', id: heading }, title), body], [button('', w('dialog.close'), () => dialog.close())]);
+  dialog.addEventListener('close', () => {
+    dialog.remove();
+    // Closed by the button or Escape, nothing was changed; closed by the screen (`done`), the screen draws its list again and puts the focus back then.
+    if (dialog.returnValue !== 'done') forget(memo);
+    if (memo.node !== null && memo.node.isConnected) memo.node.focus();
+  });
+  dialog.showModal();
+  return { close: () => dialog.close('done'), body };
 }
 
 // ---- a change that is under way ----
 
 const WORKING = {
-  activate: () => t('working.activate'),
-  rollback: () => t('working.rollback'),
-  remove: () => t('working.remove'),
-  import: () => t('working.import'),
+  activate: () => w('working.activate'),
+  rollback: () => w('working.rollback'),
+  remove: () => w('working.remove'),
+  import: () => w('working.import'),
 };
 
 /**
  * Which change of the rules this page has sent and not yet had an answer to. The page holds one at a time, whatever
- * screen is shown (the server takes one at a time as well), and a screen that is drawn again while it runs, for
- * example when the language is switched, finds it here.
+ * screen is shown (the server takes one at a time as well), and a screen that is drawn while it runs finds it here.
  */
 class Working {
   #name = null;
@@ -225,7 +462,7 @@ export async function perform(name, call) {
 
 /** The banner that tells which change runs; empty when none does. */
 export function runningNotice() {
-  return working.name === null ? '' : notice('info', el('span', { class: 'spin', 'aria-hidden': 'true' }), ' ', working.words);
+  return working.name === null ? '' : notice('info', el('span', { class: 'tc-running' }, el('span', { class: 'tc-spinner', 'aria-hidden': 'true' }), working.words));
 }
 
 // ---- what a switch of the proxy answers ----
@@ -266,19 +503,19 @@ const said = (outcome, describe) => describe(outcome.error, { change: true });
 
 // For each word: the tone, the name, what happened, and what to do next (null for nothing).
 const OUTCOMES = {
-  switched: ['ok', () => t('word.switched'), (o) => t('out.switched', ids(o)), null],
-  unchanged: ['ok', () => t('word.unchanged'), (o) => t('out.unchanged', ids(o)), null],
-  refused: ['bad', () => t('word.refused'), (o) => t('out.refused', ids(o)), (o) => t('next.refused', ids(o))],
-  failed: ['bad', () => t('word.failed'), (o) => t('out.failed', ids(o)), (o) => t('next.failed', ids(o))],
-  unreachable: ['bad', () => t('word.unreachable'), () => t('out.unreachable'), () => t('next.unreachable')],
-  unconfirmed: ['warn', () => t('word.unconfirmed'), (o) => t('out.unconfirmed', ids(o)), (o) => t('next.unconfirmed', ids(o))],
-  busy: ['warn', () => t('word.busy'), () => t('out.busy'), () => t('next.busy')],
-  lost: ['warn', () => t('word.lost'), () => t('out.lost'), () => t('next.lost')],
-  conflict: ['warn', () => t('word.conflict'), said, () => t('next.conflict')],
-  unavailable: ['bad', () => t('word.unavailable'), said, null],
-  forbidden: ['bad', () => t('word.forbidden'), said, null],
-  limited: ['warn', () => t('word.limited'), said, null],
-  other: ['bad', () => t('word.other'), said, null],
+  switched: ['ok', () => w('word.switched'), (o) => w('out.switched', ids(o)), null],
+  unchanged: ['ok', () => w('word.unchanged'), (o) => w('out.unchanged', ids(o)), null],
+  refused: ['bad', () => w('word.refused'), (o) => w('out.refused', ids(o)), (o) => w('next.refused', ids(o))],
+  failed: ['bad', () => w('word.failed'), (o) => w('out.failed', ids(o)), (o) => w('next.failed', ids(o))],
+  unreachable: ['bad', () => w('word.unreachable'), () => w('out.unreachable'), () => w('next.unreachable')],
+  unconfirmed: ['warn', () => w('word.unconfirmed'), (o) => w('out.unconfirmed', ids(o)), (o) => w('next.unconfirmed', ids(o))],
+  busy: ['warn', () => w('word.busy'), () => w('out.busy'), () => w('next.busy')],
+  lost: ['warn', () => w('word.lost'), () => w('out.lost'), () => w('next.lost')],
+  conflict: ['warn', () => w('word.conflict'), said, () => w('next.conflict')],
+  unavailable: ['bad', () => w('word.unavailable'), said, null],
+  forbidden: ['bad', () => w('word.forbidden'), said, null],
+  limited: ['warn', () => w('word.limited'), said, null],
+  other: ['bad', () => w('word.other'), said, null],
 };
 
 // The names of the engines that inspect with the rules of a generation. A word that is not here is shown as the API
@@ -294,7 +531,21 @@ export function engineName(engine) {
 }
 
 export function engineBadge(engine) {
-  return badge('muted', engineName(engine));
+  return badge('plain', lazy(() => engineName(engine)));
+}
+
+const MODES = {
+  block: () => t('mode.block'),
+  detect: () => t('mode.detect'),
+};
+
+/** The words of a mode of a generation or of the proxy, by the word the API gives. */
+export function modeName(mode) {
+  return Object.hasOwn(MODES, mode) ? MODES[mode]() : String(mode);
+}
+
+export function modeBadge(mode) {
+  return badge('muted', lazy(() => modeName(mode)));
 }
 
 /** The tone of the badge of a word of the proxy's, for the history. */
@@ -306,108 +557,41 @@ export function wordBadge(word) {
 /** The box that tells how a request to switch ended and what to do next. `describe` words a failed call. */
 export function outcomeView(outcome, describe) {
   const [tone, name, what, next] = OUTCOMES[outcome.word];
-  return notice(
-    tone,
-    el('p', {}, badge(tone, name()), ' ', what(outcome, describe)),
-    outcome.unwritten ? el('p', { class: 'small' }, t('out.unwritten')) : null,
-    next === null ? null : el('p', { class: 'small' }, next(outcome)),
-  );
+  const box = result(tone, name(), what(outcome, describe), next === null ? null : next(outcome));
+  if (outcome.unwritten) box.append(el('span', { class: 'tc-notice__next' }, w('out.unwritten')));
+  return box;
+}
+
+/**
+ * How the generation that the rules store chooses compares with the one that the proxy serves, from the answer of
+ * `GET /api/status`: `same`; `switching` (they differ while a switch is under way); `differ`; or `unknown` when the
+ * proxy did not say which it serves (it cannot be reached, or has no room to answer).
+ */
+export function generationState(data) {
+  const proxy = data?.proxy ?? null;
+  if (proxy === null || typeof proxy !== 'object') return 'unknown';
+  if (data.current === proxy.generation) return 'same';
+  return proxy.switching === true ? 'switching' : 'differ';
 }
 
 /** What the screen found when it read the status and the history again: where the result of a request shows. */
 export function findingsView(status, history) {
   const proxy = status?.proxy ?? null;
   const newest = Array.isArray(history) && history.length > 0 ? history[0] : null;
-  return el(
-    'section',
-    { class: 'card' },
-    el('h2', {}, t('found.title')),
+  return panel(
+    w('found.title'),
+    [],
     status === null || history === null
-      ? notice('bad', t('found.failed'))
-      : el(
-          'dl',
-          { class: 'kv' },
-          el('dt', {}, t('status.chosen')),
-          el('dd', {}, fingerprint(status.current)),
-          el('dt', {}, t('status.serving')),
-          el('dd', {}, proxy !== null && typeof proxy === 'object' ? fingerprint(proxy.generation) : t('status.unknown')),
-          el('dt', {}, t('found.newest')),
-          el(
-            'dd',
-            {},
+      ? notice('bad', w('found.failed'))
+      : kv(
+          row(w('status.chosen'), fingerprintView(status.current)),
+          row(w('status.serving'), proxy !== null && typeof proxy === 'object' ? fingerprintView(proxy.generation) : w('status.unknown')),
+          row(
+            w('found.newest'),
             newest === null
-              ? t('history.empty')
-              : el('span', {}, newest.ts, ' ', newest.actor, ' ', wordBadge(newest.result), ' ', fingerprint(newest.from), ' → ', fingerprint(newest.to)),
+              ? w('history.empty')
+              : el('span', { class: 'tc-actions' }, timeView(newest.ts), String(newest.actor), wordBadge(newest.result), fingerprintView(newest.from, { copy: false }), '→', fingerprintView(newest.to, { copy: false })),
           ),
         ),
   );
-}
-
-// ---- sheets and confirmations ----
-
-/**
- * Opens a sheet that comes in from the right, in `layer`, with `title` and `content` (nodes). It is a modal dialog:
- * the keyboard stays in it, and Escape or the button closes it. Gives `{ close, body }`; `body` is where the content
- * goes, so that it can be filled later.
- */
-export function openSheet(layer, title, ...content) {
-  const heading = nextId('sheet');
-  const body = el('div', { class: 'stack' }, ...content);
-  const dialog = el(
-    'dialog',
-    { class: 'sheet', 'aria-labelledby': heading },
-    el(
-      'div',
-      { class: 'sheet-head' },
-      el('h2', { id: heading }, title),
-      el('button', { type: 'button', class: 'btn', on: { click: () => dialog.close() } }, t('sheet.close')),
-    ),
-    body,
-  );
-  dialog.addEventListener('close', () => dialog.remove());
-  // A click on the dark part beside the sheet is a click on the dialog itself.
-  dialog.addEventListener('click', (event) => {
-    if (event.target === dialog) dialog.close();
-  });
-  layer.append(dialog);
-  dialog.showModal();
-  return { close: () => dialog.close(), body };
-}
-
-/**
- * Asks the user to confirm a change before it is made. `lines` say what changes (nodes). It gives true when the user
- * confirms and false when the user cancels or presses Escape; the focus starts on the cancel button, and a click
- * beside the dialog does not cancel it.
- */
-export function confirmChange(layer, { title, lines, confirm, tone = 'primary' }) {
-  return new Promise((resolve) => {
-    const heading = nextId('confirm');
-    const cancel = el('button', { type: 'button', class: 'btn', autofocus: true, on: { click: () => dialog.close('no') } }, t('confirm.cancel'));
-    const yes = el(
-      'button',
-      { type: 'button', class: `btn btn-${tone}`, on: { click: () => dialog.close('yes') } },
-      confirm,
-    );
-    const dialog = el(
-      'dialog',
-      { class: 'confirm', 'aria-labelledby': heading },
-      el('h2', { id: heading }, title),
-      el('div', { class: 'stack' }, ...lines),
-      el('div', { class: 'actions confirm-actions' }, cancel, yes),
-    );
-    dialog.addEventListener('close', () => {
-      const answer = dialog.returnValue === 'yes';
-      dialog.remove();
-      resolve(answer);
-    });
-    layer.append(dialog);
-    dialog.showModal();
-  });
-}
-
-/** The lines of a confirmation that show a generation before and after: `from` and `to` in full. */
-export function changeLines(from, to) {
-  return [
-    el('dl', { class: 'kv' }, el('dt', {}, t('confirm.from')), el('dd', {}, el('code', { class: 'fp' }, from ?? '')), el('dt', {}, t('confirm.to')), el('dd', {}, el('code', { class: 'fp' }, to ?? ''))),
-  ];
 }

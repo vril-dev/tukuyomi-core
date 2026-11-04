@@ -14,8 +14,9 @@
 //! - `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "crs"}`: the generation the rules store
 //!   chooses, the state of the proxy from its control socket (`proxy` is `null` when the state could not be read, and
 //!   `reachable` is false when the proxy cannot be reached; a proxy that has no place for the question is reachable;
-//!   `proxy` has the `mode` and the `engine` of the generation it serves), the generation a rollback would go to now
-//!   (`null` for none), and the CRS of the configuration (see `status`).
+//!   `proxy` has the `mode` and the `engine` of the generation it serves, and its figures: the time since it started,
+//!   its counts and the SHA-256 of its configuration file, each `null` when an older proxy does not send it), the
+//!   generation a rollback would go to now (`null` for none), and the CRS of the configuration (see `status`).
 //! - `GET /api/generations`: `{"reachable", "generations"}`, the newest first, each with its `fingerprint`, `made`
 //!   (seconds since the epoch), `mode`, `engine`, number of `routes`, and whether it is `current` and `serving`.
 //! - `GET /api/generations/<fingerprint>`: that, and the `load` order, the `files` (path, size, SHA-256) and the

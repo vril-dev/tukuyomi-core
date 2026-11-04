@@ -28,6 +28,10 @@ test('the scripts use none of the APIs that make markup or code from a string', 
   }
 });
 
+test('the scripts name no path of the page: its files are served below a version, and a script finds them from its own address', () => {
+  for (const [name, source] of scripts) assert.doesNotMatch(source, /['"`]\/ui\//, name);
+});
+
 test('the page has no inline script, style or event attribute, one stylesheet, and module scripts only', () => {
   const html = read('index.html');
   for (const script of html.matchAll(/<script\b([^>]*)>/gi)) {

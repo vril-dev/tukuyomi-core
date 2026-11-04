@@ -23,10 +23,10 @@ test('a text has the same values to fill in, in both languages', () => {
   }
 });
 
-test('every key that a script asks for with t() is in the dictionaries', () => {
+test('every key that a script asks for with t() or w() is in the dictionaries', () => {
   for (const name of readdirSync(scripts)) {
     const source = readFileSync(new URL(name, scripts), 'utf8');
-    for (const [, key] of source.matchAll(/\bt\(\s*'([^']+)'/g)) {
+    for (const [, key] of source.matchAll(/(?<![\w.])[tw]\(\s*'([^']+)'/g)) {
       assert.ok(Object.hasOwn(dictionaries.en, key), `${name}: ${key}`);
     }
   }
@@ -41,10 +41,61 @@ test('the language is the saved one, else the first language of the browser that
 
 test('a key gives its words with the values filled in, and a sentence that is not ours stays as it is', () => {
   setLanguage('ja');
-  assert.equal(t('status.read_at', { time: '12:00:00' }), '取得: 12:00:00');
+  assert.equal(t('table.range', { from: 1, to: 50, total: 120 }), '1–50 件目（全 120 件）');
   assert.equal(sentence('invalid credentials'), dictionaries.ja['invalid credentials']);
   assert.equal(sentence('a sentence nobody knows'), 'a sentence nobody knows');
   assert.equal(sentence('constructor'), 'constructor');
   setLanguage('en');
   assert.equal(t('no.such.key'), 'no.such.key');
+});
+
+/** The text of the argument that starts at `at` in `source` and ends at the next `,` or `)` that is not inside a bracket or a string. */
+function argumentAt(source, at) {
+  let depth = 0;
+  for (let i = at; i < source.length; i += 1) {
+    const char = source[i];
+    if (char === "'" || char === '"' || char === '`') {
+      i += 1;
+      while (source[i] !== char) i += source[i] === '\\' ? 2 : 1;
+    } else if ('([{'.includes(char)) depth += 1;
+    else if (')]}'.includes(char) && depth === 0) return source.slice(at, i);
+    else if (')]}'.includes(char)) depth -= 1;
+    else if (char === ',' && depth === 0) return source.slice(at, i);
+  }
+  return source.slice(at);
+}
+
+/** The names that an object written in the call gives (`null` when the call gives something else, or spreads another object). */
+function givenNames(text) {
+  const body = text.trim();
+  if (!body.startsWith('{') || !body.endsWith('}')) return null;
+  const names = [];
+  let at = 1;
+  while (at < body.length - 1) {
+    const entry = argumentAt(body.slice(0, -1), at);
+    const match = /^\s*(?:'([^']*)'|(\w+))/.exec(entry);
+    if (entry.trim().startsWith('...') || match === null) return null;
+    names.push(match[1] ?? match[2]);
+    at += entry.length + 1;
+  }
+  return names;
+}
+
+test('a call of t() or w() that gives its values in the call gives all that the text of its key asks for', () => {
+  const asked = (key) => [...new Set([...dictionaries.en[key].matchAll(/\{(\w+)\}/g)].map((m) => m[1]))];
+  let checked = 0;
+  for (const name of readdirSync(scripts).filter((file) => file !== 'i18n.js')) {
+    const source = readFileSync(new URL(name, scripts), 'utf8');
+    for (const match of source.matchAll(/(?<![\w.])[tw]\(\s*'([^']+)'/g)) {
+      const wanted = asked(match[1]);
+      const rest = source.slice(match.index + match[0].length);
+      const second = rest.trimStart().startsWith(',') ? argumentAt(source, match.index + match[0].length + rest.indexOf(',') + 1) : null;
+      const given = second === null ? [] : givenNames(second);
+      // A call that passes a value made elsewhere (`w('out.switched', ids(outcome))`) cannot be read here.
+      if (given === null) continue;
+      checked += 1;
+      assert.deepEqual(wanted.filter((value) => !given.includes(value)), [], `${name}: ${match[1]} is called without a value that its text asks for`);
+    }
+  }
+  assert.ok(checked > 100);
 });

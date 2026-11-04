@@ -1,5 +1,6 @@
 //! The numbers that the status listener shows at `/metrics`: counters that only grow while the process runs and start
-//! at 0, the number of connections that are open, and the time the process started.
+//! at 0, the number of connections that are open, and the time the process started. The control socket gives some
+//! of them too (`status`), and the time since the start.
 //!
 //! A counter is added where the event it counts is already handled, from the same value that the record of the event
 //! shows, so a count and its records agree. Every label comes from a fixed list; a label that is not in its list is
@@ -14,7 +15,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tukuyomi_kernel::Reason;
 
@@ -196,6 +197,22 @@ impl<const N: usize> Family<N> {
     pub fn samples(&self) -> [(&'static str, u64); N] {
         std::array::from_fn(|at| (self.labels[at], self.counts[at].get()))
     }
+
+    /// The counts of all the labels added up.
+    pub fn total(&self) -> u64 {
+        self.counts
+            .iter()
+            .map(Counter::get)
+            .fold(0, u64::saturating_add)
+    }
+
+    /// The count under `label`; 0 for a label that is not in the list.
+    pub fn get(&self, label: &str) -> u64 {
+        self.labels
+            .iter()
+            .position(|&known| known == label)
+            .map_or(0, |at| self.counts[at].get())
+    }
 }
 
 /// Everything the process counts for `/metrics`. Shared by the connections (through `Shared`), the signal handlers and
@@ -224,8 +241,10 @@ pub struct Counters {
     /// The requests of a route whose records are required that were answered with 503 for want of a place to keep
     /// their record.
     pub records_refused: Counter,
-    /// When the process started, in seconds since the epoch of Unix time.
-    started: u64,
+    /// When the process started, in seconds since the epoch of Unix time (`started`).
+    began_unix: u64,
+    /// The same moment on the clock that only goes forward, for the time since the start (`uptime`).
+    began: Instant,
 }
 
 impl Counters {
@@ -253,9 +272,10 @@ impl Counters {
             open: Arc::new(Open::default()),
             tls_failures: Counter::default(),
             records_refused: Counter::default(),
-            started: SystemTime::now()
+            began_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
+            began: Instant::now(),
         }
     }
 
@@ -288,9 +308,24 @@ impl Counters {
         self.config_reloads.add(result.label());
     }
 
+    /// The requests that a rule blocked.
+    pub fn blocked(&self) -> u64 {
+        self.rule_hits.get(RuleHit::Block.label())
+    }
+
+    /// The readings of the configuration file again that ended as `result`.
+    pub fn config_reloaded(&self, result: ReloadResult) -> u64 {
+        self.config_reloads.get(result.label())
+    }
+
     /// The time the process started, in seconds since the epoch of Unix time.
     pub fn started(&self) -> u64 {
-        self.started
+        self.began_unix
+    }
+
+    /// The time since the process started.
+    pub fn uptime(&self) -> Duration {
+        self.began.elapsed()
     }
 }
 

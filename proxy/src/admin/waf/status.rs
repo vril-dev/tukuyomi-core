@@ -1,9 +1,13 @@
 //! The status route, `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "crs"}`.
 //!
 //! `current` is the generation the rules store chooses (`null` when it chooses none), and `reachable` and `proxy` are
-//! what the control socket says of the proxy (see `control`). `rollback_to` is the generation a rollback would go to
-//! if it were asked for now: the target of the history (`history::rollback_target`) when the rules store still has
-//! that generation, else `null`. A history that cannot be read makes the answer 503, as it does for the history route.
+//! what the control socket says of the proxy (see `control`): `proxy` is `{"generation", "mode", "engine", "phase",
+//! "switching", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures", "config",
+//! "config_reloads"}`, the answer of the proxy as it is, and `null` when it could not be read. A proxy of an older
+//! version does not send the figures (the last seven), and each one it does not send is `null`; the answer is not
+//! refused for that. `rollback_to` is the generation a rollback would go to if it were asked for now: the target of the
+//! history (`history::rollback_target`) when the rules store still has that generation, else `null`. A history that
+//! cannot be read makes the answer 503, as it does for the history route.
 //!
 //! `crs` is `{"available", "files"}`: `available` says whether the configuration names a directory of the CRS
 //! (`admin.crs_dir`), and `files` are the names of the `.conf` files in its `rules` directory, which an import may turn

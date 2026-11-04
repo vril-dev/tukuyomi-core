@@ -37,6 +37,17 @@ fn status_line(mode: &str) -> String {
     )
 }
 
+/// The line of a proxy that sends the figures as well.
+fn figures_line() -> String {
+    status_line("block").replace(
+        "\"ready\":true",
+        &format!(
+            "\"ready\":true,\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"config_reloads\":{{\"replaced\":5,\"refused\":1}}",
+            fp(3).hex()
+        ),
+    )
+}
+
 fn control(path: &Path) -> Control {
     Control::new(path, Duration::from_secs(1))
 }
@@ -55,8 +66,41 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
             engine: "coraza",
             phase: "ready",
             switching: false,
-            ready: true
+            ready: true,
+            // A proxy that does not send the figures.
+            uptime_ms: None,
+            requests: None,
+            blocked: None,
+            policy_refused: None,
+            upstream_failures: None,
+            config: None,
+            config_reloads: None,
         }
+    );
+    assert_eq!(status.json()["config"], Value::Null);
+    assert_eq!(status.json()["config_reloads"], Value::Null);
+    fs::remove_file(&path).unwrap();
+    // A proxy that sends them: they are read, and shown as they are.
+    let (path, thread) = serve(dir.path(), Some(figures_line()), Duration::ZERO);
+    let status = control(&path).status().state().unwrap();
+    thread.join().unwrap();
+    assert_eq!(
+        status.json(),
+        json!({
+            "generation": fp(1).hex(),
+            "mode": "block",
+            "engine": "coraza",
+            "phase": "ready",
+            "switching": false,
+            "ready": true,
+            "uptime_ms": 1234,
+            "requests": 50,
+            "blocked": 3,
+            "policy_refused": 2,
+            "upstream_failures": 4,
+            "config": fp(3).hex(),
+            "config_reloads": {"replaced": 5, "refused": 1},
+        })
     );
     fs::remove_file(&path).unwrap();
     for (word, reply) in [
@@ -99,6 +143,12 @@ fn no_socket_no_answer_and_an_answer_that_is_not_the_proxys_are_all_unreachable(
         status_line("loud"),
         status_line("block").replace(&fp(1).hex(), "abc"),
         "{\"result\":\"error\",\"reason\":\"no answer\"}\n".to_owned(),
+        // A figure that is there and is not what it should be: a negative count, a short or an upper case digest, and
+        // a reading count that is not a number.
+        figures_line().replace("\"requests\":50", "\"requests\":-1"),
+        figures_line().replace(&fp(3).hex(), "abc"),
+        figures_line().replace(&fp(3).hex(), &fp(3).hex().to_uppercase()),
+        figures_line().replace("\"replaced\":5", "\"replaced\":\"5\""),
     ];
     for reply in cases {
         let (path, thread) = serve(dir.path(), Some(reply.clone()), Duration::ZERO);
@@ -162,7 +212,7 @@ fn a_proxy_that_takes_the_connection_and_closes_it_has_no_place_and_is_not_unrea
     let (path, thread) = closing(dir.path(), 2, None);
     let seen = control(&path).status();
     assert_eq!(
-        (seen, seen.reachable(), seen.state()),
+        (seen.clone(), seen.reachable(), seen.state()),
         (Seen::Busy, true, None)
     );
     thread.join().unwrap();

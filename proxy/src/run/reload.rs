@@ -11,7 +11,7 @@ use std::sync::mpsc::SyncSender;
 
 use tokio::sync::oneshot;
 
-use super::control::{Answer, Order, Outcome};
+use super::control::{Answer, Figures, Order, Outcome};
 use super::signals::Waits;
 use crate::inbound::conn::{Setup, Shared};
 use crate::inbound::transport::tls::Files;
@@ -128,16 +128,22 @@ pub(super) fn control_order(
     waits: &mut Waits,
     switcher: &mut Switcher,
     ingress: &SyncSender<Msg>,
-    counters: &Counters,
-    log: &Log,
+    shared: &Shared,
 ) {
     let switch = match order {
-        Order::Status(reply) => return answer_status(waits, reply),
+        Order::Status(reply) => return answer_status(waits, shared, reply),
         Order::Switch(switch) => switch,
     };
     let serving = switcher.running();
     let expect = Some(switch.expect());
-    let (outcome, reason) = match begin(waits, switcher, ingress, counters, log, expect) {
+    let (outcome, reason) = match begin(
+        waits,
+        switcher,
+        ingress,
+        &shared.counters,
+        &shared.log,
+        expect,
+    ) {
         Begun::Started => {
             if let Some(control) = waits.control.as_mut() {
                 control.hold(switch);
@@ -150,22 +156,52 @@ pub(super) fn control_order(
         Begun::Refused => (Outcome::Refused, "store refused"),
         Begun::Failed => (Outcome::Failed, "driver did not take the order"),
     };
-    switch.finish(outcome, Some(reason), serving, log);
+    switch.finish(outcome, Some(reason), serving, &shared.log);
 }
 
 /// An order of the control socket before the listeners are bound: a status is answered, and a switch is not done.
-pub(super) fn control_while_starting(order: Order, waits: &Waits, switcher: &Switcher, log: &Log) {
+pub(super) fn control_while_starting(
+    order: Order,
+    waits: &Waits,
+    switcher: &Switcher,
+    shared: &Shared,
+) {
     match order {
-        Order::Status(reply) => answer_status(waits, reply),
+        Order::Status(reply) => answer_status(waits, shared, reply),
         Order::Switch(switch) => {
-            switch.finish(Outcome::Busy, Some("starting"), switcher.running(), log);
+            switch.finish(
+                Outcome::Busy,
+                Some("starting"),
+                switcher.running(),
+                &shared.log,
+            );
         }
     }
 }
 
-fn answer_status(waits: &Waits, reply: oneshot::Sender<Answer>) {
+fn answer_status(waits: &Waits, shared: &Shared, reply: oneshot::Sender<Answer>) {
     if let Some(control) = &waits.control {
-        let _ = reply.send(control.status(waits.switch.is_some()));
+        let _ = reply.send(control.status(waits.switch.is_some(), figures(shared)));
+    }
+}
+
+/// The figures of a status answer, read where `/metrics` reads them: the counters of the process and the upstream
+/// groups and the SHA-256 of the configuration in force.
+fn figures(shared: &Shared) -> Figures {
+    let counters = &shared.counters;
+    let setup = shared.setup.current();
+    Figures {
+        uptime_ms: u64::try_from(counters.uptime().as_millis()).unwrap_or(u64::MAX),
+        requests: counters.requests.total(),
+        blocked: counters.blocked(),
+        policy_refused: counters.policy_refusals.total(),
+        upstream_failures: setup
+            .upstreams
+            .failures()
+            .fold(0, |sum, (_, failures)| sum.saturating_add(failures)),
+        config: setup.sha256,
+        config_replaced: counters.config_reloaded(ReloadResult::Replaced),
+        config_refused: counters.config_reloaded(ReloadResult::Refused),
     }
 }
 

@@ -10,13 +10,13 @@
 //! connection lives for the three times together at the most. A head that hyper refuses by itself (a malformed one,
 //! or one over the limit) gets hyper's own answer, or none, and not the fields below.
 //!
-//! The files of the page (`GET /` and `GET /ui/<name>`) are answered first, by `ui`, with fields of their own. Each API
-//! answer is JSON and has `Content-Type: application/json`, `Cache-Control: no-store`, `X-Content-Type-Options:
-//! nosniff`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, `Referrer-Policy: no-referrer`
-//! and `X-Request-ID`. An error is `{"error": "<words>"}`. The number of a request is the value of `X-Request-ID`
-//! when the peer is in `admin.trusted_proxies` and the value has the form that the proxy gives (16 lowercase
-//! hexadecimal digits, `-`, and 1 to 16 digits more); else the process makes one of the same form. The client of a
-//! request, for the limits and the audit log, is found as the proxy finds the client of a request, with
+//! The files of the page (`GET /` and `GET /ui/<version>/<name>`) are answered first, by `ui`, with fields of their
+//! own. Each API answer is JSON and has `Content-Type: application/json`, `Cache-Control: no-store`,
+//! `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
+//! `Referrer-Policy: no-referrer` and `X-Request-ID`. An error is `{"error": "<words>"}`. The number of a request is
+//! the value of `X-Request-ID` when the peer is in `admin.trusted_proxies` and the value has the form that the proxy
+//! gives (16 lowercase hexadecimal digits, `-`, and 1 to 16 digits more); else the process makes one of the same form.
+//! The client of a request, for the limits and the audit log, is found as the proxy finds the client of a request, with
 //! `admin.trusted_proxies` (see `forward::client_ip`).
 //!
 //! The table of routes is in four parts: `ROUTES` here (`GET /api/audit`), `account` (the login, the session, the

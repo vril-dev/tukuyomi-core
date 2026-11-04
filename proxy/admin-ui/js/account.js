@@ -1,22 +1,22 @@
 // The account screen: the password, the second factor (its setup with a QR code and the recovery codes, and its
 // removal) and the API tokens of the signed-in user. The password form and the setup of the second factor are also
 // what the gates of the page show, so they are made here as parts that take the context of the page (`ctx`: `api`,
-// `describe`, `guarded`, `redrawing`, `toLogin`).
+// `describe`, `guarded`, `toLogin`).
 //
 // What the API shows only once (the secret of a setup, the recovery codes, the text of a new token) is kept in `held`,
-// in memory, and nowhere else: never in the storage of the browser, in the address or in the history. A screen draws it,
-// keeps it when the page is drawn again only because the language was switched, and gives it up, and its nodes, when it
-// is left. The recovery codes that the API gives when a setup is confirmed are kept as soon as the answer comes, even
-// when the screen that sent the code is gone by then, and wait for the next screen that is drawn (see `Held.confirm`);
-// the end of the sign-in gives up all of it (see `forgetHeld`). A screen is `{ id, title, least, mount }`;
-// `mount(ctx, root)` draws into `root` and gives back a function that undoes what it set up. Nothing runs when the
+// in memory, and nowhere else: never in the storage of the browser, in the address or in the history. A screen draws it
+// and gives it up, and its nodes, when it is left. The recovery codes that the API gives when a setup is confirmed are
+// kept as soon as the answer comes, even when the screen that sent the code is gone by then, and wait for the next
+// screen that is drawn (see `Held.confirm`); the end of the sign-in gives up all of it (see `forgetHeld`). A screen is
+// `{ id, title, least, mount }`; `mount(ctx, root)` draws into `root` and gives back `{ stop }`. Nothing runs when the
 // module is loaded.
 
 import { ApiError } from './api.js';
-import { badge, el, mount, notice } from './dom.js';
-import { t } from './i18n.js';
-import { confirmChange, labelled, pageHead, row, table, utc } from './parts.js';
+import { badge, bindAttribute, button, el, mount, notice, result } from './dom.js';
+import { w } from './i18n.js';
+import { Field, checkFields, confirmChange, copyButton, emptyField, kv, pageHead, panel, restoreFocus, row, textInput, timeView, timeWords } from './parts.js';
 import { darkRuns, encode } from './qr.js';
+import { Table } from './table.js';
 
 export const ROLES = ['viewer', 'operator', 'owner'];
 const PASSWORD_MIN = 12;
@@ -71,11 +71,6 @@ export function codeToSend(typed) {
 /** `text` in groups of four characters, which reads better than one long run. */
 export function inGroups(text) {
   return String(text).replace(/(.{4})(?=.)/g, '$1 ');
-}
-
-/** `ms` (milliseconds since the epoch, as the API gives times of accounts) as UTC text. */
-export function when(ms) {
-  return typeof ms === 'number' && Number.isFinite(ms) ? utc(Math.floor(ms / 1000)) : String(ms);
 }
 
 // ---- what is shown once ----
@@ -176,19 +171,14 @@ export function forgetHeld() {
   held.forget();
 }
 
-/** Gives up what is held, unless the page is only drawn again for the language (the same screen comes back at once). */
-function release(ctx) {
-  if (!ctx.redrawing()) held.clear();
-}
-
 // ---- small parts ----
 
-function input(attributes) {
-  return el('input', { class: 'input', ...attributes });
+function passwordInput(attributes = {}) {
+  return textInput({ type: 'password', maxlength: '128', ...attributes });
 }
 
-function submitButton(label) {
-  return el('button', { type: 'submit', class: 'btn btn-primary' }, label);
+function submitButton(label, kinds = 'primary') {
+  return button(kinds, label, null, { type: 'submit' });
 }
 
 function svg(tag, attributes) {
@@ -210,48 +200,27 @@ function qrView(text) {
   }
   const side = code.size + 2 * QUIET;
   const image = svg('svg', {
-    class: 'qr',
+    class: 'tc-qr',
     viewBox: `0 0 ${side} ${side}`,
     role: 'img',
-    'aria-label': t('twofa.qr_label'),
     'shape-rendering': 'crispEdges',
     focusable: 'false',
   });
-  image.append(svg('rect', { class: 'qr-light', x: 0, y: 0, width: side, height: side }));
+  bindAttribute(image, 'aria-label', w('twofa.qr_label'));
+  image.append(svg('rect', { class: 'tc-qr-light', x: 0, y: 0, width: side, height: side }));
   for (const run of darkRuns(code)) {
-    image.append(svg('rect', { class: 'qr-dark', x: run.column + QUIET, y: run.row + QUIET, width: run.length, height: 1 }));
+    image.append(svg('rect', { class: 'tc-qr-dark', x: run.column + QUIET, y: run.row + QUIET, width: run.length, height: 1 }));
   }
   return image;
 }
 
-/** A button that puts `text()` on the clipboard, and says whether that worked. */
-function copyButton(text) {
-  const status = el('span', { class: 'muted small', role: 'status' });
-  const button = el(
-    'button',
-    {
-      type: 'button',
-      class: 'btn',
-      on: {
-        click: async () => {
-          try {
-            await globalThis.navigator.clipboard.writeText(text());
-            mount(status, t('twofa.copied'));
-          } catch {
-            mount(status, t('twofa.copy_failed'));
-          }
-        },
-      },
-    },
-    t('twofa.copy'),
-  );
-  return el('span', { class: 'row-actions' }, button, status);
-}
+/** The words for a field that is empty, or `problem` for a field that is filled in (null when nothing is wrong). */
+const emptyOr = (value, problem) => (value === '' ? emptyField() : problem);
 
 const PASSWORD_PROBLEMS = {
-  mismatch: () => t('password.mismatch'),
-  length: () => t('password.length'),
-  same: () => t('password.same'),
+  mismatch: () => w('password.mismatch'),
+  length: () => w('password.length'),
+  same: () => w('password.same'),
 };
 
 /**
@@ -259,51 +228,56 @@ const PASSWORD_PROBLEMS = {
  * when the API has changed the password and renewed the session; it is awaited with the button held down.
  */
 export function passwordForm(ctx, { username, messages, onChanged }) {
-  const secret = { type: 'password', maxlength: '128', required: true };
-  const current = input({ ...secret, name: 'current', autocomplete: 'current-password' });
-  const next = input({ ...secret, name: 'new', autocomplete: 'new-password' });
-  const again = input({ ...secret, name: 'again', autocomplete: 'new-password' });
-  const submit = submitButton(t('password.submit'));
+  const current = new Field(w('password.current'), passwordInput({ name: 'current', autocomplete: 'current-password' }), { required: true });
+  const next = new Field(w('password.new'), passwordInput({ name: 'new', autocomplete: 'new-password' }), { required: true, hint: w('password.hint') });
+  const again = new Field(w('password.confirm'), passwordInput({ name: 'again', autocomplete: 'new-password' }), { required: true });
+  const submit = submitButton(w('password.submit'));
   const fields = [current, next, again];
   const form = el(
     'form',
     {
-      class: 'stack',
+      class: 'tc-form',
+      novalidate: true,
       on: {
         submit: async (event) => {
           event.preventDefault();
           if (submit.disabled) return;
-          const typed = { current: current.value, next: next.value, again: again.value };
+          const typed = { current: current.control.value, next: next.control.value, again: again.control.value };
           const problem = passwordProblem(typed.current, typed.next, typed.again);
-          if (problem !== null) {
-            mount(messages, notice('bad', PASSWORD_PROBLEMS[problem]()));
-            return;
-          }
-          await ctx.guarded(submit, async () => {
-            try {
-              await ctx.api.call('PUT', '/api/account/password', { current: typed.current, new: typed.next });
-            } catch (error) {
-              if (!form.isConnected) return;
-              mount(messages, notice('bad', ctx.describe(error, { change: true })));
-              for (const field of fields) field.value = '';
-              current.focus();
-              return;
-            }
-            for (const field of fields) field.value = '';
-            await onChanged();
-          });
+          const entries = [
+            [current, emptyOr(typed.current, null)],
+            [next, emptyOr(typed.next, problem === 'length' || problem === 'same' ? PASSWORD_PROBLEMS[problem]() : null)],
+            [again, emptyOr(typed.again, problem === 'mismatch' ? PASSWORD_PROBLEMS.mismatch() : null)],
+          ];
+          if (!checkFields(entries)) return;
+          await ctx.guarded(
+            submit,
+            async () => {
+              try {
+                await ctx.api.call('PUT', '/api/account/password', { current: typed.current, new: typed.next });
+              } catch (error) {
+                if (!form.isConnected) return;
+                mount(messages, notice('bad', ctx.describe(error, { change: true })));
+                for (const field of fields) field.control.value = '';
+                current.control.focus();
+                return;
+              }
+              for (const field of fields) field.control.value = '';
+              await onChanged();
+            },
+            w('password.busy'),
+          );
         },
       },
     },
     // Not shown: the name of the account, so that a password manager can tell whose password is changed.
     el('input', { type: 'text', name: 'username', autocomplete: 'username', value: username, readonly: true, hidden: true }),
-    labelled(t('password.current'), current),
-    labelled(t('password.new'), next),
-    labelled(t('password.confirm'), again),
-    el('p', { class: 'muted small' }, t('password.hint')),
-    el('div', { class: 'actions' }, submit),
+    current.node,
+    next.node,
+    again.node,
+    el('div', { class: 'tc-actions' }, submit),
   );
-  return { node: form, focus: () => current.focus() };
+  return { node: form, focus: () => current.control.focus() };
 }
 
 // ---- the setup of the second factor ----
@@ -318,26 +292,26 @@ class SetupFlow {
     this.ctx = ctx;
     this.onDone = onDone;
     this.alive = true;
-    this.node = el('div', { class: 'stack' });
+    this.node = el('div', { class: 'tc-stack' });
     /** Words for the next drawing (why the setup went back to its start). */
     this.flash = null;
     this.messages = null;
     this.draw();
-    // A confirmation that was sent before this flow was drawn (the language was switched meanwhile) ends here.
+    // A confirmation that was sent before this flow was drawn (the user left the screen and came back) ends here.
     held.confirming?.then((ended) => this.settled(ended));
   }
 
   stop() {
     this.alive = false;
     mount(this.node);
-    release(this.ctx);
+    held.clear();
   }
 
   draw() {
     const step = held.enrollment.step;
     const flash = this.flash;
     this.flash = null;
-    this.messages = el('div', { class: 'notes', 'aria-live': 'polite' }, flash);
+    this.messages = el('div', { class: 'tc-notes tc-stack', 'aria-live': 'polite' }, flash);
     const view = step === 'scan' ? this.scanView() : step === 'codes' ? this.codesView() : this.startView();
     mount(this.node, view);
   }
@@ -347,104 +321,89 @@ class SetupFlow {
   }
 
   startView() {
-    const password = input({ type: 'password', name: 'password', autocomplete: 'current-password', maxlength: '128', required: true });
-    const submit = submitButton(t('twofa.start'));
-    const form = el(
+    const password = new Field(w('password.current'), passwordInput({ name: 'password', autocomplete: 'current-password' }), { required: true, hint: w('twofa.start_hint') });
+    const submit = submitButton(w('twofa.start'));
+    return el(
       'form',
       {
-        class: 'stack',
+        class: 'tc-form',
+        novalidate: true,
         on: {
           submit: async (event) => {
             event.preventDefault();
             if (submit.disabled) return;
-            const typed = password.value;
-            password.value = '';
-            await this.ctx.guarded(submit, async () => {
-              let answer;
-              try {
-                answer = await this.ctx.api.call('POST', '/api/account/mfa/setup', { password: typed });
-              } catch (error) {
-                this.tell(this.ctx.describe(error, { change: true }));
-                return;
-              }
-              if (!this.alive) return;
-              if (held.enrollment.begin(answer)) this.draw();
-              else this.tell(t('error.generic'));
-            });
+            const typed = password.control.value;
+            if (!checkFields([[password, typed === '' ? emptyField() : null]])) return;
+            password.control.value = '';
+            await this.ctx.guarded(
+              submit,
+              async () => {
+                let answer;
+                try {
+                  answer = await this.ctx.api.call('POST', '/api/account/mfa/setup', { password: typed });
+                } catch (error) {
+                  this.tell(this.ctx.describe(error, { change: true }));
+                  return;
+                }
+                if (!this.alive) return;
+                if (held.enrollment.begin(answer)) this.draw();
+                else this.tell(w('error.generic'));
+              },
+              w('twofa.start_busy'),
+            );
           },
         },
       },
-      el('p', {}, badge('muted', t('twofa.off'))),
-      el('p', {}, t('twofa.intro_off')),
+      el('p', {}, badge('muted', w('twofa.off'))),
+      el('p', {}, w('twofa.intro_off')),
       this.messages,
-      labelled(t('password.current'), password, t('twofa.start_hint')),
-      el('div', { class: 'actions' }, submit),
+      password.node,
+      el('div', { class: 'tc-actions' }, submit),
     );
-    return form;
   }
 
   scanView() {
     const { secret, uri } = held.enrollment;
-    const code = input({
-      type: 'text',
-      name: 'code',
-      autocomplete: 'one-time-code',
-      inputmode: 'numeric',
-      maxlength: '8',
-      autocapitalize: 'none',
-      spellcheck: 'false',
-      required: true,
-    });
-    const confirm = submitButton(t('twofa.confirm'));
+    const code = new Field(w('twofa.step2'), textInput({ name: 'code', autocomplete: 'one-time-code', inputmode: 'numeric', maxlength: '8', autocapitalize: 'none', spellcheck: 'false' }), { required: true });
+    const confirm = submitButton(w('twofa.confirm'));
     if (held.confirming !== null) {
       confirm.disabled = true;
       confirm.setAttribute('aria-busy', 'true');
     }
-    const cancel = el(
-      'button',
-      {
-        type: 'button',
-        class: 'btn',
-        on: {
-          click: () => {
-            held.enrollment.clear();
-            this.draw();
-          },
-        },
-      },
-      t('twofa.cancel'),
-    );
+    const cancel = button('', w('twofa.cancel'), () => {
+      held.enrollment.clear();
+      this.draw();
+    });
     const form = el(
       'form',
       {
-        class: 'stack',
+        class: 'tc-form',
+        novalidate: true,
         on: {
           submit: async (event) => {
             event.preventDefault();
             if (confirm.disabled) return;
-            const typed = code.value.replace(/\s+/g, '');
-            code.value = '';
-            if (!/^\d{6}$/.test(typed)) {
-              this.tell(t('twofa.code_form'));
-              return;
-            }
-            await this.ctx.guarded(confirm, () => this.confirm(typed));
+            const typed = code.control.value.replace(/\s+/g, '');
+            if (!checkFields([[code, emptyOr(typed, /^\d{6}$/.test(typed) ? null : w('twofa.code_form'))]])) return;
+            code.control.value = '';
+            await this.ctx.guarded(confirm, () => this.confirm(typed), w('twofa.confirm_busy'));
           },
         },
       },
       this.messages,
-      labelled(t('twofa.step2'), code),
-      el('div', { class: 'actions' }, confirm, cancel),
+      code.node,
+      el('div', { class: 'tc-actions' }, confirm, cancel),
     );
     const image = qrView(uri);
+    const secretText = el('code', { class: 'tc-secret' }, inGroups(secret));
     return el(
       'div',
-      { class: 'stack' },
-      el('p', {}, t('twofa.step1')),
-      image ?? notice('warn', t('twofa.qr_failed')),
-      el('dl', { class: 'kv' }, row(t('twofa.secret'), el('code', { class: 'secret' }, inGroups(secret)))),
-      copyButton(() => secret),
-      el('p', { class: 'muted small' }, t('twofa.secret_hint')),
+      { class: 'tc-stack' },
+      el('p', {}, w('twofa.step1')),
+      image ?? notice('warn', w('twofa.qr_failed')),
+      kv(row(w('twofa.secret'), secretText)),
+      copyButton(() => secret, secretText),
+      el('p', { class: 'tc-muted tc-small' }, w('twofa.secret_hint')),
       form,
     );
   }
@@ -461,7 +420,7 @@ class SetupFlow {
     if (error === null && !kept) {
       // The second factor is set, but the answer did not carry the codes.
       held.enrollment.clear();
-      this.flash = notice('bad', t('twofa.codes_missing'));
+      this.flash = notice('bad', w('twofa.codes_missing'));
     } else if (error !== null) {
       // A conflict says that the setup ran out (the API keeps the secret for ten minutes) or was never started.
       const conflict = error instanceof ApiError && error.kind === 'conflict';
@@ -473,17 +432,18 @@ class SetupFlow {
 
   codesView() {
     const { codes } = held.enrollment;
-    const done = el('button', { type: 'button', class: 'btn btn-primary', disabled: true, on: { click: () => this.finish() } }, t('twofa.codes_done'));
-    const saved = el('input', { type: 'checkbox', on: { change: () => (done.disabled = !saved.checked) } });
+    const done = button('primary', w('twofa.codes_done'), () => this.finish(), { disabled: true });
+    const saved = el('input', { type: 'checkbox', class: 'tc-check', on: { change: () => (done.disabled = !saved.checked) } });
+    const list = el('ol', { class: 'tc-codes', 'aria-label': w('twofa.codes_list') }, codes.map((code) => el('li', {}, el('code', {}, inGroups(code)))));
     return el(
       'div',
-      { class: 'stack' },
-      notice('warn', el('p', {}, el('strong', {}, t('twofa.codes_title'))), el('p', {}, t('twofa.codes_warn'))),
+      { class: 'tc-stack' },
+      notice('warn', el('span', { class: 'tc-notice__title' }, w('twofa.codes_title')), el('span', {}, w('twofa.codes_warn'))),
       this.messages,
-      el('ol', { class: 'codes', 'aria-label': t('twofa.codes_list') }, codes.map((code) => el('li', {}, el('code', {}, inGroups(code))))),
-      copyButton(() => codes.join('\n')),
-      el('label', { class: 'check' }, saved, el('span', {}, t('twofa.codes_saved'))),
-      el('div', { class: 'actions' }, done),
+      list,
+      copyButton(() => codes.join('\n'), list),
+      el('label', { class: 'tc-choice' }, saved, el('span', {}, w('twofa.codes_saved'))),
+      el('div', { class: 'tc-actions' }, done),
     );
   }
 
@@ -504,37 +464,53 @@ export function mfaSetup(ctx, { onDone }) {
 // ---- tokens ----
 
 /**
- * A table of API tokens (`owner`: with the column of the owner). `remove(token)` runs when the button of a token is
- * pressed. The times of a token are in milliseconds.
+ * The table of API tokens (`owner`: with the column of the owner). `remove(token)` runs when the button of a token is
+ * pressed. The times of a token are in milliseconds. Give it the tokens with `update({ rows })`.
  */
-export function tokenTable(tokens, { owner, remove }) {
-  const columns = [t('col.name'), ...(owner ? [t('col.owner')] : []), t('col.role'), t('col.expires'), t('col.last_used'), t('col.id'), t('col.actions')];
-  const rows = tokens.map((token) => [
-    String(token.name),
-    ...(owner ? [String(token.owner)] : []),
-    badge('muted', String(token.role)),
-    el('span', { class: 'badges' }, when(token.expires), token.expired === true ? badge('bad', t('tokens.expired')) : null),
-    token.last_used === null || token.last_used === undefined ? t('tokens.never') : when(token.last_used),
-    el('code', { class: 'fp' }, String(token.id)),
-    el(
-      'button',
-      { type: 'button', class: 'btn btn-danger btn-small', 'aria-label': t('tokens.delete_named', { name: String(token.name) }), on: { click: () => remove(token) } },
-      t('tokens.delete'),
-    ),
-  ]);
-  return table(columns, rows, t('tokens.caption'), { tight: owner ? [3, 4] : [2, 3] });
+export function tokenTable({ owner, remove }) {
+  return new Table({
+    caption: w('tokens.caption'),
+    rowKey: (token) => String(token.id),
+    empty: { title: w('tokens.empty') },
+    columns: [
+      { key: 'name', label: w('col.name'), value: (token) => String(token.name) },
+      ...(owner ? [{ key: 'owner', label: w('col.owner'), value: (token) => String(token.owner) }] : []),
+      { key: 'role', label: w('col.role'), value: (token) => String(token.role), cell: (token) => badge('muted', String(token.role)) },
+      {
+        key: 'expires',
+        label: w('col.expires'),
+        value: (token) => token.expires,
+        tight: true,
+        cell: (token) => el('span', { class: 'tc-badges' }, timeView(token.expires), token.expired === true ? badge('bad', w('tokens.expired')) : null),
+      },
+      {
+        key: 'last_used',
+        label: w('col.last_used'),
+        value: (token) => token.last_used ?? null,
+        tight: true,
+        cell: (token) => (token.last_used === null || token.last_used === undefined ? w('tokens.never') : timeView(token.last_used)),
+      },
+      { key: 'id', label: w('col.id'), value: (token) => String(token.id), mono: true },
+      {
+        key: 'actions',
+        label: w('col.actions'),
+        value: () => '',
+        sortable: false,
+        filter: false,
+        cell: (token) => button('small danger', w('tokens.delete'), () => remove(token), { 'aria-label': w('tokens.delete_named', { name: String(token.name) }) }),
+      },
+    ],
+  });
 }
 
 /** The lines of a confirmation that removes `token` (`owner`: with the owner of the token). */
 export function tokenLines(token, { owner }) {
   return [
-    el('p', {}, t('tokens.delete_what')),
-    el(
-      'dl',
-      { class: 'kv' },
-      row(t('col.name'), String(token.name)),
-      owner ? row(t('col.owner'), String(token.owner)) : null,
-      row(t('col.id'), el('code', { class: 'fp' }, String(token.id))),
+    el('p', {}, w('tokens.delete_what')),
+    kv(
+      row(w('col.name'), String(token.name)),
+      owner ? row(w('col.owner'), String(token.owner)) : null,
+      row(w('col.id'), el('code', {}, String(token.id))),
     ),
   ];
 }
@@ -544,6 +520,7 @@ export function tokenLines(token, { owner }) {
 class AccountScreen {
   constructor(ctx, root) {
     this.ctx = ctx;
+    this.root = root;
     this.alive = true;
     this.reads = 0;
     this.session = null;
@@ -551,27 +528,24 @@ class AccountScreen {
     this.tokens = null;
     this.tokensError = null;
     this.layer = el('div');
-    this.results = el('div', { class: 'notes', 'aria-live': 'polite' });
-    this.reloadButton = el('button', { type: 'button', class: 'btn', on: { click: () => this.load() } }, t('screen.reload'));
-    this.mfaBox = el('section', { class: 'card' });
-    this.tokensBox = el('section', { class: 'card' });
+    this.results = el('div', { class: 'tc-notes tc-stack', 'aria-live': 'polite' });
+    this.reloadButton = button('', w('screen.reload'), () => this.load());
+    this.mfaBox = el('div');
+    this.tokensBox = el('div');
+    this.tokenTable = tokenTable({ owner: false, remove: (token) => this.removeToken(token) });
     this.flow = new SetupFlow(ctx, { onDone: () => this.mfaDone() });
     // The codes of a confirmation that ends after this screen was drawn show where the session may have put the removal.
     held.confirming?.then(() => this.alive && this.drawMfa());
-    const messages = el('div', { class: 'notes', 'aria-live': 'polite' });
+    const messages = el('div', { class: 'tc-notes tc-stack', 'aria-live': 'polite' });
     const password = passwordForm(ctx, { username: ctx.user.name, messages, onChanged: () => this.passwordChanged(messages) });
     mount(
       root,
-      el(
-        'div',
-        { class: 'stack' },
-        pageHead(t('account.title'), this.reloadButton),
-        el('p', { class: 'muted' }, t('account.who', { name: ctx.user.name, role: ctx.user.role })),
-        this.results,
-        el('section', { class: 'card' }, el('h2', {}, t('account.password')), el('p', { class: 'muted' }, t('account.password_intro')), messages, password.node),
-        this.mfaBox,
-        this.tokensBox,
-      ),
+      pageHead(w('account.title'), this.reloadButton),
+      el('p', { class: 'tc-intro' }, w('account.who', { name: ctx.user.name, role: ctx.user.role })),
+      this.results,
+      panel(w('account.password'), [], el('p', { class: 'tc-muted' }, w('account.password_intro')), messages, password.node),
+      this.mfaBox,
+      this.tokensBox,
       this.layer,
     );
     this.drawMfa();
@@ -610,7 +584,10 @@ class AccountScreen {
     } catch (error) {
       this.tokensError = error;
     }
-    if (this.alive) this.drawTokens();
+    if (this.alive) {
+      this.drawTokens();
+      restoreFocus(this.root, this.root.querySelector('h1'));
+    }
   }
 
   async loadSession() {
@@ -626,20 +603,20 @@ class AccountScreen {
   /** The session ended with the change (the API could not make a new one): back to the sign-in. */
   ended(why) {
     if (this.ctx.api.csrf !== null) return false;
-    this.ctx.toLogin(() => why);
+    this.ctx.toLogin(why);
     return true;
   }
 
   async passwordChanged(messages) {
-    if (this.ended(t('login.ended'))) return;
-    mount(messages, notice('ok', t('account.password_done')));
+    if (this.ended(w('login.ended'))) return;
+    mount(messages, result('ok', w('account.password_done_title'), w('account.password_done')));
     // The tokens of the user were removed with the change.
     await this.loadTokens();
   }
 
   async mfaDone() {
-    if (this.ended(t('login.mfa_changed'))) return;
-    mount(this.results, notice('ok', t('twofa.set')));
+    if (this.ended(w('login.mfa_changed'))) return;
+    mount(this.results, result('ok', w('twofa.set_title'), w('twofa.set')));
     await this.loadSession();
   }
 
@@ -652,7 +629,7 @@ class AccountScreen {
       // A setup is under way: nothing but it is shown, whatever the session says now.
       content = this.flow.node;
     } else if (session === null) {
-      content = this.sessionError === null ? notice('info', t('account.loading')) : notice('bad', t('account.failed'), ' ', this.ctx.describe(this.sessionError));
+      content = this.sessionError === null ? notice('info', w('account.loading')) : notice('bad', w('account.failed'), ' ', this.ctx.describe(this.sessionError));
     } else if (session.mfa === true) {
       content = this.removeView(session);
     } else {
@@ -661,54 +638,62 @@ class AccountScreen {
     }
     mount(
       this.mfaBox,
-      el('h2', {}, t('twofa.title')),
-      this.sessionError !== null && session !== null ? notice('bad', t('account.failed'), ' ', this.ctx.describe(this.sessionError)) : null,
-      content,
+      panel(
+        w('twofa.title'),
+        session?.mfa === true ? [badge('ok', w('twofa.on'))] : [],
+        this.sessionError !== null && session !== null ? notice('bad', w('account.failed'), ' ', this.ctx.describe(this.sessionError)) : null,
+        content,
+      ),
     );
   }
 
   removeView(session) {
     const left = typeof session.recovery_left === 'number' ? session.recovery_left : null;
-    const messages = el('div', { class: 'notes', 'aria-live': 'polite' });
-    const password = input({ type: 'password', name: 'password', autocomplete: 'current-password', maxlength: '128', required: true });
-    const code = input({ type: 'text', name: 'code', autocomplete: 'one-time-code', maxlength: '64', autocapitalize: 'none', spellcheck: 'false', required: true });
-    const submit = el('button', { type: 'submit', class: 'btn btn-danger' }, t('twofa.remove'));
+    const messages = el('div', { class: 'tc-notes tc-stack', 'aria-live': 'polite' });
+    const password = new Field(w('password.current'), passwordInput({ name: 'password', autocomplete: 'current-password' }), { required: true });
+    const code = new Field(w('twofa.remove_code'), textInput({ name: 'code', autocomplete: 'one-time-code', maxlength: '64', autocapitalize: 'none', spellcheck: 'false' }), { required: true });
+    const submit = submitButton(w('twofa.remove'), 'danger');
     const form = el(
       'form',
       {
-        class: 'stack',
+        class: 'tc-form',
+        novalidate: true,
         on: {
           submit: async (event) => {
             event.preventDefault();
             if (submit.disabled) return;
-            const typed = { password: password.value, code: codeToSend(code.value) };
-            password.value = '';
-            code.value = '';
-            await this.ctx.guarded(submit, async () => {
-              try {
-                await this.ctx.api.call('DELETE', '/api/account/mfa', typed);
-              } catch (error) {
-                if (this.alive) mount(messages, notice('bad', this.ctx.describe(error, { change: true })));
-                return;
-              }
-              if (this.ended(t('login.ended')) || !this.alive) return;
-              mount(this.results, notice('ok', t('twofa.removed')));
-              await this.loadSession();
-            });
+            const typed = { password: password.control.value, code: codeToSend(code.control.value) };
+            if (!checkFields([[password, emptyOr(typed.password, null)], [code, emptyOr(typed.code, null)]])) return;
+            password.control.value = '';
+            code.control.value = '';
+            await this.ctx.guarded(
+              submit,
+              async () => {
+                try {
+                  await this.ctx.api.call('DELETE', '/api/account/mfa', typed);
+                } catch (error) {
+                  if (this.alive) mount(messages, notice('bad', this.ctx.describe(error, { change: true })));
+                  return;
+                }
+                if (this.ended(w('login.ended')) || !this.alive) return;
+                mount(this.results, result('ok', w('twofa.removed_title'), w('twofa.removed')));
+                await this.loadSession();
+              },
+              w('twofa.remove_busy'),
+            );
           },
         },
       },
-      el('h3', {}, t('twofa.remove_title')),
-      el('p', { class: 'muted' }, t('twofa.remove_hint')),
+      el('h3', {}, w('twofa.remove_title')),
+      el('p', { class: 'tc-muted' }, w('twofa.remove_hint')),
       messages,
-      labelled(t('password.current'), password),
-      labelled(t('twofa.remove_code'), code),
-      el('div', { class: 'actions' }, submit),
+      password.node,
+      code.node,
+      el('div', { class: 'tc-actions' }, submit),
     );
     return [
-      el('p', {}, badge('ok', t('twofa.on'))),
-      left === null ? null : el('p', {}, t('twofa.recovery_left', { n: left })),
-      left !== null && left <= FEW_CODES ? notice('warn', t('twofa.recovery_low')) : el('p', { class: 'muted small' }, t('twofa.recovery_new')),
+      left === null ? null : el('p', {}, w('twofa.recovery_left', { n: left })),
+      left !== null && left <= FEW_CODES ? notice('warn', w('twofa.recovery_low')) : el('p', { class: 'tc-muted tc-small' }, w('twofa.recovery_new')),
       form,
     ];
   }
@@ -717,22 +702,19 @@ class AccountScreen {
 
   drawTokens() {
     const tokens = this.tokens;
-    let list;
-    if (tokens === null) {
-      list = this.tokensError === null ? notice('info', t('account.loading')) : notice('bad', t('tokens.failed'), ' ', this.ctx.describe(this.tokensError));
-    } else if (tokens.length === 0) {
-      list = el('p', { class: 'muted' }, t('tokens.empty'));
-    } else {
-      list = tokenTable(tokens, { owner: false, remove: (token) => this.removeToken(token) });
-    }
+    this.tokenTable.update({ rows: tokens ?? [], loading: tokens === null && this.tokensError === null });
+    this.tokenTable.node.hidden = tokens === null && this.tokensError !== null;
     mount(
       this.tokensBox,
-      el('h2', {}, t('tokens.title')),
-      el('p', { class: 'muted' }, t('tokens.intro')),
-      this.issuedView(),
-      this.tokensError !== null && tokens !== null ? notice('bad', t('tokens.failed'), ' ', this.ctx.describe(this.tokensError)) : null,
-      list,
-      this.createForm(),
+      panel(
+        w('tokens.title'),
+        [],
+        el('p', { class: 'tc-muted' }, w('tokens.intro')),
+        this.issuedView(),
+        this.tokensError !== null ? notice('bad', w('tokens.failed'), ' ', this.ctx.describe(this.tokensError)) : null,
+        this.tokenTable.node,
+        this.createForm(),
+      ),
     );
   }
 
@@ -740,98 +722,97 @@ class AccountScreen {
   issuedView() {
     const token = held.token;
     if (token === null) return null;
-    const close = el(
-      'button',
-      {
-        type: 'button',
-        class: 'btn btn-primary',
-        on: {
-          click: () => {
-            held.token = null;
-            this.drawTokens();
-          },
-        },
-      },
-      t('tokens.issued_done'),
-    );
+    const secret = el('code', { class: 'tc-secret' }, token.text);
     return notice(
       'warn',
-      el('p', {}, el('strong', {}, t('tokens.issued_title', { name: token.name }))),
-      el('p', {}, t('tokens.issued_warn')),
-      el('p', {}, el('code', { class: 'secret' }, token.text)),
-      el('p', { class: 'muted small' }, t('tokens.issued_info', { role: token.role, time: when(token.expires) })),
-      el('div', { class: 'row-actions' }, copyButton(() => token.text), close),
+      el('span', { class: 'tc-notice__title' }, w('tokens.issued_title', { name: token.name })),
+      el('span', {}, w('tokens.issued_warn')),
+      el('span', {}, secret),
+      el('span', { class: 'tc-notice__next' }, w('tokens.issued_info', { role: token.role, time: timeWords(token.expires) })),
+      el(
+        'div',
+        { class: 'tc-actions' },
+        copyButton(() => token.text, secret),
+        button('primary', w('tokens.issued_done'), () => {
+          held.token = null;
+          this.drawTokens();
+        }),
+      ),
     );
   }
 
   createForm() {
     const own = this.ctx.user.role;
-    const name = input({ type: 'text', name: 'token-name', maxlength: '64', autocomplete: 'off', required: true, spellcheck: 'false' });
-    const role = el(
-      'select',
-      { class: 'input', name: 'token-role' },
-      rolesUpTo(own).map((choice) => el('option', { value: choice, selected: choice === own }, choice)),
+    const name = new Field(w('tokens.name'), textInput({ name: 'token-name', maxlength: '64', autocomplete: 'off', spellcheck: 'false' }), { required: true, hint: w('tokens.name_hint') });
+    const role = new Field(
+      w('col.role'),
+      el('select', { class: 'tc-select', name: 'token-role' }, rolesUpTo(own).map((choice) => el('option', { value: choice, selected: choice === own }, choice))),
+      { hint: w('tokens.role_hint', { role: own }) },
     );
-    const days = input({ type: 'number', name: 'token-days', min: String(DAYS.min), max: String(DAYS.max), step: '1', inputmode: 'numeric', value: String(DAYS.start), required: true });
-    const password = input({ type: 'password', name: 'password', autocomplete: 'current-password', maxlength: '128', required: true });
+    const days = new Field(
+      w('tokens.days'),
+      textInput({ type: 'number', name: 'token-days', min: String(DAYS.min), max: String(DAYS.max), step: '1', inputmode: 'numeric', value: String(DAYS.start) }),
+      { required: true, hint: w('tokens.days_hint') },
+    );
+    const password = new Field(w('password.current'), passwordInput({ name: 'password', autocomplete: 'current-password' }), { required: true, hint: w('tokens.password_hint') });
     // The text of a token is shown once and a new token would take its place, so the next one waits until it is saved.
     const waiting = held.token !== null;
-    const messages = el('div', { class: 'notes', 'aria-live': 'polite' }, waiting ? notice('info', t('tokens.issued_first')) : null);
-    const submit = submitButton(t('tokens.create'));
+    const messages = el('div', { class: 'tc-notes tc-stack', 'aria-live': 'polite' }, waiting ? notice('info', w('tokens.issued_first')) : null);
+    const submit = submitButton(w('tokens.create'));
     submit.disabled = waiting;
-    const problems = { name: () => t('tokens.p_name'), role: () => t('tokens.p_role'), days: () => t('tokens.p_days') };
     return el(
       'form',
       {
-        class: 'stack',
+        class: 'tc-form tc-form--wide',
+        novalidate: true,
         on: {
           submit: async (event) => {
             event.preventDefault();
             if (submit.disabled || held.token !== null) return;
-            const typed = { name: name.value, role: role.value, days: days.value.trim() };
+            const typed = { name: name.control.value, role: role.control.value, days: days.control.value.trim() };
             const problem = tokenProblem(typed, own);
-            if (problem !== null) {
-              mount(messages, notice('bad', problems[problem]()));
-              return;
-            }
-            const secret = password.value;
-            password.value = '';
-            await this.ctx.guarded(submit, async () => {
-              let made;
-              try {
-                made = await this.ctx.api.call('POST', '/api/account/tokens', { name: typed.name, role: typed.role, days: Number(typed.days), password: secret });
-              } catch (error) {
-                if (this.alive) mount(messages, notice('bad', this.ctx.describe(error, { change: true })));
-                return;
-              }
-              if (!this.alive) return;
-              if (typeof made.token !== 'string') {
-                mount(messages, notice('bad', t('error.generic')));
+            const secret = password.control.value;
+            const entries = [
+              [name, emptyOr(typed.name, problem === 'name' ? w('tokens.p_name') : null)],
+              [role, problem === 'role' ? w('tokens.p_role') : null],
+              [days, emptyOr(typed.days, problem === 'days' ? w('tokens.p_days') : null)],
+              [password, emptyOr(secret, null)],
+            ];
+            if (!checkFields(entries)) return;
+            password.control.value = '';
+            await this.ctx.guarded(
+              submit,
+              async () => {
+                let made;
+                try {
+                  made = await this.ctx.api.call('POST', '/api/account/tokens', { name: typed.name, role: typed.role, days: Number(typed.days), password: secret });
+                } catch (error) {
+                  if (this.alive) mount(messages, notice('bad', this.ctx.describe(error, { change: true })));
+                  return;
+                }
+                if (!this.alive) return;
+                if (typeof made.token !== 'string') {
+                  mount(messages, notice('bad', w('error.generic')));
+                  await this.loadTokens();
+                  return;
+                }
+                held.token = { text: made.token, name: typed.name, role: typed.role, expires: made.expires };
                 await this.loadTokens();
-                return;
-              }
-              held.token = { text: made.token, name: typed.name, role: typed.role, expires: made.expires };
-              await this.loadTokens();
-            });
+              },
+              w('tokens.create_busy'),
+            );
           },
         },
       },
-      el('h3', {}, t('tokens.create_title')),
+      el('h3', {}, w('tokens.create_title')),
       messages,
-      el(
-        'div',
-        { class: 'fields' },
-        labelled(t('tokens.name'), name, t('tokens.name_hint')),
-        labelled(t('col.role'), role, t('tokens.role_hint', { role: own })),
-        labelled(t('tokens.days'), days, t('tokens.days_hint')),
-        labelled(t('password.current'), password, t('tokens.password_hint')),
-      ),
-      el('div', { class: 'actions' }, submit),
+      el('div', { class: 'tc-fields' }, name.node, role.node, days.node, password.node),
+      el('div', { class: 'tc-actions' }, submit),
     );
   }
 
   async removeToken(token) {
-    const yes = await confirmChange(this.layer, { title: t('tokens.delete_title'), lines: tokenLines(token, { owner: false }), confirm: t('tokens.delete'), tone: 'danger' });
+    const yes = await confirmChange(this.layer, { title: w('tokens.delete_title'), lines: tokenLines(token, { owner: false }), confirm: w('tokens.delete'), tone: 'danger' });
     if (!yes || !this.alive) return;
     let error = null;
     try {
@@ -840,7 +821,7 @@ class AccountScreen {
       error = failure;
     }
     if (!this.alive) return;
-    mount(this.results, error === null ? notice('ok', t('tokens.deleted', { name: String(token.name) })) : notice('bad', this.ctx.describe(error, { change: true })));
+    mount(this.results, error === null ? result('ok', w('tokens.deleted_title'), w('tokens.deleted', { name: String(token.name) })) : notice('bad', this.ctx.describe(error, { change: true })));
     await this.loadTokens();
   }
 }
@@ -848,7 +829,7 @@ class AccountScreen {
 function mountAccount(ctx, root) {
   const screen = new AccountScreen(ctx, root);
   screen.load();
-  return () => screen.stop();
+  return { stop: () => screen.stop() };
 }
 
-export const screens = [{ id: 'account', title: () => t('nav.account'), least: 'viewer', mount: mountAccount }];
+export const screens = [{ id: 'account', title: w('nav.account'), least: 'viewer', mount: mountAccount }];

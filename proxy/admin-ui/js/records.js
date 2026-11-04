@@ -1,13 +1,15 @@
 // The screens of the lines that the proxy and the admin process write: the records of the proxy, which the user
 // searches by filters and reads page after page, and the audit log. Every value of a line is shown as text, as the
 // API gives it: what came from a request is still in the `%XX` form the proxy wrote, and a decoded view is a second
-// text beside it, with every control character made visible. The screens read when they are opened and when the
-// user asks; nothing is polled. A screen is `{ id, title, least, mount }`; `mount(ctx, root)` draws into `root` and
-// gives back a function that undoes what it set up. Nothing runs when the module is loaded.
+// text beside it, with every control character made visible. A search and one record have addresses of their own
+// (`#/records?status=403`, `#/records/<request number>`). The screens read when they are opened and when the user asks;
+// nothing is polled. A screen is `{ id, title, least, mount }`; `mount(ctx, root, route)` draws into `root` and gives
+// back `{ stop, show }`. Nothing runs when the module is loaded.
 
-import { badge, el, mount, notice } from './dom.js';
-import { t } from './i18n.js';
-import { labelled, nextId, openSheet, pageHead, row, table } from './parts.js';
+import { badge, button, buttonClass, el, mount, notice } from './dom.js';
+import { w } from './i18n.js';
+import { Field, checkFields, checkbox, choice, fingerprintView, hashOf, instantOf, kv, pageHead, panelWith, restoreFocus, row, textInput, timeView } from './parts.js';
+import { Table } from './table.js';
 
 /** The types of record there are. */
 export const TYPES = ['request', 'connection', 'tunnel', 'line', 'audit', 'dropped'];
@@ -15,18 +17,30 @@ const FIELDS = ['from', 'to', 'type', 'class', 'status', 'rule', 'id', 'client',
 const TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
 /** The names of the filters, for the screen. */
 const LABELS = {
-  from: () => t('records.f.from'),
-  to: () => t('records.f.to'),
-  type: () => t('records.f.type'),
-  class: () => t('records.f.class'),
-  status: () => t('records.f.status'),
-  rule: () => t('records.f.rule'),
-  id: () => t('records.f.id'),
-  client: () => t('records.f.client'),
-  generation: () => t('records.f.generation'),
+  from: () => w('records.f.from'),
+  to: () => w('records.f.to'),
+  type: () => w('records.f.type'),
+  class: () => w('records.f.class'),
+  status: () => w('records.f.status'),
+  rule: () => w('records.f.rule'),
+  id: () => w('records.f.id'),
+  client: () => w('records.f.client'),
+  generation: () => w('records.f.generation'),
+};
+/** What to write when a filter is not of its form. */
+const PROBLEMS = {
+  from: () => w('records.p_time'),
+  to: () => w('records.p_time'),
+  type: () => w('records.p_type'),
+  class: () => w('records.p_class'),
+  status: () => w('records.p_status'),
+  rule: () => w('records.p_rule'),
+  id: () => w('records.p_id'),
+  client: () => w('records.p_client'),
+  generation: () => w('records.p_generation'),
 };
 /** The forms of the filters, as the API takes them (it checks them again, and the dates in full). */
-const CHECKS = {
+export const CHECKS = {
   from: (value) => TIME.test(value),
   to: (value) => TIME.test(value),
   type: (value) => TYPES.includes(value),
@@ -36,6 +50,16 @@ const CHECKS = {
   id: (value) => /^[0-9a-f-]{1,40}$/.test(value),
   client: (value) => value.length <= 45 && /^[0-9a-fA-F:.]+$/.test(value),
   generation: (value) => /^([0-9a-f]{16}|[0-9a-f]{64})$/.test(value),
+};
+/** The words of each class of a request record, and the tone of its badge. A class that is not here is shown as the API gave it. */
+const CLASSES = {
+  forwarded: ['ok', () => w('records.class.forwarded')],
+  blocked: ['bad', () => w('records.class.blocked')],
+  rejected: ['warn', () => w('records.class.rejected')],
+  redirected: ['muted', () => w('records.class.redirected')],
+  answered: ['muted', () => w('records.class.answered')],
+  failed: ['bad', () => w('records.class.failed')],
+  closed: ['muted', () => w('records.class.closed')],
 };
 
 /**
@@ -172,73 +196,190 @@ function ruleOf(record) {
   return Array.isArray(record.rules) ? record.rules.join(', ') : '';
 }
 
-const RESULTS = { ok: 'ok', denied: 'warn', failed: 'bad' };
+/** The class of a record as a badge: in words, with the tone of what it came to. Nothing for a record that has none. */
+function classBadge(record) {
+  if (record.class === undefined) return null;
+  const known = Object.hasOwn(CLASSES, record.class);
+  return badge(known ? CLASSES[record.class][0] : 'muted', known ? CLASSES[record.class][1]() : textOf(record.class));
+}
+
+const sameQuery = (a, b) => FIELDS.every((field) => (a[field] ?? '') === (b[field] ?? ''));
 
 class RecordsScreen {
-  constructor(ctx, root) {
+  constructor(ctx, root, route) {
     this.ctx = ctx;
+    this.root = root;
     this.alive = true;
     this.reads = 0;
     this.pager = new Pager();
     /** The filters of the search that is shown, which paging and reloading keep. */
     this.applied = {};
+    this.route = { id: null, query: {} };
+    this.records = [];
+    this.loaded = false;
     this.loading = false;
-    this.inputs = {};
-    const typeSelect = el('select', {}, [el('option', { value: '' }, t('records.any')), ...TYPES.map((type) => el('option', { value: type }, type))]);
-    this.inputs.type = typeSelect;
-    const fields = FIELDS.map((field) => {
-      const control = field === 'type' ? typeSelect : el('input', { class: 'input', type: 'text', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false' });
-      this.inputs[field] = control;
-      return labelled(LABELS[field](), control, field === 'from' || field === 'to' ? t('records.time_hint') : null);
-    });
-    this.problems = el('div', { 'aria-live': 'polite' });
-    this.search = el('button', { type: 'submit', class: 'btn btn-primary' }, t('records.search'));
-    this.reload = el('button', { type: 'button', class: 'btn', on: { click: () => this.load() } }, t('screen.reload'));
-    this.clear = el('button', { type: 'button', class: 'btn', on: { click: () => this.clearFilters() } }, t('records.clear'));
-    this.body = el('div', { class: 'stack' });
-    this.layer = el('div');
-    const form = el(
-      'form',
-      {
-        class: 'stack',
-        on: {
-          submit: (event) => {
-            event.preventDefault();
-            this.find();
+    this.error = null;
+    /** The record that is open: `{ id, record, error }`, or null. */
+    this.open = null;
+    /** Where the table lands when a part of the records that the user paged to arrives: `first` or `last`. */
+    this.edgeFrom = null;
+
+    const typeSelect = el('select', { class: 'tc-select', name: 'type' }, [el('option', { value: '' }, w('records.any')), ...TYPES.map((type) => el('option', { value: type }, type))]);
+    this.fields = Object.fromEntries(
+      FIELDS.map((field) => {
+        const control = field === 'type' ? typeSelect : textInput({ name: field, autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false' });
+        return [field, new Field(LABELS[field](), control, { hint: field === 'from' || field === 'to' ? w('records.time_hint') : null })];
+      }),
+    );
+    this.reload = button('', w('screen.reload'), () => this.load());
+    this.search = button('primary', w('records.search'), null, { type: 'submit' });
+    this.terms = el('span', { class: 'tc-terms' });
+    this.filters = el(
+      'details',
+      { class: 'tc-panel tc-details' },
+      el('summary', {}, w('records.filters'), ' ', this.terms),
+      el(
+        'form',
+        {
+          class: 'tc-stack',
+          novalidate: true,
+          on: {
+            submit: (event) => {
+              event.preventDefault();
+              this.submit();
+            },
           },
         },
-      },
-      el('div', { class: 'filters' }, fields),
-      this.problems,
-      el('div', { class: 'actions' }, this.search, this.clear),
+        el('div', { class: 'tc-filters' }, FIELDS.map((field) => this.fields[field].node)),
+        el('div', { class: 'tc-actions' }, this.search, button('quiet', w('records.clear'), () => this.clear())),
+      ),
     );
-    mount(root, el('div', { class: 'stack' }, pageHead(t('records.title'), this.reload), el('p', { class: 'muted' }, t('records.intro')), form, this.body), this.layer);
+    this.notes = el('div', { class: 'tc-stack' });
+    this.detailBox = el('div');
+    this.table = new Table({
+      caption: w('records.title'),
+      rowKey: (record, at) => String(at),
+      empty: { title: w('records.empty') },
+      columns: [
+        { key: 'ts', label: w('col.time'), value: (record) => instantOf(record.ts), tight: true, cell: (record) => timeView(record.ts) },
+        { key: 'type', label: LABELS.type(), value: (record) => textOf(record.type) },
+        { key: 'class', label: w('col.result'), value: (record) => textOf(record.class), cell: classBadge },
+        { key: 'status', label: LABELS.status(), value: (record) => (typeof record.status === 'number' ? record.status : null), num: true, cell: (record) => textOf(record.status) },
+        { key: 'rule', label: LABELS.rule(), value: (record) => ruleOf(record), mono: true },
+        { key: 'client', label: LABELS.client(), value: (record) => textOf(record.client), mono: true },
+        { key: 'summary', label: w('records.summary'), value: (record) => summaryOf(record), mono: true },
+        { key: 'id', label: LABELS.id(), value: (record) => textOf(record.id), sortable: false, mono: true, cell: (record) => this.openLink(record) },
+      ],
+    });
+    mount(root, pageHead(w('records.title'), this.reload), el('p', { class: 'tc-intro' }, w('records.intro')), this.filters, this.notes, this.detailBox, this.table.node);
+    this.drawTerms();
+    this.show(route, true);
   }
 
   stop() {
     this.alive = false;
   }
 
-  values() {
-    return Object.fromEntries(FIELDS.map((field) => [field, this.inputs[field].value]));
-  }
+  // ---- the address ----
 
-  clearFilters() {
-    for (const field of FIELDS) this.inputs[field].value = '';
-    mount(this.problems);
-  }
-
-  /** A new search with the filters as they are typed now, from the newest record. */
-  find() {
-    const { problems } = buildQuery(this.values());
-    if (problems.length > 0) {
-      mount(this.problems, notice('bad', t('records.bad_filters', { names: problems.map((field) => LABELS[field]()).join(', ') })));
-      return;
+  /** The address changed inside the screen: a new search if the filters differ, and the record it names, if any. */
+  show(route, first = false) {
+    const searched = first || !sameQuery(route.query, this.applied);
+    const previous = this.open?.id ?? null;
+    this.route = route;
+    if (searched) {
+      this.applied = route.query;
+      for (const field of FIELDS) {
+        this.fields[field].control.value = route.query[field] ?? '';
+        this.fields[field].valid();
+      }
+      this.drawTerms();
+      this.pager.reset();
+      this.load();
     }
-    mount(this.problems);
-    this.applied = this.values();
-    this.pager.reset();
-    this.load();
+    if (route.id === null) {
+      this.open = null;
+      mount(this.detailBox);
+      this.table.update({ selected: null });
+      if (!first && previous !== null && !this.table.focusRow(this.rowOf(previous))) this.root.querySelector('h1')?.focus();
+    } else if (route.id !== previous) {
+      this.openRecord(route.id, !first);
+    }
+  }
+
+  /** The place in the list of the first record with the request number `id`, as the key of its row. */
+  rowOf(id) {
+    return String(this.records.findIndex((record) => record.id === id));
+  }
+
+  openLink(record) {
+    if (typeof record.id !== 'string' || !CHECKS.id(record.id)) {
+      return button('small', w('records.open'), () => this.showLocal(record));
+    }
+    return el('a', { class: 'tc-link tc-mono', href: hashOf('records', { id: record.id, query: this.applied }) }, record.id);
+  }
+
+  /** A record that has no request number has no address, so it is opened here only. */
+  showLocal(record) {
+    this.open = { id: null, record, error: null };
+    this.table.update({ selected: String(this.records.indexOf(record)) });
+    this.drawDetail(true);
+  }
+
+  /** Closes a record that has no address: no change of the address says so, so the screen does. `focus` puts the focus back on its row. */
+  closeLocal(focus = true) {
+    const key = this.table.selected;
+    this.open = null;
+    mount(this.detailBox);
+    this.table.update({ selected: null });
+    if (focus && (key === null || !this.table.focusRow(key))) this.root.querySelector('h1')?.focus();
+  }
+
+  async openRecord(id, focus) {
+    const open = { id, record: this.records.find((record) => record.id === id) ?? null, error: null };
+    this.open = open;
+    this.table.update({ selected: this.rowOf(id) });
+    if (open.record === null) {
+      this.drawDetail(false);
+      try {
+        const answer = await this.ctx.api.call('GET', `/api/records?${buildQuery({ id }).query}`);
+        open.record = Array.isArray(answer.records) && answer.records.length > 0 ? answer.records[0] : null;
+        open.missing = open.record === null;
+      } catch (error) {
+        open.error = error;
+      }
+      if (!this.alive || this.open !== open) return;
+    }
+    this.drawDetail(focus);
+  }
+
+  // ---- the search ----
+
+  submit() {
+    const values = Object.fromEntries(FIELDS.map((field) => [field, this.fields[field].control.value.trim()]));
+    const entries = FIELDS.map((field) => [this.fields[field], values[field] === '' || CHECKS[field](values[field]) ? null : PROBLEMS[field]()]);
+    if (!checkFields(entries)) return;
+    const query = Object.fromEntries(FIELDS.filter((field) => values[field] !== '').map((field) => [field, values[field]]));
+    this.go(hashOf('records', { query }));
+  }
+
+  clear() {
+    this.go(hashOf('records'));
+  }
+
+  /** Goes to the address of a search; when the user is there already, the search is made again. */
+  go(hash) {
+    if (hash === hashOf('records', { id: this.route.id, query: this.route.query })) {
+      this.pager.reset();
+      this.load();
+    } else {
+      this.ctx.navigate(hash);
+    }
+  }
+
+  drawTerms() {
+    const entries = FIELDS.filter((field) => (this.applied[field] ?? '') !== '');
+    mount(this.terms, entries.map((field) => el('span', { class: 'tc-badge tc-badge--plain' }, LABELS[field](), '=', this.applied[field])));
   }
 
   async load() {
@@ -255,113 +396,162 @@ class RecordsScreen {
     }
     if (!this.alive || asked !== this.reads) return;
     this.loading = false;
+    this.loaded = true;
+    this.error = error;
     this.pager.arrived(error === null && typeof answer.next === 'object' ? answer.next : null);
-    this.sync();
-    this.draw(answer, error);
+    this.records = error === null && Array.isArray(answer.records) ? answer.records : [];
+    // A record that has no address is not among the rows that were read now: what it showed is old.
+    if (this.open?.id === null) this.closeLocal(false);
+    this.sync(this.edgeFrom ?? 'first');
+    this.edgeFrom = null;
+    if (this.open?.id) this.table.update({ selected: this.rowOf(this.open.id) });
+    restoreFocus(this.root, this.root.querySelector('h1'));
   }
 
-  sync() {
+  sync(landOn = null) {
     this.reload.disabled = this.loading;
     this.search.disabled = this.loading;
     this.reload.setAttribute('aria-busy', String(this.loading));
-    if (this.loading) mount(this.body, notice('info', t('records.loading')));
+    const more = this.pager.hasOlder;
+    this.table.empty = { title: more ? w('records.searched_title') : w('records.empty'), hint: more ? w('records.searched') : w('records.empty_hint') };
+    this.table.update({
+      rows: this.records,
+      loading: this.loading && !this.loaded,
+      landOn,
+      edges: {
+        before: this.pager.hasNewer ? () => this.page(() => this.pager.newer(), 'last') : null,
+        after: more ? () => this.page(() => this.pager.older(), 'first') : null,
+        note: more ? w('records.more') : null,
+      },
+    });
+    this.drawNotes();
   }
 
-  go(move) {
-    if (move()) this.load();
-  }
-
-  draw(answer, error) {
-    if (error !== null) {
-      const gone = error.kind === 'conflict';
-      mount(
-        this.body,
-        notice(gone ? 'warn' : error.status === 404 ? 'info' : 'bad', this.ctx.describe(error)),
-        gone
-          ? el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', on: { click: () => this.find() } }, t('records.restart')))
-          : null,
-      );
+  drawNotes() {
+    const error = this.error;
+    if (error === null) {
+      mount(this.notes);
       return;
     }
-    const records = Array.isArray(answer.records) ? answer.records : [];
-    const more = this.pager.hasOlder;
+    const gone = error.kind === 'conflict';
     mount(
-      this.body,
-      this.pagerView(records.length),
-      records.length === 0
-        ? notice('info', more ? t('records.searched') : t('records.empty'))
-        : table(
-            [t('col.time'), LABELS.type(), LABELS.client(), LABELS.class(), LABELS.status(), LABELS.rule(), t('records.summary'), t('col.actions')],
-            records.map((record) => this.rowOf(record)),
-            t('records.title'),
-            { tight: [0, 1, 2, 3, 4, 5], wide: [6] },
-          ),
-      records.length === 0 ? null : this.pagerView(records.length),
+      this.notes,
+      notice(gone ? 'warn' : error.status === 404 ? 'info' : 'bad', this.ctx.describe(error)),
+      gone ? button('', w('records.restart'), () => this.restart()) : null,
     );
   }
 
-  pagerView(count) {
-    return el(
-      'div',
-      { class: 'pager' },
-      el('span', { class: 'muted' }, t('records.page', { page: this.pager.page, n: count })),
-      el('button', { type: 'button', class: 'btn', disabled: !this.pager.hasNewer, on: { click: () => this.go(() => this.pager.newer()) } }, t('records.newer')),
-      el('button', { type: 'button', class: 'btn', disabled: !this.pager.hasOlder, on: { click: () => this.go(() => this.pager.older()) } }, t('records.older')),
-    );
+  restart() {
+    this.pager.reset();
+    this.load();
   }
 
-  rowOf(record) {
-    const open = el('button', { type: 'button', class: 'btn btn-small', on: { click: () => this.openDetail(record) } }, t('records.open'));
-    return [
-      textOf(record.ts),
-      textOf(record.type),
-      textOf(record.client),
-      textOf(record.class),
-      textOf(record.status),
-      ruleOf(record),
-      summaryOf(record),
-      open,
-    ];
+  /** Reads the next or the previous part of the records; the table lands on its first or last page. */
+  page(move, landOn) {
+    if (this.loading || !move()) return;
+    this.edgeFrom = landOn;
+    this.load();
   }
 
-  /** The sheet of one line: every field as text, and on request the text with the `%XX` read. */
-  openDetail(record) {
+  // ---- one record ----
+
+  /** What a record is about, first: its result, the rule, the score, the time, the client and the way. */
+  summary(record) {
+    const lines = [];
+    if (record.class !== undefined || record.status !== undefined) {
+      lines.push(row(w('col.result'), el('span', { class: 'tc-actions' }, classBadge(record), record.status === undefined ? null : el('span', { class: 'tc-mono' }, textOf(record.status)), record.reason === undefined ? null : el('span', { class: 'tc-muted' }, textOf(record.reason)))));
+    }
+    if (ruleOf(record) !== '') lines.push(row(w('records.f.rule'), el('span', { class: 'tc-mono' }, ruleOf(record))));
+    if (record.score !== undefined) lines.push(row(w('records.score'), el('span', { class: 'tc-mono' }, textOf(record.score))));
+    lines.push(row(w('col.time'), timeView(record.ts)));
+    if (record.client !== undefined) lines.push(row(w('records.f.client'), el('span', { class: 'tc-mono' }, textOf(record.client))));
+    if (record.method !== undefined || record.path !== undefined) {
+      lines.push(row(w('records.way'), el('span', { class: 'tc-mono' }, `${textOf(record.method)} ${textOf(record.host)}${textOf(record.path)}`.trim())));
+    } else if (summaryOf(record) !== '') {
+      lines.push(row(w('records.summary'), el('span', { class: 'tc-mono' }, summaryOf(record))));
+    }
+    if (typeof record.generation === 'string') lines.push(row(w('records.f.generation'), fingerprintView(record.generation, { copy: false })));
+    return lines;
+  }
+
+  drawDetail(focus) {
+    const open = this.open;
+    if (open === null) return;
+    const close =
+      open.id === null
+        ? button('quiet small', w('records.back'), () => this.closeLocal())
+        : el('a', { class: buttonClass('quiet small'), href: hashOf('records', { query: this.applied }) }, w('records.back'));
+    if (open.record === null) {
+      const words = open.error !== null ? notice('bad', this.ctx.describe(open.error)) : open.missing ? notice('warn', w('records.missing')) : notice('info', w('records.loading'));
+      mount(this.detailBox, panelWith(w('records.detail'), [close], words).node);
+      return;
+    }
+    const record = open.record;
     const list = el('div');
     const draw = (decoded) => {
       mount(
         list,
-        el(
-          'dl',
-          { class: 'kv' },
-          Object.entries(record).map(([key, value]) => {
+        kv(
+          ...Object.entries(record).map(([key, value]) => {
             const text = textOf(value);
             const readable = decoded && typeof value === 'string' ? decodeText(text) : text;
-            return row(key, [text, readable === text ? null : el('div', { class: 'muted small' }, t('records.decoded'), ' ', readable)]);
+            return row(key, [text, readable === text ? null : el('div', { class: 'tc-muted tc-small' }, w('records.decoded'), ' ', readable)]);
           }),
         ),
       );
     };
-    const id = nextId('w');
-    const toggle = el('input', { id, type: 'checkbox', on: { change: () => draw(toggle.checked) } });
-    openSheet(
-      this.layer,
-      t('records.detail'),
-      el('label', { class: 'check', for: id }, toggle, el('span', {}, t('records.decode'))),
-      list,
-      el('details', {}, el('summary', {}, t('records.json')), el('pre', { class: 'raw' }, JSON.stringify(record, null, 2))),
+    const toggle = checkbox((checked) => draw(checked));
+    const { node, heading } = panelWith(
+      w('records.detail'),
+      [close],
+      kv(...this.summary(record)),
+      el(
+        'details',
+        { class: 'tc-details' },
+        el('summary', {}, w('records.all')),
+        el('div', { class: 'tc-stack' }, choice(w('records.decode'), toggle), list),
+      ),
+      el('details', { class: 'tc-details' }, el('summary', {}, w('records.json')), el('pre', { class: 'tc-raw' }, JSON.stringify(record, null, 2))),
     );
     draw(false);
+    mount(this.detailBox, node);
+    if (focus) heading.focus();
   }
 }
+
+// ---- the audit log ----
+
+const RESULTS = { ok: 'ok', denied: 'warn', failed: 'bad' };
 
 class AuditScreen {
   constructor(ctx, root) {
     this.ctx = ctx;
+    this.root = root;
     this.alive = true;
     this.reads = 0;
-    this.reload = el('button', { type: 'button', class: 'btn', on: { click: () => this.load() } }, t('screen.reload'));
-    this.body = el('div', { class: 'stack' });
-    mount(root, el('div', { class: 'stack' }, pageHead(t('audit.title'), this.reload), el('p', { class: 'muted' }, t('audit.intro')), this.body));
+    this.reload = button('', w('screen.reload'), () => this.load());
+    this.notes = el('div', { class: 'tc-stack' });
+    this.table = new Table({
+      caption: w('audit.title'),
+      rowKey: (entry, at) => String(at),
+      empty: { title: w('audit.empty') },
+      columns: [
+        { key: 'ts', label: w('col.time'), value: (entry) => instantOf(entry.ts), tight: true, cell: (entry) => timeView(entry.ts) },
+        { key: 'actor', label: w('col.by'), value: (entry) => textOf(entry.actor) },
+        { key: 'action', label: w('audit.action'), value: (entry) => textOf(entry.action), mono: true },
+        { key: 'target', label: w('audit.target'), value: (entry) => textOf(entry.target), mono: true },
+        {
+          key: 'result',
+          label: w('col.result'),
+          value: (entry) => `${textOf(entry.result)} ${textOf(entry.reason)}`,
+          cell: (entry) => el('span', { class: 'tc-actions' }, badge(Object.hasOwn(RESULTS, entry.result) ? RESULTS[entry.result] : 'muted', textOf(entry.result)), entry.reason === undefined ? null : el('span', {}, textOf(entry.reason))),
+        },
+        { key: 'client', label: w('records.f.client'), value: (entry) => textOf(entry.client), mono: true },
+        { key: 'change', label: w('audit.change'), value: (entry) => (entry.before === undefined && entry.after === undefined ? '' : `${textOf(entry.before)} → ${textOf(entry.after)}`) },
+        { key: 'id', label: w('audit.request'), value: (entry) => textOf(entry.id), mono: true },
+      ],
+    });
+    mount(root, pageHead(w('audit.title'), this.reload), el('p', { class: 'tc-intro' }, w('audit.intro')), this.notes, this.table.node);
   }
 
   stop() {
@@ -371,7 +561,7 @@ class AuditScreen {
   async load() {
     const asked = (this.reads += 1);
     this.reload.disabled = true;
-    mount(this.body, notice('info', t('records.loading')));
+    this.table.update({ loading: true });
     let entries = null;
     let error = null;
     try {
@@ -382,42 +572,21 @@ class AuditScreen {
     }
     if (!this.alive || asked !== this.reads) return;
     this.reload.disabled = false;
-    if (error !== null) {
-      mount(this.body, notice('bad', t('audit.failed'), ' ', this.ctx.describe(error)));
-      return;
-    }
-    mount(
-      this.body,
-      entries.length === 0
-        ? notice('info', t('audit.empty'))
-        : table(
-            [t('col.time'), t('col.by'), t('audit.action'), t('audit.target'), t('col.result'), LABELS.client(), t('audit.change'), t('audit.request')],
-            entries.map((entry) => [
-              textOf(entry.ts),
-              textOf(entry.actor),
-              textOf(entry.action),
-              textOf(entry.target),
-              el('span', {}, badge(Object.hasOwn(RESULTS, entry.result) ? RESULTS[entry.result] : 'muted', textOf(entry.result)), entry.reason === undefined ? null : [' ', textOf(entry.reason)]),
-              textOf(entry.client),
-              entry.before === undefined && entry.after === undefined ? '' : `${textOf(entry.before)} → ${textOf(entry.after)}`,
-              textOf(entry.id),
-            ]),
-            t('audit.title'),
-            { tight: [0, 1, 2, 4, 5], wide: [3, 6, 7] },
-          ),
-    );
+    mount(this.notes, error === null ? null : notice('bad', w('audit.failed'), ' ', this.ctx.describe(error)));
+    this.table.update({ rows: entries ?? [], loading: false });
+    this.table.node.hidden = error !== null;
   }
 }
 
 function mountWith(Kind) {
-  return (ctx, root) => {
-    const screen = new Kind(ctx, root);
-    screen.load();
-    return () => screen.stop();
+  return (ctx, root, route) => {
+    const screen = new Kind(ctx, root, route);
+    if (Kind !== RecordsScreen) screen.load();
+    return { stop: () => screen.stop(), show: (next) => screen.show?.(next) };
   };
 }
 
 export const screens = [
-  { id: 'records', title: () => t('nav.records'), least: 'viewer', mount: mountWith(RecordsScreen) },
-  { id: 'audit', title: () => t('nav.audit'), least: 'operator', mount: mountWith(AuditScreen) },
+  { id: 'records', title: w('nav.records'), least: 'viewer', route: { id: CHECKS.id, query: CHECKS }, mount: mountWith(RecordsScreen) },
+  { id: 'audit', title: w('nav.audit'), least: 'operator', mount: mountWith(AuditScreen) },
 ];

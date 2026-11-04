@@ -3,11 +3,14 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { ApiError } from '../js/api.js';
-import { actionsOf } from '../js/generations.js';
+import { actionsOf, screens as generationScreens } from '../js/generations.js';
 import { setLanguage } from '../js/i18n.js';
-import { ENGINES, Ended, LIMITS, checkFiles, checkRoutes, importBody, toBase64, trialBlocked } from '../js/import.js';
-import { canChange, engineName, generationState, shortOf, switchOutcome, utc } from '../js/parts.js';
-import { Pager, buildQuery, decodeText, summaryOf } from '../js/records.js';
+import { ENGINES, Ended, LIMITS, checkFiles, checkRouteList, importBody, routesOfRows, toBase64, trialBlocked } from '../js/import.js';
+import { instantOf, canChange, engineName, generationState, hashOf, shortOf, switchOutcome, timeText } from '../js/parts.js';
+import { parseRoute } from '../js/app.js';
+import { PAGE_SIZE, filterRows, nextDirection, pageOf, sortRows } from '../js/table.js';
+import { countOf, uptimeText } from '../js/waf.js';
+import { Pager, buildQuery, decodeText, screens as recordScreens, summaryOf } from '../js/records.js';
 
 const file = (name, size) => ({ name, size });
 const codes = (check) => check.problems.map((problem) => problem.code);
@@ -44,16 +47,14 @@ test('a file name must be a name the API takes, once, and some rule file or the 
   assert.deepEqual(codes(checkFiles({ rules: [], data: [file('a.data', 1)], crs: false })), ['none']);
 });
 
-test('the routes are checked as JSON of the form of a file of routes before they are sent', () => {
-  assert.deepEqual(checkRoutes('  '), { value: null, count: 0, problem: null });
+test('the routes are checked in the form of a file of routes before they are sent, and the lines of the table make them', () => {
   const route = { host: 'a.example.com', path: '/x', action: 'bypass' };
-  assert.deepEqual(checkRoutes(JSON.stringify([route, { path: '/y', action: 'bypass' }])).count, 2);
-  assert.equal(checkRoutes('[').problem, 'json');
-  assert.equal(checkRoutes('{}').problem, 'list');
-  assert.equal(checkRoutes('[]').problem, 'list');
-  const list = (n) => JSON.stringify(Array.from({ length: n }, (_, at) => ({ path: `/p${at}`, action: 'bypass' })));
-  assert.equal(checkRoutes(list(LIMITS.routes)).problem, null);
-  assert.equal(checkRoutes(list(LIMITS.routes + 1)).problem, 'many');
+  assert.equal(checkRouteList([route, { path: '/y', action: 'bypass' }]).count, 2);
+  assert.equal(checkRouteList({}).problem, 'list');
+  assert.equal(checkRouteList([]).problem, 'list');
+  const list = (n) => Array.from({ length: n }, (_, at) => ({ path: `/p${at}`, action: 'bypass' }));
+  assert.equal(checkRouteList(list(LIMITS.routes)).problem, null);
+  assert.equal(checkRouteList(list(LIMITS.routes + 1)).problem, 'many');
   for (const odd of [
     [{ path: '/x' }],
     [{ path: '/x', action: 'allow' }],
@@ -63,8 +64,15 @@ test('the routes are checked as JSON of the form of a file of routes before they
     ['/x'],
     [null],
   ]) {
-    assert.equal(checkRoutes(JSON.stringify(odd)).problem, 'form', JSON.stringify(odd));
+    assert.equal(checkRouteList(odd).problem, 'form', JSON.stringify(odd));
   }
+  // A line with neither a host nor a path is left out; one with a host and no path is named; a host may be left out.
+  const lines = [{ host: ' ', path: '' }, { host: 'a.example.com', path: '' }, { host: '', path: ' /y ' }, { host: 'b.example.com', path: '/z' }];
+  assert.deepEqual(routesOfRows(lines), {
+    routes: [{ path: '/y', action: 'bypass' }, { host: 'b.example.com', path: '/z', action: 'bypass' }],
+    missing: [1],
+  });
+  assert.deepEqual(routesOfRows([]), { routes: [], missing: [] });
 });
 
 test('the bytes of a file go as the standard base64 with padding, and the body leaves out what is empty', () => {
@@ -262,16 +270,13 @@ test('a value is shown as text, and a record says what it is about in one line',
   assert.equal(summaryOf({ type: 'other' }), '');
   assert.equal(shortOf('0123456789abcdef'.repeat(4)), '0123456789ab');
   assert.equal(shortOf('not a fingerprint'), 'not a fingerprint');
-  assert.equal(utc(0), '1970-01-01 00:00:00Z');
-  assert.equal(utc(1_795_000_000), '2026-11-18 11:06:40Z');
-  assert.equal(utc('x'), 'x');
 });
 
 test('every key that a script asks for is named in the call itself, so that the dictionary test sees it', () => {
   const scripts = new URL('../js/', import.meta.url);
   for (const name of readdirSync(scripts).filter((file) => file !== 'i18n.js')) {
     const source = readFileSync(new URL(name, scripts), 'utf8');
-    assert.ok(!/\bt\(\s*[^'\s]/.test(source), `${name}: a key that is not a plain string`);
+    assert.ok(!/(?<![\w.])[tw]\(\s*[^'\s]/.test(source), `${name}: a key that is not a plain string`);
   }
 });
 
@@ -294,4 +299,87 @@ test('an engine is shown by its name in the language, and a word that is not one
   assert.equal(engineName('constructor'), 'constructor');
   assert.equal(engineName(undefined), 'undefined');
   setLanguage('en');
+});
+
+test('a time is written one way, in the zone of the user or in UTC, from seconds, milliseconds or a text', () => {
+  assert.equal(instantOf(1_795_000_000, 's'), 1_795_000_000_000);
+  assert.equal(instantOf(1_795_000_000_000), 1_795_000_000_000);
+  assert.equal(instantOf('2026-11-18T11:06:40.000Z'), 1_795_000_000_000);
+  for (const odd of [null, undefined, 'x', NaN, Infinity, {}, '2026-13-45T00:00:00Z']) assert.equal(instantOf(odd), null, String(odd));
+  setLanguage('ja');
+  assert.equal(timeText(1_795_000_000_000, true), '2026-11-18 11:06:40（UTC）');
+  assert.equal(timeText(0, true), '1970-01-01 00:00:00（UTC）');
+  assert.match(timeText(1_795_000_000_000, false), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}（.+）$/);
+  setLanguage('en');
+  assert.equal(timeText(1_795_000_000_000, true), '2026-11-18 11:06:40 (UTC)');
+});
+
+test('rows are sorted by a column, filtered by text and cut into pages, at the edges of each', () => {
+  const rows = [
+    { n: 10, name: 'b' },
+    { n: 9, name: 'a' },
+    { n: null, name: 'c' },
+    { n: 9, name: 'd' },
+  ];
+  const column = { value: (row) => row.n };
+  // Numbers are read as numbers, equal values keep their order, and a missing value is last in either direction.
+  assert.deepEqual(sortRows(rows, column, 'ascending').map((row) => row.name), ['a', 'd', 'b', 'c']);
+  assert.deepEqual(sortRows(rows, column, 'descending').map((row) => row.name), ['b', 'a', 'd', 'c']);
+  assert.deepEqual(rows.map((row) => row.name), ['b', 'a', 'c', 'd']);
+  assert.equal(nextDirection(undefined), 'ascending');
+  assert.equal(nextDirection('ascending'), 'descending');
+  assert.equal(nextDirection('descending'), 'ascending');
+
+  const columns = [{ value: (row) => row.name }, { value: (row) => row.n, filter: false }];
+  assert.deepEqual(filterRows(rows, columns, ' B ').map((row) => row.name), ['b']);
+  assert.deepEqual(filterRows(rows, columns, '10'), []);
+  assert.equal(filterRows(rows, columns, '   ').length, 4);
+
+  assert.equal(PAGE_SIZE, 50);
+  assert.deepEqual(pageOf(0, 50, 0), { page: 0, pages: 1, from: 0, to: 0 });
+  assert.deepEqual(pageOf(50, 50, 0), { page: 0, pages: 1, from: 1, to: 50 });
+  assert.deepEqual(pageOf(51, 50, 1), { page: 1, pages: 2, from: 51, to: 51 });
+  // A page past the end, or before the start, is kept in range.
+  assert.deepEqual(pageOf(120, 50, 9), { page: 2, pages: 3, from: 101, to: 120 });
+  assert.deepEqual(pageOf(120, 50, -1), { page: 0, pages: 3, from: 1, to: 50 });
+});
+
+test('a value in the address is used only in the form its screen takes, and what is not is dropped and named', () => {
+  const known = { generations: generationScreens[0].route, records: recordScreens[0].route, history: {} };
+  const fp = 'a'.repeat(64);
+  assert.deepEqual(parseRoute(`#/generations/${fp}`, known), { screen: 'generations', id: fp, query: {}, invalid: [] });
+  assert.deepEqual(parseRoute(`#/generations/${fp.slice(1)}`, known), { screen: 'generations', id: null, query: {}, invalid: ['id'] });
+  assert.equal(parseRoute(`#/generations/${fp.toUpperCase()}`, known).id, null);
+  assert.deepEqual(parseRoute(`#/generations/${fp}/more`, known).invalid, ['path']);
+  assert.deepEqual(parseRoute('#/records/0186af5443bddbd9-1?status=403&client=192.0.2.1', known), {
+    screen: 'records',
+    id: '0186af5443bddbd9-1',
+    query: { status: '403', client: '192.0.2.1' },
+    invalid: [],
+  });
+  // A key that is not a filter, a value that is not of its form and a key given twice are dropped (the name of a key that
+  // is not known is not kept); a blank value is no filter.
+  const odd = parseRoute('#/records?status=40x&nokey=1&rule=5&rule=6&class=', known);
+  assert.deepEqual(odd.query, { rule: '5' });
+  assert.deepEqual(odd.invalid, ['status', 'key', 'rule']);
+  assert.equal(parseRoute('#/records/%E0%A4', known).id, null);
+  assert.deepEqual(parseRoute('#/history/x', known).invalid, ['id']);
+  // A screen that is not ours is none; the page then shows its first screen.
+  for (const hash of ['', '#', '#/', '#/nothing', '#/__proto__', '#/constructor/x']) assert.equal(parseRoute(hash, known).screen, null, hash);
+  // The address of what was found is the one that was read, and it reads back the same.
+  const again = parseRoute(hashOf('records', { id: 'abc-1', query: { generation: fp.slice(0, 16), client: 'a b' } }), known);
+  assert.deepEqual(again.query, { generation: fp.slice(0, 16) });
+  assert.deepEqual(again.invalid, ['client']);
+});
+
+test('the numbers of the overview are numbers only when the proxy gave them, and a time of running is told in its two largest units', () => {
+  assert.equal(countOf({ proxy: { requests: 0 } }, 'requests'), 0);
+  for (const odd of [{ proxy: { requests: null } }, { proxy: {} }, { proxy: null }, null, { proxy: { requests: -1 } }, { proxy: { requests: '5' } }]) {
+    assert.equal(countOf(odd, 'requests'), null);
+  }
+  setLanguage('en');
+  assert.equal(uptimeText(35_999), '35 s');
+  assert.equal(uptimeText(60_000), '1 min 0 s');
+  assert.equal(uptimeText(3_600_000), '1 h 0 min');
+  assert.equal(uptimeText(86_400_000 + 4 * 3_600_000), '1 d 4 h');
 });

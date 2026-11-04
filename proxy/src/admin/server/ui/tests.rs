@@ -20,26 +20,35 @@ fn method(name: &str) -> Method {
 #[test]
 fn each_file_answers_with_its_type_and_the_fields_of_the_page_and_needs_no_session() {
     let rig = rig();
+    let version = &served().version;
+    let js = "text/javascript; charset=utf-8";
     for (path, kind) in [
-        ("/", "text/html; charset=utf-8"),
-        ("/ui/app.css", "text/css; charset=utf-8"),
-        ("/ui/app.js", "text/javascript; charset=utf-8"),
-        ("/ui/api.js", "text/javascript; charset=utf-8"),
-        ("/ui/dom.js", "text/javascript; charset=utf-8"),
-        ("/ui/i18n.js", "text/javascript; charset=utf-8"),
-        ("/ui/waf.js", "text/javascript; charset=utf-8"),
-        ("/ui/parts.js", "text/javascript; charset=utf-8"),
-        ("/ui/generations.js", "text/javascript; charset=utf-8"),
-        ("/ui/import.js", "text/javascript; charset=utf-8"),
-        ("/ui/records.js", "text/javascript; charset=utf-8"),
-        ("/ui/account.js", "text/javascript; charset=utf-8"),
-        ("/ui/users.js", "text/javascript; charset=utf-8"),
-        ("/ui/qr.js", "text/javascript; charset=utf-8"),
-        ("/ui/favicon.svg", "image/svg+xml"),
+        ("/".to_owned(), "text/html; charset=utf-8"),
+        (format!("/ui/{version}/app.css"), "text/css; charset=utf-8"),
+        (format!("/ui/{version}/app.js"), js),
+        (format!("/ui/{version}/api.js"), js),
+        (format!("/ui/{version}/dom.js"), js),
+        (format!("/ui/{version}/i18n.js"), js),
+        (format!("/ui/{version}/waf.js"), js),
+        (format!("/ui/{version}/parts.js"), js),
+        (format!("/ui/{version}/table.js"), js),
+        (format!("/ui/{version}/generations.js"), js),
+        (format!("/ui/{version}/import.js"), js),
+        (format!("/ui/{version}/records.js"), js),
+        (format!("/ui/{version}/account.js"), js),
+        (format!("/ui/{version}/users.js"), js),
+        (format!("/ui/{version}/qr.js"), js),
+        (format!("/ui/{version}/favicon.svg"), "image/svg+xml"),
     ] {
+        // The page is not kept, as the next version is found in it; a file below its version never changes, so it is.
+        let cache = if path == "/" {
+            "no-store"
+        } else {
+            "public, max-age=31536000, immutable"
+        };
         // No cookie, no token: the files hold no secret.
         for verb in ["GET", "HEAD"] {
-            let answer = serve(&rig.app, &method(verb), path).unwrap_or_else(|| panic!("{path}"));
+            let answer = serve(&rig.app, &method(verb), &path).unwrap_or_else(|| panic!("{path}"));
             assert_eq!(answer.status(), StatusCode::OK, "{verb} {path}");
             assert!(
                 answer.body().size_hint().exact().is_some_and(|n| n > 0),
@@ -48,7 +57,7 @@ fn each_file_answers_with_its_type_and_the_fields_of_the_page_and_needs_no_sessi
             let fields = answer.headers();
             for (name, value) in [
                 ("content-type", kind),
-                ("cache-control", "no-store"),
+                ("cache-control", cache),
                 ("x-content-type-options", "nosniff"),
                 (
                     "content-security-policy",
@@ -73,33 +82,27 @@ fn each_file_answers_with_its_type_and_the_fields_of_the_page_and_needs_no_sessi
 }
 
 #[test]
-fn a_name_that_the_table_does_not_hold_is_left_to_the_api_which_answers_404() {
+fn a_name_or_a_version_that_the_table_does_not_hold_is_left_to_the_api_which_answers_404() {
     let rig = rig();
+    let version = &served().version;
     for path in [
-        "/ui",
-        "/ui/",
-        "/ui/nothing",
-        "/ui/index.html",
-        "/ui/js/app.js",
-        "/ui/js/",
-        "/ui/..",
-        "/ui/../api/session",
-        "/ui/%2e%2e/app.js",
-        "/ui/app.js/",
-        "/ui/app.js%00",
-        "/ui/APP.JS",
-        "/UI/app.js",
-        "/index.html",
-        "/app.js",
-        "//",
+        // No version.
+        "/ui/app.js".to_owned(),
+        // Another version, with the name of a file of the table.
+        format!("/ui/{}/app.js", "0".repeat(16)),
+        // The version, with no name, with a name that the table does not hold, and with a way out of its directory.
+        format!("/ui/{version}"),
+        format!("/ui/{version}/"),
+        format!("/ui/{version}/nothing"),
+        format!("/ui/{version}/../api/session"),
     ] {
         for verb in ["GET", "HEAD", "POST"] {
             assert!(
-                serve(&rig.app, &method(verb), path).is_none(),
+                serve(&rig.app, &method(verb), &path).is_none(),
                 "{verb} {path}"
             );
         }
-        let answer = rig.send("GET", path, &[], "");
+        let answer = rig.send("GET", &path, &[], "");
         assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
         assert!(answer.allow.is_none(), "{path}");
     }
@@ -108,9 +111,14 @@ fn a_name_that_the_table_does_not_hold_is_left_to_the_api_which_answers_404() {
 #[test]
 fn a_method_but_get_and_head_is_405_with_allow_and_the_fields_of_the_api() {
     let rig = rig();
-    for path in ["/", "/ui/app.js", "/ui/favicon.svg"] {
+    let version = &served().version;
+    for path in [
+        "/".to_owned(),
+        format!("/ui/{version}/app.js"),
+        format!("/ui/{version}/favicon.svg"),
+    ] {
         for verb in ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
-            let answer = serve(&rig.app, &method(verb), path).unwrap_or_else(|| panic!("{path}"));
+            let answer = serve(&rig.app, &method(verb), &path).unwrap_or_else(|| panic!("{path}"));
             assert_eq!(
                 answer.status(),
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -214,33 +222,98 @@ fn exchange(app: &Arc<App>, request: &str) -> Reply {
 fn the_page_is_answered_on_a_real_connection_before_any_body_is_read() {
     let rig = rig();
     let app = Arc::new(rig.app);
-    // The page, with no session, and its fields.
+    let version = &served().version;
+    // The page, with no session, and its fields. It is not kept, and it names the files below the version.
     let page = exchange(&app, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
     assert_eq!(page.status, 200);
     assert_eq!(page.values("content-type"), ["text/html; charset=utf-8"]);
+    assert_eq!(page.values("cache-control"), ["no-store"]);
     assert_eq!(page.values("referrer-policy"), ["same-origin"]);
-    assert_eq!(page.body, INDEX.bytes);
+    let text = String::from_utf8(page.body).unwrap();
+    assert_eq!(
+        text,
+        String::from_utf8_lossy(INDEX.bytes).replace("/ui/", &format!("/ui/{version}/"))
+    );
+    // Every path of the page that is below `/ui/` is below the version, and the page has some.
+    assert!(text.contains(&format!("/ui/{version}/app.js")));
+    assert_eq!(
+        text.matches("/ui/").count(),
+        text.matches(&format!("/ui/{version}/")).count()
+    );
     // `HEAD` has the fields and no body.
-    let head = exchange(&app, "HEAD /ui/app.js HTTP/1.1\r\nHost: h\r\n\r\n");
+    let head = exchange(
+        &app,
+        &format!("HEAD /ui/{version}/app.js HTTP/1.1\r\nHost: h\r\n\r\n"),
+    );
     assert_eq!(head.status, 200);
     assert_eq!(
         head.values("content-type"),
         ["text/javascript; charset=utf-8"]
+    );
+    assert_eq!(
+        head.values("cache-control"),
+        ["public, max-age=31536000, immutable"]
     );
     assert!(head.body.is_empty());
     // A change of a file of the page is 405 with `Allow` at once, though the body that it announces never comes: the
     // page is answered before any body is read.
     let post = exchange(
         &app,
-        "POST /ui/app.js HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: 5\r\n\r\n",
+        &format!(
+            "POST /ui/{version}/app.js HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: 5\r\n\r\n"
+        ),
     );
     assert_eq!(post.status, 405);
     assert_eq!(post.values("allow"), ["GET, HEAD"]);
-    // A name that the table of the page does not hold is left to the API, which answers 404 with its own fields.
-    let missing = exchange(&app, "GET /ui/nothing HTTP/1.1\r\nHost: h\r\n\r\n");
-    assert_eq!(missing.status, 404);
-    assert_eq!(missing.values("referrer-policy"), ["no-referrer"]);
-    assert_eq!(missing.values("content-type"), ["application/json"]);
+    // A name that the table of the page does not hold, and a file with no version or with another one, are left to
+    // the API, which answers 404 with its own fields.
+    for target in [
+        "/ui/nothing".to_owned(),
+        "/ui/app.js".to_owned(),
+        format!("/ui/{}/app.js", "0".repeat(16)),
+        format!("/ui/{version}/nothing"),
+    ] {
+        let missing = exchange(&app, &format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n"));
+        assert_eq!(missing.status, 404, "{target}");
+        assert_eq!(
+            missing.values("referrer-policy"),
+            ["no-referrer"],
+            "{target}"
+        );
+        assert_eq!(
+            missing.values("content-type"),
+            ["application/json"],
+            "{target}"
+        );
+        assert_eq!(missing.values("cache-control"), ["no-store"], "{target}");
+    }
+}
+
+#[test]
+fn the_version_follows_the_names_and_the_contents_of_the_files() {
+    let file = |name: &'static str, bytes: &'static [u8]| File {
+        name,
+        kind: JAVASCRIPT,
+        bytes,
+    };
+    let table = [file("a.js", b"one"), file("b.js", b"two")];
+    let version = version_of(&table);
+    // The first 16 digits, in lowercase.
+    assert_eq!(version.len(), 16);
+    assert!(
+        version
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    );
+    assert_eq!(version_of(&table), version);
+    // A byte of a file, the name of a file, and the files taking each other's contents change it.
+    for changed in [
+        [file("a.js", b"one"), file("b.js", b"twp")],
+        [file("a.js", b"one"), file("c.js", b"two")],
+        [file("a.js", b"two"), file("b.js", b"one")],
+    ] {
+        assert_ne!(version_of(&changed), version);
+    }
 }
 
 /// The names of the files (not the directories) in `dir`.

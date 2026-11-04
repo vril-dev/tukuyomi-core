@@ -37,14 +37,17 @@ pub struct Shared {
     pub setup: SharedSetup,
 }
 
-/// What a configuration makes for the connections: the configuration, the upstream groups with the routes to them and
-/// the connections that wait to be used again, the TLS of the listeners that end it, the answer to the challenge of
-/// the CA, if the configuration has `acme`, the networks and countries that may not use the proxy at all, the country
-/// database if some list of countries needs one, the rate limit if the configuration has one, and what a route does
-/// with a request whose record cannot be kept when it does not say (`records.keep`). It is not changed once it is
-/// made, except that it can be retired, once, and that SIGUSR2 replaces the certificates in its `tls` (`Tls::reload`).
+/// What a configuration makes for the connections: the configuration, the SHA-256 of its file, the upstream groups with
+/// the routes to them and the connections that wait to be used again, the TLS of the listeners that end it, the answer
+/// to the challenge of the CA, if the configuration has `acme`, the networks and countries that may not use the proxy
+/// at all, the country database if some list of countries needs one, the rate limit if the configuration has one, and
+/// what a route does with a request whose record cannot be kept when it does not say (`records.keep`). It is not
+/// changed once it is made, except that it can be retired, once, and that SIGUSR2 replaces the certificates in its
+/// `tls` (`Tls::reload`).
 pub struct Setup {
     pub cfg: ProxyConfig,
+    /// The SHA-256 of the bytes of the configuration file that this setup was made from.
+    pub sha256: [u8; 32],
     pub upstreams: Upstreams,
     pub tls: Tls,
     pub challenge: Option<Challenge>,
@@ -61,11 +64,15 @@ pub struct Setup {
 }
 
 impl Setup {
-    /// The setup of `cfg`, with the upstream groups of `forward`, and the `access`, the country database and the
-    /// `rate_limit` of `policy`. The rate limit goes on counting the clients of `earlier`, the rate limit of the setup
-    /// that this one replaces, if there is one and the two have the same `keys`, `rate` and `burst`.
+    /// The setup of `cfg`, which is read from a file whose SHA-256 is `sha256`, with the upstream groups of `forward`,
+    /// and the `access`, the country database and the `rate_limit` of `policy`. The rate limit goes on counting the
+    /// clients of `earlier`, the rate limit of the setup that this one replaces, if there is one and the two have the
+    /// same `keys`, `rate` and `burst`.
+    // One argument for each part of what the configuration file gives; a struct of them would only repeat their names.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: ProxyConfig,
+        sha256: [u8; 32],
         forward: &ForwardConfig,
         tls: Tls,
         challenge: Option<Challenge>,
@@ -76,6 +83,7 @@ impl Setup {
         Setup {
             upstreams: Upstreams::new(forward, &cfg),
             cfg,
+            sha256,
             tls,
             challenge,
             access: policy.access,

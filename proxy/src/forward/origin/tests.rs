@@ -90,6 +90,7 @@ pub(in crate::forward) fn ctx_of(forward: &ForwardConfig, cfg: ProxyConfig) -> C
         counters: Counters::start(),
         setup: SharedSetup::new(Setup::new(
             cfg,
+            [0; 32],
             forward,
             Tls::none(),
             None,

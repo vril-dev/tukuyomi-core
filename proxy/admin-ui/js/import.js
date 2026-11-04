@@ -1,29 +1,36 @@
 // The import screen: the user chooses rule files and data files in the browser, says whether the CRS of the host is
-// used (and which of its files are left out), writes the routes that are not inspected, and imports them as a new
+// used (and which of its files are left out), lists the routes that are not inspected, and imports them as a new
 // generation. The files are counted against the limits of the API before anything is sent. The API tries the new
 // rules with an inspector first; a trial that reports a block is shown, and the user may accept the block through a
 // second confirmation. The new generation is not chosen. How an import ended waits in `ended` for the screen that is
 // shown, which may not be the one that sent it. Nothing runs when the module is loaded.
 
 import { ApiError } from './api.js';
-import { badge, el, mount, notice } from './dom.js';
-import { t } from './i18n.js';
+import { badge, button, buttonClass, el, mount, notice, result, setText } from './dom.js';
+import { lazy, w } from './i18n.js';
 import {
+  Field,
   bytesText,
+  checkbox,
+  choice,
   confirmChange,
   engineName,
-  fingerprint,
-  handoff,
-  labelled,
+  fingerprintView,
+  hashOf,
+  isFingerprint,
+  kv,
   pageHead,
+  panelWith,
   perform,
+  restoreFocus,
   row,
   runningNotice,
   shortOf,
-  table,
-  utc,
+  textInput,
+  timeView,
   working,
 } from './parts.js';
+import { Table } from './table.js';
 
 /** The engines that an import can ask for, by the words the API takes. Coraza is first: it is the default. */
 export const ENGINES = ['coraza', 'modsecurity'];
@@ -34,8 +41,6 @@ const NAME = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/;
 const ROUTE_KEYS = ['host', 'path', 'action'];
 /** How the trial reports a probe that the rules blocked (see `trialBlocked`). */
 const BLOCKED = /: blocked by rule -?\d+ in phase \d+, status \d+$/;
-/** The most problems that are shown at a time. */
-const SHOWN = 10;
 
 /**
  * The files chosen for an import (`rules` and `data`: lists of `{ name, size }`) counted against the limits of the
@@ -64,21 +69,13 @@ export function checkFiles({ rules, data, crs }) {
 }
 
 /**
- * The routes that the user wrote, as the form of a file of routes: a JSON list of `{ "host"?, "path", "action":
+ * The routes that are not inspected, as the form of a file of routes: a list of `{ "host"?, "path", "action":
  * "bypass" }`. Gives `{ value, count, problem }`: `value` is what to send (null for no routes), `problem` is null or
- * `json` (not JSON), `list` (not a list, or an empty one), `many` (over the limit) or `form` (an item is not a route).
- * The API checks the paths and hosts as well.
+ * `list` (not a list, or an empty one), `many` (over the limit) or `form` (an item is not a route). The API checks
+ * the paths and hosts as well.
  */
-export function checkRoutes(text) {
+export function checkRouteList(value) {
   const none = { value: null, count: 0, problem: null };
-  const trimmed = text.trim();
-  if (trimmed === '') return none;
-  let value;
-  try {
-    value = JSON.parse(trimmed);
-  } catch {
-    return { ...none, problem: 'json' };
-  }
   if (!Array.isArray(value) || value.length === 0) return { ...none, problem: 'list' };
   if (value.length > LIMITS.routes) return { ...none, problem: 'many' };
   for (const route of value) {
@@ -92,6 +89,23 @@ export function checkRoutes(text) {
     if (!fits) return { ...none, problem: 'form' };
   }
   return { value, count: value.length, problem: null };
+}
+
+/**
+ * The routes of the lines of the table of routes (`{ host, path }` as typed): a line with neither is left out, a line
+ * with a host and no path is a problem (`missing`, the places of such lines), and the others are routes.
+ */
+export function routesOfRows(lines) {
+  const routes = [];
+  const missing = [];
+  lines.forEach((line, at) => {
+    const host = line.host.trim();
+    const path = line.path.trim();
+    if (host === '' && path === '') return;
+    if (path === '') missing.push(at);
+    else routes.push(host === '' ? { path, action: 'bypass' } : { host, path, action: 'bypass' });
+  });
+  return { routes, missing };
 }
 
 /** `bytes` in the standard base64 with padding. */
@@ -131,8 +145,8 @@ export function trialBlocked(body) {
 /**
  * How the last import that this page sent ended, until a screen has told it: `{ body, error, request }`, the answer
  * or the error, and the request that was sent, which the user may send again with a block accepted. The screen that
- * sent the import can be gone when its answer comes (the language was switched, or the user went to another screen),
- * so the end waits here for the screen that is shown, and a screen that is drawn later finds it.
+ * sent the import can be gone when its answer comes (the user went to another screen), so the end waits here for the
+ * screen that is shown, and a screen that is drawn later finds it.
  */
 export class Ended {
   #end = null;
@@ -179,66 +193,66 @@ function readBytes(file) {
   });
 }
 
+/** What to write for each problem of the files. */
 const PROBLEMS = {
-  none: () => t('import.p.none'),
-  count: () => t('import.p.count'),
-  total: () => t('import.p.total'),
-  size: (problem) => t('import.p.size', { name: problem.name }),
-  name: (problem) => t('import.p.name', { name: problem.name }),
-  twice: (problem) => t('import.p.twice', { name: problem.name }),
+  none: () => w('import.p.none'),
+  count: () => w('import.p.count'),
+  total: () => w('import.p.total'),
+  size: () => w('import.p.size'),
+  name: () => w('import.p.name'),
+  twice: () => w('import.p.twice'),
 };
 const ROUTE_PROBLEMS = {
-  json: () => t('import.r.json'),
-  list: () => t('import.r.list'),
-  many: () => t('import.r.many'),
-  form: () => t('import.r.form'),
+  list: () => w('import.r.list'),
+  many: () => w('import.r.many'),
+  form: () => w('import.r.form'),
 };
 const RESULTS = {
-  created: () => t('import.result.created'),
-  existing: () => t('import.result.existing'),
-  repaired: () => t('import.result.repaired'),
+  created: () => w('import.result.created'),
+  existing: () => w('import.result.existing'),
+  repaired: () => w('import.result.repaired'),
 };
 const KINDS = {
-  block: () => t('import.kind.block'),
-  detected: () => t('import.kind.detected'),
+  block: () => w('import.kind.block'),
+  detected: () => w('import.kind.detected'),
 };
-
-function checkbox(label, onChange, hint = null) {
-  const input = el('input', { type: 'checkbox', on: { change: () => onChange(input.checked) } });
-  return { input, row: el('label', { class: 'check' }, input, el('span', {}, label, hint === null ? null : el('span', { class: 'muted small block' }, hint))) };
-}
 
 /** What a trial says: whether it passed, why it did not, what it accepted. */
 function trialView(trial) {
   const accepted = Array.isArray(trial.accepted) ? trial.accepted : [];
+  const table = new Table({
+    caption: w('import.accepted'),
+    rowKey: (item, at) => String(at),
+    filter: false,
+    empty: { title: w('import.accepted') },
+    columns: [
+      { key: 'kind', label: w('col.kind'), value: (item) => String(item.kind), cell: (item) => (Object.hasOwn(KINDS, item.kind) ? KINDS[item.kind]() : String(item.kind)) },
+      { key: 'probe', label: w('import.probe'), value: (item) => String(item.probe), mono: true },
+      { key: 'rule', label: w('import.rule'), value: (item) => String(item.rule), mono: true },
+      { key: 'phase', label: w('import.phase'), value: (item) => (item.phase === undefined ? '' : item.phase), num: true },
+      { key: 'status', label: w('col.status'), value: (item) => item.status, num: true },
+    ],
+  });
+  table.update({ rows: accepted });
   return el(
     'div',
-    { class: 'stack' },
-    el('p', {}, trial.passed === true ? badge('ok', t('import.trial.passed')) : badge('bad', t('import.trial.failed'))),
+    { class: 'tc-stack' },
+    el('p', {}, trial.passed === true ? badge('ok', w('import.trial.passed')) : badge('bad', w('import.trial.failed'))),
     typeof trial.failure === 'string' ? el('p', {}, trial.failure) : null,
-    typeof trial.detail === 'string' ? el('p', { class: 'small' }, t('import.trial.detail'), ' ', el('code', {}, trial.detail)) : null,
-    accepted.length === 0
-      ? null
-      : table(
-          [t('col.kind'), t('import.probe'), t('import.rule'), t('import.phase'), t('col.status')],
-          accepted.map((item) => [
-            Object.hasOwn(KINDS, item.kind) ? KINDS[item.kind]() : String(item.kind),
-            String(item.probe),
-            String(item.rule),
-            item.phase === undefined ? '' : String(item.phase),
-            String(item.status),
-          ]),
-          t('import.accepted'),
-        ),
+    typeof trial.detail === 'string' ? el('p', { class: 'tc-small' }, w('import.trial.detail'), ' ', el('code', {}, trial.detail)) : null,
+    accepted.length === 0 ? null : table.node,
   );
 }
 
 class ImportScreen {
   constructor(ctx, root) {
     this.ctx = ctx;
+    this.root = root;
     this.alive = true;
     this.mine = false;
     this.reading = false;
+    /** True once the user has tried to import: the missing rule files are told from then on. */
+    this.tried = false;
     /** The chosen files: `{ file, name, size }`. */
     this.rules = [];
     this.data = [];
@@ -247,34 +261,40 @@ class ImportScreen {
     this.crs = false;
     this.crsOff = new Set();
     this.detectOnly = false;
+    /** The lines of the table of routes: `{ host, path, fields }`, the typed text and the fields that show it. */
+    this.lines = [];
     /** The request that the last trial refused for a block, which the user may send again with the block accepted. */
     this.pending = null;
 
-    this.running = el('div', { class: 'stack', 'aria-live': 'polite' });
+    this.running = el('div', { class: 'tc-stack', 'aria-live': 'polite' });
     this.rulesBox = el('div');
     this.dataBox = el('div');
-    this.crsBox = el('div', { class: 'stack' });
-    this.routesBox = el('div', { 'aria-live': 'polite' });
-    this.summary = el('div', { class: 'stack', 'aria-live': 'polite' });
-    this.offer = el('div', { class: 'stack' });
-    this.results = el('div', { class: 'stack', 'aria-live': 'polite' });
+    this.crsBox = el('div', { class: 'tc-stack' });
+    this.routesBox = el('div', { class: 'tc-rows' });
+    this.routesNote = el('div', { 'aria-live': 'polite' });
+    this.summary = el('div', { class: 'tc-stack', 'aria-live': 'polite' });
+    this.offer = el('div', { class: 'tc-stack' });
+    this.results = el('div', { class: 'tc-stack', 'aria-live': 'polite' });
     this.layer = el('div');
     this.engine = el(
       'select',
-      { class: 'input', name: 'engine', on: { change: () => this.changed() } },
-      ENGINES.map((name) => el('option', { value: name, selected: name === ENGINES[0] }, engineName(name))),
+      { class: 'tc-select', name: 'engine' },
+      ENGINES.map((name) => el('option', { value: name, selected: name === ENGINES[0] }, lazy(() => engineName(name)))),
     );
-    this.routes = el('textarea', { class: 'input mono', rows: '6', spellcheck: 'false', autocapitalize: 'none', on: { input: () => this.changed() } });
-    this.detect = checkbox(t('import.detect'), (checked) => {
+    this.engine.addEventListener('change', () => this.changed());
+    this.rulesField = new Field(w('import.choose'), this.picker(this.rules), { hint: w('import.rules_hint') });
+    this.dataField = new Field(w('import.choose'), this.picker(this.data), { hint: w('import.data_hint') });
+    this.detect = checkbox((checked) => {
       this.detectOnly = checked;
       this.changed();
-    }, t('import.detect_hint'));
-    this.submit = el('button', { type: 'submit', class: 'btn btn-primary' }, t('import.submit'));
+    });
+    this.submit = button('primary', w('import.submit'), null, { type: 'submit' });
 
     const form = el(
       'form',
       {
-        class: 'stack',
+        class: 'tc-stack tc-stack--wide',
+        novalidate: true,
         on: {
           submit: (event) => {
             event.preventDefault();
@@ -282,22 +302,17 @@ class ImportScreen {
           },
         },
       },
-      labelled(t('import.engine'), this.engine, t('import.engine_hint')),
-      this.group(t('import.rules'), t('import.rules_hint'), this.picker(this.rules), this.rulesBox),
-      this.group(t('import.data'), t('import.data_hint'), this.picker(this.data), this.dataBox),
-      this.group(t('import.crs'), null, this.crsBox),
-      this.group(t('import.routes'), null, labelled(t('import.routes_label'), this.routes, t('import.routes_hint')), this.routesBox),
-      this.detect.row,
-      this.summary,
-      el('div', { class: 'actions' }, this.submit),
+      panelWith(w('import.engine'), [], new Field(w('import.engine_label'), this.engine, { hint: w('import.engine_hint') }).node).node,
+      panelWith(w('import.rules'), [], this.rulesField.node, this.rulesBox).node,
+      panelWith(w('import.data'), [], this.dataField.node, this.dataBox).node,
+      panelWith(w('import.crs'), [], this.crsBox).node,
+      panelWith(w('import.routes'), [], el('p', { class: 'tc-muted tc-small' }, w('import.routes_hint')), this.routesBox, this.routesNote, el('div', { class: 'tc-actions' }, button('small', w('import.route_add'), () => this.addLine(true)))).node,
+      panelWith(w('import.submit_title'), [], choice(w('import.detect'), this.detect, w('import.detect_hint')), this.summary, el('div', { class: 'tc-actions' }, this.submit)).node,
     );
-    mount(
-      root,
-      el('div', { class: 'stack' }, pageHead(t('import.title')), el('p', { class: 'muted' }, t('import.intro')), this.running, form, this.results, this.offer),
-      this.layer,
-    );
+    mount(root, pageHead(w('nav.import')), el('p', { class: 'tc-intro' }, w('import.intro')), this.running, this.results, this.offer, form, this.layer);
     this.unwatch = working.watch((name) => this.onWorking(name));
     this.unwatchEnded = ended.watch(() => this.tellEnd());
+    this.addLine(false);
     this.onWorking(working.name);
     this.changed();
     this.tellEnd();
@@ -309,25 +324,14 @@ class ImportScreen {
     this.unwatchEnded();
   }
 
-  group(title, hint, ...content) {
-    return el('fieldset', { class: 'group' }, el('legend', {}, title), hint === null ? null : el('p', { class: 'muted small' }, hint), ...content);
-  }
-
   /** The file input that adds to `list`. */
   picker(list) {
-    const input = el('input', {
-      type: 'file',
-      multiple: true,
-      class: 'input',
-      'aria-label': t('import.choose'),
-      on: {
-        change: () => {
-          for (const file of input.files) list.push({ file, name: file.name, size: file.size });
-          // Cleared, so that the same file can be chosen again and the list is the only record of what is chosen.
-          input.value = '';
-          this.changed();
-        },
-      },
+    const input = el('input', { type: 'file', multiple: true, class: 'tc-input' });
+    input.addEventListener('change', () => {
+      for (const file of input.files) list.push({ file, name: file.name, size: file.size });
+      // Cleared, so that the same file can be chosen again and the list is the only record of what is chosen.
+      input.value = '';
+      this.changed();
     });
     return input;
   }
@@ -348,51 +352,70 @@ class ImportScreen {
   onWorking(name) {
     if (!this.alive) return;
     mount(this.running, runningNotice());
-    this.submit.disabled = name !== null || this.reading || this.problems().length > 0;
-    this.submit.setAttribute('aria-busy', String(name === 'import' || this.reading));
+    const busy = name === 'import' || this.reading;
+    this.submit.disabled = name !== null || this.reading;
+    this.submit.setAttribute('aria-busy', String(busy));
+    setText(this.submit, busy ? w('import.busy') : w('import.submit'));
   }
 
-  problems() {
-    return [...checkFiles({ rules: this.rules, data: this.data, crs: this.crs }).problems, ...(checkRoutes(this.routes.value).problem === null ? [] : [{ code: 'routes' }])];
+  /** What the form holds now, counted: the files, and the routes of the table. */
+  check() {
+    const files = checkFiles({ rules: this.rules, data: this.data, crs: this.crs });
+    const { routes, missing } = routesOfRows(this.lines.map((line) => ({ host: line.host.control.value, path: line.path.control.value })));
+    return { files, routes: routes.length === 0 ? { value: null, count: 0, problem: null } : checkRouteList(routes), list: routes, missing };
   }
 
   /** The form changed: draws the lists, the counts and the problems again, and drops the request that waited. */
   changed() {
     this.pending = null;
     mount(this.offer);
-    this.drawList(this.rulesBox, this.rules, true);
-    this.drawList(this.dataBox, this.data, false);
-    const check = checkFiles({ rules: this.rules, data: this.data, crs: this.crs });
-    const routes = checkRoutes(this.routes.value);
-    mount(
-      this.routesBox,
-      routes.problem === null
-        ? routes.count === 0
-          ? null
-          : el('p', { class: 'muted small' }, t('import.r.count', { n: routes.count }))
-        : notice('bad', ROUTE_PROBLEMS[routes.problem]()),
-    );
+    const check = this.check();
+    this.drawList(this.rulesBox, this.rules, true, check);
+    this.drawList(this.dataBox, this.data, false, check);
+    const loud = check.files.problems.filter((problem) => problem.code !== 'name' && problem.code !== 'size' && problem.code !== 'twice');
+    const first = loud.find((problem) => problem.code !== 'none' || this.tried);
+    if (first === undefined) this.rulesField.valid();
+    else this.rulesField.invalid(PROBLEMS[first.code]());
+    this.drawRoutesNote(check);
     mount(
       this.summary,
-      el('p', {}, t('import.summary', { files: check.files, bytes: bytesText(check.bytes), largest: bytesText(check.largest) })),
-      el('p', { class: 'muted small' }, t('import.limits')),
-      check.problems.length === 0
-        ? null
-        : notice(
-            'bad',
-            el('ul', { class: 'plain-list' }, check.problems.slice(0, SHOWN).map((problem) => el('li', {}, PROBLEMS[problem.code](problem)))),
-            check.problems.length > SHOWN ? el('p', { class: 'small' }, t('import.p.more', { n: check.problems.length - SHOWN })) : null,
-          ),
+      el('p', {}, w('import.summary', { files: check.files.files, bytes: bytesText(check.files.bytes), largest: bytesText(check.files.largest) })),
+      el('p', { class: 'tc-muted tc-small' }, w('import.limits')),
     );
     this.onWorking(working.name);
   }
 
+  /** Whether anything on the form is wrong, as the fields that say so, so that the first of them can take the focus. */
+  problems() {
+    const check = this.check();
+    const fields = [];
+    if (check.files.problems.length > 0) fields.push(this.rulesField.control);
+    for (const at of check.missing) fields.push(this.lines[at].path.control);
+    if (check.routes.problem !== null) fields.push(this.lines[0].host.control);
+    return fields;
+  }
+
+  drawRoutesNote(check) {
+    mount(
+      this.routesNote,
+      check.routes.problem === null && check.list.length > 0 ? el('p', { class: 'tc-muted tc-small' }, w('import.r.count', { n: check.routes.count })) : null,
+      check.routes.problem !== null && check.list.length > 0 ? notice('bad', ROUTE_PROBLEMS[check.routes.problem]()) : null,
+    );
+    this.lines.forEach((line, at) => {
+      if (check.missing.includes(at)) line.path.invalid(w('import.r.path'));
+      else line.path.valid();
+    });
+  }
+
+  // ---- the files ----
+
   /** The files of `list`, each with the buttons that move or drop it (the order of the rule files is the order they load in). */
-  drawList(box, list, ordered) {
+  drawList(box, list, ordered, check) {
     if (list.length === 0) {
-      mount(box, el('p', { class: 'muted small' }, t('import.none_chosen')));
+      mount(box, el('p', { class: 'tc-muted tc-small' }, w('import.none_chosen')));
       return;
     }
+    const faults = (name) => check.files.problems.filter((problem) => problem.name === name);
     const move = (at, by) => {
       const [item] = list.splice(at, 1);
       list.splice(at + by, 0, item);
@@ -402,32 +425,27 @@ class ImportScreen {
       box,
       el(
         'ol',
-        { class: 'files' },
+        { class: 'tc-files' },
         list.map((item, at) =>
           el(
             'li',
             {},
-            el('span', { class: 'file-name' }, item.name),
-            el('span', { class: 'muted small' }, bytesText(item.size)),
+            el('span', { class: 'tc-mono' }, item.name),
+            el('span', { class: 'tc-muted tc-small' }, bytesText(item.size)),
+            faults(item.name).map((problem) => el('span', { class: 'tc-error' }, PROBLEMS[problem.code]())),
             el(
               'span',
-              { class: 'actions' },
-              ordered && at > 0 ? el('button', { type: 'button', class: 'btn btn-small', 'aria-label': t('import.up', { name: item.name }), on: { click: () => move(at, -1) } }, '↑') : null,
-              ordered && at < list.length - 1 ? el('button', { type: 'button', class: 'btn btn-small', 'aria-label': t('import.down', { name: item.name }), on: { click: () => move(at, 1) } }, '↓') : null,
-              el(
-                'button',
-                {
-                  type: 'button',
-                  class: 'btn btn-small',
-                  'aria-label': t('import.drop', { name: item.name }),
-                  on: {
-                    click: () => {
-                      list.splice(at, 1);
-                      this.changed();
-                    },
-                  },
+              { class: 'tc-actions' },
+              ordered && at > 0 ? button('small quiet', '↑', () => move(at, -1), { 'aria-label': w('import.up', { name: item.name }) }) : null,
+              ordered && at < list.length - 1 ? button('small quiet', '↓', () => move(at, 1), { 'aria-label': w('import.down', { name: item.name }) }) : null,
+              button(
+                'small quiet',
+                w('import.remove'),
+                () => {
+                  list.splice(at, 1);
+                  this.changed();
                 },
-                t('import.remove'),
+                { 'aria-label': w('import.drop', { name: item.name }) },
               ),
             ),
           ),
@@ -438,40 +456,65 @@ class ImportScreen {
 
   drawCrs(error) {
     if (error !== null) {
-      mount(this.crsBox, notice('warn', t('import.crs_unknown'), ' ', this.ctx.describe(error)));
+      mount(this.crsBox, notice('warn', w('import.crs_unknown'), ' ', this.ctx.describe(error)));
       return;
     }
     if (!this.crsAvailable) {
-      mount(this.crsBox, el('p', { class: 'muted' }, t('import.crs_none')));
+      mount(this.crsBox, el('p', { class: 'tc-muted' }, w('import.crs_none')));
       return;
     }
-    const use = checkbox(t('import.crs_use'), (checked) => {
+    const off = el('div');
+    const use = checkbox((checked) => {
       this.crs = checked;
       mount(off, checked ? offList : null);
       this.changed();
-    }, t('import.crs_hint'));
+    });
     const offList = el(
       'fieldset',
-      { class: 'group' },
-      el('legend', {}, t('import.crs_off')),
+      { class: 'tc-stack' },
+      el('legend', { class: 'tc-label' }, w('import.crs_off')),
       this.crsFiles.length === 0
-        ? el('p', { class: 'muted small' }, t('import.crs_nofiles'))
+        ? el('p', { class: 'tc-muted tc-small' }, w('import.crs_nofiles'))
         : el(
             'div',
-            { class: 'checks' },
+            { class: 'tc-checks' },
             this.crsFiles.map((name) => {
-              const box = checkbox(name, (checked) => {
+              const box = checkbox((checked) => {
                 if (checked) this.crsOff.add(name);
                 else this.crsOff.delete(name);
                 this.changed();
               });
-              return box.row;
+              return choice(name, box);
             }),
           ),
     );
-    const off = el('div');
-    mount(this.crsBox, use.row, off);
+    mount(this.crsBox, choice(w('import.crs_use'), use, w('import.crs_hint')), off);
   }
+
+  // ---- the routes that are not inspected ----
+
+  /** Adds a line to the table of routes; `focus` puts the focus on its host. */
+  addLine(focus) {
+    const host = new Field(w('import.r.host'), textInput({ name: 'route-host', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', placeholder: 'admin.example.com' }));
+    const path = new Field(w('import.r.path_label'), textInput({ name: 'route-path', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', placeholder: '/api/generations' }));
+    const line = { host, path };
+    for (const field of [host, path]) field.control.addEventListener('input', () => this.changed());
+    const remove = button('small quiet', w('import.remove'), () => {
+      this.lines.splice(this.lines.indexOf(line), 1);
+      this.drawLines();
+      this.changed();
+    });
+    line.node = el('div', { class: 'tc-rows__row' }, host.node, path.node, remove);
+    this.lines.push(line);
+    this.drawLines();
+    if (focus) host.control.focus();
+  }
+
+  drawLines() {
+    mount(this.routesBox, this.lines.map((line) => line.node));
+  }
+
+  // ---- sending ----
 
   /** Reads the chosen files and gives the bodies of the request, or null with the notice of the file that failed. */
   async encode() {
@@ -487,12 +530,12 @@ class ImportScreen {
         data,
         crs: this.crs,
         crsOff: this.crs ? [...this.crsOff] : [],
-        routes: checkRoutes(this.routes.value).value,
+        routes: this.check().routes.value,
         detectOnly: this.detectOnly,
         acceptBlock: false,
       });
     } catch {
-      mount(this.results, notice('bad', t('import.read_failed')));
+      mount(this.results, notice('bad', w('import.read_failed')));
       return null;
     } finally {
       this.reading = false;
@@ -501,8 +544,16 @@ class ImportScreen {
   }
 
   async send(acceptBlock) {
-    // The form is empty when the screen was drawn again after the trial; the request that waits was checked when sent.
-    if ((!acceptBlock && this.problems().length > 0) || working.name !== null || this.reading) return;
+    if (working.name !== null || this.reading) return;
+    if (!acceptBlock) {
+      this.tried = true;
+      this.changed();
+      const fields = this.problems();
+      if (fields.length > 0) {
+        fields[0].focus();
+        return;
+      }
+    }
     let body;
     if (acceptBlock) {
       body = { ...this.pending.body, accept_block: true };
@@ -513,11 +564,11 @@ class ImportScreen {
     mount(this.offer);
     mount(this.results);
     this.mine = true;
-    const result = await perform('import', () => this.ctx.api.call('POST', '/api/generations', body));
+    const done = await perform('import', () => this.ctx.api.call('POST', '/api/generations', body));
     this.mine = false;
-    if (result.skipped) return;
+    if (done.skipped) return;
     // Whichever screen is shown now tells the end, which may not be this one.
-    ended.put({ body: result.body, error: result.error, request: body });
+    ended.put({ body: done.body, error: done.error, request: body });
   }
 
   /** Tells the end of an import that waits, if one does. */
@@ -537,17 +588,21 @@ class ImportScreen {
   done(answer) {
     const id = answer.fingerprint;
     this.ctx.refreshStatus();
+    const box = result(
+      'ok',
+      w('import.done_title'),
+      el('span', {}, badge('ok', Object.hasOwn(RESULTS, answer.result) ? RESULTS[answer.result]() : String(answer.result)), ' ', w('import.done', { id: shortOf(id) })),
+      w('import.notchosen'),
+    );
     mount(
       this.results,
-      notice(
-        'ok',
-        el('p', {}, badge('ok', Object.hasOwn(RESULTS, answer.result) ? RESULTS[answer.result]() : String(answer.result)), ' ', t('import.done', { id: shortOf(id) })),
-        el('dl', { class: 'kv' }, row(t('col.fingerprint'), fingerprint(id))),
-        typeof answer.trial === 'object' && answer.trial !== null ? trialView(answer.trial) : null,
-        el('p', {}, t('import.notchosen')),
-        el('p', {}, el('a', { class: 'btn', href: '#/generations', on: { click: () => handoff.set(id) } }, t('import.open'))),
-      ),
+      box,
+      kv(row(w('col.fingerprint'), fingerprintView(id))),
+      typeof answer.trial === 'object' && answer.trial !== null ? trialView(answer.trial) : null,
+      // The address of the generation is made only from a fingerprint: what the answer holds is checked before it is used.
+      isFingerprint(id) ? el('div', { class: 'tc-actions' }, el('a', { class: buttonClass(''), href: hashOf('generations', { id }) }, w('import.open'))) : null,
     );
+    restoreFocus(this.root, this.root.querySelector('h1'));
   }
 
   async refused(error, body) {
@@ -562,15 +617,12 @@ class ImportScreen {
       return;
     }
     if (typeof answer?.trial === 'object' && answer.trial !== null) {
-      mount(this.results, notice('bad', el('p', {}, this.ctx.describe(error)), trialView(answer.trial)));
+      mount(this.results, result('bad', w('import.refused_title'), this.ctx.describe(error), null), trialView(answer.trial));
       if (trialBlocked(answer)) this.offerAccept(answer.trial, body);
       return;
     }
     const subject = typeof answer?.subject === 'string' ? answer.subject : null;
-    mount(
-      this.results,
-      notice(error.kind === 'conflict' ? 'warn' : 'bad', this.ctx.describe(error, { change: true }), subject === null ? null : [' ', el('code', {}, subject)]),
-    );
+    mount(this.results, notice(error.kind === 'conflict' ? 'warn' : 'bad', this.ctx.describe(error, { change: true }), subject === null ? null : [' ', el('code', {}, subject)]));
   }
 
   /** The trial reported a block: the user may import the generation all the same, after a second confirmation. */
@@ -580,12 +632,8 @@ class ImportScreen {
       this.offer,
       notice(
         'warn',
-        el('p', {}, t('import.blocked_hint')),
-        el(
-          'p',
-          {},
-          el('button', { type: 'button', class: 'btn btn-danger', disabled: working.name !== null, on: { click: () => this.accept(trial) } }, t('import.accept')),
-        ),
+        el('span', {}, w('import.blocked_hint')),
+        el('div', { class: 'tc-actions' }, button('danger', w('import.accept'), () => this.accept(trial), { disabled: working.name !== null })),
       ),
     );
   }
@@ -593,9 +641,9 @@ class ImportScreen {
   async accept(trial) {
     if (this.pending === null) return;
     const yes = await confirmChange(this.layer, {
-      title: t('import.accept.title'),
-      lines: [el('p', {}, t('import.accept.what')), el('p', {}, el('code', {}, String(trial.failure))), el('p', { class: 'small' }, t('import.accept.after'))],
-      confirm: t('import.accept.confirm'),
+      title: w('import.accept.title'),
+      lines: [el('p', {}, w('import.accept.what')), el('p', {}, el('code', {}, String(trial.failure))), el('p', { class: 'tc-muted tc-small' }, w('import.accept.after'))],
+      confirm: w('import.accept.confirm'),
       tone: 'danger',
     });
     if (!yes || !this.alive || this.pending === null) return;
@@ -612,28 +660,29 @@ class ImportScreen {
     }
     if (!this.alive) return;
     const items = Array.isArray(list?.generations) ? list.generations.slice(0, 3) : null;
-    this.results.append(
-      items === null
-        ? notice('bad', t('found.failed'))
-        : el(
-            'section',
-            { class: 'card' },
-            el('h2', {}, t('import.newest')),
-            table(
-              [t('col.fingerprint'), t('col.made')],
-              items.map((item) => [fingerprint(item.fingerprint), utc(item.made)]),
-              t('import.newest'),
-            ),
-            el('p', {}, el('a', { href: '#/generations' }, t('import.open_list'))),
-          ),
-    );
+    if (items === null) {
+      this.results.append(notice('bad', w('found.failed')));
+      return;
+    }
+    const table = new Table({
+      caption: w('import.newest'),
+      rowKey: (item) => item.fingerprint,
+      filter: false,
+      empty: { title: w('gen.empty') },
+      columns: [
+        { key: 'fingerprint', label: w('col.fingerprint'), value: (item) => item.fingerprint, mono: true, cell: (item) => el('a', { class: 'tc-link tc-mono', href: hashOf('generations', { id: item.fingerprint }) }, `${shortOf(item.fingerprint)}…`) },
+        { key: 'made', label: w('col.made'), value: (item) => item.made, cell: (item) => timeView(item.made, 's') },
+      ],
+    });
+    table.update({ rows: items });
+    this.results.append(panelWith(w('import.newest'), [el('a', { class: buttonClass('quiet small'), href: hashOf('generations') }, w('import.open_list'))], table.node).node);
   }
 }
 
 function mountImport(ctx, root) {
   const screen = new ImportScreen(ctx, root);
   screen.start();
-  return () => screen.stop();
+  return { stop: () => screen.stop() };
 }
 
-export const screens = [{ id: 'import', title: () => t('nav.import'), least: 'operator', mount: mountImport }];
+export const screens = [{ id: 'import', title: w('nav.import'), least: 'operator', mount: mountImport }];

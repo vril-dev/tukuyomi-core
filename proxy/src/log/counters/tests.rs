@@ -34,7 +34,7 @@ fn a_label_outside_its_list_is_not_counted() {
     counters.add_config_reload(ReloadResult::Refused);
     let requests = counters.requests.samples();
     assert_eq!(requests[0], ("forwarded", 2));
-    assert_eq!(requests.iter().map(|&(_, count)| count).sum::<u64>(), 2);
+    assert_eq!(counters.requests.total(), 2);
     assert_eq!(counters.rule_hits.samples(), [("block", 0), ("detect", 1)]);
     assert_eq!(
         counters.switches.samples(),
@@ -53,6 +53,32 @@ fn a_label_outside_its_list_is_not_counted() {
         (0, 0)
     );
     assert!(counters.started() > 0);
+}
+
+#[test]
+fn the_sums_and_the_counts_that_the_control_socket_gives_are_read_from_the_families() {
+    let counters = Counters::start();
+    for class in ["forwarded", "forwarded", "blocked", "failed"] {
+        counters.add_request(class);
+    }
+    counters.add_rule_hit(RuleHit::Block);
+    counters.add_rule_hit(RuleHit::Detect);
+    counters.add_rule_hit(RuleHit::Detect);
+    counters.add_policy_refusal(Policy::Access);
+    counters.add_policy_refusal(Policy::RateLimit);
+    counters.add_policy_refusal(Policy::RateLimit);
+    counters.add_config_reload(ReloadResult::Replaced);
+    counters.add_config_reload(ReloadResult::Refused);
+    counters.add_config_reload(ReloadResult::Refused);
+    assert_eq!(counters.requests.total(), 4);
+    assert_eq!(counters.requests.get("forwarded"), 2);
+    assert_eq!(counters.requests.get("not a class"), 0);
+    // Only the requests that a rule blocked, not those it let through.
+    assert_eq!(counters.blocked(), 1);
+    assert_eq!(counters.policy_refusals.total(), 3);
+    assert_eq!(counters.config_reloaded(ReloadResult::Replaced), 1);
+    assert_eq!(counters.config_reloaded(ReloadResult::Refused), 2);
+    assert!(counters.uptime() < Duration::from_secs(60));
 }
 
 #[test]

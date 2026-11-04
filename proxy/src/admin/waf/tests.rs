@@ -538,6 +538,19 @@ fn a_switch_is_written_to_the_history_and_a_rollback_goes_to_the_from_of_the_las
     // The status says where a rollback would go, and a rollback goes there.
     let status = rig.get(Op::Status, "/api/status", "");
     assert_eq!(status.body["rollback_to"], g1.hex());
+    // The proxy of this test sends no figures, as an older proxy does: each one is `null`, and the rest is there.
+    assert_eq!(status.body["proxy"]["phase"], "ready");
+    for key in [
+        "uptime_ms",
+        "requests",
+        "blocked",
+        "policy_refused",
+        "upstream_failures",
+        "config",
+        "config_reloads",
+    ] {
+        assert_eq!(status.body["proxy"][key], Value::Null, "{key}");
+    }
     assert_eq!(rig.activate(g3, g2).body["result"], "switched");
     // The proxy refuses the next one: the store chooses it all the same, and the history says what happened.
     rig.behave(Behavior::Refuse);

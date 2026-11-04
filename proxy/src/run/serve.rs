@@ -51,6 +51,7 @@ pub(super) async fn run(
     policy: PolicyConfig,
     keep: Keep,
     path: PathBuf,
+    sha256: [u8; 32],
     fixed: Fixed,
     log: Log,
 ) -> u8 {
@@ -129,6 +130,7 @@ pub(super) async fn run(
         counters: Counters::start(),
         setup: SharedSetup::new(Setup::new(
             proxy.clone(),
+            sha256,
             &forward,
             tls,
             challenge,
@@ -212,7 +214,7 @@ async fn until_stop(
             Event::Configuration => log.line("reload: configuration ignored while starting"),
             Event::Reload => log.line("reload: ignored while starting"),
             Event::Certificates => log.line("reload: certificates ignored while starting"),
-            Event::Control(order) => control_while_starting(order, waits, switcher, log),
+            Event::Control(order) => control_while_starting(order, waits, switcher, shared),
             event => {
                 if let Some(cause) = Cause::of(event) {
                     return cause;
@@ -244,9 +246,7 @@ async fn until_stop(
             Event::ConfigurationLost => reloader.unanswered(shared),
             Event::Reload => reload(waits, switcher, ingress, &shared.counters, log),
             Event::Certificates => reloader.certificates(waits, shared),
-            Event::Control(order) => {
-                control_order(order, waits, switcher, ingress, &shared.counters, log);
-            }
+            Event::Control(order) => control_order(order, waits, switcher, ingress, shared),
             Event::Switched(switched) => {
                 shared.counters.add_switch(if switched {
                     SwitchResult::Switched

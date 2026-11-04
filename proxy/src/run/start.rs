@@ -97,6 +97,7 @@ pub fn start(log: &Log) -> u8 {
         records,
         admin,
         policy,
+        sha256,
         fixed,
     } = match prepare(&path, "start", log) {
         Ok(prepared) => prepared,
@@ -154,6 +155,7 @@ pub fn start(log: &Log) -> u8 {
         policy,
         keep,
         path,
+        sha256,
         fixed,
         log.clone(),
     ))
@@ -179,6 +181,8 @@ struct Prepared {
     admin: Option<AdminConfig>,
     /// The `access` and the `rate_limit` of the configuration.
     policy: PolicyConfig,
+    /// The SHA-256 of the bytes of the configuration file.
+    sha256: [u8; 32],
     /// The values that a reading of the file again may not change.
     fixed: Fixed,
 }
@@ -346,6 +350,7 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         records: parts.records,
         admin: parts.admin,
         policy: parts.policy,
+        sha256: parts.sha256,
         fixed: parts.fixed,
     })
 }

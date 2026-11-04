@@ -1,9 +1,16 @@
-//! The files of the admin page: `GET /` is the page, and `GET /ui/<name>` is its stylesheet, its scripts and its
-//! icon. They are embedded in the executable from `proxy/admin-ui/` (the files of its `js/` directory are served flat:
-//! `js/app.js` is `/ui/app.js`), so serving them reads no file of the host, and the page and the API are always of one
-//! version. A name that the table below does not hold, whatever it looks like, is looked for nowhere: the request goes
-//! on to the table of the API, which answers 404 for it. A method but `GET` and `HEAD` on a name of the table is 405
-//! with `Allow`, as for a route of the API.
+//! The files of the admin page: `GET /` is the page, and `GET /ui/<version>/<name>` is its stylesheet, its scripts and
+//! its icon. They are embedded in the executable from `proxy/admin-ui/` (the files of its `js/` directory are served
+//! flat: `js/app.js` is `/ui/<version>/app.js`), so serving them reads no file of the host, and the page and the API
+//! are always of one version. A name that the table below does not hold, and a version that is not the one of the
+//! table (no version at all included), whatever they look like, are looked for nowhere: the request goes on to the
+//! table of the API, which answers 404 for it. A method but `GET` and `HEAD` on the page or on a name of the table
+//! below its version is 405 with `Allow`, as for a route of the API.
+//!
+//! The version is the first 16 digits of the SHA-256 of a list of the name and the SHA-256 of every file of the table
+//! (as the fingerprint of a bundle is made of its manifest). It is made once, when the first request for the page or
+//! for a file comes, and the page is made then too: the page of `proxy/admin-ui/` with each `/ui/` in it replaced by
+//! `/ui/<version>/`. A path with a version always has the same content, so its files are kept for a year
+//! (`immutable`); the page is `no-store`, so the next request for it finds the next version.
 //!
 //! No session is needed, as the files hold no secret. The fields of an answer are `FIELDS`, not those of the API: the
 //! page may load its own scripts, styles and icon and call its own API, and nothing else; a script of the page cannot
@@ -13,21 +20,28 @@
 //! not `cors`, and the API refuses that origin. The answers of the API keep the fields of `response`, with
 //! `Referrer-Policy: no-referrer`.
 
+use std::sync::OnceLock;
+
 use bytes::Bytes;
-use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
+use http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName, HeaderValue};
 use http::{Method, Response, StatusCode};
 use http_body_util::Full;
 
 use super::{Answer, App, response};
+use crate::rules::bundle::{hex, sha256};
 
 const HTML: &str = "text/html; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
 const JAVASCRIPT: &str = "text/javascript; charset=utf-8";
 const SVG: &str = "image/svg+xml";
 
-/// The fields that every file of the page has besides its `Content-Type`.
-const FIELDS: [(&str, &str); 7] = [
-    ("cache-control", "no-store"),
+/// `Cache-Control` of the page, which names the version of the files.
+const NO_STORE: &str = "no-store";
+/// `Cache-Control` of a file below its version, which never changes.
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// The fields that every file of the page has besides its `Content-Type` and its `Cache-Control`.
+const FIELDS: [(&str, &str); 6] = [
     ("x-content-type-options", "nosniff"),
     (
         "content-security-policy",
@@ -57,8 +71,8 @@ static INDEX: File = File {
     bytes: include_bytes!("../../../admin-ui/index.html"),
 };
 
-/// The other files, below `/ui/`.
-static FILES: [File; 14] = [
+/// The other files, below `/ui/<version>/`.
+static FILES: [File; 15] = [
     File {
         name: "app.css",
         kind: CSS,
@@ -100,6 +114,11 @@ static FILES: [File; 14] = [
         bytes: include_bytes!("../../../admin-ui/js/parts.js"),
     },
     File {
+        name: "table.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/table.js"),
+    },
+    File {
         name: "generations.js",
         kind: JAVASCRIPT,
         bytes: include_bytes!("../../../admin-ui/js/generations.js"),
@@ -131,14 +150,52 @@ static FILES: [File; 14] = [
     },
 ];
 
-/// The answer for a request of the page, or none when `path` is not a file of the table (then the table of the API
-/// answers it). `HEAD` is answered as `GET`; hyper leaves the body out.
+/// The version of the files of `files`: the first 16 digits of the SHA-256 of the list of the name and the SHA-256 of
+/// each of them, in the order of the table.
+fn version_of(files: &[File]) -> String {
+    let mut list = String::new();
+    for file in files {
+        list.push_str(file.name);
+        list.push('\n');
+        list.push_str(&hex(&sha256(file.bytes)));
+        list.push('\n');
+    }
+    hex(&sha256(list.as_bytes())[..8])
+}
+
+/// What is made of the table once: its version, and the page with that version in the paths of its files.
+struct Served {
+    version: String,
+    index: Bytes,
+}
+
+static SERVED: OnceLock<Served> = OnceLock::new();
+
+/// The version and the page, made when they are first asked for.
+fn served() -> &'static Served {
+    SERVED.get_or_init(|| {
+        let version = version_of(&FILES);
+        let index =
+            String::from_utf8_lossy(INDEX.bytes).replace("/ui/", &format!("/ui/{version}/"));
+        Served {
+            version,
+            index: Bytes::from(index),
+        }
+    })
+}
+
+/// The answer for a request of the page, or none when `path` is not the page or a file of the table below its
+/// version (then the table of the API answers it). `HEAD` is answered as `GET`; hyper leaves the body out.
 pub(super) fn serve(app: &App, method: &Method, path: &str) -> Option<Response<Full<Bytes>>> {
-    let file = if path == "/" {
-        &INDEX
+    let (kind, body, cache) = if path == "/" {
+        (INDEX.kind, served().index.clone(), NO_STORE)
     } else {
-        let name = path.strip_prefix("/ui/")?;
-        FILES.iter().find(|file| file.name == name)?
+        let (version, name) = path.strip_prefix("/ui/")?.split_once('/')?;
+        if version != served().version {
+            return None;
+        }
+        let file = FILES.iter().find(|file| file.name == name)?;
+        (file.kind, Bytes::from_static(file.bytes), IMMUTABLE)
     };
     if !matches!(*method, Method::GET | Method::HEAD) {
         let mut answer = Answer::error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
@@ -146,9 +203,10 @@ pub(super) fn serve(app: &App, method: &Method, path: &str) -> Option<Response<F
         answer.request = app.ids.mint();
         return Some(response(&answer));
     }
-    let mut page = Response::new(Full::new(Bytes::from_static(file.bytes)));
+    let mut page = Response::new(Full::new(body));
     let fields = page.headers_mut();
-    fields.insert(CONTENT_TYPE, HeaderValue::from_static(file.kind));
+    fields.insert(CONTENT_TYPE, HeaderValue::from_static(kind));
+    fields.insert(CACHE_CONTROL, HeaderValue::from_static(cache));
     for (name, value) in FIELDS {
         fields.insert(
             HeaderName::from_static(name),
