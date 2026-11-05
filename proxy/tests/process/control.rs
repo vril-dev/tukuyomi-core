@@ -94,6 +94,8 @@ fn state(mut answer: Value) -> Value {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "config: {digits}"
     );
+    // A configuration without `managed` has no managed version.
+    assert_eq!(fields.remove("managed"), Some(Value::Null));
     let reloads = fields
         .remove("config_reloads")
         .expect("config_reloads is missing");

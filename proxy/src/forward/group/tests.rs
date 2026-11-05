@@ -177,3 +177,41 @@ fn the_upstreams_are_guarded_only_when_some_route_has_an_access_list() {
     assert!(guarded(&[(&[], &[]), (&["10.0.0.0/8"], &[])]));
     assert!(guarded(&[(&[], &["10.0.0.0/8"])]));
 }
+
+#[test]
+fn the_way_to_the_admin_process_is_taken_by_the_name_of_its_host_alone() {
+    let mut forward = ForwardConfig::of(&["127.0.0.1:9000".parse().unwrap()]);
+    forward.admin = Some(AdminWay {
+        host: "admin.example".to_owned(),
+        access: Access::default(),
+        server: "127.0.0.1:9180".parse().unwrap(),
+    });
+    let upstreams = Upstreams::new(&forward, &config());
+    let way = |host: &[u8]| {
+        upstreams
+            .admin(Some(host))
+            .map(|(route, _)| route.group.servers[0].address())
+    };
+    let admin = Some("127.0.0.1:9180".parse().unwrap());
+    for host in [
+        &b"admin.example"[..],
+        b"ADMIN.Example",
+        b"admin.example:8443",
+        b"admin.example.",
+    ] {
+        assert_eq!(way(host), admin, "{host:?}");
+    }
+    for host in [
+        &b"xadmin.example"[..],
+        b"admin.example.evil",
+        b"a.admin.example",
+        b"admin.example:0",
+        b"[::1",
+    ] {
+        assert_eq!(way(host), None, "{host:?}");
+    }
+    assert!(upstreams.admin(None).is_none());
+    // A configuration without the way has none.
+    let plain = Upstreams::new(&ForwardConfig::of(&[]), &config());
+    assert!(plain.admin(Some(b"admin.example")).is_none());
+}

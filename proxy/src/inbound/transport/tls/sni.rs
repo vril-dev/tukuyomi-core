@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use crate::config::CertificateConfig;
+use super::certs::Place;
+use super::table::Entry;
 use crate::route::RequestHost;
 
 /// The hosts of one certificate.
@@ -17,13 +18,16 @@ pub struct Hosts {
     exact: Vec<String>,
     /// The name of each wildcard host, without its `*.`.
     wildcard: Vec<String>,
+    /// The certificate is the one of the way to the admin process.
+    admin: bool,
 }
 
 impl Hosts {
-    fn new(hosts: &[String]) -> Hosts {
+    fn new(hosts: &[String], admin: bool) -> Hosts {
         let mut found = Hosts {
             exact: Vec::new(),
             wildcard: Vec::new(),
+            admin,
         };
         for host in hosts {
             match host.strip_prefix("*.") {
@@ -40,6 +44,11 @@ impl Hosts {
 
     fn has_wildcard(&self, name: &str) -> bool {
         one_label_below(name).is_some_and(|rest| self.wildcard.iter().any(|host| host == rest))
+    }
+
+    /// Whether the certificate is the one of the way to the admin process (see `table`).
+    pub fn is_admin(&self) -> bool {
+        self.admin
     }
 
     /// Whether `name`, in lowercase, is one of the hosts, or one label in front of a wildcard host.
@@ -73,11 +82,12 @@ pub struct Names {
 }
 
 impl Names {
-    pub fn new(certificates: &[CertificateConfig]) -> Names {
+    /// The hosts of the certificates of a list of the table, in its order.
+    pub(super) fn of(entries: &[Entry]) -> Names {
         Names {
-            certificates: certificates
+            certificates: entries
                 .iter()
-                .map(|certificate| Arc::new(Hosts::new(&certificate.hosts)))
+                .map(|entry| Arc::new(Hosts::new(&entry.hosts, entry.place == Place::AdminRoute)))
                 .collect(),
         }
     }

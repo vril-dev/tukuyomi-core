@@ -200,6 +200,7 @@ fn figures(shared: &Shared) -> Figures {
             .failures()
             .fold(0, |sum, (_, failures)| sum.saturating_add(failures)),
         config: setup.sha256,
+        managed: setup.managed,
         config_replaced: counters.config_reloaded(ReloadResult::Replaced),
         config_refused: counters.config_reloaded(ReloadResult::Refused),
     }

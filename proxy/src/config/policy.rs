@@ -85,7 +85,7 @@ pub struct GeoConfig {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RawRateLimit {
+pub(crate) struct RawRateLimit {
     rate: u32,
     burst: u32,
     keys: usize,
@@ -110,6 +110,21 @@ pub(super) fn check(
         access: rewrite::access(access)?,
         rate_limit: rate_limit.map(|Object(raw)| limit(raw)).transpose()?,
         geo: geo.map(|Object(raw)| located(raw)).transpose()?,
+        country: None,
+    })
+}
+
+/// Checks the `access` and the `rate_limit` of a managed version, which goes with the `geo` of its main file, checked
+/// already.
+pub(crate) fn routed(
+    access: Option<Object<RawAccess>>,
+    rate_limit: Option<Object<RawRateLimit>>,
+    geo: Option<GeoConfig>,
+) -> Result<PolicyConfig, ConfigError> {
+    Ok(PolicyConfig {
+        access: rewrite::access(access)?,
+        rate_limit: rate_limit.map(|Object(raw)| limit(raw)).transpose()?,
+        geo,
         country: None,
     })
 }

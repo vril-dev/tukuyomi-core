@@ -1,11 +1,12 @@
 //! Where a certificate and its private key come from.
 //!
-//! `KeySource` is the one way in: it gives the chain and a key that can sign. `Files` reads two PEM files. A file
-//! is a regular file of at most 1 MiB (`read_file` opens a file so, with the size as a parameter, for the account key
-//! too). The certificate file holds 1 to 10 certificates, the first of which is the one for the host. The key file
-//! holds exactly one private key, in a form (PKCS#8, SEC1 or PKCS#1) of a type that the crypto provider can load. The
-//! bytes of the key file and the key in the form of the file are overwritten with zeros as soon as the provider has
-//! made its own key of them, or the load has failed.
+//! `KeySource` is the one way in for the files of the listeners: it gives the chain and a key that can sign. `Files`
+//! reads two PEM files, and `certified` takes the same from bytes that were read already (those of the managed store).
+//! A file is a regular file of at most 1 MiB (`read_file` opens a file so, with the size as a parameter, for the
+//! account key too). The certificate file holds 1 to 10 certificates, the first of which is the one for the host. The
+//! key file holds exactly one private key, in a form (PKCS#8, SEC1 or PKCS#1) of a type that the crypto provider can
+//! load. The bytes of the key file and the key in the form of the file are overwritten with zeros as soon as the
+//! provider has made its own key of them, or the load has failed.
 
 use std::fs::OpenOptions;
 use std::io::{self, Read};
@@ -77,26 +78,39 @@ pub(crate) fn read_file(path: &Path, limit: u64) -> Result<Zeroizing<Vec<u8>>, F
 
 impl KeySource for Files {
     fn load(&self, cert_file: &Path, key_file: &Path) -> Result<CertifiedKey, Fault> {
-        let chain = {
-            let bytes = read_file(cert_file, MAX_FILE)?;
-            CertificateDer::pem_slice_iter(&bytes)
-                .take(MAX_CHAIN + 1)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| Fault::NotCertificates)?
-        };
-        if chain.is_empty() || chain.len() > MAX_CHAIN {
-            return Err(Fault::NotCertificates);
-        }
-        let bytes = read_file(key_file, MAX_FILE)?;
-        let mut keys = PrivateKeyDer::pem_slice_iter(&bytes)
-            .take(2)
-            .map(|key| key.map(Zeroizing::new))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| Fault::NotOneKey)?;
-        let (Some(key), None) = (keys.pop(), keys.pop()) else {
-            return Err(Fault::NotOneKey);
-        };
-        let signing = any_supported_type(&key).map_err(|_| Fault::KeyType)?;
-        Ok(CertifiedKey::new(chain, signing))
+        let chain = chain_of(&read_file(cert_file, MAX_FILE)?)?;
+        key_of(chain, &read_file(key_file, MAX_FILE)?)
     }
+}
+
+/// The chain and the key that the bytes of a certificate file and of a key file hold, as `Files` takes them from the
+/// files: the bytes of a file of the managed store, which the store has read and checked.
+pub(crate) fn certified(chain: &[u8], key: &[u8]) -> Result<CertifiedKey, Fault> {
+    key_of(chain_of(chain)?, key)
+}
+
+/// The 1 to 10 certificates of the bytes of a certificate file.
+fn chain_of(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>, Fault> {
+    let chain = CertificateDer::pem_slice_iter(bytes)
+        .take(MAX_CHAIN + 1)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| Fault::NotCertificates)?;
+    if chain.is_empty() || chain.len() > MAX_CHAIN {
+        return Err(Fault::NotCertificates);
+    }
+    Ok(chain)
+}
+
+/// `chain` with the one private key of the bytes of a key file, which signs for it.
+fn key_of(chain: Vec<CertificateDer<'static>>, bytes: &[u8]) -> Result<CertifiedKey, Fault> {
+    let mut keys = PrivateKeyDer::pem_slice_iter(bytes)
+        .take(2)
+        .map(|key| key.map(Zeroizing::new))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| Fault::NotOneKey)?;
+    let (Some(key), None) = (keys.pop(), keys.pop()) else {
+        return Err(Fault::NotOneKey);
+    };
+    let signing = any_supported_type(&key).map_err(|_| Fault::KeyType)?;
+    Ok(CertifiedKey::new(chain, signing))
 }

@@ -1,6 +1,6 @@
 //! The configuration file: one JSON object `{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store":
 //! {..}}, "acme": {..}, "status": {..}, "records": {..}, "access": {..}, "rate_limit": {..}, "geo": {..}, "admin":
-//! {..}}`; every value is chosen by the operator and checked here.
+//! {..}, "managed": {..}}`; every value is chosen by the operator and checked here.
 //!
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs; the result keeps the
 //! SHA-256 of the bytes that were read. Every key must be present (a route may leave out its `host`, its `path`,
@@ -22,6 +22,21 @@
 //! `admin` object against the listeners and the status listener, the directories and the control socket against
 //! each other (see `places`), the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's
 //! own check, and last the relations between the `proxy` and `kernel` objects.
+//!
+//! `managed` may be left out. When it is there it is `{"dir"}`, the directory of the managed store (see `managed`),
+//! an absolute clean path of at most 3840 bytes, and the file does not write how the proxy routes: `forward` has
+//! `resolve_timeout_ms` only, the `tls` of a listener has no `certificates`, and the file has no `access`, no
+//! `rate_limit` and no `acme` (a certificate with `acme` cannot be a site yet). The upstream groups, the routes, the
+//! default group, the `access`, the `rate_limit` and the sites with their certificates come from a version of the
+//! store, which is checked after the values of this file and against them, by the same rules and with the same
+//! sentences (see `managed::version`). Its `admin`, if it has one, writes the way to the admin process (`admin.route`,
+//! see `admin`). A file without `managed` is read as it always was.
+//!
+//! There are two readings of the file. `load` reads the whole configuration, which the proxy serves with: the file,
+//! with `managed` the version that the store chooses and the files it names (see `managed::load`), and the country
+//! database. `load_main` reads the file alone and gives a `MainFile`, which has no routing: the readers that serve no
+//! request use it (the shipper, the commands `rules`, `admin bootstrap` and `admin reset`, and the admin process). A
+//! file without `managed` gets the same checks from both, but `load_main` does not read the country database.
 //!
 //! `max_body` (1 KiB to 4 GiB) is the most bytes a request body may have once decoded (a gzip body under a route
 //! that skips the inspection is not decoded, so the limit counts its coded bytes), and `inspect_body` (1 KiB up to
@@ -58,10 +73,10 @@ use serde::Deserialize;
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::error::Category;
-use tukuyomi_kernel::Engine;
 use tukuyomi_kernel::limits::{BODY, HEADER_TOTAL};
 
 use crate::forward::client_ip::Cidr;
+use crate::managed::{self, Choice, Version};
 use crate::rules::bundle::sha256;
 
 mod acme;
@@ -76,19 +91,23 @@ mod rewrite;
 mod status;
 
 pub use acme::AcmeConfig;
-pub use admin::{AdminConfig, AdminStoreConfig, Mfa};
-pub(crate) use forward::MAX_SERVERS;
+pub use admin::{AdminConfig, AdminRoute, AdminStoreConfig, Mfa};
 pub use forward::{
-    Address, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig, Stream,
+    Address, AdminWay, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig,
+    Stream,
 };
+pub(crate) use forward::{Groups, MAX_SERVERS, RawRoute, RawTls, StoredTls, name_ok, routing};
 pub use kernel::KernelSettings;
+pub(crate) use listeners::host_ok_for_tls;
 pub use listeners::{
     CertificateAcme, CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion,
     TlsConfig, addresses,
 };
 pub use policy::{GeoConfig, PolicyConfig, RateLimitConfig};
-pub(crate) use records::MAX_RECORD_FILES;
+pub(crate) use policy::{RawRateLimit, routed};
 pub use records::{Driver, Keep, Records, RouteKeep, Ship};
+pub(crate) use records::{MAX_RECORD_FILES, consistent};
+pub(crate) use rewrite::RawAccess;
 pub use status::StatusConfig;
 
 const MAX_FILE: u64 = 256 * 1024;
@@ -167,10 +186,12 @@ pub struct ProxyConfig {
     pub upstream_keepalive_requests: usize,
 }
 
-/// A configuration that passed every check.
+/// A whole configuration that passed every check: the main file, and for a file with `managed` the version of the
+/// managed store it was read with. The proxy serves with it.
 #[derive(Clone, Debug)]
 pub struct Loaded {
     pub proxy: ProxyConfig,
+    /// From the main file, or from the version for a file with `managed` (`resolve_timeout` is the main file's).
     pub forward: ForwardSettings,
     pub kernel: KernelSettings,
     pub store: StoreConfig,
@@ -180,18 +201,61 @@ pub struct Loaded {
     pub status: Option<StatusConfig>,
     /// There if the file has the `records` object.
     pub records: Option<Records>,
-    /// What turns a request away before its route is looked for: the `access`, `rate_limit` and `geo` objects.
+    /// What turns a request away before its route is looked for: the `access`, `rate_limit` and `geo` objects. For a
+    /// file with `managed` the first two are the version's and `geo` is the main file's.
     pub policy: PolicyConfig,
     /// There if the file has the `admin` object.
     pub admin: Option<AdminConfig>,
-    /// The SHA-256 of the bytes that were read: what the running proxy shows of the file it follows.
+    /// The `route` of `admin`, there if the file has `managed` and `admin`.
+    pub admin_route: Option<AdminRoute>,
+    /// There if the file has the `managed` object.
+    pub managed: Option<ManagedConfig>,
+    /// The version that was read, there if and only if `managed` is.
+    pub version: Option<Version>,
+    /// The SHA-256 of the bytes of the main file that were read: what the running proxy shows of the file it follows.
     pub sha256: [u8; 32],
+}
+
+/// The main file that passed every check, without its routing: see the module documentation.
+#[derive(Clone, Debug)]
+pub struct MainFile {
+    pub proxy: ProxyConfig,
+    pub kernel: KernelSettings,
+    pub store: StoreConfig,
+    pub acme: Option<AcmeConfig>,
+    pub status: Option<StatusConfig>,
+    pub records: Option<Records>,
+    pub admin: Option<AdminConfig>,
+    pub admin_route: Option<AdminRoute>,
+    pub managed: Option<ManagedConfig>,
+    pub sha256: [u8; 32],
+}
+
+/// The main file, checked, with its policy and its routing.
+pub(crate) struct Built {
+    pub(crate) main: MainFile,
+    /// The `access`, the `rate_limit` and the `geo` of the file; with `managed`, its `geo` only.
+    pub(crate) policy: PolicyConfig,
+    pub(crate) routing: Routing,
+}
+
+pub(crate) enum Routing {
+    /// The groups, the routes and the default group of a file without `managed`, checked.
+    Own(ForwardSettings),
+    /// A file with `managed`: the time to look up the names of the servers of its version.
+    Managed { resolve_timeout: Duration },
 }
 
 /// Where the rule generations are kept, as the file names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreConfig {
     File { dir: PathBuf },
+}
+
+/// Where the managed store is, as the file names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedConfig {
+    pub dir: PathBuf,
 }
 
 /// Why the file was refused: a fixed English sentence, never a value taken from the file.
@@ -203,7 +267,7 @@ pub struct ConfigError(pub &'static str);
 struct RawFile {
     proxy: Object<RawProxy>,
     forward: Object<forward::RawForward>,
-    kernel: Object<RawKernel>,
+    kernel: Object<kernel::RawKernel>,
     rules: Object<RawRules>,
     #[serde(default, deserialize_with = "present")]
     acme: Option<Object<acme::RawAcme>>,
@@ -219,6 +283,8 @@ struct RawFile {
     geo: Option<Object<policy::RawGeo>>,
     #[serde(default, deserialize_with = "present")]
     admin: Option<Object<admin::RawAdmin>>,
+    #[serde(default, deserialize_with = "present")]
+    managed: Option<Object<RawManaged>>,
 }
 
 #[derive(Deserialize)]
@@ -260,33 +326,6 @@ struct RawProxy {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawKernel {
-    inspector: String,
-    #[serde(default, deserialize_with = "present")]
-    engines: Option<Object<kernel::RawEngines>>,
-    tmp_root: String,
-    gomaxprocs: u16,
-    gomemlimit: u64,
-    slots: usize,
-    wait_queue: usize,
-    records: usize,
-    discard_limit: u32,
-    tick_ms: u64,
-    hello_wait_ms: u64,
-    frame_io_ms: u64,
-    verdict_wait_ms: u64,
-    wait_deadline_ms: u64,
-    closed_wait_ms: u64,
-    stop_after_ms: u64,
-    drain_wait_ms: u64,
-    exit_wait_ms: u64,
-    kill_grace_ms: u64,
-    restarts: u32,
-    restart_window_ms: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawRules {
     store: Object<RawStore>,
 }
@@ -295,6 +334,12 @@ struct RawRules {
 #[serde(deny_unknown_fields)]
 struct RawStore {
     kind: String,
+    dir: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawManaged {
     dir: String,
 }
 
@@ -309,7 +354,7 @@ pub(crate) fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 
 /// Accepts only a JSON object. A derived struct alone would also take an array of its values in field order,
 /// which would skip the key names.
-struct Object<T>(T);
+pub(crate) struct Object<T>(pub(crate) T);
 
 struct ObjectVisitor<T>(PhantomData<T>);
 
@@ -331,8 +376,19 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
     }
 }
 
-/// Reads and checks the configuration file, and the country database that its `geo` names (see `policy`).
+/// Reads and checks the whole configuration (see the module documentation): the reading of `managed::load` with the
+/// version that the store chooses, every refusal as its sentence.
 pub fn load(path: &Path) -> Result<Loaded, ConfigError> {
+    managed::load(path, &Choice::Current).map_err(|e| e.sentence())
+}
+
+/// Reads and checks the main file alone (see the module documentation).
+pub fn load_main(path: &Path) -> Result<MainFile, ConfigError> {
+    Ok(main_file(&read(path)?)?.main)
+}
+
+/// The bytes of the main file: a regular file of at most 256 KiB, which is checked by `main_file`.
+pub(crate) fn read(path: &Path) -> Result<Vec<u8>, ConfigError> {
     const UNREADABLE: ConfigError = ConfigError("configuration file cannot be read");
     let meta = fs::metadata(path).map_err(|_| UNREADABLE)?;
     if !meta.is_file() {
@@ -344,19 +400,26 @@ pub fn load(path: &Path) -> Result<Loaded, ConfigError> {
         .take(MAX_FILE + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| UNREADABLE)?;
-    let mut loaded = parse(&bytes)?;
+    Ok(bytes)
+}
+
+/// Reads the country database that the `geo` of a whole configuration names (see `policy`). The database is read and
+/// checked whether or not a list uses it, so that a bad one is found at once; it is kept only if one does.
+pub(crate) fn read_countries(loaded: &mut Loaded) -> Result<(), ConfigError> {
     if let Some(geo) = &loaded.policy.geo {
-        // The database is read and checked whether or not a list uses it, so that a bad one is found at once; it is
-        // kept only if one does.
         let country = geo.open()?;
-        if uses_countries(&loaded.policy, &loaded.forward) {
+        let route = loaded.admin_route.as_ref();
+        if uses_countries(&loaded.policy, &loaded.forward)
+            || route.is_some_and(|route| route.access.has_countries())
+        {
             loaded.policy.country = Some(country);
         }
     }
-    Ok(loaded)
+    Ok(())
 }
 
-fn parse(bytes: &[u8]) -> Result<Loaded, ConfigError> {
+/// The bytes of a main file, checked.
+pub(crate) fn main_file(bytes: &[u8]) -> Result<Built, ConfigError> {
     if !u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_FILE) {
         return Err(ConfigError("configuration file is over 256 KiB"));
     }
@@ -366,8 +429,24 @@ fn parse(bytes: &[u8]) -> Result<Loaded, ConfigError> {
     build(file, sha256(bytes))
 }
 
+/// A file without `managed`, from its bytes, as `load` reads it but for the country database.
+#[cfg(test)]
+fn parse(bytes: &[u8]) -> Result<Loaded, ConfigError> {
+    match main_file(bytes)? {
+        Built {
+            main,
+            policy,
+            routing: Routing::Own(forward),
+        } => Ok(managed::whole(main, forward, policy, None)),
+        Built {
+            routing: Routing::Managed { .. },
+            ..
+        } => Err(ConfigError("a file with managed is read with its store")),
+    }
+}
+
 /// The fixed sentence for a deserialization fault. The text of the fault is only used to tell the kinds apart.
-fn refusal(e: &serde_json::Error) -> ConfigError {
+pub(crate) fn refusal(e: &serde_json::Error) -> ConfigError {
     ConfigError(match e.classify() {
         Category::Io | Category::Syntax | Category::Eof => "configuration is not valid JSON",
         Category::Data => {
@@ -385,12 +464,12 @@ fn refusal(e: &serde_json::Error) -> ConfigError {
     })
 }
 
-fn ensure(ok: bool, text: &'static str) -> Result<(), ConfigError> {
+pub(crate) fn ensure(ok: bool, text: &'static str) -> Result<(), ConfigError> {
     if ok { Ok(()) } else { Err(ConfigError(text)) }
 }
 
 /// Whether the `access` of the configuration or of some route has a list of countries.
-fn uses_countries(policy: &PolicyConfig, forward: &ForwardSettings) -> bool {
+pub(crate) fn uses_countries(policy: &PolicyConfig, forward: &ForwardSettings) -> bool {
     policy.access.has_countries()
         || forward
             .routes
@@ -451,17 +530,7 @@ pub fn clean_abs(p: &Path) -> bool {
             .all(|s| !s.is_empty() && s != b"." && s != b"..")
 }
 
-/// The least time the HTTP side must allow for an inspection: the kernel's wait for the first frame, two
-/// verdicts, and 18 driver steps of one slice and one frame write each. `None` if the sum overflows.
-fn inspect_floor(kernel: &tukuyomi_kernel::Config, slice: Duration) -> Option<Duration> {
-    let steps = slice.checked_add(kernel.frame_io)?.checked_mul(18)?;
-    kernel
-        .wait_deadline
-        .checked_add(kernel.verdict_wait.checked_mul(2)?)?
-        .checked_add(steps)
-}
-
-fn build(file: RawFile, sha256: [u8; 32]) -> Result<Loaded, ConfigError> {
+fn build(file: RawFile, sha256: [u8; 32]) -> Result<Built, ConfigError> {
     let RawFile {
         proxy: Object(p),
         forward: Object(f),
@@ -474,8 +543,21 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Loaded, ConfigError> {
         rate_limit: rl,
         geo: ge,
         admin: ad,
+        managed: m,
     } = file;
-    let listeners = listeners::check(p.listeners)?;
+    // The routing of a file with `managed` is in its version. Without `managed`, the three keys of the routing are
+    // required, and a missing one is found before any value is checked, as serde finds a missing key that is not
+    // optional.
+    let versioned = m.is_some();
+    ensure(
+        versioned || f.routes_written() == Some(true),
+        "configuration has a missing key",
+    )?;
+    let listeners = if versioned {
+        listeners::check_managed(p.listeners)?
+    } else {
+        listeners::check(p.listeners)?
+    };
     ensure(within(p.max_conns, 1, 65536), "max_conns is out of range")?;
     ensure(
         within(p.max_head_bytes, 1024, 32768),
@@ -586,7 +668,14 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Loaded, ConfigError> {
     // A server may not be at an address the proxy listens on, the one of the status listener included.
     let mut bound = addresses(&listeners);
     bound.extend(status.map(|status| status.listen));
-    let forward = forward::check(f, &bound, p.max_body)?;
+    // With `managed`, the routing is checked with the version (see `managed::version`).
+    let (forward, resolve_timeout) = if versioned {
+        (None, forward::timeout_only(f)?)
+    } else {
+        let forward = forward::check(f, &bound, p.max_body)?;
+        let timeout = forward.resolve_timeout;
+        (Some(forward), timeout)
+    };
 
     ensure(s.kind == "file", "rules store kind is not supported")?;
     let dir = PathBuf::from(s.dir);
@@ -598,176 +687,109 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Loaded, ConfigError> {
         dir.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
         "rules store dir is over 3840 bytes",
     )?;
+    let managed = m.map(|Object(raw)| managed_dir(raw)).transpose()?;
 
+    ensure(
+        managed.is_none() || a.is_none(),
+        "the configuration has acme while it has managed",
+    )?;
     let acme = acme::check(a, &listeners)?;
     let records = records::check(rec)?;
-    records::consistent(records.as_ref(), &forward)?;
-    let policy = policy::check(ac, rl, ge)?;
+    if let Some(forward) = &forward {
+        records::consistent(records.as_ref(), forward)?;
+    }
     ensure(
-        policy.geo.is_some() || !uses_countries(&policy, &forward),
-        "access has a list of countries while geo is left out",
+        managed.is_none() || (ac.is_none() && rl.is_none()),
+        "the configuration has access or rate_limit while it has managed",
     )?;
+    let policy = policy::check(ac, rl, ge)?;
+    if let Some(forward) = &forward {
+        ensure(
+            policy.geo.is_some() || !uses_countries(&policy, forward),
+            "access has a list of countries while geo is left out",
+        )?;
+    }
     // Unlike the status listener, the admin process may be the server of an upstream: `bound` above does not hold
     // its address.
-    let admin = admin::check(ad, &listeners, status)?;
-    places::separate(&dir, records.as_ref(), admin.as_ref())?;
+    let (admin, admin_route) = admin::check(ad, &listeners, status, versioned)?;
+    ensure(
+        policy.geo.is_some()
+            || !admin_route
+                .as_ref()
+                .is_some_and(|r| r.access.has_countries()),
+        "access has a list of countries while geo is left out",
+    )?;
+    places::separate(&dir, records.as_ref(), admin.as_ref(), managed.as_ref())?;
 
-    let engines = kernel::check(k.engines)?;
-    let kernel = tukuyomi_kernel::Config {
-        engine: Engine::Coraza,
-        inspector: PathBuf::from(k.inspector),
-        // The check looks at the form of the path only, so the directory of a generation, which is below this
-        // one, gets the same answer. The fingerprint is any value of its type.
-        rules: dir.join("generations"),
-        rules_sha256: [0; 32],
-        tmp_root: PathBuf::from(k.tmp_root),
-        gomaxprocs: k.gomaxprocs,
-        gomemlimit: k.gomemlimit,
-        slots: k.slots,
-        wait_queue: k.wait_queue,
-        records: k.records,
-        discard_limit: k.discard_limit,
-        tick: Duration::from_millis(k.tick_ms),
-        hello_wait: Duration::from_millis(k.hello_wait_ms),
-        frame_io: Duration::from_millis(k.frame_io_ms),
-        verdict_wait: Duration::from_millis(k.verdict_wait_ms),
-        wait_deadline: Duration::from_millis(k.wait_deadline_ms),
-        closed_wait: Duration::from_millis(k.closed_wait_ms),
-        stop_after: Duration::from_millis(k.stop_after_ms),
-        drain_wait: Duration::from_millis(k.drain_wait_ms),
-        exit_wait: Duration::from_millis(k.exit_wait_ms),
-        kill_grace: Duration::from_millis(k.kill_grace_ms),
-        restarts: k.restarts,
-        restart_window: Duration::from_millis(k.restart_window_ms),
+    let kernel = kernel::settings(k, &dir)?;
+    let proxy = ProxyConfig {
+        listeners,
+        max_conns: p.max_conns,
+        max_head_bytes: p.max_head_bytes,
+        max_body: p.max_body,
+        inspect_body: p.inspect_body,
+        max_body_wire: p.max_body_wire,
+        max_buffered_bytes: p.max_buffered_bytes,
+        upstream_max_headers: p.upstream_max_headers,
+        upstream_max_head_bytes: p.upstream_max_head_bytes,
+        upstream_head_wire: p.upstream_head_wire,
+        drive_slice,
+        ready_wait,
+        head_read,
+        body_read,
+        inspect_wait,
+        upstream_connect,
+        upstream_header,
+        request_total,
+        response_idle,
+        conn_total,
+        stop_inspect,
+        stop_wait,
+        keepalive_timeout,
+        keepalive_requests: p.keepalive_requests,
+        keepalive_time,
+        lingering_time,
+        lingering_timeout,
+        lingering_bytes: p.lingering_bytes,
+        trusted_proxies,
+        upstream_keepalive: p.upstream_keepalive,
+        upstream_keepalive_timeout,
+        upstream_keepalive_requests: p.upstream_keepalive_requests,
     };
-    kernel.check().map_err(|e| ConfigError(e.0))?;
+    kernel::relations(&proxy, &kernel)?;
 
-    ensure(
-        drive_slice <= kernel.tick,
-        "drive_slice_ms is above the kernel tick",
-    )?;
-    ensure(
-        ready_wait >= kernel.hello_wait,
-        "ready_wait_ms is below the kernel hello_wait",
-    )?;
-    ensure(
-        head_read <= request_total,
-        "head_read_ms is above request_total_ms",
-    )?;
-    ensure(
-        body_read <= request_total,
-        "body_read_ms is above request_total_ms",
-    )?;
-    ensure(
-        inspect_floor(&kernel, drive_slice).is_some_and(|low| inspect_wait >= low),
-        "inspect_wait_ms is below the kernel inspection time",
-    )?;
-    ensure(
-        inspect_wait <= request_total,
-        "inspect_wait_ms is above request_total_ms",
-    )?;
-    // The two stages of the exchange with the upstream follow each other, and both must end before the request time
-    // does. A server that holds a stage up is counted against only if the limit of the stage comes first; if the end
-    // of the request time comes first, the request ends there and no server is at fault. A slow client or a long
-    // inspection can still use up the time that is left, and the request then ends the same way.
-    ensure(
-        upstream_connect
-            .checked_add(upstream_header)
-            .is_some_and(|n| n < request_total),
-        "upstream_connect_ms plus upstream_header_ms is not below request_total_ms",
-    )?;
-    ensure(
-        request_total <= conn_total,
-        "request_total_ms is above conn_total_ms",
-    )?;
-    ensure(
-        response_idle <= conn_total,
-        "response_idle_ms is above conn_total_ms",
-    )?;
-    ensure(
-        keepalive_timeout <= conn_total,
-        "keepalive_timeout_ms is above conn_total_ms",
-    )?;
-    // A connection that waits in the pool is read from the whole time, and a read that waits for longer than
-    // `response_idle` fails.
-    ensure(
-        upstream_keepalive_timeout <= response_idle,
-        "upstream_keepalive_timeout_ms is above response_idle_ms",
-    )?;
-    // A request that starts before `keepalive_time` gets its answer, or the upstream's response head, before
-    // the connection time is over (`request_total` bounds that part of a request, not a streamed body).
-    ensure(
-        keepalive_time
-            .checked_add(request_total)
-            .is_some_and(|n| n <= conn_total),
-        "keepalive_time_ms plus request_total_ms is above conn_total_ms",
-    )?;
-    ensure(
-        lingering_timeout <= lingering_time,
-        "lingering_timeout_ms is above lingering_time_ms",
-    )?;
-    ensure(
-        stop_inspect < stop_wait,
-        "stop_inspect_ms is not below stop_wait_ms",
-    )?;
-    ensure(
-        stop_inspect
-            .checked_add(kernel.kill_grace)
-            .is_some_and(|n| stop_wait > n),
-        "stop_wait_ms is not above stop_inspect_ms plus kill_grace",
-    )?;
-    // A connection holds at most one inspection, so a longer queue would never fill. The bound also keeps the
-    // queue and its permits small.
-    ensure(
-        kernel.wait_queue <= p.max_conns,
-        "wait_queue is above max_conns",
-    )?;
-
-    Ok(Loaded {
-        proxy: ProxyConfig {
-            listeners,
-            max_conns: p.max_conns,
-            max_head_bytes: p.max_head_bytes,
-            max_body: p.max_body,
-            inspect_body: p.inspect_body,
-            max_body_wire: p.max_body_wire,
-            max_buffered_bytes: p.max_buffered_bytes,
-            upstream_max_headers: p.upstream_max_headers,
-            upstream_max_head_bytes: p.upstream_max_head_bytes,
-            upstream_head_wire: p.upstream_head_wire,
-            drive_slice,
-            ready_wait,
-            head_read,
-            body_read,
-            inspect_wait,
-            upstream_connect,
-            upstream_header,
-            request_total,
-            response_idle,
-            conn_total,
-            stop_inspect,
-            stop_wait,
-            keepalive_timeout,
-            keepalive_requests: p.keepalive_requests,
-            keepalive_time,
-            lingering_time,
-            lingering_timeout,
-            lingering_bytes: p.lingering_bytes,
-            trusted_proxies,
-            upstream_keepalive: p.upstream_keepalive,
-            upstream_keepalive_timeout,
-            upstream_keepalive_requests: p.upstream_keepalive_requests,
-        },
-        forward,
-        kernel: KernelSettings::new(kernel, engines),
+    let main = MainFile {
+        proxy,
+        kernel,
         store: StoreConfig::File { dir },
         acme,
         status,
         records,
-        policy,
         admin,
+        admin_route,
+        managed,
         sha256,
+    };
+    let routing = match forward {
+        Some(forward) => Routing::Own(forward),
+        None => Routing::Managed { resolve_timeout },
+    };
+    Ok(Built {
+        main,
+        policy,
+        routing,
     })
+}
+
+/// The `managed` object: the directory as the rules store `dir` is written.
+fn managed_dir(raw: RawManaged) -> Result<ManagedConfig, ConfigError> {
+    let dir = PathBuf::from(raw.dir);
+    ensure(clean_abs(&dir), "managed dir is not an absolute clean path")?;
+    ensure(
+        dir.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
+        "managed dir is over 3840 bytes",
+    )?;
+    Ok(ManagedConfig { dir })
 }
 
 #[cfg(test)]

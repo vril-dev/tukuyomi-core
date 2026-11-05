@@ -22,7 +22,7 @@ use tokio::time::{Instant, timeout_at};
 use tokio_rustls::TlsConnector;
 
 use super::Failure;
-use crate::forward::tls::{self, Settings};
+use crate::forward::tls::{self, Authorities, Settings};
 use crate::log::escaped;
 
 /// The longest URL in bytes.
@@ -180,7 +180,7 @@ impl Client {
     /// The client whose requests all end by `deadline`. The authorities are read from `ca_file` here.
     pub fn new(ca_file: &Path, deadline: Instant) -> Result<Client, Failure> {
         let config = tls::config(&Settings {
-            ca_file: ca_file.to_path_buf(),
+            authorities: Authorities::File(ca_file.to_path_buf()),
             server_name: None,
         })
         .map_err(|_| Failure::Text("the acme ca_file cannot be used for the CA"))?;

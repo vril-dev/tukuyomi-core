@@ -86,6 +86,7 @@ fn figures() -> Figures {
         policy_refused: 2,
         upstream_failures: 4,
         config: [0xab; 32],
+        managed: None,
         config_replaced: 5,
         config_refused: 1,
     }
@@ -93,7 +94,7 @@ fn figures() -> Figures {
 
 fn status_line(phase: &str, switching: bool, ready: bool) -> String {
     format!(
-        "{{\"generation\":\"{}\",\"mode\":\"block\",\"engine\":\"coraza\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready},\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"config_reloads\":{{\"replaced\":5,\"refused\":1}}}}\n",
+        "{{\"generation\":\"{}\",\"mode\":\"block\",\"engine\":\"coraza\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready},\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"managed\":null,\"config_reloads\":{{\"replaced\":5,\"refused\":1}}}}\n",
         "a".repeat(64),
         "ab".repeat(32)
     )

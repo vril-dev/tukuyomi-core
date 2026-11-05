@@ -1,5 +1,6 @@
 use super::*;
 use crate::config;
+use crate::managed::store::tests::Fixture;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
@@ -89,4 +90,47 @@ fn a_file_with_another_value_that_cannot_change_is_refused_by_the_first_such_key
         c["proxy"]["max_conns"] = json!(2048);
     });
     assert_eq!(running.first_difference(&both), Some("proxy.max_conns"));
+}
+
+#[test]
+fn a_file_with_managed_keeps_its_dir_and_may_read_another_version() {
+    let (one, two) = (Fixture::new(), Fixture::new());
+    let fixed = |fixture: &Fixture| {
+        fixture.current(&fixture.plain_version(b"chain", b"key"));
+        Fixed::of(&config::load(&fixture.main_file(|_| {})).unwrap())
+    };
+    let running = fixed(&one);
+    let mut other = one.plain_version(b"chain", b"key");
+    other["default_upstream"] = json!("app");
+    other["routes"] = json!([{"path": "/a/", "upstream": "app"}]);
+    one.current(&other);
+    let again = Fixed::of(&config::load(&one.main_file(|_| {})).unwrap());
+    assert_eq!(running.first_difference(&again), None);
+    assert_eq!(running.first_difference(&fixed(&two)), Some("managed"));
+}
+
+#[test]
+fn the_host_of_the_way_to_the_admin_process_cannot_change_and_its_certificate_and_access_can() {
+    let fixture = Fixture::new();
+    fixture.current(&fixture.plain_version(b"chain", b"key"));
+    let with_route = |host: &str, key_file: &str, allow: &str| {
+        let main = fixture.main_file(|m| {
+            m["admin"] = json!({
+                "listen": "127.0.0.1:9180", "control": "/run/tukuyomi/admin.sock",
+                "store": {"kind": "file", "dir": "/var/lib/tukuyomi/admin"}, "origin": "https://admin.test",
+                "trusted_proxies": [], "mfa": "optional", "session_idle_ms": 600_000, "session_total_ms": 3_600_000,
+                "route": {
+                    "host": host,
+                    "certificate": {"cert_file": "/etc/tukuyomi/admin.pem", "key_file": key_file},
+                    "access": {"allow_cidrs": [allow]},
+                },
+            });
+        });
+        Fixed::of(&config::load(&main).unwrap())
+    };
+    let running = with_route("admin.test", "/etc/tukuyomi/admin.key", "192.0.2.0/24");
+    let other = with_route("admin.test", "/etc/tukuyomi/new.key", "198.51.100.0/24");
+    assert_eq!(running.first_difference(&other), None);
+    let moved = with_route("panel.test", "/etc/tukuyomi/admin.key", "192.0.2.0/24");
+    assert_eq!(running.first_difference(&moved), Some("admin.route.host"));
 }

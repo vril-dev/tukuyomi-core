@@ -33,9 +33,14 @@
 //! request is held to the list of the route that its path in canonical form meets, and would not meet this one. If
 //! any route has an access list, no route has a port in its `host`: the client writes the port, and a request that
 //! writes a port that a route names would meet that route and not the one with the list.
+//!
+//! In a file with `managed`, `forward` has `resolve_timeout_ms` alone: the groups, the routes and the default group
+//! are those of the managed version, checked here by the same rules (`routing`), but for the `tls` of a group, which
+//! names the file of its authorities by the SHA-256 of a file of the managed store (`StoredTls`, see `managed`).
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -51,7 +56,7 @@ use super::{
 };
 use crate::forward::client_ip::Access;
 use crate::forward::rewrite::Rewrite;
-use crate::forward::tls::{self, Client, Settings};
+use crate::forward::tls::{self, Authorities, Client, Settings};
 use crate::route::{Rule, Table, parse_port};
 
 const MAX_GROUPS: usize = 64;
@@ -148,6 +153,17 @@ pub struct ForwardConfig {
     pub routes: Table<RouteConfig>,
     /// The index of the group for a request that no route holds for.
     pub default: Option<usize>,
+    /// The way to the admin process, for a file with `managed` and `admin` (see `admin`).
+    pub admin: Option<AdminWay>,
+}
+
+/// The way to the admin process that the proxy makes itself: a request whose `Host` is `host` goes to the one server
+/// at `server` (`admin.listen`), if `access` lets its client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminWay {
+    pub host: String,
+    pub access: Access,
+    pub server: SocketAddr,
 }
 
 #[cfg(test)]
@@ -173,33 +189,80 @@ impl ForwardConfig {
             }],
             routes: Table::default(),
             default: Some(0),
+            admin: None,
         }
     }
 }
 
+/// The `forward` object as the file writes it. A file without `managed` has every key, and a file with `managed` has
+/// `resolve_timeout_ms` only: its groups, routes and default group are those of the managed version (see `managed`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawForward {
     resolve_timeout_ms: u64,
-    upstreams: Groups,
-    routes: Vec<Object<RawRoute>>,
-    default_upstream: String,
+    #[serde(default, deserialize_with = "super::present")]
+    upstreams: Option<Groups<RawTls>>,
+    #[serde(default, deserialize_with = "super::present")]
+    routes: Option<Vec<Object<RawRoute>>>,
+    #[serde(default, deserialize_with = "super::present")]
+    default_upstream: Option<String>,
 }
 
+impl RawForward {
+    /// Whether `upstreams`, `routes` and `default_upstream` are all there (`Some(true)`), none is (`Some(false)`), or
+    /// some are and some are not (`None`).
+    pub(super) fn routes_written(&self) -> Option<bool> {
+        match (
+            self.upstreams.is_some(),
+            self.routes.is_some(),
+            self.default_upstream.is_some(),
+        ) {
+            (true, true, true) => Some(true),
+            (false, false, false) => Some(false),
+            _ => None,
+        }
+    }
+}
+
+/// A group as it is written. `T` is its `tls`: `RawTls` in the main file and in the document of `managed import`,
+/// `StoredTls` in a managed version.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawGroup {
+#[serde(deny_unknown_fields, bound(deserialize = "T: Deserialize<'de>"))]
+struct RawGroup<T> {
     servers: Vec<Object<RawServer>>,
     #[serde(default, deserialize_with = "super::present")]
-    tls: Option<Object<RawTls>>,
+    tls: Option<Object<T>>,
 }
 
+/// The `tls` of a group that names the file of its authorities by its path.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTls {
+pub(crate) struct RawTls {
     ca_file: String,
     #[serde(default, deserialize_with = "super::present")]
     server_name: Option<String>,
+}
+
+impl RawTls {
+    /// The file of the authorities, an absolute clean path of at most 3840 bytes, and the name to check the servers
+    /// for, which `routing` checks.
+    pub(crate) fn split(self) -> Result<(Authorities, Option<String>), ConfigError> {
+        let ca_file = PathBuf::from(self.ca_file);
+        ensure(
+            clean_abs(&ca_file) && ca_file.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
+            "an upstream tls ca_file is not an absolute clean path of at most 3840 bytes",
+        )?;
+        Ok((Authorities::File(ca_file), self.server_name))
+    }
+}
+
+/// The `tls` of a group of a managed version: the file of the authorities by the SHA-256 of a file of the store.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredTls {
+    pub(crate) ca: String,
+    #[serde(default, deserialize_with = "super::present")]
+    pub(crate) server_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -214,7 +277,7 @@ struct RawServer {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawRoute {
+pub(crate) struct RawRoute {
     #[serde(default, deserialize_with = "super::present")]
     host: Option<String>,
     #[serde(default, deserialize_with = "super::present")]
@@ -240,28 +303,29 @@ struct RawStream {
     websocket: bool,
 }
 
-/// The groups in the order of the file. A name that is repeated is a repeated key, which a map would swallow.
-struct Groups(Vec<(String, Object<RawGroup>)>);
+/// The groups in the order of the file. A name that is repeated is a repeated key, which a map would swallow. `T` is
+/// the `tls` of a group, as for `RawGroup`.
+pub(crate) struct Groups<T>(Vec<(String, Object<RawGroup<T>>)>);
 
-impl<'de> Deserialize<'de> for Groups {
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Groups<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_map(GroupsVisitor)
+        deserializer.deserialize_map(GroupsVisitor(PhantomData))
     }
 }
 
-struct GroupsVisitor;
+struct GroupsVisitor<T>(PhantomData<T>);
 
-impl<'de> Visitor<'de> for GroupsVisitor {
-    type Value = Groups;
+impl<'de, T: Deserialize<'de>> Visitor<'de> for GroupsVisitor<T> {
+    type Value = Groups<T>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("an object")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Groups, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Groups<T>, A::Error> {
         let mut seen = BTreeSet::new();
         let mut groups = Vec::new();
-        while let Some((name, group)) = map.next_entry::<String, Object<RawGroup>>()? {
+        while let Some((name, group)) = map.next_entry::<String, Object<RawGroup<T>>>()? {
             if !seen.insert(name.clone()) {
                 return Err(A::Error::duplicate_field("upstreams"));
             }
@@ -272,7 +336,7 @@ impl<'de> Visitor<'de> for GroupsVisitor {
 }
 
 /// A name is 1 to 64 bytes of letters, digits, `-` and `_`.
-fn name_ok(name: &str) -> bool {
+pub(crate) fn name_ok(name: &str) -> bool {
     (1..=MAX_NAME).contains(&name.len())
         && name
             .bytes()
@@ -379,22 +443,19 @@ fn servers(
         .collect()
 }
 
-/// The `tls` of a group whose servers are `servers`: the path is absolute, clean and at most 3840 bytes, and every
-/// name that a server is checked for (the `server_name`, or else the name of each server written with a name) is one
-/// that TLS can use.
-fn tls(
-    raw: Option<Object<RawTls>>,
+/// The `tls` of a group whose servers are `servers`: `split` checks the file of the authorities as it is written, and
+/// every name that a server is checked for (the `server_name`, or else the name of each server written with a name) is
+/// one that TLS can use.
+fn tls<T>(
+    raw: Option<Object<T>>,
     servers: &[ServerConfig<Address>],
+    split: &impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
 ) -> Result<Option<Settings>, ConfigError> {
     let Some(Object(raw)) = raw else {
         return Ok(None);
     };
-    let ca_file = PathBuf::from(raw.ca_file);
-    ensure(
-        clean_abs(&ca_file) && ca_file.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
-        "an upstream tls ca_file is not an absolute clean path of at most 3840 bytes",
-    )?;
-    match &raw.server_name {
+    let (authorities, server_name) = split(raw)?;
+    match &server_name {
         Some(name) => ensure(
             host_ok(name) && tls::dns_name(name).is_some(),
             "an upstream tls server_name is not a name that TLS can use",
@@ -408,35 +469,74 @@ fn tls(
         )?,
     }
     Ok(Some(Settings {
-        ca_file,
-        server_name: raw.server_name,
+        authorities,
+        server_name,
     }))
 }
 
-/// Checks the `forward` object. `listeners` are the addresses the proxy listens on, the status listener's included, and
-/// `max_body` is the limit on a request body that the proxy has: a route may lower it, not raise it.
+/// Checks the `forward` object of a file without `managed`. `listeners` are the addresses the proxy listens on, the
+/// status listener's included, and `max_body` is the limit on a request body that the proxy has: a route may lower it,
+/// not raise it.
 pub(super) fn check(
     raw: RawForward,
     listeners: &[SocketAddr],
     max_body: usize,
 ) -> Result<ForwardSettings, ConfigError> {
+    let (Some(upstreams), Some(routes), Some(default_upstream)) =
+        (raw.upstreams, raw.routes, raw.default_upstream)
+    else {
+        // The three keys are required here, as serde requires every key that is not optional.
+        return Err(ConfigError("configuration has a missing key"));
+    };
     let resolve_timeout = millis(raw.resolve_timeout_ms, "resolve_timeout_ms is out of range")?;
+    routing(
+        resolve_timeout,
+        upstreams,
+        routes,
+        &default_upstream,
+        listeners,
+        max_body,
+        RawTls::split,
+    )
+}
+
+/// The `forward` object of a file with `managed`: its `resolve_timeout_ms`, the one key it has.
+pub(super) fn timeout_only(raw: RawForward) -> Result<Duration, ConfigError> {
     ensure(
-        (1..=MAX_GROUPS).contains(&raw.upstreams.0.len()),
+        raw.routes_written() == Some(false),
+        "forward has upstreams, routes or default_upstream while the configuration has managed",
+    )?;
+    millis(raw.resolve_timeout_ms, "resolve_timeout_ms is out of range")
+}
+
+/// The upstream groups, the routes and the default group, checked, with `resolve_timeout` taken as it is: the `forward`
+/// object of a file without `managed`, or the routing of a managed version. `listeners` and `max_body` are as for
+/// `check`, and `split` checks the `tls` of a group as it is written.
+pub(crate) fn routing<T>(
+    resolve_timeout: Duration,
+    upstreams: Groups<T>,
+    routes: Vec<Object<RawRoute>>,
+    default_upstream: &str,
+    listeners: &[SocketAddr],
+    max_body: usize,
+    split: impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
+) -> Result<ForwardSettings, ConfigError> {
+    ensure(
+        (1..=MAX_GROUPS).contains(&upstreams.0.len()),
         "upstreams has no group or more than 64 groups",
     )?;
-    let mut groups = Vec::with_capacity(raw.upstreams.0.len());
-    for (name, Object(group)) in raw.upstreams.0 {
+    let mut groups = Vec::with_capacity(upstreams.0.len());
+    for (name, Object(group)) in upstreams.0 {
         ensure(
             name_ok(&name),
             "an upstream name is not 1 to 64 letters, digits, - and _",
         )?;
         let servers = servers(group.servers, listeners)?;
-        let tls = tls(group.tls, &servers)?;
+        let tls = tls(group.tls, &servers, &split)?;
         groups.push(GroupConfig { name, servers, tls });
     }
     ensure(
-        raw.routes.len() <= MAX_ROUTES,
+        routes.len() <= MAX_ROUTES,
         "routes has more than 1024 entries",
     )?;
     let index = |name: &str, undefined: &'static str| {
@@ -445,8 +545,8 @@ pub(super) fn check(
             .position(|group| group.name == name)
             .ok_or(ConfigError(undefined))
     };
-    let mut entries = Vec::with_capacity(raw.routes.len());
-    for Object(route) in raw.routes {
+    let mut entries = Vec::with_capacity(routes.len());
+    for Object(route) in routes {
         let rule = Rule::forward(route.host.as_deref(), route.path.as_deref())
             .map_err(|e| ConfigError(e.0))?;
         let group = index(
@@ -484,7 +584,7 @@ pub(super) fn check(
         "a route host has a port while a route has an access list",
     )?;
     let routes = Table::new(entries).map_err(|e| ConfigError(e.0))?;
-    let default = match raw.default_upstream.as_str() {
+    let default = match default_upstream {
         "" => None,
         name => Some(index(
             name,

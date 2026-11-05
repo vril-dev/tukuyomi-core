@@ -218,7 +218,7 @@ pub(super) fn route_keep(text: &str) -> Result<RouteKeep, ConfigError> {
 
 /// The `records` object against the routes: a route that needs its records kept needs the object, and with a shipper
 /// the object has 3 files or more.
-pub(super) fn consistent(
+pub(crate) fn consistent(
     records: Option<&Records>,
     forward: &ForwardSettings,
 ) -> Result<(), ConfigError> {

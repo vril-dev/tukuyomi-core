@@ -42,8 +42,9 @@ fn figures_line() -> String {
     status_line("block").replace(
         "\"ready\":true",
         &format!(
-            "\"ready\":true,\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"config_reloads\":{{\"replaced\":5,\"refused\":1}}",
-            fp(3).hex()
+            "\"ready\":true,\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"managed\":\"{}\",\"config_reloads\":{{\"replaced\":5,\"refused\":1}}",
+            fp(3).hex(),
+            fp(4).hex()
         ),
     )
 }
@@ -74,6 +75,7 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
             policy_refused: None,
             upstream_failures: None,
             config: None,
+            managed: None,
             config_reloads: None,
         }
     );
@@ -99,6 +101,7 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
             "policy_refused": 2,
             "upstream_failures": 4,
             "config": fp(3).hex(),
+            "managed": fp(4).hex(),
             "config_reloads": {"replaced": 5, "refused": 1},
         })
     );

@@ -746,7 +746,7 @@ pub fn run(path: &Path, log: &Log) -> Exit {
         log.line(&format!("admin: host check refused: {text}"));
         return Exit::Failed;
     }
-    let loaded = match config::load(path) {
+    let loaded = match config::load_main(path) {
         Ok(loaded) => loaded,
         Err(e) => {
             log.line(&format!("admin: configuration refused: {}", e.0));

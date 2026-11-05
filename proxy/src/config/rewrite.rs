@@ -23,7 +23,7 @@ const MAX_COUNTRIES: usize = 256;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RawAccess {
+pub(crate) struct RawAccess {
     #[serde(default)]
     deny_cidrs: Vec<String>,
     #[serde(default)]

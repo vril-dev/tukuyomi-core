@@ -17,7 +17,8 @@
 //! `inbound::transport::tls` reads them when the proxy starts and each time it reads the configuration file again. A
 //! certificate may also have `acme`, `{"renew_before_days"}` (1 to 60): the command `acme renew` issues it and keeps
 //! it renewed (see `acme`, and `acme` of the configuration), so its hosts are names only (no `*.`), and its files may
-//! not exist yet when the proxy starts. `tls` may also have `http2`, an object that turns
+//! not exist yet when the proxy starts. In a file with `managed`, `tls` has no `certificates`: the certificates are
+//! those of the sites of the managed version (see `managed`). `tls` may also have `http2`, an object that turns
 //! HTTP/2 on for the listener and has five keys, all of them required: `max_streams` (1 to 256, the streams a client
 //! may have open at once), `stream_window` (65535 to 1 MiB, the receive window of a stream), `connection_window`
 //! (65535 to 4 MiB, the receive window of the connection), `max_header_list` (1 KiB to four times `max_head_bytes`,
@@ -138,11 +139,15 @@ pub(super) struct RawListener {
     redirect: Option<Object<RawRedirect>>,
 }
 
+/// The `tls` of a listener as the file writes it. A file without `managed` gives every TLS listener its
+/// `certificates`, and a file with `managed` gives none: the certificates are those of the sites of the managed
+/// version (see `managed`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTls {
     min_version: String,
-    certificates: Vec<Object<RawCertificate>>,
+    #[serde(default, deserialize_with = "super::present")]
+    certificates: Option<Vec<Object<RawCertificate>>>,
     #[serde(default, deserialize_with = "super::present")]
     http2: Option<Object<RawHttp2>>,
 }
@@ -191,7 +196,7 @@ pub(super) fn clash(a: SocketAddr, b: SocketAddr) -> bool {
 }
 
 /// A path of a certificate or key file.
-fn file(text: String) -> Result<PathBuf, ConfigError> {
+pub(super) fn file(text: String) -> Result<PathBuf, ConfigError> {
     let path = PathBuf::from(text);
     ensure(
         clean_abs(&path) && path.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
@@ -201,7 +206,7 @@ fn file(text: String) -> Result<PathBuf, ConfigError> {
 }
 
 /// A host: a name, or `*.` and a name. The name has the form of a server name, without `_`.
-fn host_ok_for_tls(host: &str) -> bool {
+pub(crate) fn host_ok_for_tls(host: &str) -> bool {
     let name = host.strip_prefix("*.").unwrap_or(host);
     host_ok(name) && !name.contains('_')
 }
@@ -302,18 +307,31 @@ fn certificate_acme(
     })
 }
 
-fn tls(raw: RawTls) -> Result<TlsConfig, ConfigError> {
+/// The `tls` of a listener. `managed` tells that the file has `managed`, and then the listener has no certificate of
+/// its own.
+fn tls(raw: RawTls, managed: bool) -> Result<TlsConfig, ConfigError> {
     let min_version = match raw.min_version.as_str() {
         "1.2" => MinVersion::Tls12,
         "1.3" => MinVersion::Tls13,
         _ => return Err(ConfigError("tls min_version is not 1.2 or 1.3")),
     };
+    let written = match (raw.certificates, managed) {
+        (Some(written), false) => written,
+        // The key is required here, as serde requires every key that is not optional.
+        (None, false) => return Err(ConfigError("configuration has a missing key")),
+        (Some(_), true) => {
+            return Err(ConfigError(
+                "a tls listener has certificates while the configuration has managed",
+            ));
+        }
+        (None, true) => Vec::new(),
+    };
     ensure(
-        (1..=MAX_CERTIFICATES).contains(&raw.certificates.len()),
+        managed || (1..=MAX_CERTIFICATES).contains(&written.len()),
         "tls has no certificate or more than 16",
     )?;
-    let mut certificates: Vec<CertificateConfig> = Vec::with_capacity(raw.certificates.len());
-    for Object(raw) in raw.certificates {
+    let mut certificates: Vec<CertificateConfig> = Vec::with_capacity(written.len());
+    for Object(raw) in written {
         ensure(
             (1..=MAX_HOSTS).contains(&raw.hosts.len()),
             "a certificate has no host or more than 64",
@@ -348,7 +366,7 @@ fn tls(raw: RawTls) -> Result<TlsConfig, ConfigError> {
     })
 }
 
-fn listener(raw: RawListener) -> Result<ListenerConfig, ConfigError> {
+fn listener(raw: RawListener, managed: bool) -> Result<ListenerConfig, ConfigError> {
     let address = address(
         &raw.address,
         "a listener address is not an IP address and port",
@@ -356,7 +374,7 @@ fn listener(raw: RawListener) -> Result<ListenerConfig, ConfigError> {
     )?;
     let kind = match (raw.tls, raw.redirect) {
         (Some(_), Some(_)) => return Err(ConfigError("a listener has both tls and redirect")),
-        (Some(Object(raw)), None) => ListenerKind::Tls(tls(raw)?),
+        (Some(Object(raw)), None) => ListenerKind::Tls(tls(raw, managed)?),
         (None, Some(Object(raw))) => {
             ensure(
                 (1..=65535).contains(&raw.https_port),
@@ -371,15 +389,30 @@ fn listener(raw: RawListener) -> Result<ListenerConfig, ConfigError> {
     Ok(ListenerConfig { address, kind })
 }
 
-/// Checks the `listeners` array.
+/// Checks the `listeners` array of a file without `managed`.
 pub(super) fn check(raw: Vec<Object<RawListener>>) -> Result<Vec<ListenerConfig>, ConfigError> {
+    checked(raw, false)
+}
+
+/// Checks the `listeners` array of a file with `managed`: a TLS listener has no `certificates`, and its certificates
+/// are left empty here.
+pub(super) fn check_managed(
+    raw: Vec<Object<RawListener>>,
+) -> Result<Vec<ListenerConfig>, ConfigError> {
+    checked(raw, true)
+}
+
+fn checked(
+    raw: Vec<Object<RawListener>>,
+    managed: bool,
+) -> Result<Vec<ListenerConfig>, ConfigError> {
     ensure(
         (1..=MAX_LISTENERS).contains(&raw.len()),
         "listeners has no listener or more than 8",
     )?;
     let listeners = raw
         .into_iter()
-        .map(|Object(raw)| listener(raw))
+        .map(|Object(raw)| listener(raw, managed))
         .collect::<Result<Vec<_>, _>>()?;
     for (at, first) in listeners.iter().enumerate() {
         ensure(

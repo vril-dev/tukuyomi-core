@@ -547,6 +547,7 @@ fn a_switch_is_written_to_the_history_and_a_rollback_goes_to_the_from_of_the_las
         "policy_refused",
         "upstream_failures",
         "config",
+        "managed",
         "config_reloads",
     ] {
         assert_eq!(status.body["proxy"][key], Value::Null, "{key}");

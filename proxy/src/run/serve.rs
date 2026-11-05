@@ -52,6 +52,7 @@ pub(super) async fn run(
     keep: Keep,
     path: PathBuf,
     sha256: [u8; 32],
+    managed: Option<[u8; 32]>,
     fixed: Fixed,
     log: Log,
 ) -> u8 {
@@ -128,16 +129,19 @@ pub(super) async fn run(
         ingress: Arc::new(Ingress::new(ingress.clone())),
         ids,
         counters: Counters::start(),
-        setup: SharedSetup::new(Setup::new(
-            proxy.clone(),
-            sha256,
-            &forward,
-            tls,
-            challenge,
-            policy,
-            keep,
-            None,
-        )),
+        setup: SharedSetup::new(
+            Setup::new(
+                proxy.clone(),
+                sha256,
+                &forward,
+                tls,
+                challenge,
+                policy,
+                keep,
+                None,
+            )
+            .with_managed(managed),
+        ),
     });
     let mut reloader = Reloader::new(path, fixed);
     let readiness = Arc::new(Readiness::new());

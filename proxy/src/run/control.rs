@@ -22,8 +22,9 @@
 //! those of a route that writes no record for them), `blocked` (the requests a rule blocked), `policy_refused` (the
 //! requests the access list or the rate limit turned away), `upstream_failures` (the failures of the servers of every
 //! upstream group of the configuration in force; they start from 0 when a reading of the configuration file again
-//! replaces it, as they do in `/metrics`), `config` (the 64 digits of the SHA-256 of the configuration file in force)
-//! and `config_reloads` (`{"replaced":..,"refused":..}`, the readings of the configuration file again by how they
+//! replaces it, as they do in `/metrics`), `config` (the 64 digits of the SHA-256 of the configuration file in force),
+//! `managed` (the 64 digits of the name of the managed version in force, or `null` for a file without `managed`) and
+//! `config_reloads` (`{"replaced":..,"refused":..}`, the readings of the configuration file again by how they
 //! ended). The counts are those that `/metrics` shows; an answer without the figures is the answer of an older proxy.
 //! `{"op":"switch","expect":"<64 digits>"}` reads the rules store, and if the generation it chooses is not `expect` it
 //! does nothing and answers `refused` (`current changed`). Otherwise it does what SIGUSR1 does and answers when the
@@ -115,6 +116,8 @@ pub(super) struct Figures {
     pub(super) upstream_failures: u64,
     /// The SHA-256 of the configuration file in force.
     pub(super) config: [u8; 32],
+    /// The name of the managed version in force, for a file with `managed`.
+    pub(super) managed: Option<[u8; 32]>,
     /// The readings of the configuration file again, by how they ended.
     pub(super) config_replaced: u64,
     pub(super) config_refused: u64,
@@ -154,7 +157,7 @@ impl Answer {
                 ready,
                 figures,
             } => format!(
-                "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"engine\":\"{engine}\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready},\"uptime_ms\":{},\"requests\":{},\"blocked\":{},\"policy_refused\":{},\"upstream_failures\":{},\"config\":\"{}\",\"config_reloads\":{{\"replaced\":{},\"refused\":{}}}}}\n",
+                "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"engine\":\"{engine}\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready},\"uptime_ms\":{},\"requests\":{},\"blocked\":{},\"policy_refused\":{},\"upstream_failures\":{},\"config\":\"{}\",\"managed\":{},\"config_reloads\":{{\"replaced\":{},\"refused\":{}}}}}\n",
                 generation.hex(),
                 figures.uptime_ms,
                 figures.requests,
@@ -162,6 +165,9 @@ impl Answer {
                 figures.policy_refused,
                 figures.upstream_failures,
                 hex(&figures.config),
+                figures
+                    .managed
+                    .map_or_else(|| "null".to_owned(), |name| format!("\"{}\"", hex(&name))),
                 figures.config_replaced,
                 figures.config_refused
             ),

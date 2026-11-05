@@ -13,6 +13,7 @@ pub mod forward;
 pub mod inbound;
 pub mod inspect;
 pub mod log;
+pub mod managed;
 pub mod policy;
 pub mod route;
 pub mod rules;

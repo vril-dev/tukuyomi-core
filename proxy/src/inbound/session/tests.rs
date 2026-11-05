@@ -16,8 +16,8 @@ use tukuyomi_kernel::Verdict;
 
 use super::*;
 use crate::config::{
-    AcmeConfig, CertificateAcme, CertificateConfig, ForwardConfig, ListenerConfig, MinVersion,
-    RateLimitConfig, RouteConfig, TlsConfig,
+    AcmeConfig, AdminWay, CertificateAcme, CertificateConfig, ForwardConfig, ListenerConfig,
+    MinVersion, RateLimitConfig, RouteConfig, TlsConfig,
 };
 use crate::forward::client_ip::{Access, Cidr};
 use crate::inbound::challenge::Challenge;
@@ -1778,6 +1778,43 @@ fn a_redirect_listener_judges_the_country_of_the_client_that_a_trusted_peer_name
                 .with_countries(countries());
             let answer = redirected(&rig, request).await;
             assert_eq!(answer.status, status, "{deny:?} {allow:?}");
+            assert!(rig.finish(tokio::spawn(async {})).await.is_empty());
+        }
+    });
+}
+
+#[test]
+fn a_redirect_listener_sends_the_host_of_the_way_to_the_admin_process_to_https_whatever_the_policy()
+{
+    run(async {
+        let pki = Pki::new();
+        let request = |host: &str| format!("GET /p HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        // The access turns away the client, which is on the loopback address. The way to the admin process is not the
+        // policy's to refuse: its host is redirected, if a TLS listener serves its name, and gets 404 if none does.
+        for (host, status) in [("admin.a.example", 308), ("admin.other.example", 404)] {
+            let access = Access::new(vec![Cidr::parse("127.0.0.0/8").unwrap()], Vec::new());
+            let mut forward = subdomains_only();
+            forward.admin = Some(AdminWay {
+                host: host.to_owned(),
+                access: Access::new(Vec::new(), vec![Cidr::parse("192.0.2.0/24").unwrap()]),
+                server: "127.0.0.1:9180".parse().unwrap(),
+            });
+            let rig = over_tls(&pki, kept(), Mode::Answer(BLOCK), &forward, 443)
+                .await
+                .with_policy(access, None);
+            let answer = redirected(&rig, &request(host)).await;
+            assert_eq!(answer.status, status, "{host}");
+            if status == 308 {
+                assert_eq!(
+                    answer.all("location"),
+                    [format!("https://{host}/p").as_str()]
+                );
+            }
+            // Any other host is turned away as before.
+            assert_eq!(
+                redirected(&rig, &request("www.a.example")).await.status,
+                403
+            );
             assert!(rig.finish(tokio::spawn(async {})).await.is_empty());
         }
     });

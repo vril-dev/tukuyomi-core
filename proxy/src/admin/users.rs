@@ -315,7 +315,7 @@ pub fn bootstrap(config: &Path, name: &str, input: &mut dyn Read, log: &Log) -> 
         log.line(&format!("{NAME}: host check refused: {text}"));
         return Exit::Failed;
     }
-    let loaded = match config::load(config) {
+    let loaded = match config::load_main(config) {
         Ok(loaded) => loaded,
         Err(e) => {
             log.line(&format!("{NAME}: configuration refused: {}", e.0));
@@ -412,7 +412,7 @@ pub fn reset(config: &Path, name: &str, input: &mut dyn Read, log: &Log) -> Exit
         log.line(&format!("{NAME}: host check refused: {text}"));
         return Exit::Failed;
     }
-    let loaded = match config::load(config) {
+    let loaded = match config::load_main(config) {
         Ok(loaded) => loaded,
         Err(e) => {
             log.line(&format!("{NAME}: configuration refused: {}", e.0));

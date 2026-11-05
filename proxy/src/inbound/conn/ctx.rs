@@ -48,6 +48,8 @@ pub struct Setup {
     pub cfg: ProxyConfig,
     /// The SHA-256 of the bytes of the configuration file that this setup was made from.
     pub sha256: [u8; 32],
+    /// The name of the managed version it was made with, for a file with `managed` (see `with_managed`).
+    pub managed: Option<[u8; 32]>,
     pub upstreams: Upstreams,
     pub tls: Tls,
     pub challenge: Option<Challenge>,
@@ -84,6 +86,7 @@ impl Setup {
             upstreams: Upstreams::new(forward, &cfg),
             cfg,
             sha256,
+            managed: None,
             tls,
             challenge,
             access: policy.access,
@@ -96,6 +99,12 @@ impl Setup {
             keep,
             retired: watch::channel(false).0,
         }
+    }
+
+    /// The setup, made with the managed version `name` (none for a file without `managed`).
+    pub fn with_managed(mut self, name: Option<[u8; 32]>) -> Setup {
+        self.managed = name;
+        self
     }
 
     /// Retires the setup: the receivers of `watch` see `true`. Retiring it again does nothing more. Nothing is

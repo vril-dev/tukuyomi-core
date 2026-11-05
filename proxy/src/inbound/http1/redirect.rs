@@ -29,7 +29,9 @@ use crate::policy;
 /// `Host` that is an IP literal, cannot be read, or is not served that way gets 404. The body is not read. A request
 /// for the challenge of the CA is answered with the file of the challenge, or 404, instead (see `challenge`). A client
 /// that the policy turns away is answered with 403 or 429 instead of all that. The records name the client that the
-/// policy judges, found as on the other listeners (see `conn::client_of`).
+/// policy judges, found as on the other listeners (see `conn::client_of`). The host of the way to the admin process
+/// (see `forward::group`) is redirected as a host that a route holds for, and the policy is not asked of it, as on the
+/// other listeners; its access list is asked when the request comes over https.
 pub(in crate::inbound) async fn redirect_to(
     sock: TcpStream,
     peer: SocketAddr,
@@ -53,6 +55,7 @@ pub(in crate::inbound) async fn redirect_to(
     // The client is found as on the other listeners: the peer, or what a trusted peer says. The policy judges it and
     // every record of the listener names it.
     let client = client_of(&head, peer, &cfg.trusted_proxies);
+    let admin = ctx.setup.upstreams.admin(head.host()).is_some();
     // The bytes that are written, and how many of them are the body.
     let (reply, bytes, sent) = match ctx
         .setup
@@ -66,21 +69,26 @@ pub(in crate::inbound) async fn redirect_to(
             (Reply::answered(200), found(&body, head_only, &id), sent)
         }
         Some(Proof::Missing) => (Reply::answered(404), not_redirected(&id), 0),
-        None => match policy::check(
-            &ctx.setup.access,
-            ctx.setup.rate_limit.as_ref(),
-            &ctx.shared.counters,
-            client.ip(),
-            country_of(ctx, client.ip()),
-        ) {
+        None => match if admin {
+            Ok(())
+        } else {
+            policy::check(
+                &ctx.setup.access,
+                ctx.setup.rate_limit.as_ref(),
+                &ctx.shared.counters,
+                client.ip(),
+                country_of(ctx, client.ip()),
+            )
+        } {
             Err(refusal) => (Reply::refused(refusal), turned_away(refusal, &id), 0),
             Ok(()) => {
                 let name = host_name(head.host()).filter(|name| ctx.setup.tls.serves(name));
-                let routed = ctx
-                    .setup
-                    .upstreams
-                    .find(head.host(), head.target())
-                    .is_some();
+                let routed = admin
+                    || ctx
+                        .setup
+                        .upstreams
+                        .find(head.host(), head.target())
+                        .is_some();
                 match name {
                     Some(name) if routed => (
                         Reply::redirected(),

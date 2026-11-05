@@ -9,19 +9,22 @@
 //! chooses the certificate by the server name of the client, from the hosts of the settings and from nothing else
 //! (`sni`, `handshake`). After it, a request on the connection is served as on a plain one, over HTTP/1.1 or, if the
 //! listener has `http2` and the client chose it, HTTP/2, with one more rule: its `Host` has to be one that the
-//! certificate of the handshake covers, or it is answered with 421 (see `conn`).
+//! certificate of the handshake covers, or it is answered with 421 (see `conn`). With `managed`, every TLS listener
+//! chooses from the certificate of the way to the admin process and those of the sites of the version (`table`), and
+//! SIGUSR2 reads the certificate of the way from its files again and those of the sites from the managed store.
 
 mod certs;
 mod handshake;
 mod keys;
 mod set;
 mod sni;
+mod table;
 
 pub(crate) use certs::check;
 pub use certs::{Fault, Place, Refusal};
 pub use handshake::Handshake;
-pub(crate) use keys::read_file;
 pub use keys::{Files, KeySource};
+pub(crate) use keys::{certified, read_file};
 pub use set::Tls;
 pub use sni::{Hosts, Names, host_name};
 

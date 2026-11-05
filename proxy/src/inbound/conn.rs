@@ -42,6 +42,8 @@
 //! the proxy. The record gives the length of the body: its `Content-Length` if it has one, and otherwise the bytes
 //! read so far.
 //!
+//! A request whose `Host` is the host of the way to the admin process asks only the access list of the way (`admin`).
+//!
 //! The route is found on the bytes received, but an application behind the proxy may read another spelling of a path
 //! as the path of a route that limits who may use it (`/priv%61te/x` for `/private/x`). So if some route has an
 //! access list, the client has to pass the lists of every route the request could be taken for, not only those of the
@@ -75,7 +77,7 @@ use tokio::time::{Instant, timeout_at};
 
 use self::fault::{PEER_CLOSED, upstream_stop};
 use crate::config::{STREAM_HOLD, Stream};
-use crate::forward::client_ip::{self, Cidr, Country};
+use crate::forward::client_ip::{self, Access, Cidr, Country};
 use crate::forward::group::Route;
 use crate::forward::origin::{self, Forward, OriginBody};
 use crate::forward::tunnel::{self, Record, Tunnel};
@@ -470,6 +472,9 @@ impl Conn {
     fn route(&self) -> Result<Route<'_>, Stop> {
         let client = self.client.ip();
         let ctx = &self.ctx;
+        if let Some((route, access)) = ctx.setup.upstreams.admin(self.head.host()) {
+            return self.admin(route, access);
+        }
         policy::check(
             &ctx.setup.access,
             ctx.setup.rate_limit.as_ref(),
@@ -506,6 +511,23 @@ impl Conn {
             return Err(self.turned_away(413, "body over the limit of the route"));
         }
         self.admit_records(keeps)?;
+        Ok(route)
+    }
+
+    /// The way to the admin process, without the policy: over a connection of its certificate (else 421, for an HTTP/2
+    /// client may reuse one of a site that covers the name; 404 over plain HTTP), if its access list lets the client.
+    fn admin<'a>(&self, route: Route<'a>, access: &Access) -> Result<Route<'a>, Stop> {
+        match &self.scheme {
+            Scheme::Https(hosts) if hosts.is_admin() => {}
+            Scheme::Https(_) => {
+                return Err(self.turned_away(421, "admin host on another certificate"));
+            }
+            Scheme::Http => return Err(self.turned_away(404, "admin host over plain http")),
+        }
+        if !access.permits(self.client.ip(), self.country) {
+            return Err(self.turned_away(403, "denied by route access"));
+        }
+        self.admit_records(self.keep_by(&route))?;
         Ok(route)
     }
 

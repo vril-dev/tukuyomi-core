@@ -1,0 +1,263 @@
+//! The tests of the store, and the one helper of the tests of `managed` that makes a store, its versions and the main
+//! file that names it (`Fixture`).
+
+use super::*;
+use serde_json::{Value, json};
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// The main file of the fixture without its `managed`: one plain listener, `forward` with its time only.
+const MAIN: &str = r#"{"proxy":{"listeners":[{"address":"127.0.0.1:8080"}],"max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"inspect_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"forward":{"resolve_timeout_ms":30000},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
+
+/// A directory of a test (`TMPDIR`), removed with everything in it when dropped, which holds a managed store
+/// (`store/`, 0700) and the main file that names it (`config.json`).
+pub(crate) struct Fixture {
+    root: PathBuf,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+impl Fixture {
+    pub(crate) fn new() -> Fixture {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "tukuyomi-proxy-managed-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        for dir in [root.clone(), root.join("store")] {
+            DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            // A umask can only remove bits; make the mode exactly 0700.
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        Fixture { root }
+    }
+
+    /// The directory of the test, for the other files a test needs.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The directory of the store.
+    pub(crate) fn dir(&self) -> PathBuf {
+        self.root.join("store")
+    }
+
+    pub(crate) fn store(&self) -> Store {
+        match Store::open(&self.dir()) {
+            Ok(store) => store,
+            Err(e) => panic!("the store was refused: {}", e.0),
+        }
+    }
+
+    /// Puts `bytes` in the store as a file and gives its name.
+    pub(crate) fn file(&self, bytes: &[u8]) -> [u8; 32] {
+        self.store().put_file(bytes).unwrap().0
+    }
+
+    /// Puts `version` in the store in its written form and gives its name.
+    pub(crate) fn version(&self, version: &Value) -> [u8; 32] {
+        let bytes = serde_json::to_vec(version).unwrap();
+        self.store().put_version(&bytes).unwrap().0
+    }
+
+    /// Puts `version` in the store and chooses it.
+    pub(crate) fn current(&self, version: &Value) -> [u8; 32] {
+        let name = self.version(version);
+        self.store().choose(name).unwrap();
+        name
+    }
+
+    /// Writes the main file with `managed` naming the store, after `edit`, and gives its path.
+    pub(crate) fn main_file(&self, edit: impl FnOnce(&mut Value)) -> PathBuf {
+        let mut main: Value = serde_json::from_str(MAIN).unwrap();
+        main["managed"] = json!({ "dir": self.dir() });
+        edit(&mut main);
+        let path = self.root.join("config.json");
+        fs::write(&path, main.to_string()).unwrap();
+        path
+    }
+
+    /// A version with one site for `site.test` whose chain and key are files of the store with these bytes, and the
+    /// group `app` at 127.0.0.1:9000, which serves every request.
+    pub(crate) fn plain_version(&self, chain: &[u8], key: &[u8]) -> Value {
+        json!({
+            "sites": [{
+                "name": "site",
+                "hosts": ["site.test"],
+                "certificate": {"chain": hex(&self.file(chain)), "key": hex(&self.file(key))},
+            }],
+            "upstreams": {"app": {"servers": [{
+                "address": "127.0.0.1:9000", "weight": 1, "max_fails": 1, "fail_timeout_ms": 10000, "backup": false,
+            }]}},
+            "routes": [],
+            "default_upstream": "app",
+        })
+    }
+}
+
+fn refusal<T>(result: Result<T, ManagedError>) -> &'static str {
+    match result {
+        Err(e) => e.0,
+        Ok(_) => panic!("accepted"),
+    }
+}
+
+#[test]
+fn only_a_private_real_directory_of_this_user_is_a_store() {
+    let fixture = Fixture::new();
+    let dir = fixture.dir();
+    let owner = fs::metadata(&dir).unwrap().uid();
+    assert!(Store::open_as(&dir, owner).is_ok());
+    assert_eq!(
+        refusal(Store::open_as(&dir, owner.wrapping_add(1))),
+        "the directory is not owned by this user"
+    );
+    let link = fixture.root().join("link");
+    symlink(&dir, &link).unwrap();
+    assert_eq!(
+        refusal(Store::open(&link)),
+        "the directory is not a real directory"
+    );
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
+    assert_eq!(
+        refusal(Store::open(&dir)),
+        "the directory has group or other permission bits"
+    );
+    assert_eq!(
+        refusal(Store::open(Path::new("store"))),
+        "the managed store directory is not an absolute clean path"
+    );
+}
+
+#[test]
+fn a_file_is_written_once_under_its_sha256_and_a_broken_copy_is_written_again() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let (name, placed) = store.put_file(b"chain").unwrap();
+    assert_eq!((name, placed), (sha256(b"chain"), Placed::Created));
+    assert_eq!(store.put_file(b"chain").unwrap().1, Placed::Existing);
+    assert_eq!(&*store.file(name).unwrap(), b"chain");
+    let path = store.file_path(name);
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    fs::write(&path, b"other").unwrap();
+    assert_eq!(
+        refusal(store.file(name)),
+        "a managed file does not match its name"
+    );
+    assert_eq!(store.put_file(b"chain").unwrap().1, Placed::Recreated);
+    assert_eq!(&*store.file(name).unwrap(), b"chain");
+    // Nothing but the file is left in the directory.
+    let entries: Vec<_> = fs::read_dir(path.parent().unwrap()).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+}
+
+#[test]
+fn a_version_or_a_file_that_is_a_link_or_too_large_is_refused() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let name = fixture.version(&json!({"a": 1}));
+    let outside = fixture.root().join("outside.json");
+    fs::write(&outside, br#"{"a":1}"#).unwrap();
+    let path = fixture
+        .dir()
+        .join("versions")
+        .join(format!("{}.json", hex(&name)));
+    fs::remove_file(&path).unwrap();
+    symlink(&outside, &path).unwrap();
+    assert_eq!(
+        refusal(store.version(name)),
+        "the managed version cannot be read, or is a link"
+    );
+    let limit = vec![b' '; usize::try_from(MAX_BYTES).unwrap()];
+    assert!(store.put_file(&limit).is_ok());
+    let over = vec![b' '; usize::try_from(MAX_BYTES).unwrap() + 1];
+    assert_eq!(
+        refusal(store.put_file(&over)),
+        "a managed file is over 1 MiB"
+    );
+    assert_eq!(
+        refusal(store.version(sha256(b"absent"))),
+        "the managed version is not in the store"
+    );
+    // The directory of the files is not followed either.
+    let files = fixture.dir().join("files");
+    fs::rename(&files, fixture.root().join("files")).unwrap();
+    symlink(fixture.root().join("files"), &files).unwrap();
+    assert_eq!(
+        refusal(store.file(sha256(&limit))),
+        "a directory of the managed store is not a real directory"
+    );
+}
+
+#[test]
+fn a_version_is_chosen_only_if_it_is_sound_and_current_names_it() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    assert_eq!(store.current(), Ok(None));
+    let first = fixture.current(&json!({"a": 1}));
+    assert_eq!(store.current(), Ok(Some(first)));
+    let record = fs::read(fixture.dir().join("current")).unwrap();
+    assert_eq!(record, format!("{}\n", hex(&first)).into_bytes());
+    // A version that is not there, or does not match its name, is not chosen.
+    assert_eq!(
+        refusal(store.choose(sha256(b"absent"))),
+        "the managed version is not in the store"
+    );
+    let second = fixture.version(&json!({"a": 2}));
+    let path = fixture
+        .dir()
+        .join("versions")
+        .join(format!("{}.json", hex(&second)));
+    fs::write(&path, b"{}").unwrap();
+    assert_eq!(
+        refusal(store.choose(second)),
+        "the managed version does not match its name"
+    );
+    assert_eq!(store.current(), Ok(Some(first)));
+    assert!(!fixture.dir().join("current.new").exists());
+    fs::write(fixture.dir().join("current"), b"not a name\n").unwrap();
+    assert_eq!(
+        refusal(store.current()),
+        "the current managed version record is broken"
+    );
+}
+
+#[test]
+fn one_command_at_a_time_holds_the_lock() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let held = store.lock().unwrap();
+    assert_eq!(
+        refusal(store.lock()),
+        "the managed store is in use by another command"
+    );
+    drop(held);
+    assert!(store.lock().is_ok());
+}
+
+#[test]
+fn the_list_has_the_versions_only() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    assert_eq!(store.versions(), Ok(Vec::new()));
+    let name = fixture.version(&json!({"a": 1}));
+    let versions = fixture.dir().join("versions");
+    fs::write(versions.join("notes.json"), b"{}").unwrap();
+    symlink(
+        versions.join(format!("{}.json", hex(&name))),
+        versions.join(format!("{}.json", "ab".repeat(32))),
+    )
+    .unwrap();
+    let listed: Vec<[u8; 32]> = store
+        .versions()
+        .unwrap()
+        .iter()
+        .map(|listed| listed.name)
+        .collect();
+    assert_eq!(listed, [name]);
+}

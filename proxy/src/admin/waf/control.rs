@@ -18,10 +18,10 @@
 //! meets it is asked once more after 250 ms, and then the answer is `Seen::Busy`; a switch order that meets it is
 //! `Reply::Busy`, which is also what the order of a switch that goes on is. A line is taken only if it has the fields
 //! of an answer, 64 digits for the generation and one of the words of the proxy for the rest. The figures of a status
-//! (`uptime_ms`, `requests`, `blocked`, `policy_refused`, `upstream_failures`, `config` and `config_reloads`) are not
-//! needed for that: a proxy of an older version does not send them, and each one that is missing is `None`. One that
-//! is there and is not what it should be (a number; for `config`, 64 lowercase digits) makes the line one that is not
-//! the proxy's.
+//! (`uptime_ms`, `requests`, `blocked`, `policy_refused`, `upstream_failures`, `config`, `managed` and
+//! `config_reloads`) are not needed for that: a proxy of an older version does not send them, and each one that is
+//! missing is `None`, as `managed` is when it is `null`. One that is there and is not what it should be (a number; for
+//! `config` and `managed`, 64 lowercase digits) makes the line one that is not the proxy's.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -73,6 +73,8 @@ pub struct Status {
     pub upstream_failures: Option<u64>,
     /// The SHA-256 of the configuration file in force.
     pub config: Option<[u8; 32]>,
+    /// The name of the managed version in force.
+    pub managed: Option<[u8; 32]>,
     /// The readings of the configuration file again, by how they ended.
     pub config_reloads: Option<Reloads>,
 }
@@ -99,6 +101,7 @@ impl Status {
             "policy_refused": self.policy_refused,
             "upstream_failures": self.upstream_failures,
             "config": self.config.map(|sha256| hex(&sha256)),
+            "managed": self.managed.map(|name| hex(&name)),
             "config_reloads": self.config_reloads.map(|reloads| json!({
                 "replaced": reloads.replaced,
                 "refused": reloads.refused,
@@ -169,6 +172,7 @@ struct StatusLine {
     policy_refused: Option<u64>,
     upstream_failures: Option<u64>,
     config: Option<String>,
+    managed: Option<String>,
     config_reloads: Option<Reloads>,
 }
 
@@ -215,6 +219,10 @@ fn status_of(line: &[u8]) -> Option<Status> {
         policy_refused: line.policy_refused,
         upstream_failures: line.upstream_failures,
         config: match line.config {
+            Some(text) => Some(Fingerprint::from_hex(text.as_bytes())?.bytes()),
+            None => None,
+        },
+        managed: match line.managed {
             Some(text) => Some(Fingerprint::from_hex(text.as_bytes())?.bytes()),
             None => None,
         },

@@ -3,11 +3,12 @@
 //! none is inside another, and `admin.control` itself is inside none of the first three. Else one part could replace
 //! what another keeps: the rotation of the record files renames over a socket that has the name of a record file in
 //! the same directory, for one. A path is inside another when it has the other as a prefix component by component, so `/var/ab` is not
-//! inside `/var/a`. The paths are absolute and clean already.
+//! inside `/var/a`. The paths are absolute and clean already. `managed.dir`, when it is there, is checked after them
+//! against every one of them in the same way, with a sentence of its own.
 
 use std::path::Path;
 
-use super::{AdminConfig, AdminStoreConfig, ConfigError, Records, ensure};
+use super::{AdminConfig, AdminStoreConfig, ConfigError, ManagedConfig, Records, ensure};
 
 /// Whether `a` and `b` are the same path or one is inside the other.
 fn overlap(a: &Path, b: &Path) -> bool {
@@ -19,6 +20,7 @@ pub(super) fn separate(
     rules: &Path,
     records: Option<&Records>,
     admin: Option<&AdminConfig>,
+    managed: Option<&ManagedConfig>,
 ) -> Result<(), ConfigError> {
     let mut places = vec![rules];
     places.extend(records.map(|records| records.dir.as_path()));
@@ -38,5 +40,12 @@ pub(super) fn separate(
             .enumerate()
             .all(|(i, a)| places[i + 1..].iter().all(|b| !overlap(a, b))),
         "the rules store dir, the records dir, the admin store dir and the directory of admin control are the same or inside one another",
+    )?;
+    let Some(managed) = managed else {
+        return Ok(());
+    };
+    ensure(
+        places.iter().all(|place| !overlap(&managed.dir, place)),
+        "the managed dir is the same as, inside or around the rules store dir, the records dir, the admin store dir or the directory of admin control",
     )
 }

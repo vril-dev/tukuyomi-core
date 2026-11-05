@@ -44,6 +44,7 @@ mod forwarding;
 mod http2;
 mod inspector;
 mod keepalive;
+mod managed;
 mod modsecurity;
 mod policy;
 mod records;

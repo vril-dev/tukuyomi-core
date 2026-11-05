@@ -884,6 +884,66 @@ pub(crate) fn add_object(root: &Path, key: &str, value: Value) {
     fs::write(&path, config.to_string()).expect("write the configuration");
 }
 
+/// The directory of the managed store in a test root, and the document that `manage` imports.
+pub(crate) const MANAGED: &str = "managed";
+pub(crate) const DOCUMENT: &str = "document.json";
+
+/// Runs `tukuyomi-proxy managed <command> <the configuration of the test root> <rest>` and waits for it: the exit code,
+/// the standard output and the standard error.
+pub(crate) fn managed(root: &Path, command: &str, rest: &[&str]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_tukuyomi-proxy"))
+        .arg("managed")
+        .arg(command)
+        .arg(root.join("config.json"))
+        .args(rest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the command");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Imports `document` into the managed store of the test root `root` and chooses the version: the name of the version.
+pub(crate) fn import_and_activate(root: &Path, document: &Value) -> String {
+    let path = root.join(DOCUMENT);
+    fs::write(&path, document.to_string()).expect("write the document");
+    let (code, out, err) = managed(root, "import", &[&path.to_string_lossy()]);
+    assert_eq!(code, Some(0), "{err}");
+    let name = out
+        .strip_suffix(" created\n")
+        .unwrap_or_else(|| panic!("unexpected output {out:?}"))
+        .to_owned();
+    let (code, out, err) = managed(root, "activate", &[&name]);
+    assert_eq!((code, out), (Some(0), format!("{name} current\n")), "{err}");
+    name
+}
+
+/// Makes the configuration of the test root `root` one with `managed`, the store `managed/` in the root: the routing of
+/// its `forward` object (`upstreams`, `routes` and `default_upstream`) moves into a document without sites, `change`
+/// changes the main file and the document, and the document is imported and its version chosen with the commands of
+/// the proxy. Returns the name of the version.
+pub(crate) fn manage(root: &Path, change: impl FnOnce(&mut Value, &mut Value)) -> String {
+    let path = root.join("config.json");
+    let mut main: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read the configuration"))
+            .expect("parse the configuration");
+    let forward = main["forward"]
+        .as_object_mut()
+        .expect("forward is an object");
+    let mut document = json!({"sites": []});
+    for key in ["upstreams", "routes", "default_upstream"] {
+        document[key] = forward.remove(key).expect("the routing of forward");
+    }
+    main["managed"] = json!({"dir": root.join(MANAGED)});
+    change(&mut main, &mut document);
+    fs::write(&path, main.to_string()).expect("write the configuration");
+    make_dir(&root.join(MANAGED));
+    import_and_activate(root, &document)
+}
+
 /// Names the built inspector of ModSecurity as `kernel.engines.modsecurity.inspector` in the configuration in the test
 /// root `root`, so that a generation of that engine can be used.
 pub(crate) fn name_modsecurity_inspector(root: &Path) {

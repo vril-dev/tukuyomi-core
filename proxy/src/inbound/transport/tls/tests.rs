@@ -256,10 +256,19 @@ fn a_host_is_found_exactly_or_by_one_label_in_front_of_a_wildcard_and_the_exact_
         hosts: hosts.iter().map(|host| host.to_string()).collect(),
         acme: None,
     };
-    let names = Names::new(&[
-        certificate(&["*.a.example", "other.example"]),
-        certificate(&["www.a.example", "a.example"]),
-    ]);
+    // The names of a list of the table of one listener with these two certificates.
+    let table = table::Table::listeners(&[ListenerConfig {
+        address: "127.0.0.1:1".parse().unwrap(),
+        kind: ListenerKind::Tls(TlsConfig {
+            min_version: MinVersion::Tls12,
+            certificates: vec![
+                certificate(&["*.a.example", "other.example"]),
+                certificate(&["www.a.example", "a.example"]),
+            ],
+            http2: None,
+        }),
+    }]);
+    let names = Names::of(table.list_of(0).expect("a TLS listener").1);
     assert_eq!(names.find("www.a.example"), Some(1));
     assert_eq!(names.find("WWW.A.Example"), Some(1));
     assert_eq!(names.find("api.a.example"), Some(0));
@@ -307,10 +316,10 @@ fn load(listener: ListenerConfig) -> Result<Tls, Refusal> {
     Tls::load(&[listener], &Files)
 }
 
-fn refusal(listener: ListenerConfig) -> (&'static str, usize, Option<usize>) {
+fn refusal(listener: ListenerConfig) -> (&'static str, Place) {
     match load(listener) {
         Ok(_) => panic!("the certificates were taken"),
-        Err(refusal) => (refusal.why, refusal.listener, refusal.certificate),
+        Err(refusal) => (refusal.why, refusal.place),
     }
 }
 
@@ -333,10 +342,16 @@ fn a_certificate_is_checked_against_its_key_and_its_hosts_before_it_is_taken() {
     );
     // A host the certificate does not cover: a name, a name under a name, a wildcard of another name.
     for host in ["c.example", "a.example.net", "*.b.example", "*.example"] {
-        let (why, at, place) = refusal(listener(MinVersion::Tls12, &[(&a, &[host])]));
+        let (why, place) = refusal(listener(MinVersion::Tls12, &[(&a, &[host])]));
         assert_eq!(
-            (why, at, place),
-            (Fault::NotCovered.text(), 1, Some(1)),
+            (why, place),
+            (
+                Fault::NotCovered.text(),
+                Place::Certificate {
+                    listener: 1,
+                    certificate: 1
+                }
+            ),
             "{host}"
         );
     }
@@ -354,7 +369,13 @@ fn a_certificate_is_checked_against_its_key_and_its_hosts_before_it_is_taken() {
         ),
     ];
     let refused = Tls::load(&two, &Files).err().expect("refused");
-    assert_eq!((refused.listener, refused.certificate), (2, Some(2)));
+    assert_eq!(
+        refused.place,
+        Place::Certificate {
+            listener: 2,
+            certificate: 2
+        }
+    );
     let text = refused.to_string();
     assert!(text.ends_with("(listener 2, certificate 2)"), "{text}");
 }
@@ -461,7 +482,7 @@ fn only_a_file_that_does_not_exist_is_no_refusal_and_only_for_a_certificate_with
         let tls = torn(&Pair { cert, key }).unwrap();
         assert_eq!(
             tls.waiting(),
-            [Place {
+            [Place::Certificate {
                 listener: 1,
                 certificate: 1
             }]
@@ -478,8 +499,14 @@ fn only_a_file_that_does_not_exist_is_no_refusal_and_only_for_a_certificate_with
     ] {
         let refused = torn(&Pair { cert, key }).err().expect("refused");
         assert_eq!(
-            (refused.why, refused.listener, refused.certificate),
-            (why.text(), 1, Some(1))
+            (refused.why, refused.place),
+            (
+                why.text(),
+                Place::Certificate {
+                    listener: 1,
+                    certificate: 1
+                }
+            )
         );
     }
     // The same missing file of a certificate that is put in place by hand ends the start, naming the place.
@@ -498,8 +525,14 @@ fn only_a_file_that_does_not_exist_is_no_refusal_and_only_for_a_certificate_with
     );
     let refused = load(manual).err().expect("refused");
     assert_eq!(
-        (refused.why, refused.listener, refused.certificate),
-        (Fault::Missing.text(), 1, Some(2))
+        (refused.why, refused.place),
+        (
+            Fault::Missing.text(),
+            Place::Certificate {
+                listener: 1,
+                certificate: 2
+            }
+        )
     );
 }
 
@@ -522,7 +555,7 @@ fn a_certificate_that_waits_is_left_out_of_the_handshakes_until_a_reload_finds_i
         let tls = Arc::new(Tls::load(&listeners, &Files).unwrap());
         assert_eq!(
             tls.waiting(),
-            [Place {
+            [Place::Certificate {
                 listener: 1,
                 certificate: 2
             }]
@@ -779,11 +812,104 @@ fn a_reload_replaces_every_certificate_or_none() {
         pki.issue("a", &["a.example"]);
         fs::write(&b.key, b"not a key").unwrap();
         let refused = tls.reload(&listeners, &Files).expect_err("refused");
-        assert_eq!((refused.listener, refused.certificate), (1, Some(2)));
+        assert_eq!(
+            refused.place,
+            Place::Certificate {
+                listener: 1,
+                certificate: 2
+            }
+        );
         assert_eq!(seen("a.example").await, now_a);
         // A certificate that no longer covers its host is refused as well.
         pki.issue("b", &["c.example"]);
         assert!(tls.reload(&listeners, &Files).is_err());
         assert_eq!(seen("a.example").await, now_a);
+    });
+}
+
+// ---- the certificates of a configuration with `managed` ----
+
+#[test]
+fn every_tls_listener_chooses_from_the_way_to_the_admin_process_and_the_sites() {
+    runtime().block_on(async {
+        let pki = Pki::new();
+        let admin = pki.issue("admin", &["admin.a.example"]);
+        let wild = pki.issue("wild", &["*.a.example"]);
+        let fixture = crate::managed::store::tests::Fixture::new();
+        let stored = |path: &Path| fixture.file(&fs::read(path).unwrap());
+        let site = |key: [u8; 32]| crate::managed::Site {
+            name: "a".to_owned(),
+            hosts: vec!["*.a.example".to_owned()],
+            chain: stored(&wild.cert),
+            key,
+        };
+        let route = CertificateConfig {
+            cert_file: admin.cert.clone(),
+            key_file: admin.key.clone(),
+            hosts: vec!["admin.a.example".to_owned()],
+            acme: None,
+        };
+        let bare = |address: &str| ListenerConfig {
+            address: address.parse().unwrap(),
+            kind: ListenerKind::Tls(TlsConfig {
+                min_version: MinVersion::Tls12,
+                certificates: Vec::new(),
+                http2: None,
+            }),
+        };
+        let listeners = [bare("127.0.0.1:1"), bare("127.0.0.1:2")];
+        let load = |sites: &[crate::managed::Site], route: &CertificateConfig| {
+            Tls::load_sites(&listeners, Some(route), sites, &fixture.store(), &Files)
+        };
+        let tls = Arc::new(load(&[site(stored(&wild.key))], &route).unwrap());
+        // The name of the way comes before the wildcard of the site, and only its certificate is the way's.
+        let outcome = shake(&tls, pki.any_client(), name("admin.a.example")).await;
+        assert_eq!(served(&outcome), der(&admin.cert).to_vec());
+        assert!(outcome.server.unwrap().is_admin());
+        let outcome = shake(&tls, pki.any_client(), name("www.a.example")).await;
+        assert_eq!(served(&outcome), der(&wild.cert).to_vec());
+        assert!(!outcome.server.unwrap().is_admin());
+        assert!(
+            shake(&tls, pki.any_client(), name("b.example"))
+                .await
+                .client
+                .is_err()
+        );
+        // The second listener chooses from the same certificates.
+        let names = tls.handshake(1).expect("a TLS listener").names();
+        assert_eq!(
+            (names.find("admin.a.example"), names.find("www.a.example")),
+            (Some(0), Some(1))
+        );
+
+        // A refusal names the site or the way.
+        let refused = load(&[site(stored(&admin.key))], &route)
+            .err()
+            .expect("refused");
+        assert_eq!(
+            refused.to_string(),
+            format!("{} (site a)", Fault::NotPair.text())
+        );
+        let crossed = CertificateConfig {
+            key_file: wild.key.clone(),
+            ..route.clone()
+        };
+        let refused = load(&[site(stored(&wild.key))], &crossed)
+            .err()
+            .expect("refused");
+        assert_eq!(
+            refused.to_string(),
+            format!("{} (admin route)", Fault::NotPair.text())
+        );
+
+        // SIGUSR2 reads the way from its files again, and the sites from the store.
+        let again = pki.issue("admin", &["admin.a.example"]);
+        tls.reload(&listeners, &Files).unwrap();
+        let outcome = shake(&tls, pki.any_client(), name("admin.a.example")).await;
+        assert_eq!(served(&outcome), der(&again.cert).to_vec());
+        assert_eq!(
+            served(&shake(&tls, pki.any_client(), name("www.a.example")).await),
+            der(&wild.cert).to_vec()
+        );
     });
 }

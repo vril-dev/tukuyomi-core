@@ -26,15 +26,16 @@ use tokio_rustls::server::TlsStream;
 
 use super::certs::{Fault, Store};
 use super::sni::{Hosts, Names};
+use super::table::Entry;
 use crate::config::{MinVersion, TlsConfig};
 
 const ALPN: &[u8] = b"http/1.1";
 const ALPN_H2: &[u8] = b"h2";
 
-/// The certificate for a handshake: the one the name of the client finds among the hosts of the listener.
+/// The certificate for a handshake: the one the name of the client finds among the hosts of the list of the listener.
 #[derive(Debug)]
 struct Resolver {
-    listener: usize,
+    list: usize,
     names: Arc<Names>,
     store: Arc<Store>,
 }
@@ -42,7 +43,7 @@ struct Resolver {
 impl ResolvesServerCert for Resolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let index = self.names.find(hello.server_name()?)?;
-        self.store.current().get(self.listener)?.get(index)?.clone()
+        self.store.current().get(self.list)?.get(index)?.clone()
     }
 }
 
@@ -53,15 +54,17 @@ pub struct Handshake {
 }
 
 impl Handshake {
-    /// `listener` is the position of the listener, which is where its certificates are in the material.
+    /// `list` is where the certificates of the listener, `entries`, are in the material (see `table`); `tls` gives the
+    /// rest of the settings.
     pub(super) fn new(
-        listener: usize,
+        list: usize,
+        entries: &[Entry],
         tls: &TlsConfig,
         store: Arc<Store>,
     ) -> Result<Handshake, Fault> {
-        let names = Arc::new(Names::new(&tls.certificates));
+        let names = Arc::new(Names::of(entries));
         let resolver = Arc::new(Resolver {
-            listener,
+            list,
             names: names.clone(),
             store,
         });

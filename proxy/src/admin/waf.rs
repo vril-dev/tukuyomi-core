@@ -90,7 +90,7 @@ use super::password::hex;
 use super::server::{Answer, Gate, Handler, Req, Route, json_body};
 use super::store::AdminStore;
 use super::users::Role;
-use crate::config::{AdminConfig, Loaded, ProxyConfig, Records, StoreConfig};
+use crate::config::{AdminConfig, MainFile, ProxyConfig, Records, StoreConfig};
 use crate::log::escaped;
 use crate::rules::bundle::Fingerprint;
 use crate::rules::collect::CollectError;
@@ -390,7 +390,7 @@ impl Waf {
 
     /// The routes of the configuration `loaded`, whose `admin` object is `admin`, with the trial of an inspector.
     pub fn from_config(
-        loaded: &Loaded,
+        loaded: &MainFile,
         admin: &AdminConfig,
         store: Arc<dyn AdminStore>,
         audit: Arc<AuditLog>,

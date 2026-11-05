@@ -23,6 +23,11 @@
 //! A group also counts all the failures of its servers from the start of the proxy (`Group::failures`), also those of
 //! a server with a `max_fails` of 0, for `/metrics`.
 //!
+//! A configuration with `managed` and `admin` has the way to the admin process besides (`Upstreams::admin`): a route
+//! that the proxy makes itself, which a request takes by its `Host` alone, whatever the routes say, to a group of its
+//! own with the one server `admin.listen`. The group is not one of the groups of the configuration, so no route can
+//! name it, and its name cannot be the name of one: it is not counted in `failures`.
+//!
 //! The counts are atomic numbers that are read and written one at a time, so two failures that come in the same
 //! instant may count as one; a count that is a little low or high changes how soon a server is left out, nothing
 //! that a client sees. The times are milliseconds from the start of the group.
@@ -30,18 +35,23 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::time::Instant;
 
 use crate::config::{
-    ForwardConfig, GroupConfig, ProxyConfig, RouteConfig, RouteKeep, ServerConfig, Stream,
+    AdminWay, ForwardConfig, GroupConfig, ProxyConfig, RouteConfig, RouteKeep, ServerConfig, Stream,
 };
 use crate::forward::client_ip::Access;
 use crate::forward::pool::Pool;
 use crate::forward::rewrite::Rewrite;
 use crate::forward::select::Turn;
 use crate::forward::tls::Secure;
-use crate::route::Table;
+use crate::route::{RequestHost, Table};
+
+/// The name of the group of the way to the admin process: not the name of a group of the configuration, which is made
+/// of letters, digits, `-` and `_`.
+const ADMIN_GROUP: &str = "admin route";
 
 /// The groups of the configuration, and the routes to them.
 pub struct Upstreams {
@@ -51,6 +61,16 @@ pub struct Upstreams {
     default: Option<RouteConfig>,
     /// Some route has an access list.
     guarded: bool,
+    admin: Option<Admin>,
+}
+
+/// The way to the admin process: the name of its host, in lowercase, who may use it, and its group.
+struct Admin {
+    host: String,
+    access: Access,
+    group: Group,
+    /// No edit: the request goes to the admin process as it came.
+    rewrite: Rewrite,
 }
 
 /// The route a request takes: the group it goes to, how it edits the request and the response, the times of a
@@ -79,7 +99,28 @@ impl Upstreams {
             routes: cfg.routes.clone(),
             default: cfg.default.map(RouteConfig::plain),
             guarded: cfg.routes.targets().any(|route| !route.access.is_empty()),
+            admin: cfg.admin.as_ref().map(|way| Admin::new(way, proxy, born)),
         }
+    }
+
+    /// The way to the admin process for a request with this `Host` value, if it has the name of the host of the way
+    /// (in any case, with a port or a last `.`), and the access list that its client has to pass. No route of the
+    /// configuration is asked for such a request.
+    pub fn admin(&self, host: Option<&[u8]>) -> Option<(Route<'_>, &Access)> {
+        let admin = self.admin.as_ref()?;
+        let named = RequestHost::parse(host?)?
+            .name()
+            .eq_ignore_ascii_case(admin.host.as_bytes());
+        named.then_some((
+            Route {
+                group: &admin.group,
+                rewrite: &admin.rewrite,
+                stream: None,
+                max_body: None,
+                records: None,
+            },
+            &admin.access,
+        ))
     }
 
     /// Whether some route has an access list. If none has, no request is turned away by one, and `accesses` need
@@ -227,6 +268,29 @@ pub struct Group {
     born: Instant,
     /// The failures of all the servers, counted since the start.
     failures: AtomicU64,
+}
+
+impl Admin {
+    /// The group has the one server, which is never left out, as the only server of a group is not.
+    fn new(way: &AdminWay, proxy: &ProxyConfig, born: Instant) -> Admin {
+        let group = GroupConfig {
+            name: ADMIN_GROUP.to_owned(),
+            servers: vec![ServerConfig {
+                address: way.server,
+                weight: 1,
+                max_fails: 0,
+                fail_timeout: Duration::from_secs(1),
+                backup: false,
+            }],
+            tls: None,
+        };
+        Admin {
+            host: way.host.clone(),
+            access: way.access.clone(),
+            group: Group::new(&group, proxy, born),
+            rewrite: Rewrite::default(),
+        }
+    }
 }
 
 impl Group {

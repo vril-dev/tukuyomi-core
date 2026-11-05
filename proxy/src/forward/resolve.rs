@@ -28,9 +28,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use rustls::ClientConfig;
 
 use crate::config::{
     Address, ForwardConfig, ForwardSettings, GroupConfig, MAX_SERVERS, ServerConfig, same,
@@ -191,6 +194,21 @@ pub fn complete<L>(
 where
     L: Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + 'static,
 {
+    complete_with(settings, listeners, lookup, tls::config)
+}
+
+/// `complete` with the TLS of a group with `tls` made by `authorities` from its settings: `tls::config`, which reads
+/// the file of the authorities, or, for the groups of a managed version, a reading through its store.
+pub fn complete_with<L, A>(
+    settings: ForwardSettings,
+    listeners: &[SocketAddr],
+    lookup: L,
+    authorities: A,
+) -> Result<Completed, Refusal>
+where
+    L: Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + 'static,
+    A: Fn(&Settings) -> Result<Arc<ClientConfig>, Fault>,
+{
     let ForwardSettings {
         resolve_timeout,
         groups,
@@ -204,7 +222,7 @@ where
         let config = group
             .tls
             .as_ref()
-            .map(tls::config)
+            .map(&authorities)
             .transpose()
             .map_err(|fault| Refusal {
                 why: fault.text(),
@@ -274,9 +292,34 @@ where
             groups: done,
             routes,
             default,
+            admin: None,
         },
         lines,
     })
+}
+
+/// Refuses a server of `forward` at `address` (as `config::same` compares them), with `why` and the group and the place
+/// of the server (from 1) once the names are looked up: the address of the admin process for the groups of a managed
+/// version.
+pub fn refuse_at(
+    forward: &ForwardConfig,
+    address: SocketAddr,
+    why: &'static str,
+) -> Result<(), Refusal> {
+    for group in &forward.groups {
+        if let Some(place) = group
+            .servers
+            .iter()
+            .position(|server| same(address, server.address))
+        {
+            return Err(Refusal {
+                why,
+                group: group.name.clone(),
+                position: Some(place + 1),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

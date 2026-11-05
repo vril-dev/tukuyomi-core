@@ -153,6 +153,11 @@ impl Access {
         self.deny.is_empty() && self.allow.is_empty() && !self.has_countries()
     }
 
+    /// Whether the list of the networks that are let in is not empty, so that a client outside it is turned away.
+    pub fn has_allowed_networks(&self) -> bool {
+        !self.allow.is_empty()
+    }
+
     /// Whether a list of countries is not empty.
     pub fn has_countries(&self) -> bool {
         !self.deny_countries.is_empty() || !self.allow_countries.is_empty()

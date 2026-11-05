@@ -45,7 +45,7 @@ fn a_group_may_have_tls_with_a_file_of_authorities_and_a_name_that_may_be_left_o
     assert_eq!(
         taken.groups[0].tls,
         by(Settings {
-            ca_file: PathBuf::from("/etc/ca.pem"),
+            authorities: Authorities::File(PathBuf::from("/etc/ca.pem")),
             server_name: None,
         })
     );
@@ -53,7 +53,7 @@ fn a_group_may_have_tls_with_a_file_of_authorities_and_a_name_that_may_be_left_o
     assert_eq!(
         with_tls("192.0.2.1:443", named).unwrap().groups[0].tls,
         by(Settings {
-            ca_file: PathBuf::from("/etc/ca.pem"),
+            authorities: Authorities::File(PathBuf::from("/etc/ca.pem")),
             server_name: Some("api.test".to_string()),
         })
     );

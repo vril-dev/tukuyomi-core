@@ -16,6 +16,15 @@
 //! `listen` may not clash with the address of a listener or of the status listener (the rule for two listeners: the
 //! second bind would fail). A server of an upstream may be at `listen`, unlike at the address of a listener or of
 //! the status listener: the proxy reaches the admin process by a route to it, which is meant to be the way in.
+//!
+//! A file with `managed` writes that way in the object itself, and only such a file: `route`, which it then must have,
+//! is `{"host", "certificate": {"cert_file", "key_file"}, "access"}`. `host` is one name as a host of a certificate of
+//! a listener is written, without `*.`; the certificate is checked and read as the certificate of a listener with that
+//! one host is; `access` is written as the `access` of a route is (see `rewrite`) and has `allow_cidrs`, which is not
+//! empty, so that the way to the admin process is never open to every address. The proxy makes the route itself (see
+//! `forward::group`): a request whose `Host` is the host goes to `listen`, over a connection of that certificate, and
+//! the `access` and `rate_limit` of the configuration do not apply to it. `route` is the proxy's alone: it is not one
+//! of the values the admin process takes, and a reading of the file again may change it.
 
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
@@ -24,12 +33,13 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::listeners::clash;
+use super::listeners::{self, clash, host_ok_for_tls};
+use super::rewrite::{self, RawAccess};
 use super::{
-    ConfigError, ListenerConfig, MAX_STORE_DIR, Object, RawStore, StatusConfig, address, clean_abs,
-    ensure, networks,
+    CertificateConfig, ConfigError, ListenerConfig, MAX_STORE_DIR, Object, RawStore, StatusConfig,
+    address, clean_abs, ensure, networks,
 };
-use crate::forward::client_ip::Cidr;
+use crate::forward::client_ip::{Access, Cidr};
 use crate::route::Rule;
 
 /// The longest `control` in bytes: the path of a socket address, without its end byte, fits `sun_path`.
@@ -65,6 +75,16 @@ pub struct AdminConfig {
     pub crs_dir: Option<PathBuf>,
 }
 
+/// The `route` of the `admin` object, checked: the way to the admin process of a file with `managed`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminRoute {
+    /// A lowercase name.
+    pub host: String,
+    /// Its `hosts` are `[host]`, and it has no `acme`.
+    pub certificate: CertificateConfig,
+    pub access: Access,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawAdmin {
@@ -78,6 +98,23 @@ pub(super) struct RawAdmin {
     session_total_ms: u64,
     #[serde(default, deserialize_with = "super::present")]
     crs_dir: Option<String>,
+    #[serde(default, deserialize_with = "super::present")]
+    route: Option<Object<RawRoute>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRoute {
+    host: String,
+    certificate: Object<RawCertificate>,
+    access: Object<RawAccess>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCertificate {
+    cert_file: String,
+    key_file: String,
 }
 
 /// A path of at most `longest` bytes that is absolute and clean.
@@ -97,14 +134,15 @@ fn origin_ok(text: &str) -> bool {
         .is_some_and(|host| !host.starts_with('*') && Rule::forward(Some(host), None).is_ok())
 }
 
-/// Checks the object against the listeners and the status listener.
+/// Checks the object against the listeners and the status listener. `managed` tells that the file has `managed`.
 pub(super) fn check(
     raw: Option<Object<RawAdmin>>,
     listeners: &[ListenerConfig],
     status: Option<StatusConfig>,
-) -> Result<Option<AdminConfig>, ConfigError> {
+    managed: bool,
+) -> Result<(Option<AdminConfig>, Option<AdminRoute>), ConfigError> {
     let Some(Object(raw)) = raw else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let listen = address(
         &raw.listen,
@@ -167,7 +205,21 @@ pub(super) fn check(
             )
         })
         .transpose()?;
-    Ok(Some(AdminConfig {
+    let route = match (raw.route, managed) {
+        (Some(Object(raw)), true) => Some(route(raw)?),
+        (None, false) => None,
+        (Some(_), false) => {
+            return Err(ConfigError(
+                "admin route is only for a configuration with managed",
+            ));
+        }
+        (None, true) => {
+            return Err(ConfigError(
+                "admin has no route while the configuration has managed",
+            ));
+        }
+    };
+    let admin = AdminConfig {
         listen,
         control,
         store: AdminStoreConfig::File { dir },
@@ -177,5 +229,31 @@ pub(super) fn check(
         session_idle: Duration::from_millis(raw.session_idle_ms),
         session_total: Duration::from_millis(raw.session_total_ms),
         crs_dir,
-    }))
+    };
+    Ok((Some(admin), route))
+}
+
+/// The `route` of the object.
+fn route(raw: RawRoute) -> Result<AdminRoute, ConfigError> {
+    ensure(
+        !raw.host.starts_with("*.") && host_ok_for_tls(&raw.host),
+        "admin route host is not a name",
+    )?;
+    let Object(files) = raw.certificate;
+    let certificate = CertificateConfig {
+        cert_file: listeners::file(files.cert_file)?,
+        key_file: listeners::file(files.key_file)?,
+        hosts: vec![raw.host.clone()],
+        acme: None,
+    };
+    let access = rewrite::access(Some(raw.access))?;
+    ensure(
+        access.has_allowed_networks(),
+        "admin route access has no allow_cidrs",
+    )?;
+    Ok(AdminRoute {
+        host: raw.host,
+        certificate,
+        access,
+    })
 }

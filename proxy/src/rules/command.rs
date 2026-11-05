@@ -54,7 +54,7 @@ use tokio::runtime::Builder;
 use tokio::signal::unix::{SignalKind, signal};
 use tukuyomi_kernel::{Engine, Failure};
 
-use crate::config::{self, Loaded};
+use crate::config::{self, MainFile};
 use crate::log::escaped;
 use crate::rules::bundle::{Fingerprint, Mode};
 use crate::rules::collect::{self, CollectError, Inputs};
@@ -243,13 +243,13 @@ fn not_root(command: &str, term: &mut Terminal) -> Result<(), Exit> {
     })
 }
 
-/// The configuration and the store it names.
+/// The configuration (the main file alone: the commands use no key of a managed version) and the store it names.
 fn open_store(
     command: &str,
     config: &Path,
     term: &mut Terminal,
-) -> Result<(Loaded, Box<dyn RuleStore>), Exit> {
-    let loaded = config::load(config).map_err(|e| {
+) -> Result<(MainFile, Box<dyn RuleStore>), Exit> {
+    let loaded = config::load_main(config).map_err(|e| {
         term.note(&format!("{command}: configuration refused: {}", e.0));
         Exit::Usage
     })?;
@@ -323,7 +323,7 @@ fn import(config: &Path, inputs: &Inputs, accept_block: bool, term: &mut Termina
 
 /// Tries the staged bundle and tells how it went. True if it passed. `engine` and `mode` are those of the bundle.
 fn try_staged(
-    loaded: &Loaded,
+    loaded: &MainFile,
     staged: &Staged,
     accept_block: bool,
     engine: Engine,

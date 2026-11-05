@@ -45,7 +45,7 @@ fn run(path: &Path, log: &Log) -> u8 {
         log.line(&format!("records-ship: host check refused: {text}"));
         return EXIT_FAILED;
     }
-    let loaded = match config::load(path) {
+    let loaded = match config::load_main(path) {
         Ok(loaded) => loaded,
         Err(e) => {
             log.line(&format!("records-ship: configuration refused: {}", e.0));

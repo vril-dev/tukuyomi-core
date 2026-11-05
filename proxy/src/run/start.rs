@@ -1,8 +1,8 @@
 //! The start of the process, before the runtime runs: the arguments, which of the short commands (`rules`, `acme`,
-//! `config`) the process is, whether it is the admin process or one of its commands `admin bootstrap` and `admin
-//! reset` (see `admin`), and the steps from the configuration to the kernel configuration (`prepare`), which
+//! `config`, `managed`) the process is, whether it is the admin process or one of its commands `admin bootstrap` and
+//! `admin reset` (see `admin`), and the steps from the configuration to the kernel configuration (`prepare`), which
 //! `config check` runs as well. The steps before the rules store (`read_parts`) are run again when the proxy reads
-//! the configuration file again.
+//! the configuration file again, and by `managed activate` with the version it is to choose.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -14,16 +14,18 @@ use super::serve::run;
 use crate::acme;
 use crate::admin;
 use crate::config::{
-    self, AdminConfig, ForwardConfig, Keep, KernelSettings, PolicyConfig, ProxyConfig, Records,
-    StatusConfig, StoreConfig, addresses,
+    self, AdminConfig, AdminWay, ForwardConfig, Keep, KernelSettings, PolicyConfig, ProxyConfig,
+    Records, StatusConfig, StoreConfig, addresses,
 };
 use crate::forward::resolve;
+use crate::forward::tls::{self, Authorities, Fault};
 use crate::inbound::challenge::Challenge;
 use crate::inbound::session::RequestIds;
 use crate::inbound::transport::tls::{Files, Tls};
 use crate::log::Log;
 use crate::log::sink::RecordFile;
-use crate::rules::bundle::{Fingerprint, Mode};
+use crate::managed::{self, Choice, LoadError};
+use crate::rules::bundle::{Fingerprint, Mode, hex};
 use crate::rules::command;
 use crate::rules::routes::Routes;
 use crate::rules::store;
@@ -65,6 +67,15 @@ pub fn start(log: &Log) -> u8 {
         let args: Vec<OsString> = args.collect();
         return config_check(&args, log);
     }
+    if args.peek().is_some_and(|arg| arg == "managed") {
+        args.next();
+        let args: Vec<OsString> = args.collect();
+        return match managed::command::run(&args, &mut io::stdout(), log) {
+            managed::command::Exit::Done => EXIT_OK,
+            managed::command::Exit::Failed => EXIT_FAILED,
+            managed::command::Exit::Usage => EXIT_USAGE,
+        };
+    }
     if args.peek().is_some_and(|arg| arg == "admin") {
         args.next();
         let args: Vec<OsString> = args.collect();
@@ -98,6 +109,7 @@ pub fn start(log: &Log) -> u8 {
         admin,
         policy,
         sha256,
+        managed,
         fixed,
     } = match prepare(&path, "start", log) {
         Ok(prepared) => prepared,
@@ -156,6 +168,7 @@ pub fn start(log: &Log) -> u8 {
         keep,
         path,
         sha256,
+        managed,
         fixed,
         log.clone(),
     ))
@@ -183,6 +196,8 @@ struct Prepared {
     policy: PolicyConfig,
     /// The SHA-256 of the bytes of the configuration file.
     sha256: [u8; 32],
+    /// The name of the managed version, if the file has `managed`.
+    managed: Option<[u8; 32]>,
     /// The values that a reading of the file again may not change.
     fixed: Fixed,
 }
@@ -190,7 +205,7 @@ struct Prepared {
 /// What the steps before the rules store give: the configuration with the addresses of the upstream servers in it, the
 /// TLS of the listeners and the answer to the challenge of the CA. The proxy builds its setup of them at the start
 /// and again when it reads the file again.
-pub(super) struct Parts {
+pub(crate) struct Parts {
     pub(super) proxy: ProxyConfig,
     pub(super) forward: ForwardConfig,
     pub(super) tls: Tls,
@@ -205,18 +220,30 @@ pub(super) struct Parts {
     pub(super) fixed: Fixed,
     /// The SHA-256 of the bytes of the file.
     pub(super) sha256: [u8; 32],
+    /// The name of the managed version that was read with the file, if it has `managed`.
+    pub(super) managed: Option<[u8; 32]>,
 }
 
-/// The steps of start-up before the rules store: the configuration, the lookup of the names of the upstream servers,
-/// the files of the TLS listeners and the challenge of the CA. `name` is at the head of each line: `start` for the
-/// start, `config check` for the command of that name, `reload` for a reading of the file again. A refusal is a line,
-/// and its exit code is the error.
-pub(super) fn read_parts(path: &Path, name: &str, log: &Log) -> Result<Parts, u8> {
-    let loaded = match config::load(path) {
+/// The steps of start-up before the rules store: the configuration (with `managed`, with the version of `choice`), the
+/// lookup of the names of the upstream servers, the files of the TLS listeners and the challenge of the CA. `name` is
+/// at the head of each line: `start` for the start, `config check` for the command of that name, `reload` for a
+/// reading of the file again, `managed activate` for that command. A refusal is a line, and its exit code is the error:
+/// 2 for a main file that is refused, 1 for the rest, a managed version that is refused included (as for a generation
+/// of rules that is refused).
+pub(crate) fn read_parts(path: &Path, choice: &Choice, name: &str, log: &Log) -> Result<Parts, u8> {
+    let loaded = match managed::load(path, choice) {
         Ok(loaded) => loaded,
-        Err(e) => {
+        Err(LoadError::Main(e)) => {
             log.line(&format!("{name}: configuration refused: {}", e.0));
             return Err(EXIT_USAGE);
+        }
+        Err(LoadError::Version(e)) => {
+            log.line(&format!("{name}: managed version refused: {}", e.0));
+            return Err(EXIT_FAILED);
+        }
+        Err(LoadError::Store(e)) => {
+            log.line(&format!("{name}: managed store refused: {}", e.0));
+            return Err(EXIT_FAILED);
         }
     };
     log.line(&format!("{name}: configuration accepted"));
@@ -224,7 +251,22 @@ pub(super) fn read_parts(path: &Path, name: &str, log: &Log) -> Result<Parts, u8
     // A server may not have an address the proxy listens on, the one of the status listener included.
     let mut listening = addresses(&loaded.proxy.listeners);
     listening.extend(loaded.status.map(|status| status.listen));
-    let forward = match resolve::complete(loaded.forward, &listening, resolve::system) {
+    // The file of the authorities of a group of a managed version is a file of its store, named by its SHA-256
+    // (`Authorities::Stored`): it is read here through the store, which refuses a link and a file that is not what its
+    // name says, and `tls::config` refuses it.
+    let completed = match &loaded.version {
+        None => resolve::complete(loaded.forward, &listening, resolve::system),
+        Some(version) => {
+            resolve::complete_with(loaded.forward, &listening, resolve::system, |settings| {
+                let Authorities::Stored(name) = settings.authorities else {
+                    return Err(Fault::Unreadable);
+                };
+                let bytes = version.store.file(name).map_err(|_| Fault::Unreadable)?;
+                tls::config_of(&bytes)
+            })
+        }
+    };
+    let mut forward = match completed {
         Ok(done) => {
             for line in &done.lines {
                 log.line(&format!("{name}: {line}"));
@@ -236,7 +278,39 @@ pub(super) fn read_parts(path: &Path, name: &str, log: &Log) -> Result<Parts, u8
             return Err(EXIT_FAILED);
         }
     };
-    let tls = match Tls::load(&loaded.proxy.listeners, &Files) {
+    // No server of a version is the admin process, also once its names are looked up: the way to it is the proxy's own,
+    // to `admin.listen`, which the proxy makes itself (see `forward::group`).
+    if let (Some(_), Some(admin)) = (&loaded.version, &loaded.admin)
+        && let Err(refusal) = resolve::refuse_at(
+            &forward,
+            admin.listen,
+            "a server name has the address of the admin process",
+        )
+    {
+        log.line(&format!("{name}: upstream refused: {refusal}"));
+        return Err(EXIT_FAILED);
+    }
+    forward.admin = loaded
+        .admin_route
+        .as_ref()
+        .zip(loaded.admin.as_ref())
+        .map(|(route, admin)| AdminWay {
+            host: route.host.clone(),
+            access: route.access.clone(),
+            server: admin.listen,
+        });
+    let route = loaded.admin_route.as_ref().map(|route| &route.certificate);
+    let loaded_tls = match &loaded.version {
+        None => Tls::load(&loaded.proxy.listeners, &Files),
+        Some(version) => Tls::load_sites(
+            &loaded.proxy.listeners,
+            route,
+            &version.sites,
+            &version.store,
+            &Files,
+        ),
+    };
+    let tls = match loaded_tls {
         Ok(tls) => tls,
         Err(refusal) => {
             log.line(&format!("{name}: tls refused: {refusal}"));
@@ -260,6 +334,7 @@ pub(super) fn read_parts(path: &Path, name: &str, log: &Log) -> Result<Parts, u8
         policy: loaded.policy,
         fixed,
         sha256: loaded.sha256,
+        managed: loaded.version.map(|version| version.name),
     })
 }
 
@@ -267,7 +342,10 @@ pub(super) fn read_parts(path: &Path, name: &str, log: &Log) -> Result<Parts, u8
 /// included. `name` is at the head of each line: `start` for the start, `config check` for the command of that name.
 /// A refusal is a line, and its exit code is the error.
 fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
-    let parts = read_parts(path, name, log)?;
+    let parts = read_parts(path, &Choice::Current, name, log)?;
+    if let Some(version) = parts.managed {
+        log.line(&format!("{name}: managed version {}", hex(&version)));
+    }
     let rules = match store::open(&parts.store) {
         Ok(rules) => rules,
         Err(e) => {
@@ -351,6 +429,7 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         admin: parts.admin,
         policy: parts.policy,
         sha256: parts.sha256,
+        managed: parts.managed,
         fixed: parts.fixed,
     })
 }

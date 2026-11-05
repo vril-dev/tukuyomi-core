@@ -21,6 +21,7 @@ use crate::inbound::conn::{Setup, Shared};
 use crate::inbound::transport::accept::Acceptor;
 use crate::log::Log;
 use crate::log::counters::{Counters, ReloadResult};
+use crate::managed::Choice;
 use crate::rules::bundle::hex;
 use crate::run::signals::Waits;
 use crate::run::start::{Parts, read_parts};
@@ -55,7 +56,8 @@ impl Reloader {
         let (reply, told) = oneshot::channel();
         let (path, thread_log) = (self.path.clone(), log.clone());
         let spawned = thread::Builder::new().name("reload".into()).spawn(move || {
-            let _ = reply.send(read_parts(&path, "reload", &thread_log).ok().map(Box::new));
+            let reading = read_parts(&path, &Choice::Current, "reload", &thread_log);
+            let _ = reply.send(reading.ok().map(Box::new));
         });
         match spawned {
             Ok(_) => waits.config = Some(told),
@@ -149,7 +151,8 @@ impl Reloader {
             parts.policy,
             keep,
             earlier.rate_limit.as_ref(),
-        );
+        )
+        .with_managed(parts.managed);
         let carried = match (&setup.rate_limit, &earlier.rate_limit) {
             (Some(limit), Some(old)) => limit.continues(old),
             _ => false,
@@ -161,8 +164,12 @@ impl Reloader {
         shared.setup.replace(setup);
         earlier.retire();
         shared.counters.add_config_reload(ReloadResult::Replaced);
+        // With `managed`, the line names the version too.
+        let managed = parts
+            .managed
+            .map_or_else(String::new, |name| format!(" managed {}", hex(&name)));
         shared.log.line(&format!(
-            "reload: configuration replaced {}",
+            "reload: configuration replaced {}{managed}",
             hex(&parts.sha256)
         ));
     }

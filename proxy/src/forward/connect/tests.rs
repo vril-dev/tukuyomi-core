@@ -20,7 +20,7 @@ use crate::forward::origin::tests::{bare, collect, config, ctx_of, far, run, sen
 use crate::forward::origin::{OriginBody, forward};
 use crate::forward::rewrite::Rewrite;
 use crate::forward::tls::tests::{Pair, Pki};
-use crate::forward::tls::{self, Client, Settings};
+use crate::forward::tls::{self, Authorities, Client, Settings};
 use crate::inbound::conn::Ctx;
 
 const OK_REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -143,7 +143,7 @@ fn named(name: &str, at: SocketAddr) -> Address {
 /// The settings of a group: the authority of `pki`, and a `server_name` or none.
 fn trusting(pki: &Pki, server_name: Option<&str>) -> Settings {
     Settings {
-        ca_file: pki.ca(),
+        authorities: Authorities::File(pki.ca()),
         server_name: server_name.map(str::to_string),
     }
 }

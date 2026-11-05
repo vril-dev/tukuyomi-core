@@ -11,16 +11,16 @@ use super::*;
 static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
 
 /// A certificate authority of a test and the certificates it issues, in a directory that is removed when it is dropped.
-pub(in crate::forward) struct Pki {
+pub(crate) struct Pki {
     dir: PathBuf,
     serial: AtomicU32,
 }
 
 /// The files of one certificate and its key.
 #[derive(Clone)]
-pub(in crate::forward) struct Pair {
-    pub(in crate::forward) cert: PathBuf,
-    pub(in crate::forward) key: PathBuf,
+pub(crate) struct Pair {
+    pub(crate) cert: PathBuf,
+    pub(crate) key: PathBuf,
 }
 
 fn openssl(dir: &Path, args: &[&str]) {
@@ -37,7 +37,7 @@ fn openssl(dir: &Path, args: &[&str]) {
 }
 
 impl Pki {
-    pub(in crate::forward) fn new() -> Pki {
+    pub(crate) fn new() -> Pki {
         let dir = std::env::temp_dir().join(format!(
             "tukuyomi-upstream-pki-{}-{}",
             std::process::id(),
@@ -78,13 +78,13 @@ impl Pki {
     }
 
     /// The file of the authority.
-    pub(in crate::forward) fn ca(&self) -> PathBuf {
+    pub(crate) fn ca(&self) -> PathBuf {
         self.dir.join("ca.pem")
     }
 
     /// A certificate for `sans` (each of the form `DNS:name` or `IP:address`), signed by the authority, and its key.
     /// `stem` is the start of the names of the files.
-    pub(in crate::forward) fn issue(&self, stem: &str, sans: &[&str]) -> Pair {
+    pub(crate) fn issue(&self, stem: &str, sans: &[&str]) -> Pair {
         let serial = self.serial.fetch_add(1, Ordering::Relaxed).to_string();
         let (key, csr, ext, cert) = (
             format!("{stem}.key"),
@@ -222,7 +222,7 @@ fn a_file_that_is_not_authorities_in_pem_is_refused_and_a_fifo_is_not_waited_for
 #[test]
 fn a_server_is_checked_for_the_server_name_of_the_group_else_its_name_else_its_address() {
     let by = |server_name: Option<&str>| Settings {
-        ca_file: PathBuf::from("/ca.pem"),
+        authorities: Authorities::File(PathBuf::from("/ca.pem")),
         server_name: server_name.map(str::to_string),
     };
     let named = Address::Name {

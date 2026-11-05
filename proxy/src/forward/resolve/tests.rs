@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rustls::pki_types::ServerName;
 
 use super::*;
+use crate::forward::tls::Authorities;
 use crate::forward::tls::tests::Pki;
 use crate::route::Table;
 
@@ -341,7 +342,7 @@ fn with_tls(mut settings: ForwardSettings, with: &[(usize, Settings)]) -> Forwar
 fn a_group_with_tls_gets_one_name_for_each_server_and_each_address_of_a_name() {
     let pki = Pki::new();
     let by = |server_name: Option<&str>| Settings {
-        ca_file: pki.ca(),
+        authorities: Authorities::File(pki.ca()),
         server_name: server_name.map(str::to_string),
     };
     let groups = |server_name: Option<&str>| {
@@ -389,7 +390,7 @@ fn a_group_with_tls_gets_one_name_for_each_server_and_each_address_of_a_name() {
 fn a_file_of_authorities_or_a_name_that_cannot_be_used_refuses_the_start() {
     let pki = Pki::new();
     let by = |ca_file: PathBuf, server_name: Option<&str>| Settings {
-        ca_file,
+        authorities: Authorities::File(ca_file),
         server_name: server_name.map(str::to_string),
     };
     // The second group is the one with `tls`; the first is plain and has a server before it.
@@ -435,4 +436,13 @@ fn a_file_of_authorities_or_a_name_that_cannot_be_used_refuses_the_start() {
     ];
     assert_eq!(start(by(pki.ca(), None), servers.clone()), place(2));
     assert_eq!(start(by(pki.ca(), Some("a-.test")), servers), place(1));
+}
+
+#[test]
+fn a_server_at_an_address_that_no_server_may_have_is_named_by_its_group_and_place() {
+    let mut forward = ForwardConfig::of(&[addr("192.0.2.1:80"), addr("127.0.0.1:9180")]);
+    forward.groups[0].name = "app".to_owned();
+    let refused = refuse_at(&forward, addr("127.0.0.1:9180"), "why").unwrap_err();
+    assert_eq!(refused.to_string(), "why (upstream app, server 2)");
+    assert!(refuse_at(&forward, addr("127.0.0.1:9181"), "why").is_ok());
 }

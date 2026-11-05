@@ -5,11 +5,13 @@
 //! roots of trust are the certificates of `ca_file`, a regular file of at most 1 MiB that holds 1 to 100
 //! certificates in PEM, each of which must be usable as a trust anchor. The file is read when the proxy starts
 //! and each time it reads the configuration file again (see `resolve`), and not between: SIGUSR2 does not read
-//! it. A server is checked for `server_name` if the group has one, else for the name it is written with, else,
-//! if it is written as an IP literal, for that address. The name is also what the server is told to be reached
-//! by (the server name of TLS), unless it is an address. TLS 1.2 and 1.3 are spoken, `http/1.1` is the only
-//! protocol of ALPN, no certificate is sent, and the resuming of sessions is what rustls does by default: the
-//! servers of a group share one configuration and so their sessions.
+//! it. The file of a group of a managed version is a file of the managed store, named by its SHA-256 and not by a path
+//! (`Authorities::Stored`): only the store reads it, and checks it against its name (see `managed`), and its bytes are
+//! made into the configuration here (`config_of`); `config` refuses it. A server is checked for `server_name` if the
+//! group has one, else for the name it is written with, else, if it is written as an IP literal, for that address. The
+//! name is also what the server is told to be reached by (the server name of TLS), unless it is an address. TLS 1.2 and
+//! 1.3 are spoken, `http/1.1` is the only protocol of ALPN, no certificate is sent, and the resuming of sessions is
+//! what rustls does by default: the servers of a group share one configuration and so their sessions.
 //!
 //! The settings are made into a `Client` when the names of the servers are looked up: the configuration of TLS, and
 //! the name of each server in the order of the group. The handshake belongs to the server (`Secure`); the caller
@@ -41,8 +43,17 @@ const ALPN: &[u8] = b"http/1.1";
 /// servers for if it is not the name of each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
-    pub ca_file: PathBuf,
+    pub authorities: Authorities,
     pub server_name: Option<String>,
+}
+
+/// Where the file of the authorities of a group is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Authorities {
+    /// A file of the operator, by its path: the `ca_file` of a file without `managed`.
+    File(PathBuf),
+    /// A file of the managed store, by its SHA-256: the `ca` of a managed version, which the store reads.
+    Stored([u8; 32]),
 }
 
 /// Why the TLS of a group could not be made.
@@ -113,8 +124,12 @@ fn read(path: &Path) -> Result<Vec<u8>, Fault> {
 
 /// The authorities of the file at `path`.
 fn roots(path: &Path) -> Result<RootCertStore, Fault> {
-    let bytes = read(path)?;
-    let chain = CertificateDer::pem_slice_iter(&bytes)
+    roots_of(&read(path)?)
+}
+
+/// The authorities in `bytes`, the content of a file of authorities.
+fn roots_of(bytes: &[u8]) -> Result<RootCertStore, Fault> {
+    let chain = CertificateDer::pem_slice_iter(bytes)
         .take(MAX_CERTIFICATES + 1)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| Fault::NotCertificates)?;
@@ -129,9 +144,22 @@ fn roots(path: &Path) -> Result<RootCertStore, Fault> {
 }
 
 /// The configuration of TLS that the servers of a group share: the authorities of `settings`, versions 1.3 and 1.2,
-/// ALPN `http/1.1`, no certificate of our own. Reads the file.
+/// ALPN `http/1.1`, no certificate of our own. Reads the file of the operator; a file of the managed store is not
+/// read here (see `config_of`).
 pub fn config(settings: &Settings) -> Result<Arc<ClientConfig>, Fault> {
-    let roots = roots(&settings.ca_file)?;
+    match &settings.authorities {
+        Authorities::File(path) => built(roots(path)?),
+        Authorities::Stored(_) => Err(Fault::Unreadable),
+    }
+}
+
+/// `config` with the authorities in `bytes`, the content of the file of authorities read already (a file of the
+/// managed store, which its store has checked).
+pub fn config_of(bytes: &[u8]) -> Result<Arc<ClientConfig>, Fault> {
+    built(roots_of(bytes)?)
+}
+
+fn built(roots: RootCertStore) -> Result<Arc<ClientConfig>, Fault> {
     let mut config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
         .with_protocol_versions(&[&version::TLS13, &version::TLS12])
         .map_err(|_| Fault::Build)?
@@ -204,4 +232,4 @@ impl Secure {
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(crate) mod tests;
