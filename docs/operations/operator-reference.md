@@ -739,9 +739,23 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 | 依頼 | 答え |
 |---|---|
-| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "ready"}`。使っている世代の指紋（64 桁）、その世代のモード（`block`、`detect`）、その世代のエンジン（`coraza` か `modsecurity`）、検査核の段（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、`/readyz` が `ready` と答える状態か |
+| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures", "config", "config_reloads"}`。使っている世代の指紋（64 桁）、その世代のモード（`block`、`detect`）、その世代のエンジン（`coraza` か `modsecurity`）、検査核の段（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、`/readyz` が `ready` と答える状態か。続く7つは proxy の数である（下） |
 | `{"op":"switch","expect":"<指紋 64 桁>"}` | ルールの保管場所が今選んでいる世代が `expect` と同じときだけ、SIGUSR1 と同じ切り替えをする。切り替えが終わってから、`{"result", "reason"?, "generation"}` で答える。`generation` は、答えるときに使っている世代である |
 | ほかの行 | `{"result":"error","reason":..}`。`reason` は `line too long`、`malformed request`、`unknown op`、`bad expect` |
+
+`status` の答えの数は、答えを作るときに読む。`uptime_ms` と `config` のほかは、`/metrics` が見せる数と同じである（下の「数（`/metrics`）」）。
+
+| 鍵 | 中身 |
+|---|---|
+| `uptime_ms` | proxy が起動してからのミリ秒 |
+| `requests` | 要求の数。記録の7つの `class` のすべてを数える（`tukuyomi_requests_total` の合計） |
+| `blocked` | 規則が遮断した要求の数（`tukuyomi_waf_rule_hits_total` の `block`） |
+| `policy_refused` | 要求の前の方針で断った要求の数。全体の `access` の 403 と `rate_limit` の 429 で、経路の `access` の 403 は数えない（`tukuyomi_policy_refusals_total` の合計） |
+| `upstream_failures` | 効いている設定の、すべての上流の組の server の失敗の数（`tukuyomi_upstream_failures_total` の合計）。SIGHUP の読み直しで設定が替わると、`/metrics` と同じく 0 から数え直す |
+| `config` | 効いている設定ファイル（起動のときか、最後に替えた読み直しで読んだファイル）の SHA-256（64 桁の小文字の 16 進数）。読み直しで替えた後は、その `reload: configuration replaced` の文に出た SHA-256 と同じ値である |
+| `config_reloads` | `{"replaced", "refused"}`。SIGHUP による設定の読み直しの数を、替えたか断ったかで分けたもの（`tukuyomi_config_reloads_total`） |
+
+- この7つの無い答えは、前の版の proxy の答えである。管理のプロセスは、無い数を `null` として扱う（[管理リファレンス](admin-reference.md) の「一覧と中身」）。
 
 `switch` の `result` は次のとおりである。
 
@@ -1470,7 +1484,7 @@ TLS は次のとおりである。
 
 | 名前 | 型 | label | 中身 |
 |---|---|---|---|
-| `tukuyomi_requests_total` | counter | `class` | 要求の記録の数（`class` は記録と同じ7つ） |
+| `tukuyomi_requests_total` | counter | `class` | 要求の数。記録を書かない要求も数える（`class` は記録と同じ7つ） |
 | `tukuyomi_waf_rule_hits_total` | counter | `decision`（`block`、`detect`） | 規則が遮断した要求と、検知だけのモードで規則に当たった要求 |
 | `tukuyomi_uninspectable_total` | counter | `reason` | 検査できなかった要求（`invalid`、`queue_full`、`unavailable`、`wait_deadline`、`verdict_deadline`、`inspector_lost`、`protocol`、`inspector_error`、`not_created`、`cancelled`） |
 | `tukuyomi_policy_refusals_total` | counter | `policy`（`access`、`rate_limit`） | 要求の前の方針で断った要求（全体の `access` の 403、`rate_limit` の 429）。経路の `access` の 403 は数えない |
