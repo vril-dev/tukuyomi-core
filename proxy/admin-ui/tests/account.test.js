@@ -3,8 +3,8 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { ApiError } from '../js/api.js';
-import { Enrollment, Held, ROLES, codeToSend, inGroups, passwordProblem, rolesUpTo, tokenProblem } from '../js/account.js';
-import { userActions, userProblem } from '../js/users.js';
+import { Enrollment, Held, ROLES, codeToSend, inGroups, passwordProblems, rolesUpTo, tokenProblems } from '../js/account.js';
+import { userActions, userProblems } from '../js/users.js';
 
 const SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
 const CODES = ['ABCDEFGHIJKLMNOP', 'QRSTUVWXYZ234567'];
@@ -16,32 +16,36 @@ test('a token can be given the role of its maker or a lower one, and no higher',
   assert.deepEqual(rolesUpTo('root'), []);
   assert.deepEqual(rolesUpTo('owner'), ROLES);
   const token = { name: 'ci', role: 'operator', days: '30' };
-  assert.equal(tokenProblem(token, 'operator'), null);
-  assert.equal(tokenProblem(token, 'owner'), null);
-  assert.equal(tokenProblem(token, 'viewer'), 'role');
-  assert.equal(tokenProblem({ ...token, role: 'admin' }, 'owner'), 'role');
+  assert.deepEqual(tokenProblems(token, 'operator'), []);
+  assert.deepEqual(tokenProblems(token, 'owner'), []);
+  assert.deepEqual(tokenProblems(token, 'viewer'), ['role']);
+  assert.deepEqual(tokenProblems({ ...token, role: 'admin' }, 'owner'), ['role']);
 });
 
 test('the name and the days of a token are checked at the limit and one past it', () => {
   const base = { name: 'ci', role: 'viewer', days: '1' };
-  for (const days of ['1', '365', '30']) assert.equal(tokenProblem({ ...base, days }, 'viewer'), null, days);
-  for (const days of ['0', '366', '', '-1', '1.5', '1e2', ' 5', '1000', 'x']) assert.equal(tokenProblem({ ...base, days }, 'viewer'), 'days', days);
-  assert.equal(tokenProblem({ ...base, name: 'a'.repeat(64) }, 'viewer'), null);
-  assert.equal(tokenProblem({ ...base, name: 'a'.repeat(65) }, 'viewer'), 'name');
-  assert.equal(tokenProblem({ ...base, name: 'a b ~' }, 'viewer'), null);
-  for (const name of ['', 'ü', 'tab\there', 'new\nline', 'del\x7f']) assert.equal(tokenProblem({ ...base, name }, 'viewer'), 'name', JSON.stringify(name));
+  for (const days of ['1', '365', '30']) assert.deepEqual(tokenProblems({ ...base, days }, 'viewer'), [], days);
+  for (const days of ['0', '366', '', '-1', '1.5', '1e2', ' 5', '1000', 'x']) assert.deepEqual(tokenProblems({ ...base, days }, 'viewer'), ['days'], days);
+  assert.deepEqual(tokenProblems({ ...base, name: 'a'.repeat(64) }, 'viewer'), []);
+  assert.deepEqual(tokenProblems({ ...base, name: 'a'.repeat(65) }, 'viewer'), ['name']);
+  assert.deepEqual(tokenProblems({ ...base, name: 'a b ~' }, 'viewer'), []);
+  for (const name of ['', 'ü', 'tab\there', 'new\nline', 'del\x7f']) assert.deepEqual(tokenProblems({ ...base, name }, 'viewer'), ['name'], JSON.stringify(name));
+  // A bad name and bad days are told together.
+  assert.deepEqual(tokenProblems({ ...base, name: '', days: '0' }, 'viewer'), ['name', 'days']);
 });
 
 test('a password is counted in bytes, 12 to 128, and must differ from the old one', () => {
-  assert.equal(passwordProblem('old password 1', 'a'.repeat(12), 'a'.repeat(12)), null);
-  assert.equal(passwordProblem('old password 1', 'a'.repeat(11), 'a'.repeat(11)), 'length');
-  assert.equal(passwordProblem('old password 1', 'a'.repeat(128), 'a'.repeat(128)), null);
-  assert.equal(passwordProblem('old password 1', 'a'.repeat(129), 'a'.repeat(129)), 'length');
+  assert.deepEqual(passwordProblems('old password 1', 'a'.repeat(12), 'a'.repeat(12)), []);
+  assert.deepEqual(passwordProblems('old password 1', 'a'.repeat(11), 'a'.repeat(11)), ['length']);
+  assert.deepEqual(passwordProblems('old password 1', 'a'.repeat(128), 'a'.repeat(128)), []);
+  assert.deepEqual(passwordProblems('old password 1', 'a'.repeat(129), 'a'.repeat(129)), ['length']);
   // Four characters of three bytes are 12 bytes; 43 of them are 129.
-  assert.equal(passwordProblem('x', 'あ'.repeat(4), 'あ'.repeat(4)), null);
-  assert.equal(passwordProblem('x', 'あ'.repeat(43), 'あ'.repeat(43)), 'length');
-  assert.equal(passwordProblem('old password 1', 'a'.repeat(12), 'a'.repeat(13)), 'mismatch');
-  assert.equal(passwordProblem('a'.repeat(12), 'a'.repeat(12), 'a'.repeat(12)), 'same');
+  assert.deepEqual(passwordProblems('x', 'あ'.repeat(4), 'あ'.repeat(4)), []);
+  assert.deepEqual(passwordProblems('x', 'あ'.repeat(43), 'あ'.repeat(43)), ['length']);
+  assert.deepEqual(passwordProblems('old password 1', 'a'.repeat(12), 'a'.repeat(13)), ['mismatch']);
+  assert.deepEqual(passwordProblems('a'.repeat(12), 'a'.repeat(12), 'a'.repeat(12)), ['same']);
+  // A short new password and a second one that differs are told together.
+  assert.deepEqual(passwordProblems('old password 1', 'a'.repeat(11), 'a'.repeat(12)), ['length', 'mismatch']);
 });
 
 test('the code of the second factor is sent as six digits, or as a recovery code in capitals without spaces', () => {
@@ -158,14 +162,16 @@ test('an owner is offered no change to its own account, and a user is offered wh
   assert.deepEqual(userActions(user({ disabled: true, mfa: true }), 'alice'), { self: false, role: true, toggle: 'enable', password: true, resetMfa: true });
 });
 
-test('a new user needs a name the API takes, a known role and a password of 12 to 128 bytes', () => {
+test('a new user needs a name the API takes, a known role and a password of 12 to 128 bytes, and every wrong field is named', () => {
   const fields = { name: 'bob', role: 'viewer', password: 'a'.repeat(12) };
-  assert.equal(userProblem(fields), null);
-  assert.equal(userProblem({ ...fields, name: 'a'.repeat(32) }), null);
-  assert.equal(userProblem({ ...fields, name: 'a'.repeat(33) }), 'name');
-  for (const name of ['', 'Bob', 'bob smith', 'bob/x', 'bóg']) assert.equal(userProblem({ ...fields, name }), 'name', name);
-  assert.equal(userProblem({ ...fields, name: 'a.b_c-d9' }), null);
-  assert.equal(userProblem({ ...fields, role: 'admin' }), 'role');
-  assert.equal(userProblem({ ...fields, password: 'a'.repeat(11) }), 'password');
-  assert.equal(userProblem({ ...fields, password: 'a'.repeat(129) }), 'password');
+  assert.deepEqual(userProblems(fields), []);
+  assert.deepEqual(userProblems({ ...fields, name: 'a'.repeat(32) }), []);
+  assert.deepEqual(userProblems({ ...fields, name: 'a'.repeat(33) }), ['name']);
+  for (const name of ['', 'Bob', 'bob smith', 'bob/x', 'bóg']) assert.deepEqual(userProblems({ ...fields, name }), ['name'], name);
+  assert.deepEqual(userProblems({ ...fields, name: 'a.b_c-d9' }), []);
+  assert.deepEqual(userProblems({ ...fields, role: 'admin' }), ['role']);
+  assert.deepEqual(userProblems({ ...fields, password: 'a'.repeat(11) }), ['password']);
+  assert.deepEqual(userProblems({ ...fields, password: 'a'.repeat(129) }), ['password']);
+  // A bad name and a short password are told together, not one after the other.
+  assert.deepEqual(userProblems({ name: 'Bob', role: 'viewer', password: 'a'.repeat(5) }), ['name', 'password']);
 });

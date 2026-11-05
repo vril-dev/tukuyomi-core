@@ -103,9 +103,11 @@
 
 /* ==== 2. base ==== */
 *, *::before, *::after { box-sizing: border-box; }
-html, body, #app { height: 100%; }
+/* The page is at least as high as the window, and grows with what it holds. */
+html, body { height: 100%; }
+#app { min-height: 100%; }
 html { -webkit-text-size-adjust: 100%; }
-body { margin: 0; overflow-wrap: anywhere; }
+body { margin: 0; }
 .tc-root { background: var(--surface-000); color: var(--ink); font: 400 15px/24px var(--font-sans); }
 [hidden] { display: none !important; }
 h1, h2, h3, p, ol, ul, dl, dd, fieldset { margin: 0; }
@@ -123,7 +125,8 @@ code, pre { font-family: var(--font-mono); font-size: 13px; line-height: 20px; }
 .tc-num { text-align: right; font-variant-numeric: tabular-nums; }
 .tc-stack { display: grid; gap: var(--space-4); }
 .tc-stack--wide { gap: var(--space-5); }
-.tc-skip { position: absolute; left: var(--space-2); top: -4rem; z-index: 10; }
+/* Above the bar, which stays at the top of the window. */
+.tc-skip { position: absolute; left: var(--space-2); top: -4rem; z-index: 30; }
 .tc-skip:focus { top: var(--space-2); }
 
 /* ==== 3. components ==== */
@@ -146,7 +149,8 @@ code, pre { font-family: var(--font-mono); font-size: 13px; line-height: 20px; }
   white-space: nowrap;
 }
 .tc-btn:hover { background: var(--surface-200); }
-.tc-btn:focus-visible, .tc-input:focus-visible, .tc-select:focus-visible, .tc-check:focus-visible, .tc-nav a:focus-visible, .tc-sort:focus-visible, .tc-link:focus-visible, .tc-details > summary:focus-visible, a:focus-visible {
+.tc-btn:focus-visible, .tc-input:focus-visible, .tc-select:focus-visible, .tc-check:focus-visible, .tc-nav a:focus-visible, .tc-sort:focus-visible, .tc-link:focus-visible, .tc-details > summary:focus-visible, a:focus-visible,
+:is(.tc-field:has(> .tc-file:focus) > .tc-btn) {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
@@ -201,9 +205,13 @@ code, pre { font-family: var(--font-mono); font-size: 13px; line-height: 20px; }
 }
 .tc-select--auto { width: auto; }
 textarea.tc-input { min-height: 6rem; padding: var(--space-2) var(--space-3); resize: vertical; }
-input[type="file"].tc-input { padding: var(--space-1) var(--space-3); }
+/* A file input is hidden but takes the focus; the name of its field, drawn as a button, opens it, and shows its focus
+   (any focus: the page puts it there after an error) and its error. The rules of the focus ring and of the error name
+   the button in `:is()`, so that a browser that does not know `:has()` still keeps the rest of each rule. */
+.tc-file { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.tc-field > .tc-btn { justify-self: start; }
 .tc-input::placeholder { color: var(--ink-muted); }
-.tc-input[aria-invalid="true"], .tc-select[aria-invalid="true"] { border-color: var(--danger); box-shadow: inset 0 0 0 1px var(--danger); }
+.tc-input[aria-invalid="true"], .tc-select[aria-invalid="true"], :is(.tc-field:has(> .tc-file[aria-invalid="true"]) > .tc-btn) { border-color: var(--danger); box-shadow: inset 0 0 0 1px var(--danger); }
 .tc-error { display: flex; gap: var(--space-2); align-items: baseline; font-size: 13px; line-height: 18px; color: var(--danger); }
 .tc-error::before {
   content: "!";
@@ -261,12 +269,13 @@ input[type="file"].tc-input { padding: var(--space-1) var(--space-3); }
 .tc-notice--danger { border-color: var(--danger); background: var(--danger-soft); }
 .tc-notice--danger .tc-notice__title { color: var(--danger); }
 .tc-notice--warn .tc-notice__next, .tc-notice--danger .tc-notice__next, .tc-notice--ok .tc-notice__next { color: var(--ink); }
-.tc-notes:empty { display: none; }
+/* A badge in a notice may have the colour of the notice: there every badge has the colour of a panel, and keeps its shape. */
+.tc-notice .tc-badge { background: var(--surface-100); }
 
-/* A region that announces what happened takes no room while it is empty. */
-.tc-main > :empty { margin-top: calc(-1 * var(--space-5)); }
-.tc-stack > :empty, .tc-panel > :empty { margin-top: calc(-1 * var(--space-4)); }
-.tc-stack--wide > :empty { margin-top: calc(-1 * var(--space-5)); }
+/* A region that announces what happened, a line that is not filled yet and the layer that holds the dialogs take no
+   room while they are empty: out of the flow they leave no gap in the grid around them. A region stays in the page, so
+   that what is put in it is read out. */
+.tc-main > :is(div, p):empty, .tc-stack > :is(div, p):empty, .tc-panel > :is(div, p):empty, .tc-form > :is(div, p):empty { position: absolute; }
 
 /* Panel and key-value list */
 .tc-panel {
@@ -292,7 +301,7 @@ input[type="file"].tc-input { padding: var(--space-1) var(--space-3); }
 .tc-panel__foot > .tc-actions { flex: 1 1 auto; }
 .tc-kv { display: grid; grid-template-columns: minmax(8rem, max-content) 1fr; gap: var(--space-2) var(--space-5); margin: 0; }
 .tc-kv dt { color: var(--ink-muted); font-size: 13px; line-height: 20px; }
-.tc-kv dd { margin: 0; min-width: 0; font-size: 14px; line-height: 20px; }
+.tc-kv dd { margin: 0; min-width: 0; font-size: 14px; line-height: 20px; overflow-wrap: anywhere; }
 .tc-panel.tc-details { display: block; }
 .tc-details > summary { cursor: pointer; font: 600 14px/20px var(--font-sans); border-radius: var(--radius-sm); }
 .tc-details[open] > summary { margin-bottom: var(--space-3); }
@@ -331,7 +340,16 @@ input[type="file"].tc-input { padding: var(--space-1) var(--space-3); }
 .tc-table th.tc-num { text-align: right; }
 .tc-table td { padding: var(--space-2) var(--space-4); border-top: 1px solid var(--line-subtle); vertical-align: top; }
 .tc-table td.tc-tight { white-space: nowrap; }
+/* A long value with no space in it (a path, the summary of a record) fills each line before it breaks, anywhere, and
+   keeps room to read. */
+.tc-table td.tc-long { min-width: 16.5rem; word-break: break-all; }
 .tc-table tbody tr:hover { background: var(--surface-200); }
+/* A badge without a tone and a short fingerprint have the colour of a hovered row: on that row they take the colour of
+   the table, and keep their shape. */
+.tc-table tbody tr:hover .tc-badge:not(.tc-badge--ok, .tc-badge--warn, .tc-badge--danger, .tc-badge--info),
+.tc-table tbody tr:hover .tc-fp code { background: var(--surface-100); }
+/* A table of many columns draws its cells closer. */
+.tc-table--dense th, .tc-table--dense td { padding: var(--space-2) var(--space-3); }
 .tc-table tr[aria-selected="true"] { background: var(--accent-soft); }
 .tc-table tr:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .tc-sort { all: unset; display: inline-flex; gap: var(--space-1); align-items: center; cursor: pointer; border-radius: var(--radius-sm); }
@@ -364,6 +382,8 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
   color: var(--ink);
   overflow-wrap: anywhere;
 }
+/* In a table a fingerprint is in its short form, which is not broken. */
+.tc-table .tc-fp code { overflow-wrap: normal; white-space: nowrap; }
 
 /* Stat */
 .tc-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: var(--space-4); }
@@ -388,9 +408,14 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
   color: var(--ink-muted);
 }
 
-/* Navigation and the shell */
-.tc-shell { display: grid; grid-template-columns: var(--size-nav) minmax(0, 1fr); min-height: 100%; }
+/* Navigation and the shell. The bar comes first in the page and the menu after it, which is the order of the
+   keyboard; on a wide screen the menu is the column on the left, beside the bar and the screen. The row of the bar is
+   as high as the bar, however many rows it wraps to. */
+.tc-shell { display: grid; grid-template-columns: var(--size-nav) minmax(0, 1fr); grid-template-rows: max-content 1fr; min-height: 100%; }
+.tc-top { display: contents; }
 .tc-nav {
+  grid-column: 1;
+  grid-row: 1 / 3;
   display: grid;
   align-content: start;
   gap: var(--space-5);
@@ -417,7 +442,7 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
 }
 .tc-nav a:hover { background: var(--surface-200); }
 .tc-nav a[aria-current="page"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-.tc-content { display: grid; grid-template-rows: auto auto 1fr; min-width: 0; align-content: start; }
+.tc-content { grid-column: 2; grid-row: 2; display: grid; grid-template-rows: auto 1fr; min-width: 0; align-content: start; }
 .tc-main {
   display: grid;
   align-content: start;
@@ -428,6 +453,8 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
   min-width: 0;
 }
 .tc-bar {
+  grid-column: 2;
+  grid-row: 1;
   position: sticky;
   top: 0;
   z-index: 10;
@@ -444,27 +471,42 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
 .tc-bar__place strong { font-weight: 600; }
 .tc-bar__spacer { flex: 1 1 0; }
 .tc-bar__user { display: inline-flex; gap: var(--space-2); align-items: center; font-size: 14px; }
+.tc-bar__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tc-bar__user > .tc-badge { flex: none; }
 .tc-bar__tools { display: inline-flex; flex-wrap: wrap; gap: var(--space-1); align-items: center; }
 .tc-bar__out { margin-inline-start: var(--space-4); }
 .tc-bar__menu { display: none; }
-.tc-alerts:empty { display: none; }
 .tc-alerts { padding: var(--space-3) var(--space-6) 0; }
+.tc-alerts:empty { padding: 0; }
 @media (max-width: 760px) {
   .tc-shell { grid-template-columns: minmax(0, 1fr); }
+  /* The bar and the menu that it opens stay at the top of the window: the open menu lies right under the bar, however
+     many rows the bar takes. */
+  .tc-top { display: block; grid-column: 1; grid-row: 1; position: sticky; top: 0; z-index: 10; }
+  .tc-bar { position: static; }
+  .tc-content { grid-column: 1; }
   .tc-nav { display: none; height: auto; border-right: 0; border-bottom: 1px solid var(--line-subtle); }
   .tc-nav.tc-nav--open {
     display: grid;
-    position: fixed;
-    top: 52px;
+    position: absolute;
+    top: 100%;
     left: var(--space-2);
     right: var(--space-2);
-    z-index: 20;
-    max-height: calc(100vh - 60px);
+    max-height: 70vh;
     border: 1px solid var(--line-subtle);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-float);
   }
-  .tc-bar { padding: var(--space-2) var(--space-4); }
+  /* The bar takes two rows at most: the place and the user, then the tools and the sign-out. */
+  .tc-bar { gap: var(--space-2); padding: var(--space-2) var(--space-4); }
+  .tc-bar__out { margin-inline-start: 0; }
+  /* The user takes what is left of its row, and a long name is cut short there (the whole name is its title). Only the
+     name shrinks, and keeps about 8 characters: a row with no room for those and the badge of the role sends the user
+     to the next row. */
+  .tc-bar__spacer { display: none; }
+  .tc-bar__user { flex: 1 1 0; }
+  .tc-bar__name { flex: 1 1 auto; width: 0; min-width: 8ch; text-align: end; }
+  .tc-bar .tc-btn--quiet { padding: 0 var(--space-1); }
   .tc-bar__menu { display: inline-flex; }
   .tc-main { padding: var(--space-4); }
   .tc-alerts { padding: var(--space-3) var(--space-4) 0; }
@@ -476,22 +518,25 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
   .tc-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   .tc-table tr { padding: var(--space-2) 0; border-top: 1px solid var(--line-strong); }
   .tc-table tbody tr:first-child { border-top: 0; }
-  .tc-table td, .tc-table td.tc-tight {
-    position: relative;
+  /* The name of a column stands in the padding of the cell, and a name of two lines makes the cell as high. */
+  .tc-table td, .tc-table td.tc-tight, .tc-table td.tc-long, .tc-table--dense td {
+    display: flow-root;
+    min-width: 0;
     padding: var(--space-1) var(--space-3) var(--space-1) 7.5rem;
     border: 0;
     white-space: normal;
     text-align: left;
+    overflow-wrap: anywhere;
   }
   .tc-table td:empty { display: none; }
   .tc-table td::before {
     content: attr(data-label);
-    position: absolute;
-    left: var(--space-3);
+    float: left;
     width: 6.5rem;
+    margin-inline-start: calc(var(--space-3) - 7.5rem);
     color: var(--ink-muted);
-    font-size: 13px;
-    font-weight: 600;
+    font: 600 13px/20px var(--font-sans);
+    overflow-wrap: normal;
   }
 }
 
@@ -554,16 +599,19 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
   border: 1px solid var(--line-subtle);
   border-radius: var(--radius-md);
 }
-.tc-files .tc-mono { font-weight: 600; }
+.tc-files .tc-mono { min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
 .tc-files .tc-actions { margin-inline-start: auto; }
 .tc-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); gap: var(--space-2) var(--space-4); }
 .tc-rows { display: grid; gap: var(--space-2); }
 .tc-rows__row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto; gap: var(--space-2); align-items: start; }
 .tc-rows__row > .tc-field { gap: 2px; }
-.tc-list { margin: 0; padding-inline-start: var(--space-5); }
+/* The button of a line stands in the middle of the inputs, below the line of their names: 20px is the line height of a
+   label (`.tc-label`), 2px the gap of a field of a line, and 28px the height of a small button (`.tc-btn--small`). */
+.tc-rows__row > .tc-btn { margin-top: calc(20px + 2px + (var(--size-control) - 28px) / 2); }
+.tc-list { margin: 0; padding-inline-start: var(--space-5); overflow-wrap: anywhere; }
 
 /* records */
-.tc-filters { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: var(--space-4); }
+.tc-filters { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: var(--space-4); align-items: start; }
 .tc-terms { display: flex; flex-wrap: wrap; gap: var(--space-1); }
 
 /* account */
@@ -598,5 +646,6 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
 .tc-codes code { font-size: 15px; letter-spacing: 0.04em; user-select: all; }
 @media (max-width: 760px) {
   .tc-rows__row { grid-template-columns: minmax(0, 1fr); }
+  .tc-rows__row > .tc-btn { justify-self: start; margin-top: 0; }
   .tc-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

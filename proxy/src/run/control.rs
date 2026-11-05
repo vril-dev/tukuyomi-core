@@ -18,24 +18,25 @@
 //! serves, what its rules do (`block` or `detect`), the engine that applies them (`coraza` or `modsecurity`), the phase
 //! of its kernel (`starting`, `ready`, `stopping`, `stopped` or `failed`), whether a switch is under way, and whether
 //! `/readyz` says `ready`. The same object holds the figures of the proxy: `uptime_ms` (the milliseconds since the
-//! proxy started), `requests` (the answers written to clients, of every class), `blocked` (the requests a rule
-//! blocked), `policy_refused` (the requests the access list or the rate limit turned away), `upstream_failures` (the
-//! failures of the servers of every upstream group of the configuration in force; they start from 0 when a reading of
-//! the configuration file again replaces it, as they do in `/metrics`), `config` (the 64 digits of the SHA-256 of the
-//! configuration file in force) and `config_reloads` (`{"replaced":..,"refused":..}`, the readings of the configuration
-//! file again by how they ended). The counts are those that `/metrics` shows; an answer without the figures is the
-//! answer of an older proxy. `{"op":"switch","expect":"<64 digits>"}` reads the rules store, and if the generation it
-//! chooses is not `expect` it does nothing and answers `refused` (`current changed`). Otherwise it does what SIGUSR1
-//! does and answers when the switch has ended, `{"result":..,"generation":..}` with the generation that serves then
-//! and, when the result is not `switched`, a `reason`: `unchanged` (`already serving`), `refused` (`current changed`,
-//! `store refused`), `failed` (`driver did not take the order`, `not switched`) or `busy` (`starting`, `switch under
-//! way`, `too many orders`, `stopping`). A switch is waited for as long as the kernel may take to be ready and a
-//! margin; a client that has waited that long gets `busy` and `switch under way`, and the switch goes on. A line that
-//! is not a request gets `{"result":"error","reason":..}` with `line too long`, `malformed request`, `unknown op` or
-//! `bad expect`, and a status that the main loop does not answer within 2 s gets `no answer`. Each answer to a switch
-//! order is one line in the records (`control: switch ..`), the busy answers of the connection itself included (the
-//! queue of orders is full, the wait is over, the order was dropped); an order that gets such an answer and then ends
-//! gets a second line when it ends.
+//! proxy started), `requests` (the requests of every class of the records, `closed` included, which got no answer, and
+//! those of a route that writes no record for them), `blocked` (the requests a rule blocked), `policy_refused` (the
+//! requests the access list or the rate limit turned away), `upstream_failures` (the failures of the servers of every
+//! upstream group of the configuration in force; they start from 0 when a reading of the configuration file again
+//! replaces it, as they do in `/metrics`), `config` (the 64 digits of the SHA-256 of the configuration file in force)
+//! and `config_reloads` (`{"replaced":..,"refused":..}`, the readings of the configuration file again by how they
+//! ended). The counts are those that `/metrics` shows; an answer without the figures is the answer of an older proxy.
+//! `{"op":"switch","expect":"<64 digits>"}` reads the rules store, and if the generation it chooses is not `expect` it
+//! does nothing and answers `refused` (`current changed`). Otherwise it does what SIGUSR1 does and answers when the
+//! switch has ended, `{"result":..,"generation":..}` with the generation that serves then and, when the result is not
+//! `switched`, a `reason`: `unchanged` (`already serving`), `refused` (`current changed`, `store refused`), `failed`
+//! (`driver did not take the order`, `not switched`) or `busy` (`starting`, `switch under way`, `too many orders`,
+//! `stopping`). A switch is waited for as long as the kernel may take to be ready and a margin; a client that has
+//! waited that long gets `busy` and `switch under way`, and the switch goes on. A line that is not a request gets
+//! `{"result":"error","reason":..}` with `line too long`, `malformed request`, `unknown op` or `bad expect`, and a
+//! status that the main loop does not answer within 2 s gets `no answer`. Each answer to a switch order is one line in
+//! the records (`control: switch ..`), the busy answers of the connection itself included (the queue of orders is full,
+//! the wait is over, the order was dropped); an order that gets such an answer and then ends gets a second line when it
+//! ends.
 
 use std::fs;
 use std::future::poll_fn;
@@ -103,7 +104,8 @@ impl Outcome {
 pub(super) struct Figures {
     /// The milliseconds since the proxy started.
     pub(super) uptime_ms: u64,
-    /// The answers written to clients, of every class.
+    /// The requests of every class of the records, `closed` (no answer) included, and those of a route that writes no
+    /// record.
     pub(super) requests: u64,
     /// The requests that a rule blocked.
     pub(super) blocked: u64,

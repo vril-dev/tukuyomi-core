@@ -8,7 +8,7 @@
 import { badge, button, buttonClass, el, mount, notice, result } from './dom.js';
 import { w } from './i18n.js';
 import { ROLES, passwordFits, tokenLines, tokenTable } from './account.js';
-import { Field, checkFields, confirmChange, emptyField, hashOf, instantOf, kv, openDialog, pageHead, panel, restoreFocus, row, textInput, timeView } from './parts.js';
+import { Field, checkFields, confirmChange, emptyField, hashOf, instantOf, kv, openDialog, pageHead, panel, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeView } from './parts.js';
 import { Table } from './table.js';
 
 /** The name of a user: 1 to 32 characters of a-z, 0-9, dot, underscore and hyphen. */
@@ -24,11 +24,9 @@ export function userActions(user, own) {
   return { self: false, role: true, toggle: user.disabled === true ? 'enable' : 'disable', password: true, resetMfa: user.mfa === true };
 }
 
-/** What is wrong with the fields of a new user, as `name`, `role` or `password`; null when nothing is. */
-export function userProblem({ name, role, password }) {
-  if (!NAME.test(name)) return 'name';
-  if (!ROLES.includes(role)) return 'role';
-  return passwordFits(password) ? null : 'password';
+/** The fields of a new user that are wrong, in the order of the form: `name`, `role` and `password`; none when all are right. */
+export function userProblems({ name, role, password }) {
+  return [NAME.test(name) ? null : 'name', ROLES.includes(role) ? null : 'role', passwordFits(password) ? null : 'password'].filter((field) => field !== null);
 }
 
 function roleSelect(current) {
@@ -71,9 +69,15 @@ class UsersScreen {
       columns: [
         { key: 'name', label: w('col.name'), value: (user) => String(user.name) },
         { key: 'role', label: w('col.role'), value: (user) => String(user.role), cell: (user) => badge('muted', String(user.role)) },
-        { key: 'state', label: w('col.state'), value: (user) => this.stateWords(user).join(' '), cell: (user) => this.stateBadges(user) },
-        { key: 'created', label: w('col.created'), value: (user) => instantOf(user.created), tight: true, cell: (user) => timeView(user.created) },
-        { key: 'changed', label: w('col.changed'), value: (user) => instantOf(user.changed), tight: true, cell: (user) => timeView(user.changed) },
+        {
+          key: 'state',
+          label: w('col.state'),
+          value: (user) => this.stateWords(user).join(' '),
+          text: (user) => this.stateWords(user).map((word) => STATES[word][1]().text()).join(' '),
+          cell: (user) => this.stateBadges(user),
+        },
+        { key: 'created', label: timeLabel(w('col.created')), value: (user) => instantOf(user.created), text: (user) => timeCellText(user.created), tight: true, cell: (user) => timeCell(user.created) },
+        { key: 'changed', label: timeLabel(w('col.changed')), value: (user) => instantOf(user.changed), text: (user) => timeCellText(user.changed), tight: true, cell: (user) => timeCell(user.changed) },
         {
           key: 'actions',
           label: w('col.actions'),
@@ -104,10 +108,10 @@ class UsersScreen {
 
   async load() {
     const asked = (this.reads += 1);
-    this.reloadButton.disabled = true;
+    setBusy(this.reloadButton, true);
     const [users, tokens] = await Promise.allSettled([this.ctx.api.call('GET', '/api/users'), this.ctx.api.call('GET', '/api/tokens')]);
     if (!this.alive || asked !== this.reads) return;
-    this.reloadButton.disabled = false;
+    setBusy(this.reloadButton, false);
     if (users.status === 'fulfilled') {
       this.users = Array.isArray(users.value.users) ? users.value.users : [];
       this.usersError = null;
@@ -146,11 +150,11 @@ class UsersScreen {
               event.preventDefault();
               if (submit.disabled) return;
               const typed = { name: name.control.value, role: role.control.value, password: password.control.value };
-              const problem = userProblem(typed);
+              const problems = userProblems(typed);
               const entries = [
-                [name, emptyOr(typed.name, problem === 'name' ? w('users.p_name') : null)],
-                [role, problem === 'role' ? w('users.p_role') : null],
-                [password, emptyOr(typed.password, problem === 'password' ? w('users.p_password') : null)],
+                [name, emptyOr(typed.name, problems.includes('name') ? w('users.p_name') : null)],
+                [role, problems.includes('role') ? w('users.p_role') : null],
+                [password, emptyOr(typed.password, problems.includes('password') ? w('users.p_password') : null)],
               ];
               if (!checkFields(entries)) return;
               const yes = await confirmChange(this.layer, {

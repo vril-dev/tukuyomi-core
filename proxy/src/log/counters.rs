@@ -279,7 +279,8 @@ impl Counters {
         }
     }
 
-    /// An answer of this `class` (the word of the record) was written.
+    /// A request of this `class` (the word of the record), whether or not an answer was written to it and a record is
+    /// written for it.
     pub fn add_request(&self, class: &str) {
         self.requests.add(class);
     }

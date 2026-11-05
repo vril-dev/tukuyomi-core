@@ -10,7 +10,7 @@ import { badge, button, el, mount, notice } from './dom.js';
 import { screens as generationScreens } from './generations.js';
 import { formatNumber, lazy, t, w } from './i18n.js';
 import { screens as importScreens } from './import.js';
-import { engineBadge, fingerprintView, generationState, hashOf, isFingerprint, kv, modeName, pageHead, panel, row, stat, timeView } from './parts.js';
+import { engineBadge, fingerprintView, generationState, hashOf, isFingerprint, kv, modeName, pageHead, panel, row, setBusy, stat, timeView } from './parts.js';
 import { screens as recordScreens } from './records.js';
 
 export { generationState };
@@ -42,49 +42,54 @@ export function countOf(data, key) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-/** Why a number of the overview is missing: the proxy cannot be reached, it had no room to answer, or it gives no such number. */
-function reasonFor(data) {
-  if (data.reachable === false) return w('overview.reason_unreachable');
-  if (data.proxy === null || typeof data.proxy !== 'object') return w('overview.reason_busy');
-  return w('overview.reason_old');
+/** The readings of the configuration file again (`{ replaced, refused }`), or null when the proxy gave none. */
+function reloadsOf(data) {
+  const reloads = data?.proxy?.config_reloads;
+  return reloads !== null && typeof reloads === 'object' && Number.isFinite(reloads.replaced) && Number.isFinite(reloads.refused) ? reloads : null;
 }
 
+/** Whether a proxy that answered left out a number of the overview, as an older proxy does. */
+function figuresLeftOut(data) {
+  const counts = ['uptime_ms', 'requests', 'blocked', 'policy_refused', 'upstream_failures'];
+  return counts.some((key) => countOf(data, key) === null) || reloadsOf(data) === null || !isFingerprint(data.proxy?.config);
+}
+
+/**
+ * The short word for a number that is missing: not read (the proxy cannot be reached, or had no room to answer), or not
+ * given (the proxy answered without it). Why is said once, in the panel of the proxy.
+ */
+function missingWord(data) {
+  return data.proxy !== null && typeof data.proxy === 'object' ? w('overview.not_given') : w('overview.missing');
+}
+
+/** The numbers of the proxy, in one row. A number that the proxy did not give is a dash and a short word (see `missingWord`). */
 function overviewStats(data) {
-  const reason = reasonFor(data);
   const count = (key) => countOf(data, key);
   const number = (key) => {
     const value = count(key);
     return value === null ? '—' : lazy(() => formatNumber(value));
   };
-  const missing = (key, sub = null) => (count(key) === null ? reason : sub);
+  const missing = (key, sub = null) => (count(key) === null ? missingWord(data) : sub);
   const uptime = count('uptime_ms');
   const failures = count('upstream_failures');
-  const reloads = data.proxy?.config_reloads;
-  const reloadsKnown = reloads !== null && typeof reloads === 'object' && Number.isFinite(reloads.replaced) && Number.isFinite(reloads.refused);
-  return [
-    el(
-      'div',
-      { class: 'tc-stats' },
-      stat(w('overview.requests'), number('requests'), missing('requests', uptime === null ? null : lazy(() => t('overview.since', { time: uptimeText(uptime) })))),
-      stat(w('overview.blocked'), number('blocked'), missing('blocked', w('overview.blocked_note'))),
-      stat(w('overview.policy'), number('policy_refused'), missing('policy_refused', w('overview.policy_note'))),
-      stat(
-        w('overview.failures'),
-        number('upstream_failures'),
-        missing('upstream_failures', [failures === 0 ? badge('ok', w('overview.failures_none')) : badge('warn', w('overview.failures_some')), w('overview.failures_note')]),
-      ),
+  const reloads = reloadsOf(data);
+  return el(
+    'div',
+    { class: 'tc-stats' },
+    stat(w('overview.requests'), number('requests'), missing('requests', uptime === null ? null : lazy(() => t('overview.since', { time: uptimeText(uptime) })))),
+    stat(w('overview.blocked'), number('blocked'), missing('blocked', w('overview.blocked_note'))),
+    stat(w('overview.policy'), number('policy_refused'), missing('policy_refused', w('overview.policy_note'))),
+    stat(
+      w('overview.failures'),
+      number('upstream_failures'),
+      missing('upstream_failures', [failures === 0 ? badge('ok', w('overview.failures_none')) : badge('warn', w('overview.failures_some')), w('overview.failures_note')]),
     ),
-    el(
-      'div',
-      { class: 'tc-stats' },
-      stat(w('overview.uptime'), uptime === null ? '—' : lazy(() => uptimeText(uptime)), uptime === null ? reason : null),
-      stat(
-        w('overview.reloads'),
-        reloadsKnown ? lazy(() => formatNumber(reloads.replaced)) : '—',
-        reloadsKnown ? lazy(() => t('overview.reloads_refused', { n: formatNumber(reloads.refused) })) : reason,
-      ),
+    stat(
+      w('overview.reloads'),
+      reloads === null ? '—' : lazy(() => formatNumber(reloads.replaced)),
+      reloads === null ? missingWord(data) : lazy(() => t('overview.reloads_refused', { n: formatNumber(reloads.refused) })),
     ),
-  ];
+  );
 }
 
 function proxyPanel(data) {
@@ -101,6 +106,7 @@ function proxyPanel(data) {
       row(w('status.engine'), engineBadge(proxy.engine)),
       row(w('status.switching'), proxy.switching ? badge('warn', w('status.switching_on')) : w('status.switching_off')),
     ),
+    figuresLeftOut(data) ? notice('info', w('overview.reason_old')) : null,
   );
 }
 
@@ -130,12 +136,11 @@ function generationsPanel(data) {
 }
 
 function configPanel(data) {
-  const reason = reasonFor(data);
   const config = data.proxy?.config;
   return panel(
     w('overview.config'),
     [],
-    kv(row(w('overview.config_sha'), isFingerprint(config) ? fingerprintView(config, { whole: true }) : el('span', { class: 'tc-muted' }, '—', ' ', reason))),
+    kv(row(w('overview.config_sha'), isFingerprint(config) ? fingerprintView(config) : el('span', { class: 'tc-muted' }, '—', ' ', missingWord(data)))),
     el('p', { class: 'tc-muted tc-small' }, w('overview.config_note')),
   );
 }
@@ -147,7 +152,7 @@ function mountOverview(ctx, root) {
   mount(root, pageHead(w('overview.title'), reload), stamp, body);
 
   const draw = (status) => {
-    reload.disabled = status.busy;
+    setBusy(reload, status.busy);
     reload.setAttribute('aria-busy', String(status.busy));
     mount(stamp, status.at === null ? null : [w('status.read_at'), ' ', timeView(status.at.getTime())]);
     const failed = status.error === null ? null : notice('bad', w('status.failed'), ' ', ctx.describe(status.error));

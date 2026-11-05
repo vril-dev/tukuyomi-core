@@ -6,7 +6,7 @@
 // shown, which may not be the one that sent it. Nothing runs when the module is loaded.
 
 import { ApiError } from './api.js';
-import { badge, button, buttonClass, el, mount, notice, result, setText } from './dom.js';
+import { append, badge, button, buttonClass, el, mount, notice, result, setText } from './dom.js';
 import { lazy, w } from './i18n.js';
 import {
   Field,
@@ -27,7 +27,8 @@ import {
   runningNotice,
   shortOf,
   textInput,
-  timeView,
+  timeCell,
+  timeLabel,
   working,
 } from './parts.js';
 import { Table } from './table.js';
@@ -282,8 +283,8 @@ class ImportScreen {
       ENGINES.map((name) => el('option', { value: name, selected: name === ENGINES[0] }, lazy(() => engineName(name)))),
     );
     this.engine.addEventListener('change', () => this.changed());
-    this.rulesField = new Field(w('import.choose'), this.picker(this.rules), { hint: w('import.rules_hint') });
-    this.dataField = new Field(w('import.choose'), this.picker(this.data), { hint: w('import.data_hint') });
+    this.rulesField = new Field(w('import.choose'), this.picker(this.rules), { hint: w('import.rules_hint'), asButton: true });
+    this.dataField = new Field(w('import.choose'), this.picker(this.data), { hint: w('import.data_hint'), asButton: true });
     this.detect = checkbox((checked) => {
       this.detectOnly = checked;
       this.changed();
@@ -324,9 +325,9 @@ class ImportScreen {
     this.unwatchEnded();
   }
 
-  /** The file input that adds to `list`. */
+  /** The file input that adds to `list`. It is hidden, and the name of its field opens it: the list below says what is chosen, and the input itself says nothing. */
   picker(list) {
-    const input = el('input', { type: 'file', multiple: true, class: 'tc-input' });
+    const input = el('input', { type: 'file', multiple: true, class: 'tc-file' });
     input.addEventListener('change', () => {
       for (const file of input.files) list.push({ file, name: file.name, size: file.size });
       // Cleared, so that the same file can be chosen again and the list is the only record of what is chosen.
@@ -594,14 +595,14 @@ class ImportScreen {
       el('span', {}, badge('ok', Object.hasOwn(RESULTS, answer.result) ? RESULTS[answer.result]() : String(answer.result)), ' ', w('import.done', { id: shortOf(id) })),
       w('import.notchosen'),
     );
-    mount(
-      this.results,
-      box,
+    // What the import made is told inside the box of its result.
+    append(box, [
       kv(row(w('col.fingerprint'), fingerprintView(id))),
       typeof answer.trial === 'object' && answer.trial !== null ? trialView(answer.trial) : null,
       // The address of the generation is made only from a fingerprint: what the answer holds is checked before it is used.
       isFingerprint(id) ? el('div', { class: 'tc-actions' }, el('a', { class: buttonClass(''), href: hashOf('generations', { id }) }, w('import.open'))) : null,
-    );
+    ]);
+    mount(this.results, box);
     restoreFocus(this.root, this.root.querySelector('h1'));
   }
 
@@ -617,7 +618,7 @@ class ImportScreen {
       return;
     }
     if (typeof answer?.trial === 'object' && answer.trial !== null) {
-      mount(this.results, result('bad', w('import.refused_title'), this.ctx.describe(error), null), trialView(answer.trial));
+      mount(this.results, append(result('bad', w('import.refused_title'), this.ctx.describe(error), null), [trialView(answer.trial)]));
       if (trialBlocked(answer)) this.offerAccept(answer.trial, body);
       return;
     }
@@ -671,7 +672,7 @@ class ImportScreen {
       empty: { title: w('gen.empty') },
       columns: [
         { key: 'fingerprint', label: w('col.fingerprint'), value: (item) => item.fingerprint, mono: true, cell: (item) => el('a', { class: 'tc-link tc-mono', href: hashOf('generations', { id: item.fingerprint }) }, `${shortOf(item.fingerprint)}…`) },
-        { key: 'made', label: w('col.made'), value: (item) => item.made, cell: (item) => timeView(item.made, 's') },
+        { key: 'made', label: timeLabel(w('col.made')), value: (item) => item.made, cell: (item) => timeCell(item.made, 's') },
       ],
     });
     table.update({ rows: items });

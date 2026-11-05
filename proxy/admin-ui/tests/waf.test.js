@@ -4,9 +4,9 @@ import { test } from 'node:test';
 
 import { ApiError } from '../js/api.js';
 import { actionsOf, screens as generationScreens } from '../js/generations.js';
-import { setLanguage } from '../js/i18n.js';
+import { setLanguage, w } from '../js/i18n.js';
 import { ENGINES, Ended, LIMITS, checkFiles, checkRouteList, importBody, routesOfRows, toBase64, trialBlocked } from '../js/import.js';
-import { instantOf, canChange, engineName, generationState, hashOf, shortOf, switchOutcome, timeText } from '../js/parts.js';
+import { instantOf, canChange, clock, engineName, generationState, hashOf, shortOf, switchOutcome, timeCellText, timeLabel, timeText } from '../js/parts.js';
 import { parseRoute } from '../js/app.js';
 import { PAGE_SIZE, filterRows, nextDirection, pageOf, sortRows } from '../js/table.js';
 import { countOf, uptimeText } from '../js/waf.js';
@@ -312,6 +312,11 @@ test('a time is written one way, in the zone of the user or in UTC, from seconds
   assert.match(timeText(1_795_000_000_000, false), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}（.+）$/);
   setLanguage('en');
   assert.equal(timeText(1_795_000_000_000, true), '2026-11-18 11:06:40 (UTC)');
+  // In a table the name of the column says the zone once, and a cell in that zone does not repeat it.
+  clock.utc = true;
+  assert.equal(timeLabel(w('col.time')).text(), 'Time (UTC)');
+  assert.equal(timeCellText(1_795_000_000_000), '2026-11-18 11:06:40');
+  clock.utc = false;
 });
 
 test('rows are sorted by a column, filtered by text and cut into pages, at the edges of each', () => {
@@ -334,6 +339,10 @@ test('rows are sorted by a column, filtered by text and cut into pages, at the e
   assert.deepEqual(filterRows(rows, columns, ' B ').map((row) => row.name), ['b']);
   assert.deepEqual(filterRows(rows, columns, '10'), []);
   assert.equal(filterRows(rows, columns, '   ').length, 4);
+  // A column whose cell shows other words than its value is looked in by what it shows, not by what it is sorted by.
+  const shown = [{ value: (row) => row.n * 1000, text: (row) => `#${row.name}` }];
+  assert.deepEqual(filterRows(rows, shown, '#a').map((row) => row.name), ['a']);
+  assert.deepEqual(filterRows(rows, shown, '9000'), []);
 
   assert.equal(PAGE_SIZE, 50);
   assert.deepEqual(pageOf(0, 50, 0), { page: 0, pages: 1, from: 0, to: 0 });

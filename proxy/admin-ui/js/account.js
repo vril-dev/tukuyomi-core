@@ -14,7 +14,7 @@
 import { ApiError } from './api.js';
 import { badge, bindAttribute, button, el, mount, notice, result } from './dom.js';
 import { w } from './i18n.js';
-import { Field, checkFields, confirmChange, copyButton, emptyField, kv, pageHead, panel, restoreFocus, row, textInput, timeView, timeWords } from './parts.js';
+import { Field, checkFields, confirmChange, copyButton, emptyField, kv, pageHead, panel, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeWords } from './parts.js';
 import { darkRuns, encode } from './qr.js';
 import { Table } from './table.js';
 
@@ -44,22 +44,26 @@ export function passwordFits(password) {
   return size >= PASSWORD_MIN && size <= PASSWORD_MAX;
 }
 
-/** What is wrong with a change of the password, as `mismatch`, `length` or `same`; null when nothing is. */
-export function passwordProblem(current, next, again) {
-  if (next !== again) return 'mismatch';
-  if (!passwordFits(next)) return 'length';
-  return next === current ? 'same' : null;
+/**
+ * What is wrong with a change of the password, in the order of the form: `length` or `same` for the new password, and
+ * `mismatch` for the second one; none when nothing is.
+ */
+export function passwordProblems(current, next, again) {
+  const onNext = !passwordFits(next) ? 'length' : next === current ? 'same' : null;
+  return [onNext, next === again ? null : 'mismatch'].filter((problem) => problem !== null);
 }
 
 /**
- * What is wrong with the fields of a new token (`days` is the text of the field), as `name`, `role` or `days`; null
- * when nothing is. `own` is the role of the user, which no token may be above.
+ * The fields of a new token that are wrong (`days` is the text of the field), in the order of the form: `name`, `role`
+ * and `days`; none when all are right. `own` is the role of the user, which no token may be above.
  */
-export function tokenProblem({ name, role, days }, own) {
-  if (!TOKEN_NAME.test(name)) return 'name';
-  if (!rolesUpTo(own).includes(role)) return 'role';
+export function tokenProblems({ name, role, days }, own) {
   const count = /^\d{1,3}$/.test(days) ? Number(days) : 0;
-  return count >= DAYS.min && count <= DAYS.max ? null : 'days';
+  return [
+    TOKEN_NAME.test(name) ? null : 'name',
+    rolesUpTo(own).includes(role) ? null : 'role',
+    count >= DAYS.min && count <= DAYS.max ? null : 'days',
+  ].filter((field) => field !== null);
 }
 
 /** The code of the second factor as it is sent: six digits stay; anything else is a recovery code, in capitals. */
@@ -243,11 +247,12 @@ export function passwordForm(ctx, { username, messages, onChanged }) {
           event.preventDefault();
           if (submit.disabled) return;
           const typed = { current: current.control.value, next: next.control.value, again: again.control.value };
-          const problem = passwordProblem(typed.current, typed.next, typed.again);
+          const problems = passwordProblems(typed.current, typed.next, typed.again);
+          const onNext = problems.find((problem) => problem === 'length' || problem === 'same') ?? null;
           const entries = [
             [current, emptyOr(typed.current, null)],
-            [next, emptyOr(typed.next, problem === 'length' || problem === 'same' ? PASSWORD_PROBLEMS[problem]() : null)],
-            [again, emptyOr(typed.again, problem === 'mismatch' ? PASSWORD_PROBLEMS.mismatch() : null)],
+            [next, emptyOr(typed.next, onNext === null ? null : PASSWORD_PROBLEMS[onNext]())],
+            [again, emptyOr(typed.again, problems.includes('mismatch') ? PASSWORD_PROBLEMS.mismatch() : null)],
           ];
           if (!checkFields(entries)) return;
           await ctx.guarded(
@@ -478,17 +483,19 @@ export function tokenTable({ owner, remove }) {
       { key: 'role', label: w('col.role'), value: (token) => String(token.role), cell: (token) => badge('muted', String(token.role)) },
       {
         key: 'expires',
-        label: w('col.expires'),
+        label: timeLabel(w('col.expires')),
         value: (token) => token.expires,
+        text: (token) => [timeCellText(token.expires), token.expired === true ? w('tokens.expired').text() : ''].join(' '),
         tight: true,
-        cell: (token) => el('span', { class: 'tc-badges' }, timeView(token.expires), token.expired === true ? badge('bad', w('tokens.expired')) : null),
+        cell: (token) => el('span', { class: 'tc-badges' }, timeCell(token.expires), token.expired === true ? badge('bad', w('tokens.expired')) : null),
       },
       {
         key: 'last_used',
-        label: w('col.last_used'),
+        label: timeLabel(w('col.last_used')),
         value: (token) => token.last_used ?? null,
+        text: (token) => (token.last_used === null || token.last_used === undefined ? w('tokens.never').text() : timeCellText(token.last_used)),
         tight: true,
-        cell: (token) => (token.last_used === null || token.last_used === undefined ? w('tokens.never') : timeView(token.last_used)),
+        cell: (token) => (token.last_used === null || token.last_used === undefined ? w('tokens.never') : timeCell(token.last_used)),
       },
       { key: 'id', label: w('col.id'), value: (token) => String(token.id), mono: true },
       {
@@ -560,10 +567,10 @@ class AccountScreen {
 
   async load() {
     const asked = (this.reads += 1);
-    this.reloadButton.disabled = true;
+    setBusy(this.reloadButton, true);
     const [session, tokens] = await Promise.allSettled([this.ctx.api.call('GET', '/api/session'), this.ctx.api.call('GET', '/api/account/tokens')]);
     if (!this.alive || asked !== this.reads) return;
-    this.reloadButton.disabled = false;
+    setBusy(this.reloadButton, false);
     if (session.status === 'fulfilled') {
       this.session = session.value;
       this.sessionError = null;
@@ -770,12 +777,12 @@ class AccountScreen {
             event.preventDefault();
             if (submit.disabled || held.token !== null) return;
             const typed = { name: name.control.value, role: role.control.value, days: days.control.value.trim() };
-            const problem = tokenProblem(typed, own);
+            const problems = tokenProblems(typed, own);
             const secret = password.control.value;
             const entries = [
-              [name, emptyOr(typed.name, problem === 'name' ? w('tokens.p_name') : null)],
-              [role, problem === 'role' ? w('tokens.p_role') : null],
-              [days, emptyOr(typed.days, problem === 'days' ? w('tokens.p_days') : null)],
+              [name, emptyOr(typed.name, problems.includes('name') ? w('tokens.p_name') : null)],
+              [role, problems.includes('role') ? w('tokens.p_role') : null],
+              [days, emptyOr(typed.days, problems.includes('days') ? w('tokens.p_days') : null)],
               [password, emptyOr(secret, null)],
             ];
             if (!checkFields(entries)) return;

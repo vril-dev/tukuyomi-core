@@ -2,8 +2,8 @@
 // that were received 50 at a time, a state for an empty list and one for a list that is being read, and on a narrow
 // screen a row that is one box (the cells are named by `data-label`). The rules of sorting, filtering and paging are
 // plain functions, `sortRows`, `filterRows` and `pageOf`; `Table` draws what they give. A list that the server reads
-// in parts (the records) hangs the buttons that read the parts on the ends of the pager (`edges`). Nothing runs when
-// the module is loaded.
+// in parts (the records) hangs the buttons that read the parts on the ends of the pager (`edges`: each gives the
+// promise of its read). Nothing runs when the module is loaded.
 
 import { button, el, mount } from './dom.js';
 import { formatNumber, lazy, t, w } from './i18n.js';
@@ -37,15 +37,16 @@ export function sortRows(rows, column, direction) {
 }
 
 /**
- * The rows that hold every word of `query` (words are told by spaces, case does not matter) in the value of some
- * column. A column with `filter: false` is not looked in. A blank query keeps all the rows.
+ * The rows that hold every word of `query` (words are told by spaces, case does not matter) in the text that some
+ * column shows: `column.text(row)` for a column whose cell shows other words than its value (a time, a state in words),
+ * else the value. A column with `filter: false` is not looked in. A blank query keeps all the rows.
  */
 export function filterRows(rows, columns, query) {
   const terms = query.toLowerCase().split(/\s+/).filter((term) => term !== '');
   if (terms.length === 0) return rows;
   const looked = columns.filter((column) => column.filter !== false);
   return rows.filter((row) => {
-    const text = looked.map((column) => String(column.value(row) ?? '')).join('\n').toLowerCase();
+    const text = looked.map((column) => String((column.text ?? column.value)(row) ?? '')).join('\n').toLowerCase();
     return terms.every((term) => text.includes(term));
   });
 }
@@ -64,13 +65,30 @@ export function nextDirection(direction) {
   return direction === 'ascending' ? 'descending' : 'ascending';
 }
 
+// The tables that hold a filter that was typed in, weakly: a change of the language or of the way times are written
+// changes the text of the cells, and `refilter` applies the filter again to the new text.
+const filtered = new Set();
+const dropped = new FinalizationRegistry((ref) => filtered.delete(ref));
+
+/** Applies the filter of every table that has one again, after the text of the cells changed (see `retranslate` in `dom.js`). */
+export function refilter() {
+  for (const ref of filtered) {
+    const table = ref.deref();
+    if (table === undefined) filtered.delete(ref);
+    else table.draw();
+  }
+}
+
 export class Table {
   /**
-   * `columns` are `{ key, label, value(row), cell(row)?, sortable?, num?, mono?, tight?, filter? }`: `value` is what
-   * is sorted and looked in, `cell` is what is shown (the value as text when there is none). `rowKey(row, index)` names
-   * a row (`index` is its place in the rows that were given); `empty` is `{ title, hint?, action? }` for a list with no rows; `sort` is the starting `{ key, direction }`.
+   * `columns` are `{ key, label, value(row), cell(row)?, text(row)?, sortable?, num?, mono?, tight?, long?, filter? }`:
+   * `value` is what is sorted, `cell` is what is shown (the value as text when there is none), and the filter looks in
+   * `text`, the text of the cell, when it is not the value (see `filterRows`); `long` is for a long value with no space
+   * in it (a path), which may break anywhere. `rowKey(row, index)` names a row (`index` is its place in the rows that
+   * were given); `empty` is `{ title, hint?, action? }` for a list with no rows; `sort` is the starting `{ key, direction }`;
+   * `dense` draws the cells closer, for a table of many columns.
    */
-  constructor({ caption, columns, rowKey, empty, filter = true, size = PAGE_SIZE, sort = null }) {
+  constructor({ caption, columns, rowKey, empty, filter = true, size = PAGE_SIZE, sort = null, dense = false }) {
     this.columns = columns;
     this.rowKey = rowKey;
     this.empty = empty;
@@ -84,18 +102,23 @@ export class Table {
     this.sort = sort;
     this.page = 0;
     this.headers = new Map();
+    /** The element of each column that holds its name, which is written again with each drawing (the name of a column of times says the zone). */
+    this.labels = new Map();
 
     this.input = el('input', { class: 'tc-input', type: 'search', autocomplete: 'off', spellcheck: 'false', 'aria-label': w('table.filter'), placeholder: w('table.filter') });
+    this.ref = new WeakRef(this);
+    dropped.register(this, this.ref);
     this.input.addEventListener('input', () => {
       this.query = this.input.value;
       this.page = 0;
+      this.follow();
       this.draw();
     });
     this.count = el('span', { class: 'tc-muted tc-small', role: 'status' });
     this.body = el('tbody');
     this.table = el(
       'table',
-      { class: 'tc-table' },
+      { class: dense ? 'tc-table tc-table--dense' : 'tc-table' },
       el('caption', {}, caption),
       el('thead', {}, el('tr', {}, columns.map((column) => this.header(column)))),
       this.body,
@@ -103,7 +126,8 @@ export class Table {
     this.notes = el('div');
     // The buttons of the pager are made once, so that the focus stays on the one that was pressed; what they do is set when the pager is drawn.
     this.moves = { before: null, after: null };
-    this.range = el('span', { role: 'status' });
+    // The line that says which rows are shown takes the focus when neither button of the pager can.
+    this.range = el('span', { role: 'status', tabindex: '-1' });
     this.before = button('small', w('table.prev'), () => this.move('before'));
     this.after = button('small', w('table.next'), () => this.move('after'));
     this.pager = el('div', { class: 'tc-pager' }, this.range, el('span', { class: 'tc-actions' }, this.before, this.after));
@@ -116,8 +140,11 @@ export class Table {
     const th = el('th', { scope: 'col', class: column.num ? 'tc-num' : null });
     if (column.sortable === false) {
       mount(th, column.label);
+      this.labels.set(column.key, th);
     } else {
-      mount(th, button('', column.label, () => this.sortBy(column.key), { class: 'tc-sort' }));
+      const sort = button('', column.label, () => this.sortBy(column.key), { class: 'tc-sort' });
+      mount(th, sort);
+      this.labels.set(column.key, sort);
     }
     this.headers.set(column.key, th);
     return th;
@@ -135,6 +162,12 @@ export class Table {
     if ('selected' in patch) this.selected = patch.selected;
     if ('edges' in patch) this.edges = patch.edges;
     this.draw();
+  }
+
+  /** Keeps this table among those whose filter `refilter` applies again while a filter is typed in. */
+  follow() {
+    if (this.query.trim() === '') filtered.delete(this.ref);
+    else filtered.add(this.ref);
   }
 
   sortBy(key) {
@@ -169,6 +202,8 @@ export class Table {
       if (this.sort?.key === key) th.setAttribute('aria-sort', this.sort.direction);
       else th.removeAttribute('aria-sort');
     }
+    // The names are worked out with the cells, so that a name that says the zone of the times says the one the cells use.
+    for (const column of this.columns) mount(this.labels.get(column.key), column.label);
     this.node.setAttribute('aria-busy', String(this.loading));
     this.drawCount(rows.length);
     mount(this.body, rows.slice(page.from === 0 ? 0 : page.from - 1, page.to).map((row) => this.line(row)));
@@ -198,7 +233,7 @@ export class Table {
       this.columns.map((column) =>
         el(
           'td',
-          { 'data-label': column.label, class: [column.num ? 'tc-num' : '', column.mono ? 'tc-mono' : '', column.tight ? 'tc-tight' : ''].filter(Boolean).join(' ') || null },
+          { 'data-label': column.label, class: [column.num ? 'tc-num' : '', column.mono ? 'tc-mono' : '', column.tight ? 'tc-tight' : '', column.long ? 'tc-long' : ''].filter(Boolean).join(' ') || null },
           column.cell === undefined ? String(column.value(row) ?? '') : column.cell(row),
         ),
       ),
@@ -217,6 +252,7 @@ export class Table {
         button('small', w('table.clear'), () => {
           this.input.value = '';
           this.query = '';
+          this.follow();
           this.draw();
           this.input.focus();
         }),
@@ -238,14 +274,35 @@ export class Table {
     this.after.disabled = this.moves.after === null;
     mount(
       this.range,
-      lazy(() => t('table.range', { from: formatNumber(page.from), to: formatNumber(page.to), total: formatNumber(count) })),
+      // With no row there is no range to name: the count alone.
+      count === 0
+        ? lazy(() => t('table.count', { n: formatNumber(0) }))
+        : lazy(() => t('table.range', { from: formatNumber(page.from), to: formatNumber(page.to), total: formatNumber(count) })),
       edges?.note === undefined || edges?.note === null ? null : [' ', edges.note],
     );
   }
 
-  /** Goes to the page before or after, or reads the part of the records that comes before or after (`edges`). Nothing happens while a read is under way. */
+  /**
+   * Goes to the page before or after, or reads the part of the records that comes before or after (`edges`). Nothing
+   * happens while a read is under way. A button that the move turned off cannot keep the focus: it goes to the other
+   * button, or to the line that says which rows are shown. While a part is read, the focus waits on that line, and
+   * when the read ends it goes back to the button that was pressed, else to the other one.
+   */
   move(side) {
-    if (!this.loading) this.moves[side]?.();
+    if (this.loading) return;
+    const [pressed, other] = side === 'before' ? [this.before, this.after] : [this.after, this.before];
+    const landing = () => (pressed.disabled ? (other.disabled ? this.range : other) : pressed).focus();
+    const read = this.moves[side]?.();
+    if (typeof read?.then !== 'function') {
+      if (pressed.disabled) landing();
+      return;
+    }
+    this.range.focus();
+    read.then(() => {
+      // The user may have gone elsewhere meanwhile; then the focus stays there.
+      const active = globalThis.document.activeElement;
+      if (active === this.range || active === null || active === globalThis.document.body) landing();
+    });
   }
 
   go(page) {

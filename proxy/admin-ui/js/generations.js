@@ -16,6 +16,7 @@ import {
   engineBadge,
   engineName,
   findingsView,
+  fingerprintText,
   fingerprintView,
   generationState,
   hashOf,
@@ -30,11 +31,16 @@ import {
   restoreFocus,
   row,
   runningNotice,
+  setBusy,
   shortOf,
   switchOutcome,
+  timeCell,
+  timeCellText,
+  timeLabel,
   timeView,
   instantOf,
   wordBadge,
+  wordText,
   working,
 } from './parts.js';
 import { Table } from './table.js';
@@ -80,7 +86,7 @@ export function actionsOf(role, generation, { hasChosen, rollbackTo, servingKnow
 export function diffRows(now, after, { gone = false } = {}) {
   const same = (key) => now?.[key] === after?.[key];
   const text = (item, key, show) => (item === null || item === undefined || item[key] === undefined ? '—' : show(item[key]));
-  const fp = (value) => `${shortOf(value)}…`;
+  const fp = (value) => el('span', { class: 'tc-mono' }, `${shortOf(value)}…`);
   const lines = [
     [() => w('col.fingerprint'), 'fingerprint', fp],
     [() => w('col.mode'), 'mode', (value) => lazy(() => modeName(value))],
@@ -124,7 +130,7 @@ class Screen {
 
   showRunning() {
     mount(this.running, runningNotice());
-    this.reloadButton.disabled = this.loading || working.name !== null;
+    setBusy(this.reloadButton, this.loading || working.name !== null);
   }
 
   onWorking(name) {
@@ -226,12 +232,13 @@ class GenerationsScreen extends Screen {
           key: 'fingerprint',
           label: w('col.fingerprint'),
           value: (item) => item.fingerprint,
+          text: (item) => `${shortOf(item.fingerprint)}…`,
           mono: true,
           cell: (item) => el('a', { class: 'tc-link tc-mono', href: hashOf('generations', { id: item.fingerprint }), title: item.fingerprint }, `${shortOf(item.fingerprint)}…`),
         },
-        { key: 'made', label: w('col.made'), value: (item) => item.made, tight: true, cell: (item) => timeView(item.made, 's') },
-        { key: 'mode', label: w('col.mode'), value: (item) => item.mode, cell: (item) => modeBadge(item.mode) },
-        { key: 'engine', label: w('col.engine'), value: (item) => item.engine, cell: (item) => engineBadge(item.engine) },
+        { key: 'made', label: timeLabel(w('col.made')), value: (item) => item.made, text: (item) => timeCellText(item.made, 's'), tight: true, cell: (item) => timeCell(item.made, 's') },
+        { key: 'mode', label: w('col.mode'), value: (item) => item.mode, text: (item) => modeName(item.mode), cell: (item) => modeBadge(item.mode) },
+        { key: 'engine', label: w('col.engine'), value: (item) => item.engine, text: (item) => engineName(item.engine), cell: (item) => engineBadge(item.engine) },
         { key: 'routes', label: w('col.routes'), value: (item) => item.routes, num: true },
         { key: 'state', label: w('col.state'), value: (item) => this.stateWords(item).map((name) => STATES[name].text()).join(' '), cell: (item) => this.stateBadges(item) },
         { key: 'actions', label: w('col.actions'), value: () => '', sortable: false, filter: false, cell: (item) => this.actions(item) },
@@ -314,9 +321,9 @@ class GenerationsScreen extends Screen {
       rowKey: (file) => String(file.path),
       empty: { title: w('status.none') },
       columns: [
-        { key: 'path', label: w('col.path'), value: (file) => String(file.path), mono: true },
-        { key: 'size', label: w('col.size'), value: (file) => file.size, num: true, tight: true, cell: (file) => bytesText(file.size) },
-        { key: 'sha256', label: w('col.sha256'), value: (file) => String(file.sha256), mono: true },
+        { key: 'path', label: w('col.path'), value: (file) => String(file.path), mono: true, long: true },
+        { key: 'size', label: w('col.size'), value: (file) => file.size, text: (file) => bytesText(file.size), num: true, tight: true, cell: (file) => bytesText(file.size) },
+        { key: 'sha256', label: w('col.sha256'), value: (file) => String(file.sha256), text: (file) => fingerprintText(file.sha256), mono: true, cell: (file) => fingerprintView(file.sha256, { copy: false }) },
       ],
     });
     filesTable.update({ rows: files });
@@ -327,7 +334,7 @@ class GenerationsScreen extends Screen {
       empty: { title: w('gen.no_routes') },
       columns: [
         { key: 'host', label: w('col.host'), value: (route) => route.host ?? '', cell: (route) => (route.host === undefined ? el('span', { class: 'tc-muted' }, w('gen.any_host')) : String(route.host)) },
-        { key: 'path', label: w('col.path'), value: (route) => String(route.path), mono: true },
+        { key: 'path', label: w('col.path'), value: (route) => String(route.path), mono: true, long: true },
         { key: 'action', label: w('col.action'), value: (route) => String(route.action) },
       ],
     });
@@ -466,12 +473,12 @@ class HistoryScreen extends Screen {
       rowKey: (entry, at) => String(at),
       empty: { title: w('history.empty') },
       columns: [
-        { key: 'ts', label: w('col.time'), value: (entry) => instantOf(entry.ts), tight: true, cell: (entry) => timeView(entry.ts) },
+        { key: 'ts', label: timeLabel(w('col.time')), value: (entry) => instantOf(entry.ts), text: (entry) => timeCellText(entry.ts), tight: true, cell: (entry) => timeCell(entry.ts) },
         { key: 'actor', label: w('col.by'), value: (entry) => String(entry.actor) },
         { key: 'kind', label: w('col.kind'), value: (entry) => (Object.hasOwn(KINDS, entry.kind) ? KINDS[entry.kind]() : String(entry.kind)) },
-        { key: 'from', label: w('col.from'), value: (entry) => entry.from ?? '', mono: true, cell: fp('from') },
-        { key: 'to', label: w('col.to'), value: (entry) => entry.to ?? '', mono: true, cell: fp('to') },
-        { key: 'result', label: w('col.result'), value: (entry) => String(entry.result), cell: (entry) => wordBadge(entry.result) },
+        { key: 'from', label: w('col.from'), value: (entry) => entry.from ?? '', text: (entry) => fingerprintText(entry.from), mono: true, cell: fp('from') },
+        { key: 'to', label: w('col.to'), value: (entry) => entry.to ?? '', text: (entry) => fingerprintText(entry.to), mono: true, cell: fp('to') },
+        { key: 'result', label: w('col.result'), value: (entry) => String(entry.result), text: (entry) => wordText(entry.result), cell: (entry) => wordBadge(entry.result) },
       ],
     });
     mount(this.body, this.target, this.table.node);

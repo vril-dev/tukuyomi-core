@@ -162,6 +162,8 @@ function fakePage() {
   document.body = new Element('body');
   document.append(document.body);
   document.activeElement = document.body;
+  document.addEventListener = () => {};
+  document.removeEventListener = () => {};
   document.createElement = (tag) => new Element(tag);
   document.createElementNS = (space, tag) => new Element(tag);
   document.createTextNode = (data) => new Text(data);
@@ -252,7 +254,7 @@ const wait = () => new Promise((resolve) => setTimeout(resolve, 0));
 const FP = 'a'.repeat(64);
 const OTHER = 'b'.repeat(64);
 
-test('the overview shows the numbers of the proxy, and a dash with the reason where the proxy gave none', () => {
+test('the overview shows the numbers of the proxy, and a dash where the proxy gave none, with the reason said once', () => {
   setLanguage('en');
   const mountOverview = wafScreens[0].mount;
   const shown = (proxy, reachable = true) => {
@@ -263,12 +265,16 @@ test('the overview shows the numbers of the proxy, and a dash with the reason wh
     return root.textContent;
   };
   const full = shown({ phase: 'ready', mode: 'block', engine: 'coraza', switching: false, generation: FP, uptime_ms: 3_700_000, requests: 12408, blocked: 31, policy_refused: 6, upstream_failures: 0, config: OTHER, config_reloads: { replaced: 3, refused: 1 } });
-  for (const text of ['12,408', 'Up for 1 h 1 min', 'Refused 1', OTHER]) assert.equal(full.includes(text), true, text);
+  for (const text of ['12,408', 'Up for 1 h 1 min', 'Refused 1', `${OTHER.slice(0, 12)}…`]) assert.equal(full.includes(text), true, text);
+  assert.equal(full.includes('Not read'), false);
+  const times = (text, part) => text.split(part).length - 1;
   // An old proxy gives none of the numbers; a number that is 0 is a number and is not confused with a missing one.
   const old = shown({ phase: 'ready', mode: 'block', engine: 'coraza', switching: false, generation: FP, requests: null, blocked: 0 });
-  assert.equal(old.includes('This proxy does not give this number.'), true);
+  assert.equal(times(old, 'This proxy does not give the numbers of the overview that show —.'), 1);
   assert.equal(old.includes('—'), true);
-  assert.equal(shown(null, false).includes('Not read: the proxy cannot be reached.'), true);
+  const away = shown(null, false);
+  assert.equal(times(away, 'The proxy cannot be reached.'), 1);
+  assert.equal(times(away, 'Not read'), 6);
 });
 
 test('the list of generations is a table, and the address of one generation opens its detail and closes it again', async () => {

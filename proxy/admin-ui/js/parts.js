@@ -4,7 +4,7 @@
 // words of the page in them are `Words` (see `dom.js`). Nothing runs when the module is loaded.
 
 import { ApiError } from './api.js';
-import { badge, button, el, mount, notice, result } from './dom.js';
+import { badge, button, buttonClass, el, mount, notice, result } from './dom.js';
 import { language, lazy, t, w } from './i18n.js';
 
 /** Whether a user of this role may import, choose, roll back and remove (the API checks it again). */
@@ -64,16 +64,47 @@ function zoneName(date) {
   return `UTC${offset < 0 ? '-' : '+'}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`;
 }
 
-/** The one way a time is written: `2026-11-04 16:33:56（JST）`, or with `（UTC）` when `utc` is true. */
-export function timeText(ms, utc) {
-  const date = new Date(ms);
+/** `2026-11-04 16:33:56`: the date and the time of `date` in UTC, or in the time of the user's place. */
+function stampOf(date, utc) {
   const part = utc
     ? [date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate(), date.getUTCHours(), date.getUTCMinutes(), date.getUTCSeconds()]
     : [date.getFullYear(), date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds()];
   const [year, month, day, hour, minute, second] = part;
-  const stamp = `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}:${pad(second)}`;
-  const zone = utc ? 'UTC' : zoneName(date);
-  return language() === 'ja' ? `${stamp}（${zone}）` : `${stamp} (${zone})`;
+  return `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}:${pad(second)}`;
+}
+
+/** `text` with the name of a zone after it, as the language writes it: `時刻（JST）`, `Time (JST)`. */
+function zoned(text, zone) {
+  return language() === 'ja' ? `${text}（${zone}）` : `${text} (${zone})`;
+}
+
+/** The one way a time is written: `2026-11-04 16:33:56（JST）`, or with `（UTC）` when `utc` is true. */
+export function timeText(ms, utc) {
+  const date = new Date(ms);
+  return zoned(stampOf(date, utc), utc ? 'UTC' : zoneName(date));
+}
+
+/** The zone that the times of a table are written in: UTC, or the zone of the user's place now. */
+function tableZone() {
+  return clock.utc ? 'UTC' : zoneName(new Date());
+}
+
+/** The name of a column of times: `words`, and the zone that the cells are written in (see `timeCell`). */
+export function timeLabel(words) {
+  return lazy(() => zoned(words.text(), tableZone()));
+}
+
+/**
+ * The text of a time in a table: written the way the bar says, without the zone, which the name of the column says
+ * (see `timeLabel`). A time of the year when the place is in another zone (summer time) keeps its own. A value that is
+ * no time is text.
+ */
+export function timeCellText(value, unit = 'ms') {
+  const ms = instantOf(value, unit);
+  if (ms === null) return String(value ?? '');
+  const date = new Date(ms);
+  const zone = clock.utc ? 'UTC' : zoneName(date);
+  return zone === tableZone() ? stampOf(date, clock.utc) : zoned(stampOf(date, clock.utc), zone);
 }
 
 /** A time for a screen: written the way the bar says, and the other way as its title. A value that is no time is text. */
@@ -85,6 +116,13 @@ export function timeView(value, unit = 'ms') {
     { datetime: new Date(ms).toISOString(), title: lazy(() => timeText(ms, !clock.utc)) },
     lazy(() => timeText(ms, clock.utc)),
   );
+}
+
+/** A time for a cell of a table (see `timeCellText`), with the other way, and the zone, as its title. */
+export function timeCell(value, unit = 'ms') {
+  const ms = instantOf(value, unit);
+  if (ms === null) return el('span', {}, String(value ?? ''));
+  return el('time', { datetime: new Date(ms).toISOString(), title: lazy(() => timeText(ms, !clock.utc)) }, lazy(() => timeCellText(ms)));
 }
 
 /** The words of a time, for a place that takes words (not an element). */
@@ -187,9 +225,10 @@ export function textInput(attributes = {}) {
 /**
  * One field of a form: its name, the control, a line of help, and the place of the error. `invalid(words)` shows the
  * error under the control and ties it to the control (`aria-invalid`, `aria-describedby`); `valid()` takes it away.
+ * `asButton` draws the name as a button, for a control that is hidden and that its name opens (a file input).
  */
 export class Field {
-  constructor(label, control, { hint = null, required = false } = {}) {
+  constructor(label, control, { hint = null, required = false, asButton = false } = {}) {
     const id = nextId('field');
     this.control = control;
     this.hintId = hint === null ? null : `${id}-hint`;
@@ -203,7 +242,7 @@ export class Field {
     this.node = el(
       'div',
       { class: 'tc-field' },
-      el('label', { class: 'tc-label', for: id }, label, required ? el('span', { class: 'tc-req' }, w('field.required')) : null),
+      el('label', { class: asButton ? buttonClass('') : 'tc-label', for: id }, label, required ? el('span', { class: 'tc-req' }, w('field.required')) : null),
       control,
       this.hint,
       this.error,
@@ -268,6 +307,12 @@ export function copyButton(text, target = null) {
   return el('span', { class: 'tc-actions' }, copy, status);
 }
 
+/** The text of the short form of a fingerprint (see `fingerprintView`): its first 12 digits and `…`. */
+export function fingerprintText(value) {
+  if (!isFingerprint(value)) return typeof value === 'string' ? value : t('status.none');
+  return `${shortOf(value)}…`;
+}
+
 /** A fingerprint: its first 12 digits, and the whole of it as the title and by the copy button (`whole`: all of it is shown). */
 export function fingerprintView(value, { whole = false, copy = true } = {}) {
   if (!isFingerprint(value)) {
@@ -318,6 +363,26 @@ export function restoreFocus(root, fallback = null) {
   }
   const line = key === null ? null : [...root.querySelectorAll('[data-row]')].find((item) => item.getAttribute('data-row') === key);
   (line ?? fallback)?.focus();
+}
+
+/**
+ * Puts the focus on `control` when it is nowhere: on no element, on the page itself, or on an element that is gone (the
+ * browser moves the focus away from it only later). A button that the page turned off while it worked cannot keep the
+ * focus, and gets it back so when it is turned on again.
+ */
+export function keepFocus(control) {
+  const active = globalThis.document.activeElement;
+  if (active === null || active === globalThis.document.body || !active.isConnected) control.focus();
+}
+
+// The buttons that had the focus when they were turned off while the page worked.
+const held = new WeakSet();
+
+/** Turns `control` off while `busy`, and on again after; a control that had the focus when it was turned off gets it back (see `keepFocus`). */
+export function setBusy(control, busy) {
+  if (busy && !control.disabled && globalThis.document.activeElement === control) held.add(control);
+  control.disabled = busy;
+  if (!busy && held.delete(control)) keepFocus(control);
 }
 
 function dialogOf(layer, heading, wide, body, foot) {
@@ -552,6 +617,11 @@ export function modeBadge(mode) {
 export function wordBadge(word) {
   const known = Object.hasOwn(OUTCOMES, word) && SWITCH_WORDS.includes(word);
   return badge(known ? OUTCOMES[word][0] : 'muted', known ? OUTCOMES[word][1]() : String(word));
+}
+
+/** The text of the badge of a word of the proxy's (see `wordBadge`). */
+export function wordText(word) {
+  return Object.hasOwn(OUTCOMES, word) && SWITCH_WORDS.includes(word) ? OUTCOMES[word][1]().text() : String(word);
 }
 
 /** The box that tells how a request to switch ended and what to do next. `describe` words a failed call. */

@@ -8,7 +8,7 @@
 
 import { badge, button, buttonClass, el, mount, notice } from './dom.js';
 import { w } from './i18n.js';
-import { Field, checkFields, checkbox, choice, fingerprintView, hashOf, instantOf, kv, pageHead, panelWith, restoreFocus, row, textInput, timeView } from './parts.js';
+import { Field, checkFields, checkbox, choice, fingerprintText, fingerprintView, hashOf, instantOf, isFingerprint, kv, pageHead, panelWith, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeView } from './parts.js';
 import { Table } from './table.js';
 
 /** The types of record there are. */
@@ -203,6 +203,21 @@ function classBadge(record) {
   return badge(known ? CLASSES[record.class][0] : 'muted', known ? CLASSES[record.class][1]() : textOf(record.class));
 }
 
+/** The text of the badge of the class of a record (see `classBadge`). */
+function classText(record) {
+  return Object.hasOwn(CLASSES, record.class) ? CLASSES[record.class][1]().text() : textOf(record.class);
+}
+
+/** A value of the audit log that may be a fingerprint: a fingerprint in its short form, anything else as text. */
+function auditValue(value) {
+  return isFingerprint(value) ? fingerprintView(value, { copy: false }) : textOf(value);
+}
+
+/** The text of a value of the audit log as `auditValue` shows it. */
+function auditText(value) {
+  return isFingerprint(value) ? fingerprintText(value) : textOf(value);
+}
+
 const sameQuery = (a, b) => FIELDS.every((field) => (a[field] ?? '') === (b[field] ?? ''));
 
 class RecordsScreen {
@@ -260,15 +275,24 @@ class RecordsScreen {
       caption: w('records.title'),
       rowKey: (record, at) => String(at),
       empty: { title: w('records.empty') },
+      dense: true,
       columns: [
-        { key: 'ts', label: w('col.time'), value: (record) => instantOf(record.ts), tight: true, cell: (record) => timeView(record.ts) },
+        { key: 'ts', label: timeLabel(w('col.time')), value: (record) => instantOf(record.ts), text: (record) => timeCellText(record.ts), tight: true, cell: (record) => timeCell(record.ts) },
         { key: 'type', label: LABELS.type(), value: (record) => textOf(record.type) },
-        { key: 'class', label: w('col.result'), value: (record) => textOf(record.class), cell: classBadge },
+        { key: 'class', label: w('col.result'), value: (record) => textOf(record.class), text: classText, cell: classBadge },
         { key: 'status', label: LABELS.status(), value: (record) => (typeof record.status === 'number' ? record.status : null), num: true, cell: (record) => textOf(record.status) },
         { key: 'rule', label: LABELS.rule(), value: (record) => ruleOf(record), mono: true },
         { key: 'client', label: LABELS.client(), value: (record) => textOf(record.client), mono: true },
-        { key: 'summary', label: w('records.summary'), value: (record) => summaryOf(record), mono: true },
-        { key: 'id', label: LABELS.id(), value: (record) => textOf(record.id), sortable: false, mono: true, cell: (record) => this.openLink(record) },
+        {
+          key: 'summary',
+          label: w('records.summary'),
+          value: (record) => summaryOf(record),
+          // The cell opens the record, and its title holds the request number, which the filter finds as well.
+          text: (record) => `${summaryOf(record)} ${textOf(record.id)}`,
+          mono: true,
+          long: true,
+          cell: (record) => this.openLink(record),
+        },
       ],
     });
     mount(root, pageHead(w('records.title'), this.reload), el('p', { class: 'tc-intro' }, w('records.intro')), this.filters, this.notes, this.detailBox, this.table.node);
@@ -312,11 +336,16 @@ class RecordsScreen {
     return String(this.records.findIndex((record) => record.id === id));
   }
 
+  /**
+   * What a record is about, as the way to open it: a link to its address, with its request number as the title; a record
+   * that has no request number has no address, and a button opens it here.
+   */
   openLink(record) {
+    const summary = summaryOf(record);
     if (typeof record.id !== 'string' || !CHECKS.id(record.id)) {
-      return button('small', w('records.open'), () => this.showLocal(record));
+      return [summary === '' ? null : el('span', {}, summary, ' '), button('small', w('records.open'), () => this.showLocal(record))];
     }
-    return el('a', { class: 'tc-link tc-mono', href: hashOf('records', { id: record.id, query: this.applied }) }, record.id);
+    return el('a', { class: 'tc-link tc-mono', href: hashOf('records', { id: record.id, query: this.applied }), title: record.id }, summary === '' ? record.id : summary);
   }
 
   /** A record that has no request number has no address, so it is opened here only. */
@@ -409,8 +438,8 @@ class RecordsScreen {
   }
 
   sync(landOn = null) {
-    this.reload.disabled = this.loading;
-    this.search.disabled = this.loading;
+    setBusy(this.reload, this.loading);
+    setBusy(this.search, this.loading);
     this.reload.setAttribute('aria-busy', String(this.loading));
     const more = this.pager.hasOlder;
     this.table.empty = { title: more ? w('records.searched_title') : w('records.empty'), hint: more ? w('records.searched') : w('records.empty_hint') };
@@ -446,11 +475,11 @@ class RecordsScreen {
     this.load();
   }
 
-  /** Reads the next or the previous part of the records; the table lands on its first or last page. */
+  /** Reads the next or the previous part of the records; the table lands on its first or last page. Gives the read, or null when none started. */
   page(move, landOn) {
-    if (this.loading || !move()) return;
+    if (this.loading || !move()) return null;
     this.edgeFrom = landOn;
-    this.load();
+    return this.load();
   }
 
   // ---- one record ----
@@ -470,7 +499,7 @@ class RecordsScreen {
     } else if (summaryOf(record) !== '') {
       lines.push(row(w('records.summary'), el('span', { class: 'tc-mono' }, summaryOf(record))));
     }
-    if (typeof record.generation === 'string') lines.push(row(w('records.f.generation'), fingerprintView(record.generation, { copy: false })));
+    if (typeof record.generation === 'string') lines.push(row(w('records.generation'), fingerprintView(record.generation, { copy: false })));
     return lines;
   }
 
@@ -535,11 +564,12 @@ class AuditScreen {
       caption: w('audit.title'),
       rowKey: (entry, at) => String(at),
       empty: { title: w('audit.empty') },
+      dense: true,
       columns: [
-        { key: 'ts', label: w('col.time'), value: (entry) => instantOf(entry.ts), tight: true, cell: (entry) => timeView(entry.ts) },
+        { key: 'ts', label: timeLabel(w('col.time')), value: (entry) => instantOf(entry.ts), text: (entry) => timeCellText(entry.ts), tight: true, cell: (entry) => timeCell(entry.ts) },
         { key: 'actor', label: w('col.by'), value: (entry) => textOf(entry.actor) },
         { key: 'action', label: w('audit.action'), value: (entry) => textOf(entry.action), mono: true },
-        { key: 'target', label: w('audit.target'), value: (entry) => textOf(entry.target), mono: true },
+        { key: 'target', label: w('audit.target'), value: (entry) => textOf(entry.target), text: (entry) => auditText(entry.target), mono: true, cell: (entry) => auditValue(entry.target) },
         {
           key: 'result',
           label: w('col.result'),
@@ -547,8 +577,22 @@ class AuditScreen {
           cell: (entry) => el('span', { class: 'tc-actions' }, badge(Object.hasOwn(RESULTS, entry.result) ? RESULTS[entry.result] : 'muted', textOf(entry.result)), entry.reason === undefined ? null : el('span', {}, textOf(entry.reason))),
         },
         { key: 'client', label: w('records.f.client'), value: (entry) => textOf(entry.client), mono: true },
-        { key: 'change', label: w('audit.change'), value: (entry) => (entry.before === undefined && entry.after === undefined ? '' : `${textOf(entry.before)} → ${textOf(entry.after)}`) },
-        { key: 'id', label: w('audit.request'), value: (entry) => textOf(entry.id), mono: true },
+        {
+          key: 'change',
+          label: w('audit.change'),
+          value: (entry) => (entry.before === undefined && entry.after === undefined ? '' : `${textOf(entry.before)} → ${textOf(entry.after)}`),
+          text: (entry) => (entry.before === undefined && entry.after === undefined ? '' : `${auditText(entry.before)} → ${auditText(entry.after)}`),
+          // Between words, the arrow stays on the line of the word before it.
+          cell: (entry) => (entry.before === undefined && entry.after === undefined ? null : [auditValue(entry.before), '\u00a0→ ', auditValue(entry.after)]),
+        },
+        {
+          key: 'id',
+          label: w('audit.request'),
+          value: (entry) => textOf(entry.id),
+          mono: true,
+          // A number of the form of a request number opens the record of that request.
+          cell: (entry) => (typeof entry.id === 'string' && CHECKS.id(entry.id) ? el('a', { class: 'tc-link tc-mono', href: hashOf('records', { id: entry.id }) }, entry.id) : textOf(entry.id)),
+        },
       ],
     });
     mount(root, pageHead(w('audit.title'), this.reload), el('p', { class: 'tc-intro' }, w('audit.intro')), this.notes, this.table.node);
@@ -560,7 +604,7 @@ class AuditScreen {
 
   async load() {
     const asked = (this.reads += 1);
-    this.reload.disabled = true;
+    setBusy(this.reload, true);
     this.table.update({ loading: true });
     let entries = null;
     let error = null;
@@ -571,7 +615,7 @@ class AuditScreen {
       error = failure;
     }
     if (!this.alive || asked !== this.reads) return;
-    this.reload.disabled = false;
+    setBusy(this.reload, false);
     mount(this.notes, error === null ? null : notice('bad', w('audit.failed'), ' ', this.ctx.describe(error)));
     this.table.update({ rows: entries ?? [], loading: false });
     this.table.node.hidden = error !== null;

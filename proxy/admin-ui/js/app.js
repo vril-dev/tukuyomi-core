@@ -16,7 +16,8 @@ import { Api, ApiError, gateOf } from './api.js';
 import { badge, button, el, mount, notice, retranslate } from './dom.js';
 import { LANGUAGES, language, lazy, pickLanguage, sentence, setLanguage, t, w } from './i18n.js';
 import { forgetEnded } from './import.js';
-import { Field, checkFields, clock, emptyField, hashOf, textInput } from './parts.js';
+import { Field, checkFields, clock, emptyField, hashOf, keepFocus, textInput } from './parts.js';
+import { refilter } from './table.js';
 import { screens as userScreens } from './users.js';
 import { generationState, screens as wafScreens } from './waf.js';
 
@@ -162,6 +163,7 @@ class App {
     remember(KEYS.language, code);
     globalThis.document.documentElement.lang = code;
     retranslate();
+    refilter();
     globalThis.document.title = String(this.title);
   }
 
@@ -176,6 +178,7 @@ class App {
     clock.utc = !clock.utc;
     remember(KEYS.time, clock.utc ? 'utc' : null);
     retranslate();
+    refilter();
   }
 
   /** The language choice, the theme button and the button for the way times are written. */
@@ -196,7 +199,11 @@ class App {
     return el('div', { class: 'tc-bar__tools' }, select, theme, time);
   }
 
-  /** Runs `task` with the button held down and marked busy, so that a second click does nothing. `busy` are the words it shows meanwhile. */
+  /**
+   * Runs `task` with the button held down and marked busy, so that a second click does nothing. `busy` are the words it
+   * shows meanwhile. A button that is held down cannot take the focus, so a dialog that the task opened and closed
+   * could not give it back: when the task ends with the focus nowhere, it goes back to the button.
+   */
   async guarded(control, task, busy = null) {
     const saved = busy === null ? null : [...control.childNodes];
     control.disabled = true;
@@ -209,6 +216,7 @@ class App {
         control.disabled = false;
         control.removeAttribute('aria-busy');
         if (saved !== null) control.replaceChildren(...saved);
+        keepFocus(control);
       }
     }
   }
@@ -540,12 +548,15 @@ class App {
       toggle.setAttribute('aria-expanded', String(open));
     };
     toggle.addEventListener('click', () => setOpen(toggle.getAttribute('aria-expanded') !== 'true'));
-    nav.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape' && toggle.getAttribute('aria-expanded') === 'true') {
-        setOpen(false);
-        toggle.focus();
-      }
-    });
+    // Escape closes the open menu wherever the focus is, but not while a dialog is open: Escape closes the dialog.
+    const onKey = (event) => {
+      if (event.key !== 'Escape' || toggle.getAttribute('aria-expanded') !== 'true') return;
+      if (event.target?.closest?.('dialog') || globalThis.document.querySelector('dialog[open]') !== null) return;
+      setOpen(false);
+      toggle.focus();
+    };
+    globalThis.document.addEventListener('keydown', onKey);
+    this.teardown.push(() => globalThis.document.removeEventListener('keydown', onKey));
     const bar = el(
       'header',
       { class: 'tc-bar' },
@@ -553,13 +564,14 @@ class App {
       place,
       el('span', { class: 'tc-bar__spacer' }),
       warning,
-      el('span', { class: 'tc-bar__user' }, el('span', {}, this.user.name), badge('muted', this.user.role)),
+      el('span', { class: 'tc-bar__user' }, el('span', { class: 'tc-bar__name', title: this.user.name }, this.user.name), badge('muted', this.user.role)),
       this.tools(),
       el('span', { class: 'tc-bar__out' }, this.signOutButton(w('bar.logout'), 'quiet', alerts)),
     );
     const skip = button('', w('app.skip'), () => main.focus(), { class: 'tc-btn tc-skip' });
     this.root.className = 'tc-shell';
-    mount(this.root, skip, nav, el('div', { class: 'tc-content' }, bar, alerts, main));
+    // The bar comes before the menu, so that the keyboard reaches the bar, then the menu, then the screen.
+    mount(this.root, skip, el('div', { class: 'tc-top' }, bar, nav), el('div', { class: 'tc-content' }, alerts, main));
 
     const show = (status) => {
       warning.hidden = generationState(status.data) !== 'differ';
