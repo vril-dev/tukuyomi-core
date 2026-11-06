@@ -11,7 +11,10 @@
 //! listener has `http2` and the client chose it, HTTP/2, with one more rule: its `Host` has to be one that the
 //! certificate of the handshake covers, or it is answered with 421 (see `conn`). With `managed`, every TLS listener
 //! chooses from the certificate of the way to the admin process and those of the sites of the version (`table`), and
-//! SIGUSR2 reads the certificate of the way from its files again and those of the sites from the managed store.
+//! SIGUSR2 reads the certificate of the way from its files again and those of the sites from the managed store. The
+//! certificate of the way and those of the sites may have `acme` as well: the files of the way are those that
+//! `admin.route` names, and those of a site with `acme` are in `acme/` of the managed store; either waits as a
+//! certificate of a listener with `acme` does until its files are there.
 
 mod certs;
 mod handshake;

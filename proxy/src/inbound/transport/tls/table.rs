@@ -6,14 +6,16 @@
 //! admin process and those of the sites of the version, named `admin route` and `site <name>`. The certificate of
 //! the way is read from its files as the certificate of a listener is (`KeySource`); the chain and the key of a site
 //! are files of the managed store, which are read through the store only, so they are checked against their names
-//! each time (see `managed`). The material that is read has the same lists in the same order.
+//! each time (see `managed`). Those of a site with `acme` are read through the store too, from `acme/`, and while they
+//! are not there the site waits as a certificate of a listener with `acme` does. The material that is read has the
+//! same lists in the same order.
 
 use std::sync::Arc;
 
 use super::certs::{Fault, Material, Place, Refusal, check};
 use super::keys::{KeySource, certified};
 use crate::config::{CertificateConfig, ListenerConfig, ListenerKind};
-use crate::managed::{Site, Store};
+use crate::managed::{Site, SiteCertificate, Store, acme_name};
 
 /// Where the chain and the key of a certificate are.
 #[derive(Clone, Debug)]
@@ -22,6 +24,20 @@ enum Source {
     Files(CertificateConfig),
     /// Files of the managed store, by their SHA-256.
     Stored { chain: [u8; 32], key: [u8; 32] },
+    /// The files that the command `acme renew` writes into `acme/` of the managed store for a site with `acme`, by the
+    /// name of the hosts of the site.
+    Issued([u8; 32]),
+}
+
+impl Source {
+    /// Whether the certificate has `acme`, so that files that are not there yet are no fault.
+    fn acme(&self) -> bool {
+        match self {
+            Source::Files(certificate) => certificate.acme.is_some(),
+            Source::Stored { .. } => false,
+            Source::Issued(_) => true,
+        }
+    }
 }
 
 /// One certificate of a list: its hosts, where it is in the configuration, and where its files are.
@@ -86,9 +102,9 @@ impl Table {
         let sites = sites.iter().map(|site| Entry {
             hosts: site.hosts.clone(),
             place: Place::Site(site.name.clone()),
-            source: Source::Stored {
-                chain: site.chain,
-                key: site.key,
+            source: match site.certificate {
+                SiteCertificate::Files { chain, key } => Source::Stored { chain, key },
+                SiteCertificate::Acme(_) => Source::Issued(acme_name(&site.hosts)),
             },
         });
         Table {
@@ -113,7 +129,7 @@ impl Table {
     }
 
     /// Reads and checks every certificate (see `certs`). The first that fails ends the reading, and the refusal names
-    /// it. A certificate of a listener with `acme` whose file does not exist yet is left empty.
+    /// it. A certificate with `acme` whose file does not exist yet is left empty.
     pub(super) fn read(&self, files: &dyn KeySource) -> Result<Material, Refusal> {
         let mut material = Vec::with_capacity(self.lists.len());
         for list in &self.lists {
@@ -128,11 +144,11 @@ impl Table {
                         files.load(&certificate.cert_file, &certificate.key_file)
                     }
                     Source::Stored { chain, key } => self.stored(*chain, *key),
+                    Source::Issued(name) => self.issued(*name),
                 };
                 let key = match read {
                     Ok(key) => key,
-                    Err(Fault::Missing) if matches!(&entry.source, Source::Files(c) if c.acme.is_some()) =>
-                    {
+                    Err(Fault::Missing) if entry.source.acme() => {
                         keys.push(None);
                         continue;
                     }
@@ -154,8 +170,19 @@ impl Table {
         certified(&chain, &key)
     }
 
-    /// The certificates with `acme` that `material`, read from this table, has empty: only a certificate of a listener
-    /// may have `acme`.
+    /// The chain and the key of a site with `acme`, read through the store: `Fault::Missing` when they have not been
+    /// issued yet, and `Fault::Unreadable` for any fault the store finds with them.
+    fn issued(&self, name: [u8; 32]) -> Result<rustls::sign::CertifiedKey, Fault> {
+        let store = self.store.as_ref().ok_or(Fault::Unreadable)?;
+        match store.issued(name) {
+            Ok(Some((chain, key))) => certified(&chain, &key),
+            Ok(None) => Err(Fault::Missing),
+            Err(_) => Err(Fault::Unreadable),
+        }
+    }
+
+    /// The certificates with `acme` that `material`, read from this table, has empty: only a certificate with `acme`
+    /// may be.
     pub(super) fn waiting(&self, material: &Material) -> Vec<Place> {
         let mut places = Vec::new();
         for (list, keys) in self.lists.iter().zip(material) {

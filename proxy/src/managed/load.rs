@@ -4,7 +4,9 @@
 //! The order is the main file (see `config`; a refusal there ends the reading), then, for a file with `managed`, the
 //! store, the version that is asked for (`Choice`), its check with the main file (see `version`), and every file that
 //! it names, each read and checked against its name; last the country database of the main file. The bytes of the
-//! files are not kept: whatever uses a file later reads it again through the store, which checks it again.
+//! files are not kept: whatever uses a file later reads it again through the store, which checks it again. The
+//! certificate of a site with `acme` is not read here: it is in `acme/` of the store, may not be issued yet, and is
+//! read with the other certificates (see `inbound::transport::tls`).
 //!
 //! The proxy starts with the version that `current` names, and so do `config check` and the reading of SIGHUP: with
 //! no version chosen, or one that is refused, the proxy does not start, and SIGHUP changes nothing. `managed activate`
@@ -165,10 +167,15 @@ fn with_version(
     let checked = version::parse(&bytes)
         .and_then(|raw| raw.check(&main, resolve_timeout, geo, version::stored_tls))
         .map_err(LoadError::Version)?;
-    // Each file is read once here, to be checked against its name; whatever uses it reads it again.
-    for site in &checked.sites {
-        store.file(site.chain).map_err(LoadError::Store)?;
-        store.file(site.key).map_err(LoadError::Store)?;
+    // Each file is read once here, to be checked against its name; whatever uses it reads it again. A site with `acme`
+    // names no file.
+    for (chain, key) in checked
+        .sites
+        .iter()
+        .filter_map(|site| site.certificate.files())
+    {
+        store.file(*chain).map_err(LoadError::Store)?;
+        store.file(*key).map_err(LoadError::Store)?;
     }
     for group in &checked.forward.groups {
         if let Some(Settings {

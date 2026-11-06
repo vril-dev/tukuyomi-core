@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde_json::{Value, json};
+use tukuyomi_proxy::rules::bundle::{hex, sha256};
 
 pub(crate) const MS: Duration = Duration::from_millis(1);
 pub(crate) const SEC: Duration = Duration::from_secs(1);
@@ -919,6 +920,23 @@ pub(crate) fn import_and_activate(root: &Path, document: &Value) -> String {
     let (code, out, err) = managed(root, "activate", &[&name]);
     assert_eq!((code, out), (Some(0), format!("{name} current\n")), "{err}");
     name
+}
+
+/// Puts the chain and the key `files` where the command `acme renew` writes them for a site with `acme` and these
+/// `hosts`: `chain` and `key` in `acme/<64 digits>/` of the managed store of the test root `root`, the digits the
+/// SHA-256 of the hosts in byte order, each followed by a newline. The directories are made (0700) when they are not
+/// there.
+pub(crate) fn put_issued(root: &Path, hosts: &[&str], files: &(PathBuf, PathBuf)) {
+    let mut sorted = hosts.to_vec();
+    sorted.sort_unstable();
+    let named: String = sorted.iter().map(|host| format!("{host}\n")).collect();
+    let dir = root
+        .join(MANAGED)
+        .join("acme")
+        .join(hex(&sha256(named.as_bytes())));
+    make_dir(&dir);
+    fs::copy(&files.0, dir.join("chain")).expect("copy the chain");
+    fs::copy(&files.1, dir.join("key")).expect("copy the key");
 }
 
 /// Makes the configuration of the test root `root` one with `managed`, the store `managed/` in the root: the routing of

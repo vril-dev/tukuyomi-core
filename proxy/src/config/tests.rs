@@ -1731,6 +1731,22 @@ fn no_file_of_the_command_or_of_a_certificate_is_directly_inside_the_challenge_d
 }
 
 #[test]
+fn the_challenge_directory_is_apart_from_every_directory_of_the_configuration() {
+    let refused = "acme challenge_dir is the same as, inside or around the rules store dir, the records dir, the admin store dir, the directory of admin control or the managed dir";
+    let with = |dir: &str| {
+        let mut object = acme_object();
+        object["challenge_dir"] = dir.into();
+        let [listeners, acme] = with_acme(object);
+        [listeners, acme, records("dir", "/var/lib/tukuyomi/records")]
+    };
+    // The rules store dir is `/var/lib/tukuyomi/rules`.
+    refuse(&with("/var/lib/tukuyomi/rules"), refused);
+    refuse(&with("/var/lib/tukuyomi/records/challenges"), refused);
+    refuse(&with("/var/lib/tukuyomi"), refused);
+    pass(&with("/var/lib/tukuyomi/rules2"));
+}
+
+#[test]
 fn every_value_of_the_acme_object_is_checked_and_the_first_one_past_a_bound_is_refused() {
     let mut cases: Vec<(&str, Value, Option<&str>)> = Vec::new();
     let url = |tail: usize| Value::from(format!("https://ca.example/{}", "x".repeat(tail)));

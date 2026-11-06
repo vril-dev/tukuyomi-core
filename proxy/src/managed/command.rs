@@ -14,7 +14,8 @@
 //! `import` takes a document of at most 1 MiB (see `version`) and checks it with the main file as a version is
 //! checked. It reads each file that the document names once, as the proxy reads a certificate file (a regular file of
 //! at most 1 MiB; a link is followed), and checks it as the proxy would: the chain and the key of each site go together
-//! and cover its hosts, and the file of the authorities of each group holds certificates that can be trust anchors.
+//! and cover its hosts, and the file of the authorities of each group holds certificates that can be trust anchors. A
+//! site with `acme` names no file, and its certificate is in the version as the document writes it.
 //! A document that is refused so far has written nothing. Then, with the lock of the store, it puts the files in the
 //! store (a file that is there already is not written again), makes the version that names them by their SHA-256,
 //! reads the main file with that version as the proxy would (see `load`), and puts the version in the store. It does
@@ -258,14 +259,15 @@ fn import(config: &Path, document: &Path, out: &mut dyn Write, log: &Log) -> Exi
 }
 
 /// The files that `document` names, each read once as the proxy reads a certificate file, and checked as the proxy
-/// checks them, before anything is written: the chain and the key of each site go together and cover its hosts, and the
-/// file of the authorities of each group holds 1 to 100 certificates that can be trust anchors. A refusal is the rest
-/// of a line.
+/// checks them, before anything is written: the chain and the key of each site that has them (a site with `acme` has
+/// none) go together and cover its hosts, and the file of the authorities of each group holds 1 to 100 certificates
+/// that can be trust anchors. A refusal is the rest of a line.
 fn checked(document: &Document) -> Result<BTreeMap<PathBuf, Zeroizing<Vec<u8>>>, String> {
     let sites = document
         .sites
         .iter()
-        .flat_map(|site| [&site.chain, &site.key]);
+        .filter_map(|site| site.certificate.files())
+        .flat_map(|(chain, key)| [chain, key]);
     let authorities = document.authorities.iter().map(|(_, path)| path);
     let mut files = BTreeMap::new();
     for path in sites.chain(authorities) {
@@ -285,7 +287,10 @@ fn checked(document: &Document) -> Result<BTreeMap<PathBuf, Zeroizing<Vec<u8>>>,
     // Every path was read above; one that were not would be empty, and refused.
     let bytes = |path: &PathBuf| files.get(path).map_or(&[][..], |bytes| bytes.as_slice());
     for site in &document.sites {
-        certified(bytes(&site.chain), bytes(&site.key))
+        let Some((chain, key)) = site.certificate.files() else {
+            continue;
+        };
+        certified(bytes(chain), bytes(key))
             .and_then(|key| check(&key, &site.hosts))
             .map_err(|fault| format!("{} (site {})", fault.text(), site.name))?;
     }

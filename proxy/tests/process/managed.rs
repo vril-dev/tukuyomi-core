@@ -325,3 +325,258 @@ fn sighup_takes_the_chosen_version_and_a_version_that_activate_refuses_is_not_ch
     assert!(current[0].starts_with(&name), "{listed}");
     finish(proxy, 1);
 }
+
+// ---- the certificates with `acme` ----
+
+/// The `acme` object with its files in the directory of `pki` and a CA at a port where nothing listens.
+fn acme_object(pki: &Pki) -> Value {
+    json!({
+        "directory_url": format!("https://127.0.0.1:{}/dir", free_port()),
+        "contact_email": "ops@example.test",
+        "account_key_file": pki.path("account.key"),
+        "challenge_dir": pki.path("challenges"),
+        "ca_file": pki.path("ca.pem"),
+        "timeout_ms": 20_000,
+    })
+}
+
+/// A site with `acme` for `hosts`.
+fn acme_site(name: &str, hosts: &[&str]) -> Value {
+    json!({"name": name, "hosts": hosts, "certificate": {"acme": {"renew_before_days": 30}}})
+}
+
+/// A request for the challenge of the token `Tok_-1` for `host`, from a client that `admin.route.access` turns away.
+fn challenge(host: &str) -> Vec<u8> {
+    format!(
+        "GET /.well-known/acme-challenge/Tok_-1 HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-For: 203.0.113.5\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// Whether the handshake with the server name `name` at `port` is refused.
+fn refused(pki: &Pki, port: u16, name: &str) -> bool {
+    let mut stream = pki.client(name, port);
+    stream.conn.complete_io(&mut stream.sock).is_err()
+}
+
+fn acme_renew(root: &Path) -> (Option<i32>, String, String) {
+    let config = root.join("config.json");
+    crate::acme::command(&[Path::new("acme"), Path::new("renew"), &config])
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_site_and_the_way_with_acme_wait_for_their_files_and_their_hosts_are_answered_the_challenge_of_the_version()
+ {
+    let mut pki = Pki::new("managed_acme");
+    fs::create_dir(pki.path("challenges")).unwrap();
+    let given = pki.issue("given", &["g.example"]);
+    let way = (pki.path("admin.pem"), pki.path("admin.key"));
+    let tls_port = free_port();
+    let mut first = String::new();
+    let proxy = Proxy::start_with("mng_acme", knobs(), |root| {
+        first = manage(root, |main, document| {
+            let listeners = main["proxy"]["listeners"].as_array_mut().unwrap();
+            listeners.push(tls_listener(tls_port, false));
+            main["acme"] = acme_object(&pki);
+            document["sites"] = json!([
+                acme_site("issued", &["s.example"]),
+                acme_site("gone", &["x.example"]),
+                {"name": "given", "hosts": ["g.example"], "certificate": {"chain_file": given.0, "key_file": given.1}},
+            ]);
+            with_admin(root, main, document, &way);
+            main["admin"]["route"]["certificate"]["acme"] = json!({"renew_before_days": 30});
+        });
+    });
+    let root = proxy.root().to_path_buf();
+    // The start is not refused for the files that are not there: they are named, and their hosts get no handshake.
+    for place in ["admin route", "site issued", "site gone"] {
+        let line = format!("start: tls certificate not issued yet ({place})");
+        proxy
+            .records
+            .wait_lines("a waiting certificate", 1, |l| l == line);
+    }
+    assert!(refused(&pki, tls_port, "s.example"));
+    assert!(refused(&pki, tls_port, "admin.a.example"));
+    let (answer, cert) = over_tls(
+        &pki,
+        tls_port,
+        "g.example",
+        &request("g.example", "192.0.2.1"),
+    );
+    assert_eq!((answer.status(), cert), (200, shown(&given.0)));
+
+    // The plain listener answers the challenge for the hosts with acme, also to a client that the way to the admin
+    // process turns away; for the host of the site without acme the request goes on to the upstream.
+    fs::write(pki.path("challenges/Tok_-1"), b"abc.def").unwrap();
+    for host in ["s.example", "admin.a.example", "x.example"] {
+        let reply = exchange(proxy.port, &challenge(host));
+        assert_eq!(
+            (reply.status(), reply.message().body),
+            (200, b"abc.def".to_vec()),
+            "{host}"
+        );
+    }
+    let reply = exchange(proxy.port, &challenge("g.example"));
+    assert_eq!(reply.message().body, UPSTREAM_BODY.as_bytes());
+    fs::remove_file(pki.path("challenges/Tok_-1")).unwrap();
+
+    // The command cannot reach the CA: the way first, then the sites in the order of the version, all failed.
+    let (code, out, err) = acme_renew(&root);
+    assert_eq!(
+        (code, out.as_str()),
+        (
+            Some(1),
+            "admin route failed\nsite issued failed\nsite gone failed\n"
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        err,
+        "acme renew: admin route: the CA cannot be reached\nacme renew: site issued: the CA cannot be reached\nacme renew: site gone: the CA cannot be reached\n"
+    );
+
+    // The files appear where the command writes them, and SIGUSR2 takes them.
+    let issued = pki.issue("s", &["s.example"]);
+    put_issued(&root, &["s.example"], &issued);
+    let admin = pki.issue("admin", &["admin.a.example"]);
+    assert_eq!(admin, way);
+    proxy.signal("USR2");
+    proxy.records.wait_lines("the certificates", 1, |l| {
+        l == "reload: certificates replaced"
+    });
+    let (answer, cert) = over_tls(
+        &pki,
+        tls_port,
+        "s.example",
+        &request("s.example", "192.0.2.1"),
+    );
+    assert_eq!((answer.status(), cert), (200, shown(&issued.0)));
+    let (answer, cert) = over_tls(
+        &pki,
+        tls_port,
+        "admin.a.example",
+        &request("admin.a.example", "198.51.100.9"),
+    );
+    assert_eq!((answer.status(), cert), (200, shown(&admin.0)));
+
+    // A version whose site has one more host waits for a certificate of those hosts, and the site that it leaves out
+    // is answered no challenge.
+    let document: Value =
+        serde_json::from_str(&fs::read_to_string(root.join(DOCUMENT)).unwrap()).unwrap();
+    let mut second = document.clone();
+    second["sites"] = json!([
+        acme_site("issued", &["s.example", "t.example"]),
+        document["sites"][2]
+    ]);
+    let name = import_and_activate(&root, &second);
+    let config = hex(&sha256(&fs::read(root.join("config.json")).unwrap()));
+    proxy.signal("HUP");
+    let line = format!("reload: configuration replaced {config} managed {name}");
+    proxy
+        .records
+        .wait_lines("the second version", 1, |l| l == line);
+    proxy.records.wait_lines("the site of more hosts", 1, |l| {
+        l == "reload: tls certificate not issued yet (site issued)"
+    });
+    assert!(refused(&pki, tls_port, "s.example"));
+    fs::write(pki.path("challenges/Tok_-1"), b"abc.def").unwrap();
+    let reply = exchange(proxy.port, &challenge("t.example"));
+    assert_eq!(reply.message().body, b"abc.def");
+    let reply = exchange(proxy.port, &challenge("x.example"));
+    assert_eq!(reply.message().body, UPSTREAM_BODY.as_bytes());
+    fs::remove_file(pki.path("challenges/Tok_-1")).unwrap();
+
+    // Back to the first version: the certificate of its hosts is still there, and serves.
+    let (code, _, err) = managed(&root, "activate", &[&first]);
+    assert_eq!(code, Some(0), "{err}");
+    proxy.signal("HUP");
+    let line = format!("reload: configuration replaced {config} managed {first}");
+    proxy
+        .records
+        .wait_lines("the first version again", 1, |l| l == line);
+    let (answer, cert) = over_tls(
+        &pki,
+        tls_port,
+        "s.example",
+        &request("s.example", "192.0.2.1"),
+    );
+    assert_eq!((answer.status(), cert), (200, shown(&issued.0)));
+    // The group `main` had the requests for g.example (two), s.example (two) and the challenge of x.example.
+    finish(proxy, 5);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_link_in_the_place_of_the_directory_of_a_site_with_acme_refuses_the_start_and_the_command_orders_nothing()
+ {
+    let pki = Pki::new("managed_acme_link");
+    fs::create_dir(pki.path("challenges")).unwrap();
+    let idle = Idle::new("mng_acme_link", &Knobs::quick(), |_| {});
+    let root = idle.root();
+    manage(root, |main, document| {
+        main["acme"] = acme_object(&pki);
+        document["sites"] = json!([acme_site("issued", &["s.example"])]);
+    });
+    let elsewhere = pki.path("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::write(elsewhere.join("chain"), b"the chain").unwrap();
+    fs::write(elsewhere.join("key"), b"the key").unwrap();
+    let place = root
+        .join(MANAGED)
+        .join("acme")
+        .join(hex(&sha256(b"s.example\n")));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(place.parent().unwrap())
+        .unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &place).unwrap();
+
+    // The steps of the start refuse the link, and do not take it for a certificate that is not issued yet.
+    let ran = crate::config_check::config_check(&idle);
+    assert_eq!(ran.code, Some(1), "{}", ran.err);
+    assert!(
+        ran.err.contains(
+            "config check: tls refused: a certificate or key file cannot be read (site issued)"
+        ),
+        "{}",
+        ran.err
+    );
+    assert!(!ran.err.contains("not issued yet"), "{}", ran.err);
+
+    // The command does not order the certificate: the store refused before the CA was asked, so the account key was
+    // never made, and nothing was written through the link.
+    let (code, out, err) = acme_renew(root);
+    assert_eq!(
+        (code, out.as_str()),
+        (Some(1), "site issued failed\n"),
+        "{err}"
+    );
+    assert_eq!(
+        err,
+        "acme renew: site issued: a directory of the managed store is not a real directory\n"
+    );
+    assert!(!pki.path("account.key").exists());
+    let mut entries: Vec<String> = fs::read_dir(&elsewhere)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["chain", "key"]);
+    assert_eq!(fs::read(elsewhere.join("chain")).unwrap(), b"the chain");
+    assert_eq!(fs::read(elsewhere.join("key")).unwrap(), b"the key");
+
+    // A version with no site with acme, and no way to the admin process: nothing to renew, and the exit code is 0.
+    fs::remove_file(&place).unwrap();
+    let document: Value =
+        serde_json::from_str(&fs::read_to_string(root.join(DOCUMENT)).unwrap()).unwrap();
+    let mut second = document;
+    second["sites"] = json!([]);
+    import_and_activate(root, &second);
+    let (code, out, err) = acme_renew(root);
+    assert_eq!((code, out.as_str()), (Some(0), ""), "{err}");
+    assert_eq!(
+        err,
+        "acme renew: no certificate has acme, neither that of admin route nor a site of the managed version\n"
+    );
+}

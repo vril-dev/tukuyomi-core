@@ -6,31 +6,43 @@
 //!
 //! A command is a short process of its own, apart from a running proxy, which does not notice what it does (the proxy
 //! answers the challenge of the CA while the command waits for it, see `inbound::challenge`; it takes a new
-//! certificate when it is sent SIGUSR2). The configuration is the one of the proxy, as an absolute clean path. Each
-//! certificate of a TLS listener that has `acme` is looked at in the order of the configuration, and is due if its
-//! certificate file or key file cannot be read, the key does not go with the certificate, the certificate does not
+//! certificate when it is sent SIGUSR2). The configuration is the one of the proxy, as an absolute clean path, read
+//! whole as the proxy reads it: with `managed`, with the version that `current` names. The certificates with `acme`
+//! are looked at in this order: those of the TLS listeners in the order of the configuration, then that of
+//! `admin.route`, then the sites with `acme` of the version in its order. The cert and key files of a certificate of a
+//! listener and of `admin.route` are the ones that the configuration names; those of a site are `chain` and `key` in
+//! `acme/<64 digits>/` of the managed store, named by its hosts and read through the store (see `managed`). A
+//! certificate is due if its files cannot be read, the key does not go with the certificate, the certificate does not
 //! cover every host, or less than `renew_before_days` days are left until the end of its time of validity (exactly
-//! that many days is not less). A certificate that is not due is `valid`. For the first that is due the account key
-//! is read or made, and the account is made or found at the CA; then each due certificate is ordered in turn with a
-//! new key (see `order`, `files`), the chain the CA made is checked as the proxy checks a chain when it reads it
-//! (the key goes with it, and it covers the hosts), and the key and the chain are written. The whole command, the
-//! CA's answers and its waiting included, takes at most `timeout_ms`; a certificate that is still due when the time
-//! is gone is `failed`, and so is every one after it. SIGINT and SIGTERM end the command at once, with the files of
-//! its challenges removed. However it ends, the command does not wait for the system to answer the lookup of the
-//! name of the CA.
+//! that many days is not less). A certificate that is not due is `valid`. For a due site, `acme/` and its directory
+//! are looked at, and made when they are not there, before anything is ordered: one that is a link or not a directory
+//! makes the site `failed`, and nothing is asked of the CA for it. For the first certificate that is due the account
+//! key is read or made, and the account is made or found at the CA; then each due certificate is ordered in turn with
+//! a new key (see `order`, `files`), the chain the CA made is checked as the proxy checks a chain when it reads it
+//! (the key goes with it, and it covers the hosts), and the key and the chain are written. The command takes no lock
+//! of the managed store: it changes no version and not `current`, and two of it are not run on one configuration at
+//! once. The whole command, the CA's answers and its waiting included, takes at most `timeout_ms`; a certificate
+//! that is still due when the time is gone is `failed`, and so is every one after it. SIGINT and SIGTERM end the
+//! command at once, with the files of its challenges removed. However it ends, the command does not wait for the
+//! system to answer the lookup of the name of the CA.
 //!
-//! The result is one line on the standard output for each certificate with `acme`: `<listener>.<certificate>`, both
-//! counted from 1, a space, and `renewed`, `valid` or `failed`. A failed certificate keeps its files as they were.
-//! Everything else goes to the standard error, a line each, and starts with the name of the command. What the CA sent
-//! is written only as the `type` of its problem document, with every byte outside 0x20 to 0x7e as `\xNN`.
+//! The result is one line on the standard output for each certificate with `acme`: its place, a space, and
+//! `renewed`, `valid` or `failed`. The place of a certificate of a listener is `<listener>.<certificate>`, both counted
+//! from 1, that of `admin.route` is `admin route`, and that of a site `site <name>`. A failed certificate keeps its
+//! files as they were. Everything else goes to the standard error, a line each, and starts with the name of the
+//! command, then the place for a line about one certificate. What the CA sent is written only as the `type` of its
+//! problem document, with every byte outside 0x20 to 0x7e as `\xNN`. A configuration with `managed` and the `acme`
+//! object whose certificate of `admin.route` has no `acme` and whose version has no site with `acme` has nothing to
+//! renew: no result line, one line on the standard error, and the exit code 0, so that a timer does not fail while
+//! the sites with `acme` are not there yet.
 //!
 //! The command does not run as root: when any user id of the process is 0, it writes a `host check refused` line and
 //! ends before it reads the configuration. A key and a certificate that root wrote would not be read by the proxy
 //! that runs as another user.
 //!
 //! The exit code is 0 if every certificate is `renewed` or `valid`, 1 if one is `failed` (or the command was stopped,
-//! cannot run, or runs as root), and 2 for a wrong argument, a refused configuration, or a configuration with no
-//! certificate that has `acme`.
+//! cannot run, or runs as root), and 2 for a wrong argument, a refused configuration (with `managed`, a store, a
+//! `current` or a version that the proxy would not start with as well), or a configuration without the `acme` object.
 
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
@@ -52,8 +64,9 @@ use super::files::{Challenges, account_key, install};
 use super::key::Key;
 use super::order::Session;
 use super::{Failure, base64, der};
-use crate::config::{self, AcmeConfig, CertificateConfig, ListenerConfig, ListenerKind};
-use crate::inbound::transport::tls::{Files, KeySource, check};
+use crate::config::{self, AcmeConfig, CertificateConfig, ListenerKind, Loaded};
+use crate::inbound::transport::tls::{Files, KeySource, certified, check};
+use crate::managed::{SiteCertificate, Store, acme_name};
 use crate::run::host;
 
 const USAGE: &str = "usage: tukuyomi-proxy acme renew <config>";
@@ -87,11 +100,67 @@ impl Terminal<'_> {
     }
 }
 
-/// A certificate with `acme`, and its number as the lines of the result name it.
+/// Where the files of a certificate with `acme` are.
+enum Kept<'a> {
+    /// The cert and key files that the configuration names: of a certificate of a listener, or of `admin.route`.
+    Named {
+        cert_file: &'a Path,
+        key_file: &'a Path,
+    },
+    /// `acme/<name>/` of the managed store, for a site with `acme`.
+    Stored { store: &'a Store, name: [u8; 32] },
+}
+
+/// A certificate with `acme`: its place as the lines of the result name it, its hosts, and where its files are.
 struct Target<'a> {
     label: String,
-    certificate: &'a CertificateConfig,
+    hosts: &'a [String],
     renew_before_days: u32,
+    kept: Kept<'a>,
+}
+
+impl<'a> Target<'a> {
+    /// The target of a certificate whose files the configuration names, if it has `acme`.
+    fn named(label: String, certificate: &'a CertificateConfig) -> Option<Target<'a>> {
+        let acme = certificate.acme?;
+        Some(Target {
+            label,
+            hosts: &certificate.hosts,
+            renew_before_days: acme.renew_before_days,
+            kept: Kept::Named {
+                cert_file: &certificate.cert_file,
+                key_file: &certificate.key_file,
+            },
+        })
+    }
+
+    /// The certificate and the key that are there now, as the proxy reads them; `None` for any fault.
+    fn current(&self) -> Option<CertifiedKey> {
+        match &self.kept {
+            Kept::Named {
+                cert_file,
+                key_file,
+            } => Files.load(cert_file, key_file).ok(),
+            Kept::Stored { store, name } => match store.issued(*name) {
+                Ok(Some((chain, key))) => certified(&chain, &key).ok(),
+                Ok(None) | Err(_) => None,
+            },
+        }
+    }
+
+    /// Where the chain and the key are written, in that order. For a site the directories of the store are looked at,
+    /// and made when they are not there; a refusal of the store is the failure of the target.
+    fn places(&self) -> Result<(PathBuf, PathBuf), Failure> {
+        match &self.kept {
+            Kept::Named {
+                cert_file,
+                key_file,
+            } => Ok((cert_file.to_path_buf(), key_file.to_path_buf())),
+            Kept::Stored { store, name } => {
+                store.issue_places(*name).map_err(|e| Failure::Text(e.0))
+            }
+        }
+    }
 }
 
 /// Runs the command that `args` (what follows `acme`) name.
@@ -120,19 +189,34 @@ fn parse(args: &[OsString]) -> Result<PathBuf, &'static str> {
     }
 }
 
-/// The certificates with `acme` of the TLS listeners, in the order of the configuration.
-fn targets(listeners: &[ListenerConfig]) -> Vec<Target<'_>> {
+/// The certificates with `acme` of the whole configuration `loaded`, in the order of the head of this file.
+fn targets(loaded: &Loaded) -> Vec<Target<'_>> {
     let mut found = Vec::new();
-    for (at, listener) in listeners.iter().enumerate() {
+    for (at, listener) in loaded.proxy.listeners.iter().enumerate() {
         let ListenerKind::Tls(tls) = &listener.kind else {
             continue;
         };
         for (place, certificate) in tls.certificates.iter().enumerate() {
-            if let Some(acme) = certificate.acme {
+            found.extend(Target::named(
+                format!("{}.{}", at + 1, place + 1),
+                certificate,
+            ));
+        }
+    }
+    if let Some(route) = &loaded.admin_route {
+        found.extend(Target::named("admin route".to_owned(), &route.certificate));
+    }
+    if let Some(version) = &loaded.version {
+        for site in &version.sites {
+            if let SiteCertificate::Acme(acme) = site.certificate {
                 found.push(Target {
-                    label: format!("{}.{}", at + 1, place + 1),
-                    certificate,
+                    label: format!("site {}", site.name),
+                    hosts: &site.hosts,
                     renew_before_days: acme.renew_before_days,
+                    kept: Kept::Stored {
+                        store: &version.store,
+                        name: acme_name(&site.hosts),
+                    },
                 });
             }
         }
@@ -153,11 +237,10 @@ fn expires_soon(not_after: i64, now: i64, days: u32) -> bool {
 
 /// Whether the certificate of `target` is to be made again at `now`, for any of the reasons in the head of this file.
 fn due(target: &Target<'_>, now: i64) -> bool {
-    let certificate = target.certificate;
-    let Ok(key) = Files.load(&certificate.cert_file, &certificate.key_file) else {
+    let Some(key) = target.current() else {
         return true;
     };
-    if check(&key, &certificate.hosts).is_err() {
+    if check(&key, target.hosts).is_err() {
         return true;
     }
     key.cert
@@ -184,11 +267,18 @@ fn renew(config: &Path, term: &mut Terminal<'_>) -> Exit {
         ));
         return Exit::Usage;
     };
+    let targets = targets(&loaded);
+    // Only a file with `managed` has the object with no certificate with `acme`: its sites with `acme` may be to come.
+    if targets.is_empty() {
+        term.note(&format!(
+            "{NAME}: no certificate has acme, neither that of admin route nor a site of the managed version"
+        ));
+        return Exit::Done;
+    }
     let Some(now) = unix_now() else {
         term.note(&format!("{NAME}: the clock is before 1970"));
         return Exit::Failed;
     };
-    let targets = targets(&loaded.proxy.listeners);
     let runtime = match Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(_) => {
@@ -272,8 +362,12 @@ async fn renew_all(
             term.result(&format!("{} valid", target.label));
             continue;
         }
-        let done = match session_of(&mut session, acme, deadline).await {
-            Ok(session) => renew_one(session, acme, target, deadline).await,
+        // The places are made sure of before anything is asked of the CA.
+        let done = match target.places() {
+            Ok(places) => match session_of(&mut session, acme, deadline).await {
+                Ok(session) => renew_one(session, acme, target, &places, deadline).await,
+                Err(failure) => Err(failure),
+            },
             Err(failure) => Err(failure),
         };
         match done {
@@ -288,24 +382,22 @@ async fn renew_all(
     exit
 }
 
-/// Orders a new certificate for `target`, checks it, and writes it and its key.
+/// Orders a new certificate for `target`, checks it, and writes it and its key to `places` (the chain, the key).
 async fn renew_one(
     session: &mut Session,
     acme: &AcmeConfig,
     target: &Target<'_>,
+    places: &(PathBuf, PathBuf),
     deadline: Instant,
 ) -> Result<(), Failure> {
-    let certificate = target.certificate;
+    let hosts = target.hosts;
     let (key, key_pem) = Key::generate()?;
-    let csr = der::csr_text(&key, &certificate.hosts)?;
+    let csr = der::csr_text(&key, hosts)?;
     // Dropped when this function ends, with the files of the order's challenges.
     let mut challenges = Challenges::new(&acme.challenge_dir);
-    let ordered = timeout_at(
-        deadline,
-        session.issue(&certificate.hosts, &csr, &mut challenges),
-    )
-    .await
-    .map_err(|_| Failure::Text("the time for the command is used up"))??;
+    let ordered = timeout_at(deadline, session.issue(hosts, &csr, &mut challenges))
+        .await
+        .map_err(|_| Failure::Text("the time for the command is used up"))??;
     let chain = CertificateDer::pem_slice_iter(&ordered)
         .take(MAX_CHAIN + 1)
         .collect::<Result<Vec<_>, _>>()
@@ -317,17 +409,10 @@ async fn renew_one(
         .iter()
         .map(|der| base64::pem("CERTIFICATE", der.as_ref()).to_string())
         .collect();
-    check(
-        &CertifiedKey::new(chain, key.signing_key()),
-        &certificate.hosts,
-    )
-    .map_err(|_| "the chain of the CA does not go with the key or does not cover the hosts")?;
-    install(
-        &certificate.cert_file,
-        &certificate.key_file,
-        &key_pem,
-        &text,
-    )
+    check(&CertifiedKey::new(chain, key.signing_key()), hosts)
+        .map_err(|_| "the chain of the CA does not go with the key or does not cover the hosts")?;
+    let (chain_file, key_file) = places;
+    install(chain_file, key_file, &key_pem, &text)
 }
 
 #[cfg(test)]

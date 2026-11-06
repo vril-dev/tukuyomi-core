@@ -320,7 +320,11 @@ pub(crate) fn read_parts(path: &Path, choice: &Choice, name: &str, log: &Log) ->
     for place in tls.waiting() {
         log.line(&format!("{name}: tls certificate not issued yet ({place})"));
     }
-    let challenge = Challenge::new(loaded.acme.as_ref(), &loaded.proxy.listeners);
+    let sites = loaded
+        .version
+        .as_ref()
+        .map_or(&[][..], |version| &version.sites);
+    let challenge = Challenge::new(loaded.acme.as_ref(), &loaded.proxy.listeners, route, sites);
     Ok(Parts {
         proxy: loaded.proxy,
         forward,

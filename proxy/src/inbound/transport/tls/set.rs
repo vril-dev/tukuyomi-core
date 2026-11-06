@@ -2,7 +2,8 @@
 //! file again, what is looked up for a connection, and what SIGUSR2 replaces.
 //!
 //! `Tls::load` reads and checks every certificate of every TLS listener and makes the handshake of each; one that
-//! fails refuses the start, except a certificate with `acme` whose files do not exist yet, which waits (`waiting`).
+//! fails refuses the start, except a certificate with `acme` whose files do not exist yet, which waits (`waiting`):
+//! of a listener, and with `managed` that of the way to the admin process and those of the sites with `acme`.
 //! `Tls::load_sites` does the same for a file with `managed`, whose TLS listeners all choose from the certificate of
 //! the way to the admin process and those of the sites (see `table`). `Tls::reload` reads and checks them all again,
 //! and puts the new certificates in use only if every one passes; the hosts of the certificates are those of the

@@ -840,8 +840,10 @@ fn every_tls_listener_chooses_from_the_way_to_the_admin_process_and_the_sites() 
         let site = |key: [u8; 32]| crate::managed::Site {
             name: "a".to_owned(),
             hosts: vec!["*.a.example".to_owned()],
-            chain: stored(&wild.cert),
-            key,
+            certificate: crate::managed::SiteCertificate::Files {
+                chain: stored(&wild.cert),
+                key,
+            },
         };
         let route = CertificateConfig {
             cert_file: admin.cert.clone(),

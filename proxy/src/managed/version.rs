@@ -5,15 +5,19 @@
 //! "access"?: {..}, "rate_limit"?: {..}}`. `upstreams`, `routes`, `default_upstream`, `access` and `rate_limit` are
 //! written and checked as in a main file without `managed` (see `config`, whose sentences the refusals are), except the
 //! `tls` of a group, `{"ca", "server_name"?}`, whose `ca` is the SHA-256 of a file of the store: the file of the
-//! authorities. `sites` is a list of 0 to 64 sites `{"name", "hosts", "certificate": {"chain", "key"}}`: the name is
-//! written as the name of a group is and no two sites have the same, the hosts are 1 to 64 as the hosts of a
-//! certificate of a listener are written (a name, or `*.` and a name) and no host is in two sites, and `chain` and
-//! `key` are the SHA-256 of the files of the store that hold the certificate chain and the private key. A version has
-//! no path. An unknown, repeated or missing key is refused as in the main file.
+//! authorities. `sites` is a list of 0 to 64 sites `{"name", "hosts", "certificate"}`: the name is written as the
+//! name of a group is and no two sites have the same, the hosts are 1 to 64 as the hosts of a certificate of a listener
+//! are written (a name, or `*.` and a name) and no host is in two sites, and the certificate is one of two forms and
+//! nothing else. `{"chain", "key"}` names the files of the store that hold the certificate chain and the private key
+//! by their SHA-256. `{"acme": {"renew_before_days"}}` (1 to 60) is a certificate that the command `acme renew`
+//! issues and writes into `acme/` of the store, as for a certificate of a listener with `acme`: the hosts of such a
+//! site are names only (no `*.`), and the main file has the `acme` object. A version has no path. An unknown,
+//! repeated or missing key is refused as in the main file.
 //!
-//! A version is checked against the main file it comes with (`check`), after that file: the sites, that no site has
-//! the host of the way to the admin process (`admin.route`; a `*.` host may cover it, as the name comes first), that
-//! a main file with a TLS listener has some certificate for it (a site, or the way), then the groups, the routes and
+//! A version is checked against the main file it comes with (`check`), after that file: the sites, that the main file
+//! has `acme` if a site has, that no site has the host of the way to the admin process (`admin.route`; a `*.` host may
+//! cover it, as the name comes first), that a main file with a TLS listener has some certificate for it (a site,
+//! with `acme` or not, or the way), then the groups, the routes and
 //! the default group with the addresses the proxy listens on and the `max_body` of the proxy, that no route has the
 //! host of the way (with any port), that no server is at `admin.listen` (the way is the proxy's own; a name that comes
 //! to that address is refused when it is looked up), then the `records` of the routes with the `records` of the main
@@ -26,9 +30,10 @@
 //! is always the same version, under the same name.
 //!
 //! The document of `managed import` has the form of a version with paths in the place of the SHA-256: the
-//! `certificate` of a site is `{"chain_file", "key_file"}` and the `tls` of a group `{"ca_file", "server_name"?}`, each
-//! path absolute and clean and of at most 3840 bytes. It is checked as a version is, and it may be in any form.
-//! `version_of` makes the version of a document whose files are in the store.
+//! `certificate` of a site is `{"chain_file", "key_file"}` or `{"acme"}` (which names no file, and is the same in the
+//! version) and the `tls` of a group `{"ca_file", "server_name"?}`, each path absolute and clean and of at most 3840
+//! bytes. It is checked as a version is, and it may be in any form. `version_of` makes the version of a document whose
+//! files are in the store.
 
 use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
@@ -41,9 +46,10 @@ use serde_json::Value;
 
 use super::store::MAX_BYTES;
 use crate::config::{
-    self, Address, ConfigError, ForwardSettings, GeoConfig, Groups, ListenerKind, MainFile, Object,
-    PolicyConfig, RawAccess, RawRateLimit, RawRoute, RawTls, StoredTls, addresses, clean_abs,
-    ensure, host_ok_for_tls, name_ok, present, same, uses_countries,
+    self, Address, CertificateAcme, ConfigError, ForwardSettings, GeoConfig, Groups, ListenerKind,
+    MainFile, Object, PolicyConfig, RawAccess, RawCertificateAcme, RawRateLimit, RawRoute, RawTls,
+    StoredTls, addresses, certificate_acme, clean_abs, ensure, host_ok_for_tls, name_ok, present,
+    same, uses_countries,
 };
 use crate::forward::tls::Authorities;
 use crate::rules::bundle::{Fingerprint, hex};
@@ -84,45 +90,53 @@ struct RawSite<C> {
     certificate: Object<C>,
 }
 
-/// The `certificate` of a site of a version.
+/// The `certificate` of a site of a version: `chain` and `key`, or `acme` (see `one_of`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredCertificate {
-    chain: String,
-    key: String,
+    #[serde(default, deserialize_with = "present")]
+    chain: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    key: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    acme: Option<Object<RawCertificateAcme>>,
 }
 
-/// The `certificate` of a site of a document.
+/// The `certificate` of a site of a document: `chain_file` and `key_file`, or `acme` (see `one_of`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileCertificate {
-    chain_file: String,
-    key_file: String,
+    #[serde(default, deserialize_with = "present")]
+    chain_file: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    key_file: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    acme: Option<Object<RawCertificateAcme>>,
 }
 
-/// The `certificate` of a site as it is written: its two files, checked, by what names them (`F`).
+/// The `certificate` of a site as it is written, checked for a site with `hosts`; its files are named by `File`.
 pub(crate) trait Certificate {
     type File;
-    fn files(self) -> Result<(Self::File, Self::File), ConfigError>;
+    fn certificate(self, hosts: &[String]) -> Result<SiteCertificate<Self::File>, ConfigError>;
 }
 
 impl Certificate for StoredCertificate {
     type File = [u8; 32];
 
-    fn files(self) -> Result<([u8; 32], [u8; 32]), ConfigError> {
-        let name = |text: &str| {
-            digest(text).ok_or(ConfigError(
+    fn certificate(self, hosts: &[String]) -> Result<SiteCertificate<[u8; 32]>, ConfigError> {
+        let name = |text: String| {
+            digest(&text).ok_or(ConfigError(
                 "a site chain or key is not 64 lower-case hexadecimal digits",
             ))
         };
-        Ok((name(&self.chain)?, name(&self.key)?))
+        one_of(self.chain, self.key, self.acme, hosts, name)
     }
 }
 
 impl Certificate for FileCertificate {
     type File = PathBuf;
 
-    fn files(self) -> Result<(PathBuf, PathBuf), ConfigError> {
+    fn certificate(self, hosts: &[String]) -> Result<SiteCertificate<PathBuf>, ConfigError> {
         let path = |text: String| {
             let path = PathBuf::from(text);
             ensure(
@@ -131,23 +145,65 @@ impl Certificate for FileCertificate {
             )?;
             Ok(path)
         };
-        Ok((path(self.chain_file)?, path(self.key_file)?))
+        one_of(self.chain_file, self.key_file, self.acme, hosts, path)
     }
 }
 
-/// A site, checked: its name, the hosts it serves, and its certificate chain and private key, named by `F`, the
-/// SHA-256 of a file of the store in a version (`Site`) and a path in a document.
+/// The certificate that is written with both files (`chain` and `key`, each read by `file`) and no `acme`, or with
+/// `acme` and no file. Any other form, both files and `acme` or one file only or nothing, is refused with one sentence.
+fn one_of<F>(
+    chain: Option<String>,
+    key: Option<String>,
+    acme: Option<Object<RawCertificateAcme>>,
+    hosts: &[String],
+    file: impl Fn(String) -> Result<F, ConfigError>,
+) -> Result<SiteCertificate<F>, ConfigError> {
+    match (chain, key, acme) {
+        (Some(chain), Some(key), None) => Ok(SiteCertificate::Files {
+            chain: file(chain)?,
+            key: file(key)?,
+        }),
+        (None, None, Some(Object(acme))) => {
+            Ok(SiteCertificate::Acme(certificate_acme(acme, hosts)?))
+        }
+        _ => Err(ConfigError(
+            "a site certificate is neither chain and key nor acme",
+        )),
+    }
+}
+
+/// A site, checked: its name, the hosts it serves, and its certificate, whose files are named by `F`, the SHA-256 of a
+/// file of the store in a version (`Site`) and a path in a document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SiteOf<F> {
     pub name: String,
     /// In the form the hosts of a certificate of a listener have: a lowercase name, or `*.` and a name.
     pub hosts: Vec<String>,
-    pub chain: F,
-    pub key: F,
+    pub certificate: SiteCertificate<F>,
 }
 
 /// A site of a version.
 pub type Site = SiteOf<[u8; 32]>;
+
+/// The certificate of a site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SiteCertificate<F> {
+    /// The certificate chain and the private key, in files of the store (a document names them by their paths).
+    Files { chain: F, key: F },
+    /// Issued by the command `acme renew`, into `acme/` of the store under the name of the hosts of the site (see
+    /// `store`). Its files may not be there yet.
+    Acme(CertificateAcme),
+}
+
+impl<F> SiteCertificate<F> {
+    /// The chain and the key, for a certificate that is in files.
+    pub fn files(&self) -> Option<(&F, &F)> {
+        match self {
+            SiteCertificate::Files { chain, key } => Some((chain, key)),
+            SiteCertificate::Acme(_) => None,
+        }
+    }
+}
 
 /// A version or a document, checked with its main file.
 pub(crate) struct Checked<F> {
@@ -170,6 +226,13 @@ impl<C: Certificate, T> Raw<C, T> {
         split: impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
     ) -> Result<Checked<C::File>, ConfigError> {
         let sites = sites(self.sites)?;
+        ensure(
+            main.acme.is_some()
+                || sites
+                    .iter()
+                    .all(|site| !matches!(site.certificate, SiteCertificate::Acme(_))),
+            "a site has acme but the configuration has no acme object",
+        )?;
         let admin = main.admin_route.as_ref().map(|route| route.host.as_str());
         ensure(
             sites
@@ -259,12 +322,11 @@ fn sites<C: Certificate>(
             "a site host is not a name, or * and a name",
         )?;
         let Object(certificate) = site.certificate;
-        let (chain, key) = certificate.files()?;
+        let certificate = certificate.certificate(&site.hosts)?;
         sites.push(SiteOf {
             name: site.name,
             hosts: site.hosts,
-            chain,
-            key,
+            certificate,
         });
     }
     let mut hosts: Vec<&String> = sites.iter().flat_map(|site| &site.hosts).collect();
@@ -351,6 +413,10 @@ pub(crate) fn version_of(
     for site in sites.ok_or(LOST)? {
         let certificate = site.get_mut("certificate").and_then(Value::as_object_mut);
         let certificate = certificate.ok_or(LOST)?;
+        // A certificate with `acme` names no file: the version has it as the document does.
+        if certificate.contains_key("acme") {
+            continue;
+        }
         let chain = name(certificate, "chain_file")?;
         let key = name(certificate, "key_file")?;
         certificate.insert("chain".to_owned(), Value::String(chain));

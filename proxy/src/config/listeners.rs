@@ -172,9 +172,11 @@ struct RawCertificate {
     acme: Option<Object<RawCertificateAcme>>,
 }
 
+/// The `acme` object of a certificate as it is written: of a listener, of `admin.route` (see `admin`) and of a site of
+/// a managed version (see `managed`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawCertificateAcme {
+pub(crate) struct RawCertificateAcme {
     renew_before_days: u64,
 }
 
@@ -290,7 +292,7 @@ pub(super) fn holds_fit(listeners: &[ListenerConfig], upstream_max_head_bytes: u
 }
 
 /// The `acme` object of a certificate with these hosts. HTTP-01 cannot prove a wildcard name, so there is none.
-fn certificate_acme(
+pub(crate) fn certificate_acme(
     raw: RawCertificateAcme,
     hosts: &[String],
 ) -> Result<CertificateAcme, ConfigError> {

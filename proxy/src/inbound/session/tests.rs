@@ -1521,7 +1521,7 @@ fn challenge_in(dir: &Path) -> Challenge {
             http2: None,
         }),
     }];
-    Challenge::new(Some(&acme), &listeners).unwrap()
+    Challenge::new(Some(&acme), &listeners, None, &[]).unwrap()
 }
 
 /// One request on a new connection to the listener at `listener`, and the answer, whole: its head and its body.

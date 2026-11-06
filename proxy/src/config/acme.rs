@@ -1,17 +1,21 @@
 //! The `acme` object of the configuration: how the command `acme renew` (see `acme`) reaches the CA that issues the
 //! certificates that have `acme`, and where it keeps its account key and the files of the challenges.
 //!
-//! The object is there if and only if some certificate of some TLS listener has `acme` (see `listeners`), and then
-//! some listener has to be plain or to redirect, for the CA asks for the challenge over plain HTTP. Its keys are all
-//! required: `directory_url` (an `https://` URL of at most 2048 bytes without blanks or control bytes),
-//! `contact_email` (at most 254 bytes, `name@domain` of letters, digits and a few signs; the form only is checked),
-//! `account_key_file`, `challenge_dir` and `ca_file` (each an absolute clean path of at most 3840 bytes; `ca_file` holds
-//! the authorities that the CA's certificate is checked against, as the `ca_file` of an upstream group does) and
-//! `timeout_ms` (1 ms to 600 s, the time the whole command may take). The account key file, `ca_file` and the cert and
-//! key files of the certificates that have `acme` are all different files: the command replaces the cert and key
-//! files, and the account key file is made by it. None of these files, and no cert or key file of any other
-//! certificate, is directly inside `challenge_dir`: a listener answers a request with the content of a file of that
-//! directory whose name is a token (see `inbound::challenge`). The paths are compared as they are written.
+//! The certificates here are those of the TLS listeners (see `listeners`) and the certificate of `admin.route` (see
+//! `admin`). A file without `managed` has the object if and only if one of them has `acme`. A file with `managed` has
+//! it if the certificate of `admin.route` has `acme`, and may have it when none does: its sites with `acme` are in the
+//! version, which the main file alone does not show (see `managed`). With the object, some listener has to be plain or
+//! to redirect, for the CA asks for the challenge over plain HTTP. Its keys are all required: `directory_url` (an
+//! `https://` URL of at most 2048 bytes without blanks or control bytes), `contact_email` (at most 254 bytes,
+//! `name@domain` of letters, digits and a few signs; the form only is checked), `account_key_file`, `challenge_dir`
+//! and `ca_file` (each an absolute clean path of at most 3840 bytes; `ca_file` holds the authorities that the CA's
+//! certificate is checked against, as the `ca_file` of an upstream group does) and `timeout_ms` (1 ms to 600 s, the
+//! time the whole command may take). The account key file, `ca_file` and the cert and key files of the certificates
+//! that have `acme` are all different files: the command replaces the cert and key files, and the account key file is
+//! made by it. None of these files, and no cert or key file of any other certificate, is directly inside
+//! `challenge_dir`: a listener answers a request with the content of a file of that directory whose name is a token
+//! (see `inbound::challenge`). The paths are compared as they are written. Where `challenge_dir` and these files are
+//! against the other places of the configuration is in `places`.
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -20,8 +24,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::{
-    CertificateConfig, ConfigError, ListenerConfig, ListenerKind, MAX_STORE_DIR, Object, clean_abs,
-    ensure,
+    AdminRoute, CertificateConfig, ConfigError, ListenerConfig, ListenerKind, MAX_STORE_DIR,
+    Object, clean_abs, ensure,
 };
 
 /// The longest `directory_url` in bytes.
@@ -92,8 +96,11 @@ fn path(text: String) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
-/// The certificates of the TLS listeners.
-fn certificates(listeners: &[ListenerConfig]) -> impl Iterator<Item = &CertificateConfig> {
+/// The certificates of the TLS listeners, and that of the way to the admin process.
+fn certificates<'a>(
+    listeners: &'a [ListenerConfig],
+    route: Option<&'a AdminRoute>,
+) -> impl Iterator<Item = &'a CertificateConfig> {
     listeners
         .iter()
         .filter_map(|listener| match &listener.kind {
@@ -101,27 +108,34 @@ fn certificates(listeners: &[ListenerConfig]) -> impl Iterator<Item = &Certifica
             _ => None,
         })
         .flatten()
+        .chain(route.map(|route| &route.certificate))
 }
 
-/// The certificates of the TLS listeners that have `acme`.
-fn issued(listeners: &[ListenerConfig]) -> impl Iterator<Item = &CertificateConfig> {
-    certificates(listeners).filter(|certificate| certificate.acme.is_some())
+/// Those of them that have `acme`.
+fn issued<'a>(
+    listeners: &'a [ListenerConfig],
+    route: Option<&'a AdminRoute>,
+) -> impl Iterator<Item = &'a CertificateConfig> {
+    certificates(listeners, route).filter(|certificate| certificate.acme.is_some())
 }
 
-/// Checks the object against the listeners: it is there if and only if a certificate has `acme`.
+/// Checks the object against the certificates of the listeners and of `route`, the way to the admin process.
+/// `managed` tells that the file has `managed`.
 pub(super) fn check(
     raw: Option<Object<RawAcme>>,
     listeners: &[ListenerConfig],
+    route: Option<&AdminRoute>,
+    managed: bool,
 ) -> Result<Option<AcmeConfig>, ConfigError> {
     let Some(Object(raw)) = raw else {
         ensure(
-            issued(listeners).next().is_none(),
+            issued(listeners, route).next().is_none(),
             "a certificate has acme but the configuration has no acme object",
         )?;
         return Ok(None);
     };
     ensure(
-        issued(listeners).next().is_some(),
+        managed || issued(listeners, route).next().is_some(),
         "the configuration has an acme object but no certificate has acme",
     )?;
     ensure(
@@ -146,7 +160,7 @@ pub(super) fn check(
     let challenge_dir = path(raw.challenge_dir)?;
     let ca_file = path(raw.ca_file)?;
     let mut files: Vec<&PathBuf> = vec![&account_key_file, &ca_file];
-    for certificate in issued(listeners) {
+    for certificate in issued(listeners, route) {
         files.push(&certificate.cert_file);
         files.push(&certificate.key_file);
     }
@@ -158,7 +172,7 @@ pub(super) fn check(
     // The files of a certificate without acme are the operator's: the command neither takes one as its own key or CA nor
     // writes one.
     ensure(
-        certificates(listeners)
+        certificates(listeners, route)
             .filter(|certificate| certificate.acme.is_none())
             .flat_map(|certificate| [&certificate.cert_file, &certificate.key_file])
             .all(|file| !files.contains(&file)),
@@ -167,7 +181,7 @@ pub(super) fn check(
     ensure(
         [&account_key_file, &ca_file]
             .into_iter()
-            .chain(certificates(listeners).flat_map(|c| [&c.cert_file, &c.key_file]))
+            .chain(certificates(listeners, route).flat_map(|c| [&c.cert_file, &c.key_file]))
             .all(|file| file.parent() != Some(challenge_dir.as_path())),
         "the account key file, the ca_file or a cert or key file of a certificate is directly inside challenge_dir",
     )?;

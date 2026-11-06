@@ -198,10 +198,51 @@ fn the_hosts_are_those_of_the_certificates_with_acme_and_there_is_nothing_withou
         ca_file: PathBuf::from("/ca"),
         timeout: Duration::from_secs(1),
     };
-    let made = Challenge::new(Some(&acme), &listeners).unwrap();
+    let made = Challenge::new(Some(&acme), &listeners, None, &[]).unwrap();
     assert_eq!(made.hosts, ["a.test", "b.test"]);
     assert_eq!(made.dir, Path::new("/challenges"));
-    assert!(Challenge::new(None, &listeners).is_none());
+    assert!(Challenge::new(None, &listeners, None, &[]).is_none());
+
+    // With `managed`: the way to the admin process if its certificate has acme, and the sites with acme.
+    let route = |acme: Option<CertificateAcme>| CertificateConfig {
+        cert_file: PathBuf::from("/r.pem"),
+        key_file: PathBuf::from("/r.key"),
+        hosts: vec!["admin.test".to_owned()],
+        acme,
+    };
+    let site = |name: &str, host: &str, certificate| Site {
+        name: name.to_owned(),
+        hosts: vec![host.to_owned()],
+        certificate,
+    };
+    let sites = [
+        site(
+            "issued",
+            "issued.test",
+            SiteCertificate::Acme(CertificateAcme {
+                renew_before_days: 30,
+            }),
+        ),
+        site(
+            "given",
+            "given.test",
+            SiteCertificate::Files {
+                chain: [1; 32],
+                key: [2; 32],
+            },
+        ),
+    ];
+    let plain = [ListenerConfig {
+        address: "127.0.0.1:2".parse().unwrap(),
+        kind: ListenerKind::Plain,
+    }];
+    let with_acme = route(Some(CertificateAcme {
+        renew_before_days: 30,
+    }));
+    let made = Challenge::new(Some(&acme), &plain, Some(&with_acme), &sites).unwrap();
+    assert_eq!(made.hosts, ["admin.test", "issued.test"]);
+    let made = Challenge::new(Some(&acme), &plain, Some(&route(None)), &sites).unwrap();
+    assert_eq!(made.hosts, ["issued.test"]);
 }
 
 #[test]

@@ -9,16 +9,21 @@
 //! A request is a challenge when its method is `GET` or `HEAD`, its target is the path above and a token of 1 to 128
 //! letters, digits, `-` and `_` and nothing after it (no query, no escape, no further `/`), and its `Host` names one
 //! of the hosts of the certificates with `acme` (the same comparison as the one for the hosts of a certificate: case
-//! ignored, a port and a trailing dot left out). The answer is the content of the file, with `200` and
+//! ignored, a port and a trailing dot left out). Those certificates are the ones of the whole configuration that the
+//! proxy serves with: of the TLS listeners, of `admin.route` and of the sites of the managed version, so a new version
+//! read at SIGHUP changes the hosts, and the hosts of a site that is no longer in it are not answered for. The
+//! `access` of `admin.route` does not apply here: the CA asks from any address, and nothing but the file of a token
+//! that `acme renew` puts there for an order is answered with. The answer is the content of the file, with `200` and
 //! `Content-Type: text/plain`, if it is a regular file of at most 1 KiB, else `404`. A link is never followed: the
 //! command writes regular files, and a link in the directory could point at any file. The token can name no other
 //! file than one in `challenge_dir`, and nothing else is looked at.
 
 use std::path::PathBuf;
 
-use crate::config::{AcmeConfig, ListenerConfig, ListenerKind};
+use crate::config::{AcmeConfig, CertificateConfig, ListenerConfig, ListenerKind};
 use crate::inbound::head::Head;
 use crate::inbound::transport::tls::host_name;
+use crate::managed::{Site, SiteCertificate};
 use crate::rules::file_store::read_regular;
 
 /// The path in front of the token.
@@ -52,20 +57,31 @@ pub fn is_token(bytes: &[u8]) -> bool {
 }
 
 impl Challenge {
-    /// The challenge for the hosts of the certificates with `acme` among those of `listeners`; none if the
+    /// The challenge for the hosts of the certificates with `acme` of a whole configuration: those of `listeners`, the
+    /// certificate `route` of the way to the admin process and the `sites` of the managed version. None if the
     /// configuration has no `acme`.
-    pub fn new(acme: Option<&AcmeConfig>, listeners: &[ListenerConfig]) -> Option<Challenge> {
+    pub fn new(
+        acme: Option<&AcmeConfig>,
+        listeners: &[ListenerConfig],
+        route: Option<&CertificateConfig>,
+        sites: &[Site],
+    ) -> Option<Challenge> {
         let acme = acme?;
-        let hosts = listeners
+        let certificates = listeners
             .iter()
             .filter_map(|listener| match &listener.kind {
                 ListenerKind::Tls(tls) => Some(&tls.certificates),
                 _ => None,
             })
             .flatten()
+            .chain(route)
             .filter(|certificate| certificate.acme.is_some())
-            .flat_map(|certificate| certificate.hosts.iter().cloned())
-            .collect();
+            .map(|certificate| &certificate.hosts);
+        let sites = sites
+            .iter()
+            .filter(|site| matches!(site.certificate, SiteCertificate::Acme(_)))
+            .map(|site| &site.hosts);
+        let hosts = certificates.chain(sites).flatten().cloned().collect();
         Some(Challenge {
             dir: acme.challenge_dir.clone(),
             hosts,

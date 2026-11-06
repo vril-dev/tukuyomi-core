@@ -18,13 +18,15 @@
 //! the status listener: the proxy reaches the admin process by a route to it, which is meant to be the way in.
 //!
 //! A file with `managed` writes that way in the object itself, and only such a file: `route`, which it then must have,
-//! is `{"host", "certificate": {"cert_file", "key_file"}, "access"}`. `host` is one name as a host of a certificate of
-//! a listener is written, without `*.`; the certificate is checked and read as the certificate of a listener with that
-//! one host is; `access` is written as the `access` of a route is (see `rewrite`) and has `allow_cidrs`, which is not
-//! empty, so that the way to the admin process is never open to every address. The proxy makes the route itself (see
-//! `forward::group`): a request whose `Host` is the host goes to `listen`, over a connection of that certificate, and
-//! the `access` and `rate_limit` of the configuration do not apply to it. `route` is the proxy's alone: it is not one
-//! of the values the admin process takes, and a reading of the file again may change it.
+//! is `{"host", "certificate": {"cert_file", "key_file", "acme"?}, "access"}`. `host` is one name as a host of a
+//! certificate of a listener is written, without `*.`; the certificate is checked and read as the certificate of a
+//! listener with that one host is, its `acme` included (the command `acme renew` then writes its two files, which need
+//! not exist when the proxy starts, and the file has the `acme` object, see `acme`); `access` is written as the
+//! `access` of a route is (see `rewrite`) and has `allow_cidrs`, which is not empty, so that the way to the admin
+//! process is never open to every address. The proxy makes the route itself (see `forward::group`): a request whose
+//! `Host` is the host goes to `listen`, over a connection of that certificate, and the `access` and `rate_limit` of
+//! the configuration do not apply to it. `route` is the proxy's alone: it is not one of the values the admin process
+//! takes, and a reading of the file again may change it.
 
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
@@ -33,7 +35,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::listeners::{self, clash, host_ok_for_tls};
+use super::listeners::{self, RawCertificateAcme, clash, host_ok_for_tls};
 use super::rewrite::{self, RawAccess};
 use super::{
     CertificateConfig, ConfigError, ListenerConfig, MAX_STORE_DIR, Object, RawStore, StatusConfig,
@@ -80,7 +82,7 @@ pub struct AdminConfig {
 pub struct AdminRoute {
     /// A lowercase name.
     pub host: String,
-    /// Its `hosts` are `[host]`, and it has no `acme`.
+    /// Its `hosts` are `[host]`. With `acme`, the command `acme renew` writes its two files.
     pub certificate: CertificateConfig,
     pub access: Access,
 }
@@ -115,6 +117,8 @@ struct RawRoute {
 struct RawCertificate {
     cert_file: String,
     key_file: String,
+    #[serde(default, deserialize_with = "super::present")]
+    acme: Option<Object<RawCertificateAcme>>,
 }
 
 /// A path of at most `longest` bytes that is absolute and clean.
@@ -240,11 +244,16 @@ fn route(raw: RawRoute) -> Result<AdminRoute, ConfigError> {
         "admin route host is not a name",
     )?;
     let Object(files) = raw.certificate;
+    let hosts = vec![raw.host.clone()];
+    let acme = files
+        .acme
+        .map(|Object(acme)| listeners::certificate_acme(acme, &hosts))
+        .transpose()?;
     let certificate = CertificateConfig {
         cert_file: listeners::file(files.cert_file)?,
         key_file: listeners::file(files.key_file)?,
-        hosts: vec![raw.host.clone()],
-        acme: None,
+        hosts,
+        acme,
     };
     let access = rewrite::access(Some(raw.access))?;
     ensure(

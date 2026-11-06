@@ -83,12 +83,14 @@
 //! A switch order on the control socket takes the same steps (see `control`) once the store chooses the generation
 //! that the order expects, and is answered when the switch has ended.
 //! SIGUSR2 reads every certificate and key file of every TLS listener again (with `managed`, the files of the way to
-//! the admin process, and those of the sites from the managed store). If all of them pass the checks, they
-//! replace the old ones for the handshakes that start from then on (a connection that is open keeps what it has);
+//! the admin process, and those of the sites from the managed store, `acme/` for a site with `acme`). If all of them
+//! pass the checks, they replace the old ones for the handshakes that start from then on (a connection that is open
+//! keeps what it has);
 //! if one does not, none is replaced and a line says which. It is a line and nothing else before the listeners are
 //! bound and while the proxy stops, and it has nothing to do with SIGUSR1. A certificate with `acme` whose files do
-//! not exist yet is not a refusal, at the start or at SIGUSR2: a line names it, and it is left out of the handshakes
-//! until a SIGUSR2 finds its files (the command `acme renew` makes them).
+//! not exist yet, of a listener, of the way to the admin process or of a site, is not a refusal, at the start, at
+//! SIGHUP or at SIGUSR2: a line names it, and it is left out of the handshakes until a reading finds its files (the
+//! command `acme renew` makes them).
 //!
 //! The first cause of a stop (SIGTERM or SIGINT, or a failure of start-up or of the driver) fixes the time `t0`. From
 //! then on `/readyz` says `stopping`, and `STOPPING=1` is sent if the environment has `NOTIFY_SOCKET`. The stop

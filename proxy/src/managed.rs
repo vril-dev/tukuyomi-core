@@ -16,6 +16,13 @@
 //! directory (not a link) owned by the user that the file system sees for this process, without group or other
 //! permission bits. What is read is opened without following a link and without waiting for a writer.
 //!
+//! The store also holds `acme/<64 digits>/chain` and `acme/<64 digits>/key`: the certificate chain and the private key
+//! of a site with `acme`, which the command `acme renew` writes and replaces (see `acme`). They are outside the
+//! versions: their directory is named by the hosts of the site (`acme_name`), not by a version, and their names
+//! are not their SHA-256, for they are replaced in place. `acme/` and the directories in it are real directories, made
+//! (0700) by the command when they are not there; one that is not there yet, or a file that is not, is a certificate
+//! that has not been issued yet, and anything else that is wrong with them is refused.
+//!
 //! The proxy reads the main file and a version as one configuration (`load`): when it starts, for `config check` and at
 //! SIGHUP, with the version that `current` names. Every TLS listener of the main file then chooses, by the name the
 //! client asks for, from the certificates of the sites and that of the way to the admin process, which the main file
@@ -32,5 +39,5 @@ mod version;
 #[cfg(test)]
 pub(crate) use load::whole;
 pub use load::{Choice, LoadError, Version, load};
-pub use store::{Listed, ManagedError, Placed, Store};
-pub use version::{Site, SiteOf};
+pub use store::{Listed, ManagedError, Placed, Store, acme_name};
+pub use version::{Site, SiteCertificate, SiteOf};

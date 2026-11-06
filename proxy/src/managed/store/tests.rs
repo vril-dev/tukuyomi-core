@@ -261,3 +261,81 @@ fn the_list_has_the_versions_only() {
         .collect();
     assert_eq!(listed, [name]);
 }
+
+#[test]
+fn the_directory_of_a_site_with_acme_is_named_by_its_hosts_in_any_order() {
+    let hosts = |list: &[&str]| -> Vec<String> { list.iter().map(|h| (*h).to_owned()).collect() };
+    let name = acme_name(&hosts(&["b.test", "a.test"]));
+    assert_eq!(name, acme_name(&hosts(&["a.test", "b.test"])));
+    assert_eq!(name, sha256(b"a.test\nb.test\n"));
+    assert_ne!(name, acme_name(&hosts(&["a.test"])));
+}
+
+#[test]
+fn a_certificate_of_a_site_with_acme_is_missing_only_when_a_directory_or_a_file_is_not_there() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let name = acme_name(&["a.test".to_owned()]);
+    assert!(matches!(store.issued(name), Ok(None)));
+    let (chain, key) = store.issue_places(name).unwrap();
+    let dir = fixture.dir().join("acme").join(hex(&name));
+    assert_eq!(
+        (chain.clone(), key.clone()),
+        (dir.join("chain"), dir.join("key"))
+    );
+    for made in [fixture.dir().join("acme"), dir.clone()] {
+        assert_eq!(fs::symlink_metadata(&made).unwrap().mode() & 0o777, 0o700);
+    }
+    assert!(matches!(store.issued(name), Ok(None)));
+    // Between the two renames of the command: the key is there, the chain not yet.
+    fs::write(&key, b"key").unwrap();
+    assert!(matches!(store.issued(name), Ok(None)));
+    fs::write(&chain, b"chain").unwrap();
+    let (read_chain, read_key) = store.issued(name).unwrap().unwrap();
+    assert_eq!(
+        (&read_chain[..], &read_key[..]),
+        (&b"chain"[..], &b"key"[..])
+    );
+    // A link in the place of a file is a fault, not a certificate that is not issued yet.
+    let outside = fixture.root().join("chain");
+    fs::write(&outside, b"chain").unwrap();
+    fs::remove_file(&chain).unwrap();
+    symlink(&outside, &chain).unwrap();
+    assert_eq!(
+        refusal(store.issued(name)),
+        "an issued certificate or key cannot be read, or is a link"
+    );
+}
+
+#[test]
+fn a_link_in_the_place_of_a_directory_of_a_site_with_acme_is_refused_for_reading_and_writing() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let name = acme_name(&["a.test".to_owned()]);
+    let elsewhere = fixture.root().join("elsewhere");
+    DirBuilder::new().mode(0o700).create(&elsewhere).unwrap();
+    fs::write(elsewhere.join("chain"), b"chain").unwrap();
+    fs::write(elsewhere.join("key"), b"key").unwrap();
+    store
+        .issue_places(acme_name(&["b.test".to_owned()]))
+        .unwrap();
+    let site = fixture.dir().join("acme").join(hex(&name));
+    symlink(&elsewhere, &site).unwrap();
+    let not_real = "a directory of the managed store is not a real directory";
+    assert_eq!(refusal(store.issued(name)), not_real);
+    assert_eq!(refusal(store.issue_places(name)), not_real);
+    // The same for `acme/` itself, which is looked at first.
+    let acme = fixture.dir().join("acme");
+    fs::rename(&acme, fixture.root().join("acme")).unwrap();
+    symlink(fixture.root().join("acme"), &acme).unwrap();
+    assert_eq!(refusal(store.issued(name)), not_real);
+    assert_eq!(refusal(store.issue_places(name)), not_real);
+    // Nothing was made or changed through the links.
+    let mut entries: Vec<_> = fs::read_dir(&elsewhere)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["chain", "key"]);
+    assert_eq!(fs::read(elsewhere.join("chain")).unwrap(), b"chain");
+}

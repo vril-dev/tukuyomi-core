@@ -58,7 +58,7 @@ fn request(target: &str, host: &str) -> String {
 }
 
 /// The command `acme renew` with these arguments; its exit code, standard output and standard error.
-fn command(args: &[&Path]) -> (Option<i32>, String, String) {
+pub(crate) fn command(args: &[&Path]) -> (Option<i32>, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_tukuyomi-proxy"))
         .args(args)
         .output()

@@ -8,7 +8,7 @@
 //! present, see `rewrite`, and a `stream` has all three; an upstream group may leave out its
 //! `tls`, which may leave out its `server_name`; a listener may leave out its `tls` and its `redirect`, and the `tls`
 //! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
-//! may leave out `acme`, which it must have if and only if a certificate has one, see `acme`, and `status`, which
+//! may leave out `acme`, which it must have when a certificate has one, see `acme`, and `status`, which
 //! has the one key `listen`, see `status`, and `records`, `access`, `rate_limit`, `geo` and `admin`, see their files
 //! (`access`, `rate_limit` and `geo` are in `policy`); an unknown or repeated
 //! key is refused, and so is a value of the wrong
@@ -17,20 +17,20 @@
 //! file. Then the values are checked in a fixed order and the first broken rule is returned: the `proxy` bounds, the
 //! `status` object against the listeners (before `forward`, for no server may be at its address), the `forward`
 //! values (see `forward`; the names of the servers are not looked up here, `forward::resolve` does that when the proxy
-//! starts), the `rules.store` values, the `acme` object with the certificates that have `acme`, the `records` object
-//! (and that the `records` of the routes suit it), the `access`, `rate_limit` and `geo` objects (see `policy`) and that `geo` is there if a list of countries is, the
-//! `admin` object against the listeners and the status listener, the directories and the control socket against
-//! each other (see `places`), the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's
+//! starts), the `rules.store` values, the `records` object (and that the `records` of the routes suit it), the
+//! `access`, `rate_limit` and `geo` objects (see `policy`) and that `geo` is there if a list of countries is, the
+//! `admin` object against the listeners and the status listener, the `acme` object with the certificates that have
+//! `acme` (that of `admin.route` included), the directories, the control socket and the files of `acme` against each
+//! other (see `places`), the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's
 //! own check, and last the relations between the `proxy` and `kernel` objects.
 //!
 //! `managed` may be left out. When it is there it is `{"dir"}`, the directory of the managed store (see `managed`),
 //! an absolute clean path of at most 3840 bytes, and the file does not write how the proxy routes: `forward` has
-//! `resolve_timeout_ms` only, the `tls` of a listener has no `certificates`, and the file has no `access`, no
-//! `rate_limit` and no `acme` (a certificate with `acme` cannot be a site yet). The upstream groups, the routes, the
-//! default group, the `access`, the `rate_limit` and the sites with their certificates come from a version of the
-//! store, which is checked after the values of this file and against them, by the same rules and with the same
-//! sentences (see `managed::version`). Its `admin`, if it has one, writes the way to the admin process (`admin.route`,
-//! see `admin`). A file without `managed` is read as it always was.
+//! `resolve_timeout_ms` only, the `tls` of a listener has no `certificates`, and the file has no `access` and no
+//! `rate_limit`. The upstream groups, the routes, the default group, the `access`, the `rate_limit` and the sites with
+//! their certificates come from a version of the store, which is checked after the values of this file and against
+//! them, by the same rules and with the same sentences (see `managed::version`). Its `admin`, if it has one, writes
+//! the way to the admin process (`admin.route`, see `admin`). A file without `managed` is read as it always was.
 //!
 //! There are two readings of the file. `load` reads the whole configuration, which the proxy serves with: the file,
 //! with `managed` the version that the store chooses and the files it names (see `managed::load`), and the country
@@ -98,11 +98,11 @@ pub use forward::{
 };
 pub(crate) use forward::{Groups, MAX_SERVERS, RawRoute, RawTls, StoredTls, name_ok, routing};
 pub use kernel::KernelSettings;
-pub(crate) use listeners::host_ok_for_tls;
 pub use listeners::{
     CertificateAcme, CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion,
     TlsConfig, addresses,
 };
+pub(crate) use listeners::{RawCertificateAcme, certificate_acme, host_ok_for_tls};
 pub use policy::{GeoConfig, PolicyConfig, RateLimitConfig};
 pub(crate) use policy::{RawRateLimit, routed};
 pub use records::{Driver, Keep, Records, RouteKeep, Ship};
@@ -195,7 +195,7 @@ pub struct Loaded {
     pub forward: ForwardSettings,
     pub kernel: KernelSettings,
     pub store: StoreConfig,
-    /// There if and only if a certificate has `acme`.
+    /// There if the file has the `acme` object (see `acme` for when it must).
     pub acme: Option<AcmeConfig>,
     /// There if the file has the `status` object.
     pub status: Option<StatusConfig>,
@@ -689,11 +689,6 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Built, ConfigError> {
     )?;
     let managed = m.map(|Object(raw)| managed_dir(raw)).transpose()?;
 
-    ensure(
-        managed.is_none() || a.is_none(),
-        "the configuration has acme while it has managed",
-    )?;
-    let acme = acme::check(a, &listeners)?;
     let records = records::check(rec)?;
     if let Some(forward) = &forward {
         records::consistent(records.as_ref(), forward)?;
@@ -719,7 +714,15 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Built, ConfigError> {
                 .is_some_and(|r| r.access.has_countries()),
         "access has a list of countries while geo is left out",
     )?;
-    places::separate(&dir, records.as_ref(), admin.as_ref(), managed.as_ref())?;
+    let acme = acme::check(a, &listeners, admin_route.as_ref(), versioned)?;
+    places::separate(
+        &dir,
+        records.as_ref(),
+        admin.as_ref(),
+        managed.as_ref(),
+        acme.as_ref(),
+        admin_route.as_ref(),
+    )?;
 
     let kernel = kernel::settings(k, &dir)?;
     let proxy = ProxyConfig {

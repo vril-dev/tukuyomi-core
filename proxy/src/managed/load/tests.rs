@@ -1,5 +1,6 @@
 use super::*;
 use crate::forward::tls::Authorities;
+use crate::managed::SiteCertificate;
 use crate::managed::store::tests::Fixture;
 use crate::rules::bundle::hex;
 use serde_json::{Value, json};
@@ -46,14 +47,6 @@ fn a_main_file_with_managed_writes_none_of_what_a_version_holds() {
         "a tls listener has certificates while the configuration has managed"
     );
     assert_eq!(
-        main_refusal(&fixture, |m| m["acme"] = json!({
-            "directory_url": "https://ca.test/directory", "contact_email": "ops@example.test",
-            "account_key_file": "/a/account.key", "challenge_dir": "/a/challenges", "ca_file": "/a/ca.pem",
-            "timeout_ms": 1000,
-        })),
-        "the configuration has acme while it has managed"
-    );
-    assert_eq!(
         main_refusal(&fixture, |m| m["rules"]["store"]["dir"] =
             json!(fixture.dir().join("rules"))),
         "the managed dir is the same as, inside or around the rules store dir, the records dir, the admin store dir or the directory of admin control"
@@ -79,7 +72,10 @@ fn the_whole_reading_takes_the_routing_from_the_current_version() {
     let read = loaded.version.unwrap();
     assert_eq!(read.name, name);
     assert_eq!(read.sites[0].hosts, ["site.test"]);
-    assert_eq!(read.sites[0].chain, sha256(b"chain"));
+    assert_eq!(
+        read.sites[0].certificate.files().map(|(chain, _)| *chain),
+        Some(sha256(b"chain"))
+    );
     // The same file of the store, given as bytes, reads the same.
     let bytes = serde_json::to_vec(&version).unwrap();
     assert!(load(&main, &Choice::Given(bytes)).is_ok());
@@ -357,4 +353,154 @@ fn the_file_of_the_authorities_of_a_group_is_read_through_the_store_only() {
         refusal(load(&main, &Choice::Current)),
         LoadError::Store(ManagedError("a managed file cannot be read, or is a link"))
     );
+}
+
+// ---- acme ----
+
+fn acme_object() -> Value {
+    json!({
+        "directory_url": "https://ca.test/directory", "contact_email": "ops@example.test",
+        "account_key_file": "/a/account.key", "challenge_dir": "/a/challenges", "ca_file": "/a/ca.pem",
+        "timeout_ms": 1000,
+    })
+}
+
+/// The version of the fixture whose site has `acme` in the place of its files.
+fn acme_version(fixture: &Fixture) -> Value {
+    let mut version = fixture.plain_version(b"chain", b"key");
+    version["sites"][0]["certificate"] = json!({"acme": {"renew_before_days": 30}});
+    version
+}
+
+#[test]
+fn a_main_file_with_managed_may_have_acme_with_a_listener_for_the_challenge() {
+    let fixture = Fixture::new();
+    // No certificate of the main file has acme: those of the sites are in the version.
+    let main = fixture.main_file(|m| m["acme"] = acme_object());
+    assert!(config::load_main(&main).unwrap().acme.is_some());
+    assert_eq!(
+        main_refusal(&fixture, |m| {
+            m["acme"] = acme_object();
+            m["proxy"]["listeners"] =
+                json!([{"address": "127.0.0.1:8443", "tls": {"min_version": "1.2"}}]);
+        }),
+        "a certificate with acme needs a plain or a redirect listener for the challenge"
+    );
+}
+
+#[test]
+fn a_site_with_acme_needs_the_acme_object_names_no_file_and_counts_as_a_certificate() {
+    let fixture = Fixture::new();
+    let given = |version: &Value| Choice::Given(serde_json::to_vec(version).unwrap());
+    let without = fixture.main_file(|_| {});
+    assert_eq!(
+        refusal(load(&without, &given(&acme_version(&fixture)))),
+        LoadError::Version(ConfigError(
+            "a site has acme but the configuration has no acme object"
+        ))
+    );
+    // With only that site, a TLS listener has its certificate, though it is not issued yet; the store has no `acme/`.
+    let main = fixture.main_file(|m| {
+        m["acme"] = acme_object();
+        m["proxy"]["listeners"] = json!([
+            {"address": "127.0.0.1:8080"},
+            {"address": "127.0.0.1:8443", "tls": {"min_version": "1.2"}},
+        ]);
+    });
+    let loaded = load(&main, &given(&acme_version(&fixture))).unwrap();
+    assert_eq!(
+        loaded.version.unwrap().sites[0].certificate,
+        SiteCertificate::Acme(crate::config::CertificateAcme {
+            renew_before_days: 30
+        })
+    );
+    assert!(!fixture.dir().join("acme").exists());
+}
+
+/// The `admin` object whose route has a certificate with `acme`, its files `cert_file` and `key_file`.
+fn admin_acme(cert_file: &str, key_file: &str) -> Value {
+    let mut route = route("admin.test", json!({"allow_cidrs": ["192.0.2.0/24"]}));
+    route["certificate"] = json!({
+        "cert_file": cert_file, "key_file": key_file, "acme": {"renew_before_days": 30},
+    });
+    admin(Some(route))
+}
+
+#[test]
+fn the_certificate_of_the_way_to_the_admin_process_may_have_acme_with_the_acme_object() {
+    let fixture = Fixture::new();
+    let (cert, key) = ("/etc/tukuyomi/admin.pem", "/etc/tukuyomi/admin.key");
+    // The main file alone refuses it, as the proxy does.
+    assert_eq!(
+        main_refusal(&fixture, |m| m["admin"] = admin_acme(cert, key)),
+        "a certificate has acme but the configuration has no acme object"
+    );
+    let main = fixture.main_file(|m| {
+        m["admin"] = admin_acme(cert, key);
+        m["acme"] = acme_object();
+    });
+    let route = config::load_main(&main).unwrap().admin_route.unwrap();
+    assert_eq!(
+        route.certificate.acme,
+        Some(crate::config::CertificateAcme {
+            renew_before_days: 30
+        })
+    );
+    // Its files are files of the command: apart from the account key and outside challenge_dir.
+    let with = |cert: &str, key: &str| {
+        let (cert, key) = (cert.to_owned(), key.to_owned());
+        main_refusal(&fixture, move |m| {
+            m["admin"] = admin_acme(&cert, &key);
+            m["acme"] = acme_object();
+        })
+    };
+    assert_eq!(
+        with(cert, "/a/account.key"),
+        "the account key file, the ca_file and the cert and key files of the certificates with acme are not all different"
+    );
+    assert_eq!(
+        with("/a/challenges/admin.pem", key),
+        "the account key file, the ca_file or a cert or key file of a certificate is directly inside challenge_dir"
+    );
+}
+
+#[test]
+fn the_challenge_directory_and_the_files_of_acme_are_apart_from_the_managed_store() {
+    let fixture = Fixture::new();
+    let store = fixture.dir();
+    let with_acme = |key: &str, path: PathBuf| {
+        let mut object = acme_object();
+        object[key] = json!(path);
+        main_refusal(&fixture, |m| m["acme"] = object)
+    };
+    let challenge = "acme challenge_dir is the same as, inside or around the rules store dir, the records dir, the admin store dir, the directory of admin control or the managed dir";
+    assert_eq!(with_acme("challenge_dir", store.clone()), challenge);
+    assert_eq!(
+        with_acme("challenge_dir", store.join("challenges")),
+        challenge
+    );
+    assert_eq!(
+        with_acme("challenge_dir", fixture.root().to_owned()),
+        challenge
+    );
+    let inside = "the acme account_key_file or ca_file, or a cert or key file of admin route, is inside the managed dir";
+    assert_eq!(
+        with_acme("account_key_file", store.join("account.key")),
+        inside
+    );
+    let in_store = store.join("admin.pem");
+    assert_eq!(
+        main_refusal(&fixture, |m| {
+            m["admin"] = admin_acme(in_store.to_str().unwrap(), "/etc/tukuyomi/admin.key");
+            m["acme"] = acme_object();
+        }),
+        inside
+    );
+    // A name that only starts with that of the store is no place inside it.
+    let mut beside = store.into_os_string();
+    beside.push("2");
+    let beside = PathBuf::from(beside).join("account.key");
+    let mut object = acme_object();
+    object["account_key_file"] = json!(beside);
+    assert!(config::load_main(&fixture.main_file(|m| m["acme"] = object)).is_ok());
 }

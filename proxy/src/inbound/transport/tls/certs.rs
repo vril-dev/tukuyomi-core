@@ -6,10 +6,11 @@
 //! one that fails ends the pass and is named by its `Place`: the number of its listener and its place in the listener,
 //! or, in the table of a file with `managed`, `admin route` or `site <name>`. The time of validity is not looked at.
 //! Nothing is in use until the whole pass has succeeded: the result is one `Material`, and `Store` replaces the one in
-//! use with it in a single step. A certificate with `acme` whose certificate file or key file does not exist is not a
-//! failure: it has not been issued yet, so its place in the material is empty and a handshake for its hosts is refused
-//! like one for a name that nobody has (`Tls::waiting` lists such certificates). Any other fault of such a certificate,
-//! and a missing file of any other certificate, fails the pass as before.
+//! use with it in a single step. A certificate with `acme` whose certificate file or key file does not exist (for a
+//! site with `acme`, whose files are in the managed store, also its directory there) is not a failure: it has not
+//! been issued yet, so its place in the material is empty and a handshake for its hosts is refused like one for a name
+//! that nobody has (`Tls::waiting` lists such certificates). Any other fault of such a certificate, a link in the place
+//! of a directory of the store included, and a missing file of any other certificate, fails the pass as before.
 
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};

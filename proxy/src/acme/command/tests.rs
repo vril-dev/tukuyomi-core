@@ -100,11 +100,7 @@ fn a_certificate_is_due_when_it_cannot_be_read_goes_with_no_key_or_host_or_has_l
         }),
     };
     let due_for = |certificate: &CertificateConfig, now: i64| {
-        let target = Target {
-            label: "1.1".to_owned(),
-            certificate,
-            renew_before_days: 30,
-        };
+        let target = Target::named("1.1".to_owned(), certificate).unwrap();
         due(&target, now)
     };
     let good = certificate("a.pem", "a.key", &["a.test"]);

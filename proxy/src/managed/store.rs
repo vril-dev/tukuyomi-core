@@ -1,6 +1,8 @@
 //! The managed store in its directory: the versions, the files they name, the record of the chosen version and the
-//! lock (see `managed` for the form). The writes are made by the commands, which hold the lock; the readings take no
-//! lock, for every name they read is replaced whole or not at all.
+//! lock, and the certificates of the sites with `acme` (see `managed` for the form). The writes of the versions, the
+//! files and the record are made by the commands of `managed`, which hold the lock; the certificates of the sites with
+//! `acme` are written by the command `acme renew`, which does not take it, for it touches no version and no record. The
+//! readings take no lock, for every name they read is replaced whole or not at all.
 
 use std::fs::{self, DirBuilder, File, TryLockError};
 use std::io;
@@ -27,6 +29,27 @@ const CURRENT_NEW: &str = "current.new";
 const LOCK: &str = "lock";
 /// What follows the name of a version.
 const VERSION_END: &str = ".json";
+/// The directory of the certificates of the sites with `acme`, and the names of the two files of a site in it.
+const ACME: &str = "acme";
+const CHAIN: &str = "chain";
+const KEY: &str = "key";
+
+/// The chain and the key of a site with `acme`, as the store has them.
+pub type Issued = (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
+
+/// The name of the directory of `acme/` for a site with `acme` and these `hosts`: the SHA-256 of the hosts in byte
+/// order, each followed by a newline. The same hosts in any order have the same name; the name of the site is no part
+/// of it.
+pub fn acme_name(hosts: &[String]) -> [u8; 32] {
+    let mut sorted: Vec<&str> = hosts.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut bytes = Vec::new();
+    for host in sorted {
+        bytes.extend_from_slice(host.as_bytes());
+        bytes.push(b'\n');
+    }
+    sha256(&bytes)
+}
 
 /// Why the managed store refused: a fixed English sentence, never a path or a value read from the store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +205,46 @@ impl Store {
         self.path(Kind::File, name)
     }
 
+    /// The chain and the key of the site with `acme` whose hosts have the name `name` (see `acme_name`), each read
+    /// without following a link and at most 1 MiB, and overwritten with zeros when they are dropped. `None` when
+    /// `acme/`, its directory `name` or one of the two files is not there: the certificate has not been issued yet.
+    /// Everything else is a refusal, never `None`: a link or anything but a directory in the place of a directory, a
+    /// link or a special file in the place of a file, a file over 1 MiB, and a failure to look at or read one.
+    pub fn issued(&self, name: [u8; 32]) -> Result<Option<Issued>, ManagedError> {
+        let acme = self.dir.join(ACME);
+        let site = acme.join(hex(&name));
+        for dir in [&acme, &site] {
+            match fs::symlink_metadata(dir) {
+                Ok(meta) if meta.file_type().is_dir() => {}
+                Ok(_) => {
+                    return Err(ManagedError(
+                        "a directory of the managed store is not a real directory",
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => {
+                    return Err(ManagedError(
+                        "a directory of the managed store cannot be looked at",
+                    ));
+                }
+            }
+        }
+        let read = |file: &str| match read_regular(&site.join(file), MAX_BYTES, None) {
+            Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(ManagedError(
+                "an issued certificate or key is not a regular file of at most 1 MiB",
+            )),
+            Err(_) => Err(ManagedError(
+                "an issued certificate or key cannot be read, or is a link",
+            )),
+        };
+        match (read(CHAIN)?, read(KEY)?) {
+            (Some(chain), Some(key)) => Ok(Some((chain, key))),
+            _ => Ok(None),
+        }
+    }
+
     /// The versions, oldest first: the regular files of `versions/` whose name is 64 lowercase digits and `.json`.
     pub fn versions(&self) -> Result<Vec<Listed>, ManagedError> {
         const CANNOT: ManagedError = ManagedError("the managed versions cannot be listed");
@@ -250,6 +313,16 @@ impl Store {
                 let _ = fs::remove_file(&new);
                 CANNOT
             })
+    }
+
+    /// The places of the chain and of the key of the site with `acme` whose hosts have the name `name`, for the command
+    /// `acme renew` to write the two files there: `acme/` and then its directory `name` are made (0700) when they are
+    /// not there, and refused when what is there is not a real directory, for a file that is written beside its place
+    /// would be written through a link. The command looks before it orders the certificate.
+    pub fn issue_places(&self, name: [u8; 32]) -> Result<(PathBuf, PathBuf), ManagedError> {
+        self.ensure_dir(ACME)?;
+        let site = self.ensure_dir(&format!("{ACME}/{}", hex(&name)))?;
+        Ok((site.join(CHAIN), site.join(KEY)))
     }
 
     /// Refuses a directory of the kind that is not a real directory: a name is opened without following a link, and so
@@ -325,7 +398,9 @@ impl Store {
         ))
     }
 
-    /// `<dir>/<name>`, made (0700) when it is not there; whatever else is there is refused.
+    /// `<dir>/<name>`, made (0700) when it is not there, and the directory it is made in synced; whatever else is there
+    /// is refused. Only the last component of `name` is looked at without following a link, so for a `name` of two
+    /// components the caller has made sure of the first one before.
     fn ensure_dir(&self, name: &str) -> Result<PathBuf, ManagedError> {
         let path = self.dir.join(name);
         match fs::symlink_metadata(&path) {
@@ -334,10 +409,11 @@ impl Store {
                 "a directory of the managed store is not a real directory",
             )),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let parent = path.parent().unwrap_or(self.dir.as_path());
                 DirBuilder::new()
                     .mode(0o700)
                     .create(&path)
-                    .and_then(|()| sync_dir(&self.dir))
+                    .and_then(|()| sync_dir(parent))
                     .map_err(|_| ManagedError("a directory of the managed store cannot be made"))?;
                 Ok(path)
             }
