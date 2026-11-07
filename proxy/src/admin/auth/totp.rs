@@ -33,10 +33,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use aws_lc_rs::{constant_time, hmac};
 use zeroize::Zeroize;
 
+use super::session::Opened;
 use super::{Auth, Cx, Entered, Next, Refusal, Who};
 use crate::admin::audit::Outcome;
 use crate::admin::password::{Secret, random};
-use crate::admin::session::Opened;
 use crate::admin::users::{User, now_ms};
 use crate::rules::bundle::sha256;
 

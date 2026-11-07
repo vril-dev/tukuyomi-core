@@ -6,14 +6,16 @@
 //!
 //! The parts, one file each: `server` (the listener, the table of routes and the checks that come before a route
 //! runs, and the start and stop of the process), `auth` (the login with its limits, the session or the API token of a
-//! request, the change of a password; its parts `auth::totp`, the second factor, and `auth::tokens`, the API tokens),
-//! `account` (the routes of the account: the login and its second step, the session, the password, the second factor
-//! and the user's own tokens), `session` (the sessions in memory), `password` (the rules for names and passwords, the
-//! hash, the random bytes), `users` (the user and the role, and the first user; `users::manage` has the routes with
-//! which an owner manages users and everybody's tokens), `store` and `file_store` (where the users, the tokens and
-//! the history of the switches are kept: the trait and the directory of files), `audit` (the audit log), and `waf`
-//! (the routes of the rules: the generations, their import, the switch of the proxy and the way back, the history and
-//! the records; the client of the control socket of the proxy is `waf::control`).
+//! request, the change of a password; its parts `auth::totp`, the second factor, `auth::tokens`, the API tokens, and
+//! `auth::session`, the sessions in memory), `account` (the routes of the account: the login and its second step, the
+//! session, the password, the second factor and the user's own tokens), `password` (the rules for names and passwords,
+//! the hash, the random bytes), `users` (the user and the role, and the first user; `users::manage` has the routes with
+//! which an owner manages users and everybody's tokens), `store` and `file_store` (where the users, the tokens, the
+//! history of the switches and the history of the changes of the managed configuration are kept: the trait and the
+//! directory of files), `audit` (the audit log), `waf` (the routes of the rules: the generations, their import, the
+//! switch of the proxy and the way back, the history and the records; the client of the control socket of the proxy
+//! is `waf::control`), and `managed` (the routes of the managed configuration: its state and its versions, the saving
+//! of a version, the job that puts one in force in the proxy, the way back, and the history).
 //!
 //! The commands: `admin <config>` runs the process and writes its records as JSON, like the proxy. `admin bootstrap
 //! <config> <name>` is a short command that writes texts for a person to read: it reads one line from the standard
@@ -41,16 +43,16 @@
 //! - `GET /api/audit` (operator, a token may), and the routes of `users::manage` (owner, session only): `GET` and
 //!   `POST /api/users`, `PUT /api/users/<name>`, `POST /api/users/<name>/password`, `DELETE /api/users/<name>/mfa`,
 //!   `GET /api/tokens`, `DELETE /api/tokens/<id>`;
-//! - the routes of the rules, which `waf` lists.
+//! - the routes of the rules, which `waf` lists, and those of the managed configuration, which `managed` lists.
 //!
 //! A request has a session cookie or an API token (`Authorization: Bearer`), never both. A token may use the routes of
-//! a role (the rules and the audit), and none of the account or the management; its role is the one it was made with,
-//! not above its owner's. A session is in one of four states: it counts, it waits for the second factor (it ends
-//! after 5 minutes and may only give the code or log out), the password must be changed (an owner made the user or
-//! set the password), or the second factor must be set up (`admin.mfa` is `required` and the user has none); the last
-//! three limit the routes with a 403 and a fixed sentence (see `server`). Every body is JSON of at most 64 KiB, the
-//! one of the import of a generation of at most 12 MiB. A path that is not in the table is 404, a path with another
-//! method is 405.
+//! a role (the rules, the managed configuration and the audit), and none of the account or the management; its role is
+//! the one it was made with, not above its owner's. A session is in one of four states: it counts, it waits for the
+//! second factor (it ends after 5 minutes and may only give the code or log out), the password must be changed (an
+//! owner made the user or set the password), or the second factor must be set up (`admin.mfa` is `required` and the
+//! user has none); the last three limit the routes with a 403 and a fixed sentence (see `server`). Every body is JSON
+//! of at most 64 KiB, the ones of the import of a generation and of the saving of a managed version of at most 12 MiB.
+//! A path that is not in the table is 404, a path with another method is 405.
 //!
 //! Sessions are kept in memory only: when the process starts again, everybody logs in again, and the second factor
 //! that was being set up is lost. The tokens are kept in the store and stay.
@@ -59,9 +61,9 @@ pub mod account;
 pub mod audit;
 pub mod auth;
 pub mod file_store;
+pub mod managed;
 pub mod password;
 pub mod server;
-pub mod session;
 pub mod store;
 pub mod users;
 pub mod waf;

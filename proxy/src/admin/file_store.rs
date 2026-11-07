@@ -12,10 +12,11 @@
 //! token that was removed is not made again by a late write. Not more than 4096 entries of `users/` or `tokens/`
 //! are read for a list.
 //!
-//! `activations.log` is the history of the switches of the rules (see `waf::history`). A line is written whole to the
-//! end of the file, which is synced before the write returns, and so is the directory. A line that failed part way is
-//! cut off, and a file that does not end with a line feed (a write that a crash stopped) gets one before the next
-//! line, so that the lines stay apart. Only the last 1 MiB of the file is read back (`audit::tail`).
+//! `activations.log` is the history of the switches of the rules (see `waf::history`), and `managed.log` the history of
+//! the changes of the managed configuration (see `managed::history`). A line is written whole to the end of its file,
+//! which is synced before the write returns, and so is the directory. A line that failed part way is cut off, and a
+//! file that does not end with a line feed (a write that a crash stopped) gets one before the next line, so that the
+//! lines stay apart. Only the last 1 MiB of a file is read back (`audit::tail`).
 //!
 //! Only the store directory itself is examined, as the directory of the rules store is: a real directory (not a link)
 //! without group or other permission bits, owned by the user that the file system sees for this process. A file is
@@ -31,6 +32,7 @@ use std::sync::{Mutex, PoisonError};
 
 use super::audit::tail;
 use super::auth::tokens::{self, Token};
+use super::managed::Change;
 use super::password::valid_name;
 use super::store::{AdminError, AdminStore, BUSY, CONFLICT, EXISTS, FULL, IN_USE};
 use super::users::{Role, User};
@@ -49,6 +51,7 @@ const TOKENS: &str = "tokens";
 const LOCK: &str = "lock";
 const PROCESS_LOCK: &str = "process.lock";
 const ACTIVATIONS: &str = "activations.log";
+const CHANGES: &str = "managed.log";
 /// The most bytes of a user file or of a token file.
 const USER_MAX: u64 = 4096;
 /// The most entries of `users/` or `tokens/` that a list reads.
@@ -372,8 +375,50 @@ impl AdminStore for FileAdminStore {
     }
 
     fn record_activation(&self, activation: &Activation) -> Result<(), AdminError> {
-        const CANNOT: AdminError = AdminError("the history cannot be written");
-        let mut line = activation.encode().ok_or(CANNOT)?.into_bytes();
+        self.append(
+            ACTIVATIONS,
+            activation.encode(),
+            AdminError("the history cannot be written"),
+        )
+    }
+
+    fn activations(&self, limit: usize) -> Result<Vec<Activation>, AdminError> {
+        newest(
+            &self.dir.join(ACTIVATIONS),
+            Activation::decode,
+            limit,
+            AdminError("the history cannot be read"),
+        )
+    }
+
+    fn record_change(&self, change: &Change) -> Result<(), AdminError> {
+        self.append(
+            CHANGES,
+            change.encode(),
+            AdminError("the history of the managed configuration cannot be written"),
+        )
+    }
+
+    fn changes(&self, limit: usize) -> Result<Vec<Change>, AdminError> {
+        newest(
+            &self.dir.join(CHANGES),
+            Change::decode,
+            limit,
+            AdminError("the history of the managed configuration cannot be read"),
+        )
+    }
+}
+
+impl FileAdminStore {
+    /// Appends `line` (none: it could not be made) and a line feed to the history `name` (see the module
+    /// documentation); `cannot` is the answer when it is not written.
+    fn append(
+        &self,
+        name: &str,
+        line: Option<String>,
+        cannot: AdminError,
+    ) -> Result<(), AdminError> {
+        let mut line = line.ok_or(cannot)?.into_bytes();
         line.push(b'\n');
         let mut file = OpenOptions::new()
             .read(true)
@@ -381,17 +426,17 @@ impl AdminStore for FileAdminStore {
             .create(true)
             .mode(0o600)
             .custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
-            .open(self.dir.join(ACTIVATIONS))
-            .map_err(|_| CANNOT)?;
-        let meta = file.metadata().map_err(|_| CANNOT)?;
+            .open(self.dir.join(name))
+            .map_err(|_| cannot)?;
+        let meta = file.metadata().map_err(|_| cannot)?;
         if !meta.is_file() {
-            return Err(CANNOT);
+            return Err(cannot);
         }
         // A file that a crash stopped in the middle of a line gets its line feed first.
         let mut last = [b'\n'];
         if meta.len() > 0 {
             file.read_exact_at(&mut last, meta.len() - 1)
-                .map_err(|_| CANNOT)?;
+                .map_err(|_| cannot)?;
         }
         if last[0] != b'\n' {
             line.insert(0, b'\n');
@@ -402,21 +447,28 @@ impl AdminStore for FileAdminStore {
             .and_then(|()| sync_dir(&self.dir));
         if written.is_err() {
             let _ = file.set_len(meta.len());
-            return Err(CANNOT);
+            return Err(cannot);
         }
         Ok(())
     }
+}
 
-    fn activations(&self, limit: usize) -> Result<Vec<Activation>, AdminError> {
-        match tail(&self.dir.join(ACTIVATIONS)) {
-            Ok((bytes, _)) => Ok(bytes
-                .rsplit(|&b| b == b'\n')
-                .filter_map(Activation::decode)
-                .take(limit)
-                .collect()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(_) => Err(AdminError("the history cannot be read")),
-        }
+/// The newest `limit` lines of the history at `path` that `decode` reads, the newest first; `cannot` is the answer when
+/// the file cannot be read. No file is no line.
+fn newest<T>(
+    path: &Path,
+    decode: fn(&[u8]) -> Option<T>,
+    limit: usize,
+    cannot: AdminError,
+) -> Result<Vec<T>, AdminError> {
+    match tail(path) {
+        Ok((bytes, _)) => Ok(bytes
+            .rsplit(|&b| b == b'\n')
+            .filter_map(decode)
+            .take(limit)
+            .collect()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(_) => Err(cannot),
     }
 }
 

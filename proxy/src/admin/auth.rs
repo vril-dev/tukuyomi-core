@@ -54,12 +54,13 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use self::session::{Opened, Sessions};
 use super::audit::{AuditLog, Event, Outcome};
 use super::password::{Hash, PASSWORD_MAX, Secret, hex, random, valid_name, valid_password};
-use super::session::{Opened, Sessions};
 use super::store::{AdminError, AdminStore, CONFLICT};
 use super::users::{Role, User, now_ms};
 
+pub mod session;
 pub mod tokens;
 pub mod totp;
 

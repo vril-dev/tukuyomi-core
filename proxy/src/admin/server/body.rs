@@ -1,9 +1,10 @@
 //! The body of a request: read within its limit and its time, or not read at all.
 //!
-//! A body over the usual limit (the import of a generation) is read only for a client with a live session, or an API
-//! token, of a user whose role is at least that of the import and whom no state limits (a session that waits for
-//! the second factor, a password that must be changed and a second factor that must be set up all do). A request
-//! with a cookie and a token is not read either. For another client the body is not read, and the request goes on
+//! A body over the usual limit (the import of a generation, the version to apply) is read only for a client with a
+//! live session, or an API token, of a user whose role is at least the least role of the route and whom no state
+//! limits (a session that waits for the second factor, a password that must be changed and a second factor that must
+//! be set up all do). A request with a cookie and a token is not read either, and neither is one whose route names no
+//! least role. For another client the body is not read, and the request goes on
 //! with an empty one: the checks of `dispatch` (the credential, the state, the role) refuse it before any route
 //! reads the body, and the audit log has the refusal. The user is read from the store, so the check runs on a thread
 //! of the blocking pool. A token that is not right counts against the client here as it does in `dispatch`, and the
@@ -22,27 +23,31 @@ use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use tokio::time::timeout;
 
 use super::{App, BODY_MAX, BODY_WAIT, credential};
-use crate::admin::waf::IMPORT_LEAST;
+use crate::admin::users::Role;
 
 /// The body of the request with these `headers`, from `client`, at most `limit` bytes within `BODY_WAIT`; empty if it
-/// is not to be read. The refusal is the response to send.
+/// is not to be read. `least` is the least role of the route. The refusal is the response to send.
 pub(super) async fn read<B>(
     app: &Arc<App>,
     headers: &HeaderMap,
     client: IpAddr,
     body: B,
     limit: usize,
+    least: Option<Role>,
 ) -> Result<Bytes, Response<Full<Bytes>>>
 where
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn Error + Send + Sync>>,
 {
     if limit > BODY_MAX {
+        let Some(least) = least else {
+            return Ok(Bytes::new());
+        };
         let (worker, credential) = (app.clone(), credential(headers));
         let allowed = tokio::task::spawn_blocking(move || {
             worker
                 .auth
-                .allows(&credential, IMPORT_LEAST, client, Instant::now())
+                .allows(&credential, least, client, Instant::now())
         })
         .await
         .unwrap_or(false);

@@ -11,7 +11,8 @@
 //! The proxy starts with the version that `current` names, and so do `config check` and the reading of SIGHUP: with
 //! no version chosen, or one that is refused, the proxy does not start, and SIGHUP changes nothing. A reload order of
 //! the control socket reads the version it names, and one that is refused changes nothing either. `managed activate`
-//! reads the version it is to choose, and `managed import` the version it is to make.
+//! reads the version it is to choose, and `managed import` and the admin process the version they are to put in the
+//! store, the admin process without the country database (see `import`).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -122,25 +123,33 @@ pub fn load_with(
     store: Option<&Store>,
     choice: &Choice,
 ) -> Result<Loaded, LoadError> {
+    let mut loaded = without_countries(built, store, choice)?;
+    config::read_countries(&mut loaded).map_err(LoadError::Main)?;
+    Ok(loaded)
+}
+
+/// `load_with` but for the country database, which is not read: the check of a version that the admin process puts in
+/// the store (see `import`). What it gives is not served with; the proxy reads the database when it takes the version.
+pub(super) fn without_countries(
+    built: Built,
+    store: Option<&Store>,
+    choice: &Choice,
+) -> Result<Loaded, LoadError> {
     let Built {
         main,
         policy,
         routing,
     } = built;
-    let mut loaded = match (routing, store) {
-        (Routing::Own(forward), _) => whole(main, forward, policy, None),
+    match (routing, store) {
+        (Routing::Own(forward), _) => Ok(whole(main, forward, policy, None)),
         (Routing::Managed { resolve_timeout }, Some(store)) => {
-            with_version(main, resolve_timeout, policy.geo, store, choice)?
+            with_version(main, resolve_timeout, policy.geo, store, choice)
         }
         // `config` gives the routing of `managed` only to a file that has it, and `load` opens its store.
-        (Routing::Managed { .. }, None) => {
-            return Err(LoadError::Main(ConfigError(
-                "the configuration has no managed object",
-            )));
-        }
-    };
-    config::read_countries(&mut loaded).map_err(LoadError::Main)?;
-    Ok(loaded)
+        (Routing::Managed { .. }, None) => Err(LoadError::Main(ConfigError(
+            "the configuration has no managed object",
+        ))),
+    }
 }
 
 /// The main file `main`, which has `managed`, with the version of `choice`, read from `store` and checked with it.

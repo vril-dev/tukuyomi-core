@@ -1,9 +1,10 @@
 //! The managed store in its directory: the versions, the files they name, the record of the chosen version and the
 //! lock, and the certificates of the sites with `acme` (see `managed` for the form). The writes of the versions, the
-//! files and the record are made by the commands of `managed` and by the order of the admin process (`apply`), which
-//! hold the lock; the certificates of the sites with
-//! `acme` are written by the command `acme renew`, which does not take it, for it touches no version and no record. The
-//! readings take no lock, for every name they read is replaced whole or not at all.
+//! files and the record are made by the commands of `managed`, by the admin process when it saves a version (the
+//! files and the version, through `import::place`, as `managed import` does) and by its order (`apply`), which hold
+//! the lock; the certificates of the sites with `acme` are written by the command `acme renew`, which does not take
+//! it, for it touches no version and no record. The readings take no lock, for every name they read is replaced whole
+//! or not at all.
 
 use std::fs::{self, DirBuilder, File, TryLockError};
 use std::io;

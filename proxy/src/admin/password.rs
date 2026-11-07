@@ -72,8 +72,8 @@ fn nibble(digit: u8) -> Option<u8> {
     }
 }
 
-/// A password in a request or on the standard input. It is not shown by `Debug` and its text is zeroed when it is
-/// dropped.
+/// A password, or another secret text such as the content of a key file, in a request or on the standard input. It is
+/// not shown by `Debug` and its text is zeroed when it is dropped.
 pub struct Secret(String);
 
 impl Secret {

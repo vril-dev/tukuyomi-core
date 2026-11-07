@@ -27,7 +27,8 @@
 //!
 //! A version has one written form, which `encode` makes: JSON without white space, the keys of every object in byte
 //! order (the form `serde_json` writes a value in). A version in another form is refused, so that the same content
-//! is always the same version, under the same name.
+//! is always the same version, under the same name. A version that a request sends to the admin process may be in any
+//! form, and is written in this one (`sent`).
 //!
 //! The document of `managed import` has the form of a version with paths in the place of the SHA-256: the
 //! `certificate` of a site is `{"chain_file", "key_file"}` or `{"acme"}` (which names no file, and is the same in the
@@ -391,6 +392,33 @@ pub(crate) fn parse_document(bytes: &[u8]) -> Result<RawDocument, ConfigError> {
 /// The one written form of a version (see the module documentation).
 pub(crate) fn encode(value: &Value) -> Option<Vec<u8>> {
     serde_json::to_vec(value).ok()
+}
+
+/// The version that a request sends as the value of `version` in its JSON object `body`, in its one written form. The
+/// value is read twice: in the form of a version, so that a repeated, unknown or missing key and a value of the wrong
+/// type are refused with the sentences of the main file (a value read as JSON keeps the last of two keys of the same
+/// name), and then as JSON, which `encode` writes. The other keys of `body` are not looked at here.
+pub(crate) fn sent(body: &[u8]) -> Result<Vec<u8>, ConfigError> {
+    #[derive(Deserialize)]
+    struct Typed {
+        version: Object<RawVersion>,
+    }
+    #[derive(Deserialize)]
+    struct Untyped {
+        version: Value,
+    }
+    let Object(Typed { version: _typed }) =
+        serde_json::from_slice(body).map_err(|e| config::refusal(&e))?;
+    let Object(Untyped { version }) =
+        serde_json::from_slice(body).map_err(|e| config::refusal(&e))?;
+    let bytes = encode(&version).ok_or(ConfigError(
+        "the managed version cannot be written in its one written form",
+    ))?;
+    ensure(
+        u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_BYTES),
+        "the managed version is over 1 MiB",
+    )?;
+    Ok(bytes)
 }
 
 /// The version of the document `bytes`, which `parse_document` accepted, whose files are in the store under the names

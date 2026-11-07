@@ -8,19 +8,21 @@
 //!
 //! A command is a short process of its own, apart from a running proxy, which does not notice what it does: a proxy
 //! takes the chosen version when it starts or reads its configuration again at SIGHUP. The commands ask no proxy; the
-//! admin process puts a version in force in a running proxy by its control socket (see `apply`). The configuration is
-//! the main file of the proxy, as an absolute clean path, and it has `managed`; the document is a path as the operator
-//! writes it, from the working directory, and the version is its 64 lowercase hexadecimal digits.
+//! admin process puts a version in force in a running proxy by its control socket (see `apply`), and holds the lock of
+//! the store while it does, so that `import` and `activate` are refused meanwhile (the store is in use). The
+//! configuration is the main file of the proxy, as an absolute clean path, and it has `managed`; the document is a
+//! path as the operator writes it, from the working directory, and the version is its 64 lowercase hexadecimal digits.
 //!
 //! `import` takes a document of at most 1 MiB (see `version`) and checks it with the main file as a version is
 //! checked. It reads each file that the document names once, as the proxy reads a certificate file (a regular file of
 //! at most 1 MiB; a link is followed), and checks it as the proxy would: the chain and the key of each site go together
 //! and cover its hosts, and the file of the authorities of each group holds certificates that can be trust anchors. A
-//! site with `acme` names no file, and its certificate is in the version as the document writes it.
-//! A document that is refused so far has written nothing. Then, with the lock of the store, it puts the files in the
-//! store (a file that is there already is not written again), makes the version that names them by their SHA-256,
-//! reads the main file with that version as the proxy would (see `load`), and puts the version in the store. It does
-//! not choose it. A file that was put in the store stays there if that last reading refuses. `activate` takes the lock
+//! site with `acme` names no file, and its certificate is in the version as the document writes it. Then it makes the
+//! version that names the files by their SHA-256. A document that is refused so far has written nothing. Then, with
+//! the lock of the store, it puts the files in the store (a file that is there already is not written again), reads
+//! the version with the main file it read first as the proxy would, the country database included (see `load`), and
+//! puts the version in the store (see `import`, whose way the admin process takes as well). It does not choose it. A
+//! file that was put in the store stays there if that last reading refuses. `activate` takes the lock
 //! of the store and chooses the version only if the steps of the start before the rules store pass with it (see
 //! `run`): the main file with the version, the lookup of the names of the upstream servers and the files of their
 //! authorities, and the certificates of the listeners. `list` shows the versions.
@@ -39,20 +41,16 @@
 //! not in the store, a version that `activate` refuses, as a document that `import` refuses, a process that runs as
 //! root) and 2 for a wrong argument or a refused configuration, a main file without `managed` included.
 
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use zeroize::Zeroizing;
-
-use super::load::{self, Choice, Document, LoadError};
+use super::import::{self, Placing, Reading};
+use super::load::{Choice, LoadError};
 use super::store::{MAX_BYTES, Placed, Store};
-use super::version;
 use crate::config::{self, Built};
-use crate::forward::tls;
-use crate::inbound::transport::tls::{Fault, certified, check, read_file};
+use crate::inbound::transport::tls::{Fault, read_file};
 use crate::log::{Log, escaped};
 use crate::rules::bundle::{Fingerprint, hex};
 use crate::run::{EXIT_FAILED, host, read_parts};
@@ -186,63 +184,14 @@ fn import(config: &Path, document: &Path, out: &mut dyn Write, log: &Log) -> Exi
             return Exit::Failed;
         }
     };
-    let document = match load::document(&built, &text) {
-        Ok(document) => document,
-        Err(e) => {
-            log.line(&format!("{NAME}: document refused: {}", e.0));
-            return Exit::Failed;
-        }
-    };
-    let files = match checked(&document) {
-        Ok(files) => files,
+    let import = match import::from_document(&built, &text) {
+        Ok(import) => import,
         Err(line) => {
             log.line(&format!("{NAME}: {line}"));
             return Exit::Failed;
         }
     };
-    let _lock = match store.lock() {
-        Ok(lock) => lock,
-        Err(e) => {
-            log.line(&format!("{NAME}: {}", e.0));
-            return Exit::Failed;
-        }
-    };
-    let mut names = BTreeMap::new();
-    for (path, bytes) in &files {
-        match store.put_file(bytes) {
-            Ok((name, _)) => {
-                names.insert(path.clone(), name);
-            }
-            Err(e) => {
-                log.line(&format!("{NAME}: {}", e.0));
-                return Exit::Failed;
-            }
-        }
-    }
-    let made = match version::version_of(&text, &names) {
-        Ok(made) => made,
-        Err(e) => {
-            log.line(&format!("{NAME}: document refused: {}", e.0));
-            return Exit::Failed;
-        }
-    };
-    // The version is read with the main file as the proxy will read it, its files from the store.
-    match load::load(config, &Choice::Given(made.clone())) {
-        Ok(_) => {}
-        Err(LoadError::Main(e)) => {
-            log.line(&format!("{NAME}: configuration refused: {}", e.0));
-            return Exit::Usage;
-        }
-        Err(LoadError::Version(e)) => {
-            log.line(&format!("{NAME}: document refused: {}", e.0));
-            return Exit::Failed;
-        }
-        Err(LoadError::Store(e)) => {
-            log.line(&format!("{NAME}: managed store refused: {}", e.0));
-            return Exit::Failed;
-        }
-    }
-    match store.put_version(&made) {
+    match import::place(built, &store, &import, Reading::Whole) {
         Ok((name, placed)) => {
             let how = match placed {
                 Placed::Created => "created",
@@ -252,54 +201,23 @@ fn import(config: &Path, document: &Path, out: &mut dyn Write, log: &Log) -> Exi
             result(out, &format!("{} {how}", hex(&name)));
             Exit::Done
         }
-        Err(e) => {
+        Err(Placing::Store(e)) => {
             log.line(&format!("{NAME}: {}", e.0));
             Exit::Failed
         }
-    }
-}
-
-/// The files that `document` names, each read once as the proxy reads a certificate file, and checked as the proxy
-/// checks them, before anything is written: the chain and the key of each site that has them (a site with `acme` has
-/// none) go together and cover its hosts, and the file of the authorities of each group holds 1 to 100 certificates
-/// that can be trust anchors. A refusal is the rest of a line.
-fn checked(document: &Document) -> Result<BTreeMap<PathBuf, Zeroizing<Vec<u8>>>, String> {
-    let sites = document
-        .sites
-        .iter()
-        .filter_map(|site| site.certificate.files())
-        .flat_map(|(chain, key)| [chain, key]);
-    let authorities = document.authorities.iter().map(|(_, path)| path);
-    let mut files = BTreeMap::new();
-    for path in sites.chain(authorities) {
-        if files.contains_key(path) {
-            continue;
+        Err(Placing::Load(LoadError::Main(e))) => {
+            log.line(&format!("{NAME}: configuration refused: {}", e.0));
+            Exit::Usage
         }
-        let bytes = read_file(path, MAX_BYTES).map_err(|fault| {
-            let why = match fault {
-                Fault::Missing => "a file of the document does not exist",
-                Fault::TooLarge => "a file of the document is over 1 MiB",
-                _ => "a file of the document cannot be read",
-            };
-            format!("{why}: \"{}\"", escaped(path.as_os_str().as_bytes()))
-        })?;
-        files.insert(path.clone(), bytes);
+        Err(Placing::Load(LoadError::Version(e))) => {
+            log.line(&format!("{NAME}: document refused: {}", e.0));
+            Exit::Failed
+        }
+        Err(Placing::Load(LoadError::Store(e))) => {
+            log.line(&format!("{NAME}: managed store refused: {}", e.0));
+            Exit::Failed
+        }
     }
-    // Every path was read above; one that were not would be empty, and refused.
-    let bytes = |path: &PathBuf| files.get(path).map_or(&[][..], |bytes| bytes.as_slice());
-    for site in &document.sites {
-        let Some((chain, key)) = site.certificate.files() else {
-            continue;
-        };
-        certified(bytes(chain), bytes(key))
-            .and_then(|key| check(&key, &site.hosts))
-            .map_err(|fault| format!("{} (site {})", fault.text(), site.name))?;
-    }
-    for (group, path) in &document.authorities {
-        tls::config_of(bytes(path))
-            .map_err(|fault| format!("{} (upstream {group})", fault.text()))?;
-    }
-    Ok(files)
 }
 
 fn activate(config: &Path, version: [u8; 32], out: &mut dyn Write, log: &Log) -> Exit {

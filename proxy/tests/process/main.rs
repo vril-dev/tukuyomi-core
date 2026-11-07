@@ -34,6 +34,7 @@
 
 mod acme;
 mod admin;
+mod admin_managed;
 mod admin_waf;
 mod bodies;
 mod config_check;

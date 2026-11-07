@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use super::*;
-use crate::admin::server::connection;
+use crate::admin::server::listener::connection;
 use crate::admin::server::tests::rig;
 
 fn method(name: &str) -> Method {

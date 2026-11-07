@@ -7,8 +7,8 @@
 //! that are left (see `auth::totp`), whether the password must be changed at the next login (`must_change`: a user
 //! that an owner made, and one whose password an owner set) and the time after which a token counts
 //! (`tokens_after`). `changed` goes up with every change of the user, and a session keeps the value it saw (see
-//! `session`), so a session does not outlive a change of the password, the role, the state or the second factor of
-//! its user. The one change that does not raise it is the use of the second factor at a login (the last step, or a
+//! `auth::session`), so a session does not outlive a change of the password, the role, the state or the second factor
+//! of its user. The one change that does not raise it is the use of the second factor at a login (the last step, or a
 //! recovery code that is gone): it changes no right, and the other sessions of the user stay. The tokens of a user
 //! (see `auth::tokens`) are not in the file of the user, but `tokens_after` is: a token made at that time or before
 //! is void, and the time goes up to the time of the change when the password is set, when the user is disabled and

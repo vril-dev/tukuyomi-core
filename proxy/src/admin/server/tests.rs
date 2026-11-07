@@ -1,19 +1,22 @@
+use std::convert::Infallible;
 use std::fs;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::Context;
+use std::task::{Context, Poll};
 
+use http::header::HeaderName;
 use http_body::{Body, Frame};
 
+use super::listener::response;
 use super::*;
 use crate::admin::audit::Append;
 use crate::admin::file_store::FileAdminStore;
 use crate::admin::file_store::tests::{TestDir, scratch};
 use crate::admin::password::{Hash, hex};
 use crate::admin::users::User;
-use crate::config::Mfa;
+use crate::config::{AdminStoreConfig, Mfa};
 use crate::log::{self, Lines, sink::RecordFile};
 use crate::rules::bundle::sha256;
 
@@ -121,6 +124,7 @@ pub(crate) fn rig_with(trusted: &[&str], mfa: Mfa) -> Rig {
         audit,
         RequestIds::new().unwrap(),
         ITER,
+        None,
         None,
     )
     .unwrap();
@@ -956,6 +960,87 @@ fn the_routes_of_the_rules_are_in_the_table_with_the_roles_it_gives_them() {
     );
 }
 
+#[test]
+fn the_routes_of_the_managed_configuration_are_in_the_table_with_their_roles_and_a_token_may_use_them()
+ {
+    use crate::admin::auth::tokens::mint;
+    let rig = rig();
+    let one = format!("/api/managed/versions/{}", "0123456789abcdef".repeat(4));
+    let vera = rig.login("vera");
+    // A viewer may not save a version or read one, and the refusal is written.
+    for (method, path, action) in [
+        ("POST", "/api/managed/apply", "managed-apply"),
+        ("POST", "/api/managed/activate", "managed-activate"),
+        ("POST", "/api/managed/rollback", "managed-rollback"),
+        ("GET", one.as_str(), "managed-version"),
+    ] {
+        let viewer = rig.with(&vera, method, path, &[], "{}");
+        assert_eq!(viewer.status, StatusCode::FORBIDDEN, "{method} {path}");
+        let last = rig.audit().pop().unwrap();
+        assert_eq!(
+            (last["action"].as_str(), last["reason"].as_str()),
+            (Some(action), Some("role"))
+        );
+    }
+    // A viewer may read the state and the list, and a token of an operator may use every route: each passes every
+    // check of the server, and the rig has no routes of the managed configuration, so it is 404.
+    for path in ["/api/managed", "/api/managed/versions"] {
+        let viewer = rig.with(&vera, "GET", path, &[], "");
+        assert_eq!(viewer.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    let store = FileAdminStore::open(rig.dir.path()).unwrap();
+    let (text, token) = mint(
+        "ola",
+        Role::Operator,
+        "test",
+        crate::admin::users::now_ms(),
+        1,
+    )
+    .unwrap();
+    store.create_token(&token).unwrap();
+    let bearer = format!("Bearer {}", text.as_str());
+    for (method, path) in [
+        ("GET", "/api/managed"),
+        ("GET", one.as_str()),
+        ("POST", "/api/managed/apply"),
+    ] {
+        let headers = [JSON_TYPE, ("authorization", bearer.as_str())];
+        let answer = rig.send(method, path, &headers, "{}");
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{method} {path}");
+    }
+}
+
+#[test]
+fn the_body_of_the_saving_of_a_managed_version_is_read_for_an_operator_and_not_for_a_viewer() {
+    let rig = rig();
+    let (ola, vera) = (rig.login("ola"), rig.login("vera"));
+    let (big, least) = body_limit(&Method::POST, "/api/managed/apply");
+    assert_eq!((big, least), (12 << 20, Some(Role::Operator)));
+    let app = Arc::new(rig.app);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let read = |session: &Session| {
+        let mut headers = HeaderMap::new();
+        let cookie = format!("{COOKIE_NAME}={}", session.id);
+        headers.insert(COOKIE, HeaderValue::from_str(&cookie).unwrap());
+        let asked = Arc::new(AtomicBool::new(false));
+        let client = IpAddr::from([127, 0, 0, 1]);
+        let result = runtime.block_on(body::read(
+            &app,
+            &headers,
+            client,
+            Watched(asked.clone()),
+            big,
+            least,
+        ));
+        (result.is_ok(), asked.load(Ordering::SeqCst))
+    };
+    assert_eq!(read(&ola), (true, true));
+    assert_eq!(read(&vera), (true, false));
+}
+
 /// A body that tells whether anybody asked for its data.
 struct Watched(Arc<AtomicBool>);
 
@@ -976,7 +1061,7 @@ impl Body for Watched {
 fn a_body_over_the_usual_limit_is_read_only_for_a_live_session_of_an_operator() {
     let rig = rig();
     let (alice, ola, vera) = (rig.login("alice"), rig.login("ola"), rig.login("vera"));
-    let big = waf::body_limit(&Method::POST, "/api/generations").unwrap();
+    let (big, least) = body_limit(&Method::POST, "/api/generations");
     let dir = rig.dir.path().to_path_buf();
     let app = Arc::new(rig.app);
     let client = IpAddr::from([127, 0, 0, 1]);
@@ -998,6 +1083,7 @@ fn a_body_over_the_usual_limit_is_read_only_for_a_live_session_of_an_operator() 
             client,
             Watched(asked.clone()),
             limit,
+            least,
         ));
         (result.is_ok(), asked.load(Ordering::SeqCst))
     };
@@ -1037,7 +1123,7 @@ fn a_body_over_the_usual_limit_is_read_for_the_token_of_an_operator_and_for_noth
         text("alice", Role::Owner),
     );
     let cookie = format!("{COOKIE_NAME}={}", rig.login("ola").id);
-    let big = waf::body_limit(&Method::POST, "/api/generations").unwrap();
+    let (big, least) = body_limit(&Method::POST, "/api/generations");
     let client = IpAddr::from([127, 0, 0, 1]);
     let app = Arc::new(rig.app);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1059,6 +1145,7 @@ fn a_body_over_the_usual_limit_is_read_for_the_token_of_an_operator_and_for_noth
             client,
             Watched(asked.clone()),
             big,
+            least,
         ));
         (result.is_ok(), asked.load(Ordering::SeqCst))
     };

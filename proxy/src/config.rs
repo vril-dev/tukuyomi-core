@@ -35,8 +35,10 @@
 //! There are two readings of the file. `load` reads the whole configuration, which the proxy serves with: the file,
 //! with `managed` the version that the store chooses and the files it names (see `managed::load`), and the country
 //! database. `load_main` reads the file alone and gives a `MainFile`, which has no routing: the readers that serve no
-//! request use it (the shipper, the commands `rules`, `admin bootstrap` and `admin reset`, and the admin process). A
-//! file without `managed` gets the same checks from both, but `load_main` does not read the country database.
+//! request use it (the shipper, the commands `rules`, `admin bootstrap` and `admin reset`, and the admin process when
+//! it starts). A file without `managed` gets the same checks from both, but `load_main` does not read the country
+//! database. For a change of the managed configuration, the admin process reads the file again with `main_file`, and
+//! checks the version with it as `load` would, but without the country database (see `managed::import`).
 //!
 //! `max_body` (1 KiB to 4 GiB) is the most bytes a request body may have once decoded (a gzip body under a route
 //! that skips the inspection is not decoded, so the limit counts its coded bytes), and `inspect_body` (1 KiB up to

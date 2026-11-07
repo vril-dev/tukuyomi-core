@@ -30,12 +30,14 @@
 //! the proxy makes itself (see `config::admin`, `inbound::transport::tls`). The commands (see `command`) make a version
 //! from a document whose files are named by their paths (`managed import`), choose one after the same reading as the
 //! proxy's (`managed activate`), and list them (`managed list`); a running proxy takes the version they choose at the
-//! next SIGHUP or start. The admin process puts a version in force in a running proxy the other way round (see
-//! `apply`): the proxy reads its configuration again with the version by a reload order, and the store chooses it
-//! only once the proxy has taken it. The proxy never writes the store.
+//! next SIGHUP or start. The admin process saves a version that a request sends, its files named by their SHA-256 and
+//! the new ones sent with it, in the way of `managed import` (see `import`), and puts a version in force in a running
+//! proxy the other way round (see `apply`): the proxy reads its configuration again with the version by a reload
+//! order, and the store chooses it only once the proxy has taken it. The proxy never writes the store.
 
 pub mod apply;
 pub mod command;
+pub(crate) mod import;
 mod load;
 pub(crate) mod store;
 mod version;
@@ -44,4 +46,5 @@ mod version;
 pub(crate) use load::whole;
 pub use load::{Choice, LoadError, Version, load};
 pub use store::{Listed, ManagedError, Placed, Store, acme_name};
+pub(crate) use version::sent;
 pub use version::{Site, SiteCertificate, SiteOf};

@@ -1,29 +1,21 @@
-//! The listener of the admin API, the table of routes, and the start and stop of the admin process.
+//! The table of routes of the admin API and the checks that come before a route runs. The listener of the admin
+//! process, its connections and its start and stop are in `listener`; the body of a request is read by `body`, and
+//! the files of the page are answered by `ui`.
 //!
-//! The process listens on `admin.listen`, a loopback address, and speaks HTTP/1.1 without TLS (a route of the proxy
-//! that has TLS can be the way in from outside). At most 32 connections are served at once;
-//! one that finds no place is accepted and closed. A connection serves one request and is closed after the answer
-//! (`Connection: close`), so a connection never waits for a second request. The head is at most 8 KiB and comes within
-//! 10 s; the body is at most 64 KiB (12 MiB for the import of a generation, read only for a client with a live
-//! session or token of an operator or an owner whose state lets it import; see `body`) and comes within 30 s; the
-//! answer is made within 30 s, or for the import, the switch and the rollback of the rules within `Waf::longest`. A
-//! connection lives for the three times together at the most. A head that hyper refuses by itself (a malformed one,
-//! or one over the limit) gets hyper's own answer, or none, and not the fields below.
-//!
-//! The files of the page (`GET /` and `GET /ui/<version>/<name>`) are answered first, by `ui`, with fields of their
-//! own. Each API answer is JSON and has `Content-Type: application/json`, `Cache-Control: no-store`,
-//! `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
-//! `Referrer-Policy: no-referrer` and `X-Request-ID`. An error is `{"error": "<words>"}`. The number of a request is
-//! the value of `X-Request-ID` when the peer is in `admin.trusted_proxies` and the value has the form that the proxy
-//! gives (16 lowercase hexadecimal digits, `-`, and 1 to 16 digits more); else the process makes one of the same form.
-//! The client of a request, for the limits and the audit log, is found as the proxy finds the client of a request, with
+//! An answer of a route is JSON, and an error is `{"error": "<words>"}`. The number of a request is the value of
+//! `X-Request-ID` when the peer is in `admin.trusted_proxies` and the value has the form that the proxy gives (16
+//! lowercase hexadecimal digits, `-`, and 1 to 16 digits more); else the process makes one of the same form. The
+//! client of a request, for the limits and the audit log, is found as the proxy finds the client of a request, with
 //! `admin.trusted_proxies` (see `forward::client_ip`).
 //!
-//! The table of routes is in four parts: `ROUTES` here (`GET /api/audit`), `account` (the login, the session, the
+//! The table of routes is in five parts: `ROUTES` here (`GET /api/audit`), `account` (the login, the session, the
 //! password, the second factor and the user's own tokens), `users::manage` (an owner's management of users and
-//! tokens) and `waf` (the rules). Each route has its method and path (a `*` stands for one part of the path, and a
-//! `*` that ends the path of the rules for the rest of it), the least role that may use it (none: no credential is
-//! needed), the kind of state of a session that may use it (`Gate`), and whether a request with an API token may.
+//! tokens), `waf` (the rules) and `managed` (the managed configuration). Each route has its method and path (a `*`
+//! stands for one part of the path, and a `*` that ends the path of the rules for the rest of it), the least role that
+//! may use it (none: no credential is needed), the kind of state of a session that may use it (`Gate`), and whether a
+//! request with an API token may. A body is at most `BODY_MAX`, but for the routes whose part says otherwise (the
+//! import of a generation, the version to apply: `body_limit`); such a body is read only for a client of at least
+//! the least role of its route (see `body`).
 //!
 //! A request goes through these steps, and the first that refuses answers: the path (404 if the table has no route
 //! with it) and the method (405 with `Allow`; `HEAD` is taken as `GET`); for a route that names a least role, the
@@ -38,71 +30,40 @@
 //! exactly the keys they know, is 400.
 //!
 //! The cookie is `tukuyomi_admin=<43 characters>; Secure; HttpOnly; SameSite=Strict; Path=/`.
-//!
-//! The stop: SIGTERM, SIGINT and SIGHUP close the listener and tell the service manager `STOPPING=1`; the requests
-//! in flight have 10 s to end, and the process exits with code 0. `READY=1` is told after the listener is bound.
 
 mod body;
+mod listener;
 mod ui;
 
-use std::convert::Infallible;
-use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use aws_lc_rs::constant_time;
 use bytes::Bytes;
-use http::header::{
-    ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderMap,
-    HeaderName, HeaderValue, ORIGIN, SET_COOKIE,
-};
-use http::{Method, Request, Response, StatusCode};
-use http_body_util::Full;
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioIo, TokioTimer};
+use http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN};
+use http::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout, timeout_at};
-use tukuyomi_kernel::limits;
 
-use super::Exit;
 use super::account;
 use super::audit::AuditLog;
 use super::auth::{Auth, Authed, Credential, Cx, Refusal, Who};
-use super::file_store::AUDIT_DIR;
-use super::password::ITERATIONS;
-use super::store::{self, AdminStore};
+use super::managed::{self, Managed};
+use super::store::AdminStore;
 use super::users::{Role, manage};
 use super::waf::{self, Op, Waf};
-use crate::config::{self, AdminConfig, AdminStoreConfig, Mfa};
+use crate::config::{AdminConfig, Mfa};
 use crate::forward::client_ip::{Cidr, effective, trusts};
 use crate::inbound::session::RequestIds;
-use crate::log::Log;
-use crate::run::host;
-use crate::run::notify::Notify;
 
-/// The most connections served at once.
-const SEATS: usize = 32;
-/// The most bytes of a head.
-const HEAD_MAX: usize = 8192;
-const HEAD_WAIT: Duration = Duration::from_secs(10);
+pub use self::listener::run;
+
 const BODY_WAIT: Duration = Duration::from_secs(30);
-const ANSWER_WAIT: Duration = Duration::from_secs(30);
-/// The most bytes of a body, for every route.
+/// The time an answer has, but for the routes whose part says otherwise.
+pub(super) const ANSWER_WAIT: Duration = Duration::from_secs(30);
+/// The most bytes of a body, for every route but those whose part says otherwise.
 const BODY_MAX: usize = 64 * 1024;
-/// The time the requests in flight have at the stop.
-const STOP_WAIT: Duration = Duration::from_secs(10);
-/// The pause after an accept failed.
-const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 /// The lines that `GET /api/audit` gives.
 const AUDIT_LINES: usize = 200;
 pub(super) const COOKIE_NAME: &str = "tukuyomi_admin";
@@ -115,6 +76,7 @@ pub(super) enum Handler {
     Account(account::Op),
     Users(manage::Op),
     Waf(Op),
+    Managed(managed::Op),
 }
 
 /// What kind of state of a session may use a route: a pending session (the password was right, the second factor is
@@ -306,14 +268,28 @@ fn is_json(headers: &HeaderMap) -> bool {
 
 /// The body of the request as the JSON object `T`, with exactly the keys `T` knows.
 pub(super) fn json_body<T: DeserializeOwned>(req: &Req) -> Result<T, Answer> {
+    json_body_telling(req, &[])
+}
+
+/// `json_body`, but a refusal of the reading whose text starts with one of `sentences` (the fixed sentence of a limit
+/// that `T` keeps while it is read) is answered with that sentence.
+pub(super) fn json_body_telling<T: DeserializeOwned>(
+    req: &Req,
+    sentences: &[&'static str],
+) -> Result<T, Answer> {
     if !is_json(&req.headers) {
         return Err(Answer::error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported media type",
         ));
     }
-    serde_json::from_slice(&req.body)
-        .map_err(|_| Answer::error(StatusCode::BAD_REQUEST, "bad request"))
+    serde_json::from_slice(&req.body).map_err(|e| {
+        let text = e.to_string();
+        let told = sentences
+            .iter()
+            .find(|sentence| text.starts_with(**sentence));
+        Answer::error(StatusCode::BAD_REQUEST, told.unwrap_or(&"bad request"))
+    })
 }
 
 /// Whether `text` has the form of the number of a request: 16 hexadecimal digits, `-`, and 1 to 16 digits more.
@@ -331,17 +307,20 @@ fn proxy_form(text: &str) -> bool {
     })
 }
 
-/// The routes of the table: `GET /api/audit`, then those of the account, of the management and of the rules.
+/// The routes of the table: `GET /api/audit`, then those of the account, of the management, of the rules and of the
+/// managed configuration.
 fn routes() -> impl Iterator<Item = &'static Route> {
     ROUTES
         .iter()
         .chain(account::ROUTES.iter())
         .chain(manage::ROUTES.iter())
         .chain(waf::ROUTES.iter())
+        .chain(managed::ROUTES.iter())
 }
 
-/// The path as the table has it: a path below `/api/generations/`, `/api/account/tokens/` or `/api/tokens/` ends in
-/// `*`, and `/api/users/<name>` with nothing, `password` or `mfa` after the name has `*` for the name.
+/// The path as the table has it: a path below `/api/generations/`, `/api/account/tokens/`, `/api/tokens/` or
+/// `/api/managed/versions/` ends in `*`, and `/api/users/<name>` with nothing, `password` or `mfa` after the name has
+/// `*` for the name.
 fn pattern(path: &str) -> &str {
     let rules = waf::pattern(path);
     if rules != path {
@@ -350,6 +329,7 @@ fn pattern(path: &str) -> &str {
     for (prefix, star) in [
         ("/api/account/tokens/", "/api/account/tokens/*"),
         ("/api/tokens/", "/api/tokens/*"),
+        ("/api/managed/versions/", "/api/managed/versions/*"),
     ] {
         if path.starts_with(prefix) {
             return star;
@@ -363,6 +343,20 @@ fn pattern(path: &str) -> &str {
         Some(Some((_, "password"))) => "/api/users/*/password",
         Some(Some((_, "mfa"))) => "/api/users/*/mfa",
         _ => path,
+    }
+}
+
+/// The most bytes of the body of a request for `method` and `path`, and the least role of a client whose body is read
+/// when that is over `BODY_MAX`: the role of the route (none for a path that the table does not have, whose body is
+/// then not read, see `body`).
+fn body_limit(method: &Method, path: &str) -> (usize, Option<Role>) {
+    match waf::body_limit(method, path).or_else(|| managed::body_limit(method, path)) {
+        Some(limit) => {
+            let path = pattern(path);
+            let route = routes().find(|route| route.path == path && route.method == *method);
+            (limit, route.and_then(|route| route.least))
+        }
+        None => (BODY_MAX, None),
     }
 }
 
@@ -389,13 +383,15 @@ pub struct App {
     pub(super) auth: Auth,
     ids: RequestIds,
     waf: Option<Waf>,
+    managed: Option<Managed>,
     /// The time an answer may take.
     answer_wait: Duration,
 }
 
 impl App {
     /// The routes over `store` and `audit`, for the configuration. `iterations` are the rounds of a new password
-    /// hash. `waf` are the routes of the rules; without them those routes are 404. None: no random number.
+    /// hash. `waf` are the routes of the rules and `managed` those of the managed configuration; without them those
+    /// routes are 404. None: no random number.
     pub fn new(
         config: &AdminConfig,
         store: Arc<dyn AdminStore>,
@@ -403,6 +399,7 @@ impl App {
         ids: RequestIds,
         iterations: u32,
         waf: Option<Waf>,
+        managed: Option<Managed>,
     ) -> Option<App> {
         Some(App {
             origin: config.origin.clone(),
@@ -418,14 +415,8 @@ impl App {
             ids,
             answer_wait: ANSWER_WAIT.max(waf.as_ref().map_or(Duration::ZERO, Waf::longest)),
             waf,
+            managed,
         })
-    }
-
-    /// An answer for a request that never reached the routes.
-    fn refuse(&self, status: StatusCode, words: &'static str) -> Response<Full<Bytes>> {
-        let mut answer = Answer::error(status, words);
-        answer.request = self.ids.mint();
-        response(&answer)
     }
 
     /// The number of the request: the one the proxy gave it, if that can be believed, else a new one.
@@ -510,6 +501,10 @@ impl App {
                 Some(waf) => waf.handle(op, req, &who, cx),
                 None => Answer::error(StatusCode::NOT_FOUND, "not found"),
             },
+            (Handler::Managed(op), Some(who)) => match &self.managed {
+                Some(managed) => managed.handle(op, req, &who, cx),
+                None => Answer::error(StatusCode::NOT_FOUND, "not found"),
+            },
             // A route that names a least role has a user by now.
             (_, None) => Answer::error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         }
@@ -577,222 +572,6 @@ fn csrf_ok(req: &Req, who: &Who) -> bool {
         }
         _ => false,
     }
-}
-
-/// The response for an answer, with the fields every answer has.
-fn response(answer: &Answer) -> Response<Full<Bytes>> {
-    let body = serde_json::to_vec(&answer.body).unwrap_or_else(|_| b"{}".to_vec());
-    let mut response = Response::new(Full::new(Bytes::from(body)));
-    *response.status_mut() = answer.status;
-    let fields = response.headers_mut();
-    fields.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    fields.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    fields.insert(
-        HeaderName::from_static("x-content-type-options"),
-        HeaderValue::from_static("nosniff"),
-    );
-    fields.insert(
-        HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
-    );
-    fields.insert(
-        HeaderName::from_static("referrer-policy"),
-        HeaderValue::from_static("no-referrer"),
-    );
-    if let Ok(value) = HeaderValue::from_str(&answer.request) {
-        fields.insert(HeaderName::from_static("x-request-id"), value);
-    }
-    if let Some(Ok(value)) = answer.cookie.as_deref().map(HeaderValue::from_str) {
-        fields.append(SET_COOKIE, value);
-    }
-    if let Some(Ok(value)) = answer.allow.as_deref().map(HeaderValue::from_str) {
-        fields.insert(ALLOW, value);
-    }
-    response
-}
-
-/// Reads the body of the request within its limits and answers it.
-async fn answer(
-    app: Arc<App>,
-    peer: SocketAddr,
-    request: Request<Incoming>,
-) -> Response<Full<Bytes>> {
-    let (parts, body) = request.into_parts();
-    if let Some(page) = ui::serve(&app, &parts.method, parts.uri.path()) {
-        return page;
-    }
-    let limit = waf::body_limit(&parts.method, parts.uri.path()).unwrap_or(BODY_MAX);
-    let slow = waf::slow(&parts.method, parts.uri.path());
-    let wait = if slow { app.answer_wait } else { ANSWER_WAIT };
-    let declared = parts
-        .headers
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|text| text.parse::<usize>().ok());
-    if declared.is_some_and(|length| length > limit) {
-        return app.refuse(StatusCode::PAYLOAD_TOO_LARGE, "payload too large");
-    }
-    let client = app.client(&parts.headers, peer);
-    let body = match body::read(&app, &parts.headers, client, body, limit).await {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
-    let req = Req {
-        method: parts.method,
-        path: parts.uri.path().to_owned(),
-        query: parts.uri.query().unwrap_or_default().to_owned(),
-        headers: parts.headers,
-        peer,
-        body,
-    };
-    let worker = app.clone();
-    match timeout(
-        wait,
-        tokio::task::spawn_blocking(move || worker.handle(&req)),
-    )
-    .await
-    {
-        Ok(Ok(answer)) => response(&answer),
-        _ => app.refuse(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-    }
-}
-
-/// One connection: one request, one answer, and the close.
-async fn connection(stream: TcpStream, peer: SocketAddr, app: Arc<App>) {
-    let total = HEAD_WAIT + BODY_WAIT + app.answer_wait;
-    let service = service_fn(move |request: Request<Incoming>| {
-        let app = app.clone();
-        async move { Ok::<_, Infallible>(answer(app, peer, request).await) }
-    });
-    let mut server = http1::Builder::new();
-    server
-        .keep_alive(false)
-        .timer(TokioTimer::new())
-        .header_read_timeout(HEAD_WAIT)
-        .max_headers(limits::HEADERS)
-        .max_header_size(HEAD_MAX)
-        .max_buf_size(HEAD_MAX);
-    let served = server.serve_connection(TokioIo::new(stream), service);
-    let _ = timeout(total, served).await;
-}
-
-/// Binds the listener, serves until a signal asks for the stop, and stops.
-async fn serve(address: SocketAddr, app: Arc<App>, log: &Log) -> Exit {
-    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-        signal(SignalKind::hangup()),
-    ) else {
-        log.line("admin: cannot install the signal handlers");
-        return Exit::Failed;
-    };
-    let notify = Notify::from_env(log);
-    let Ok(listener) = TcpListener::bind(address).await else {
-        log.line("admin: the listen address cannot be bound");
-        return Exit::Failed;
-    };
-    log.line("admin: listening");
-    notify.ready(log);
-    let seats = Arc::new(Semaphore::new(SEATS));
-    let mut conns = JoinSet::new();
-    let cause = loop {
-        let event = poll_fn(|cx| {
-            for (name, stream) in [
-                ("SIGTERM", &mut term),
-                ("SIGINT", &mut int),
-                ("SIGHUP", &mut hup),
-            ] {
-                if stream.poll_recv(cx).is_ready() {
-                    return Poll::Ready(Err(name));
-                }
-            }
-            // A connection that is done is joined here, so the set holds only those that are being served.
-            while let Poll::Ready(Some(_)) = conns.poll_join_next(cx) {}
-            listener.poll_accept(cx).map(Ok)
-        })
-        .await;
-        match event {
-            Err(name) => break name,
-            Ok(Ok((stream, peer))) => match seats.clone().try_acquire_owned() {
-                Ok(seat) => {
-                    let app = app.clone();
-                    conns.spawn(async move {
-                        let _seat = seat;
-                        connection(stream, peer, app).await;
-                    });
-                }
-                // No place is free: the connection is closed.
-                Err(_) => drop(stream),
-            },
-            Ok(Err(_)) => sleep(ACCEPT_PAUSE).await,
-        }
-    };
-    log.line(&format!("admin: stop: {cause}"));
-    notify.stopping(log);
-    app.waf.iter().for_each(Waf::interrupt);
-    drop(listener);
-    let by = tokio::time::Instant::now() + STOP_WAIT;
-    while timeout_at(by, conns.join_next())
-        .await
-        .is_ok_and(|done| done.is_some())
-    {}
-    conns.abort_all();
-    Exit::Done
-}
-
-/// The admin process for the configuration file `path`.
-pub fn run(path: &Path, log: &Log) -> Exit {
-    if let Err(text) = host::check() {
-        log.line(&format!("admin: host check refused: {text}"));
-        return Exit::Failed;
-    }
-    let loaded = match config::load_main(path) {
-        Ok(loaded) => loaded,
-        Err(e) => {
-            log.line(&format!("admin: configuration refused: {}", e.0));
-            return Exit::Usage;
-        }
-    };
-    let Some(admin) = loaded.admin.clone() else {
-        log.line("admin: configuration refused: there is no admin object");
-        return Exit::Usage;
-    };
-    log.line("admin: configuration accepted");
-    let store = match store::open_exclusive(&admin.store) {
-        Ok(store) => store,
-        Err(e) => {
-            log.line(&format!("admin: admin store refused: {}", e.0));
-            return Exit::Failed;
-        }
-    };
-    let AdminStoreConfig::File { dir } = &admin.store;
-    let audit = match AuditLog::open(&dir.join(AUDIT_DIR), log.clone()) {
-        Ok(audit) => Arc::new(audit),
-        Err(e) => {
-            log.line(&format!("admin: audit log refused: {}", e.0));
-            return Exit::Failed;
-        }
-    };
-    let Some(ids) = RequestIds::new() else {
-        log.line("admin: no random number is available for the request numbers");
-        return Exit::Failed;
-    };
-    let waf = Waf::from_config(&loaded, &admin, store.clone(), audit.clone());
-    let Some(app) = App::new(&admin, store, audit, ids, ITERATIONS, Some(waf)) else {
-        log.line("admin: no random number is available");
-        return Exit::Failed;
-    };
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(_) => {
-            log.line("admin: cannot build the runtime");
-            return Exit::Failed;
-        }
-    };
-    runtime.block_on(serve(admin.listen, Arc::new(app), log))
 }
 
 #[cfg(test)]

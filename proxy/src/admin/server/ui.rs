@@ -27,7 +27,8 @@ use http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName, HeaderValue};
 use http::{Method, Response, StatusCode};
 use http_body_util::Full;
 
-use super::{Answer, App, response};
+use super::listener::response;
+use super::{Answer, App};
 use crate::rules::bundle::{hex, sha256};
 
 const HTML: &str = "text/html; charset=utf-8";

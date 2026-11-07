@@ -59,7 +59,7 @@ const SWITCH_EXTRA: Duration = Duration::from_secs(7);
 const MODES: [&str; 2] = ["block", "detect"];
 const PHASES: [&str; 5] = ["starting", "ready", "stopping", "stopped", "failed"];
 /// The words of the reason of an answer to a reload order, by its result.
-const REFUSED: [&str; 9] = [
+pub(crate) const REFUSED: [&str; 9] = [
     "configuration",
     "version",
     "store",
@@ -70,13 +70,13 @@ const REFUSED: [&str; 9] = [
     "thread",
     "unmanaged",
 ];
-const BUSY: [&str; 4] = [
+pub(crate) const BUSY: [&str; 4] = [
     "starting",
     "reload under way",
     "too many orders",
     "stopping",
 ];
-const ERRORS: [&str; 5] = [
+pub(crate) const ERRORS: [&str; 5] = [
     "line too long",
     "malformed request",
     "unknown op",

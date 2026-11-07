@@ -281,7 +281,10 @@ fn session_answer(who: &Who) -> Answer {
 
 /// The answer with the new `csrf` and the cookie of the session that replaced the others; a session that could not
 /// be made leaves the person without one.
-fn renewed(opened: Option<&crate::admin::session::Opened>, mut body: serde_json::Value) -> Answer {
+fn renewed(
+    opened: Option<&crate::admin::auth::session::Opened>,
+    mut body: serde_json::Value,
+) -> Answer {
     match opened {
         Some(opened) => {
             body["csrf"] = opened.csrf.clone().into();

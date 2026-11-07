@@ -1,11 +1,12 @@
-//! Where the state of the admin process is kept: the users, the API tokens (see `auth::tokens`) and the history of
-//! the switches of the rules (see `waf::history`).
+//! Where the state of the admin process is kept: the users, the API tokens (see `auth::tokens`), the history of the
+//! switches of the rules (see `waf::history`) and the history of the changes of the managed configuration (see
+//! `managed::history`).
 //!
 //! A user is read whenever it is needed and is never held in memory by the process, so that a change made by another
 //! process (the commands `admin bootstrap` and `admin reset`) is seen at once. `create_first`, `create`, `replace`
 //! and the writes of tokens each take the lock of the store without waiting: when another process holds it the
-//! answer is `BUSY`. A line of the history is appended without the lock, as a line of the audit log is: it is
-//! written whole.
+//! answer is `BUSY`. A line of a history is appended without the lock, as a line of the audit log is: it is written
+//! whole.
 //!
 //! One admin process uses a store at a time. `open_exclusive`, with which the admin process opens its store, takes
 //! a second lock and keeps it for as long as the store is open; when another admin process holds it the answer is
@@ -17,6 +18,7 @@ use std::sync::Arc;
 
 use super::auth::tokens::Token;
 use super::file_store::FileAdminStore;
+use super::managed::Change;
 use super::users::{Role, User};
 use super::waf::history::Activation;
 use crate::config::AdminStoreConfig;
@@ -66,6 +68,11 @@ pub trait AdminStore: Send + Sync {
     fn record_activation(&self, activation: &Activation) -> Result<(), AdminError>;
     /// The newest `limit` lines of the history that can be read, the newest first.
     fn activations(&self, limit: usize) -> Result<Vec<Activation>, AdminError>;
+    /// Appends `change` to the history of the changes of the managed configuration; the line is on the disk when this
+    /// returns.
+    fn record_change(&self, change: &Change) -> Result<(), AdminError>;
+    /// The newest `limit` lines of that history that can be read, the newest first.
+    fn changes(&self, limit: usize) -> Result<Vec<Change>, AdminError>;
 }
 
 /// Opens the store that the configuration names.

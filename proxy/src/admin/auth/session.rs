@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroize;
 
-use super::auth::totp::Seed;
-use super::password::{hex, random};
+use super::totp::Seed;
 use crate::acme::base64;
+use crate::admin::password::{hex, random};
 use crate::rules::bundle::sha256;
 
 /// The bytes of an id and of a CSRF token.

@@ -99,8 +99,8 @@ use crate::rules::store::{self, NOT_EXPECTED, RuleStore, StoreError};
 /// The most bytes of the body of an import: JSON with the files in base64.
 const IMPORT_BODY_MAX: usize = 12 << 20;
 const IMPORT: &str = "/api/generations";
-/// The least role that may import a generation, which is the only request with a body over the usual limit.
-pub(super) const IMPORT_LEAST: Role = Role::Operator;
+/// The least role that may import a generation, and so the least role whose body over the usual limit is read.
+const IMPORT_LEAST: Role = Role::Operator;
 /// The path of one generation in a request; in the table it is `/api/generations/*`.
 const GENERATION: &str = "/api/generations/";
 /// A margin on the time that something is waited for.
