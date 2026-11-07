@@ -33,7 +33,9 @@
 //! next SIGHUP or start. The admin process saves a version that a request sends, its files named by their SHA-256 and
 //! the new ones sent with it, in the way of `managed import` (see `import`), and puts a version in force in a running
 //! proxy the other way round (see `apply`): the proxy reads its configuration again with the version by a reload
-//! order, and the store chooses it only once the proxy has taken it. The proxy never writes the store.
+//! order, and the store chooses it only once the proxy has taken it. It also checks a version that a request sends
+//! without saving it (`version::check_sent`, the route `POST /api/managed/check`), and tells the place in the version
+//! of a refusal. The proxy never writes the store.
 
 pub mod apply;
 pub mod command;
@@ -46,5 +48,5 @@ mod version;
 pub(crate) use load::whole;
 pub use load::{Choice, LoadError, Version, load};
 pub use store::{Listed, ManagedError, Placed, Store, acme_name};
-pub(crate) use version::sent;
+pub(crate) use version::{Objection, sent};
 pub use version::{Site, SiteCertificate, SiteOf};

@@ -149,21 +149,28 @@ fn headers(raw: Option<Object<RawHeaders>>, make: Make) -> Result<Headers, Confi
     make(raw.remove, pairs(raw.set), pairs(raw.add)).map_err(refused)
 }
 
-/// The edits of a route whose path is `route_path`.
+/// The edits of a route whose path is `route_path`. A refusal of the query or of the fields comes with its key in the
+/// route (`rewrite.query`, `rewrite.request_headers`, `rewrite.response_headers`), and one of the host or of the path
+/// with none: their sentences tell them apart (see `forward`).
 pub(super) fn rewrite(
     route_path: Option<&str>,
     raw: Option<Object<RawRewrite>>,
-) -> Result<Rewrite, ConfigError> {
+) -> Result<Rewrite, (ConfigError, Option<&'static str>)> {
     let Some(Object(raw)) = raw else {
         return Ok(Rewrite::default());
     };
+    let query = query(raw.query).map_err(|e| (e, Some("rewrite.query")))?;
+    let request = headers(raw.request_headers, Headers::request)
+        .map_err(|e| (e, Some("rewrite.request_headers")))?;
+    let response = headers(raw.response_headers, Headers::response)
+        .map_err(|e| (e, Some("rewrite.response_headers")))?;
     Rewrite::new(
         route_path,
         raw.host.as_deref(),
         raw.path.as_deref(),
-        query(raw.query)?,
-        headers(raw.request_headers, Headers::request)?,
-        headers(raw.response_headers, Headers::response)?,
+        query,
+        request,
+        response,
     )
-    .map_err(refused)
+    .map_err(|e| (refused(e), None))
 }

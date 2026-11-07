@@ -967,12 +967,15 @@ fn the_routes_of_the_managed_configuration_are_in_the_table_with_their_roles_and
     let rig = rig();
     let one = format!("/api/managed/versions/{}", "0123456789abcdef".repeat(4));
     let vera = rig.login("vera");
-    // A viewer may not save a version or read one, and the refusal is written.
+    // A viewer may not save a version, check one or read one, nor read the values of the main file, and the refusal is
+    // written.
     for (method, path, action) in [
         ("POST", "/api/managed/apply", "managed-apply"),
         ("POST", "/api/managed/activate", "managed-activate"),
         ("POST", "/api/managed/rollback", "managed-rollback"),
         ("GET", one.as_str(), "managed-version"),
+        ("POST", "/api/managed/check", "managed-check"),
+        ("GET", "/api/config", "config"),
     ] {
         let viewer = rig.with(&vera, method, path, &[], "{}");
         assert_eq!(viewer.status, StatusCode::FORBIDDEN, "{method} {path}");
@@ -1003,6 +1006,8 @@ fn the_routes_of_the_managed_configuration_are_in_the_table_with_their_roles_and
         ("GET", "/api/managed"),
         ("GET", one.as_str()),
         ("POST", "/api/managed/apply"),
+        ("POST", "/api/managed/check"),
+        ("GET", "/api/config"),
     ] {
         let headers = [JSON_TYPE, ("authorization", bearer.as_str())];
         let answer = rig.send(method, path, &headers, "{}");
@@ -1011,11 +1016,16 @@ fn the_routes_of_the_managed_configuration_are_in_the_table_with_their_roles_and
 }
 
 #[test]
-fn the_body_of_the_saving_of_a_managed_version_is_read_for_an_operator_and_not_for_a_viewer() {
+fn the_body_of_the_saving_and_of_the_check_of_a_managed_version_is_read_for_an_operator_and_not_for_a_viewer()
+ {
     let rig = rig();
     let (ola, vera) = (rig.login("ola"), rig.login("vera"));
-    let (big, least) = body_limit(&Method::POST, "/api/managed/apply");
-    assert_eq!((big, least), (12 << 20, Some(Role::Operator)));
+    let limits = [
+        body_limit(&Method::POST, "/api/managed/apply"),
+        body_limit(&Method::POST, "/api/managed/check"),
+    ];
+    assert_eq!(limits, [(12 << 20, Some(Role::Operator)); 2]);
+    let (big, least) = limits[1];
     let app = Arc::new(rig.app);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

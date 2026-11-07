@@ -1,7 +1,8 @@
 //! The routes of the managed configuration in real processes: the proxy with a configuration with `managed` and a
 //! control socket, and the admin process over the same configuration. An owner is made with `admin bootstrap` and logs
-//! in. A version that sends every request to another group is saved through the API; its job puts it in force, which
-//! the next request shows, and the way back puts the version before it in force again.
+//! in, and reads the values of the main file. A version that sends every request to another group is checked and then
+//! saved through the API; its job puts it in force, which the next request shows, and the way back puts the version
+//! before it in force again.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -133,14 +134,48 @@ fn a_version_saved_through_the_api_is_put_in_force_by_its_job_and_then_rolled_ba
     assert_eq!(exchange(proxy.port, &get("/x")).status(), 200);
     assert_eq!(proxy.upstream.requests().len(), 1);
 
-    // A version that sends every request to `other` is saved, and its job puts it in force.
+    // The values of the main file are those the proxy follows, without a path.
+    let values = session.get("/api/config");
+    assert_eq!(
+        (&values["managed"], &values["admin"]["control"]),
+        (&json!(true), &json!(true))
+    );
+    assert_eq!(
+        values["sha256"],
+        session.get("/api/status")["proxy"]["config"]
+    );
+    assert!(!values.to_string().contains(root.to_str().unwrap()));
+
+    // A version that sends every request to `other` is checked, which changes nothing, then saved, and its job puts it
+    // in force.
     let mut version = session.get(&format!("/api/managed/versions/{first}"))["version"].clone();
     version["default_upstream"] = json!("other");
+    let listed = session.get("/api/managed/versions")["versions"].clone();
+    let (status, checked) = session.post(
+        "/api/managed/check",
+        &json!({"version": version, "files": []}),
+    );
+    assert_eq!(status, 200, "{checked}");
+    let mut broken = version.clone();
+    broken["routes"] = json!([{"path": "x", "upstream": "main"}]);
+    let (status, refused) = session.post(
+        "/api/managed/check",
+        &json!({"version": broken, "files": []}),
+    );
+    assert_eq!(
+        (status, refused),
+        (
+            400,
+            json!({"error": "a route path does not start with /", "at": "routes[0].path"})
+        )
+    );
+    assert_eq!(session.get("/api/managed/versions")["versions"], listed);
     let (status, saved) = session.post(
         "/api/managed/apply",
         &json!({"expect": first, "version": version, "files": []}),
     );
     assert_eq!(status, 202, "{saved}");
+    assert_eq!(saved["version"], checked["version"]);
     let second = saved["version"].as_str().unwrap().to_owned();
     let job = session.ended_job();
     assert_eq!(

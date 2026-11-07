@@ -37,8 +37,11 @@
 //! writes a port that a route names would meet that route and not the one with the list.
 //!
 //! In a file with `managed`, `forward` has `resolve_timeout_ms` alone: the groups, the routes and the default group
-//! are those of the managed version, checked here by the same rules (`routing`), but for the `tls` of a group, which
-//! names the file of its authorities by the SHA-256 of a file of the managed store (`StoredTls`, see `managed`).
+//! are those of the managed version, checked by the same rules (`located`, which `managed::version` calls), but for
+//! the `tls` of a group, which names the file of its authorities by the SHA-256 of a file of the managed store
+//! (`StoredTls`, see `managed`). A refusal of `located` also tells where in the version it is (`At`), which the admin
+//! process answers; the main file is checked through `routing`, which keeps the sentence alone, and the commands and
+//! the proxy take the sentence alone from the check of the version (`managed::version`, `Raw::check`).
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -49,7 +52,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde::de::{Deserializer, Error, MapAccess, Visitor};
+use serde::de::{DeserializeOwned, Deserializer, Error, MapAccess, Visitor};
+use serde_json::Value;
 
 use super::records;
 use super::rewrite::{self, RawAccess, RawRewrite};
@@ -66,6 +70,51 @@ const MAX_GROUPS: usize = 64;
 pub(crate) const MAX_SERVERS: usize = 64;
 const MAX_ROUTES: usize = 1024;
 const MAX_NAME: usize = 64;
+
+/// The key of a route that each sentence of `Rule::forward` and of `Rewrite::new` is about: each is about one key.
+const ROUTE_KEYS: [(&str, &str); 11] = [
+    ("a route host is not 1 to 253 bytes", "host"),
+    ("a route host is malformed", "host"),
+    ("a route path is not 1 to 255 bytes", "path"),
+    ("a route path does not start with /", "path"),
+    ("a route path has a character that is not allowed", "path"),
+    (
+        "a % in a route path is not followed by two hexadecimal digits",
+        "path",
+    ),
+    ("a route path can be read in more than one way", "path"),
+    ("a rewrite host is malformed", "rewrite.host"),
+    (
+        "a rewrite path is set on a route that has no path",
+        "rewrite.path",
+    ),
+    ("a rewrite path is malformed", "rewrite.path"),
+    (
+        "a rewrite path for a route path that ends in / does not end in /",
+        "rewrite.path",
+    ),
+];
+
+/// Where in a managed version a refusal of its check is: an item by its number from 0 and, when the refusal is about
+/// one key of the item, that key, as the code names it (`managed::version` writes the place as a path, such as
+/// `upstreams.app.servers[2].address`). A group is numbered in the order the groups are written, which in a version is
+/// the byte order of their names. The place that the check of a main file or of a document finds is not used: their
+/// refusals are the sentence alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum At {
+    /// A key at the top of the version, and a key in it.
+    Top(&'static str, Option<&'static str>),
+    /// The site of this number, and a key in it.
+    Site(usize, Option<&'static str>),
+    /// A host of a site: the numbers of the site and of the host.
+    Host(usize, usize),
+    /// The group of this number, and a key in it.
+    Group(usize, Option<&'static str>),
+    /// A key of a server: the numbers of the group and of the server.
+    Server(usize, usize, &'static str),
+    /// The route of this number, and a key in it.
+    Route(usize, Option<&'static str>),
+}
 
 /// Where a server is, as the file writes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -313,6 +362,22 @@ struct RawStream {
 /// the `tls` of a group, as for `RawGroup`.
 pub(crate) struct Groups<T>(Vec<(String, Object<RawGroup<T>>)>);
 
+impl<T> Groups<T> {
+    /// The names of the groups, in order: what the place of a refusal names a group by (see `At`).
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.0.iter().map(|(name, _)| name.clone()).collect()
+    }
+}
+
+impl<T: DeserializeOwned> Groups<T> {
+    /// Reads `value` as one group is read here, for the reading of a version item by item (see `managed::version`).
+    pub(crate) fn read_one(value: &Value) -> Result<(), ConfigError> {
+        Object::<RawGroup<T>>::deserialize(value)
+            .map(drop)
+            .map_err(|e| super::refusal(&e))
+    }
+}
+
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Groups<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_map(GroupsVisitor(PhantomData))
@@ -410,31 +475,39 @@ fn stream(raw: Option<Object<RawStream>>) -> Result<Option<Stream>, ConfigError>
     }))
 }
 
+/// The servers of the group at `group`.
 fn servers(
+    group: usize,
     raw: Vec<Object<RawServer>>,
     listeners: &[SocketAddr],
-) -> Result<Vec<ServerConfig<Address>>, ConfigError> {
+) -> Result<Vec<ServerConfig<Address>>, (ConfigError, At)> {
     ensure(
         (1..=MAX_SERVERS).contains(&raw.len()),
         "an upstream has no server or more than 64 servers",
-    )?;
+    )
+    .map_err(|e| (e, At::Group(group, Some("servers"))))?;
     raw.into_iter()
-        .map(|Object(server)| {
-            let address = server_address(&server.address)?;
+        .enumerate()
+        .map(|(at, Object(server))| {
+            let key = |key: &'static str| move |e: ConfigError| (e, At::Server(group, at, key));
+            let address = server_address(&server.address).map_err(key("address"))?;
             if let Address::Literal(literal) = address {
                 ensure(
                     !listeners.iter().any(|listener| same(*listener, literal)),
                     "a listener and a server are the same address",
-                )?;
+                )
+                .map_err(key("address"))?;
             }
             ensure(
                 (1..=100).contains(&server.weight),
                 "a server weight is out of range",
-            )?;
+            )
+            .map_err(key("weight"))?;
             ensure(
                 server.max_fails <= 100,
                 "a server max_fails is out of range",
-            )?;
+            )
+            .map_err(key("max_fails"))?;
             Ok(ServerConfig {
                 address,
                 weight: server.weight,
@@ -442,37 +515,48 @@ fn servers(
                 fail_timeout: millis(
                     server.fail_timeout_ms,
                     "a server fail_timeout_ms is out of range",
-                )?,
+                )
+                .map_err(key("fail_timeout_ms"))?,
                 backup: server.backup,
             })
         })
         .collect()
 }
 
-/// The `tls` of a group whose servers are `servers`: `split` checks the file of the authorities as it is written, and
-/// every name that a server is checked for (the `server_name`, or else the name of each server written with a name) is
-/// one that TLS can use.
+/// The `tls` of the group at `group`, whose servers are `servers`: `split` checks the file of the authorities as it is
+/// written, and every name that a server is checked for (the `server_name`, or else the name of each server written
+/// with a name) is one that TLS can use.
 fn tls<T>(
+    group: usize,
     raw: Option<Object<T>>,
     servers: &[ServerConfig<Address>],
     split: &impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
-) -> Result<Option<Settings>, ConfigError> {
+) -> Result<Option<Settings>, (ConfigError, At)> {
     let Some(Object(raw)) = raw else {
         return Ok(None);
     };
-    let (authorities, server_name) = split(raw)?;
+    let (authorities, server_name) =
+        split(raw).map_err(|e| (e, At::Group(group, Some("tls.ca"))))?;
     match &server_name {
         Some(name) => ensure(
             host_ok(name) && tls::dns_name(name).is_some(),
             "an upstream tls server_name is not a name that TLS can use",
-        )?,
-        None => ensure(
-            servers.iter().all(|server| match &server.address {
-                Address::Name { name, .. } => tls::dns_name(name).is_some(),
-                Address::Literal(_) => true,
-            }),
-            "a server name of an upstream with tls is not a name that TLS can use",
-        )?,
+        )
+        .map_err(|e| (e, At::Group(group, Some("tls.server_name"))))?,
+        None => {
+            let unfit = servers.iter().position(|server| match &server.address {
+                Address::Name { name, .. } => tls::dns_name(name).is_none(),
+                Address::Literal(_) => false,
+            });
+            if let Some(at) = unfit {
+                return Err((
+                    ConfigError(
+                        "a server name of an upstream with tls is not a name that TLS can use",
+                    ),
+                    At::Server(group, at, "address"),
+                ));
+            }
+        }
     }
     Ok(Some(Settings {
         authorities,
@@ -515,10 +599,10 @@ pub(super) fn timeout_only(raw: RawForward) -> Result<Duration, ConfigError> {
     millis(raw.resolve_timeout_ms, "resolve_timeout_ms is out of range")
 }
 
-/// The upstream groups, the routes and the default group, checked, with `resolve_timeout` taken as it is: the `forward`
-/// object of a file without `managed`, or the routing of a managed version. `listeners` and `max_body` are as for
-/// `check`, and `split` checks the `tls` of a group as it is written.
-pub(crate) fn routing<T>(
+/// The upstream groups, the routes and the default group of the `forward` object of a file without `managed`, checked,
+/// with `resolve_timeout` taken as it is. `listeners` and `max_body` are as for `check`, and `split` checks the `tls`
+/// of a group as it is written. A refusal is the sentence of `located`.
+fn routing<T>(
     resolve_timeout: Duration,
     upstreams: Groups<T>,
     routes: Vec<Object<RawRoute>>,
@@ -527,24 +611,55 @@ pub(crate) fn routing<T>(
     max_body: usize,
     split: impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
 ) -> Result<ForwardSettings, ConfigError> {
+    located(
+        resolve_timeout,
+        upstreams,
+        routes,
+        default_upstream,
+        listeners,
+        max_body,
+        split,
+    )
+    .map_err(|(e, _)| e)
+}
+
+/// The upstream groups, the routes and the default group, checked: the routing of a managed version (see
+/// `managed::version`), and, through `routing`, that of a file without `managed`. A refusal also tells where in a
+/// managed version it is (see `At`): a refusal about two items is about the later one, and one about a rule that the
+/// routes break together is about the first route that breaks it.
+pub(crate) fn located<T>(
+    resolve_timeout: Duration,
+    upstreams: Groups<T>,
+    routes: Vec<Object<RawRoute>>,
+    default_upstream: &str,
+    listeners: &[SocketAddr],
+    max_body: usize,
+    split: impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
+) -> Result<ForwardSettings, (ConfigError, Option<At>)> {
+    let top = |key: &'static str| move |e: ConfigError| (e, Some(At::Top(key, None)));
+    let placed = |(e, at): (ConfigError, At)| (e, Some(at));
     ensure(
         (1..=MAX_GROUPS).contains(&upstreams.0.len()),
         "upstreams has no group or more than 64 groups",
-    )?;
+    )
+    .map_err(top("upstreams"))?;
     let mut groups = Vec::with_capacity(upstreams.0.len());
-    for (name, Object(group)) in upstreams.0 {
+    for (at, (name, Object(group))) in upstreams.0.into_iter().enumerate() {
+        // A name that is not a name is not written in a place.
         ensure(
             name_ok(&name),
             "an upstream name is not 1 to 64 letters, digits, - and _",
-        )?;
-        let servers = servers(group.servers, listeners)?;
-        let tls = tls(group.tls, &servers, &split)?;
+        )
+        .map_err(top("upstreams"))?;
+        let servers = servers(at, group.servers, listeners).map_err(placed)?;
+        let tls = tls(at, group.tls, &servers, &split).map_err(placed)?;
         groups.push(GroupConfig { name, servers, tls });
     }
     ensure(
         routes.len() <= MAX_ROUTES,
         "routes has more than 1024 entries",
-    )?;
+    )
+    .map_err(top("routes"))?;
     let index = |name: &str, undefined: &'static str| {
         groups
             .iter()
@@ -552,50 +667,85 @@ pub(crate) fn routing<T>(
             .ok_or(ConfigError(undefined))
     };
     let mut entries = Vec::with_capacity(routes.len());
-    for Object(route) in routes {
+    for (at, Object(route)) in routes.into_iter().enumerate() {
+        let key = |key: &'static str| move |e: ConfigError| (e, Some(At::Route(at, Some(key))));
+        // The host and the path of a rule, and of an edit, are told apart by the sentence.
+        let by_sentence = |e: ConfigError| {
+            let key = ROUTE_KEYS.iter().find(|(text, _)| *text == e.0);
+            (e, Some(At::Route(at, key.map(|(_, key)| *key))))
+        };
         let rule = Rule::forward(route.host.as_deref(), route.path.as_deref())
-            .map_err(|e| ConfigError(e.0))?;
+            .map_err(|e| by_sentence(ConfigError(e.0)))?;
         let group = index(
             &route.upstream,
             "a route names an upstream that is not defined",
-        )?;
+        )
+        .map_err(key("upstream"))?;
         ensure(
             route.max_body.is_none_or(|limit| limit <= max_body),
             "a route max_body is above the max_body of the proxy",
-        )?;
-        let access = rewrite::access(route.access)?;
+        )
+        .map_err(key("max_body"))?;
+        let access = rewrite::access(route.access).map_err(key("access"))?;
         ensure(
             access.is_empty() || rule.canonical(),
             "a route with an access list has an escape in its path that is lowercase or is for a byte that needs no escape",
+        )
+        .map_err(key("path"))?;
+        let rewrite = rewrite::rewrite(route.path.as_deref(), route.rewrite).map_err(
+            |(e, part)| match part {
+                Some(part) => (e, Some(At::Route(at, Some(part)))),
+                None => by_sentence(e),
+            },
         )?;
+        let stream = stream(route.stream).map_err(key("stream"))?;
+        let records = route
+            .records
+            .as_deref()
+            .map(records::route_keep)
+            .transpose()
+            .map_err(key("records"))?;
         entries.push((
             rule,
             RouteConfig {
                 group,
                 access,
-                rewrite: rewrite::rewrite(route.path.as_deref(), route.rewrite)?,
-                stream: stream(route.stream)?,
+                rewrite,
+                stream,
                 max_body: route.max_body,
-                records: route
-                    .records
-                    .as_deref()
-                    .map(records::route_keep)
-                    .transpose()?,
+                records,
             },
         ));
     }
-    ensure(
-        entries.iter().all(|(_, route)| route.access.is_empty())
-            || entries.iter().all(|(rule, _)| rule.port().is_none()),
-        "a route host has a port while a route has an access list",
-    )?;
-    let routes = Table::new(entries).map_err(|e| ConfigError(e.0))?;
+    if entries.iter().any(|(_, route)| !route.access.is_empty())
+        && let Some(at) = entries.iter().position(|(rule, _)| rule.port().is_some())
+    {
+        return Err((
+            ConfigError("a route host has a port while a route has an access list"),
+            Some(At::Route(at, Some("host"))),
+        ));
+    }
+    // The later of two routes with the same host and path, which `Table::new` refuses: its refusal is about that route.
+    let twice = {
+        let mut seen = BTreeSet::new();
+        entries
+            .iter()
+            .position(|(rule, _)| !seen.insert((rule.host(), rule.path())))
+    };
+    let routes = Table::new(entries);
+    if let (Err(e), Some(at)) = (&routes, twice) {
+        return Err((ConfigError(e.0), Some(At::Route(at, None))));
+    }
+    let routes = routes.map_err(|e| (ConfigError(e.0), None))?;
     let default = match default_upstream {
         "" => None,
-        name => Some(index(
-            name,
-            "default_upstream names an upstream that is not defined",
-        )?),
+        name => Some(
+            index(
+                name,
+                "default_upstream names an upstream that is not defined",
+            )
+            .map_err(top("default_upstream"))?,
+        ),
     };
     Ok(ForwardSettings {
         resolve_timeout,

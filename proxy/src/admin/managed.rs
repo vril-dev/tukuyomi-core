@@ -1,8 +1,11 @@
 //! The routes of the managed configuration (see `crate::managed`): `routes` (the table, the state of the managed store
 //! and of the proxy, and the versions of the store), `import` (the saving of a version, `POST /api/managed/apply`),
-//! `job` (the steps of a change, the job that puts a version in force in the proxy, and the changes by name and back)
-//! and `history` (the history of the changes and the target of a rollback).
+//! `job` (the steps of a change, the job that puts a version in force in the proxy, and the changes by name and back),
+//! `history` (the history of the changes and the target of a rollback), `check` (the check of a version that saves
+//! nothing, `POST /api/managed/check`) and `config` (the values of the main file, `GET /api/config`).
 
+mod check;
+mod config;
 mod history;
 mod import;
 mod job;

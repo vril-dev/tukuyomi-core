@@ -1,14 +1,14 @@
 //! The body of a request: read within its limit and its time, or not read at all.
 //!
-//! A body over the usual limit (the import of a generation, the version to apply) is read only for a client with a
-//! live session, or an API token, of a user whose role is at least the least role of the route and whom no state
-//! limits (a session that waits for the second factor, a password that must be changed and a second factor that must
-//! be set up all do). A request with a cookie and a token is not read either, and neither is one whose route names no
-//! least role. For another client the body is not read, and the request goes on
-//! with an empty one: the checks of `dispatch` (the credential, the state, the role) refuse it before any route
-//! reads the body, and the audit log has the refusal. The user is read from the store, so the check runs on a thread
-//! of the blocking pool. A token that is not right counts against the client here as it does in `dispatch`, and the
-//! client that has used up its tries is not looked at.
+//! A body over the usual limit (the import of a generation, the version to apply or to check) is read only for a
+//! client with a live session, or an API token, of a user whose role is at least the least role of the route and whom
+//! no state limits (a session that waits for the second factor, a password that must be changed and a second factor
+//! that must be set up all do). A request with a cookie and a token is not read either, and neither is one whose route
+//! names no least role. For another client the body is not read, and the request goes on with an empty one: the checks
+//! of `dispatch` (the credential, the state, the role) refuse it before any route reads the body, and the audit log has
+//! the refusal. The user is read from the store, so the check runs on a thread of the blocking pool. A token that is
+//! not right counts against the client here as it does in `dispatch`, and the client that has used up its tries is not
+//! looked at.
 
 use std::error::Error;
 use std::net::IpAddr;

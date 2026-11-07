@@ -146,29 +146,37 @@ fn a_request_brings_at_most_192_files_of_at_most_1_mib_each() {
     let rig = rig(true);
     let before = stored(&rig);
     let version = bare_version();
-    // The sentence of the refusal, and whether the proxy was asked: whether the request got past its body.
+    // The sentence and the place of the refusal, and whether the proxy was asked: whether the request got past its
+    // body.
     let refusal = |files: &[String]| {
         let files: Vec<&str> = files.iter().map(String::as_str).collect();
         let asked = rig.proxy().asked.load(Ordering::SeqCst);
         let answer = apply(&rig, &body(&rig, &version, &files));
         assert_eq!(answer.status, StatusCode::BAD_REQUEST);
         let past = rig.proxy().asked.load(Ordering::SeqCst) > asked;
-        (answer.body["error"].as_str().unwrap().to_owned(), past)
+        (answer.body, past)
     };
+    let said = |error: &str, at: &str| json!({"error": error, "at": at});
     // At the limit, the files are taken and refused by the next check, for the version does not name them; past it,
-    // the reading of the body stops.
-    let unnamed = "a file of the request is not named by the version".to_owned();
+    // no file is kept, and the request is refused before anything is asked.
+    let unnamed = "a file of the request is not named by the version";
     let many: Vec<String> = (0..192).map(|n| format!("file {n}")).collect();
-    assert_eq!(refusal(&many), (unnamed.clone(), true));
+    assert_eq!(refusal(&many), (said(unnamed, "files[0]"), true));
     let more: Vec<String> = (0..193).map(|n| format!("file {n}")).collect();
     assert_eq!(
         refusal(&more),
-        ("the request has more than 192 files".to_owned(), false)
+        (said("the request has more than 192 files", "files"), false)
     );
-    assert_eq!(refusal(&["x".repeat(1 << 20)]), (unnamed, true));
     assert_eq!(
-        refusal(&["x".repeat((1 << 20) + 1)]),
-        ("a file of the request is over 1 MiB".to_owned(), false)
+        refusal(&["x".repeat(1 << 20)]),
+        (said(unnamed, "files[0]"), true)
+    );
+    assert_eq!(
+        refusal(&["x".to_owned(), "x".repeat((1 << 20) + 1)]),
+        (
+            said("a file of the request is over 1 MiB", "files[1]"),
+            false
+        )
     );
     assert_eq!(stored(&rig), before);
     assert!(rig.audit().is_empty());
@@ -240,10 +248,13 @@ fn a_refused_body_saves_nothing_and_is_not_audited() {
     let chosen = sha256(&serde_json::to_vec(&good).unwrap());
     let answer = apply(&rig, &body_from(chosen, &unpaired, &[&other.key]));
     assert_eq!(
-        (answer.status, &answer.body["error"]),
+        (answer.status, &answer.body),
         (
             StatusCode::BAD_REQUEST,
-            &json!("a certificate and a private key are not a pair (site a)")
+            &json!({
+                "error": "a certificate and a private key are not a pair",
+                "at": "sites[0].certificate.key",
+            })
         )
     );
     assert!(

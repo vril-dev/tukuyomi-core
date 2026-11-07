@@ -115,15 +115,18 @@ pub(super) fn check(
 }
 
 /// Checks the `access` and the `rate_limit` of a managed version, which goes with the `geo` of its main file, checked
-/// already.
+/// already. A refusal comes with the key it is about, `access` or `rate_limit`.
 pub(crate) fn routed(
     access: Option<Object<RawAccess>>,
     rate_limit: Option<Object<RawRateLimit>>,
     geo: Option<GeoConfig>,
-) -> Result<PolicyConfig, ConfigError> {
+) -> Result<PolicyConfig, (ConfigError, &'static str)> {
     Ok(PolicyConfig {
-        access: rewrite::access(access)?,
-        rate_limit: rate_limit.map(|Object(raw)| limit(raw)).transpose()?,
+        access: rewrite::access(access).map_err(|e| (e, "access"))?,
+        rate_limit: rate_limit
+            .map(|Object(raw)| limit(raw))
+            .transpose()
+            .map_err(|e| (e, "rate_limit"))?,
         geo,
         country: None,
     })

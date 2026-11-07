@@ -37,7 +37,7 @@
 //! database. `load_main` reads the file alone and gives a `MainFile`, which has no routing: the readers that serve no
 //! request use it (the shipper, the commands `rules`, `admin bootstrap` and `admin reset`, and the admin process when
 //! it starts). A file without `managed` gets the same checks from both, but `load_main` does not read the country
-//! database. For a change of the managed configuration, the admin process reads the file again with `main_file`, and
+//! database. For a change or a check of a version, the admin process reads the file again with `main_file`, and
 //! checks the version with it as `load` would, but without the country database (see `managed::import`).
 //!
 //! `max_body` (1 KiB to 4 GiB) is the most bytes a request body may have once decoded (a gzip body under a route
@@ -98,7 +98,7 @@ pub use forward::{
     Address, AdminWay, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig,
     Stream,
 };
-pub(crate) use forward::{Groups, MAX_SERVERS, RawRoute, RawTls, StoredTls, name_ok, routing};
+pub(crate) use forward::{At, Groups, MAX_SERVERS, RawRoute, RawTls, StoredTls, located, name_ok};
 pub use kernel::KernelSettings;
 pub use listeners::{
     CertificateAcme, CertificateConfig, Http2Config, ListenerConfig, ListenerKind, MinVersion,

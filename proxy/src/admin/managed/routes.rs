@@ -1,18 +1,19 @@
-//! The table of the routes of the managed configuration, what they work with (`Managed`), and the routes that read:
-//! the state of the managed store, of the proxy and of the last job, the versions of the store, and the job. `ROUTES`
-//! says which role may use
-//! each route; `server` checks the origin, the session or the token, the CSRF token of a session, the state of the
-//! session and the role before `Managed::handle` runs, and writes a refusal to the audit log. A request with a token
-//! may use all of these routes.
+//! The table of the routes of the managed configuration, what they work with (`Managed`), and the routes that read: the
+//! state of the managed store, of the proxy and of the last job, the versions of the store, and the job. `ROUTES` says
+//! which role may use each route; `server` checks the origin, the session or the token, the CSRF token of a session,
+//! the state of the session and the role before `Managed::handle` runs, and writes a refusal to the audit log. A
+//! request with a token may use all of these routes.
 //!
 //! The routes work only for a main file that had `managed` when the process started: without it, `GET /api/managed` is
-//! `{"managed": false}` and every other route is 409 (`the configuration has no managed object`). The managed store is
-//! the directory that `managed.dir` named then; it is opened for each request, and one that cannot be opened is 500
-//! with the sentence of the store, as a record of the chosen version that cannot be read is.
+//! `{"managed": false}`, `GET /api/config` works as it does with it, and every other route is 409 (`the configuration
+//! has no managed object`). The managed store is the directory that `managed.dir` named then; it is opened for each
+//! request, and one that cannot be opened is 500 with the sentence of the store, as a record of the chosen version that
+//! cannot be read is.
 //!
 //! The routes (a viewer may use the state, the list of the versions, the job and the history, an operator the content
-//! of a version and the changes as well; a body is JSON of at most 64 KiB, the one of the saving 12 MiB; the answers
-//! are JSON, and `error` is a fixed sentence):
+//! of a version, its check, the values of the main file and the changes as well; a body is JSON of at most 64 KiB, the
+//! ones of the saving and of the check 12 MiB; the answers are JSON, and `error` is a fixed sentence, which a 400 of
+//! the saving and of the check has with `at`, the place it is about, see `import`):
 //! - `GET /api/managed`: `{"managed": true, "current", "serving", "reachable", "reloading", "rollback_to", "job"}`:
 //!   the version the store chooses (`null` for none), the version the proxy serves by its control socket (`null` when
 //!   its state cannot be read or it has none), whether the proxy can be reached (a proxy that has no place for the
@@ -29,6 +30,8 @@
 //! - `POST /api/managed/apply`: the saving of a version and its putting in force (see `import`); `POST
 //!   /api/managed/activate` and `POST /api/managed/rollback`: the putting in force of a version of the store (see
 //!   `job`). Each is answered 202 with its job.
+//! - `POST /api/managed/check`: the check of a version as the saving checks it, which saves nothing (see `check`).
+//! - `GET /api/config`: the values of the main file as it is now, without its paths (see `config`).
 //! - `GET /api/managed/job`: `{"job"}`, the last job or `null`.
 //! - `GET /api/managed/history`: `{"entries"}`, the newest 200 lines of the history (see `history`); 503 when it
 //!   cannot be read.
@@ -54,9 +57,10 @@ use crate::log::Log;
 use crate::managed::{ManagedError, Store};
 use crate::rules::bundle::{Fingerprint, hex};
 
-/// The most bytes of the body of the saving: the JSON of a version and its files.
+/// The most bytes of the body of the saving and of the check: the JSON of a version and its files.
 const APPLY_BODY_MAX: usize = 12 << 20;
 const APPLY: &str = "/api/managed/apply";
+const CHECK: &str = "/api/managed/check";
 /// The path of one version in a request; in the table it is `/api/managed/versions/*`.
 const VERSION: &str = "/api/managed/versions/";
 
@@ -71,6 +75,8 @@ pub enum Op {
     Rollback,
     Job,
     History,
+    Check,
+    Config,
 }
 
 impl Op {
@@ -85,6 +91,8 @@ impl Op {
             Op::Rollback => "managed-rollback",
             Op::Job => "managed-job",
             Op::History => "managed-history",
+            Op::Check => "managed-check",
+            Op::Config => "config",
         }
     }
 }
@@ -102,7 +110,7 @@ const fn route(method: Method, path: &'static str, least: Role, op: Op) -> Route
 }
 
 /// The routes of the managed configuration. A `*` at the end of a path stands for the name of a version.
-pub(in crate::admin) static ROUTES: [Route; 8] = [
+pub(in crate::admin) static ROUTES: [Route; 10] = [
     route(Method::GET, "/api/managed", Role::Viewer, Op::State),
     route(
         Method::GET,
@@ -136,11 +144,13 @@ pub(in crate::admin) static ROUTES: [Route; 8] = [
         Role::Viewer,
         Op::History,
     ),
+    route(Method::POST, CHECK, Role::Operator, Op::Check),
+    route(Method::GET, "/api/config", Role::Operator, Op::Config),
 ];
 
 /// The most bytes of a body, for a request whose body may be longer than the usual limit.
 pub(in crate::admin) fn body_limit(method: &Method, path: &str) -> Option<usize> {
-    (*method == Method::POST && path == APPLY).then_some(APPLY_BODY_MAX)
+    (*method == Method::POST && (path == APPLY || path == CHECK)).then_some(APPLY_BODY_MAX)
 }
 
 /// The version that `path`, a path below `/api/managed/versions/`, names.
@@ -168,8 +178,9 @@ pub(super) fn failed(e: ManagedError) -> Answer {
     Answer::error(StatusCode::INTERNAL_SERVER_ERROR, e.0)
 }
 
-/// The right to change the managed configuration in this process, which one change holds at a time. It is given back
-/// when it is dropped: at the end of the change, or when the change ends in a panic.
+/// A right that one holder at a time has in this process: to change the managed configuration (`Managed::seat`), or to
+/// check a version (`Managed::check_seat`). It is given back when it is dropped: at the end of the change or of the
+/// check, or when it ends in a panic.
 pub(super) struct Seat(Arc<AtomicBool>);
 
 impl Drop for Seat {
@@ -180,8 +191,8 @@ impl Drop for Seat {
 
 /// The routes of the managed configuration.
 pub struct Managed {
-    /// The main file, which a change reads again.
-    config: PathBuf,
+    /// The main file, which a change, a check and the route of its values read again.
+    pub(super) config: PathBuf,
     /// The directory of the managed store that the main file named when the process started; none: it had no
     /// `managed`.
     pub(super) dir: Option<PathBuf>,
@@ -193,6 +204,8 @@ pub struct Managed {
     pub(super) log: Log,
     /// A change holds it (see `Seat`).
     seat: Arc<AtomicBool>,
+    /// The check of a version holds it, for the saving and for the check (see `Seat`).
+    checking: Arc<AtomicBool>,
     /// The last job.
     pub(super) job: Slot,
     /// The process is stopping: no change starts.
@@ -220,6 +233,7 @@ impl Managed {
             audit,
             log,
             seat: Arc::new(AtomicBool::new(false)),
+            checking: Arc::new(AtomicBool::new(false)),
             job: Arc::new(Mutex::new(None)),
             stopping: AtomicBool::new(false),
         }
@@ -269,6 +283,8 @@ impl Managed {
             Op::Rollback => self.rollback(req, who, cx, began),
             Op::Job => self.job(),
             Op::History => self.history(),
+            Op::Check => self.check(req),
+            Op::Config => self.values(),
         }
     }
 
@@ -288,9 +304,25 @@ impl Managed {
         }
     }
 
-    /// The main file, read again for a change. It must have `managed`, with the directory `dir` that it named when the
-    /// process started: another store is not opened. The refusal is the word of the audit log and the sentence of the
-    /// answer, which is 409.
+    /// The right to check a version, which the saving and the check take before they read their body: the reading
+    /// again of a large body and of the files of the store holds much memory, so one check runs at a time (503 while
+    /// another one does).
+    pub(super) fn check_seat(&self) -> Result<Seat, Answer> {
+        match self
+            .checking
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(Seat(self.checking.clone())),
+            Err(_) => Err(Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a check of a managed version is under way",
+            )),
+        }
+    }
+
+    /// The main file, read again for a change or a check. It must have `managed`, with the directory `dir` that it
+    /// named when the process started: another store is not opened. The refusal is the word of the audit log and the
+    /// sentence of the answer, which is 409.
     pub(super) fn main_file(&self, dir: &Path) -> Result<Built, (&'static str, &'static str)> {
         let built = config::read(&self.config)
             .and_then(|bytes| config::main_file(&bytes))

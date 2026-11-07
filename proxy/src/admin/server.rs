@@ -2,20 +2,21 @@
 //! process, its connections and its start and stop are in `listener`; the body of a request is read by `body`, and
 //! the files of the page are answered by `ui`.
 //!
-//! An answer of a route is JSON, and an error is `{"error": "<words>"}`. The number of a request is the value of
-//! `X-Request-ID` when the peer is in `admin.trusted_proxies` and the value has the form that the proxy gives (16
-//! lowercase hexadecimal digits, `-`, and 1 to 16 digits more); else the process makes one of the same form. The
+//! An answer of a route is JSON, and an error is `{"error": "<words>"}` (a refusal of the input of the saving and of
+//! the check of a managed version also has `at`, the place it is about; see `managed`). The number of a request is the
+//! value of `X-Request-ID` when the peer is in `admin.trusted_proxies` and the value has the form that the proxy gives
+//! (16 lowercase hexadecimal digits, `-`, and 1 to 16 digits more); else the process makes one of the same form. The
 //! client of a request, for the limits and the audit log, is found as the proxy finds the client of a request, with
 //! `admin.trusted_proxies` (see `forward::client_ip`).
 //!
 //! The table of routes is in five parts: `ROUTES` here (`GET /api/audit`), `account` (the login, the session, the
 //! password, the second factor and the user's own tokens), `users::manage` (an owner's management of users and
-//! tokens), `waf` (the rules) and `managed` (the managed configuration). Each route has its method and path (a `*`
-//! stands for one part of the path, and a `*` that ends the path of the rules for the rest of it), the least role that
-//! may use it (none: no credential is needed), the kind of state of a session that may use it (`Gate`), and whether a
-//! request with an API token may. A body is at most `BODY_MAX`, but for the routes whose part says otherwise (the
-//! import of a generation, the version to apply: `body_limit`); such a body is read only for a client of at least
-//! the least role of its route (see `body`).
+//! tokens), `waf` (the rules) and `managed` (the managed configuration and the main file). Each route has its method
+//! and path (a `*` stands for one part of the path, and a `*` that ends the path of the rules for the rest of it), the
+//! least role that may use it (none: no credential is needed), the kind of state of a session that may use it
+//! (`Gate`), and whether a request with an API token may. A body is at most `BODY_MAX`, but for the routes whose part
+//! says otherwise (the import of a generation, the version to apply or to check: `body_limit`); such a body is read
+//! only for a client of at least the least role of its route (see `body`).
 //!
 //! A request goes through these steps, and the first that refuses answers: the path (404 if the table has no route
 //! with it) and the method (405 with `Allow`; `HEAD` is taken as `GET`); for a route that names a least role, the
@@ -268,28 +269,14 @@ fn is_json(headers: &HeaderMap) -> bool {
 
 /// The body of the request as the JSON object `T`, with exactly the keys `T` knows.
 pub(super) fn json_body<T: DeserializeOwned>(req: &Req) -> Result<T, Answer> {
-    json_body_telling(req, &[])
-}
-
-/// `json_body`, but a refusal of the reading whose text starts with one of `sentences` (the fixed sentence of a limit
-/// that `T` keeps while it is read) is answered with that sentence.
-pub(super) fn json_body_telling<T: DeserializeOwned>(
-    req: &Req,
-    sentences: &[&'static str],
-) -> Result<T, Answer> {
     if !is_json(&req.headers) {
         return Err(Answer::error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported media type",
         ));
     }
-    serde_json::from_slice(&req.body).map_err(|e| {
-        let text = e.to_string();
-        let told = sentences
-            .iter()
-            .find(|sentence| text.starts_with(**sentence));
-        Answer::error(StatusCode::BAD_REQUEST, told.unwrap_or(&"bad request"))
-    })
+    serde_json::from_slice(&req.body)
+        .map_err(|_| Answer::error(StatusCode::BAD_REQUEST, "bad request"))
 }
 
 /// Whether `text` has the form of the number of a request: 16 hexadecimal digits, `-`, and 1 to 16 digits more.

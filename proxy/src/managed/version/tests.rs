@@ -1,5 +1,11 @@
-use super::*;
+use std::fs;
+
 use serde_json::json;
+
+use super::*;
+use crate::config::{Built, Routing};
+use crate::managed::store::tests::Fixture;
+use crate::managed::{Choice, LoadError};
 
 const NAME: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -7,7 +13,7 @@ const NAME: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
 fn checked(sites: Value) -> Result<Vec<Site>, ConfigError> {
     let raw: Vec<Object<RawSite<StoredCertificate>>> =
         serde_json::from_value(sites).map_err(|e| config::refusal(&e))?;
-    super::sites(raw)
+    super::sites(raw).map_err(|(e, _)| e)
 }
 
 fn site(name: &str, hosts: &[&str]) -> Value {
@@ -153,5 +159,181 @@ fn a_document_becomes_the_version_that_names_its_files_by_their_sha256() {
     assert_eq!(
         parse_document(&serde_json::to_vec(&stored).unwrap()).err(),
         Some(ConfigError("configuration has an unknown key"))
+    );
+}
+
+/// The main file of `fixture`, with the way to the admin process for `admin.test`, checked.
+fn with_admin(fixture: &Fixture) -> Built {
+    let path = fixture.main_file(|m| {
+        m["admin"] = json!({
+            "listen": "127.0.0.1:9180", "control": "/run/tukuyomi/admin.sock",
+            "store": {"kind": "file", "dir": "/var/lib/tukuyomi/admin"}, "origin": "https://admin.test",
+            "trusted_proxies": [], "mfa": "optional", "session_idle_ms": 600_000, "session_total_ms": 3_600_000,
+            "route": {
+                "host": "admin.test",
+                "certificate": {"cert_file": "/etc/tukuyomi/admin.pem", "key_file": "/etc/tukuyomi/admin.key"},
+                "access": {"allow_cidrs": ["192.0.2.0/24"]},
+            },
+        });
+    });
+    config::main_file(&fs::read(path).unwrap()).unwrap()
+}
+
+/// The refusal of `version` by the check of the admin process: its sentence and its place.
+fn objection(built: &Built, version: &Value) -> (&'static str, Option<String>) {
+    let Routing::Managed { resolve_timeout } = built.routing else {
+        panic!("the main file has no managed object");
+    };
+    let bytes = serde_json::to_vec(version).unwrap();
+    match check_sent(&bytes, &built.main, resolve_timeout, None) {
+        Err(objection) => (objection.why, objection.at),
+        Ok(_) => panic!("accepted"),
+    }
+}
+
+/// The refusal of the body `body` by the reading of the admin process: its sentence and its place.
+fn unread(body: &str) -> (&'static str, Option<String>) {
+    match sent(body.as_bytes()) {
+        Err(objection) => (objection.why, objection.at),
+        Ok(_) => panic!("accepted"),
+    }
+}
+
+fn server(address: &str) -> Value {
+    json!({"address": address, "weight": 1, "max_fails": 1, "fail_timeout_ms": 1000, "backup": false})
+}
+
+fn at(path: &str) -> Option<String> {
+    Some(path.to_owned())
+}
+
+#[test]
+fn a_refusal_of_a_sent_version_is_about_the_item_and_the_key_it_is_about() {
+    let fixture = Fixture::new();
+    let built = with_admin(&fixture);
+    let base = fixture.plain_version(b"chain", b"key");
+    let refused = |edit: &dyn Fn(&mut Value)| {
+        let mut version = base.clone();
+        edit(&mut version);
+        objection(&built, &version)
+    };
+    let push = |version: &mut Value, key: &str, item: Value| {
+        version[key].as_array_mut().unwrap().push(item);
+    };
+    assert_eq!(
+        refused(&|v| push(
+            v,
+            "sites",
+            json!({"name": "b", "hosts": ["A.test"], "certificate": {"chain": NAME, "key": NAME}})
+        )),
+        (
+            "a site host is not a name, or * and a name",
+            at("sites[1].hosts[0]")
+        )
+    );
+    // The groups are in the byte order of their names: `app`, then `g1`.
+    assert_eq!(
+        refused(&|v| v["upstreams"]["g1"] = json!({"servers": [
+            server("127.0.0.1:9001"), server("127.0.0.1:9002"), server("0.0.0.0:9003"),
+        ]})),
+        (
+            "a server address is unspecified or a multicast address",
+            at("upstreams.g1.servers[2].address")
+        )
+    );
+    assert_eq!(
+        refused(&|v| {
+            for path in ["/a", "/b", "/c", "d"] {
+                push(v, "routes", json!({"path": path, "upstream": "app"}));
+            }
+        }),
+        ("a route path does not start with /", at("routes[3].path"))
+    );
+    assert_eq!(
+        refused(&|v| v["rate_limit"] = json!({"rate": 10, "burst": 0, "keys": 10})),
+        (
+            "rate_limit keys is not 1024 to 1048576",
+            at("rate_limit.keys")
+        )
+    );
+    // A rule that the version breaks with the main file.
+    assert_eq!(
+        refused(&|v| push(
+            v,
+            "routes",
+            json!({"host": "admin.test:8443", "upstream": "app"})
+        )),
+        (
+            "a route host is the host of the admin route",
+            at("routes[0].host")
+        )
+    );
+    // A group whose name is not a name is not named in the place.
+    assert_eq!(
+        refused(&|v| v["upstreams"]["bad name"] = json!({"servers": [server("127.0.0.1:9001")]})),
+        (
+            "an upstream name is not 1 to 64 letters, digits, - and _",
+            at("upstreams")
+        )
+    );
+}
+
+#[test]
+fn a_sent_version_that_cannot_be_read_is_refused_about_the_first_item_that_cannot() {
+    let site = |name: Value| json!({"name": name, "hosts": ["a.test"], "certificate": {"chain": NAME, "key": NAME}});
+    let body = |sites: Value, routes: Value, upstreams: Value| {
+        json!({"version": {"sites": sites, "upstreams": upstreams, "routes": routes, "default_upstream": "app"}})
+            .to_string()
+    };
+    let groups = || json!({"app": {"servers": [server("127.0.0.1:9000")]}});
+    let wrong = "configuration has a value of the wrong type";
+    assert_eq!(
+        unread(&body(
+            json!([site(json!("a")), site(json!(5))]),
+            json!([]),
+            groups()
+        )),
+        (wrong, at("sites[1]"))
+    );
+    // `routes` comes before `sites` in the text, and the first reading stops at its unknown key; the sentence and the
+    // place are both those of the first item in the order of the check.
+    let both = body(
+        json!([site(json!("a")), site(json!(5))]),
+        json!([{"upstream": "app", "colour": "red"}]),
+        groups(),
+    );
+    assert!(both.find("\"routes\"") < both.find("\"sites\""));
+    assert_eq!(unread(&both), (wrong, at("sites[1]")));
+    let mut unnamed = groups();
+    unnamed["bad name"] = json!({"servers": 5});
+    assert_eq!(
+        unread(&body(json!([]), json!([]), unnamed)),
+        (wrong, at("upstreams"))
+    );
+    assert_eq!(
+        unread(r#"{"version": {"sites": [], "upstreams": {}, "default_upstream": "app"}}"#),
+        ("configuration has a missing key", at("routes"))
+    );
+    assert_eq!(
+        unread(
+            r#"{"version": {"sites": [], "upstreams": {}, "routes": [{"upstream": "a", "upstream": "b"}], "default_upstream": "app"}}"#
+        ),
+        ("configuration has a repeated key", None)
+    );
+}
+
+#[test]
+fn the_proxy_takes_the_sentence_of_a_refusal_without_its_place() {
+    let fixture = Fixture::new();
+    let path = fixture.main_file(|_| {});
+    let built = config::main_file(&fs::read(&path).unwrap()).unwrap();
+    let mut version = fixture.plain_version(b"chain", b"key");
+    version["upstreams"]["app"]["servers"][0]["address"] = json!("0.0.0.0:9000");
+    let (why, place) = objection(&built, &version);
+    assert_eq!(place, at("upstreams.app.servers[0].address"));
+    let bytes = serde_json::to_vec(&version).unwrap();
+    assert_eq!(
+        crate::managed::load(&path, &Choice::Given(bytes)).err(),
+        Some(LoadError::Version(ConfigError(why)))
     );
 }
