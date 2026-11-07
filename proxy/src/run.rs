@@ -3,9 +3,10 @@
 //! steps from the configuration to the kernel configuration), `serve` (the
 //! runtime part: the driver, the wait for the kernel, the listeners and the accept side), `reload` (SIGHUP, SIGUSR1
 //! and SIGUSR2), `stop`, `signals` (what the process waits for, behind one poll), `status` (the listener that answers
-//! `/healthz`, `/readyz` and `/metrics`), `control` (the socket on which the admin process asks for the state and for
-//! a switch), `notify` (the notices to the service manager, which the admin process sends as well) and `host` (the
-//! checks of the host process, which the admin process makes as well).
+//! `/healthz`, `/readyz` and `/metrics`), `control` (the socket on which the admin process asks for the state, for a
+//! switch and for a reading of the configuration with a managed version), `notify` (the notices to the service
+//! manager, which the admin process sends as well) and `host` (the checks of the host process, which the admin process
+//! makes as well).
 //!
 //! Start-up runs in this order: the logger thread, one argument (the absolute clean path of the configuration file),
 //! the host checks, the configuration (when the file has `managed`, with the version of the managed store that its
@@ -20,15 +21,15 @@
 //! exit code 1 before the inspector is started), the control socket (when the configuration has `admin`; bound here for
 //! the same reason, see `control`), the driver thread, the wait for the kernel to be ready, bind, accept. The steps
 //! from the configuration to the kernel configuration are `prepare`, which `config check` runs as well. The
-//! configuration file is read here, and again when SIGHUP comes (the steps before the rules store only); the rules
-//! store is read here, and again when SIGUSR1 comes; the certificate and key files are read here, and again when
-//! SIGUSR2 comes. Handlers exist for SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2 only and are installed before the
-//! kernel starts its child process; SIGCHLD is never handled. The listeners are bound only after the kernel is ready,
-//! all of them or none, and the accept side takes a connection permit before every accept (see
-//! `inbound::transport::accept`). When they are bound, `/readyz` says `ready` (as long as the kernel that serves is)
-//! and, if the environment has `NOTIFY_SOCKET`, `READY=1` is sent (see `notify`). The status listener is not one of the
-//! listeners of the configuration: it is bound earlier, answers before the proxy is ready (`/healthz` 200, `/readyz`
-//! 503), forwards nothing and takes no permit of the accept side (see `status`).
+//! configuration file is read here, and again when SIGHUP or a reload order of the control socket comes (the steps
+//! before the rules store only); the rules store is read here, and again when SIGUSR1 comes; the certificate and key
+//! files are read here, and again when SIGUSR2 comes. Handlers exist for SIGTERM, SIGINT, SIGHUP, SIGUSR1 and SIGUSR2
+//! only and are installed before the kernel starts its child process; SIGCHLD is never handled. The listeners are bound
+//! only after the kernel is ready, all of them or none, and the accept side takes a connection permit before every
+//! accept (see `inbound::transport::accept`). When they are bound, `/readyz` says `ready` (as long as the kernel that
+//! serves is) and, if the environment has `NOTIFY_SOCKET`, `READY=1` is sent (see `notify`). The status listener is not
+//! one of the listeners of the configuration: it is bound earlier, answers before the proxy is ready (`/healthz` 200,
+//! `/readyz` 503), forwards nothing and takes no permit of the accept side (see `status`).
 //!
 //! `config check <config>` refuses a process that runs as root and then takes the steps of `prepare`, and writes the
 //! lines of the start headed `config check:` where the start heads them `start:`. It builds no runtime, starts no
@@ -76,6 +77,12 @@
 //! before the listeners are bound and while the proxy stops. SIGUSR2 while a reading is under way reads the certificate
 //! files when the reading has ended, for the setup that is current then. A thread that cannot be started, or that ends
 //! without an answer, is a refusal and no cause of a stop; an answer that comes while the proxy stops is dropped.
+//!
+//! A reload order of the control socket takes the steps of SIGHUP, with the managed version that the order names in
+//! the place of the one that `current` names (see `control`): one reading is under way at a time, of SIGHUP or of an
+//! order, and the order is answered when its reading has ended, with the part that refused and the sentence of its
+//! line if it was refused. Its reading is counted with those of SIGHUP. A configuration without `managed` refuses the
+//! order before any reading.
 //!
 //! SIGUSR1 makes the proxy switch to the generation that the rules store chooses now (`rules::switch` reads the
 //! store, the driver starts the new inspector and moves the requests over when it is ready). It is a line in the

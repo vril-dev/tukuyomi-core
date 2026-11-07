@@ -13,7 +13,7 @@ use tokio::time::{Instant, timeout_at};
 use tukuyomi_kernel::Failure;
 
 use super::control::{Control, Order};
-use super::start::Parts;
+use super::start::{Parts, Refusal};
 use super::status::Status;
 use crate::inbound::transport::accept::{Accepted, Acceptor, Arrival};
 use crate::inspect::driver::{End, Switched};
@@ -73,9 +73,9 @@ pub(super) enum Event {
     Certificates,
     /// The driver answered a switch: whether the new generation serves.
     Switched(bool),
-    /// The thread that reads the configuration file again answered: the parts it made, or none if it refused the file
-    /// (it wrote the line that says why).
-    Configured(Option<Box<Parts>>),
+    /// The thread that reads the configuration file again answered: the parts it made, or why it refused the file (it
+    /// wrote the line that says so).
+    Configured(Result<Box<Parts>, Refusal>),
     /// The thread that reads the configuration file again ended without an answer. This is no cause of a stop: the
     /// thread has nothing to do with the requests that are served.
     ConfigurationLost,
@@ -106,7 +106,7 @@ pub(super) struct Waits {
     /// The answer to the switch that is under way, if there is one.
     pub(super) switch: Option<oneshot::Receiver<Switched>>,
     /// The answer of the thread that reads the configuration file again, if one is under way.
-    pub(super) config: Option<oneshot::Receiver<Option<Box<Parts>>>>,
+    pub(super) config: Option<oneshot::Receiver<Result<Box<Parts>, Refusal>>>,
     end: Option<oneshot::Receiver<End>>,
     pub(super) accept: Option<Acceptor>,
     pub(super) status: Option<Status>,

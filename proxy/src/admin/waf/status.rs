@@ -2,10 +2,11 @@
 //!
 //! `current` is the generation the rules store chooses (`null` when it chooses none), and `reachable` and `proxy` are
 //! what the control socket says of the proxy (see `control`): `proxy` is `{"generation", "mode", "engine", "phase",
-//! "switching", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures", "config",
-//! "managed", "config_reloads"}`, the answer of the proxy as it is, and `null` when it could not be read. A proxy of an
-//! older version does not send the figures (the last eight), and each one it does not send is `null`, as `managed` is
-//! for a proxy whose configuration has no `managed`; the answer is not refused for that. `rollback_to` is the
+//! "switching", "reloading", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures",
+//! "config", "managed", "resolve_timeout_ms", "config_reloads"}`, the answer of the proxy as it is, and `null` when it
+//! could not be read. A proxy of an older version does not send the figures (`reloading` and the last nine), and each
+//! one it does not send is `null`, as `managed` is for a proxy whose configuration has no `managed`; the answer is not
+//! refused for that. `rollback_to` is the
 //! generation a rollback would go to if it were asked for now: the target of the history (`history::rollback_target`)
 //! when the rules store still has that generation, else `null`. A history that cannot be read makes the answer 503, as
 //! it does for the history route.

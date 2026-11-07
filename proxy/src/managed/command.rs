@@ -7,9 +7,10 @@
 //! ```
 //!
 //! A command is a short process of its own, apart from a running proxy, which does not notice what it does: a proxy
-//! takes the chosen version when it starts or reads its configuration again (SIGHUP). The configuration is the main
-//! file of the proxy, as an absolute clean path, and it has `managed`; the document is a path as the operator writes
-//! it, from the working directory, and the version is its 64 lowercase hexadecimal digits.
+//! takes the chosen version when it starts or reads its configuration again at SIGHUP. The commands ask no proxy; the
+//! admin process puts a version in force in a running proxy by its control socket (see `apply`). The configuration is
+//! the main file of the proxy, as an absolute clean path, and it has `managed`; the document is a path as the operator
+//! writes it, from the working directory, and the version is its 64 lowercase hexadecimal digits.
 //!
 //! `import` takes a document of at most 1 MiB (see `version`) and checks it with the main file as a version is
 //! checked. It reads each file that the document names once, as the proxy reads a certificate file (a regular file of
@@ -35,8 +36,8 @@
 //!
 //! The exit code is 0 for success, 1 for any other end (a refused store, document or file, a store that is in use, a
 //! name that cannot be looked up or a file that cannot be used when the version is chosen, a current version that is
-//! not in the store, a process that runs as root) and 2 for a wrong argument or a refused configuration, a main file
-//! without `managed` and a version that `activate` refuses included.
+//! not in the store, a version that `activate` refuses, as a document that `import` refuses, a process that runs as
+//! root) and 2 for a wrong argument or a refused configuration, a main file without `managed` included.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -318,8 +319,8 @@ fn activate(config: &Path, version: [u8; 32], out: &mut dyn Write, log: &Log) ->
         }
     };
     // The check comes before the store chooses: a version that the proxy would refuse is never the chosen one.
-    if let Err(code) = read_parts(config, &Choice::Named(version), NAME, log) {
-        return if code == EXIT_FAILED {
+    if let Err(refusal) = read_parts(config, &Choice::Named(version), NAME, log) {
+        return if refusal.exit() == EXIT_FAILED {
             Exit::Failed
         } else {
             Exit::Usage

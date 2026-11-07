@@ -2,7 +2,9 @@
 //! `config`, `managed`) the process is, whether it is the admin process or one of its commands `admin bootstrap` and
 //! `admin reset` (see `admin`), and the steps from the configuration to the kernel configuration (`prepare`), which
 //! `config check` runs as well. The steps before the rules store (`read_parts`) are run again when the proxy reads
-//! the configuration file again, and by `managed activate` with the version it is to choose.
+//! the configuration file again (at SIGHUP, and for a reload order of the control socket with the version that the
+//! order names), and by `managed activate` with the version it is to choose; a refusal there comes back with the part
+//! that refused and its sentence, for the answer to the order.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -224,26 +226,92 @@ pub(crate) struct Parts {
     pub(super) managed: Option<[u8; 32]>,
 }
 
+/// The part of a reading of the configuration that refused it. Its word is the `reason` of a reload order of the
+/// control socket that the reading refused (see `control`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reason {
+    /// The main file, or its country database.
+    Configuration,
+    /// The managed version, checked with the main file.
+    Version,
+    /// The managed store: it, a version or a file that cannot be read or is not what its name says.
+    Store,
+    /// The lookup of the names of the upstream servers, or the authorities of an upstream group.
+    Upstream,
+    /// A certificate or key file: of a listener, of a site or of the way to the admin process.
+    Tls,
+    /// A value that cannot change while the proxy runs (see `reload::Fixed`), `managed` being there or not included.
+    Fixed,
+    /// The address of a new listener cannot be bound.
+    Listener,
+    /// The thread of the reading cannot be started, or ended without an answer.
+    Thread,
+    /// The configuration in force has no `managed`: a reload order is refused before any reading.
+    Unmanaged,
+}
+
+impl Reason {
+    pub(super) fn word(self) -> &'static str {
+        match self {
+            Reason::Configuration => "configuration",
+            Reason::Version => "version",
+            Reason::Store => "store",
+            Reason::Upstream => "upstream",
+            Reason::Tls => "tls",
+            Reason::Fixed => "fixed",
+            Reason::Listener => "listener",
+            Reason::Thread => "thread",
+            Reason::Unmanaged => "unmanaged",
+        }
+    }
+}
+
+/// Why a reading of the configuration refused it: the part that refused, and the sentence of the record line that says
+/// so, the part of it after `refused: `. The sentence is fixed but for its place (a key, a listener, a site, the way to
+/// the admin process, a server of an upstream group), and never shows a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub(super) reason: Reason,
+    pub(super) detail: String,
+}
+
+impl Refusal {
+    /// The exit code of the start, `config check` or `managed activate` that the refusal ends: 2 for the main file, 1
+    /// for the rest, a managed version included (as for a generation of rules that is refused).
+    pub(crate) fn exit(&self) -> u8 {
+        if self.reason == Reason::Configuration {
+            EXIT_USAGE
+        } else {
+            EXIT_FAILED
+        }
+    }
+}
+
 /// The steps of start-up before the rules store: the configuration (with `managed`, with the version of `choice`), the
 /// lookup of the names of the upstream servers, the files of the TLS listeners and the challenge of the CA. `name` is
 /// at the head of each line: `start` for the start, `config check` for the command of that name, `reload` for a
-/// reading of the file again, `managed activate` for that command. A refusal is a line, and its exit code is the error:
-/// 2 for a main file that is refused, 1 for the rest, a managed version that is refused included (as for a generation
-/// of rules that is refused).
-pub(crate) fn read_parts(path: &Path, choice: &Choice, name: &str, log: &Log) -> Result<Parts, u8> {
+/// reading of the file again, `managed activate` for that command. A refusal is a line, `<name>: <part> refused:
+/// <sentence>`, and comes back with the part and the sentence (`Refusal`, whose `exit` is the exit code).
+pub(crate) fn read_parts(
+    path: &Path,
+    choice: &Choice,
+    name: &str,
+    log: &Log,
+) -> Result<Parts, Refusal> {
+    let refuse = |reason: Reason, part: &str, detail: String| {
+        log.line(&format!("{name}: {part} refused: {detail}"));
+        Refusal { reason, detail }
+    };
     let loaded = match managed::load(path, choice) {
         Ok(loaded) => loaded,
         Err(LoadError::Main(e)) => {
-            log.line(&format!("{name}: configuration refused: {}", e.0));
-            return Err(EXIT_USAGE);
+            return Err(refuse(Reason::Configuration, "configuration", e.0.into()));
         }
         Err(LoadError::Version(e)) => {
-            log.line(&format!("{name}: managed version refused: {}", e.0));
-            return Err(EXIT_FAILED);
+            return Err(refuse(Reason::Version, "managed version", e.0.into()));
         }
         Err(LoadError::Store(e)) => {
-            log.line(&format!("{name}: managed store refused: {}", e.0));
-            return Err(EXIT_FAILED);
+            return Err(refuse(Reason::Store, "managed store", e.0.into()));
         }
     };
     log.line(&format!("{name}: configuration accepted"));
@@ -273,10 +341,7 @@ pub(crate) fn read_parts(path: &Path, choice: &Choice, name: &str, log: &Log) ->
             }
             done.forward
         }
-        Err(refusal) => {
-            log.line(&format!("{name}: upstream refused: {refusal}"));
-            return Err(EXIT_FAILED);
-        }
+        Err(refusal) => return Err(refuse(Reason::Upstream, "upstream", refusal.to_string())),
     };
     // No server of a version is the admin process, also once its names are looked up: the way to it is the proxy's own,
     // to `admin.listen`, which the proxy makes itself (see `forward::group`).
@@ -287,8 +352,7 @@ pub(crate) fn read_parts(path: &Path, choice: &Choice, name: &str, log: &Log) ->
             "a server name has the address of the admin process",
         )
     {
-        log.line(&format!("{name}: upstream refused: {refusal}"));
-        return Err(EXIT_FAILED);
+        return Err(refuse(Reason::Upstream, "upstream", refusal.to_string()));
     }
     forward.admin = loaded
         .admin_route
@@ -312,10 +376,7 @@ pub(crate) fn read_parts(path: &Path, choice: &Choice, name: &str, log: &Log) ->
     };
     let tls = match loaded_tls {
         Ok(tls) => tls,
-        Err(refusal) => {
-            log.line(&format!("{name}: tls refused: {refusal}"));
-            return Err(EXIT_FAILED);
-        }
+        Err(refusal) => return Err(refuse(Reason::Tls, "tls", refusal.to_string())),
     };
     for place in tls.waiting() {
         log.line(&format!("{name}: tls certificate not issued yet ({place})"));
@@ -346,7 +407,7 @@ pub(crate) fn read_parts(path: &Path, choice: &Choice, name: &str, log: &Log) ->
 /// included. `name` is at the head of each line: `start` for the start, `config check` for the command of that name.
 /// A refusal is a line, and its exit code is the error.
 fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
-    let parts = read_parts(path, &Choice::Current, name, log)?;
+    let parts = read_parts(path, &Choice::Current, name, log).map_err(|refusal| refusal.exit())?;
     if let Some(version) = parts.managed {
         log.line(&format!("{name}: managed version {}", hex(&version)));
     }

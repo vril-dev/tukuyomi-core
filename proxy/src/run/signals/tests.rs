@@ -1,4 +1,5 @@
 use super::*;
+use crate::run::start::Reason;
 use crate::run::stop::Cause;
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
@@ -89,14 +90,18 @@ fn a_wait_returns_the_answer_of_a_configuration_reload_once_and_a_lost_answer_is
         let mut f = fixture();
         let (reply, told) = oneshot::channel();
         f.waits.config = Some(told);
-        assert!(reply.send(None).is_ok());
+        let refusal = Refusal {
+            reason: Reason::Configuration,
+            detail: "configuration file is not UTF-8".to_owned(),
+        };
+        assert!(reply.send(Err(refusal.clone())).is_ok());
         assert!(matches!(
             f.waits.wait(after(2000)).await,
-            Event::Configured(None)
+            Event::Configured(Err(answer)) if answer == refusal
         ));
         assert!(matches!(f.waits.wait(after(30)).await, Event::Late));
 
-        let (reply, told) = oneshot::channel::<Option<Box<Parts>>>();
+        let (reply, told) = oneshot::channel::<Result<Box<Parts>, Refusal>>();
         f.waits.config = Some(told);
         drop(reply);
         let event = f.waits.wait(after(2000)).await;

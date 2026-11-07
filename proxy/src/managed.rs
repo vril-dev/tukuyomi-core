@@ -24,13 +24,17 @@
 //! that has not been issued yet, and anything else that is wrong with them is refused.
 //!
 //! The proxy reads the main file and a version as one configuration (`load`): when it starts, for `config check` and at
-//! SIGHUP, with the version that `current` names. Every TLS listener of the main file then chooses, by the name the
-//! client asks for, from the certificates of the sites and that of the way to the admin process, which the main file
-//! writes in `admin.route` and the proxy makes itself (see `config::admin`, `inbound::transport::tls`). The commands
-//! (see `command`) make a version from a document whose files are named by their paths (`managed import`), choose one
-//! after the same reading as the proxy's (`managed activate`), and list them (`managed list`). The proxy takes the
-//! chosen version when it starts or reads the configuration again.
+//! SIGHUP, with the version that `current` names, and for a reload order of its control socket with the version that
+//! the order names. Every TLS listener of the main file then chooses, by the name the client asks for, from the
+//! certificates of the sites and that of the way to the admin process, which the main file writes in `admin.route` and
+//! the proxy makes itself (see `config::admin`, `inbound::transport::tls`). The commands (see `command`) make a version
+//! from a document whose files are named by their paths (`managed import`), choose one after the same reading as the
+//! proxy's (`managed activate`), and list them (`managed list`); a running proxy takes the version they choose at the
+//! next SIGHUP or start. The admin process puts a version in force in a running proxy the other way round (see
+//! `apply`): the proxy reads its configuration again with the version by a reload order, and the store chooses it
+//! only once the proxy has taken it. The proxy never writes the store.
 
+pub mod apply;
 pub mod command;
 mod load;
 pub(crate) mod store;

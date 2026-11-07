@@ -1,7 +1,9 @@
 //! The `forward` object of the configuration: the upstream groups, and the routes that choose a group for a request.
 //!
-//! `resolve_timeout_ms` is the time the proxy may take, when it starts, to look up the names of the servers (1 ms to
-//! 3600 s). `upstreams` is an object from the name of a group to `{"servers": [..], "tls"?}`. A name is 1 to 64
+//! `resolve_timeout_ms` is the time the proxy may take to look up the names of the servers each time it reads the
+//! configuration: when it starts, at SIGHUP, and for a reload order of the control socket, whose answer is waited for
+//! that long and a margin (1 ms to 3600 s).
+//! `upstreams` is an object from the name of a group to `{"servers": [..], "tls"?}`. A name is 1 to 64
 //! letters, digits, `-` and `_`, and there are 1 to 64 groups. A group has 1 to 64 servers, each `{"address", "weight",
 //! "max_fails", "fail_timeout_ms", "backup"}` with every key present: the address is an IP literal and a port
 //! (`[..]:port` for IPv6) or a name and a port (`name:port`), the weight is 1 to 100, `max_fails` is 0 to 100 (0:
@@ -149,6 +151,9 @@ pub struct ForwardSettings {
 /// The `forward` object once every name is looked up (see `forward::resolve`).
 #[derive(Clone, Debug)]
 pub struct ForwardConfig {
+    /// The time the lookup of the names could take (`resolve_timeout_ms`): a reading of the file that a reload order
+    /// of the control socket asks for is waited for that long, and a margin (see `run::control`).
+    pub resolve_timeout: Duration,
     pub groups: Vec<GroupConfig>,
     pub routes: Table<RouteConfig>,
     /// The index of the group for a request that no route holds for.
@@ -169,7 +174,7 @@ pub struct AdminWay {
 #[cfg(test)]
 impl ForwardConfig {
     /// One group, `main`, of servers at these addresses, each with a weight of 1, one failure leaving it out for a
-    /// minute, and no backup; every request goes to it.
+    /// minute, and no backup; every request goes to it. The lookup could take 30 s.
     pub(crate) fn of(addresses: &[SocketAddr]) -> ForwardConfig {
         let servers = addresses
             .iter()
@@ -182,6 +187,7 @@ impl ForwardConfig {
             })
             .collect();
         ForwardConfig {
+            resolve_timeout: Duration::from_secs(30),
             groups: vec![GroupConfig {
                 name: "main".to_string(),
                 servers,

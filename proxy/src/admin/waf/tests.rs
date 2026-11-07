@@ -541,6 +541,7 @@ fn a_switch_is_written_to_the_history_and_a_rollback_goes_to_the_from_of_the_las
     // The proxy of this test sends no figures, as an older proxy does: each one is `null`, and the rest is there.
     assert_eq!(status.body["proxy"]["phase"], "ready");
     for key in [
+        "reloading",
         "uptime_ms",
         "requests",
         "blocked",
@@ -548,6 +549,7 @@ fn a_switch_is_written_to_the_history_and_a_rollback_goes_to_the_from_of_the_las
         "upstream_failures",
         "config",
         "managed",
+        "resolve_timeout_ms",
         "config_reloads",
     ] {
         assert_eq!(status.body["proxy"][key], Value::Null, "{key}");

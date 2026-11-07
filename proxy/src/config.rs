@@ -114,7 +114,7 @@ const MAX_FILE: u64 = 256 * 1024;
 /// Longest accepted `rules.store.dir` in bytes: the paths below it must stay inside the Linux `PATH_MAX`. A guard
 /// against a wrong setting, not a recommendation.
 const MAX_STORE_DIR: usize = 3840;
-const MAX_MS: u64 = 3_600_000;
+pub(crate) const MAX_MS: u64 = 3_600_000;
 /// The longest `conn_total_ms`: the connection time has room for `keepalive_time_ms` and one request after it.
 const MAX_CONN_MS: u64 = 86_400_000;
 /// The most networks in `trusted_proxies`.

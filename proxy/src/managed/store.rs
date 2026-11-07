@@ -1,6 +1,7 @@
 //! The managed store in its directory: the versions, the files they name, the record of the chosen version and the
 //! lock, and the certificates of the sites with `acme` (see `managed` for the form). The writes of the versions, the
-//! files and the record are made by the commands of `managed`, which hold the lock; the certificates of the sites with
+//! files and the record are made by the commands of `managed` and by the order of the admin process (`apply`), which
+//! hold the lock; the certificates of the sites with
 //! `acme` are written by the command `acme renew`, which does not take it, for it touches no version and no record. The
 //! readings take no lock, for every name they read is replaced whole or not at all.
 
@@ -54,6 +55,13 @@ pub fn acme_name(hosts: &[String]) -> [u8; 32] {
 /// Why the managed store refused: a fixed English sentence, never a path or a value read from the store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ManagedError(pub &'static str);
+
+/// Why `lock` refuses a lock that another holds.
+pub const IN_USE: ManagedError = ManagedError("the managed store is in use by another command");
+
+/// Why `choose_if_current` refuses when `current` does not name the version that the caller saw as chosen.
+pub const NOT_CURRENT: ManagedError =
+    ManagedError("the chosen managed version is not the one that was expected");
 
 /// What a write found at its name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,9 +139,7 @@ impl Store {
         .map_err(|e| ManagedError(e.0))?;
         match file.try_lock() {
             Ok(()) => Ok(file),
-            Err(TryLockError::WouldBlock) => Err(ManagedError(
-                "the managed store is in use by another command",
-            )),
+            Err(TryLockError::WouldBlock) => Err(IN_USE),
             Err(TryLockError::Error(_)) => Err(ManagedError(
                 "the lock of the managed store cannot be taken",
             )),
@@ -313,6 +319,17 @@ impl Store {
                 let _ = fs::remove_file(&new);
                 CANNOT
             })
+    }
+
+    /// `choose`, but only if `current` names `expect`: the record is read and the version chosen while the caller holds
+    /// the lock, which this does not take (a lock of the store is refused to a second taker in the same process as
+    /// well), so nothing that changes the store comes in between. Another version, or none, is refused with
+    /// `NOT_CURRENT`.
+    pub fn choose_if_current(&self, expect: [u8; 32], name: [u8; 32]) -> Result<(), ManagedError> {
+        if self.current()? != Some(expect) {
+            return Err(NOT_CURRENT);
+        }
+        self.choose(name)
     }
 
     /// The places of the chain and of the key of the site with `acme` whose hosts have the name `name`, for the command

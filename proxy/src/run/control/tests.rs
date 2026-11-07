@@ -6,9 +6,13 @@ use tokio::io::AsyncWriteExt;
 use tukuyomi_kernel::Failure;
 
 use super::*;
+use crate::config::{self, ForwardConfig, Keep, PolicyConfig};
+use crate::inbound::transport::tls::Tls;
 use crate::log::recording;
+use crate::managed::store::tests::Fixture;
 use crate::rules::bundle::Mode;
 use crate::run::signals::tests::runtime;
+use crate::run::start::Reason;
 use tukuyomi_kernel::Engine;
 
 /// A fresh 0700 directory under the temp directory (`TMPDIR`), removed with everything in it when dropped. Its name is
@@ -56,16 +60,56 @@ fn state(phase: Phase) -> State {
     }
 }
 
-/// Binds and serves `path`, and returns the handle with the way to change the state it reads.
-fn serving(path: &Path, switch_wait: Duration, log: &Log) -> (Control, watch::Sender<State>) {
+/// The setup in force of a main file with `managed`, made with the version `managed`, whose names may take
+/// `resolve_timeout` to be looked up. The SHA-256 of the file is 32 times `ab`.
+fn setup(managed: Option<[u8; 32]>, resolve_timeout: Duration) -> Setup {
+    let fixture = Fixture::new();
+    let main = fs::read(fixture.main_file(|_| {})).unwrap();
+    let proxy = config::main_file(&main).unwrap().main.proxy;
+    let forward = ForwardConfig {
+        resolve_timeout,
+        ..ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()])
+    };
+    Setup::new(
+        proxy,
+        [0xab; 32],
+        &forward,
+        Tls::none(),
+        None,
+        PolicyConfig::default(),
+        Keep::BestEffort,
+        None,
+    )
+    .with_managed(managed)
+}
+
+/// Binds and serves `path` with `setup` in force, and returns the handle with the way to change the state it reads.
+fn serving(
+    path: &Path,
+    switch_wait: Duration,
+    setup: Setup,
+    log: &Log,
+) -> (Control, watch::Sender<State>) {
     let bound = bind(path).unwrap();
     let (changes, state) = watch::channel(state(Phase::Ready));
     let readiness = Arc::new(Readiness::new());
     readiness.bound();
     (
-        serve(bound, state, readiness, switch_wait, log.clone()),
+        serve(
+            bound,
+            state,
+            readiness,
+            switch_wait,
+            SharedSetup::new(setup),
+            log.clone(),
+        ),
         changes,
     )
+}
+
+/// The setup of a socket whose tests send no reload order.
+fn unused() -> Setup {
+    setup(None, Duration::from_secs(30))
 }
 
 /// Sends `request` as it is and reads the answer until the socket closes. A reset ends the read as a close does.
@@ -87,14 +131,15 @@ fn figures() -> Figures {
         upstream_failures: 4,
         config: [0xab; 32],
         managed: None,
+        resolve_timeout_ms: 30_000,
         config_replaced: 5,
         config_refused: 1,
     }
 }
 
-fn status_line(phase: &str, switching: bool, ready: bool) -> String {
+fn status_line(phase: &str, switching: bool, reloading: bool, ready: bool) -> String {
     format!(
-        "{{\"generation\":\"{}\",\"mode\":\"block\",\"engine\":\"coraza\",\"phase\":\"{phase}\",\"switching\":{switching},\"ready\":{ready},\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"managed\":null,\"config_reloads\":{{\"replaced\":5,\"refused\":1}}}}\n",
+        "{{\"generation\":\"{}\",\"mode\":\"block\",\"engine\":\"coraza\",\"phase\":\"{phase}\",\"switching\":{switching},\"reloading\":{reloading},\"ready\":{ready},\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"managed\":null,\"resolve_timeout_ms\":30000,\"config_reloads\":{{\"replaced\":5,\"refused\":1}}}}\n",
         "a".repeat(64),
         "ab".repeat(32)
     )
@@ -176,23 +221,29 @@ fn a_status_and_a_switch_go_to_the_main_loop_and_its_answers_to_the_client() {
         let dir = scratch();
         let path = dir.path().join("c.sock");
         let (log, lines) = recording();
-        let (mut control, changes) = serving(&path, Duration::from_secs(30), &log);
+        let (mut control, changes) = serving(&path, Duration::from_secs(30), unused(), &log);
 
         let client = tokio::spawn(ask(path.clone(), b"{\"op\":\"status\"}\n".to_vec()));
         let Some(Order::Status(reply)) = control.orders.recv().await else {
             panic!("no status order");
         };
-        reply.send(control.status(false, figures())).unwrap();
-        assert_eq!(client.await.unwrap(), status_line("ready", false, true));
+        reply.send(control.status(false, false, figures())).unwrap();
+        assert_eq!(
+            client.await.unwrap(),
+            status_line("ready", false, false, true)
+        );
 
-        // A kernel that failed is not ready, and a switch under way is told.
+        // A kernel that failed is not ready, and a switch and a reading under way are told.
         changes.send_replace(state(Phase::Failed(Failure::BudgetExhausted)));
         let client = tokio::spawn(ask(path.clone(), b"{\"op\":\"status\"}\n".to_vec()));
         let Some(Order::Status(reply)) = control.orders.recv().await else {
             panic!("no status order");
         };
-        reply.send(control.status(true, figures())).unwrap();
-        assert_eq!(client.await.unwrap(), status_line("failed", true, false));
+        reply.send(control.status(true, true, figures())).unwrap();
+        assert_eq!(
+            client.await.unwrap(),
+            status_line("failed", true, true, false)
+        );
 
         // A switch is answered when the main loop says so, with the generation that serves then.
         let client = tokio::spawn(ask(path.clone(), switch_request(b'b')));
@@ -258,11 +309,20 @@ fn a_line_that_is_not_a_request_is_answered_with_a_word_and_never_reaches_the_ma
         let dir = scratch();
         let path = dir.path().join("c.sock");
         let (log, _lines) = recording();
-        let (mut control, _changes) = serving(&path, Duration::from_secs(30), &log);
+        let (mut control, _changes) = serving(&path, Duration::from_secs(30), unused(), &log);
         let upper = format!("{{\"op\":\"switch\",\"expect\":\"{}\"}}\n", "A".repeat(64));
+        let reload = |managed: &str| format!("{{\"op\":\"reload\",\"managed\":\"{managed}\"}}\n");
+        let both = format!(
+            "{{\"op\":\"reload\",\"managed\":\"{0}\",\"expect\":\"{0}\"}}\n",
+            "a".repeat(64)
+        );
+        let unknown = format!(
+            "{{\"op\":\"reload\",\"managed\":\"{}\",\"x\":1}}\n",
+            "a".repeat(64)
+        );
         let mut past_the_limit = vec![b' '; LINE_MAX];
         past_the_limit.push(b'\n');
-        let cases: [(Vec<u8>, &str); 9] = [
+        let cases: [(Vec<u8>, &str); 15] = [
             (b"not json\n".to_vec(), "malformed request"),
             (b"{\"op\":\"stop\"}\n".to_vec(), "unknown op"),
             (
@@ -283,6 +343,17 @@ fn a_line_that_is_not_a_request_is_answered_with_a_word_and_never_reaches_the_ma
                 b"{\"op\":\"switch\",\"expect\":\"abc\"}\n".to_vec(),
                 "bad expect",
             ),
+            // A reload names its version, and nothing else.
+            (b"{\"op\":\"reload\"}\n".to_vec(), "malformed request"),
+            (both.into_bytes(), "malformed request"),
+            (unknown.into_bytes(), "malformed request"),
+            (
+                format!("{{\"op\":\"status\",\"managed\":\"{}\"}}\n", "a".repeat(64)).into_bytes(),
+                "malformed request",
+            ),
+            // 64 lowercase digits, and one more or an uppercase one is not a name.
+            (reload(&"A".repeat(64)).into_bytes(), "bad managed"),
+            (reload(&"a".repeat(65)).into_bytes(), "bad managed"),
             // 4096 bytes without a line feed, and the first byte past that.
             (past_the_limit, "line too long"),
         ];
@@ -304,8 +375,11 @@ fn a_line_that_is_not_a_request_is_answered_with_a_word_and_never_reaches_the_ma
         let Some(Order::Status(reply)) = control.orders.recv().await else {
             panic!("no status order");
         };
-        reply.send(control.status(false, figures())).unwrap();
-        assert_eq!(client.await.unwrap(), status_line("ready", false, true));
+        reply.send(control.status(false, false, figures())).unwrap();
+        assert_eq!(
+            client.await.unwrap(),
+            status_line("ready", false, false, true)
+        );
     });
 }
 
@@ -315,7 +389,7 @@ fn a_fifth_connection_is_closed_and_a_switch_that_is_not_answered_in_time_is_tol
         let dir = scratch();
         let path = dir.path().join("c.sock");
         let (log, lines) = recording();
-        let (mut control, _changes) = serving(&path, Duration::from_millis(100), &log);
+        let (mut control, _changes) = serving(&path, Duration::from_millis(100), unused(), &log);
         let mut held = Vec::new();
         for _ in 0..SEATS {
             held.push(UnixStream::connect(&path).await.unwrap());
@@ -372,5 +446,139 @@ fn a_fifth_connection_is_closed_and_a_switch_that_is_not_answered_in_time_is_tol
         // The handle closes the socket and removes its file.
         drop(control);
         assert!(!path.exists());
+    });
+}
+
+fn reload_request(c: u8) -> Vec<u8> {
+    format!(
+        "{{\"op\":\"reload\",\"managed\":\"{}\"}}\n",
+        char::from(c).to_string().repeat(64)
+    )
+    .into_bytes()
+}
+
+#[test]
+fn a_reload_is_answered_when_the_main_loop_says_so_and_a_refusal_is_escaped_by_the_json_writer() {
+    runtime().block_on(async {
+        let dir = scratch();
+        let path = dir.path().join("c.sock");
+        let (log, lines) = recording();
+        let (in_force, wanted) = ([0x11; 32], [0xbb; 32]);
+        let (mut control, _changes) = serving(
+            &path,
+            Duration::from_millis(100),
+            setup(Some(in_force), Duration::from_secs(30)),
+            &log,
+        );
+        let next = setup(Some(wanted), Duration::from_secs(30));
+        let (b, c) = ("b".repeat(64), "c".repeat(64));
+
+        // The order names the version; the answer has the main file and the version in force when it is given.
+        let client = tokio::spawn(ask(path.clone(), reload_request(b'b')));
+        let Some(Order::Reload(order)) = control.orders.recv().await else {
+            panic!("no reload order");
+        };
+        assert_eq!(order.managed(), wanted);
+        control.hold_reload(order);
+        control.reload_ended(Ok(()), &next, &log);
+        assert_eq!(
+            client.await.unwrap(),
+            format!(
+                "{{\"result\":\"replaced\",\"config\":\"{}\",\"managed\":\"{b}\"}}\n",
+                "ab".repeat(32)
+            )
+        );
+
+        // A sentence is written as JSON writes a string: a quote, a backslash and a control character are escaped.
+        let client = tokio::spawn(ask(path.clone(), reload_request(b'c')));
+        let Some(Order::Reload(order)) = control.orders.recv().await else {
+            panic!("no reload order");
+        };
+        control.hold_reload(order);
+        let detail = "a \"quoted\" \\ name\u{1}";
+        let refusal = Refusal {
+            reason: Reason::Tls,
+            detail: detail.to_owned(),
+        };
+        control.reload_ended(Err(refusal), &next, &log);
+        let line = client.await.unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "{{\"result\":\"refused\",\"reason\":\"tls\",\"detail\":\"a \\\"quoted\\\" \\\\ name\\u0001\",\"managed\":\"{b}\"}}\n"
+            )
+        );
+        let read: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(read["detail"], detail);
+
+        // A reading that no order asked for (SIGHUP) answers nobody; a busy answer of the main loop has no detail and
+        // names the version in force, or `null`.
+        control.reload_ended(Ok(()), &next, &log);
+        let client = tokio::spawn(ask(path.clone(), reload_request(b'c')));
+        let Some(Order::Reload(order)) = control.orders.recv().await else {
+            panic!("no reload order");
+        };
+        order.finish(Reloaded::Busy("starting"), &unused(), &log);
+        assert_eq!(
+            client.await.unwrap(),
+            "{\"result\":\"busy\",\"reason\":\"starting\",\"managed\":null}\n"
+        );
+        assert_eq!(
+            lines.texts(),
+            [
+                format!("control: reload {b}: replaced"),
+                format!("control: reload {c}: refused (tls)"),
+                format!("control: reload {c}: busy (starting)"),
+            ]
+        );
+    });
+}
+
+#[test]
+fn a_reload_is_waited_for_as_long_as_the_setup_in_force_may_look_names_up_and_the_margin() {
+    runtime().block_on(async {
+        let dir = scratch();
+        let path = dir.path().join("c.sock");
+        let (log, lines) = recording();
+        // A switch would be told after 100 ms; a reading of this setup only after 1 ms and the margin.
+        let (mut control, _changes) = serving(
+            &path,
+            Duration::from_millis(100),
+            setup(Some([0x11; 32]), Duration::from_millis(1)),
+            &log,
+        );
+        let a = "11".repeat(32);
+        let busy = |reason: &str| {
+            format!("{{\"result\":\"busy\",\"reason\":\"{reason}\",\"managed\":\"{a}\"}}\n")
+        };
+        let started = tokio::time::Instant::now();
+        let client = tokio::spawn(ask(path.clone(), reload_request(b'b')));
+        let Some(Order::Reload(order)) = control.orders.recv().await else {
+            panic!("no reload order");
+        };
+        assert_eq!(client.await.unwrap(), busy("reload under way"));
+        let waited = started.elapsed();
+        assert!(
+            waited >= SWITCH_MARGIN && waited < SWITCH_MARGIN + Duration::from_secs(10),
+            "waited {waited:?}"
+        );
+        // The order ends later: it gets its second line, and nobody reads the answer.
+        order.finish(Reloaded::Replaced, &unused(), &log);
+        // An order that is dropped without an answer is the stop.
+        let client = tokio::spawn(ask(path.clone(), reload_request(b'b')));
+        let Some(Order::Reload(order)) = control.orders.recv().await else {
+            panic!("no reload order");
+        };
+        drop(order);
+        assert_eq!(client.await.unwrap(), busy("stopping"));
+        let b = "b".repeat(64);
+        assert_eq!(
+            lines.texts(),
+            [
+                format!("control: reload {b}: busy (reload under way)"),
+                format!("control: reload {b}: replaced"),
+                format!("control: reload {b}: busy (stopping)"),
+            ]
+        );
     });
 }

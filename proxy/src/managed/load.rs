@@ -9,7 +9,8 @@
 //! read with the other certificates (see `inbound::transport::tls`).
 //!
 //! The proxy starts with the version that `current` names, and so do `config check` and the reading of SIGHUP: with
-//! no version chosen, or one that is refused, the proxy does not start, and SIGHUP changes nothing. `managed activate`
+//! no version chosen, or one that is refused, the proxy does not start, and SIGHUP changes nothing. A reload order of
+//! the control socket reads the version it names, and one that is refused changes nothing either. `managed activate`
 //! reads the version it is to choose, and `managed import` the version it is to make.
 
 use std::path::{Path, PathBuf};

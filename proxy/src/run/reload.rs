@@ -1,8 +1,8 @@
 //! SIGUSR1 and SIGUSR2: the switch to the generation that the rules store chooses now, and the reading of the
 //! certificate and key files again. The orders of the control socket are carried out here too: a status is
-//! answered, and a switch is the switch of SIGUSR1 once the store chooses the generation that the order expects.
-//! SIGHUP, the reading of the configuration file again, is in `config`, with the values that it may not change in
-//! `fixed`.
+//! answered, a switch is the switch of SIGUSR1 once the store chooses the generation that the order expects, and a
+//! reload is the reading of SIGHUP with the managed version that the order names. SIGHUP, the reading of the
+//! configuration file again, is in `config`, with the values that it may not change in `fixed`.
 
 mod config;
 mod fixed;
@@ -22,6 +22,7 @@ use crate::rules::bundle::Fingerprint;
 use crate::rules::switch::{Next, Switcher};
 
 pub(super) use config::Reloader;
+use config::reload_while_starting;
 pub(super) use fixed::Fixed;
 
 /// What a try to switch came to.
@@ -122,16 +123,19 @@ fn begin(
 }
 
 /// An order of the control socket while the proxy serves. A status is answered at once. A switch that the driver
-/// has taken is answered when the driver answers (`Control::switch_ended`); every other case is answered here.
+/// has taken is answered when the driver answers (`Control::switch_ended`); every other case is answered here. A
+/// reload order goes to `reloader` (`Reloader::order`), and is answered when its reading ends.
 pub(super) fn control_order(
     order: Order,
     waits: &mut Waits,
     switcher: &mut Switcher,
+    reloader: &Reloader,
     ingress: &SyncSender<Msg>,
     shared: &Shared,
 ) {
     let switch = match order {
         Order::Status(reply) => return answer_status(waits, shared, reply),
+        Order::Reload(order) => return reloader.order(order, waits, shared),
         Order::Switch(switch) => switch,
     };
     let serving = switcher.running();
@@ -159,7 +163,8 @@ pub(super) fn control_order(
     switch.finish(outcome, Some(reason), serving, &shared.log);
 }
 
-/// An order of the control socket before the listeners are bound: a status is answered, and a switch is not done.
+/// An order of the control socket before the listeners are bound: a status is answered, and neither a switch nor a
+/// reload is done.
 pub(super) fn control_while_starting(
     order: Order,
     waits: &Waits,
@@ -176,17 +181,22 @@ pub(super) fn control_while_starting(
                 &shared.log,
             );
         }
+        Order::Reload(order) => reload_while_starting(order, shared),
     }
 }
 
 fn answer_status(waits: &Waits, shared: &Shared, reply: oneshot::Sender<Answer>) {
     if let Some(control) = &waits.control {
-        let _ = reply.send(control.status(waits.switch.is_some(), figures(shared)));
+        let _ = reply.send(control.status(
+            waits.switch.is_some(),
+            waits.config.is_some(),
+            figures(shared),
+        ));
     }
 }
 
 /// The figures of a status answer, read where `/metrics` reads them: the counters of the process and the upstream
-/// groups and the SHA-256 of the configuration in force.
+/// groups, and the SHA-256, the managed version and the `resolve_timeout` of the configuration in force.
 fn figures(shared: &Shared) -> Figures {
     let counters = &shared.counters;
     let setup = shared.setup.current();
@@ -201,6 +211,7 @@ fn figures(shared: &Shared) -> Figures {
             .fold(0, |sum, (_, failures)| sum.saturating_add(failures)),
         config: setup.sha256,
         managed: setup.managed,
+        resolve_timeout_ms: u64::try_from(setup.resolve_timeout.as_millis()).unwrap_or(u64::MAX),
         config_replaced: counters.config_reloaded(ReloadResult::Replaced),
         config_refused: counters.config_reloaded(ReloadResult::Refused),
     }

@@ -6,6 +6,7 @@
 //! place of the old one, which is retired: the connections that hold it wind down after the request they serve.
 
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
 
 use tokio::sync::{Semaphore, watch};
 
@@ -37,11 +38,12 @@ pub struct Shared {
     pub setup: SharedSetup,
 }
 
-/// What a configuration makes for the connections: the configuration, the SHA-256 of its file, the upstream groups with
-/// the routes to them and the connections that wait to be used again, the TLS of the listeners that end it, the answer
-/// to the challenge of the CA, if the configuration has `acme`, the networks and countries that may not use the proxy
-/// at all, the country database if some list of countries needs one, the rate limit if the configuration has one, and
-/// what a route does with a request whose record cannot be kept when it does not say (`records.keep`). It is not
+/// What a configuration makes for the connections: the configuration, the SHA-256 of its file, the time the lookup of
+/// the names of its servers could take, the upstream groups with the routes to them and the connections that wait to be
+/// used again, the TLS of the listeners that end it, the answer to the challenge of the CA, if the configuration has
+/// `acme`, the networks and countries that may not use the proxy at all, the country database if some list of
+/// countries needs one, the rate limit if the configuration has one, and what a route does with a request whose record
+/// cannot be kept when it does not say (`records.keep`). It is not
 /// changed once it is made, except that it can be retired, once, and that SIGUSR2 replaces the certificates in its
 /// `tls` (`Tls::reload`).
 pub struct Setup {
@@ -50,6 +52,9 @@ pub struct Setup {
     pub sha256: [u8; 32],
     /// The name of the managed version it was made with, for a file with `managed` (see `with_managed`).
     pub managed: Option<[u8; 32]>,
+    /// The `forward.resolve_timeout_ms` of the file: what a reload order of the control socket waits for, with a
+    /// margin, while this setup is in force.
+    pub resolve_timeout: Duration,
     pub upstreams: Upstreams,
     pub tls: Tls,
     pub challenge: Option<Challenge>,
@@ -87,6 +92,7 @@ impl Setup {
             cfg,
             sha256,
             managed: None,
+            resolve_timeout: forward.resolve_timeout,
             tls,
             challenge,
             access: policy.access,

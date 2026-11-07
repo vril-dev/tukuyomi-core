@@ -11,7 +11,8 @@
 //! of the hosts of the certificates with `acme` (the same comparison as the one for the hosts of a certificate: case
 //! ignored, a port and a trailing dot left out). Those certificates are the ones of the whole configuration that the
 //! proxy serves with: of the TLS listeners, of `admin.route` and of the sites of the managed version, so a new version
-//! read at SIGHUP changes the hosts, and the hosts of a site that is no longer in it are not answered for. The
+//! read at SIGHUP or for a reload order of the control socket changes the hosts, and the hosts of a site that is no
+//! longer in it are not answered for. The
 //! `access` of `admin.route` does not apply here: the CA asks from any address, and nothing but the file of a token
 //! that `acme renew` puts there for an order is answered with. The answer is the content of the file, with `200` and
 //! `Content-Type: text/plain`, if it is a regular file of at most 1 KiB, else `404`. A link is never followed: the

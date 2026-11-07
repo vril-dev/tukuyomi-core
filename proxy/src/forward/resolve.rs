@@ -2,7 +2,8 @@
 //! name of a server becomes its addresses.
 //!
 //! The names are looked up here each time the file is read, and not between, so a name that comes to have other
-//! addresses later is not followed until the file is read again (at the next start, or at SIGHUP). One thread looks
+//! addresses later is not followed until the file is read again (at the next start, at SIGHUP, or for a reload order
+//! of the control socket). One thread looks
 //! the names up, one after the other, in the order of the file, and a name with a port that is written more than once
 //! is looked up once. The caller waits for all of them until one deadline, `resolve_timeout` after the call. A lookup
 //! of the system cannot be stopped, so when the deadline passes the thread is left to end by itself, and the file is
@@ -289,6 +290,7 @@ where
     }
     Ok(Completed {
         forward: ForwardConfig {
+            resolve_timeout,
             groups: done,
             routes,
             default,

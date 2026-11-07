@@ -1,4 +1,5 @@
-//! SIGHUP: the configuration file read again.
+//! SIGHUP and the reload order of the control socket: the configuration file read again, with the managed version
+//! that the managed store chooses (SIGHUP) or with the one that the order names.
 //!
 //! The steps before the rules store (`start::read_parts`, which the start takes too) run on a thread of their own,
 //! for the lookup of the names of the upstream servers and the country database take time that the main loop does not
@@ -9,6 +10,13 @@
 //! leaves everything as it is. The listeners of the addresses that are gone are closed, and the old setup is retired:
 //! the connections that hold it wind down after the request they serve, and the ones that are idle end. The rules store
 //! is not read, so the generation that serves stays as it is.
+//!
+//! One reading is under way at a time, of either: SIGHUP while one is under way is a line, and a reload order then is
+//! answered `busy` (`reload under way`). A reload order for a configuration without `managed` is refused
+//! (`unmanaged`) before that, and starts nothing: `managed` cannot come or go while the proxy runs, so the reading
+//! could only be refused. The order is answered when its reading has ended (`Control::reload_ended`), with the part
+//! that refused and the sentence of its line when it was refused anywhere, the thread and the main loop alike. A
+//! reading of either kind is counted, and an order that started none is not.
 
 use std::path::PathBuf;
 use std::thread;
@@ -20,11 +28,12 @@ use crate::config::{Keep, addresses};
 use crate::inbound::conn::{Setup, Shared};
 use crate::inbound::transport::accept::Acceptor;
 use crate::log::Log;
-use crate::log::counters::{Counters, ReloadResult};
+use crate::log::counters::ReloadResult;
 use crate::managed::Choice;
 use crate::rules::bundle::hex;
+use crate::run::control::{ReloadOrder, Reloaded};
 use crate::run::signals::Waits;
-use crate::run::start::{Parts, read_parts};
+use crate::run::start::{Parts, Reason, Refusal, read_parts};
 
 /// The reading of the configuration file again: where the file is, the values that do not change while the proxy runs,
 /// and whether SIGUSR2 came while a reading was under way.
@@ -47,59 +56,96 @@ impl Reloader {
 
     /// SIGHUP: starts the thread that reads the file, unless one is at work already. The answer comes as
     /// `Event::Configured`. Every other case is a record line, and the proxy goes on as it is.
-    pub(in crate::run) fn hangup(&self, waits: &mut Waits, counters: &Counters, log: &Log) {
-        log.line("reload: SIGHUP");
+    pub(in crate::run) fn hangup(&self, waits: &mut Waits, shared: &Shared) {
+        shared.log.line("reload: SIGHUP");
         if waits.config.is_some() {
-            log.line("reload: a configuration reload is in progress, ignored");
+            shared
+                .log
+                .line("reload: a configuration reload is in progress, ignored");
             return;
         }
-        let (reply, told) = oneshot::channel();
-        let (path, thread_log) = (self.path.clone(), log.clone());
-        let spawned = thread::Builder::new().name("reload".into()).spawn(move || {
-            let reading = read_parts(&path, &Choice::Current, "reload", &thread_log);
-            let _ = reply.send(reading.ok().map(Box::new));
-        });
-        match spawned {
-            Ok(_) => waits.config = Some(told),
-            Err(_) => {
-                counters.add_config_reload(ReloadResult::Refused);
-                log.line("reload: configuration refused: the reload thread cannot be started");
+        // A thread that cannot be started is counted and on a line, and SIGHUP has nobody else to tell.
+        let _ = self.read(Choice::Current, waits, shared);
+    }
+
+    /// A reload order of the control socket: the reading of SIGHUP, with the version that the order names, unless the
+    /// configuration in force has no `managed` (refused at once) or a reading is under way (`busy`). Once the thread
+    /// is started the order waits in the control socket for the end of the reading.
+    pub(in crate::run) fn order(&self, order: ReloadOrder, waits: &mut Waits, shared: &Shared) {
+        let setup = shared.setup.current();
+        let Some(order) = managed_only(order, &setup, &shared.log) else {
+            return;
+        };
+        if waits.config.is_some() {
+            order.finish(Reloaded::Busy("reload under way"), &setup, &shared.log);
+            return;
+        }
+        let name = order.managed();
+        shared
+            .log
+            .line(&format!("reload: control reload {}", hex(&name)));
+        match self.read(Choice::Named(name), waits, shared) {
+            Ok(()) => {
+                if let Some(control) = waits.control.as_mut() {
+                    control.hold_reload(order);
+                }
             }
+            Err(refusal) => order.finish(Reloaded::Refused(refusal), &setup, &shared.log),
         }
     }
 
-    /// The answer of the thread: `None` if it refused the file and said why. Otherwise the parts replace those of the
-    /// setup that is current, and the listeners of the accept side follow them, if no value that cannot change differs
-    /// and every address that is new can be bound.
+    /// Starts the thread that reads the file with the version of `choice`; its answer comes as `Event::Configured`. A
+    /// thread that cannot be started is a refusal of the reading.
+    fn read(&self, choice: Choice, waits: &mut Waits, shared: &Shared) -> Result<(), Refusal> {
+        let (reply, told) = oneshot::channel();
+        let (path, thread_log) = (self.path.clone(), shared.log.clone());
+        let spawned = thread::Builder::new().name("reload".into()).spawn(move || {
+            let reading = read_parts(&path, &choice, "reload", &thread_log);
+            let _ = reply.send(reading.map(Box::new));
+        });
+        match spawned {
+            Ok(_) => {
+                waits.config = Some(told);
+                Ok(())
+            }
+            Err(_) => Err(refused(
+                shared,
+                Reason::Thread,
+                "the reload thread cannot be started",
+            )),
+        }
+    }
+
+    /// The answer of the thread: why it refused the file, which it has said on a line, or the parts that replace those
+    /// of the setup that is current, and the listeners of the accept side follow them, if no value that cannot change
+    /// differs and every address that is new can be bound.
     pub(in crate::run) async fn answered(
         &mut self,
-        parts: Option<Box<Parts>>,
+        parts: Result<Box<Parts>, Refusal>,
         waits: &mut Waits,
         shared: &Shared,
     ) {
-        match (parts, waits.accept.as_mut()) {
-            (Some(parts), Some(acceptor)) => self.replace(*parts, acceptor, shared).await,
+        let reading = match (parts, waits.accept.as_mut()) {
+            (Ok(parts), Some(acceptor)) => self.replace(*parts, acceptor, shared).await,
             // The thread is only started once the listeners are bound, so this cannot be; the file is refused all the
             // same.
-            (Some(_), None) => {
+            (Ok(_), None) => Err(refused(
+                shared,
+                Reason::Listener,
+                "the listeners are not bound yet",
+            )),
+            (Err(refusal), _) => {
                 shared.counters.add_config_reload(ReloadResult::Refused);
-                shared
-                    .log
-                    .line("reload: configuration refused: the listeners are not bound yet");
+                Err(refusal)
             }
-            // The thread refused the file and said why.
-            (None, _) => shared.counters.add_config_reload(ReloadResult::Refused),
-        }
-        self.ended(shared);
+        };
+        self.ended(reading, waits, shared);
     }
 
     /// The thread ended without an answer.
-    pub(in crate::run) fn unanswered(&mut self, shared: &Shared) {
-        shared.counters.add_config_reload(ReloadResult::Refused);
-        shared
-            .log
-            .line("reload: configuration refused: the reload thread gave no answer");
-        self.ended(shared);
+    pub(in crate::run) fn unanswered(&mut self, waits: &mut Waits, shared: &Shared) {
+        let refusal = refused(shared, Reason::Thread, "the reload thread gave no answer");
+        self.ended(Err(refusal), waits, shared);
     }
 
     /// SIGUSR2: reads the certificates now, or, while the file is being read again, when that has ended: the parts
@@ -117,24 +163,28 @@ impl Reloader {
     /// put in the order of the file in the same step, so a connection that is accepted from then on is numbered by the
     /// listeners of the setup it takes. The listeners of the addresses that are gone are closed, and the old setup is
     /// retired.
-    async fn replace(&self, parts: Parts, acceptor: &mut Acceptor, shared: &Shared) {
+    async fn replace(
+        &self,
+        parts: Parts,
+        acceptor: &mut Acceptor,
+        shared: &Shared,
+    ) -> Result<(), Refusal> {
         if let Some(key) = self.fixed.first_difference(&parts.fixed) {
-            shared.counters.add_config_reload(ReloadResult::Refused);
-            shared.log.line(&format!(
-                "reload: configuration refused: {key} cannot change while running"
+            return Err(refused(
+                shared,
+                Reason::Fixed,
+                &format!("{key} cannot change while running"),
             ));
-            return;
         }
         let listening = addresses(&parts.proxy.listeners);
         let bound = match acceptor.bind_new(&listening).await {
             Ok(bound) => bound,
             Err(at) => {
-                shared.counters.add_config_reload(ReloadResult::Refused);
-                shared.log.line(&format!(
-                    "reload: configuration refused: listener {} cannot be bound",
-                    at + 1
+                return Err(refused(
+                    shared,
+                    Reason::Listener,
+                    &format!("listener {} cannot be bound", at + 1),
                 ));
-                return;
             }
         };
         let keep = parts
@@ -172,13 +222,51 @@ impl Reloader {
             "reload: configuration replaced {}{managed}",
             hex(&parts.sha256)
         ));
+        Ok(())
     }
 
-    /// The reading has ended, replaced or not: a SIGUSR2 that came meanwhile reads the certificates of the setup that
-    /// is current now.
-    fn ended(&mut self, shared: &Shared) {
+    /// The reading has ended, replaced or not: the reload order that asked for it, if there is one, gets its answer,
+    /// and a SIGUSR2 that came meanwhile reads the certificates of the setup that is current now.
+    fn ended(&mut self, reading: Result<(), Refusal>, waits: &mut Waits, shared: &Shared) {
+        if let Some(control) = waits.control.as_mut() {
+            control.reload_ended(reading, &shared.setup.current(), &shared.log);
+        }
         if std::mem::take(&mut self.certificates) {
             reload_certificates(shared, &shared.setup.current());
         }
+    }
+}
+
+/// A reload order before the listeners are bound: refused if the configuration in force has no `managed`, else
+/// `busy` (`starting`).
+pub(in crate::run) fn reload_while_starting(order: ReloadOrder, shared: &Shared) {
+    let setup = shared.setup.current();
+    if let Some(order) = managed_only(order, &setup, &shared.log) {
+        order.finish(Reloaded::Busy("starting"), &setup, &shared.log);
+    }
+}
+
+/// The order, if `setup`, the setup in force, has `managed`; else the order is refused (`unmanaged`) here.
+fn managed_only(order: ReloadOrder, setup: &Setup, log: &Log) -> Option<ReloadOrder> {
+    if setup.managed.is_some() {
+        return Some(order);
+    }
+    let refusal = Refusal {
+        reason: Reason::Unmanaged,
+        detail: "the configuration in force has no managed object".to_owned(),
+    };
+    order.finish(Reloaded::Refused(refusal), setup, log);
+    None
+}
+
+/// A refusal of the main loop: counted, and on its line, `reload: configuration refused: <detail>`.
+fn refused(shared: &Shared, reason: Reason, detail: &str) -> Refusal {
+    shared.counters.add_config_reload(ReloadResult::Refused);
+    shared
+        .log
+        .line(&format!("reload: configuration refused: {detail}"));
+    Refusal {
+        reason,
+        detail: detail.to_owned(),
     }
 }

@@ -152,6 +152,7 @@ pub(super) async fn run(
             state.clone(),
             readiness.clone(),
             switch_wait,
+            shared.setup.clone(),
             log.clone(),
         ));
     }
@@ -245,12 +246,14 @@ async fn until_stop(
             Event::AcceptErr(Some(errno)) => log.line(&format!("accept: failed, errno {errno}")),
             Event::AcceptErr(None) => log.line("accept: failed"),
             Event::Joined(done) => note_joined(done, log),
-            Event::Configuration => reloader.hangup(waits, &shared.counters, log),
+            Event::Configuration => reloader.hangup(waits, shared),
             Event::Configured(parts) => reloader.answered(parts, waits, shared).await,
-            Event::ConfigurationLost => reloader.unanswered(shared),
+            Event::ConfigurationLost => reloader.unanswered(waits, shared),
             Event::Reload => reload(waits, switcher, ingress, &shared.counters, log),
             Event::Certificates => reloader.certificates(waits, shared),
-            Event::Control(order) => control_order(order, waits, switcher, ingress, shared),
+            Event::Control(order) => {
+                control_order(order, waits, switcher, reloader, ingress, shared);
+            }
             Event::Switched(switched) => {
                 shared.counters.add_switch(if switched {
                     SwitchResult::Switched

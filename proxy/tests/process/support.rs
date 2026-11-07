@@ -907,16 +907,21 @@ pub(crate) fn managed(root: &Path, command: &str, rest: &[&str]) -> (Option<i32>
     )
 }
 
-/// Imports `document` into the managed store of the test root `root` and chooses the version: the name of the version.
-pub(crate) fn import_and_activate(root: &Path, document: &Value) -> String {
+/// Imports `document` into the managed store of the test root `root` as a version that is not there yet, and does not
+/// choose it: the name of the version.
+pub(crate) fn import(root: &Path, document: &Value) -> String {
     let path = root.join(DOCUMENT);
     fs::write(&path, document.to_string()).expect("write the document");
     let (code, out, err) = managed(root, "import", &[&path.to_string_lossy()]);
     assert_eq!(code, Some(0), "{err}");
-    let name = out
-        .strip_suffix(" created\n")
+    out.strip_suffix(" created\n")
         .unwrap_or_else(|| panic!("unexpected output {out:?}"))
-        .to_owned();
+        .to_owned()
+}
+
+/// Imports `document` into the managed store of the test root `root` and chooses the version: the name of the version.
+pub(crate) fn import_and_activate(root: &Path, document: &Value) -> String {
+    let name = import(root, document);
     let (code, out, err) = managed(root, "activate", &[&name]);
     assert_eq!((code, out), (Some(0), format!("{name} current\n")), "{err}");
     name

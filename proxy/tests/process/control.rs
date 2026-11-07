@@ -70,7 +70,7 @@ fn status(root: &Path) -> Value {
 }
 
 /// What a status answer says of what the proxy is doing: the answer without its figures, which are looked at here. No
-/// test here sends SIGHUP, so no reading of the configuration file again has ended: both counts are 0.
+/// test here sends SIGHUP, so no reading of the configuration file again has ended or is under way: both counts are 0.
 fn state(mut answer: Value) -> Value {
     let fields = answer.as_object_mut().expect("the answer is an object");
     for key in [
@@ -96,6 +96,11 @@ fn state(mut answer: Value) -> Value {
     );
     // A configuration without `managed` has no managed version.
     assert_eq!(fields.remove("managed"), Some(Value::Null));
+    assert_eq!(fields.remove("reloading"), Some(Value::Bool(false)));
+    assert_eq!(
+        fields.remove("resolve_timeout_ms"),
+        Some(json!(RESOLVE_TIMEOUT_MS))
+    );
     let reloads = fields
         .remove("config_reloads")
         .expect("config_reloads is missing");
@@ -232,6 +237,20 @@ fn the_control_socket_has_mode_0600_and_switches_only_to_the_generation_that_is_
         json!({"result": "unchanged", "reason": "already serving", "generation": second})
     );
     assert_eq!(switch(&root, &first), changed(&second));
+    // A configuration without `managed` refuses a reload order before it reads anything: nothing is counted.
+    let name = "a".repeat(64);
+    assert_eq!(
+        ask(
+            &root,
+            &format!("{{\"op\":\"reload\",\"managed\":\"{name}\"}}\n")
+        ),
+        json!({"result": "refused", "reason": "unmanaged", "detail": "the configuration in force has no managed object", "managed": null})
+    );
+    assert_eq!(state(status(&root)), running(&second));
+    let line = format!("control: reload {name}: refused (unmanaged)");
+    proxy
+        .records
+        .wait_lines("the record of the reload order", 1, |l| l == line);
     // The figures count what the proxy has answered: four requests, one of them blocked by a rule.
     let deadline = Instant::now() + MARGIN;
     loop {

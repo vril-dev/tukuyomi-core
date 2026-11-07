@@ -5,17 +5,23 @@
 //! that a request can come from another address by its `X-Forwarded-For`.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::Request;
 use http_body_util::Full;
 use serde_json::{Value, json};
-use tukuyomi_proxy::rules::bundle::{hex, sha256};
+use tukuyomi_proxy::admin::waf::control::Control;
+use tukuyomi_proxy::managed::Store;
+use tukuyomi_proxy::managed::apply::{Outcome, apply};
+use tukuyomi_proxy::rules::bundle::{Fingerprint, hex, sha256};
 
 use crate::http2::Client;
 use crate::support::*;
@@ -117,15 +123,35 @@ fn shown(path: &Path) -> Vec<u8> {
     CertificateDer::from_pem_file(path).unwrap().to_vec()
 }
 
-/// The one line of the answer of the control socket in `root` to a status question.
-fn status(root: &Path) -> Value {
+/// Sends `request` to the control socket in `root` and reads the one line of the answer, until the proxy closes. A
+/// reading of the configuration may take the time of the lookup of the names and a margin.
+fn ask(root: &Path, request: &str) -> Value {
     let mut sock = std::os::unix::net::UnixStream::connect(socket(root))
         .expect("connect to the control socket");
-    sock.set_read_timeout(Some(MARGIN)).unwrap();
-    sock.write_all(b"{\"op\":\"status\"}\n").unwrap();
+    sock.set_read_timeout(Some(MARGIN * 6)).unwrap();
+    sock.write_all(request.as_bytes()).unwrap();
     let mut out = String::new();
     sock.read_to_string(&mut out).unwrap();
+    assert_eq!(out.matches('\n').count(), 1, "answer: {out:?}");
     serde_json::from_str(&out).expect("a line of JSON")
+}
+
+/// The answer of the control socket in `root` to a status question.
+fn status(root: &Path) -> Value {
+    ask(root, "{\"op\":\"status\"}\n")
+}
+
+/// The answer of the control socket in `root` to a reload order for the version `name`.
+fn reload(root: &Path, name: &str) -> Value {
+    ask(
+        root,
+        &format!("{{\"op\":\"reload\",\"managed\":\"{name}\"}}\n"),
+    )
+}
+
+/// The document that the version of the test root `root` was last imported from.
+fn document(root: &Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(root.join(DOCUMENT)).unwrap()).unwrap()
 }
 
 /// Stops the proxy and leaves its root as `finish` wants it: the store of the version and the document go, and so
@@ -324,6 +350,285 @@ fn sighup_takes_the_chosen_version_and_a_version_that_activate_refuses_is_not_ch
     assert_eq!(current.len(), 1);
     assert!(current[0].starts_with(&name), "{listed}");
     finish(proxy, 1);
+}
+
+// ---- the reload order of the control socket ----
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_reload_order_replaces_the_configuration_with_the_version_it_names_and_leaves_current_as_it_is()
+{
+    let mut pki = Pki::new("managed_order");
+    let admin = pki.issue("admin", &["admin.a.example"]);
+    let mut first = String::new();
+    let proxy = Proxy::start_with("mng_order", knobs(), |root| {
+        first = manage(root, |main, document| {
+            with_admin(root, main, document, &admin);
+        });
+    });
+    let root = proxy.root().to_path_buf();
+    assert_eq!(exchange(proxy.port, &get("/x")).status(), 200);
+    assert_eq!(proxy.upstream.requests().len(), 1);
+
+    // A second version sends every request to `other`. It is made and not chosen; the order names it.
+    let mut second = document(&root);
+    second["default_upstream"] = json!("other");
+    let name = import(&root, &second);
+    let config = hex(&sha256(&fs::read(root.join("config.json")).unwrap()));
+    assert_eq!(
+        reload(&root, &name),
+        json!({"result": "replaced", "config": config, "managed": name})
+    );
+    for line in [
+        format!("reload: control reload {name}"),
+        format!("reload: configuration replaced {config} managed {name}"),
+        format!("control: reload {name}: replaced"),
+    ] {
+        proxy.records.wait_lines(&line, 1, |l| l == line);
+    }
+    // The next connection takes it, and the status names it.
+    assert_eq!(exchange(proxy.port, &get("/x")).status(), 200);
+    assert_eq!(proxy.others[1].requests().len(), 1);
+    let answer = status(&root);
+    assert_eq!(
+        [
+            &answer["managed"],
+            &answer["config_reloads"],
+            &answer["reloading"],
+            &answer["resolve_timeout_ms"]
+        ],
+        [
+            &json!(name),
+            &json!({"replaced": 1, "refused": 0}),
+            &json!(false),
+            &json!(RESOLVE_TIMEOUT_MS)
+        ]
+    );
+    // The proxy does not write the store: `current` names the first version still.
+    let (_, listed, _) = managed(&root, "list", &[]);
+    let current: Vec<&str> = listed
+        .lines()
+        .filter(|line| line.ends_with(" current"))
+        .collect();
+    assert_eq!(current.len(), 1, "{listed}");
+    assert!(current[0].starts_with(&first), "{listed}");
+    finish(proxy, 1);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_version_that_the_reading_refuses_is_answered_with_the_part_and_its_sentence_and_nothing_is_replaced()
+ {
+    let mut pki = Pki::new("managed_refused");
+    let site_a = pki.issue("a", &["a.example"]);
+    let site_b = pki.issue("b", &["b.example"]);
+    let site_c = pki.issue("c", &["c.example"]);
+    let admin = pki.issue("admin", &["admin.a.example"]);
+    let tls_port = free_port();
+    let mut first = String::new();
+    let proxy = Proxy::start_with("mng_refused", knobs(), |root| {
+        first = manage(root, |main, document| {
+            let listeners = main["proxy"]["listeners"].as_array_mut().unwrap();
+            listeners.push(tls_listener(tls_port, false));
+            document["sites"] = json!([
+                {"name": "a", "hosts": ["a.example"], "certificate": {"chain_file": site_a.0, "key_file": site_a.1}},
+                {"name": "b", "hosts": ["b.example"], "certificate": {"chain_file": site_b.0, "key_file": site_b.1}},
+            ]);
+            with_admin(root, main, document, &admin);
+        });
+    });
+    let root = proxy.root().to_path_buf();
+    let store = root.join(MANAGED);
+    let refused = |reason: &str, detail: &str| json!({"result": "refused", "reason": reason, "detail": detail, "managed": first});
+
+    // A version whose site has the key of the other site: the sentence names the site, as the line does.
+    let path = store.join("versions").join(format!("{first}.json"));
+    let mut swapped: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    swapped["sites"][0]["certificate"]["key"] = swapped["sites"][1]["certificate"]["key"].clone();
+    let bytes = serde_json::to_vec(&swapped).unwrap();
+    let name = hex(&sha256(&bytes));
+    fs::write(store.join("versions").join(format!("{name}.json")), &bytes).unwrap();
+    let detail = "a certificate and a private key are not a pair (site a)";
+    assert_eq!(reload(&root, &name), refused("tls", detail));
+    let line = format!("reload: tls refused: {detail}");
+    proxy.records.wait_lines(&line, 1, |l| l == line);
+
+    // A version that names a file whose bytes are not what its name says.
+    let mut third = document(&root);
+    third["sites"].as_array_mut().unwrap().push(json!(
+        {"name": "c", "hosts": ["c.example"], "certificate": {"chain_file": site_c.0, "key_file": site_c.1}}
+    ));
+    let name = import(&root, &third);
+    let chain = hex(&sha256(&fs::read(&site_c.0).unwrap()));
+    fs::write(
+        store.join("files").join(chain),
+        fs::read(&site_b.0).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        reload(&root, &name),
+        refused("store", "a managed file does not match its name")
+    );
+
+    // A main file with another value that cannot change while the proxy runs, with the version in force.
+    let config = root.join("config.json");
+    let original = fs::read(&config).unwrap();
+    let mut main: Value = serde_json::from_slice(&original).unwrap();
+    main["proxy"]["max_conns"] = json!(main["proxy"]["max_conns"].as_u64().unwrap() + 1);
+    fs::write(&config, main.to_string()).unwrap();
+    assert_eq!(
+        reload(&root, &first),
+        refused("fixed", "proxy.max_conns cannot change while running")
+    );
+    fs::write(&config, &original).unwrap();
+
+    // Nothing was replaced: the first version serves, and each reading is counted as refused.
+    let answer = status(&root);
+    assert_eq!(
+        [&answer["managed"], &answer["config_reloads"]],
+        [&json!(first), &json!({"replaced": 0, "refused": 3})]
+    );
+    let (answer, cert) = over_tls(
+        &pki,
+        tls_port,
+        "a.example",
+        &request("a.example", "192.0.2.1"),
+    );
+    assert_eq!((answer.status(), cert), (200, shown(&site_a.0)));
+    finish(proxy, 1);
+}
+
+// ---- the order of the admin process ----
+
+/// Starts the proxy of the test root `root` again with its configuration, as the service manager does after a stop,
+/// asks `/x` at `port` once it listens, and stops it: the texts of its records, the status of the answer (`None` if it
+/// did not listen in time or did not answer) and its exit code. It is killed if it does not listen in time.
+fn start_again(root: &Path, port: u16) -> (Vec<String>, Option<u16>, Option<i32>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tukuyomi-proxy"))
+        .arg(root.join("config.json"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env_remove("NOTIFY_SOCKET")
+        .spawn()
+        .expect("start the proxy again");
+    let stderr = child.stderr.take().expect("the stderr is piped");
+    let (send, texts) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let record: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+            let text = record["line"].as_str().map_or(line.clone(), str::to_owned);
+            if send.send(text).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + 3 * MARGIN;
+    let mut lines = Vec::new();
+    let listening = loop {
+        match texts.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(text) => {
+                let done = text == "start: listening";
+                lines.push(text);
+                if done {
+                    break true;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    let answered = listening
+        .then(|| std::panic::catch_unwind(|| exchange(port, &get("/x")).status()).ok())
+        .flatten();
+    if listening {
+        run_kill("TERM", child.id());
+    } else {
+        // It may have ended by itself already.
+        let _ = child.kill();
+    }
+    let code = child.wait().expect("wait for the proxy").code();
+    reader.join().expect("the reader ends");
+    lines.extend(texts.try_iter());
+    (lines, answered, code)
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn the_order_of_the_admin_process_chooses_a_version_only_once_the_proxy_has_taken_it() {
+    let mut pki = Pki::new("managed_apply");
+    let admin = pki.issue("admin", &["admin.a.example"]);
+    let mut first = String::new();
+    let mut proxy = Proxy::start_with("mng_apply", knobs(), |root| {
+        first = manage(root, |main, document| {
+            with_admin(root, main, document, &admin);
+        });
+    });
+    let root = proxy.root().to_path_buf();
+    let original = document(&root);
+    let digits = |text: &str| Fingerprint::from_hex(text.as_bytes()).unwrap().bytes();
+    let store = Store::open(&root.join(MANAGED)).expect("open the store");
+    let control = Control::new(&socket(&root), Duration::from_secs(20));
+    let lookup = Duration::from_millis(RESOLVE_TIMEOUT_MS);
+    let config = sha256(&fs::read(root.join("config.json")).unwrap());
+
+    // A version whose server has a name that cannot be looked up: the proxy refuses it, and the store goes on choosing
+    // the first.
+    let mut refused = original.clone();
+    refused["upstreams"]["other"]["servers"] = json!([server("nowhere.invalid:80")]);
+    let name = import(&root, &refused);
+    let ended = apply(
+        &store,
+        &control,
+        digits(&first),
+        digits(&name),
+        lookup,
+        |_| Ok::<(), ()>(()),
+    );
+    assert!(
+        matches!(
+            &ended,
+            Outcome::Refused {
+                reason: "upstream",
+                ..
+            }
+        ),
+        "{ended:?}"
+    );
+    assert_eq!(store.current(), Ok(Some(digits(&first))));
+    assert_eq!(exchange(proxy.port, &get("/x")).status(), 200);
+    assert_eq!(proxy.upstream.requests().len(), 1);
+
+    // A version that sends every request to `other`: the proxy takes it, and then the store chooses it.
+    let mut second = original;
+    second["default_upstream"] = json!("other");
+    let to = import(&root, &second);
+    assert_eq!(
+        apply(
+            &store,
+            &control,
+            digits(&first),
+            digits(&to),
+            lookup,
+            |_| Ok::<(), ()>(())
+        ),
+        Outcome::Applied {
+            before: Some(config),
+            after: Some(config)
+        }
+    );
+    assert_eq!(store.current(), Ok(Some(digits(&to))));
+    assert_eq!(exchange(proxy.port, &get("/x")).status(), 200);
+    assert_eq!(proxy.others[1].requests().len(), 1);
+
+    // Stopped and started again, the proxy comes up with the version that the store chooses.
+    let since = proxy.term();
+    let (status, _) = proxy.wait_exit(since, 3 * MARGIN);
+    assert_eq!(status.code(), Some(0));
+    let (lines, answered, code) = start_again(&root, proxy.port);
+    let line = format!("start: managed version {to}");
+    assert!(lines.contains(&line), "{lines:#?}");
+    assert_eq!((answered, code), (Some(200), Some(0)), "{lines:#?}");
+    assert_eq!(proxy.others[1].requests().len(), 2);
 }
 
 // ---- the certificates with `acme` ----

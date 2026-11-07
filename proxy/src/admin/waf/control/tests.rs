@@ -42,7 +42,7 @@ fn figures_line() -> String {
     status_line("block").replace(
         "\"ready\":true",
         &format!(
-            "\"ready\":true,\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"managed\":\"{}\",\"config_reloads\":{{\"replaced\":5,\"refused\":1}}",
+            "\"ready\":true,\"reloading\":true,\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"managed\":\"{}\",\"resolve_timeout_ms\":30000,\"config_reloads\":{{\"replaced\":5,\"refused\":1}}",
             fp(3).hex(),
             fp(4).hex()
         ),
@@ -69,6 +69,7 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
             switching: false,
             ready: true,
             // A proxy that does not send the figures.
+            reloading: None,
             uptime_ms: None,
             requests: None,
             blocked: None,
@@ -76,11 +77,18 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
             upstream_failures: None,
             config: None,
             managed: None,
+            resolve_timeout_ms: None,
             config_reloads: None,
         }
     );
-    assert_eq!(status.json()["config"], Value::Null);
-    assert_eq!(status.json()["config_reloads"], Value::Null);
+    for key in [
+        "config",
+        "reloading",
+        "resolve_timeout_ms",
+        "config_reloads",
+    ] {
+        assert_eq!(status.json()[key], Value::Null, "{key}");
+    }
     fs::remove_file(&path).unwrap();
     // A proxy that sends them: they are read, and shown as they are.
     let (path, thread) = serve(dir.path(), Some(figures_line()), Duration::ZERO);
@@ -94,6 +102,7 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
             "engine": "coraza",
             "phase": "ready",
             "switching": false,
+            "reloading": true,
             "ready": true,
             "uptime_ms": 1234,
             "requests": 50,
@@ -102,6 +111,7 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
             "upstream_failures": 4,
             "config": fp(3).hex(),
             "managed": fp(4).hex(),
+            "resolve_timeout_ms": 30000,
             "config_reloads": {"replaced": 5, "refused": 1},
         })
     );
@@ -152,6 +162,14 @@ fn no_socket_no_answer_and_an_answer_that_is_not_the_proxys_are_all_unreachable(
         figures_line().replace(&fp(3).hex(), "abc"),
         figures_line().replace(&fp(3).hex(), &fp(3).hex().to_uppercase()),
         figures_line().replace("\"replaced\":5", "\"replaced\":\"5\""),
+        figures_line().replace("\"reloading\":true", "\"reloading\":1"),
+        figures_line().replace("\"resolve_timeout_ms\":30000", "\"resolve_timeout_ms\":-1"),
+        // A time of the lookup outside the range of the configuration: none, and one more than 3600 s.
+        figures_line().replace("\"resolve_timeout_ms\":30000", "\"resolve_timeout_ms\":0"),
+        figures_line().replace(
+            "\"resolve_timeout_ms\":30000",
+            "\"resolve_timeout_ms\":3600001",
+        ),
     ];
     for reply in cases {
         let (path, thread) = serve(dir.path(), Some(reply.clone()), Duration::ZERO);
@@ -159,6 +177,19 @@ fn no_socket_no_answer_and_an_answer_that_is_not_the_proxys_are_all_unreachable(
         thread.join().unwrap();
         fs::remove_file(&path).unwrap();
     }
+    // 3600 s, the longest, is taken.
+    let longest = figures_line().replace(
+        "\"resolve_timeout_ms\":30000",
+        "\"resolve_timeout_ms\":3600000",
+    );
+    let (path, thread) = serve(dir.path(), Some(longest), Duration::ZERO);
+    let status = control(&path)
+        .status()
+        .state()
+        .map(|status| status.resolve_timeout_ms);
+    assert_eq!(status, Some(Some(3_600_000)));
+    thread.join().unwrap();
+    fs::remove_file(&path).unwrap();
     let (path, thread) = serve(
         dir.path(),
         Some(good.replace("switched", "done")),
@@ -256,4 +287,116 @@ fn a_socket_whose_queue_is_full_is_given_up_within_the_time_of_a_question() {
     assert_eq!(control(&path).status(), Seen::Unreachable);
     assert_eq!(control(&path).switch(fp(1)), None);
     assert!(began.elapsed() < 2 * ASK_WAIT);
+}
+
+/// The answer of a proxy to a reload order, as `serve` sends it: one line.
+fn reload_answer(dir: &Path, line: &str) -> Option<Reloaded> {
+    let (path, thread) = serve(dir, Some(line.to_owned()), Duration::ZERO);
+    let answered = control(&path).reload(fp(5).bytes(), Duration::from_secs(1));
+    assert_eq!(
+        thread.join().unwrap(),
+        format!("{{\"op\":\"reload\",\"managed\":\"{}\"}}\n", fp(5).hex())
+    );
+    fs::remove_file(&path).unwrap();
+    answered
+}
+
+#[test]
+fn an_answer_to_a_reload_is_taken_only_with_the_words_and_the_fields_of_its_result() {
+    let dir = scratch();
+    let (config, managed) = (fp(3).hex(), fp(4).hex());
+    let detail = |text: &str| {
+        format!(
+            "{{\"result\":\"refused\",\"reason\":\"tls\",\"detail\":\"{text}\",\"managed\":\"{managed}\"}}\n"
+        )
+    };
+    let taken = [
+        (
+            format!("{{\"result\":\"replaced\",\"config\":\"{config}\",\"managed\":\"{managed}\"}}\n"),
+            Reloaded::Replaced {
+                config: fp(3).bytes(),
+                managed: Some(fp(4).bytes()),
+            },
+        ),
+        (
+            detail("a certificate and a private key are not a pair (site a)"),
+            Reloaded::Refused {
+                reason: "tls",
+                detail: "a certificate and a private key are not a pair (site a)".to_owned(),
+                managed: Some(fp(4).bytes()),
+            },
+        ),
+        // A sentence of 512 bytes is the longest.
+        (
+            detail(&"x".repeat(DETAIL_MAX)),
+            Reloaded::Refused {
+                reason: "tls",
+                detail: "x".repeat(DETAIL_MAX),
+                managed: Some(fp(4).bytes()),
+            },
+        ),
+        (
+            "{\"result\":\"refused\",\"reason\":\"unmanaged\",\"detail\":\"the configuration in force has no managed object\",\"managed\":null}\n".to_owned(),
+            Reloaded::Refused {
+                reason: "unmanaged",
+                detail: "the configuration in force has no managed object".to_owned(),
+                managed: None,
+            },
+        ),
+        (
+            format!("{{\"result\":\"busy\",\"reason\":\"reload under way\",\"managed\":\"{managed}\"}}\n"),
+            Reloaded::Busy {
+                reason: "reload under way",
+                managed: Some(fp(4).bytes()),
+            },
+        ),
+        // A proxy that does not know the order.
+        (
+            "{\"result\":\"error\",\"reason\":\"unknown op\"}\n".to_owned(),
+            Reloaded::Error("unknown op"),
+        ),
+    ];
+    for (line, reloaded) in taken {
+        assert_eq!(reload_answer(dir.path(), &line), Some(reloaded), "{line:?}");
+    }
+    let refused = [
+        // An unknown result, and a reason of another result or of none.
+        format!("{{\"result\":\"done\",\"managed\":\"{managed}\"}}\n"),
+        format!("{{\"result\":\"busy\",\"reason\":\"tls\",\"managed\":\"{managed}\"}}\n"),
+        format!(
+            "{{\"result\":\"replaced\",\"reason\":\"tls\",\"config\":\"{config}\",\"managed\":\"{managed}\"}}\n"
+        ),
+        "{\"result\":\"error\",\"reason\":\"no such thing\"}\n".to_owned(),
+        // Digits that are short or upper case, a `replaced` without `config`, `config` beside another result.
+        format!("{{\"result\":\"replaced\",\"config\":\"abc\",\"managed\":\"{managed}\"}}\n"),
+        format!(
+            "{{\"result\":\"replaced\",\"config\":\"{config}\",\"managed\":\"{}\"}}\n",
+            managed.to_uppercase()
+        ),
+        format!("{{\"result\":\"replaced\",\"managed\":\"{managed}\"}}\n"),
+        format!(
+            "{{\"result\":\"busy\",\"reason\":\"starting\",\"config\":\"{config}\",\"managed\":\"{managed}\"}}\n"
+        ),
+        // A sentence that is missing, empty, one byte too long, or has a byte outside 0x20 to 0x7e.
+        format!("{{\"result\":\"refused\",\"reason\":\"tls\",\"managed\":\"{managed}\"}}\n"),
+        detail(""),
+        detail(&"x".repeat(DETAIL_MAX + 1)),
+        detail("a\\u001fb"),
+        detail("caf\u{e9}"),
+        // A sentence beside another result, and a version beside an error.
+        format!(
+            "{{\"result\":\"busy\",\"reason\":\"starting\",\"detail\":\"x\",\"managed\":\"{managed}\"}}\n"
+        ),
+        format!("{{\"result\":\"error\",\"reason\":\"unknown op\",\"managed\":\"{managed}\"}}\n"),
+    ];
+    for line in refused {
+        assert_eq!(reload_answer(dir.path(), &line), None, "{line:?}");
+    }
+    // A proxy that closes the connection without a line gives no answer either.
+    let (path, thread) = closing(dir.path(), 1, None);
+    assert_eq!(
+        control(&path).reload(fp(5).bytes(), Duration::from_secs(1)),
+        None
+    );
+    thread.join().unwrap();
 }
