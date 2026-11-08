@@ -11,12 +11,12 @@
 // `{ id, title, least, mount }`; `mount(ctx, root)` draws into `root` and gives back `{ stop }`. Nothing runs when the
 // module is loaded.
 
-import { ApiError } from './api.js';
-import { badge, bindAttribute, button, el, mount, notice, result } from './dom.js';
-import { w } from './i18n.js';
-import { Field, checkFields, confirmChange, copyButton, emptyField, kv, pageHead, panel, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeWords } from './parts.js';
+import { ApiError } from '../api.js';
+import { badge, bindAttribute, button, el, mount, notice, result } from '../dom.js';
+import { w } from '../i18n.js';
+import { Field, checkFields, confirmChange, copyButton, emptyField, kv, pageHead, panel, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeWords } from '../parts.js';
 import { darkRuns, encode } from './qr.js';
-import { Table } from './table.js';
+import { Table } from '../table.js';
 
 export const ROLES = ['viewer', 'operator', 'owner'];
 const PASSWORD_MIN = 12;

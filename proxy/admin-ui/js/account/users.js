@@ -5,11 +5,11 @@
 // the screen does not offer them. A screen is `{ id, title, least, mount }`; `mount(ctx, root)` draws into `root` and
 // gives back `{ stop }`. Nothing runs when the module is loaded.
 
-import { badge, button, buttonClass, el, mount, notice, result } from './dom.js';
-import { w } from './i18n.js';
+import { badge, button, buttonClass, el, mount, notice, result } from '../dom.js';
+import { w } from '../i18n.js';
 import { ROLES, passwordFits, tokenLines, tokenTable } from './account.js';
-import { Field, checkFields, confirmChange, emptyField, hashOf, instantOf, kv, openDialog, pageHead, panel, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeView } from './parts.js';
-import { Table } from './table.js';
+import { Field, checkFields, confirmChange, emptyField, hashOf, instantOf, kv, openDialog, pageHead, panel, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeView } from '../parts.js';
+import { Table } from '../table.js';
 
 /** The name of a user: 1 to 32 characters of a-z, 0-9, dot, underscore and hyphen. */
 const NAME = /^[a-z0-9._-]{1,32}$/;

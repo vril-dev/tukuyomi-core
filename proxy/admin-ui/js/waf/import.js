@@ -5,9 +5,9 @@
 // second confirmation. The new generation is not chosen. How an import ended waits in `ended` for the screen that is
 // shown, which may not be the one that sent it. Nothing runs when the module is loaded.
 
-import { ApiError } from './api.js';
-import { append, badge, button, buttonClass, el, mount, notice, result, setText } from './dom.js';
-import { lazy, w } from './i18n.js';
+import { ApiError } from '../api.js';
+import { append, badge, button, buttonClass, el, mount, notice, result, setText } from '../dom.js';
+import { lazy, w } from '../i18n.js';
 import {
   Field,
   bytesText,
@@ -30,8 +30,8 @@ import {
   timeCell,
   timeLabel,
   working,
-} from './parts.js';
-import { Table } from './table.js';
+} from '../parts.js';
+import { Table } from '../table.js';
 
 /** The engines that an import can ask for, by the words the API takes. Coraza is first: it is the default. */
 export const ENGINES = ['coraza', 'modsecurity'];

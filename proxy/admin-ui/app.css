@@ -610,6 +610,9 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
 .tc-rows__row > .tc-btn { margin-top: calc(20px + 2px + (var(--size-control) - 28px) / 2); }
 .tc-list { margin: 0; padding-inline-start: var(--space-5); overflow-wrap: anywhere; }
 
+/* the managed configuration */
+.tc-raw--tall { max-height: 32rem; }
+
 /* records */
 .tc-filters { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: var(--space-4); align-items: start; }
 .tc-terms { display: flex; flex-wrap: wrap; gap: var(--space-1); }

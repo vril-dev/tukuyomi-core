@@ -1,10 +1,11 @@
 //! The files of the admin page: `GET /` is the page, and `GET /ui/<version>/<name>` is its stylesheet, its scripts and
-//! its icon. They are embedded in the executable from `proxy/admin-ui/` (the files of its `js/` directory are served
-//! flat: `js/app.js` is `/ui/<version>/app.js`), so serving them reads no file of the host, and the page and the API
-//! are always of one version. A name that the table below does not hold, and a version that is not the one of the
-//! table (no version at all included), whatever they look like, are looked for nowhere: the request goes on to the
-//! table of the API, which answers 404 for it. A method but `GET` and `HEAD` on the page or on a name of the table
-//! below its version is 405 with `Allow`, as for a route of the API.
+//! its icon. They are embedded in the executable from `proxy/admin-ui/` (the name of a script is its path below the
+//! `js/` directory: `js/app.js` is `/ui/<version>/app.js`, and `js/waf/waf.js` is `/ui/<version>/waf/waf.js`), so
+//! serving them reads no file of the host, and the page and the API are always of one version. A name that the table
+//! below does not hold, and a version that is not the one of the table (no version at all included), whatever they look
+//! like, are looked for nowhere: the request goes on to the table of the API, which answers 404 for it. A method but
+//! `GET` and `HEAD` on the page or on a name of the table below its version is 405 with `Allow`, as for a route of the
+//! API.
 //!
 //! The version is the first 16 digits of the SHA-256 of a list of the name and the SHA-256 of every file of the table
 //! (as the fingerprint of a bundle is made of its manifest). It is made once, when the first request for the page or
@@ -73,7 +74,7 @@ static INDEX: File = File {
 };
 
 /// The other files, below `/ui/<version>/`.
-static FILES: [File; 15] = [
+static FILES: [File; 22] = [
     File {
         name: "app.css",
         kind: CSS,
@@ -105,9 +106,9 @@ static FILES: [File; 15] = [
         bytes: include_bytes!("../../../admin-ui/js/i18n.js"),
     },
     File {
-        name: "waf.js",
+        name: "waf/waf.js",
         kind: JAVASCRIPT,
-        bytes: include_bytes!("../../../admin-ui/js/waf.js"),
+        bytes: include_bytes!("../../../admin-ui/js/waf/waf.js"),
     },
     File {
         name: "parts.js",
@@ -120,34 +121,69 @@ static FILES: [File; 15] = [
         bytes: include_bytes!("../../../admin-ui/js/table.js"),
     },
     File {
-        name: "generations.js",
+        name: "waf/generations.js",
         kind: JAVASCRIPT,
-        bytes: include_bytes!("../../../admin-ui/js/generations.js"),
+        bytes: include_bytes!("../../../admin-ui/js/waf/generations.js"),
     },
     File {
-        name: "import.js",
+        name: "waf/import.js",
         kind: JAVASCRIPT,
-        bytes: include_bytes!("../../../admin-ui/js/import.js"),
+        bytes: include_bytes!("../../../admin-ui/js/waf/import.js"),
     },
     File {
-        name: "records.js",
+        name: "waf/records.js",
         kind: JAVASCRIPT,
-        bytes: include_bytes!("../../../admin-ui/js/records.js"),
+        bytes: include_bytes!("../../../admin-ui/js/waf/records.js"),
     },
     File {
-        name: "account.js",
+        name: "waf/words.js",
         kind: JAVASCRIPT,
-        bytes: include_bytes!("../../../admin-ui/js/account.js"),
+        bytes: include_bytes!("../../../admin-ui/js/waf/words.js"),
     },
     File {
-        name: "users.js",
+        name: "managed/managed.js",
         kind: JAVASCRIPT,
-        bytes: include_bytes!("../../../admin-ui/js/users.js"),
+        bytes: include_bytes!("../../../admin-ui/js/managed/managed.js"),
     },
     File {
-        name: "qr.js",
+        name: "managed/screen.js",
         kind: JAVASCRIPT,
-        bytes: include_bytes!("../../../admin-ui/js/qr.js"),
+        bytes: include_bytes!("../../../admin-ui/js/managed/screen.js"),
+    },
+    File {
+        name: "managed/job.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/job.js"),
+    },
+    File {
+        name: "managed/history.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/history.js"),
+    },
+    File {
+        name: "managed/words.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/words.js"),
+    },
+    File {
+        name: "account/account.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/account/account.js"),
+    },
+    File {
+        name: "account/users.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/account/users.js"),
+    },
+    File {
+        name: "account/qr.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/account/qr.js"),
+    },
+    File {
+        name: "account/words.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/account/words.js"),
     },
 ];
 

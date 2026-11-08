@@ -465,11 +465,14 @@ const WORKING = {
   rollback: () => w('working.rollback'),
   remove: () => w('working.remove'),
   import: () => w('working.import'),
+  'managed-activate': () => w('working.managed_activate'),
+  'managed-rollback': () => w('working.managed_rollback'),
 };
 
 /**
- * Which change of the rules this page has sent and not yet had an answer to. The page holds one at a time, whatever
- * screen is shown (the server takes one at a time as well), and a screen that is drawn while it runs finds it here.
+ * Which change this page has sent and not yet had an answer to (of the rules, or of the managed configuration). The
+ * page holds one at a time, whatever screen is shown (the server takes one at a time as well), and a screen that is
+ * drawn while it runs finds it here.
  */
 class Working {
   #name = null;
@@ -509,9 +512,9 @@ class Working {
 export const working = new Working();
 
 /**
- * Runs the call of a change that may take long (`name` is `activate`, `rollback`, `remove` or `import`). The answer
- * or the error comes back as `{ body, error }`, never thrown, so that the screen decides what it means. A call that
- * would start while another runs does not start (`skipped`).
+ * Runs the call of a change that may take long (`name` is `activate`, `rollback`, `remove`, `import`,
+ * `managed-activate` or `managed-rollback`). The answer or the error comes back as `{ body, error }`, never thrown, so
+ * that the screen decides what it means. A call that would start while another runs does not start (`skipped`).
  */
 export async function perform(name, call) {
   if (working.name !== null) return { body: null, error: null, skipped: true };

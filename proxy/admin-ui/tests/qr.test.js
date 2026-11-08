@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-import { MAX_BYTES, darkRuns, encode } from '../js/qr.js';
+import { MAX_BYTES, darkRuns, encode } from '../js/account/qr.js';
 
 // Matrices that an independent encoder made once for each text, in byte mode at level M with the smallest version
 // that holds it: `rows` are the rows of the matrix, '1' for a dark module. They are data, not code. The texts run

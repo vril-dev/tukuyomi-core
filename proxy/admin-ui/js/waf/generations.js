@@ -6,8 +6,8 @@
 // `mount(ctx, root, route)` draws into `root` and gives back `{ stop, show }`; `show(route)` is called when the
 // address changes inside the screen. Nothing runs when the module is loaded.
 
-import { badge, button, buttonClass, el, mount, notice, result } from './dom.js';
-import { lazy, t, w } from './i18n.js';
+import { badge, button, buttonClass, el, mount, notice, result } from '../dom.js';
+import { lazy, t, w } from '../i18n.js';
 import {
   bytesText,
   canChange,
@@ -42,8 +42,8 @@ import {
   wordBadge,
   wordText,
   working,
-} from './parts.js';
-import { Table } from './table.js';
+} from '../parts.js';
+import { Table } from '../table.js';
 
 const KINDS = {
   activate: () => t('history.kind.activate'),

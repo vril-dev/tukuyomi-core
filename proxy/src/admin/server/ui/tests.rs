@@ -29,15 +29,22 @@ fn each_file_answers_with_its_type_and_the_fields_of_the_page_and_needs_no_sessi
         (format!("/ui/{version}/api.js"), js),
         (format!("/ui/{version}/dom.js"), js),
         (format!("/ui/{version}/i18n.js"), js),
-        (format!("/ui/{version}/waf.js"), js),
         (format!("/ui/{version}/parts.js"), js),
         (format!("/ui/{version}/table.js"), js),
-        (format!("/ui/{version}/generations.js"), js),
-        (format!("/ui/{version}/import.js"), js),
-        (format!("/ui/{version}/records.js"), js),
-        (format!("/ui/{version}/account.js"), js),
-        (format!("/ui/{version}/users.js"), js),
-        (format!("/ui/{version}/qr.js"), js),
+        (format!("/ui/{version}/waf/waf.js"), js),
+        (format!("/ui/{version}/waf/generations.js"), js),
+        (format!("/ui/{version}/waf/import.js"), js),
+        (format!("/ui/{version}/waf/records.js"), js),
+        (format!("/ui/{version}/waf/words.js"), js),
+        (format!("/ui/{version}/managed/managed.js"), js),
+        (format!("/ui/{version}/managed/screen.js"), js),
+        (format!("/ui/{version}/managed/job.js"), js),
+        (format!("/ui/{version}/managed/history.js"), js),
+        (format!("/ui/{version}/managed/words.js"), js),
+        (format!("/ui/{version}/account/account.js"), js),
+        (format!("/ui/{version}/account/users.js"), js),
+        (format!("/ui/{version}/account/qr.js"), js),
+        (format!("/ui/{version}/account/words.js"), js),
         (format!("/ui/{version}/favicon.svg"), "image/svg+xml"),
     ] {
         // The page is not kept, as the next version is found in it; a file below its version never changes, so it is.
@@ -95,6 +102,9 @@ fn a_name_or_a_version_that_the_table_does_not_hold_is_left_to_the_api_which_ans
         format!("/ui/{version}/"),
         format!("/ui/{version}/nothing"),
         format!("/ui/{version}/../api/session"),
+        // A name below a folder that the table does not hold, and a way out of a folder to a name that it holds.
+        format!("/ui/{version}/waf/nothing.js"),
+        format!("/ui/{version}/waf/../app.js"),
     ] {
         for verb in ["GET", "HEAD", "POST"] {
             assert!(
@@ -326,11 +336,27 @@ fn names(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// The paths of the files below `dir` and its folders, from `dir` on with `/` between their parts (`waf/waf.js`).
+fn paths(dir: &Path) -> BTreeSet<String> {
+    let mut found = names(dir);
+    for entry in fs::read_dir(dir).unwrap().map(Result::unwrap) {
+        if entry.file_type().unwrap().is_dir() {
+            let folder = entry.file_name().into_string().unwrap();
+            found.extend(
+                paths(&entry.path())
+                    .into_iter()
+                    .map(|name| format!("{folder}/{name}")),
+            );
+        }
+    }
+    found
+}
+
 #[test]
 fn the_table_holds_every_file_of_the_directory_of_the_page() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("admin-ui");
     let mut on_disk = names(&root);
-    on_disk.extend(names(&root.join("js")));
+    on_disk.extend(paths(&root.join("js")));
     let served: BTreeSet<String> = std::iter::once(INDEX.name)
         .chain(FILES.iter().map(|file| file.name))
         .map(str::to_owned)

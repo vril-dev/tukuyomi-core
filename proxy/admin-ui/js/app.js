@@ -11,15 +11,16 @@
 // in it is checked before it is used. Nothing runs when the module is loaded, except the start of the page when there
 // is one.
 
-import { screens as accountScreens, forgetHeld, mfaSetup, passwordForm } from './account.js';
+import { screens as accountScreens, forgetHeld, mfaSetup, passwordForm } from './account/account.js';
 import { Api, ApiError, gateOf } from './api.js';
 import { badge, button, el, mount, notice, retranslate } from './dom.js';
 import { LANGUAGES, language, lazy, pickLanguage, sentence, setLanguage, t, w } from './i18n.js';
-import { forgetEnded } from './import.js';
+import { forgetEnded } from './waf/import.js';
+import { screens as managedScreens } from './managed/managed.js';
 import { Field, checkFields, clock, emptyField, hashOf, keepFocus, textInput } from './parts.js';
 import { refilter } from './table.js';
-import { screens as userScreens } from './users.js';
-import { generationState, screens as wafScreens } from './waf.js';
+import { screens as userScreens } from './account/users.js';
+import { generationState, screens as wafScreens } from './waf/waf.js';
 
 const KEYS = { language: 'tukuyomi_admin_language', theme: 'tukuyomi_admin_theme', time: 'tukuyomi_admin_time' };
 const THEMES = ['auto', 'light', 'dark'];
@@ -36,9 +37,10 @@ const GROUPS = [
   { label: null, screens: ['overview'] },
   { label: w('nav.group.waf'), screens: ['generations', 'import', 'history'] },
   { label: w('nav.group.records'), screens: ['records', 'audit'] },
+  { label: w('nav.group.managed'), screens: ['managed', 'managed-history', 'config'] },
   { label: w('nav.group.admin'), screens: ['account', 'users'] },
 ];
-const ALL = [...wafScreens, ...accountScreens, ...userScreens];
+const ALL = [...wafScreens, ...managedScreens, ...accountScreens, ...userScreens];
 /** The screens in the order of the menu. */
 const screens = GROUPS.flatMap((group) => group.screens.map((id) => ALL.find((screen) => screen.id === id)));
 
@@ -579,6 +581,12 @@ class App {
     this.listeners.add(show);
     show(this.status);
 
+    /** The address named something of a screen that this user may not see: the screen stays, without it, and the page says so. */
+    const dropId = (id) => {
+      globalThis.history.replaceState(null, '', hashOf(id));
+      mount(alerts, notice('warn', w('route.dropped')));
+    };
+
     let current = null;
     const go = (first) => {
       const parsed = parseRoute(globalThis.location.hash, known);
@@ -592,7 +600,7 @@ class App {
         current.controller.show(route);
       } else {
         if (current !== null) current.controller.stop();
-        current = { id, controller: screen.mount(this.context(), main, route) ?? { stop() {} } };
+        current = { id, controller: screen.mount({ ...this.context(), dropId: () => dropId(id) }, main, route) ?? { stop() {} } };
         const group = GROUPS.find((item) => item.screens.includes(id));
         mount(place, group?.label ? [el('span', { class: 'tc-muted' }, group.label), el('span', { class: 'tc-muted', 'aria-hidden': 'true' }, '/')] : null, el('strong', {}, screen.title));
         if (!first) main.querySelector('h1')?.focus();

@@ -3,8 +3,8 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { ApiError } from '../js/api.js';
-import { Enrollment, Held, ROLES, codeToSend, inGroups, passwordProblems, rolesUpTo, tokenProblems } from '../js/account.js';
-import { userActions, userProblems } from '../js/users.js';
+import { Enrollment, Held, ROLES, codeToSend, inGroups, passwordProblems, rolesUpTo, tokenProblems } from '../js/account/account.js';
+import { userActions, userProblems } from '../js/account/users.js';
 
 const SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
 const CODES = ['ABCDEFGHIJKLMNOP', 'QRSTUVWXYZ234567'];
@@ -144,7 +144,7 @@ test('the scripts of the account never write to the storage of the browser, the 
     ['a form of the address', /new\s+URL\b|URLSearchParams/],
   ];
   for (const name of ['account.js', 'users.js', 'qr.js']) {
-    const source = readFileSync(new URL(`../js/${name}`, import.meta.url), 'utf8');
+    const source = readFileSync(new URL(`../js/account/${name}`, import.meta.url), 'utf8');
     for (const [what, pattern] of STORES) assert.doesNotMatch(source, pattern, `${name}: ${what}`);
   }
 });

@@ -3,9 +3,12 @@ import { test } from 'node:test';
 
 import { bindAttribute, el, mount, retranslate, safeUrl, setText } from '../js/dom.js';
 import { setLanguage, w } from '../js/i18n.js';
-import { screens as generationScreens } from '../js/generations.js';
-import { screens as wafScreens } from '../js/waf.js';
-import { screens as importScreens } from '../js/import.js';
+import { screens as generationScreens } from '../js/waf/generations.js';
+import { screens as wafScreens } from '../js/waf/waf.js';
+import { screens as importScreens } from '../js/waf/import.js';
+import { jobResult } from '../js/managed/job.js';
+import { screens as managedScreens } from '../js/managed/managed.js';
+import { valueTree } from '../js/managed/history.js';
 import { start } from '../js/app.js';
 
 // `el` builds elements with the DOM of the page. A small stand-in is enough for what these tests look at: it keeps the
@@ -47,6 +50,11 @@ class Node {
     for (const child of this.children) child.parent = null;
     this.children = [];
     this.append(...nodes);
+  }
+
+  remove() {
+    this.parent?.children.splice(this.parent.children.indexOf(this), 1);
+    this.parent = null;
   }
 }
 
@@ -261,7 +269,8 @@ test('the overview shows the numbers of the proxy, and a dash where the proxy ga
     const data = { current: FP, reachable, proxy, rollback_to: null, crs: { available: false, files: [] } };
     const root = document.createElement('main');
     document.body.append(root);
-    mountOverview({ status: () => ({ data, error: null, at: new Date(0), busy: false }), onStatus: () => () => {}, refreshStatus() {}, describe: String }, root);
+    const api = { call: async () => ({ managed: false }) };
+    mountOverview({ status: () => ({ data, error: null, at: new Date(0), busy: false }), onStatus: () => () => {}, refreshStatus() {}, describe: String, api }, root);
     return root.textContent;
   };
   const full = shown({ phase: 'ready', mode: 'block', engine: 'coraza', switching: false, generation: FP, uptime_ms: 3_700_000, requests: 12408, blocked: 31, policy_refused: 6, upstream_failures: 0, config: OTHER, config_reloads: { replaced: 3, refused: 1 } });
@@ -311,9 +320,12 @@ test('the list of generations is a table, and the address of one generation open
 
 test('the page opens the shell for the role of the user, follows the address, and takes a new language without drawing again', async () => {
   const answer = (body) => ({ status: 200, headers: { get: (name) => (name === 'content-type' ? 'application/json' : null) }, json: async () => body });
+  const asked = [];
   let role = 'viewer';
   globalThis.fetch = async (path) => {
+    asked.push(path);
     if (path === '/api/session') return answer({ name: 'ann', role, state: 'active', csrf: 'tok', mfa: false });
+    if (path === '/api/managed') return answer({ managed: false });
     if (path === '/api/status') return answer({ current: FP, reachable: true, proxy: { generation: FP, mode: 'block', engine: 'coraza', phase: 'ready', switching: false }, rollback_to: null, crs: { available: false, files: [] } });
     return answer({ reachable: true, generations: [], entries: [], records: [], next: null });
   };
@@ -332,7 +344,7 @@ test('the page opens the shell for the role of the user, follows the address, an
 
   const links = () => app.querySelectorAll('a').filter((link) => link.getAttribute('data-screen') !== null);
   // A viewer is offered the screens that a viewer may open, and no others; the address is made right at the start.
-  assert.deepEqual(links().map((link) => link.getAttribute('data-screen')), ['overview', 'generations', 'history', 'records', 'account']);
+  assert.deepEqual(links().map((link) => link.getAttribute('data-screen')), ['overview', 'generations', 'history', 'records', 'managed', 'managed-history', 'account']);
   assert.equal(globalThis.location.hash, '#/overview');
   assert.equal(links()[0].getAttribute('aria-current'), 'page');
   const main = app.querySelector('main');
@@ -343,12 +355,23 @@ test('the page opens the shell for the role of the user, follows the address, an
   hash.handlers.forEach((handler) => handler());
   await wait();
   assert.equal(main.querySelector('h1').textContent, 'Generations');
-  assert.deepEqual(links().map((link) => link.getAttribute('aria-current')), [null, 'page', null, null, null]);
+  assert.deepEqual(links().map((link) => link.getAttribute('aria-current')), [null, 'page', null, null, null, null, null]);
   // A value that is not of its form is dropped from the address and told.
   globalThis.location.hash = '#/generations/not-a-fingerprint';
   hash.handlers.forEach((handler) => handler());
   assert.equal(globalThis.location.hash, '#/generations');
   assert.equal(app.textContent.includes('Removed what was not valid in the address.'), true);
+  // The content of a version is not for a viewer: its name is dropped from the address and told, and it is not asked for.
+  globalThis.location.hash = `#/managed/${FP}`;
+  hash.handlers.forEach((handler) => handler());
+  await wait();
+  await wait();
+  assert.equal(globalThis.location.hash, '#/managed');
+  assert.equal(app.textContent.includes('Removed what was not valid in the address.'), true);
+  assert.equal(asked.includes(`/api/managed/versions/${FP}`), false);
+  globalThis.location.hash = '#/generations';
+  hash.handlers.forEach((handler) => handler());
+  await wait();
 
   // The language is switched: the words change where they are, and the elements, and what was typed, stay.
   const filter = main.querySelector('input');
@@ -364,6 +387,114 @@ test('the page opens the shell for the role of the user, follows the address, an
   assert.equal(filter.value, 'typed');
   setLanguage('en');
   void role;
+});
+
+test('while a job runs, the screen of the versions holds its buttons and says nothing of a difference', async () => {
+  setLanguage('en');
+  const job = { kind: 'activate', actor: 'ann', from: FP, to: OTHER, started: 1, state: 'running' };
+  const api = {
+    async call(method, path) {
+      if (path === '/api/managed') return { managed: true, current: FP, serving: OTHER, reachable: true, reloading: false, rollback_to: null, job };
+      if (path === '/api/managed/versions') return { reachable: true, versions: [{ name: FP, made: 1, current: true, serving: false }, { name: OTHER, made: 1, current: false, serving: true }] };
+      if (path === '/api/status') return { proxy: { config: 'c'.repeat(64) } };
+      return { sha256: 'c'.repeat(64), forward: {} };
+    },
+  };
+  const ctx = { user: { name: 'ann', role: 'operator' }, api, describe: String, refreshStatus() {}, navigate() {} };
+  const root = document.createElement('main');
+  document.body.append(root);
+  const screen = managedScreens[0].mount(ctx, root, { id: null, query: {} });
+  await wait();
+  await wait();
+  await wait();
+  const apply = root.querySelectorAll('button').filter((item) => item.textContent === 'Apply this version');
+  assert.equal(apply.length, 1);
+  assert.equal(apply[0].disabled, true);
+  assert.equal(root.textContent.includes('The selected version and the version that the proxy runs differ.'), false);
+  screen.stop();
+});
+
+/** A fake API for the screen of the versions, where the two versions `FP` (selected) and `OTHER` (running) differ. */
+function differingApi(asked = []) {
+  return {
+    async call(method, path) {
+      asked.push(path);
+      if (path === '/api/managed') return { managed: true, current: FP, serving: OTHER, reachable: true, reloading: false, rollback_to: null, job: null };
+      if (path === '/api/managed/versions') return { reachable: true, versions: [{ name: FP, made: 1, current: true, serving: false }, { name: OTHER, made: 1, current: false, serving: true }] };
+      if (path === '/api/status') return { proxy: { config: 'c'.repeat(64) } };
+      if (path === `/api/managed/versions/${OTHER}`) return { name: OTHER, made: 1, current: false, serving: true, version: { sites: [], upstreams: {}, routes: [], default_upstream: 'a', secret: 'the secret' } };
+      return { sha256: 'c'.repeat(64), forward: {} };
+    },
+  };
+}
+
+test('a viewer is not asked about the file, gets no way to correct a difference and no way to the content of a version', async () => {
+  setLanguage('en');
+  const asked = [];
+  const ctx = { user: { name: 'ann', role: 'viewer' }, api: differingApi(asked), describe: String, refreshStatus() {}, navigate() {} };
+  const root = document.createElement('main');
+  document.body.append(root);
+  const screen = managedScreens[0].mount(ctx, root, { id: null, query: {} });
+  await wait();
+  await wait();
+  await wait();
+  assert.equal(root.textContent.includes('The selected version and the version that the proxy runs differ.'), true);
+  assert.equal(asked.includes('/api/config'), false);
+  assert.deepEqual(root.querySelectorAll('button').filter((item) => ['Apply the selected version again', 'Select the running version', 'Apply this version'].includes(item.textContent)), []);
+  assert.deepEqual(root.querySelectorAll('a').filter((link) => /^#\/managed\/[0-9a-f]{64}$/.test(link.getAttribute('href'))), []);
+  screen.stop();
+});
+
+test('once the content of a version is closed, nothing that the screen keeps reaches it', async () => {
+  setLanguage('en');
+  const ctx = { user: { name: 'ann', role: 'operator' }, api: differingApi(), describe: String, refreshStatus() {}, navigate() {} };
+  const root = document.createElement('main');
+  document.body.append(root);
+  const screen = managedScreens[0].mount(ctx, root, { id: OTHER, query: {} });
+  await wait();
+  await wait();
+  await wait();
+  const pre = root.querySelector('pre');
+  assert.equal(pre.textContent.includes('the secret'), true);
+  let panel = pre;
+  while (panel.tag !== 'section') panel = panel.parent;
+  const foot = panel.querySelector('[class="tc-panel__foot"]');
+  const states = panel.querySelector('[class="tc-actions"]').children[0];
+  const apply = foot.querySelector('button');
+  assert.equal(apply.textContent, 'Apply this version');
+  screen.show({ id: null, query: {} });
+  const top = (node) => {
+    let at = node;
+    while (at.parent !== null) at = at.parent;
+    return at;
+  };
+  for (const node of [foot, states, apply]) assert.equal(top(node).querySelector('pre'), null);
+  assert.equal(root.querySelector('pre'), null);
+  screen.stop();
+});
+
+test('the outcome of a job with a result that this page does not know is told as such, with the word as it came', () => {
+  setLanguage('en');
+  const box = jobResult({ state: 'ended', result: 'a new word', from: FP, to: OTHER });
+  assert.equal(box.textContent.includes('The result is not one that this page knows.'), true);
+  assert.equal(box.textContent.includes('a new word'), true);
+  // A word of an object's prototype is no result.
+  assert.equal(jobResult({ state: 'ended', result: 'constructor', from: FP, to: OTHER }).textContent.includes('The result is not one that this page knows.'), true);
+});
+
+test('the values of the configuration file number a list from 1 and stop drawing below sixteen levels', () => {
+  const list = valueTree(['a', 'b']);
+  assert.deepEqual(list.querySelectorAll('dt').map((node) => node.textContent), ['1', '2']);
+  // `nested(n)` is n objects, one in the other, with a value in the last: the value is at level n + 1.
+  const nested = (n) => {
+    let value = 'the end';
+    for (let i = 0; i < n; i += 1) value = { a: value };
+    return value;
+  };
+  assert.equal(valueTree(nested(15)).textContent.includes('the end'), true);
+  const deep = valueTree(nested(16));
+  assert.equal(deep.textContent.includes('the end'), false);
+  assert.equal(deep.textContent.includes('…'), true);
 });
 
 test('a form that is sent with a field empty says which field and why, puts the focus on the first, and sends nothing', async () => {

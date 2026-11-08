@@ -6,6 +6,8 @@ import { test } from 'node:test';
 import { dictionaries, pickLanguage, sentence, setLanguage, t } from '../js/i18n.js';
 
 const scripts = new URL('../js/', import.meta.url);
+const scriptNames = readdirSync(scripts, { recursive: true }).filter((name) => name.endsWith('.js'));
+const isWords = (name) => name.endsWith('/words.js');
 
 test('the two dictionaries have the same keys, and every text is filled', () => {
   assert.deepEqual(Object.keys(dictionaries.ja).sort(), Object.keys(dictionaries.en).sort());
@@ -23,8 +25,22 @@ test('a text has the same values to fill in, in both languages', () => {
   }
 });
 
+test('a key is written in one file of the dictionaries only', () => {
+  const unquoted = (text) => text.replace(/\\(.)/g, '$1');
+  const keysOf = (source) => new Set([...source.matchAll(/^ {2}(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"):/gm)].map((match) => unquoted(match[1] ?? match[2])));
+  const seen = new Map();
+  for (const name of scriptNames.filter((file) => file === 'i18n.js' || isWords(file))) {
+    for (const key of keysOf(readFileSync(new URL(name, scripts), 'utf8'))) {
+      assert.equal(seen.get(key), undefined, `${key}: in ${seen.get(key)} and in ${name}`);
+      seen.set(key, name);
+    }
+  }
+  // Every key of the dictionaries was seen above, so that a key that the reading above missed cannot pass.
+  assert.equal(seen.size, Object.keys(dictionaries.en).length);
+});
+
 test('every key that a script asks for with t() or w() is in the dictionaries', () => {
-  for (const name of readdirSync(scripts)) {
+  for (const name of scriptNames) {
     const source = readFileSync(new URL(name, scripts), 'utf8');
     for (const [, key] of source.matchAll(/(?<![\w.])[tw]\(\s*'([^']+)'/g)) {
       assert.ok(Object.hasOwn(dictionaries.en, key), `${name}: ${key}`);
@@ -84,7 +100,7 @@ function givenNames(text) {
 test('a call of t() or w() that gives its values in the call gives all that the text of its key asks for', () => {
   const asked = (key) => [...new Set([...dictionaries.en[key].matchAll(/\{(\w+)\}/g)].map((m) => m[1]))];
   let checked = 0;
-  for (const name of readdirSync(scripts).filter((file) => file !== 'i18n.js')) {
+  for (const name of scriptNames.filter((file) => file !== 'i18n.js' && !isWords(file))) {
     const source = readFileSync(new URL(name, scripts), 'utf8');
     for (const match of source.matchAll(/(?<![\w.])[tw]\(\s*'([^']+)'/g)) {
       const wanted = asked(match[1]);

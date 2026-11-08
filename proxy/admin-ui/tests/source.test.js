@@ -4,7 +4,9 @@ import { test } from 'node:test';
 
 const root = new URL('../', import.meta.url);
 const read = (path) => readFileSync(new URL(path, root), 'utf8');
-const scripts = readdirSync(new URL('js/', root)).map((name) => [`js/${name}`, read(`js/${name}`)]);
+const scripts = readdirSync(new URL('js/', root), { recursive: true })
+  .filter((name) => name.endsWith('.js'))
+  .map((name) => [`js/${name}`, read(`js/${name}`)]);
 
 // What makes markup or code from a string. The page's CSP also refuses these at run time where the browser can.
 const FORBIDDEN = [

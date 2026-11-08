@@ -1,16 +1,18 @@
 // The screens of the WAF. This file has the overview: the numbers of the proxy since it started, its state, the rule
 // generation that the rules store chooses and the one that the proxy serves (with a warning when they differ), the
-// generation that a rollback would choose, and the settings file that is in force. The other screens are in
-// `generations.js` (the generations, the history and the rollback), `import.js` and `records.js` (the records and the
+// generation that a rollback would choose, the settings file that is in force, and the card of the managed
+// configuration (made in `../managed/managed.js`). The other screens are in `generations.js` (the generations, the
+// history and the rollback), `import.js` and `records.js` (the records and the
 // audit log); `app.js` puts them in the order of the menu. A screen is `{ id, title, least, mount }`; `mount(ctx, root)`
 // draws into `root` and gives back `{ stop }` (and `show(route)` when the address of the screen can change in it). Nothing runs when the
 // module is loaded.
 
-import { badge, button, el, mount, notice } from './dom.js';
+import { badge, button, el, mount, notice } from '../dom.js';
 import { screens as generationScreens } from './generations.js';
-import { formatNumber, lazy, t, w } from './i18n.js';
+import { formatNumber, lazy, t, w } from '../i18n.js';
 import { screens as importScreens } from './import.js';
-import { engineBadge, fingerprintView, generationState, hashOf, isFingerprint, kv, modeName, pageHead, panel, row, setBusy, stat, timeView } from './parts.js';
+import { managedCard } from '../managed/managed.js';
+import { engineBadge, fingerprintView, generationState, hashOf, isFingerprint, kv, modeName, pageHead, panel, row, setBusy, stat, timeView } from '../parts.js';
 import { screens as recordScreens } from './records.js';
 
 export { generationState };
@@ -146,7 +148,10 @@ function configPanel(data) {
 }
 
 function mountOverview(ctx, root) {
-  const reload = button('', w('status.reload'), () => ctx.refreshStatus());
+  const reload = button('', w('status.reload'), () => {
+    ctx.refreshStatus();
+    card.read();
+  });
   const stamp = el('p', { class: 'tc-muted tc-small' });
   const body = el('div', { class: 'tc-stack tc-stack--wide' });
   mount(root, pageHead(w('overview.title'), reload), stamp, body);
@@ -164,12 +169,19 @@ function mountOverview(ctx, root) {
       body,
       failed,
       overviewStats(status.data),
-      el('div', { class: 'tc-overview' }, proxyPanel(status.data), generationsPanel(status.data), configPanel(status.data)),
+      el('div', { class: 'tc-overview' }, proxyPanel(status.data), generationsPanel(status.data), configPanel(status.data), card.node),
     );
   };
+  const card = managedCard(ctx);
   const stop = ctx.onStatus(draw);
   draw(ctx.status());
-  return { stop };
+  card.read();
+  return {
+    stop() {
+      stop();
+      card.stop();
+    },
+  };
 }
 
 export const screens = [

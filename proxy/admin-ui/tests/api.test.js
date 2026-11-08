@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { Api, ApiError, gateOf, kindOf, requestOf } from '../js/api.js';
 import { describe } from '../js/app.js';
 import { sentence, setLanguage, t } from '../js/i18n.js';
-import { generationState } from '../js/waf.js';
+import { generationState } from '../js/waf/waf.js';
 
 /**
  * A fetch that answers from a list, in order, and keeps what it was asked. A reply is `[status, body, fields]`: the

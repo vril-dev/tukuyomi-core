@@ -3,14 +3,14 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { ApiError } from '../js/api.js';
-import { actionsOf, screens as generationScreens } from '../js/generations.js';
+import { actionsOf, screens as generationScreens } from '../js/waf/generations.js';
 import { setLanguage, w } from '../js/i18n.js';
-import { ENGINES, Ended, LIMITS, checkFiles, checkRouteList, importBody, routesOfRows, toBase64, trialBlocked } from '../js/import.js';
+import { ENGINES, Ended, LIMITS, checkFiles, checkRouteList, importBody, routesOfRows, toBase64, trialBlocked } from '../js/waf/import.js';
 import { instantOf, canChange, clock, engineName, generationState, hashOf, shortOf, switchOutcome, timeCellText, timeLabel, timeText } from '../js/parts.js';
 import { parseRoute } from '../js/app.js';
 import { PAGE_SIZE, filterRows, nextDirection, pageOf, sortRows } from '../js/table.js';
-import { countOf, uptimeText } from '../js/waf.js';
-import { Pager, buildQuery, decodeText, screens as recordScreens, summaryOf } from '../js/records.js';
+import { countOf, uptimeText } from '../js/waf/waf.js';
+import { Pager, buildQuery, decodeText, screens as recordScreens, summaryOf } from '../js/waf/records.js';
 
 const file = (name, size) => ({ name, size });
 const codes = (check) => check.problems.map((problem) => problem.code);
@@ -274,7 +274,8 @@ test('a value is shown as text, and a record says what it is about in one line',
 
 test('every key that a script asks for is named in the call itself, so that the dictionary test sees it', () => {
   const scripts = new URL('../js/', import.meta.url);
-  for (const name of readdirSync(scripts).filter((file) => file !== 'i18n.js')) {
+  const files = readdirSync(scripts, { recursive: true }).filter((file) => file.endsWith('.js') && file !== 'i18n.js' && !file.endsWith('/words.js'));
+  for (const name of files) {
     const source = readFileSync(new URL(name, scripts), 'utf8');
     assert.ok(!/(?<![\w.])[tw]\(\s*[^'\s]/.test(source), `${name}: a key that is not a plain string`);
   }

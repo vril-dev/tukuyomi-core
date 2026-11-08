@@ -6,10 +6,10 @@
 // nothing is polled. A screen is `{ id, title, least, mount }`; `mount(ctx, root, route)` draws into `root` and gives
 // back `{ stop, show }`. Nothing runs when the module is loaded.
 
-import { badge, button, buttonClass, el, mount, notice } from './dom.js';
-import { w } from './i18n.js';
-import { Field, checkFields, checkbox, choice, fingerprintText, fingerprintView, hashOf, instantOf, isFingerprint, kv, pageHead, panelWith, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeView } from './parts.js';
-import { Table } from './table.js';
+import { badge, button, buttonClass, el, mount, notice } from '../dom.js';
+import { w } from '../i18n.js';
+import { Field, checkFields, checkbox, choice, fingerprintText, fingerprintView, hashOf, instantOf, isFingerprint, kv, pageHead, panelWith, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeView } from '../parts.js';
+import { Table } from '../table.js';
 
 /** The types of record there are. */
 export const TYPES = ['request', 'connection', 'tunnel', 'line', 'audit', 'dropped'];
