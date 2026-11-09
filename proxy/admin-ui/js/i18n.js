@@ -6,6 +6,7 @@
 // loaded.
 
 import { en as accountEnglish, ja as accountJapanese } from './account/words.js';
+import { en as editEnglish, ja as editJapanese } from './managed/edit/words.js';
 import { en as managedEnglish, ja as managedJapanese } from './managed/words.js';
 import { en as wafEnglish, ja as wafJapanese } from './waf/words.js';
 
@@ -26,6 +27,7 @@ const ja = {
   'login.step_lost': 'コードの入力の途中で画面が読み込み直されました。もう一度ログインしてください。',
   'login.step_expired': 'コードの入力に使える時間（5 分）を過ぎました。もう一度ログインしてください。',
   'login.changed': 'パスワードを変更しました。その後のログインの状態を読み込めなかったので、新しいパスワードでもう一度ログインしてください。',
+  'login.draft_dropped': '保存していない下書きを捨てました。',
 
   'mfa.title': '確認コードの入力',
   'mfa.intro': '認証アプリに表示されている 6 桁のコードを入力してください。',
@@ -97,6 +99,7 @@ const ja = {
   'working.import': 'ルールを取り込んでいます。試しの実行に時間がかかります…',
   'working.managed_activate': '画面の設定の版を反映しています…',
   'working.managed_rollback': '画面の設定を前の版に戻しています…',
+  'working.managed_apply': '下書きを保存して反映しています…',
 
   'word.switched': '切り替え済み',
   'word.unchanged': '変更なし',
@@ -162,6 +165,10 @@ const ja = {
   'table.clear': '絞り込みを消す',
   'nav.group.waf': 'WAF',
   'nav.group.records': '記録',
+  'nav.group.forward': '転送',
+  'nav.group.policy': '方針',
+  'nav.upstreams': '上流の組',
+  'nav.policy': 'アクセスと流量',
   'nav.group.managed': '設定',
   'nav.group.admin': '管理',
   'time.label': '時刻',
@@ -189,6 +196,7 @@ const en = {
   'login.step_lost': 'The page was reloaded in the middle of the code step. Sign in again.',
   'login.step_expired': 'The time for entering the code (5 minutes) is over. Sign in again.',
   'login.changed': 'The password was changed, but the state of the session could not be read afterwards. Sign in again with the new password.',
+  'login.draft_dropped': 'A draft that was not saved has been discarded.',
 
   'mfa.title': 'Verification code',
   'mfa.intro': 'Enter the 6-digit code that your authenticator app shows.',
@@ -260,6 +268,7 @@ const en = {
   'working.import': 'Importing the rules. The trial takes a while…',
   'working.managed_activate': 'Applying the version of the managed configuration…',
   'working.managed_rollback': 'Rolling back the managed configuration…',
+  'working.managed_apply': 'Saving and applying the draft…',
 
   'word.switched': 'Switched',
   'word.unchanged': 'Unchanged',
@@ -325,6 +334,10 @@ const en = {
   'table.clear': 'Clear the filter',
   'nav.group.waf': 'WAF',
   'nav.group.records': 'Records',
+  'nav.group.forward': 'Forwarding',
+  'nav.group.policy': 'Policy',
+  'nav.upstreams': 'Upstream groups',
+  'nav.policy': 'Access and rate',
   'nav.group.managed': 'Configuration',
   'nav.group.admin': 'Admin',
   'time.label': 'Time',
@@ -338,8 +351,8 @@ const en = {
 };
 
 export const dictionaries = {
-  ja: { ...ja, ...wafJapanese, ...accountJapanese, ...managedJapanese },
-  en: { ...en, ...wafEnglish, ...accountEnglish, ...managedEnglish },
+  ja: { ...ja, ...wafJapanese, ...accountJapanese, ...managedJapanese, ...editJapanese },
+  en: { ...en, ...wafEnglish, ...accountEnglish, ...managedEnglish, ...editEnglish },
 };
 
 let current = 'en';

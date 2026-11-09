@@ -16,6 +16,7 @@ import { Api, ApiError, gateOf } from './api.js';
 import { badge, button, el, mount, notice, retranslate } from './dom.js';
 import { LANGUAGES, language, lazy, pickLanguage, sentence, setLanguage, t, w } from './i18n.js';
 import { forgetEnded } from './waf/import.js';
+import { forgetDraft } from './managed/edit/draft.js';
 import { screens as managedScreens } from './managed/managed.js';
 import { Field, checkFields, clock, emptyField, hashOf, keepFocus, textInput } from './parts.js';
 import { refilter } from './table.js';
@@ -30,13 +31,15 @@ const ROLES = ['viewer', 'operator', 'owner'];
 const CODE_WAIT_MS = 5 * 60 * 1000;
 
 /**
- * The menu: groups of screens, in the order they are shown. The group of the overview has no name. The groups of the
- * stages to come (forwarding, policy, protection) are added here, with their screens, when the screens exist.
+ * The menu: groups of screens, in the order they are shown. The group of the overview has no name. A group that is
+ * still to come is added here, with its screens, when the screens exist.
  */
 const GROUPS = [
   { label: null, screens: ['overview'] },
   { label: w('nav.group.waf'), screens: ['generations', 'import', 'history'] },
   { label: w('nav.group.records'), screens: ['records', 'audit'] },
+  { label: w('nav.group.forward'), screens: ['upstreams'] },
+  { label: w('nav.group.policy'), screens: ['policy'] },
   { label: w('nav.group.managed'), screens: ['managed', 'managed-history', 'config'] },
   { label: w('nav.group.admin'), screens: ['account', 'users'] },
 ];
@@ -316,11 +319,12 @@ class App {
     this.leave();
     forgetHeld();
     forgetEnded();
+    const draftDropped = forgetDraft();
     this.user = null;
     this.api.csrf = null;
     this.status = { data: null, error: null, at: null, busy: false };
     const epoch = this.epoch;
-    const messages = el('div', { class: 'tc-stack', 'aria-live': 'polite' }, why ? notice('info', why) : null);
+    const messages = el('div', { class: 'tc-stack', 'aria-live': 'polite' }, why ? notice('info', why) : null, draftDropped ? notice('warn', w('login.draft_dropped')) : null);
     const name = new Field(w('login.name'), textInput({ name: 'username', autocomplete: 'username', maxlength: '32', autocapitalize: 'none', spellcheck: 'false' }), { required: true });
     const password = new Field(w('login.password'), textInput({ type: 'password', name: 'password', autocomplete: 'current-password', maxlength: '128' }), { required: true });
     const submit = button('primary', w('login.submit'), null, { type: 'submit' });

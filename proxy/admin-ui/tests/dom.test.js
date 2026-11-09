@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { ApiError } from '../js/api.js';
 import { bindAttribute, el, mount, retranslate, safeUrl, setText } from '../js/dom.js';
-import { setLanguage, w } from '../js/i18n.js';
+import { lazy, setLanguage, w } from '../js/i18n.js';
+import { forgetDraft, heldDraft } from '../js/managed/edit/draft.js';
 import { screens as generationScreens } from '../js/waf/generations.js';
 import { screens as wafScreens } from '../js/waf/waf.js';
 import { screens as importScreens } from '../js/waf/import.js';
@@ -558,4 +560,77 @@ test('the import form tells a missing rule file at the field, a line of routes w
   assert.equal(paths[1].getAttribute('aria-invalid'), null);
   assert.equal(document.activeElement, rules);
   screen.stop();
+});
+
+test('the screen of the upstream groups makes a draft from the selected version, and a refusal of a check is told at its field', async () => {
+  setLanguage('en');
+  // A draft with changes makes the page ask before it goes away, and these are what the fake page has for that.
+  globalThis.addEventListener = () => {};
+  globalThis.removeEventListener = () => {};
+  const server = { address: '127.0.0.1:8080', weight: 1, max_fails: 1, fail_timeout_ms: 10000, backup: false };
+  const version = { sites: [], upstreams: { app: { servers: [server] } }, routes: [], default_upstream: '' };
+  const sent = [];
+  const api = {
+    async call(method, path, body) {
+      if (method === 'POST') {
+        sent.push(path, body);
+        throw new ApiError('refused', 400, 'a server port is 0', { error: 'a server port is 0', at: 'upstreams.app.servers[0].address' });
+      }
+      if (path === '/api/managed') return { managed: true, current: FP, serving: FP, reachable: true, reloading: false, rollback_to: null, job: null };
+      if (path === `/api/managed/versions/${FP}`) return { name: FP, made: 1, current: true, serving: true, version };
+      if (path === '/api/status') return { proxy: { config: 'c'.repeat(64) } };
+      return { sha256: 'c'.repeat(64), forward: {}, proxy: { max_body: 1_000_000 } };
+    },
+  };
+  const ctx = { user: { name: 'ann', role: 'operator' }, api, describe: (error) => lazy(() => error.sentence), refreshStatus() {}, navigate() {} };
+  const root = document.createElement('main');
+  document.body.append(root);
+  const screen = managedScreens.find((item) => item.id === 'upstreams').mount(ctx, root, { id: null, query: {} });
+  await wait();
+  await wait();
+  await wait();
+  assert.equal(heldDraft().base, FP);
+  assert.equal(root.querySelectorAll('[data-row]').length, 1);
+  const pressed = (label) => press(root.querySelectorAll('button').find((item) => item.textContent === label));
+  // The panel of the group opens and takes the focus; what is typed goes to the draft, and the field stays where it is.
+  pressed('Edit');
+  const addressOf = () => root.querySelectorAll('input').find((input) => input.value.startsWith('127.0.0.1'));
+  const address = addressOf();
+  assert.equal(address.isConnected, true);
+  address.value = '127.0.0.1:0';
+  address.dispatch('input');
+  assert.equal(heldDraft().changed, true);
+  assert.equal(heldDraft().revision, 1);
+  assert.equal(address.isConnected, true);
+  // The panel is closed, so the refusal of the check has to open it again.
+  pressed('Close');
+  assert.equal(addressOf(), undefined);
+  pressed('Check');
+  await wait();
+  await wait();
+  assert.equal(sent[0], '/api/managed/check');
+  assert.equal(sent[1].expect, FP);
+  assert.equal(sent[1].version.upstreams.app.servers[0].address, '127.0.0.1:0');
+  assert.deepEqual(sent[1].files, []);
+  const refused = addressOf();
+  assert.equal(refused.value, '127.0.0.1:0');
+  assert.equal(refused.getAttribute('aria-invalid'), 'true');
+  assert.equal(root.querySelector(`[id="${refused.getAttribute('aria-describedby')}"]`).textContent, 'a server port is 0');
+  assert.equal(document.activeElement, refused);
+  // The list says where the error is, and the field that is corrected no longer says it.
+  assert.equal(root.querySelector('[data-row]').textContent.includes('Has an error'), true);
+  refused.value = '127.0.0.1:8081';
+  refused.dispatch('input');
+  assert.equal(refused.getAttribute('aria-invalid'), null);
+  // Choosing the default group is told in the list, and the choice stays where it is, with the focus.
+  const choice = root.querySelector('select');
+  choice.focus();
+  choice.value = String(heldDraft().groups[0].cid);
+  choice.dispatch('change');
+  assert.equal(heldDraft().defaultRef.cid, heldDraft().groups[0].cid);
+  assert.equal(root.querySelector('select'), choice);
+  assert.equal(document.activeElement, choice);
+  assert.equal(root.querySelector('[data-row]').textContent.includes('Default'), true);
+  screen.stop();
+  assert.equal(forgetDraft(), true);
 });

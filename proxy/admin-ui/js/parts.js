@@ -467,6 +467,7 @@ const WORKING = {
   import: () => w('working.import'),
   'managed-activate': () => w('working.managed_activate'),
   'managed-rollback': () => w('working.managed_rollback'),
+  'managed-apply': () => w('working.managed_apply'),
 };
 
 /**
@@ -513,7 +514,7 @@ export const working = new Working();
 
 /**
  * Runs the call of a change that may take long (`name` is `activate`, `rollback`, `remove`, `import`,
- * `managed-activate` or `managed-rollback`). The answer or the error comes back as `{ body, error }`, never thrown, so
+ * `managed-activate`, `managed-rollback` or `managed-apply`). The answer or the error comes back as `{ body, error }`, never thrown, so
  * that the screen decides what it means. A call that would start while another runs does not start (`skipped`).
  */
 export async function perform(name, call) {

@@ -612,6 +612,13 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
 
 /* the managed configuration */
 .tc-raw--tall { max-height: 32rem; }
+/* What a saving of the draft turns off is one fieldset, which has no frame of its own. */
+.tc-edit { min-width: 0; padding: 0; border: 0; }
+/* A list that is typed in lines: its lines are addresses and codes. */
+.tc-input--lines { min-height: 8rem; font-family: var(--font-mono); font-size: 13px; line-height: 20px; }
+/* A line of a server: the address, three numbers, the backup mark and the button. */
+.tc-rows__row--server { grid-template-columns: minmax(0, 2fr) repeat(3, minmax(0, 1fr)) auto auto; }
+.tc-rows__row--server > .tc-choice { margin-top: calc(20px + 2px + (var(--size-control) - 24px) / 2); }
 
 /* records */
 .tc-filters { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: var(--space-4); align-items: start; }
@@ -648,7 +655,7 @@ th[aria-sort="descending"] .tc-sort::after { content: "↓"; color: var(--ink); 
 .tc-codes li::before { content: counter(code) "."; min-width: 1.75rem; color: var(--ink-muted); text-align: right; }
 .tc-codes code { font-size: 15px; letter-spacing: 0.04em; user-select: all; }
 @media (max-width: 760px) {
-  .tc-rows__row { grid-template-columns: minmax(0, 1fr); }
-  .tc-rows__row > .tc-btn { justify-self: start; margin-top: 0; }
+  .tc-rows__row, .tc-rows__row--server { grid-template-columns: minmax(0, 1fr); }
+  .tc-rows__row > .tc-btn, .tc-rows__row--server > .tc-choice { justify-self: start; margin-top: 0; }
   .tc-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

@@ -74,7 +74,7 @@ static INDEX: File = File {
 };
 
 /// The other files, below `/ui/<version>/`.
-static FILES: [File; 22] = [
+static FILES: [File; 31] = [
     File {
         name: "app.css",
         kind: CSS,
@@ -164,6 +164,51 @@ static FILES: [File; 22] = [
         name: "managed/words.js",
         kind: JAVASCRIPT,
         bytes: include_bytes!("../../../admin-ui/js/managed/words.js"),
+    },
+    File {
+        name: "managed/edit/draft.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/draft.js"),
+    },
+    File {
+        name: "managed/edit/locate.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/locate.js"),
+    },
+    File {
+        name: "managed/edit/changes.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/changes.js"),
+    },
+    File {
+        name: "managed/edit/pem.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/pem.js"),
+    },
+    File {
+        name: "managed/edit/form.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/form.js"),
+    },
+    File {
+        name: "managed/edit/bar.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/bar.js"),
+    },
+    File {
+        name: "managed/edit/upstreams.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/upstreams.js"),
+    },
+    File {
+        name: "managed/edit/policy.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/policy.js"),
+    },
+    File {
+        name: "managed/edit/words.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/words.js"),
     },
     File {
         name: "account/account.js",

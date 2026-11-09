@@ -38,7 +38,7 @@ export function isJob(value) {
   return value !== null && typeof value === 'object' && (value.state === 'running' || value.state === 'ended') && isFingerprint(value.from) && isFingerprint(value.to);
 }
 
-const sameJob = (a, b) => a.kind === b.kind && a.actor === b.actor && a.to === b.to && a.started === b.started;
+export const sameJob = (a, b) => a.kind === b.kind && a.actor === b.actor && a.to === b.to && a.started === b.started;
 
 /**
  * Reads the job until it ends, one read at a time, a second after the answer to the one before. `ask` reads the job,

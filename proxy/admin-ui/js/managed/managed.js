@@ -6,8 +6,11 @@
 
 import { badge, button, buttonClass, el, mount, notice } from '../dom.js';
 import { t, w } from '../i18n.js';
-import { canChange, fingerprintText, fingerprintView, hashOf, isFingerprint, kv, panel, panelWith, row, shortOf, timeCell, timeCellText, timeLabel, timeView } from '../parts.js';
+import { canChange, confirmChange, fingerprintText, fingerprintView, hashOf, isFingerprint, kv, panel, panelWith, row, shortOf, timeCell, timeCellText, timeLabel, timeView, working } from '../parts.js';
 import { Table } from '../table.js';
+import { draftFromVersion, heldDraft, readableVersion, savingRuns, settleSaving } from './edit/draft.js';
+import { screens as policyScreens } from './edit/policy.js';
+import { screens as upstreamScreens } from './edit/upstreams.js';
 import { screens as historyScreens } from './history.js';
 import { isJob } from './job.js';
 import { Screen, countsOf, mountScreen, proxyOf, servingView, unusedNotice } from './screen.js';
@@ -205,10 +208,26 @@ class VersionsScreen extends Screen {
     return names.length === 0 ? null : el('span', { class: 'tc-badges' }, names.map((name) => badge(STATES[name].tone, STATES[name].words())));
   }
 
-  /** The button of a version; it is the main button of a detail, and in a row it is an ordinary one. */
+  /** A read has been taken in: a saving of the draft that ended while another screen was shown ends here too. */
+  follow(job) {
+    super.follow(job);
+    if (this.data.state.managed === true && settleSaving(this.data.state, this.ctx.user.name, working.name) === 'unseen') mount(this.results, notice('ok', w('edit.applied_found')));
+  }
+
+  /** Whether a saving of the draft by this user runs: until it ends, the draft stays what it is. */
+  saving() {
+    return savingRuns({ workingName: working.name, watching: this.watch.active, job: this.job, user: this.ctx.user.name });
+  }
+
+  /** The buttons of a version; applying it is the main button of a detail and an ordinary one in a row, and a draft is made from a detail only. */
   actions(item, inDetail = false) {
     if (this.error !== null || !versionActions(this.ctx.user.role, item, this.selected()).apply) return null;
-    return el('div', { class: 'tc-actions' }, button(inDetail ? 'primary' : 'small', w('managed.apply'), () => this.activate(item.name), { disabled: this.busy() }));
+    return el(
+      'div',
+      { class: 'tc-actions' },
+      button(inDetail ? 'primary' : 'small', w('managed.apply'), () => this.activate(item.name), { disabled: this.busy() }),
+      inDetail ? button('', w('edit.from_version'), () => this.draftFrom(item.name), { disabled: this.saving() }) : null,
+    );
   }
 
   drawBody() {
@@ -249,6 +268,7 @@ class VersionsScreen extends Screen {
       proxy === 'silent' ? notice('warn', w('managed.proxy.silent')) : null,
       proxy === 'unmanaged' ? notice('bad', w('managed.proxy.unmanaged')) : null,
       proxy === 'reloading' ? notice('info', w('managed.proxy.reloading')) : null,
+      heldDraft()?.changed === true ? notice('info', w('edit.held'), ' ', el('a', { class: 'tc-link', href: hashOf('upstreams') }, w('edit.held.open'))) : null,
       differs(state, this.watch.active) ? this.differNotice() : null,
       this.fileWaits() ? notice('warn', w('managed.file_waits')) : null,
       file?.refused ? notice('bad', w('managed.file_refused'), ' ', this.ctx.describe(file.refused)) : null,
@@ -289,6 +309,39 @@ class VersionsScreen extends Screen {
         row(w('managed.rollback_to'), isFingerprint(target) ? [fingerprintView(target), ' ', el('a', { class: 'tc-link', href: hashOf('managed-history') }, w('managed.rollback_open'))] : w('managed.rollback_none')),
       ),
     );
+  }
+
+  // ---- a draft from a version ----
+
+  /** The content of the version `name`; throws when it cannot be read or is not in the form of a version. */
+  async versionContent(name) {
+    const answer = await this.ctx.api.call('GET', `/api/managed/versions/${name}`);
+    if (!readableVersion(answer.version)) throw new Error('not a version');
+    return answer.version;
+  }
+
+  /** Makes a draft that holds the version `name`, on top of the selected one; one that is not saved goes only when the user says so. */
+  async draftFrom(name) {
+    const selected = this.selected();
+    if (this.asking || selected === null || this.saving()) return;
+    this.asking = true;
+    let contents;
+    try {
+      contents = await Promise.all([this.versionContent(selected), this.versionContent(name)]);
+    } catch (error) {
+      if (this.alive) mount(this.results, notice('bad', w('edit.from_version.failed'), ' ', this.ctx.describe(error)));
+      return;
+    } finally {
+      this.asking = false;
+    }
+    if (!this.alive) return;
+    if (heldDraft()?.changed === true) {
+      const yes = await confirmChange(this.layer, { title: w('edit.from_version.replace_title'), lines: [el('p', {}, w('edit.from_version.replace_what'))], confirm: w('edit.from_version.replace_title'), tone: 'danger' });
+      if (!yes || !this.alive) return;
+    }
+    draftFromVersion(selected, contents[0], contents[1], () => this.ctx.api.call('GET', '/api/session'));
+    mount(this.results, notice('ok', w('edit.from_version.done'), ' ', el('a', { class: 'tc-link', href: hashOf('upstreams') }, w('edit.from_version.open'))));
+    this.drawBody();
   }
 
   // ---- the changes ----
@@ -397,4 +450,4 @@ export function managedCard(ctx) {
   };
 }
 
-export const screens = [{ id: 'managed', title: w('nav.managed'), least: 'viewer', route: { id: isFingerprint }, mount: mountScreen(VersionsScreen) }, ...historyScreens];
+export const screens = [{ id: 'managed', title: w('nav.managed'), least: 'viewer', route: { id: isFingerprint }, mount: mountScreen(VersionsScreen) }, ...historyScreens, ...upstreamScreens, ...policyScreens];

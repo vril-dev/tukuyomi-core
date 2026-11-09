@@ -216,7 +216,7 @@ test('the scripts of the managed configuration never write to the storage of the
     ['a form of the address', /new\s+URL\b|URLSearchParams/],
   ];
   const scripts = new URL('../js/managed/', import.meta.url);
-  for (const name of readdirSync(scripts)) {
+  for (const name of readdirSync(scripts, { recursive: true }).filter((file) => file.endsWith('.js'))) {
     const source = readFileSync(new URL(name, scripts), 'utf8');
     for (const [what, pattern] of STORES) assert.doesNotMatch(source, pattern, `${name}: ${what}`);
   }

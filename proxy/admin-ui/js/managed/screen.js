@@ -45,7 +45,7 @@ export function countsOf(version) {
 }
 
 /** The lines of a confirmation for the versions `from` and `to` with their numbers (`null`: that version could not be read). */
-function diffRows(from, to, before, after) {
+export function diffRows(from, to, before, after) {
   const number = (counts, key) => (counts === null || counts[key] === null ? '—' : String(counts[key]));
   const present = (counts, key) => {
     if (counts === null) return '—';
@@ -232,19 +232,34 @@ export class Screen {
     await this.load();
   }
 
-  /** Sends a change and gives its `{ body, error }`, or null when none was sent or the screen is gone. */
-  async change(name, call) {
+  /**
+   * Sends a change and gives its `{ body, error }`, or null when none was sent or the screen is gone. `heard`, when it
+   * is given, receives the `{ body, error }` first, whether the screen is still there or not.
+   */
+  async change(name, call, heard = null) {
     this.mine = true;
     const outcome = await perform(name, call);
     this.mine = false;
     this.ctx.refreshStatus();
+    if (heard !== null && !outcome.skipped) heard(outcome);
     return outcome.skipped || !this.alive ? null : outcome;
   }
 
-  /** Sends a change to `path`: watches the job it started, or says why none started and reads the screen again. */
-  async send(name, path, body) {
+  /**
+   * Sends a change to `path`: watches the job it started, or says why none started and reads the screen again. `heard`
+   * (see `change`) takes over telling a refusal; `sending` runs right before the request leaves, and not at all for a
+   * change that does not start.
+   */
+  async send(name, path, body, heard = null, sending = null) {
     this.otherTold = false;
-    const done = await this.change(name, () => this.ctx.api.call('POST', path, body));
+    const done = await this.change(
+      name,
+      () => {
+        sending?.();
+        return this.ctx.api.call('POST', path, body);
+      },
+      heard,
+    );
     if (done === null) return;
     if (done.error === null) {
       if (isJob(done.body?.job)) {
@@ -261,7 +276,8 @@ export class Screen {
     }
     const kind = done.error instanceof ApiError ? done.error.kind : 'other';
     if (kind === 'unknown') mount(this.results, this.resultLost());
-    else mount(this.results, notice(kind === 'conflict' ? 'warn' : 'bad', this.ctx.describe(done.error, { change: true })));
+    else if (heard === null) mount(this.results, notice(kind === 'conflict' ? 'warn' : 'bad', this.ctx.describe(done.error, { change: true })));
+    else mount(this.results);
     await this.load();
   }
 
@@ -331,13 +347,17 @@ export class Screen {
     return { status, file };
   }
 
-  /** The two values of the configuration file that the screens use, or why it was refused (a 409): its other values are not kept. */
+  /**
+   * The values of the configuration file that the screens use (its SHA-256, the time of the lookup of the names, the
+   * limit of a body of the proxy, and whether it names a country database; `geo` is null when the file could not be
+   * read), or why it was refused (a 409): its other values are not kept.
+   */
   async readFile() {
     try {
       const answer = await this.ctx.api.call('GET', '/api/config');
-      return { sha256: answer.sha256, resolveMs: answer.forward?.resolve_timeout_ms, refused: null };
+      return { sha256: answer.sha256, resolveMs: answer.forward?.resolve_timeout_ms, maxBody: answer.proxy?.max_body, geo: answer.geo !== undefined && answer.geo !== null, refused: null };
     } catch (error) {
-      return { sha256: null, resolveMs: null, refused: error instanceof ApiError && error.status === 409 ? error : null };
+      return { sha256: null, resolveMs: null, maxBody: null, geo: null, refused: error instanceof ApiError && error.status === 409 ? error : null };
     }
   }
 }
