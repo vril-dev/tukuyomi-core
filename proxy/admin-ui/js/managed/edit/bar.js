@@ -10,7 +10,7 @@ import { badge, button, el, mount, notice } from '../../dom.js';
 import { lazy, t, w } from '../../i18n.js';
 import { confirmChange, diffView, fingerprintView, hashOf, isFingerprint, panelWith, setBusy, shortOf, working } from '../../parts.js';
 import { Screen, countsOf, diffRows, unusedNotice } from '../screen.js';
-import { changesBetween } from './changes.js';
+import { changesBetween, sitesToIssue } from './changes.js';
 import { forgetDraft, heldDraft, readableVersion, savingRuns, settleSaving, syncDraft, watchDraft } from './draft.js';
 import { barFault, faultAt } from './locate.js';
 
@@ -36,7 +36,9 @@ const ACTIONS = {
 };
 // The way to the screen of a field that is told in the band of another screen.
 const WAYS = {
+  sites: () => w('edit.way.sites'),
   upstreams: () => w('edit.way.upstreams'),
+  routes: () => w('edit.way.routes'),
   policy: () => w('edit.way.policy'),
 };
 // What an answer with nothing in it says, by its status: the proxy in front gave it, not the admin process.
@@ -122,7 +124,7 @@ export class EditScreen extends Screen {
     this.form = el('fieldset', { class: 'tc-edit tc-stack tc-stack--wide' });
     this.barBox.hidden = true;
     this.form.hidden = true;
-    /** Where the faults of this screen are shown: `<cid>:<field>` to `{ cid, field, box, note }`, a `Field` or a box of notices. */
+    /** Where the faults of this screen are shown: `<cid>:<field>` to `{ cid, field, box, note, part }`, a `Field` or a box of notices, and the `details` element around it (or null). */
     this.places = new Map();
     /** The faults that the places show, so that they are written again only when they change. */
     this.faultsShown = null;
@@ -284,15 +286,15 @@ export class EditScreen extends Screen {
 
   // ---- the places of the faults ----
 
-  /** A fault about the field `field` of the item `cid` is told at the `Field` `box`. */
-  placeField(cid, field, box) {
-    this.places.set(`${cid}:${field}`, { cid, field, box, note: null });
+  /** A fault about the field `field` of the item `cid` is told at the `Field` `box`, which is in the `details` element `part` when it is given. */
+  placeField(cid, field, box, part = null) {
+    this.places.set(`${cid}:${field}`, { cid, field, box, note: null, part });
     this.faultsShown = null;
   }
 
-  /** A fault about the item `cid` that no field holds is told in the box `note`. */
-  placeNote(cid, field, note) {
-    this.places.set(`${cid}:${field}`, { cid, field, box: null, note });
+  /** A fault about the item `cid` that no field holds is told in the box `note`, which is in the `details` element `part` when it is given. */
+  placeNote(cid, field, note, part = null) {
+    this.places.set(`${cid}:${field}`, { cid, field, box: null, note, part });
     this.faultsShown = null;
   }
 
@@ -302,17 +304,21 @@ export class EditScreen extends Screen {
     this.faultsShown = draft.faults;
     for (const place of this.places.values()) {
       const fault = draft.faults.find((one) => one.screen === this.screen && one.cid === place.cid && one.field === place.field);
+      // What is wrong is not left in a part that is closed.
+      if (fault !== undefined && place.part !== null) place.part.open = true;
       if (place.box === null) mount(place.note, fault === undefined ? null : notice('bad', fault.words));
       else if (fault === undefined) place.box.valid();
       else place.box.invalid(fault.words);
     }
   }
 
-  /** Opens the place of `fault`, which belongs to this screen, and puts the focus on it. */
+  /** Opens the place of `fault`, which belongs to this screen, and puts the focus on it; a closed `details` around it is opened first, as what is in one cannot take the focus. */
   openFault(fault, draft) {
     this.showFaults(draft);
     const place = this.places.get(`${fault.cid}:${fault.field}`);
-    if (place !== undefined) (place.box === null ? place.note : place.box.control).focus();
+    if (place === undefined) return;
+    if (place.part !== null) place.part.open = true;
+    (place.box === null ? place.note : place.box.control).focus();
   }
 
   openFirstFault(draft) {
@@ -379,12 +385,15 @@ export class EditScreen extends Screen {
 
   /** Asks whether to save what the check `checked` found, with what changes from the base. */
   askSave(draft, checked) {
+    const toIssue = sitesToIssue(draft.baseVersion, checked.version);
     return confirmChange(this.layer, {
       title: w('edit.confirm.title'),
       lines: [
         el('p', {}, w('edit.confirm.what')),
         changesView(changesBetween(draft.baseVersion, checked.version)),
         this.fileWaits() ? notice('warn', w('managed.file_waits')) : null,
+        toIssue > 0 ? notice('warn', w('edit.confirm.to_issue', { n: toIssue })) : null,
+        draft.choseChain() ? notice('info', w('edit.confirm.expiry')) : null,
         el('p', { class: 'tc-muted tc-small' }, w('managed.confirm.groups_reset')),
       ],
       diff: diffView([w('managed.confirm.now'), w('managed.confirm.after')], diffRows(draft.base, checked.to, countsOf(draft.baseVersion), countsOf(checked.version))),

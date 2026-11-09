@@ -44,6 +44,12 @@ export function countsOf(version) {
   };
 }
 
+/** How a confirmation and the content of a version tell the default group `name`: null is what could not be read, and the empty name is no group. */
+export function defaultGroupView(name) {
+  if (name === null) return '—';
+  return name === '' ? w('managed.diff.unset') : name;
+}
+
 /** The lines of a confirmation for the versions `from` and `to` with their numbers (`null`: that version could not be read). */
 export function diffRows(from, to, before, after) {
   const number = (counts, key) => (counts === null || counts[key] === null ? '—' : String(counts[key]));
@@ -63,7 +69,7 @@ export function diffRows(from, to, before, after) {
     counted(w('managed.diff.sites'), 'sites', number),
     counted(w('managed.diff.upstreams'), 'upstreams', number),
     counted(w('managed.diff.routes'), 'routes', number),
-    counted(w('managed.diff.default'), 'defaultUpstream', number),
+    counted(w('managed.diff.default'), 'defaultUpstream', (counts, key) => (counts === null ? '—' : defaultGroupView(counts[key]))),
     counted(w('managed.diff.access'), 'access', present),
     counted(w('managed.diff.rate_limit'), 'rateLimit', present),
   ];
@@ -349,15 +355,17 @@ export class Screen {
 
   /**
    * The values of the configuration file that the screens use (its SHA-256, the time of the lookup of the names, the
-   * limit of a body of the proxy, and whether it names a country database; `geo` is null when the file could not be
-   * read), or why it was refused (a 409): its other values are not kept.
+   * limit of a body of the proxy, whether it names a country database, an ACME account and records, and the host of the
+   * route to this admin screen; `geo`, `acme`, `records` and `adminHost` are null when the file could not be read), or
+   * why it was refused (a 409): its other values are not kept.
    */
   async readFile() {
     try {
       const answer = await this.ctx.api.call('GET', '/api/config');
-      return { sha256: answer.sha256, resolveMs: answer.forward?.resolve_timeout_ms, maxBody: answer.proxy?.max_body, geo: answer.geo !== undefined && answer.geo !== null, refused: null };
+      const present = (value) => value !== undefined && value !== null;
+      return { sha256: answer.sha256, resolveMs: answer.forward?.resolve_timeout_ms, maxBody: answer.proxy?.max_body, geo: present(answer.geo), acme: present(answer.acme), records: present(answer.records), adminHost: answer.admin?.route?.host ?? null, refused: null };
     } catch (error) {
-      return { sha256: null, resolveMs: null, maxBody: null, geo: null, refused: error instanceof ApiError && error.status === 409 ? error : null };
+      return { sha256: null, resolveMs: null, maxBody: null, geo: null, acme: null, records: null, adminHost: null, refused: error instanceof ApiError && error.status === 409 ? error : null };
     }
   }
 }

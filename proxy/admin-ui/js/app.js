@@ -38,7 +38,7 @@ const GROUPS = [
   { label: null, screens: ['overview'] },
   { label: w('nav.group.waf'), screens: ['generations', 'import', 'history'] },
   { label: w('nav.group.records'), screens: ['records', 'audit'] },
-  { label: w('nav.group.forward'), screens: ['upstreams'] },
+  { label: w('nav.group.forward'), screens: ['sites', 'upstreams', 'routes'] },
   { label: w('nav.group.policy'), screens: ['policy'] },
   { label: w('nav.group.managed'), screens: ['managed', 'managed-history', 'config'] },
   { label: w('nav.group.admin'), screens: ['account', 'users'] },

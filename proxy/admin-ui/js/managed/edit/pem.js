@@ -1,8 +1,9 @@
-// A file of PEM that the user chooses for a field of the draft: the authority of a group of upstreams. It is read in the
-// browser, checked to be text in UTF-8, and named by the SHA-256 of what is sent, which is the text and not the bytes
+// A file of PEM that the user chooses for a field of the draft: the authorities of a group of upstreams, or the chain or
+// the private key of a site. It is read in the browser, checked to be text in UTF-8, and named by the SHA-256 of what is sent, which is the text and not the bytes
 // that were read: a byte order mark at the start of a file is not part of the text. What is in a file is not shown.
-// A reading that a new choice or a change of the draft has passed by is dropped. Nothing runs when the module is
-// loaded.
+// What was read of a key is wiped as soon as it has served, on the way out of a failure as well; the text of a file
+// cannot be wiped in the browser, and goes when nothing refers to it. A reading that a new choice or a change of the
+// draft has passed by is dropped. Nothing runs when the module is loaded.
 
 import { w } from '../../i18n.js';
 
@@ -38,18 +39,27 @@ export async function pemFromBytes(bytes) {
   } catch {
     return null;
   }
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return { text, sha256: [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('') };
+  const encoded = new TextEncoder().encode(text);
+  try {
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', encoded);
+    return { text, sha256: [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('') };
+  } finally {
+    encoded.fill(0);
+  }
 }
 
 async function readPem(file, read) {
   if (globalThis.crypto?.subtle === undefined) return { problem: 'secure' };
   if (file.size > PEM_MAX) return { problem: 'size' };
+  let bytes = null;
   try {
-    const pem = await pemFromBytes(await read(file));
+    bytes = await read(file);
+    const pem = await pemFromBytes(bytes);
     return pem === null ? { problem: 'utf8' } : { pem: { ...pem, name: file.name, size: file.size } };
   } catch {
     return { problem: 'read' };
+  } finally {
+    bytes?.fill(0);
   }
 }
 

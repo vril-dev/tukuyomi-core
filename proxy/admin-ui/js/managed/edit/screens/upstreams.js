@@ -3,15 +3,15 @@
 // nothing is saved here: the band above the form checks and saves it. The list is drawn again with every change and the
 // panel is not, so that what is typed and the focus stay. Nothing runs when the module is loaded.
 
-import { badge, button, el, mount } from '../../dom.js';
-import { t, w } from '../../i18n.js';
-import { Field, bytesText, checkbox, choice, fingerprintView, panelWith } from '../../parts.js';
-import { Table } from '../../table.js';
-import { mountScreen } from '../screen.js';
-import { EditScreen } from './bar.js';
-import { caKey } from './draft.js';
-import { Rows, numberBox, selectBox, textBox } from './form.js';
-import { pemProblem, pickPem } from './pem.js';
+import { badge, button, el, mount } from '../../../dom.js';
+import { t, w } from '../../../i18n.js';
+import { bytesText, checkbox, choice, fingerprintView, panelWith } from '../../../parts.js';
+import { Table } from '../../../table.js';
+import { mountScreen } from '../../screen.js';
+import { EditScreen } from '../bar.js';
+import { caKey } from '../draft.js';
+import { Rows, fileBox, numberBox, selectBox, textBox } from '../form.js';
+import { pemProblem, pickPem } from '../pem.js';
 
 /** The marks of a group in the list: the tone of the badge, its words and the same words as text. */
 const MARKS = {
@@ -106,7 +106,7 @@ class UpstreamsScreen extends EditScreen {
     if (draft.defaultRef.cid === group.cid) names.push('default');
     if (group.fresh) names.push('fresh');
     else if (draft.groupChanged(group)) names.push('changed');
-    if (draft.faults.some((one) => one.group === group.cid)) names.push('fault');
+    if (draft.faults.some((one) => one.panel === group.cid)) names.push('fault');
     return names;
   }
 
@@ -123,15 +123,15 @@ class UpstreamsScreen extends EditScreen {
   /** Opens the panel of the group `cid` and puts the focus on its name. */
   openGroup(cid) {
     const draft = this.shown;
-    draft.openGroup = cid;
+    draft.openPanels.upstreams = cid;
     this.drawPanel(draft);
     this.showFaults(draft);
     this.places.get(`${cid}:name`)?.box.control.focus();
   }
 
   closePanel(draft) {
-    const cid = draft.openGroup;
-    draft.openGroup = null;
+    const cid = draft.openPanels.upstreams;
+    draft.openPanels.upstreams = null;
     this.drawPanel(draft);
     if (!this.table.focusRow(String(cid))) this.root.querySelector('h1')?.focus();
   }
@@ -142,7 +142,7 @@ class UpstreamsScreen extends EditScreen {
     for (const key of [...this.places.keys()]) {
       if (!OUTSIDE_PANEL.has(key)) this.places.delete(key);
     }
-    const group = draft.group(draft.openGroup);
+    const group = draft.group(draft.openPanels.upstreams);
     this.panelOf = group === null ? null : group.cid;
     this.caShown = null;
     this.removeKey = null;
@@ -178,7 +178,7 @@ class UpstreamsScreen extends EditScreen {
 
   /** Opens the panel that holds the fault first: the first fault of the draft has made it the open one. */
   openFault(fault, draft) {
-    if (fault.group !== null && fault.group !== this.panelOf) this.drawPanel(draft);
+    if (fault.panel !== null && fault.panel !== this.panelOf) this.drawPanel(draft);
     super.openFault(fault, draft);
   }
 
@@ -226,14 +226,7 @@ class UpstreamsScreen extends EditScreen {
     use.checked = group.tls;
     const chosen = el('div', {}, this.caView(draft, group));
     this.caShown = { cid: group.cid, node: chosen };
-    const input = el('input', { type: 'file', class: 'tc-file' });
-    const ca = new Field(w('edit.tls.choose'), input, { hint: w('edit.tls.ca_hint'), asButton: true });
-    input.addEventListener('change', () => {
-      const file = input.files[0];
-      // Cleared, so that the same file can be chosen again.
-      input.value = '';
-      if (file !== undefined) this.chooseCa(draft, group, file);
-    });
+    const ca = fileBox(w('edit.tls.choose'), { hint: w('edit.tls.ca_hint'), onFile: (file) => this.chooseCa(draft, group, file) });
     this.placeField(group.cid, 'ca', ca);
     const serverName = textBox(w('edit.tls.server_name'), group.server_name, { hint: w('edit.tls.server_name_hint'), onInput: (value) => draft.write(group, 'server_name', value) });
     this.placeField(group.cid, 'server_name', serverName);
@@ -253,10 +246,10 @@ class UpstreamsScreen extends EditScreen {
     const outcome = await pickPem(draft, caKey(group.cid), file);
     if (outcome === null) return;
     if (outcome.problem !== undefined) {
-      draft.putFault({ screen: 'upstreams', group: group.cid, cid: group.cid, field: 'ca', words: pemProblem(outcome.problem) });
+      draft.putFault({ screen: 'upstreams', panel: group.cid, cid: group.cid, field: 'ca', words: pemProblem(outcome.problem) });
       return;
     }
-    draft.useCa(group, outcome.pem);
+    draft.useFile(group, 'ca', outcome.pem);
     if (this.caShown?.cid === group.cid) mount(this.caShown.node, this.caView(draft, group));
   }
 

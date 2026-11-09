@@ -1,124 +1,18 @@
-// The draft of the managed configuration: what the user has changed on the screens of the upstreams and of the policy,
-// and has not saved. There is one, kept here and only in the memory of this page: nothing of it goes to the storage of
-// the browser, the address or the history. A draft with no change is dropped when the screens are left, and one with
-// changes stays while the user is signed in (`forgetDraft` gives it up with the sign-in). The fields hold the text
-// that was typed, and `build` is the one place that makes a version of it: what no form has touched is carried over
-// from the version the draft was made from, as it was. The items of the draft have numbers of their own (`cid`) that
-// never leave the page. Nothing runs when the module is loaded.
+// The draft of the managed configuration: what the user has changed on the screens that edit it, and has not saved.
+// There is one, kept here and only in the memory of this page: nothing of it goes to the storage of the browser, the
+// address or the history. A draft with no change is dropped when the screens are left, and one with changes stays while
+// the user is signed in (`forgetDraft` gives it up with the sign-in). The fields hold the text that was typed, and
+// `build` is the one place that makes a version of it: what no form has touched is carried over from the version the
+// draft was made from, as it was. Nothing runs when the module is loaded.
 
 import { w } from '../../i18n.js';
 import { emptyField } from '../../parts.js';
 import { isJob, sameJob } from '../job.js';
-
-/** A name of a group of upstreams, as the API takes it. */
-const NAME = /^[A-Za-z0-9_-]{1,64}$/;
-// A number of the kind `u32` is written with at most 9 digits, and any other with at most 15: a number past what the
-// API can read is refused about the whole item, so it is told here at its field.
-const U32 = /^[0-9]{1,9}$/;
-const WIDE = /^[0-9]{1,15}$/;
-// The forms of a line of a list; what is in a line that has the form is for the check of the API.
-const NETWORK = /^[0-9A-Fa-f:.]+\/[0-9]{1,3}$/;
-const COUNTRY = /^([A-Z]{2}|UNKNOWN)$/;
+import { NAME, accessOf, builtAccess, builtRate, builtServer, builtSite, builtTls, fault, groupOf, linesOf, newGroup, newServer, newSite, plain, rateOf, readableSite, siteOf, siteText, snapshot } from './items.js';
+import { builtRoute, makeForm, newRoute, readableRoute, routeChanged, routeLine, routeOf } from './route-items.js';
 
 // An edit of a draft with changes that comes this long after the last request keeps the session alive: an edit is use.
 const TOUCH_MS = 30_000;
-
-const SERVER_NUMBERS = [
-  ['weight', U32, 9],
-  ['max_fails', U32, 9],
-  ['fail_timeout_ms', WIDE, 15],
-];
-const RATE_NUMBERS = [
-  ['rate', U32, 9],
-  ['burst', U32, 9],
-  ['keys', WIDE, 15],
-];
-const networkLine = (line) => w('edit.fault.network', { line });
-const countryLine = (line) => w('edit.fault.country', { line });
-const ACCESS_LISTS = [
-  ['deny_cidrs', NETWORK, networkLine],
-  ['allow_cidrs', NETWORK, networkLine],
-  ['deny_countries', COUNTRY, countryLine],
-  ['allow_countries', COUNTRY, countryLine],
-];
-
-const plain = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
-
-let serial = 0;
-
-function nextCid() {
-  serial += 1;
-  return serial;
-}
-
-function serverOf(raw) {
-  return {
-    cid: nextCid(),
-    address: String(raw.address ?? ''),
-    weight: String(raw.weight ?? ''),
-    max_fails: String(raw.max_fails ?? ''),
-    fail_timeout_ms: String(raw.fail_timeout_ms ?? ''),
-    backup: raw.backup === true,
-    raw,
-  };
-}
-
-/** A new server: the values of a server of nginx that says nothing else. */
-function newServer() {
-  return { cid: nextCid(), address: '', weight: '1', max_fails: '1', fail_timeout_ms: '10000', backup: false, raw: {} };
-}
-
-/** What a group holds as text, to tell whether it has changed since the draft was made. */
-function snapshot(group) {
-  const servers = group.servers.map((server) => [server.address, server.weight, server.max_fails, server.fail_timeout_ms, server.backup]);
-  return JSON.stringify([group.name, group.tls, group.ca, group.server_name, servers]);
-}
-
-function groupOf(name, raw) {
-  const tls = Object.hasOwn(raw, 'tls') ? raw.tls : {};
-  const group = {
-    cid: nextCid(),
-    fresh: false,
-    name,
-    servers: raw.servers.map(serverOf),
-    tls: Object.hasOwn(raw, 'tls'),
-    ca: typeof tls.ca === 'string' ? tls.ca : '',
-    server_name: typeof tls.server_name === 'string' ? tls.server_name : '',
-    raw,
-  };
-  group.origin = snapshot(group);
-  return group;
-}
-
-function newGroup() {
-  return { cid: nextCid(), fresh: true, name: '', servers: [newServer()], tls: false, ca: '', server_name: '', raw: {} };
-}
-
-const linesText = (list) => (Array.isArray(list) ? list.join('\n') : '');
-
-function accessOf(raw) {
-  return {
-    cid: 'access',
-    on: raw !== undefined,
-    deny_cidrs: linesText(raw?.deny_cidrs),
-    allow_cidrs: linesText(raw?.allow_cidrs),
-    deny_countries: linesText(raw?.deny_countries),
-    allow_countries: linesText(raw?.allow_countries),
-    raw: raw ?? {},
-  };
-}
-
-function rateOf(raw) {
-  return {
-    cid: 'rate',
-    on: raw !== undefined,
-    rate: String(raw?.rate ?? ''),
-    burst: String(raw?.burst ?? ''),
-    keys: String(raw?.keys ?? ''),
-    exempt_cidrs: linesText(raw?.exempt_cidrs),
-    raw: raw ?? {},
-  };
-}
 
 /**
  * Whether `version` has the form that a draft is made from: the API has checked its content, and a version that is not
@@ -132,39 +26,14 @@ export function readableVersion(version) {
     plain(version.upstreams) &&
     Object.values(version.upstreams).every(group) &&
     Array.isArray(version.sites) &&
-    version.sites.every(plain) &&
+    version.sites.every(readableSite) &&
     Array.isArray(version.routes) &&
-    version.routes.every(plain) &&
+    version.routes.every(readableRoute) &&
     typeof version.default_upstream === 'string' &&
     optional('access') &&
     optional('rate_limit')
   );
 }
-
-/** The lines of a list as it was typed, without what is blank, each with its number in the box (from 1). */
-function linesOf(text) {
-  return text
-    .split('\n')
-    .map((line, at) => ({ text: line.trim(), line: at + 1 }))
-    .filter((entry) => entry.text !== '');
-}
-
-/** The number that `text` holds, or 0 with the fault told to `report`. */
-function numberOf(text, pattern, digits, report) {
-  const value = text.trim();
-  if (value === '') {
-    report(emptyField());
-    return 0;
-  }
-  if (!pattern.test(value)) {
-    report(w('edit.fault.number', { digits }));
-    return 0;
-  }
-  return Number(value);
-}
-
-/** A fault of a field: the screen, the group whose panel holds it (null: none), the item and the field it is about, and its words. */
-const fault = (screen, group, cid, field, words) => ({ screen, group, cid, field, words });
 
 // ---- the draft ----
 
@@ -192,20 +61,23 @@ export class Draft {
     this.faults = [];
     /** What the band says of the last check, `{ tone, words }`. */
     this.said = [];
-    /** The group whose panel is open. */
-    this.openGroup = null;
+    /** The item whose panel is open, by the screens that have panels. */
+    this.openPanels = { upstreams: null, sites: null, routes: null };
     this.checking = false;
     /** How many files are being read, and the reading of each field that still counts. */
     this.reading = 0;
     this.readings = new Map();
     /** The files that were chosen: SHA-256 to `{ text, name, size }`. */
     this.files = new Map();
+    /** Grows with every change that the list of the routes shows, so that the list need not look at every route to know. */
+    this.routeList = 0;
     this.groups = Object.entries(source.upstreams).map(([name, raw]) => groupOf(name, raw));
     const cids = new Map(this.groups.map((group) => [group.name, group.cid]));
     const refOf = (name) => (cids.has(name) ? { cid: cids.get(name) } : { text: name });
     this.defaultRef = refOf(source.default_upstream);
-    this.routes = source.routes.map((raw) => ({ raw, ref: refOf(raw.upstream) }));
-    this.access = accessOf(source.access);
+    this.routes = source.routes.map((raw) => routeOf(raw, refOf(raw.upstream)));
+    this.sites = source.sites.map(siteOf);
+    this.access = accessOf(source.access, 'access');
     this.rate = rateOf(source.rate_limit);
   }
 
@@ -218,9 +90,24 @@ export class Draft {
   edited() {
     this.revision += 1;
     if (this.said.length > 0) this.said = [];
+    this.#prune();
     this.#touch();
     guard();
     tell();
+  }
+
+  /** Lets go of the files that no field names any more: a private key stays no longer than something uses it. The file of the authorities of a group that has TLS turned off is still named, and comes back with TLS. */
+  #prune() {
+    const named = new Set();
+    for (const group of this.groups) named.add(group.ca);
+    for (const site of this.sites) {
+      if (site.kind !== 'file') continue;
+      named.add(site.chain);
+      named.add(site.key);
+    }
+    for (const sha256 of this.files.keys()) {
+      if (!named.has(sha256)) this.files.delete(sha256);
+    }
   }
 
   /** An edit is use of the session, so it keeps the session alive: at most one request in `TOUCH_MS`. The answer is not looked at. */
@@ -280,7 +167,7 @@ export class Draft {
   /** The first fault of the screen `screen`, whose panel is the one to open, or null. */
   firstFault(screen) {
     const first = this.faults.find((one) => one.screen === screen) ?? null;
-    if (first !== null && first.group !== null) this.openGroup = first.group;
+    if (first !== null && first.panel !== null) this.openPanels[screen] = first.panel;
     return first;
   }
 
@@ -318,7 +205,7 @@ export class Draft {
   addGroup() {
     const group = newGroup();
     this.groups.push(group);
-    this.openGroup = group.cid;
+    this.openPanels.upstreams = group.cid;
     this.clearFault('groups', 'notice');
     this.edited();
     return group;
@@ -329,8 +216,8 @@ export class Draft {
     if (!this.mayRemove(cid)) return false;
     this.groups = this.groups.filter((one) => one.cid !== cid);
     this.readings.delete(caKey(cid));
-    if (this.openGroup === cid) this.openGroup = null;
-    this.putFaults(this.faults.filter((one) => one.group !== cid));
+    if (this.openPanels.upstreams === cid) this.openPanels.upstreams = null;
+    this.putFaults(this.faults.filter((one) => one.panel !== cid));
     this.clearFault('groups', 'notice');
     this.edited();
     return true;
@@ -359,6 +246,114 @@ export class Draft {
     this.edited();
   }
 
+  // ---- the sites ----
+
+  site(cid) {
+    return this.sites.find((one) => one.cid === cid) ?? null;
+  }
+
+  /** Whether a site differs from what it was when the draft was made; a new site is told as new. */
+  siteChanged(site) {
+    return !site.fresh && siteText(site) !== site.origin;
+  }
+
+  addSite() {
+    const site = newSite();
+    this.sites.push(site);
+    this.openPanels.sites = site.cid;
+    this.clearFault('sites', 'notice');
+    this.edited();
+    return site;
+  }
+
+  /** Takes the site `cid` away, with what is told of it and the files it is reading. Nothing refers to a site, so any may go. */
+  removeSite(cid) {
+    this.sites = this.sites.filter((one) => one.cid !== cid);
+    this.readings.delete(siteFileKey(cid, 'chain'));
+    this.readings.delete(siteFileKey(cid, 'key'));
+    if (this.openPanels.sites === cid) this.openPanels.sites = null;
+    this.putFaults(this.faults.filter((one) => one.panel !== cid));
+    this.clearFault('sites', 'notice');
+    this.edited();
+  }
+
+  /**
+   * The certificate of `site` is of the kind `kind` (`file` or `acme`). To `acme`, the chain and the key are dropped with
+   * what is being read for them, so that the key of a site that no longer uses it does not stay in the draft; back to
+   * `file`, the site names the files of the version it was read from, if it had any.
+   */
+  setSiteKind(site, kind) {
+    if (site.kind === kind) return;
+    site.kind = kind;
+    this.readings.delete(siteFileKey(site.cid, 'chain'));
+    this.readings.delete(siteFileKey(site.cid, 'key'));
+    const was = kind === 'file' && Object.hasOwn(site.raw.certificate ?? {}, 'chain') ? site.raw.certificate : null;
+    site.chain = was === null ? '' : was.chain;
+    site.key = was === null ? '' : was.key;
+    for (const field of ['chain', 'key', 'renew_before_days', 'certificate', 'notice']) this.clearFault(site.cid, field);
+    this.edited();
+  }
+
+  // ---- the routes ----
+
+  route(cid) {
+    return this.routes.find((one) => one.cid === cid) ?? null;
+  }
+
+  addRoute() {
+    const route = newRoute();
+    this.routes.push(route);
+    this.openPanels.routes = route.cid;
+    this.routeList += 1;
+    this.clearFault('routes', 'notice');
+    this.edited();
+    return route;
+  }
+
+  /** Takes the route `cid` away, with what is told of it. Nothing refers to a route, so any may go. */
+  removeRoute(cid) {
+    this.routes = this.routes.filter((one) => one.cid !== cid);
+    if (this.openPanels.routes === cid) this.openPanels.routes = null;
+    this.routeList += 1;
+    this.putFaults(this.faults.filter((one) => one.panel !== cid));
+    this.clearFault('routes', 'notice');
+    this.edited();
+  }
+
+  /** The user wrote to a field `key` of `item`, the form of `route` or one of its parts. The list of the routes is told only when a line of it would change. */
+  writeRoute(route, item, key, value) {
+    const before = routeLine(route);
+    item[key] = value;
+    if (routeLine(route) !== before) this.routeList += 1;
+    this.write(item, key, value);
+  }
+
+  /** The group of `route` is the group whose `cid` is `value` (the value of the choice of the form), or none. */
+  setRouteUpstream(route, value) {
+    const group = this.groups.find((one) => String(one.cid) === String(value));
+    route.ref = group === undefined ? { text: '' } : { cid: group.cid };
+    this.routeList += 1;
+    this.clearFault(route.cid, 'upstream');
+    this.clearFault(route.cid, 'notice');
+    this.edited();
+  }
+
+  /** The form of `route`, made the first time its panel is opened. Making it is no edit: nothing is told of it, and the draft does not change. */
+  routeForm(route) {
+    if (route.form === null) makeForm(route);
+    return route.form;
+  }
+
+  /** Whether a route differs from what it was when its form was made. */
+  routeChanged(route) {
+    return routeChanged(route);
+  }
+
+  /** Whether a file of a certificate chain was chosen in this draft, for a confirmation to say what a check does not look at. */
+  choseChain() {
+    return this.sites.some((site) => site.kind === 'file' && this.files.has(site.chain));
+  }
+
   // ---- the files ----
 
   /** Starts a reading for the field `key`: a reading of it that runs on no longer counts. Gives the mark of this one. */
@@ -379,74 +374,25 @@ export class Draft {
     return counts;
   }
 
-  /** The file `pem` is the authority of `group`; a file of the same content is held once. */
-  useCa(group, pem) {
+  /** The file `pem` is what the field `field` of `item` names (the authority of a group, the chain or the key of a site); a file of the same content is held once. */
+  useFile(item, field, pem) {
     this.files.set(pem.sha256, { text: pem.text, name: pem.name, size: pem.size });
-    this.write(group, 'ca', pem.sha256);
+    this.write(item, field, pem.sha256);
   }
 
   // ---- a version from the draft ----
 
-  #nameOf(ref) {
+  /** The name of the group that `ref` stands for, as it is written now; a name that no group has stays as it was read. */
+  nameOf(ref) {
     return ref.cid === undefined ? ref.text : this.group(ref.cid).name.trim();
-  }
-
-  #builtServer(group, server, faults) {
-    const report = (key) => (words) => faults.push(fault('upstreams', group.cid, server.cid, key, words));
-    const built = { ...server.raw, address: server.address.trim(), backup: server.backup };
-    if (built.address === '') report('address')(emptyField());
-    for (const [key, pattern, digits] of SERVER_NUMBERS) built[key] = numberOf(server[key], pattern, digits, report(key));
-    return built;
-  }
-
-  /** The `tls` of a group, or undefined when the group does not use TLS. */
-  #builtTls(group, faults) {
-    if (!group.tls) return undefined;
-    if (group.ca === '') faults.push(fault('upstreams', group.cid, group.cid, 'ca', w('edit.fault.ca')));
-    const built = { ...group.raw.tls, ca: group.ca };
-    const name = group.server_name.trim();
-    if (name === '') delete built.server_name;
-    else built.server_name = name;
-    return built;
-  }
-
-  /** The values of the list under `key`, with a fault at the first line that is not in the form of its list. */
-  #builtList(item, key, pattern, problem, faults) {
-    const lines = linesOf(item[key]);
-    const wrong = lines.find((entry) => !pattern.test(entry.text));
-    if (wrong !== undefined) faults.push(fault('policy', null, item.cid, key, problem(wrong.line)));
-    return lines.map((entry) => entry.text);
-  }
-
-  /** The object of `item` with its list under `key`: a key that was written stays when the list is empty, and one that was not is written for lines only. */
-  #withList(built, item, key, values) {
-    if (values.length > 0 || Object.hasOwn(item.raw, key)) built[key] = values;
-  }
-
-  #builtAccess(faults) {
-    const { access } = this;
-    if (!access.on) return undefined;
-    const built = { ...access.raw };
-    for (const [key, pattern, problem] of ACCESS_LISTS) this.#withList(built, access, key, this.#builtList(access, key, pattern, problem, faults));
-    return built;
-  }
-
-  #builtRate(faults) {
-    const { rate } = this;
-    if (!rate.on) return undefined;
-    const built = { ...rate.raw };
-    for (const [key, pattern, digits] of RATE_NUMBERS) {
-      built[key] = numberOf(rate[key], pattern, digits, (words) => faults.push(fault('policy', null, rate.cid, key, words)));
-    }
-    this.#withList(built, rate, 'exempt_cidrs', this.#builtList(rate, 'exempt_cidrs', NETWORK, networkLine, faults));
-    return built;
   }
 
   /**
    * The draft as what a request carries: `{ version, files, map }`, or `{ faults }` when a field is not in its form. `map`
    * says what the numbers and the names of the request stand for: `groups` a `Map` from a name to `{ cid, servers }`
-   * (the numbers of its servers by their place), and `files` the place of the field that chose each file of `files`. It
-   * is a copy of that moment: an answer speaks of the request as it was sent.
+   * (the numbers of its servers by their place), `files` the place of the field that chose each file of `files`, `sites`
+   * `{ cid, hostLines }` by their place (the line of the box of each host), and `routes` the number of each route. It is
+   * a copy of that moment: an answer speaks of the request as it was sent.
    */
   build() {
     const faults = [];
@@ -455,6 +401,13 @@ export class Draft {
     const named = new Set();
     const files = [];
     const map = { groups: new Map(), files: [] };
+    // A file goes once, with the place of the first field that names it, and only when the draft holds it.
+    const nameFile = (sha256, place) => {
+      if (!this.files.has(sha256) || named.has(sha256)) return;
+      named.add(sha256);
+      files.push(this.files.get(sha256).text);
+      map.files.push(place);
+    };
     for (const group of this.groups) {
       const name = group.name.trim();
       const nameFault = (words) => faults.push(fault('upstreams', group.cid, group.cid, 'name', words));
@@ -462,34 +415,40 @@ export class Draft {
       else if (!NAME.test(name)) nameFault(w('edit.fault.group_name'));
       else if (seen.has(name)) nameFault(w('edit.fault.group_twice'));
       seen.add(name);
-      const built = { ...group.raw, servers: group.servers.map((server) => this.#builtServer(group, server, faults)) };
-      const tls = this.#builtTls(group, faults);
+      const built = { ...group.raw, servers: group.servers.map((server) => builtServer(group, server, faults)) };
+      const tls = builtTls(group, faults);
       if (tls === undefined) {
         delete built.tls;
       } else {
         built.tls = tls;
-        if (this.files.has(tls.ca) && !named.has(tls.ca)) {
-          named.add(tls.ca);
-          files.push(this.files.get(tls.ca).text);
-          map.files.push({ screen: 'upstreams', group: group.cid, cid: group.cid, field: 'ca' });
-        }
+        nameFile(tls.ca, { screen: 'upstreams', panel: group.cid, cid: group.cid, field: 'ca' });
       }
       pairs.push([name, built]);
       map.groups.set(name, { cid: group.cid, servers: group.servers.map((server) => server.cid) });
     }
-    const access = this.#builtAccess(faults);
-    const rate = this.#builtRate(faults);
+    const sites = this.sites.map((site) => builtSite(site, faults));
+    for (const site of this.sites) {
+      if (site.kind !== 'file') continue;
+      nameFile(site.chain, { screen: 'sites', panel: site.cid, cid: site.cid, field: 'chain' });
+      nameFile(site.key, { screen: 'sites', panel: site.cid, cid: site.cid, field: 'key' });
+    }
+    const routes = this.routes.map((route) => builtRoute(route, this.nameOf(route.ref), faults));
+    const access = builtAccess(this.access, 'policy', null, faults);
+    const rate = builtRate(this.rate, faults);
     if (faults.length > 0) return { faults };
     const version = {
       ...this.source,
+      sites,
       upstreams: Object.fromEntries(pairs),
-      routes: this.routes.map((route) => ({ ...route.raw, upstream: this.#nameOf(route.ref) })),
-      default_upstream: this.#nameOf(this.defaultRef),
+      routes,
+      default_upstream: this.nameOf(this.defaultRef),
     };
     delete version.access;
     delete version.rate_limit;
     if (access !== undefined) version.access = access;
     if (rate !== undefined) version.rate_limit = rate;
+    map.sites = this.sites.map((site) => ({ cid: site.cid, hostLines: linesOf(site.hosts).map((entry) => entry.line) }));
+    map.routes = this.routes.map((route) => route.cid);
     return { version, files, map };
   }
 }
@@ -497,6 +456,11 @@ export class Draft {
 /** The key of the reading of the file of the authority of the group `cid`. */
 export function caKey(cid) {
   return `ca:${cid}`;
+}
+
+/** The key of the reading of the chain or the key (`field`) of the site `cid`. */
+export function siteFileKey(cid, field) {
+  return `${field}:${cid}`;
 }
 
 // ---- the one draft of the page ----

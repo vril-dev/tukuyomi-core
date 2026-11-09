@@ -3,12 +3,12 @@
 // and saves it. Each part can be turned off, and what it holds stays in the draft meanwhile. Nothing runs when the module
 // is loaded.
 
-import { el, mount, notice } from '../../dom.js';
-import { w } from '../../i18n.js';
-import { checkbox, choice, panelWith } from '../../parts.js';
-import { mountScreen } from '../screen.js';
-import { EditScreen } from './bar.js';
-import { linesBox, numberBox } from './form.js';
+import { el, mount, notice } from '../../../dom.js';
+import { w } from '../../../i18n.js';
+import { checkbox, choice, panelWith } from '../../../parts.js';
+import { mountScreen } from '../../screen.js';
+import { EditScreen } from '../bar.js';
+import { linesBox, numberBox } from '../form.js';
 
 class PolicyScreen extends EditScreen {
   constructor(ctx, root) {

@@ -10,6 +10,7 @@ import { screens as wafScreens } from '../js/waf/waf.js';
 import { screens as importScreens } from '../js/waf/import.js';
 import { jobResult } from '../js/managed/job.js';
 import { screens as managedScreens } from '../js/managed/managed.js';
+import { countsOf, defaultGroupView, diffRows } from '../js/managed/screen.js';
 import { valueTree } from '../js/managed/history.js';
 import { start } from '../js/app.js';
 
@@ -633,4 +634,184 @@ test('the screen of the upstream groups makes a draft from the selected version,
   assert.equal(root.querySelector('[data-row]').textContent.includes('Default'), true);
   screen.stop();
   assert.equal(forgetDraft(), true);
+});
+
+/** A screen of the draft on the fake page, with an API that gives `version`, and answers a check with the 400 for `at` (and `sentence`). */
+async function editScreen(id, version, refusal) {
+  setLanguage('en');
+  globalThis.addEventListener = () => {};
+  globalThis.removeEventListener = () => {};
+  const sent = [];
+  const api = {
+    async call(method, path, body) {
+      if (method === 'POST') {
+        sent.push(path, body);
+        const { at, sentence } = refusal();
+        throw new ApiError('refused', 400, sentence, { error: sentence, at });
+      }
+      if (path === '/api/managed') return { managed: true, current: FP, serving: FP, reachable: true, reloading: false, rollback_to: null, job: null };
+      if (path === `/api/managed/versions/${FP}`) return { name: FP, made: 1, current: true, serving: true, version };
+      if (path === '/api/status') return { proxy: { config: 'c'.repeat(64) } };
+      return { sha256: 'c'.repeat(64), forward: {}, proxy: { max_body: 1_000_000 } };
+    },
+  };
+  const ctx = { user: { name: 'ann', role: 'operator' }, api, describe: (error) => lazy(() => error.sentence), refreshStatus() {}, navigate() {} };
+  const root = document.createElement('main');
+  document.body.append(root);
+  const screen = managedScreens.find((item) => item.id === id).mount(ctx, root, { id: null, query: {} });
+  await wait();
+  await wait();
+  await wait();
+  const pressed = (label) => press(root.querySelectorAll('button').find((item) => item.textContent === label));
+  /** The control of the field whose name starts with `label`. */
+  const control = (label) => {
+    const name = root.querySelectorAll('label').find((item) => item.textContent.startsWith(label));
+    return root.querySelector(`[id="${name.getAttribute('for')}"]`);
+  };
+  const errorOf = (input) => root.querySelector(`[id="${input.getAttribute('aria-describedby')}"]`).textContent;
+  return { root, screen, sent, pressed, control, errorOf };
+}
+
+const groupOfOne = { app: { servers: [{ address: '127.0.0.1:8080', weight: 1, max_fails: 1, fail_timeout_ms: 10000, backup: false }] } };
+
+test('the screen of the sites opens a site, and a refusal of a check names the line of the box of its host', async () => {
+  const version = { sites: [{ name: 'main', hosts: ['a.example', 'b.example'], certificate: { chain: 'c'.repeat(64), key: 'd'.repeat(64) } }], upstreams: groupOfOne, routes: [], default_upstream: '' };
+  const { root, screen, sent, pressed, control, errorOf } = await editScreen('sites', version, () => ({ at: 'sites[0].hosts[1]', sentence: 'a site host is written twice in the sites' }));
+  assert.equal(heldDraft().sites.length, 1);
+  assert.equal(root.querySelector('[data-row]').textContent.includes('a.example and 1 more'), true);
+  pressed('Edit');
+  const hosts = control('Hosts');
+  assert.equal(hosts.value, 'a.example\nb.example');
+  hosts.value = 'a.example\n\nb.example';
+  hosts.dispatch('input');
+  assert.equal(heldDraft().revision, 1);
+  pressed('Close');
+  pressed('Check');
+  await wait();
+  await wait();
+  assert.equal(sent[0], '/api/managed/check');
+  assert.deepEqual(sent[1].version.sites[0].hosts, ['a.example', 'b.example']);
+  assert.deepEqual(sent[1].version.sites[0].certificate, { chain: 'c'.repeat(64), key: 'd'.repeat(64) });
+  // The panel opens again for the fault; the number of the API is turned into the line that the box shows.
+  const refused = control('Hosts');
+  assert.equal(refused.getAttribute('aria-invalid'), 'true');
+  assert.equal(errorOf(refused), 'Line 3: a site host is written twice in the sites');
+  assert.equal(document.activeElement, refused);
+  assert.equal(root.querySelector('[data-row]').textContent.includes('Has an error'), true);
+  // What another screen is to correct is told in the band with the way there.
+  heldDraft().putFaults([{ screen: 'routes', panel: null, cid: 'routes', field: 'notice', words: lazy(() => 'too many routes') }]);
+  assert.equal(root.textContent.includes('Correct it on the routes screen'), true);
+  screen.stop();
+  assert.equal(forgetDraft(), true);
+});
+
+test('the screen of the routes makes a form when it opens, and a refusal of a field in a part that is closed opens the part', async () => {
+  const version = { sites: [], upstreams: groupOfOne, routes: [{ path: '/', upstream: 'app' }], default_upstream: '' };
+  let answer = { at: 'routes[0].rewrite.host', sentence: 'a rewrite host is malformed' };
+  const { root, screen, sent, pressed, control, errorOf } = await editScreen('routes', version, () => answer);
+  const route = heldDraft().routes[0];
+  assert.equal(route.form, null);
+  assert.equal(root.querySelector('[data-row]').textContent.includes('Any'), true);
+  pressed('Edit');
+  assert.notEqual(route.form, null);
+  assert.equal(heldDraft().revision, 0);
+  // The part of the rewrite holds nothing, so it stays closed.
+  const details = () => root.querySelectorAll('details');
+  assert.deepEqual(details().map((part) => part.open), [false, false, false]);
+  const host = control('Host');
+  host.value = 'a.example';
+  host.dispatch('input');
+  assert.equal(heldDraft().revision, 1);
+  assert.equal(root.querySelector('[data-row]').textContent.includes('a.example'), true);
+  pressed('Close');
+  pressed('Check');
+  await wait();
+  await wait();
+  assert.deepEqual(sent[1].version.routes, [{ path: '/', upstream: 'app', host: 'a.example' }]);
+  // The panel opens, the closed part around the field opens, and the field has the focus.
+  const refused = control('Host to rewrite to');
+  assert.equal(refused.getAttribute('aria-invalid'), 'true');
+  assert.equal(errorOf(refused), 'a rewrite host is malformed');
+  assert.equal(document.activeElement, refused);
+  assert.deepEqual(details().map((part) => part.open), [false, false, true]);
+  // A refusal of a list as a whole is told above the lists of that part, which is opened for it.
+  answer = { at: 'routes[0].stream', sentence: 'a stream idle_ms is above its total_ms' };
+  pressed('Check');
+  await wait();
+  await wait();
+  const stream = details()[1];
+  assert.equal(stream.open, true);
+  assert.equal(stream.textContent.includes('a stream idle_ms is above its total_ms'), true);
+  // What another screen is to correct is told in the band with the way there.
+  heldDraft().putFaults([{ screen: 'sites', panel: null, cid: 'sites', field: 'notice', words: lazy(() => 'too many sites') }]);
+  assert.equal(root.textContent.includes('Correct it on the sites screen'), true);
+  screen.stop();
+  assert.equal(forgetDraft(), true);
+});
+
+test('typing in a field of a route draws the list again only when a line of it would change', async () => {
+  const version = { sites: [], upstreams: groupOfOne, routes: [{ path: '/', upstream: 'app', stream: { idle_ms: 5, total_ms: 9, websocket: false } }], default_upstream: '' };
+  const { root, screen, pressed, control } = await editScreen('routes', version, () => ({ at: null, sentence: 'refused' }));
+  pressed('Edit');
+  const line = () => root.querySelector('[data-row]');
+  const type = (input, value) => {
+    input.value = value;
+    input.dispatch('input');
+  };
+  const idle = control('Idle limit');
+  // The first change of the route is a change that the list shows.
+  const unchanged = line();
+  type(idle, '50');
+  assert.notEqual(line(), unchanged);
+  assert.equal(line().textContent.includes('Changed'), true);
+  // Another keystroke changes nothing that the list shows: the line stays the same element.
+  const drawn = line();
+  const seen = heldDraft().routeList;
+  type(idle, '500');
+  assert.equal(line(), drawn);
+  assert.equal(heldDraft().routeList, seen);
+  // A field that the list shows draws it again.
+  type(control('Path'), '/app/');
+  assert.notEqual(line(), drawn);
+  assert.equal(line().textContent.includes('/app/'), true);
+  screen.stop();
+  assert.equal(forgetDraft(), true);
+});
+
+test('a key file that is chosen for a site is named on the panel, and what is in it is shown nowhere', async () => {
+  const secret = '-----BEGIN PRIVATE KEY-----\nSECRETKEYTEXT\n-----END PRIVATE KEY-----\n';
+  // The fake page has no reader of files: this one gives the bytes that the test put on the file.
+  globalThis.FileReader = class {
+    readAsArrayBuffer(file) {
+      this.result = file.content;
+      this.onload();
+    }
+  };
+  const version = { sites: [{ name: 'main', hosts: ['a.example'], certificate: { chain: 'c'.repeat(64), key: 'd'.repeat(64) } }], upstreams: groupOfOne, routes: [], default_upstream: '' };
+  const { root, screen, pressed, control } = await editScreen('sites', version, () => ({ at: null, sentence: 'refused' }));
+  pressed('Edit');
+  const input = control('Choose the private key file');
+  input.files = [{ name: 'key.pem', size: secret.length, content: new TextEncoder().encode(secret).buffer }];
+  input.dispatch('change');
+  for (let turns = 0; turns < 200 && heldDraft().files.size === 0; turns += 1) await wait();
+  assert.equal(heldDraft().files.size, 1);
+  assert.equal(root.textContent.includes('key.pem'), true);
+  assert.equal(root.textContent.includes('SECRETKEYTEXT'), false);
+  assert.equal(root.textContent.includes('BEGIN PRIVATE'), false);
+  screen.stop();
+  assert.equal(forgetDraft(), true);
+  delete globalThis.FileReader;
+});
+
+test('no default group is told as such in a confirmation and in the content of a version', () => {
+  setLanguage('en');
+  const version = (name) => ({ sites: [], upstreams: {}, routes: [], default_upstream: name });
+  const row = (before, after) => diffRows(FP, OTHER, before, after).find((one) => String(one.label) === 'Default group');
+  const rows = row(countsOf(version('')), countsOf(version('a')));
+  assert.equal(String(rows.now), 'Not set');
+  assert.equal(rows.after, 'a');
+  assert.equal(rows.changed, true);
+  assert.equal(String(defaultGroupView('')), 'Not set');
+  assert.equal(defaultGroupView('app'), 'app');
+  assert.equal(defaultGroupView(null), '—');
 });

@@ -34,6 +34,19 @@ function single(area, a, b, out) {
 const routeKey = (route) => JSON.stringify([route.host ?? null, route.path ?? null]);
 const routeLabel = (route) => `${route.host ?? '*'} ${route.path ?? '*'}`;
 
+const isAcme = (site) => plain(site.certificate) && Object.hasOwn(site.certificate, 'acme');
+const hostsKey = (site) => JSON.stringify([...site.hosts].sort());
+
+/**
+ * How many sites of `after` need a certificate that is not issued yet: those with ACME whose set of hosts no site with
+ * ACME of `before` has. A certificate is kept under the set of the hosts of its site, so a site that is new, a change of
+ * its hosts and a site that used files before all need one, and a new order of the hosts or a new name does not.
+ */
+export function sitesToIssue(before, after) {
+  const issued = new Set(before.sites.filter(isAcme).map(hostsKey));
+  return after.sites.filter((site) => isAcme(site) && !issued.has(hostsKey(site))).length;
+}
+
 /**
  * The lines of what changes from the version `before` to the version `after`: `{ area, action, label }` with `area`
  * one of `upstream`, `default`, `access`, `rate_limit`, `site` and `route`, and `action` one of `add`, `remove` and

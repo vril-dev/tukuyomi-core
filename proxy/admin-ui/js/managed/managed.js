@@ -9,11 +9,13 @@ import { t, w } from '../i18n.js';
 import { canChange, confirmChange, fingerprintText, fingerprintView, hashOf, isFingerprint, kv, panel, panelWith, row, shortOf, timeCell, timeCellText, timeLabel, timeView, working } from '../parts.js';
 import { Table } from '../table.js';
 import { draftFromVersion, heldDraft, readableVersion, savingRuns, settleSaving } from './edit/draft.js';
-import { screens as policyScreens } from './edit/policy.js';
-import { screens as upstreamScreens } from './edit/upstreams.js';
+import { screens as policyScreens } from './edit/screens/policy.js';
+import { screens as routeScreens } from './edit/screens/routes.js';
+import { screens as siteScreens } from './edit/screens/sites.js';
+import { screens as upstreamScreens } from './edit/screens/upstreams.js';
 import { screens as historyScreens } from './history.js';
 import { isJob } from './job.js';
-import { Screen, countsOf, mountScreen, proxyOf, servingView, unusedNotice } from './screen.js';
+import { Screen, countsOf, defaultGroupView, mountScreen, proxyOf, servingView, unusedNotice } from './screen.js';
 
 // The tone and the short words of what `proxyOf` says.
 const PROXY = {
@@ -168,7 +170,7 @@ class VersionsScreen extends Screen {
         row(w('managed.diff.sites'), number(counts.sites)),
         row(w('managed.diff.upstreams'), number(counts.upstreams)),
         row(w('managed.diff.routes'), number(counts.routes)),
-        row(w('managed.diff.default'), number(counts.defaultUpstream)),
+        row(w('managed.diff.default'), defaultGroupView(counts.defaultUpstream)),
         row(w('managed.diff.access'), present(counts.access)),
         row(w('managed.diff.rate_limit'), present(counts.rateLimit)),
       ),
@@ -450,4 +452,4 @@ export function managedCard(ctx) {
   };
 }
 
-export const screens = [{ id: 'managed', title: w('nav.managed'), least: 'viewer', route: { id: isFingerprint }, mount: mountScreen(VersionsScreen) }, ...historyScreens, ...upstreamScreens, ...policyScreens];
+export const screens = [{ id: 'managed', title: w('nav.managed'), least: 'viewer', route: { id: isFingerprint }, mount: mountScreen(VersionsScreen) }, ...historyScreens, ...siteScreens, ...upstreamScreens, ...routeScreens, ...policyScreens];

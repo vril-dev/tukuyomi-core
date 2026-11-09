@@ -6,10 +6,11 @@ import { ApiError } from '../js/api.js';
 import { lazy, setLanguage } from '../js/i18n.js';
 import { BODY_MAX, EditScreen, FILES_MAX, bodySize, checkFinding } from '../js/managed/edit/bar.js';
 import { Screen } from '../js/managed/screen.js';
-import { changesBetween } from '../js/managed/edit/changes.js';
-import { Draft, caKey, forgetDraft, heldDraft, holdDraft, isOwnJob, readableVersion, savingRuns, settleSaving, settleSent, syncDraft } from '../js/managed/edit/draft.js';
+import { changesBetween, sitesToIssue } from '../js/managed/edit/changes.js';
+import { Draft, caKey, forgetDraft, heldDraft, holdDraft, isOwnJob, readableVersion, savingRuns, settleSaving, settleSent, siteFileKey, syncDraft, watchDraft } from '../js/managed/edit/draft.js';
 import { barFault as barFaultOf, faultAt, locate } from '../js/managed/edit/locate.js';
 import { PEM_MAX, pemFromBytes, pickPem } from '../js/managed/edit/pem.js';
+import { headerPair, queryPair } from '../js/managed/edit/route-items.js';
 
 const FP = 'a'.repeat(64);
 const OTHER = 'b'.repeat(64);
@@ -150,8 +151,8 @@ test('what is not in its form is told at its field and nothing is built, and the
   assert.match(String(about('deny_cidrs').words), /^3 行目/);
   draft.putFaults(faults);
   assert.equal(draft.firstFault('upstreams').cid, api.cid);
-  assert.equal(draft.openGroup, api.cid);
-  assert.notEqual(draft.openGroup, app.cid);
+  assert.equal(draft.openPanels.upstreams, api.cid);
+  assert.notEqual(draft.openPanels.upstreams, app.cid);
   // Writing the field takes its fault away, and leaves the others.
   draft.write(api, 'name', 'fine');
   assert.equal(draft.faults.some((one) => one.field === 'name'), false);
@@ -164,19 +165,20 @@ test('a place in a refusal is found in the request as it was sent', () => {
   const draft = draftOf(sampleVersion());
   const [app, api] = draft.groups;
   draft.write(app, 'tls', true);
-  draft.useCa(app, { sha256: 'd'.repeat(64), text: 'pem', name: 'ca.pem', size: 3 });
+  draft.useFile(app, 'ca', { sha256: 'd'.repeat(64), text: 'pem', name: 'ca.pem', size: 3 });
   const { map } = draft.build();
-  assert.deepEqual(locate('upstreams.api.servers[1].address', map), { screen: 'upstreams', group: api.cid, cid: api.servers[1].cid, field: 'address' });
-  assert.deepEqual(locate('upstreams.app', map), { screen: 'upstreams', group: app.cid, cid: app.cid, field: 'name' });
-  assert.deepEqual(locate('rate_limit.keys', map), { screen: 'policy', group: null, cid: 'rate', field: 'keys' });
-  assert.deepEqual(locate('files[0]', map), { screen: 'upstreams', group: app.cid, cid: app.cid, field: 'ca' });
+  assert.deepEqual(locate('upstreams.api.servers[1].address', map), { screen: 'upstreams', panel: api.cid, cid: api.servers[1].cid, field: 'address' });
+  assert.deepEqual(locate('upstreams.app', map), { screen: 'upstreams', panel: app.cid, cid: app.cid, field: 'name' });
+  assert.deepEqual(locate('rate_limit.keys', map), { screen: 'policy', panel: null, cid: 'rate', field: 'keys' });
+  assert.deepEqual(locate('files[0]', map), { screen: 'upstreams', panel: app.cid, cid: app.cid, field: 'ca' });
   assert.equal(locate('files[1]', map), null);
-  // What the table does not hold is for the band, with the sentence alone; a route is told by its number from 1.
+  // What the table does not hold, and a number past what the request held, goes to the band with the sentence alone.
   const sentence = lazy(() => 'refused');
-  assert.equal(String(faultAt('routes[3].path', map, sentence).words), '経路の 4 番目: refused');
-  assert.equal(String(faultAt('routes', map, sentence).words), 'refused');
-  assert.equal(String(faultAt(null, map, sentence).words), 'refused');
-  assert.equal(faultAt('routes[3].path', map, sentence).screen, null);
+  for (const at of ['routes[3].path', 'sites[64].name', 'sites[0].hosts[64]', 'routes[1024]', 'routes[0].rewrite', null]) {
+    const told = faultAt(at, map, sentence);
+    assert.equal(told.screen, null, String(at));
+    assert.equal(String(told.words), 'refused', String(at));
+  }
   // The name of a group is looked for only among the names that were sent: what every object has is no group.
   assert.equal(locate('upstreams.__proto__.servers[0].address', map), null);
   assert.equal(locate('upstreams.constructor', map), null);
@@ -258,9 +260,9 @@ test('only the files that the version names are sent, and a content chosen twice
   const [app, api] = draft.groups;
   const pem = { sha256: 'd'.repeat(64), text: 'pem', name: 'ca.pem', size: 3 };
   draft.write(app, 'tls', true);
-  draft.useCa(app, pem);
+  draft.useFile(app, 'ca', pem);
   draft.write(api, 'tls', true);
-  draft.useCa(api, pem);
+  draft.useFile(api, 'ca', pem);
   assert.equal(draft.files.size, 1);
   const twice = draft.build();
   assert.deepEqual(twice.files, ['pem']);
@@ -501,14 +503,327 @@ test('saving and checking are off in each state that holds them, and a saving ru
 test('what is hidden or about the old base is told no more', () => {
   const draft = draftOf(sampleVersion());
   const words = lazy(() => 'wrong');
-  draft.putFaults([barFaultOf(words), { screen: 'policy', group: null, cid: 'rate', field: 'keys', words }, { screen: 'policy', group: null, cid: 'access', field: 'deny_cidrs', words }]);
+  draft.putFaults([barFaultOf(words), { screen: 'policy', panel: null, cid: 'rate', field: 'keys', words }, { screen: 'policy', panel: null, cid: 'access', field: 'deny_cidrs', words }]);
   draft.clearFaultsOf('rate');
   assert.deepEqual(draft.faults.map((one) => one.cid), [null, 'access']);
   draft.rebase(OTHER, sampleVersion());
   assert.deepEqual(draft.faults.map((one) => one.cid), ['access']);
   // A fault of a field takes the place of the one before it.
-  draft.putFault({ screen: 'policy', group: null, cid: 'access', field: 'deny_cidrs', words: lazy(() => 'newer') });
+  draft.putFault({ screen: 'policy', panel: null, cid: 'access', field: 'deny_cidrs', words: lazy(() => 'newer') });
   assert.equal(draft.faults.length, 1);
   assert.equal(String(draft.faults[0].words), 'newer');
 });
 
+/** A version with what the forms of the sites and of the routes read: a site of files beside the site of `sampleVersion`, and routes with nested parts, some empty. */
+function routedVersion() {
+  const version = sampleVersion();
+  version.sites.push({ name: 'files', hosts: ['b.example', '*.c.example'], certificate: { chain: 'e'.repeat(64), key: 'f'.repeat(64) } });
+  version.routes = [
+    {
+      host: 'a.example',
+      path: '/app/',
+      upstream: 'app',
+      access: { deny_cidrs: [] },
+      stream: { idle_ms: 5, total_ms: 9, websocket: true },
+      max_body: 0,
+      records: 'security',
+      rewrite: { host: 'b.internal', query: { remove: ['x'], set: [{ name: 'a', value: '' }] }, request_headers: {}, response_headers: { add: [{ name: 'X-A', value: 'a:b=c' }] } },
+    },
+    { path: '/', upstream: 'api' },
+    { upstream: 'app', rewrite: {} },
+  ];
+  return version;
+}
+
+test('a site and a route whose form was opened build back to what the version held, and opening a form is no edit', () => {
+  const version = routedVersion();
+  const draft = draftOf(version);
+  assert.deepEqual(draft.build().version, version);
+  holdDraft(draft);
+  let told = 0;
+  const stop = watchDraft(() => {
+    told += 1;
+  });
+  for (const route of draft.routes) draft.routeForm(route);
+  stop();
+  assert.equal(told, 0);
+  assert.equal(draft.revision, 0);
+  assert.deepEqual(draft.build().version, version);
+  assert.equal(draft.routes.some((route) => draft.routeChanged(route)), false);
+  // A form is made once, and a route with no form has not changed.
+  const [first] = draft.routes;
+  assert.equal(draft.routeForm(first), first.form);
+  draft.write(first.form, 'host', 'c.example');
+  assert.equal(draft.routeChanged(first), true);
+  assert.equal(draft.routeChanged({ form: null }), false);
+  forgetDraft();
+});
+
+test('a part of a rewrite that the version did not write is written only when it holds something', () => {
+  const draft = draftOf(routedVersion());
+  const route = draft.routes[1];
+  const form = draft.routeForm(route);
+  draft.write(form.query, 'set', 'a=b');
+  assert.deepEqual(draft.build().version.routes[1], { path: '/', upstream: 'api', rewrite: { query: { set: [{ name: 'a', value: 'b' }] } } });
+  draft.write(form.query, 'set', '');
+  assert.deepEqual(draft.build().version.routes[1], { path: '/', upstream: 'api' });
+  // A max body left empty is not written, and 0 is written.
+  draft.write(form, 'max_body', '0');
+  assert.equal(draft.build().version.routes[1].max_body, 0);
+  draft.write(form, 'max_body', ' ');
+  assert.equal(Object.hasOwn(draft.build().version.routes[1], 'max_body'), false);
+});
+
+test('a line of a rewrite is cut at its first separator, and is written back as it was read', () => {
+  const version = sampleVersion();
+  version.routes = [{ upstream: 'app', rewrite: { query: { add: [{ name: 'q', value: '' }] }, response_headers: { set: [{ name: 'X', value: 'a:b=c' }, { name: 'Empty', value: '' }] } } }];
+  const draft = draftOf(version);
+  const form = draft.routeForm(draft.routes[0]);
+  assert.equal(form.query.add, 'q=');
+  assert.equal(form.response_headers.set, 'X: a:b=c\nEmpty:');
+  assert.deepEqual(draft.build().version, version);
+  assert.deepEqual(queryPair('a=b=c'), { name: 'a', value: 'b=c' });
+  assert.deepEqual(headerPair('X : a:b '), { name: 'X', value: 'a:b' });
+  assert.equal(queryPair('nothing'), null);
+  assert.equal(headerPair(': no name'), null);
+});
+
+test('a line with no separator is told by its line, a route with no group and a stream without its numbers are told at their fields', () => {
+  setLanguage('ja');
+  const draft = draftOf(routedVersion());
+  const route = draft.routes[2];
+  const form = draft.routeForm(route);
+  draft.write(form.query, 'set', 'ok=1\n\nnothing');
+  draft.write(form.stream, 'on', true);
+  route.ref = { text: '' };
+  const { faults, version } = draft.build();
+  assert.equal(version, undefined);
+  const about = (cid, field) => faults.find((one) => one.cid === cid && one.field === field);
+  assert.match(String(about(form.query.cid, 'set').words), /^3 行目/);
+  assert.equal(about(form.query.cid, 'set').panel, route.cid);
+  assert.equal(about(form.stream.cid, 'idle_ms').panel, route.cid);
+  assert.equal(about(route.cid, 'upstream').screen, 'routes');
+  setLanguage('en');
+});
+
+test('a part of a route takes away what was told about the part as a whole when it is written to', () => {
+  const draft = draftOf(routedVersion());
+  const route = draft.routes[0];
+  const form = draft.routeForm(route);
+  for (const [part, field] of [[form.query, 'remove'], [form.response_headers, 'add'], [form.access, 'deny_cidrs'], [form.stream, 'idle_ms']]) {
+    draft.putFault({ screen: 'routes', panel: route.cid, cid: part.cid, field: 'notice', words: lazy(() => 'wrong') });
+    assert.equal(draft.faults.length, 1);
+    draft.write(part, field, part[field]);
+    assert.equal(draft.faults.length, 0);
+  }
+});
+
+test('the first fault of a screen opens the panel of that screen alone', () => {
+  const draft = draftOf(routedVersion());
+  const words = lazy(() => 'wrong');
+  draft.putFaults([{ screen: 'routes', panel: 77, cid: 77, field: 'host', words }]);
+  assert.equal(draft.firstFault('routes').panel, 77);
+  assert.deepEqual(draft.openPanels, { upstreams: null, sites: null, routes: 77 });
+});
+
+const pemOf = (sha) => ({ sha256: sha.repeat(64), text: `text-of-${sha}`, name: 'file.pem', size: 3 });
+
+test('a file that no field names is let go, one that a field still names stays, and a certificate is written whole for its kind', () => {
+  const version = routedVersion();
+  const draft = draftOf(version);
+  holdDraft(draft);
+  const api = groupNamed(draft, 'api');
+  // A file chosen in the place of another; and a group taken away with its file. The file of a group with TLS turned off stays (see above).
+  draft.useFile(api, 'ca', pemOf('1'));
+  draft.useFile(api, 'ca', pemOf('2'));
+  assert.deepEqual([...draft.files.keys()], ['2'.repeat(64)]);
+  // The route that uses `api` is taken away from the version, so the group can be.
+  draft.routes = draft.routes.filter((route) => route.ref.cid !== api.cid);
+  assert.equal(draft.removeGroup(api.cid), true);
+  assert.equal(draft.files.size, 0);
+  const [, one] = draft.sites;
+  // A second site with the same key: taking one away leaves the file with the other.
+  const other = { ...one, cid: 9999, name: 'other' };
+  draft.sites.push(other);
+  draft.useFile(one, 'key', pemOf('3'));
+  draft.useFile(other, 'key', pemOf('3'));
+  draft.removeSite(other.cid);
+  assert.deepEqual([...draft.files.keys()], ['3'.repeat(64)]);
+  // To ACME: the key goes from the draft, and what is being read for the field no longer counts. The certificate is `{acme}` alone.
+  const mark = draft.startReading(siteFileKey(one.cid, 'key'));
+  draft.setSiteKind(one, 'acme');
+  assert.equal(draft.files.size, 0);
+  assert.equal(draft.endReading(siteFileKey(one.cid, 'key'), mark), false);
+  assert.equal(draft.reading, 0);
+  draft.write(one, 'renew_before_days', '7');
+  assert.deepEqual(draft.build().version.sites[1].certificate, { acme: { renew_before_days: 7 } });
+  // Back to files: the names of the version it was read from, and no reading of the fields counts.
+  draft.setSiteKind(one, 'file');
+  assert.deepEqual(draft.build().version.sites[1].certificate, version.sites[1].certificate);
+  // The file sent for a chain and a key is told at its field.
+  draft.useFile(one, 'chain', pemOf('4'));
+  const built = draft.build();
+  assert.deepEqual(built.files, ['text-of-4']);
+  assert.deepEqual(built.map.files[0], { screen: 'sites', panel: one.cid, cid: one.cid, field: 'chain' });
+  // What the other kind of certificate held does not count as a change once the site is back on its own kind.
+  assert.equal(draft.siteChanged(one), true);
+  draft.useFile(one, 'chain', { ...pemOf('4'), sha256: version.sites[1].certificate.chain });
+  assert.equal(one.renew_before_days, '7');
+  assert.equal(draft.siteChanged(one), false);
+  // The key of a site read as ACME, once it is of files, has to be chosen.
+  const [acme] = draft.sites;
+  draft.setSiteKind(acme, 'file');
+  const missing = draft.build().faults.filter((fault) => fault.cid === acme.cid).map((fault) => fault.field);
+  assert.deepEqual(missing, ['chain', 'key']);
+  forgetDraft();
+});
+
+test('a version whose sites and routes are not in their forms is not edited', () => {
+  const site = (more) => ({ ...sampleVersion(), sites: [{ name: 'x', hosts: ['a.example'], certificate: { acme: {} }, ...more }] });
+  assert.equal(readableVersion(site({})), true);
+  assert.equal(readableVersion(site({ hosts: 'a.example' })), false);
+  assert.equal(readableVersion(site({ certificate: { acme: {}, chain: 'c', key: 'k' } })), false);
+  assert.equal(readableVersion(site({ certificate: { chain: 'c' } })), false);
+  const route = (more) => ({ ...sampleVersion(), routes: [{ upstream: 'app', ...more }] });
+  assert.equal(readableVersion(route({})), true);
+  assert.equal(readableVersion(route({ upstream: 1 })), false);
+  assert.equal(readableVersion(route({ host: 7 })), false);
+  assert.equal(readableVersion(route({ max_body: '7' })), false);
+  assert.equal(readableVersion(route({ access: { deny_cidrs: 'x' } })), false);
+  assert.equal(readableVersion(route({ stream: { idle_ms: 1, total_ms: '2', websocket: true } })), false);
+  assert.equal(readableVersion(route({ rewrite: { query: { set: ['a=b'] } } })), false);
+});
+
+test('what was read of a file is wiped once it has served, on the way out of a refusal as well', async () => {
+  const draft = draftOf(sampleVersion());
+  holdDraft(draft);
+  const good = new TextEncoder().encode('pem');
+  assert.equal((await pickPem(draft, 'a', { name: 'a.pem', size: 3 }, async () => good)).pem.text, 'pem');
+  assert.deepEqual([...good], [0, 0, 0]);
+  const bad = new Uint8Array([0xff, 0xfe]);
+  assert.deepEqual(await pickPem(draft, 'b', { name: 'b.pem', size: 2 }, async () => bad), { problem: 'utf8' });
+  assert.deepEqual([...bad], [0, 0]);
+  forgetDraft();
+});
+
+test('a fault of a field in a closed part opens the part before the focus goes there', () => {
+  const part = { open: false };
+  let focused = false;
+  const box = { control: { focus: () => { assert.equal(part.open, true); focused = true; } } };
+  const screen = { places: new Map(), faultsShown: null, showFaults() {}, placeField: EditScreen.prototype.placeField, openFault: EditScreen.prototype.openFault };
+  screen.placeField(5, 'remove', box, part);
+  screen.openFault({ cid: 5, field: 'remove' }, null);
+  assert.equal(focused, true);
+});
+
+test('what the configuration file says of ACME, the records and the host of the admin route is read when it can be', async () => {
+  const reading = (call) => Screen.prototype.readFile.call({ ctx: { api: { call } } });
+  const read = await reading(async () => ({ sha256: FP, acme: { directory: 'x' }, admin: { route: { host: 'admin.example' } } }));
+  assert.deepEqual([read.acme, read.records, read.adminHost], [true, false, 'admin.example']);
+  const refused = await reading(async () => {
+    throw new Error('gone');
+  });
+  assert.deepEqual([refused.acme, refused.records, refused.adminHost], [null, null, null]);
+});
+
+test('a refusal about a site or a route is found at its field, at the note of its part, or at its panel', () => {
+  setLanguage('ja');
+  const version = routedVersion();
+  const draft = draftOf(version);
+  const [first, second] = draft.sites;
+  draft.write(second, 'hosts', '\nb.example\n\n*.c.example');
+  const { map } = draft.build();
+  const sentence = lazy(() => 'refused');
+  assert.deepEqual(locate('sites', map), { screen: 'sites', panel: null, cid: 'sites', field: 'notice' });
+  assert.deepEqual(locate('sites[0]', map), { screen: 'sites', panel: first.cid, cid: first.cid, field: 'notice' });
+  assert.deepEqual(locate('sites[1].certificate.key', map), { screen: 'sites', panel: second.cid, cid: second.cid, field: 'key' });
+  assert.deepEqual(locate('sites[1].certificate.acme', map), { screen: 'sites', panel: second.cid, cid: second.cid, field: 'renew_before_days' });
+  // The number is of the hosts that were sent, and the line of the box is what the user sees: blank lines are counted there.
+  const line = faultAt('sites[1].hosts[1]', map, sentence);
+  assert.deepEqual([line.field, line.panel], ['hosts', second.cid]);
+  assert.equal(String(line.words), '4 行目: refused');
+  assert.deepEqual([...map.sites[1].hostLines], [2, 4]);
+  const [route] = draft.routes;
+  assert.deepEqual(locate('routes[0]', map), { screen: 'routes', panel: route.cid, cid: route.cid, field: 'notice' });
+  assert.deepEqual(locate('routes[0].host', map), { screen: 'routes', panel: route.cid, cid: route.cid, field: 'host' });
+  assert.deepEqual(locate('routes[0].rewrite.path', map), { screen: 'routes', panel: route.cid, cid: route.cid, field: 'rewrite_path' });
+  assert.deepEqual(locate('routes[0].rewrite.query', map), { screen: 'routes', panel: route.cid, cid: `${route.cid}.query`, field: 'notice' });
+  assert.deepEqual(locate('routes[0].access', map), { screen: 'routes', panel: route.cid, cid: `${route.cid}.access`, field: 'notice' });
+  assert.deepEqual(locate('routes[0].stream', map), { screen: 'routes', panel: route.cid, cid: `${route.cid}.stream`, field: 'notice' });
+  setLanguage('en');
+});
+
+test('a new site needs its files, a new route its group, and neither gets a key it does not need', () => {
+  setLanguage('ja');
+  const draft = draftOf(routedVersion());
+  const site = draft.addSite();
+  const route = draft.addRoute();
+  assert.equal(draft.openPanels.sites, site.cid);
+  assert.equal(draft.openPanels.routes, route.cid);
+  const { faults } = draft.build();
+  assert.deepEqual(faults.filter((one) => one.cid === site.cid).map((one) => one.field).sort(), ['chain', 'hosts', 'key', 'name']);
+  assert.deepEqual(faults.filter((one) => one.cid === route.cid).map((one) => one.field), ['upstream']);
+  // Once it is filled in, the new route is written with its keys and no others.
+  draft.setRouteUpstream(route, draft.groups[0].cid);
+  draft.writeRoute(route, route.form, 'path', '/new/');
+  draft.write(site, 'name', 'next');
+  draft.write(site, 'hosts', 'n.example');
+  draft.useFile(site, 'chain', pemOf('5'));
+  draft.useFile(site, 'key', pemOf('6'));
+  const built = draft.build();
+  assert.deepEqual(built.version.routes.at(-1), { upstream: draft.groups[0].name, path: '/new/' });
+  assert.deepEqual(built.version.sites.at(-1), { name: 'next', hosts: ['n.example'], certificate: { chain: '5'.repeat(64), key: '6'.repeat(64) } });
+  assert.deepEqual(built.files, ['text-of-5', 'text-of-6']);
+  // A route taken away goes with what was told of it, and the list is told that it changed.
+  const seen = draft.routeList;
+  draft.putFault({ screen: 'routes', panel: route.cid, cid: route.cid, field: 'path', words: lazy(() => 'wrong') });
+  draft.removeRoute(route.cid);
+  assert.deepEqual(draft.faults, []);
+  assert.equal(draft.openPanels.routes, null);
+  assert.equal(draft.routeList > seen, true);
+  setLanguage('en');
+});
+
+test('a confirmation counts the sites that need a new certificate by the set of their hosts', () => {
+  const acme = (name, hosts) => ({ name, hosts, certificate: { acme: { renew_before_days: 30 } } });
+  const files = (name, hosts) => ({ name, hosts, certificate: { chain: 'e'.repeat(64), key: 'f'.repeat(64) } });
+  const before = { sites: [acme('a', ['a.example', 'b.example']), files('f', ['f.example'])] };
+  const count = (sites) => sitesToIssue(before, { sites });
+  // A new order of the hosts and a new name need nothing.
+  assert.equal(count([acme('renamed', ['b.example', 'a.example']), files('f', ['f.example'])]), 0);
+  // A new site, a host added or taken away, and a site that used files need one each.
+  assert.equal(count([acme('a', ['a.example', 'b.example']), files('f', ['f.example']), acme('new', ['n.example'])]), 1);
+  assert.equal(count([acme('a', ['a.example', 'b.example', 'c.example'])]), 1);
+  assert.equal(count([acme('a', ['a.example'])]), 1);
+  assert.equal(count([acme('a', ['a.example', 'b.example']), acme('f', ['f.example'])]), 1);
+});
+
+test('what is in a key file reaches neither the lines of a change nor the version that is sent, only the files', () => {
+  const version = routedVersion();
+  const draft = draftOf(version);
+  const site = draft.sites[1];
+  const pem = { sha256: 'a'.repeat(64), text: '-----BEGIN PRIVATE KEY-----SECRETKEYTEXT', name: 'k.pem', size: 3 };
+  draft.useFile(site, 'key', pem);
+  const built = draft.build();
+  const lines = changesBetween(version, built.version);
+  assert.deepEqual(lines, [{ area: 'site', action: 'change', label: 'files' }]);
+  assert.doesNotMatch(JSON.stringify(lines), /SECRETKEYTEXT/);
+  assert.doesNotMatch(JSON.stringify(built.version), /SECRETKEYTEXT/);
+  assert.deepEqual(built.files, [pem.text]);
+  assert.deepEqual(built.map.files[0], { screen: 'sites', panel: site.cid, cid: site.cid, field: 'key' });
+  assert.equal(draft.choseChain(), false);
+  draft.useFile(site, 'chain', { ...pem, sha256: 'b'.repeat(64) });
+  assert.equal(draft.choseChain(), true);
+});
+
+test('every part that holds a fault is opened when the faults are shown, and one that holds none stays as it was', () => {
+  const box = { valid() {}, invalid() {}, control: { focus() {} } };
+  const parts = { a: { open: false }, b: { open: false }, c: { open: false } };
+  const screen = { screen: 'routes', places: new Map(), faultsShown: null, placeField: EditScreen.prototype.placeField, showFaults: EditScreen.prototype.showFaults };
+  screen.placeField('1.access', 'deny_cidrs', box, parts.a);
+  screen.placeField('1.stream', 'idle_ms', box, parts.b);
+  screen.placeField('1.query', 'set', box, parts.c);
+  const words = lazy(() => 'wrong');
+  screen.showFaults({ faults: [{ screen: 'routes', panel: 1, cid: '1.access', field: 'deny_cidrs', words }, { screen: 'routes', panel: 1, cid: '1.stream', field: 'idle_ms', words }] });
+  assert.deepEqual([parts.a.open, parts.b.open, parts.c.open], [true, true, false]);
+});

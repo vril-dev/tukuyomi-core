@@ -74,7 +74,7 @@ static INDEX: File = File {
 };
 
 /// The other files, below `/ui/<version>/`.
-static FILES: [File; 31] = [
+static FILES: [File; 36] = [
     File {
         name: "app.css",
         kind: CSS,
@@ -171,6 +171,16 @@ static FILES: [File; 31] = [
         bytes: include_bytes!("../../../admin-ui/js/managed/edit/draft.js"),
     },
     File {
+        name: "managed/edit/items.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/items.js"),
+    },
+    File {
+        name: "managed/edit/route-items.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/route-items.js"),
+    },
+    File {
         name: "managed/edit/locate.js",
         kind: JAVASCRIPT,
         bytes: include_bytes!("../../../admin-ui/js/managed/edit/locate.js"),
@@ -196,14 +206,29 @@ static FILES: [File; 31] = [
         bytes: include_bytes!("../../../admin-ui/js/managed/edit/bar.js"),
     },
     File {
-        name: "managed/edit/upstreams.js",
+        name: "managed/edit/screens/sites.js",
         kind: JAVASCRIPT,
-        bytes: include_bytes!("../../../admin-ui/js/managed/edit/upstreams.js"),
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/screens/sites.js"),
     },
     File {
-        name: "managed/edit/policy.js",
+        name: "managed/edit/screens/routes.js",
         kind: JAVASCRIPT,
-        bytes: include_bytes!("../../../admin-ui/js/managed/edit/policy.js"),
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/screens/routes.js"),
+    },
+    File {
+        name: "managed/edit/screens/rewrite.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/screens/rewrite.js"),
+    },
+    File {
+        name: "managed/edit/screens/upstreams.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/screens/upstreams.js"),
+    },
+    File {
+        name: "managed/edit/screens/policy.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/screens/policy.js"),
     },
     File {
         name: "managed/edit/words.js",
