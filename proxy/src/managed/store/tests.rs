@@ -367,3 +367,54 @@ fn a_held_version_is_its_file_in_the_store_and_a_broken_one_that_is_held_is_not_
     assert_eq!(fs::read(&path).unwrap(), b"broken");
     drop(hold);
 }
+
+#[test]
+fn the_chain_is_read_and_the_key_only_looked_at_for_the_admin_process() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    // A key of a site of the files that is broken and cannot be opened is there all the same, for it is not read.
+    let key = fixture.file(b"key");
+    let path = store.file_path(key);
+    fs::write(&path, b"broken").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(store.look_file(key), Ok(()));
+    assert!(store.file(key).is_err());
+    // A file of 1 MiB is there, and one a byte over it is not a file of the store.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let file = File::options().write(true).open(&path).unwrap();
+    file.set_len(MAX_BYTES).unwrap();
+    assert_eq!(store.look_file(key), Ok(()));
+    file.set_len(MAX_BYTES + 1).unwrap();
+    assert_eq!(
+        refusal(store.look_file(key)),
+        "a managed file is not a regular file of at most 1 MiB"
+    );
+    // Nothing there is told by its sentence, which a link is not.
+    fs::remove_file(&path).unwrap();
+    assert_eq!(store.look_file(key), Err(FILE_NOT_IN_STORE));
+    symlink(fixture.root().join("elsewhere"), &path).unwrap();
+    assert_eq!(
+        refusal(store.look_file(key)),
+        "a managed file cannot be read, or is a link"
+    );
+    // The same for a site with acme: its chain is read, and its key only looked at.
+    let name = acme_name(&["a.test".to_owned()]);
+    assert!(matches!(store.issued_chain(name), Ok(None)));
+    assert_eq!(store.issued_key(name), Ok(false));
+    let (chain, key) = store.issue_places(name).unwrap();
+    fs::write(&chain, b"chain").unwrap();
+    fs::write(&key, b"broken").unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o000)).unwrap();
+    let read = store.issued_chain(name).unwrap();
+    assert_eq!(read.as_deref().map(Vec::as_slice), Some(&b"chain"[..]));
+    assert_eq!(store.issued_key(name), Ok(true));
+    assert!(store.issued(name).is_err());
+    fs::remove_file(&key).unwrap();
+    assert_eq!(store.issued_key(name), Ok(false));
+    // A link in the place of the key is a fault, not a key that is not there.
+    symlink(fixture.root().join("elsewhere"), &key).unwrap();
+    assert_eq!(
+        refusal(store.issued_key(name)),
+        "an issued certificate or key cannot be read, or is a link"
+    );
+}

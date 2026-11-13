@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { ApiError } from '../js/api.js';
 import { bindAttribute, el, mount, retranslate, safeUrl, setText } from '../js/dom.js';
 import { lazy, setLanguage, w } from '../js/i18n.js';
-import { forgetDraft, heldDraft } from '../js/managed/edit/draft.js';
+import { draftFromVersion, forgetDraft, heldDraft } from '../js/managed/edit/draft.js';
 import { screens as generationScreens } from '../js/waf/generations.js';
 import { screens as wafScreens } from '../js/waf/waf.js';
 import { screens as importScreens } from '../js/waf/import.js';
@@ -819,6 +819,102 @@ test('a key file that is chosen for a site is named on the panel, and what is in
   screen.stop();
   assert.equal(forgetDraft(), true);
   delete globalThis.FileReader;
+});
+
+test('the sites show the certificate of the store that each names, read for the version that the draft carries', async () => {
+  setLanguage('en');
+  globalThis.addEventListener = () => {};
+  globalThis.removeEventListener = () => {};
+  const chain = 'c'.repeat(64);
+  const key = 'd'.repeat(64);
+  const version = { sites: [{ name: 'main', hosts: ['a.example'], certificate: { chain, key } }, { name: 'auto', hosts: ['b.example'], certificate: { acme: { renew_before_days: 30 } } }], upstreams: groupOfOne, routes: [], default_upstream: '' };
+  const files = { name: 'main', kind: 'files', chain, key, state: 'present', names: ['a.example', 'www.a.example'], more: 2, not_after: 2_000_000_000, expired: false };
+  let carried = { name: OTHER, sites: [files, { name: 'auto', kind: 'acme', hosts: ['b.example'], state: 'waiting' }] };
+  const asked = [];
+  const api = {
+    async call(method, path) {
+      asked.push(path);
+      if (path === '/api/managed') return { managed: true, current: FP, serving: FP, reachable: true, reloading: false, rollback_to: null, job: null };
+      if (path === `/api/managed/versions/${FP}`) return { name: FP, made: 1, current: true, serving: true, version };
+      // The selected version cannot be read: that adds nothing, and the screen goes on.
+      if (path === `/api/managed/certificates/${FP}`) throw new ApiError('broken', 500, 'the managed version is not JSON');
+      if (path === `/api/managed/certificates/${OTHER}`) return carried;
+      if (path === '/api/status') return { proxy: { config: 'c'.repeat(64) } };
+      return { sha256: 'c'.repeat(64), forward: {} };
+    },
+  };
+  // The draft carries the version OTHER, as one made on the screen of the versions on top of the selected one.
+  draftFromVersion(FP, version, OTHER, version, null);
+  const ctx = { user: { name: 'ann', role: 'operator' }, api, describe: (error) => lazy(() => error.sentence), refreshStatus() {}, navigate() {} };
+  const root = document.createElement('main');
+  document.body.append(root);
+  const screen = managedScreens.find((item) => item.id === 'sites').mount(ctx, root, { id: null, query: {} });
+  const settle = async () => {
+    for (let turns = 0; turns < 3; turns += 1) await wait();
+  };
+  await settle();
+  assert.equal(asked.includes(`/api/managed/certificates/${FP}`), true);
+  assert.equal(asked.includes(`/api/managed/certificates/${OTHER}`), true);
+  const lines = () => root.querySelectorAll('[data-row]');
+  assert.notEqual(lines()[0].querySelector('time'), null);
+  assert.equal(lines()[1].textContent.includes('Not issued'), true);
+  press(root.querySelectorAll('button').find((item) => item.textContent === 'Edit'));
+  assert.equal(root.textContent.includes('Host names in the certificate'), true);
+  assert.equal(root.textContent.includes('a.example, www.a.example and 2 more'), true);
+  // A read that finds the same values draws no line again, and one that finds other values does.
+  const reload = () => press(root.querySelectorAll('button').find((item) => item.textContent === 'Reload'));
+  const drawn = lines()[0];
+  reload();
+  await settle();
+  assert.equal(lines()[0], drawn);
+  carried = { ...carried, sites: [{ ...files, state: 'missing', expired: true }, carried.sites[1]] };
+  reload();
+  await settle();
+  assert.notEqual(lines()[0], drawn);
+  assert.equal(lines()[0].textContent.includes('Expired') && lines()[0].textContent.includes('Missing'), true);
+  const panel = root.querySelectorAll('section').find((item) => item.textContent.startsWith('Edit the site'));
+  assert.equal(panel.textContent.includes('Missing') && panel.textContent.includes('a.example, www.a.example and 2 more'), true);
+  // A key chosen again keeps the expiry of the chain, and the state that the old key had is no longer told.
+  heldDraft().write(heldDraft().sites[0], 'key', 'e'.repeat(64));
+  assert.equal(lines()[0].textContent.includes('Expired'), true);
+  assert.equal(lines()[0].textContent.includes('Missing'), false);
+  assert.equal(root.textContent.includes('Missing'), false);
+  screen.stop();
+  assert.equal(forgetDraft(), true);
+});
+
+test('the content of a version shows the certificates of its sites row by row, or says that they could not be read', async () => {
+  setLanguage('en');
+  let answer = null;
+  const versions = differingApi();
+  const api = {
+    async call(method, path) {
+      if (path !== `/api/managed/certificates/${OTHER}`) return versions.call(method, path);
+      if (answer === null) throw new ApiError('broken', 500, 'the managed version is not JSON');
+      return answer;
+    },
+  };
+  const ctx = { user: { name: 'ann', role: 'operator' }, api, describe: String, refreshStatus() {}, navigate() {} };
+  const root = document.createElement('main');
+  document.body.append(root);
+  const screen = managedScreens[0].mount(ctx, root, { id: OTHER, query: {} });
+  await wait();
+  await wait();
+  await wait();
+  assert.equal(root.textContent.includes('The certificate information could not be read.'), true);
+  // Two sites of one name, as a version put in the store by hand may have, are two rows.
+  answer = { name: OTHER, sites: [{ name: 'main', kind: 'files', chain: 'c'.repeat(64), key: 'd'.repeat(64), state: 'present', names: [], more: 0, not_after: 1, expired: true }, { name: 'main', kind: null, state: 'unreadable' }] };
+  screen.show({ id: null, query: {} });
+  screen.show({ id: OTHER, query: {} });
+  await wait();
+  await wait();
+  const part = root.querySelectorAll('h3').find((item) => item.textContent === 'Certificates').parent;
+  const rows = part.querySelectorAll('[data-row]').map((item) => item.textContent);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].includes('Files') && rows[0].includes('Expired') && rows[0].includes('Present'), true);
+  assert.equal(rows[1].includes('Unknown') && rows[1].includes('Unreadable') && rows[1].includes('—'), true);
+  assert.equal(root.textContent.includes('The certificate information could not be read.'), false);
+  screen.stop();
 });
 
 test('no default upstream is told as such in a confirmation and in the content of a version', () => {

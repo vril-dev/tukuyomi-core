@@ -1,27 +1,35 @@
-//! The few encodings of X.509 that the command needs, written and read by hand.
+//! The few encodings of X.509 that the command needs, written and read by hand, and the DNS names of a certificate,
+//! which the admin process shows (see `managed::certificates`).
 //!
 //! The writer makes the request for a certificate (PKCS #10, RFC 2986): an empty subject, the hosts as the names
 //! of the alternative-name extension, signed with the key of the certificate. The reader is strict: it takes a
 //! definite length in the shortest form only (the short form below 128, else the long form of 1 to 4 bytes without a
 //! leading zero), refuses the indefinite length, a length that goes past the end of what holds the element, a tag
 //! of the long form, and bytes left over where nothing may follow. It reads the end of the time of validity of a
-//! certificate (`not_after`, in seconds since the epoch) and the two numbers of an ECDSA signature (`ecdsa_fixed`).
+//! certificate (`not_after`, in seconds since the epoch), the DNS names of the alternative names of a certificate
+//! (`dns_names`) and the two numbers of an ECDSA signature (`ecdsa_fixed`). It checks no signature.
 
 use super::Failure;
 use super::base64;
 use super::key::Key;
 
+const BOOLEAN: u8 = 0x01;
 const INTEGER: u8 = 0x02;
 const BIT_STRING: u8 = 0x03;
 const OCTET_STRING: u8 = 0x04;
+const OBJECT_IDENTIFIER: u8 = 0x06;
 const SEQUENCE: u8 = 0x30;
 const SET: u8 = 0x31;
 const UTC_TIME: u8 = 0x17;
 const GENERALIZED_TIME: u8 = 0x18;
 /// `[0]`, constructed: the version of a certificate, the attributes of a request.
 const CONTEXT_0: u8 = 0xa0;
+/// `[3]`, constructed: the extensions of a certificate.
+const CONTEXT_3: u8 = 0xa3;
 /// `[2]`, primitive: a `dNSName` of a general name.
 const DNS_NAME: u8 = 0x82;
+/// The longest DNS name, in bytes.
+const LONGEST_NAME: usize = 253;
 
 /// The object identifiers of the request, with their tag and length: `ecdsa-with-SHA256`, `extensionRequest`,
 /// `subjectAltName`.
@@ -158,13 +166,20 @@ fn only(bytes: &[u8], tag: u8) -> Result<&[u8], Malformed> {
     }
 }
 
-/// The end of the time of validity of the certificate `cert`, in seconds since 1970-01-01 00:00:00 UTC.
-pub fn not_after(cert: &[u8]) -> Result<i64, Malformed> {
+/// The content of the version of a certificate, if it is there, the content of its time of validity, and the rest of
+/// the part that is signed, after the time of validity (see `validity`).
+type Validity<'a> = (Option<&'a [u8]>, &'a [u8], Reader<'a>);
+
+/// The way into the certificate `cert` that `not_after` and `dns_names` share, up to its time of validity. The version
+/// is there for all but the oldest form; the serial number, the algorithm of the signature and the issuer are passed
+/// over.
+fn validity(cert: &[u8]) -> Result<Validity<'_>, Malformed> {
     let mut certificate = Reader::new(only(cert, SEQUENCE)?);
     let mut tbs = Reader::new(certificate.expect(SEQUENCE)?);
     // The version, which is there for all but the oldest form, then the serial number.
-    let (mut tag, _) = tbs.element()?;
-    if tag == CONTEXT_0 {
+    let (mut tag, content) = tbs.element()?;
+    let version = (tag == CONTEXT_0).then_some(content);
+    if version.is_some() {
         tag = tbs.element()?.0;
     }
     if tag != INTEGER {
@@ -172,7 +187,14 @@ pub fn not_after(cert: &[u8]) -> Result<i64, Malformed> {
     }
     tbs.expect(SEQUENCE)?; // the algorithm of the signature
     tbs.expect(SEQUENCE)?; // the issuer
-    let mut validity = Reader::new(tbs.expect(SEQUENCE)?);
+    let validity = tbs.expect(SEQUENCE)?;
+    Ok((version, validity, tbs))
+}
+
+/// The end of the time of validity of the certificate `cert`, in seconds since 1970-01-01 00:00:00 UTC.
+pub fn not_after(cert: &[u8]) -> Result<i64, Malformed> {
+    let (_, validity, _) = validity(cert)?;
+    let mut validity = Reader::new(validity);
     let (before, _) = validity.element()?;
     if before != UTC_TIME && before != GENERALIZED_TIME {
         return Err(Malformed);
@@ -182,6 +204,70 @@ pub fn not_after(cert: &[u8]) -> Result<i64, Malformed> {
         return Err(Malformed);
     }
     time(tag, text)
+}
+
+/// The DNS names of the alternative-name extension of the certificate `cert` (RFC 5280, 4.2.1.6), in their order: at
+/// most `most` of those that `graphic_name` takes, and how many DNS names are left out, past `most` or not of that
+/// form. A name of another kind (an address, a mail address, a URI) is passed over and not counted, and a
+/// certificate without the extension has no name. Only a certificate of the third version is read, as far as its
+/// extensions: one of another version, or with a unique identifier after the public key (the tag `[2]` of one is the
+/// tag of a DNS name a level down), is not read, and neither is one with the extension twice, an extension or a list
+/// that is not in its form, or anything after the extensions.
+pub fn dns_names(cert: &[u8], most: usize) -> Result<(Vec<String>, usize), Malformed> {
+    let (version, _, mut tbs) = validity(cert)?;
+    match version.map(|version| only(version, INTEGER)) {
+        Some(Ok([2])) => {}
+        _ => return Err(Malformed),
+    }
+    tbs.expect(SEQUENCE)?; // the subject
+    tbs.expect(SEQUENCE)?; // the public key
+    let mut found = None;
+    if !tbs.is_empty() {
+        let mut extensions = Reader::new(only(tbs.expect(CONTEXT_3)?, SEQUENCE)?);
+        if !tbs.is_empty() {
+            return Err(Malformed);
+        }
+        while !extensions.is_empty() {
+            let mut extension = Reader::new(extensions.expect(SEQUENCE)?);
+            let id = extension.expect(OBJECT_IDENTIFIER)?;
+            let (mut tag, mut value) = extension.element()?;
+            // `critical`, which DER writes only when it is true; false is found as well.
+            if tag == BOOLEAN {
+                if !matches!(value, [0x00] | [0xff]) {
+                    return Err(Malformed);
+                }
+                (tag, value) = extension.element()?;
+            }
+            if tag != OCTET_STRING || !extension.is_empty() {
+                return Err(Malformed);
+            }
+            if id == &SUBJECT_ALT_NAME[2..] && found.replace(value).is_some() {
+                return Err(Malformed);
+            }
+        }
+    }
+    let (mut names, mut more) = (Vec::new(), 0);
+    let Some(value) = found else {
+        return Ok((names, more));
+    };
+    let mut general = Reader::new(only(value, SEQUENCE)?);
+    while !general.is_empty() {
+        let (tag, name) = general.element()?;
+        if tag != DNS_NAME {
+            continue;
+        }
+        if names.len() < most && graphic_name(name) {
+            names.push(name.iter().copied().map(char::from).collect());
+        } else {
+            more += 1;
+        }
+    }
+    Ok((names, more))
+}
+
+/// Whether `name` is a name that is shown as it is: 1 to 253 bytes, each a graphic ASCII character (0x21 to 0x7e).
+pub fn graphic_name(name: &[u8]) -> bool {
+    (1..=LONGEST_NAME).contains(&name.len()) && name.iter().all(u8::is_ascii_graphic)
 }
 
 /// A number of ASCII digits.

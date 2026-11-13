@@ -8,7 +8,8 @@
 //! name it reads is replaced whole or not at all. A version that is read to be served with or used is read with a
 //! shared lock on its own file (`hold`), which keeps `remove` from removing it, and `put` from replacing a broken copy
 //! of it, while it is held. What the cleaning removes is named by no version that is left, so whatever holds a version
-//! loses no file of it.
+//! loses no file of it. The admin process reads the chain of a site to show it, and of its key it only looks at
+//! whether it is there (`look_file`, `issued_key`).
 
 use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder, File, TryLockError};
@@ -72,6 +73,9 @@ pub const IN_USE: ManagedError = ManagedError("the managed store is in use by an
 /// Why `choose_if_current` refuses when `current` does not name the version that the caller saw as chosen.
 pub const NOT_CURRENT: ManagedError =
     ManagedError("the chosen managed version is not the one that was expected");
+
+/// Why a file is refused that is not there (see `file` and `look_file`).
+pub const FILE_NOT_IN_STORE: ManagedError = ManagedError("a managed file is not in the store");
 
 /// Why a version is refused that is not there, or not any more.
 const NOT_IN_STORE: ManagedError = ManagedError("the managed version is not in the store");
@@ -278,20 +282,21 @@ impl Store {
     pub fn file(&self, name: [u8; 32]) -> Result<Zeroizing<Vec<u8>>, ManagedError> {
         self.real_dir(Kind::File)?;
         let bytes = Zeroizing::new(
-            read_regular(&self.path(Kind::File, name), MAX_BYTES, None).map_err(|e| {
-                ManagedError(match e.kind() {
-                    io::ErrorKind::NotFound => "a managed file is not in the store",
-                    io::ErrorKind::InvalidData => {
-                        "a managed file is not a regular file of at most 1 MiB"
-                    }
-                    _ => "a managed file cannot be read, or is a link",
-                })
-            })?,
+            read_regular(&self.path(Kind::File, name), MAX_BYTES, None).map_err(file_fault)?,
         );
         if sha256(&bytes) != name {
             return Err(ManagedError("a managed file does not match its name"));
         }
         Ok(bytes)
+    }
+
+    /// Looks whether the file `name` is there, and at nothing more: a regular file of at most 1 MiB, looked at without
+    /// following a link and neither opened nor read, so neither whether it can be read (its permissions) nor its bytes
+    /// against its name are looked at. What the admin process looks at for the private key of a site, which it does not
+    /// read. The refusals are those of `file`; one that is not there is `FILE_NOT_IN_STORE`.
+    pub fn look_file(&self, name: [u8; 32]) -> Result<(), ManagedError> {
+        self.real_dir(Kind::File)?;
+        look_regular(&self.path(Kind::File, name)).map_err(file_fault)
     }
 
     /// Where the file `name` is, for the tests that change what is there.
@@ -306,6 +311,43 @@ impl Store {
     /// Everything else is a refusal, never `None`: a link or anything but a directory in the place of a directory, a
     /// link or a special file in the place of a file, a file over 1 MiB, and a failure to look at or read one.
     pub fn issued(&self, name: [u8; 32]) -> Result<Option<Issued>, ManagedError> {
+        let Some(site) = self.issued_dir(name)? else {
+            return Ok(None);
+        };
+        let read = |file: &str| {
+            issued_fault(read_regular(&site.join(file), MAX_BYTES, None).map(Zeroizing::new))
+        };
+        match (read(CHAIN)?, read(KEY)?) {
+            (Some(chain), Some(key)) => Ok(Some((chain, key))),
+            _ => Ok(None),
+        }
+    }
+
+    /// The chain of the site with `acme` whose hosts have the name `name`, as `issued` reads it, without its key: what
+    /// the admin process reads to show the certificate. `None` when `acme/`, its directory `name` or the chain is not
+    /// there; the refusals are those of `issued`.
+    pub fn issued_chain(&self, name: [u8; 32]) -> Result<Option<Zeroizing<Vec<u8>>>, ManagedError> {
+        let Some(site) = self.issued_dir(name)? else {
+            return Ok(None);
+        };
+        issued_fault(read_regular(&site.join(CHAIN), MAX_BYTES, None).map(Zeroizing::new))
+    }
+
+    /// Whether the key of the site with `acme` whose hosts have the name `name` is there, as `look_file` looks at a
+    /// file: a regular file of at most 1 MiB, neither opened nor read, so whether it can be read (its permissions) is
+    /// not looked at. False when `acme/`, its directory `name` or the key is not there; the refusals are those of
+    /// `issued`.
+    pub fn issued_key(&self, name: [u8; 32]) -> Result<bool, ManagedError> {
+        let Some(site) = self.issued_dir(name)? else {
+            return Ok(false);
+        };
+        Ok(issued_fault(look_regular(&site.join(KEY)))?.is_some())
+    }
+
+    /// The directory of the site with `acme` whose hosts have the name `name`, for `issued` and the two above, after
+    /// `acme/` and then it are looked at without following a link: `None` when either is not there, and a refusal
+    /// when either is anything but a real directory or cannot be looked at.
+    fn issued_dir(&self, name: [u8; 32]) -> Result<Option<PathBuf>, ManagedError> {
         let acme = self.dir.join(ACME);
         let site = acme.join(hex(&name));
         for dir in [&acme, &site] {
@@ -324,20 +366,7 @@ impl Store {
                 }
             }
         }
-        let read = |file: &str| match read_regular(&site.join(file), MAX_BYTES, None) {
-            Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(ManagedError(
-                "an issued certificate or key is not a regular file of at most 1 MiB",
-            )),
-            Err(_) => Err(ManagedError(
-                "an issued certificate or key cannot be read, or is a link",
-            )),
-        };
-        match (read(CHAIN)?, read(KEY)?) {
-            (Some(chain), Some(key)) => Ok(Some((chain, key))),
-            _ => Ok(None),
-        }
+        Ok(Some(site))
     }
 
     /// The versions, oldest first: the regular files of `versions/` whose name is 64 lowercase digits and `.json`.
@@ -654,6 +683,52 @@ fn version_fault(e: io::Error) -> ManagedError {
         io::ErrorKind::InvalidData => "the managed version is not a regular file of at most 1 MiB",
         _ => "the managed version cannot be read, or is a link",
     })
+}
+
+/// The refusal of a file of `files/` that cannot be read or looked at: it is not there (`FILE_NOT_IN_STORE`), it is not
+/// a regular file of at most 1 MiB, or any other fault (a link included).
+fn file_fault(e: io::Error) -> ManagedError {
+    match e.kind() {
+        io::ErrorKind::NotFound => FILE_NOT_IN_STORE,
+        io::ErrorKind::InvalidData => {
+            ManagedError("a managed file is not a regular file of at most 1 MiB")
+        }
+        _ => ManagedError("a managed file cannot be read, or is a link"),
+    }
+}
+
+/// What the reading or the look of the chain or the key of a site with `acme` comes to: `None` when the file is not
+/// there (not issued yet), and a refusal for a file that is not a regular file of at most 1 MiB or any other fault (a
+/// link included).
+fn issued_fault<T>(found: io::Result<T>) -> Result<Option<T>, ManagedError> {
+    match found {
+        Ok(found) => Ok(Some(found)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(ManagedError(
+            "an issued certificate or key is not a regular file of at most 1 MiB",
+        )),
+        Err(_) => Err(ManagedError(
+            "an issued certificate or key cannot be read, or is a link",
+        )),
+    }
+}
+
+/// Looks at `path` as `read_regular` reads it, without opening it: a regular file of at most 1 MiB, looked at without
+/// following a link. The faults have the kinds of those of `read_regular`: `NotFound` when nothing is there,
+/// `InvalidData` for anything but a regular file and for a file over the size, and another kind for a link and for a
+/// failure to look.
+fn look_regular(path: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::other("a link"));
+    }
+    if !meta.file_type().is_file() || meta.len() > MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file of at most 1 MiB",
+        ));
+    }
+    Ok(())
 }
 
 /// The name of the entry `text` of a directory of the store whose names end with `end`: 64 lowercase hexadecimal digits

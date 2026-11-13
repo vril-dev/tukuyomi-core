@@ -11,6 +11,7 @@ import { Draft, caKey, forgetDraft, heldDraft, holdDraft, isOwnJob, readableVers
 import { barFault as barFaultOf, faultAt, locate } from '../js/managed/edit/locate.js';
 import { PEM_MAX, pemFromBytes, pickPem } from '../js/managed/edit/pem.js';
 import { headerPair, queryPair } from '../js/managed/edit/route-items.js';
+import { certificateIndex, certificateOf } from '../js/managed/edit/screens/sites.js';
 
 const FP = 'a'.repeat(64);
 const OTHER = 'b'.repeat(64);
@@ -826,4 +827,34 @@ test('every part that holds a fault is opened when the faults are shown, and one
   const words = lazy(() => 'wrong');
   screen.showFaults({ faults: [{ screen: 'routes', panel: 1, cid: '1.access', field: 'deny_cidrs', words }, { screen: 'routes', panel: 1, cid: '1.stream', field: 'idle_ms', words }] });
   assert.deepEqual([parts.a.open, parts.b.open, parts.c.open], [true, true, false]);
+});
+
+test('a certificate of the store is matched with a site by what is in it, and its state only while the key is the same too', () => {
+  const chain = 'c'.repeat(64);
+  const key = 'd'.repeat(64);
+  const version = { ...sampleVersion(), sites: [{ name: 'main', hosts: ['a.example'], certificate: { chain, key } }, { name: 'auto', hosts: ['b.example', 'c.example'], certificate: { acme: { renew_before_days: 30 } } }] };
+  const answer = {
+    name: FP,
+    sites: [
+      { name: 'main', kind: 'files', chain, key, state: 'present', names: ['a.example'], more: 0, not_after: 2_000_000_000, expired: false },
+      { name: 'auto', kind: 'acme', hosts: ['b.example', 'c.example'], state: 'issued', names: ['b.example', 'c.example'], more: 0, not_after: 2_000_000_000, expired: false },
+    ],
+  };
+  const index = certificateIndex([null, answer]);
+  const draft = draftOf(version);
+  const [files, acme] = draft.sites;
+  // A new name and a new order of the hosts are no new certificate.
+  draft.write(files, 'name', 'renamed');
+  draft.write(acme, 'hosts', 'c.example\nb.example');
+  assert.deepEqual(certificateOf(files, index), { answer: answer.sites[0], whole: true });
+  assert.deepEqual(certificateOf(acme, index), { answer: answer.sites[1], whole: true });
+  // A key chosen again keeps what follows from the chain and not the state; a chain chosen again keeps nothing.
+  draft.write(files, 'key', 'e'.repeat(64));
+  assert.deepEqual(certificateOf(files, index), { answer: answer.sites[0], whole: false });
+  draft.write(files, 'chain', 'f'.repeat(64));
+  assert.equal(certificateOf(files, index), null);
+  // Another set of hosts is another certificate of ACME.
+  draft.write(acme, 'hosts', 'b.example');
+  assert.equal(certificateOf(acme, index), null);
+  assert.equal(certificateOf(acme, null), null);
 });

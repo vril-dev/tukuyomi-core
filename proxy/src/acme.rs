@@ -6,11 +6,11 @@
 //!
 //! The parts, each with its own file: `base64` (the two alphabets), `der` (the few encodings of X.509 that are
 //! needed: the end of the time of validity of a certificate, the request for a certificate, the form of a
-//! signature), `key` (a key on the curve P-256, for the account and for a certificate), `jws` (the signed messages,
-//! the JWK and its thumbprint), `client` (HTTPS to the CA), `order` (the account and the order of a certificate
-//! with its challenges), `files` (the account key, the files of the challenges and the writing of a certificate)
-//! and `command` (the arguments, the decision which certificates are due, and the report). The crypto provider is
-//! the one of rustls, so no part needs another crate.
+//! signature, and the DNS names of a certificate, which the admin process reads as well), `key` (a key on the curve
+//! P-256, for the account and for a certificate), `jws` (the signed messages, the JWK and its thumbprint), `client`
+//! (HTTPS to the CA), `order` (the account and the order of a certificate with its challenges), `files` (the account
+//! key, the files of the challenges and the writing of a certificate) and `command` (the arguments, the decision which
+//! certificates are due, and the report). The crypto provider is the one of rustls, so no part needs another crate.
 //!
 //! A failure of a step is a `Failure` (see `failure`): a fixed sentence, or the `type` of the problem document that
 //! the CA sent, with every byte outside 0x20 to 0x7e written as `\xNN`. Nothing else from the CA is written out.
@@ -18,7 +18,7 @@
 pub(crate) mod base64;
 mod client;
 pub mod command;
-mod der;
+pub(crate) mod der;
 mod failure;
 mod files;
 mod jws;

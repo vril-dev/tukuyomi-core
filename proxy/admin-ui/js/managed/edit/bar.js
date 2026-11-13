@@ -149,8 +149,13 @@ export class EditScreen extends Screen {
     const state = await api.call('GET', '/api/managed');
     if (state.managed === false) return { state };
     if (state.managed !== true) throw new Error('not an answer of the managed state');
-    const [version, around] = await Promise.all([this.readVersion(state.current), this.readAround()]);
-    return { state, version, ...around };
+    const [version, around, more] = await Promise.all([this.readVersion(state.current), this.readAround(), this.readMore(state)]);
+    return { state, version, ...around, ...more };
+  }
+
+  /** What this screen reads besides, with the others, for the answer `state` of `GET /api/managed`: an object whose keys join what the read found. */
+  readMore() {
+    return {};
   }
 
   /** The content of the version `name`, or null when no version is selected. A version that is not in the form of one is a failure of the read. */

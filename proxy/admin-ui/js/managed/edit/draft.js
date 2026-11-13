@@ -44,12 +44,14 @@ export class Draft {
   /**
    * `base` is the version that a saving expects to be selected and `baseVersion` its content, which is only compared
    * with; `source` is the content that is carried over (of another version, for a draft made from a version:
-   * `fromVersion`). `session` asks the admin process for something, which keeps the session alive.
+   * `fromVersion`), and `sourceName` the name of that version (null: not known). A new base changes neither. `session`
+   * asks the admin process for something, which keeps the session alive.
    */
-  constructor({ base, baseVersion, source, fromVersion = false, session = null }) {
+  constructor({ base, baseVersion, source, sourceName = null, fromVersion = false, session = null }) {
     this.base = base;
     this.baseVersion = baseVersion;
     this.source = source;
+    this.sourceName = sourceName;
     this.fromVersion = fromVersion;
     this.#session = session;
     this.#touched = Date.now();
@@ -523,13 +525,13 @@ export function watchDraft(watcher) {
 export function syncDraft(current, version, session) {
   if (held !== null && held.base === current) return 'same';
   if (held !== null && held.changed) return 'moved';
-  holdDraft(new Draft({ base: current, baseVersion: version, source: version, session }));
+  holdDraft(new Draft({ base: current, baseVersion: version, source: version, sourceName: current, session }));
   return 'made';
 }
 
-/** Makes the draft of the page from the version with the content `source`, on top of the selected version `base`; it holds changes from the start. */
-export function draftFromVersion(base, baseVersion, source, session) {
-  holdDraft(new Draft({ base, baseVersion, source, fromVersion: true, session }));
+/** Makes the draft of the page from the version `sourceName` with the content `source`, on top of the selected version `base`; it holds changes from the start. */
+export function draftFromVersion(base, baseVersion, sourceName, source, session) {
+  holdDraft(new Draft({ base, baseVersion, source, sourceName, fromVersion: true, session }));
 }
 
 /** Whether `job` is the job of the saving `sent` of `user`, and not one that was known before it was sent. */

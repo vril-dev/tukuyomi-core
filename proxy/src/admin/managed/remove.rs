@@ -30,7 +30,7 @@ use serde_json::json;
 
 use super::history::rollback_target;
 use super::job::Caller;
-use super::routes::{Managed, conflict, failed, name_of, not_found, unmanaged};
+use super::routes::{Managed, VERSION, conflict, failed, name_of, not_found, unmanaged};
 use crate::admin::audit::Outcome;
 use crate::admin::auth::{Cx, Who};
 use crate::admin::server::Answer;
@@ -43,7 +43,7 @@ const ACTION: &str = "managed-remove";
 impl Managed {
     /// The route, for the version that `path` names (see the module documentation).
     pub(super) fn remove(&self, path: &str, who: &Who, cx: &Cx<'_>) -> Answer {
-        let Some(name) = name_of(path) else {
+        let Some(name) = name_of(path, VERSION) else {
             return not_found();
         };
         let target = hex(&name);

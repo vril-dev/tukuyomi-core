@@ -305,9 +305,9 @@ fn routes() -> impl Iterator<Item = &'static Route> {
         .chain(managed::ROUTES.iter())
 }
 
-/// The path as the table has it: a path below `/api/generations/`, `/api/account/tokens/`, `/api/tokens/` or
-/// `/api/managed/versions/` ends in `*`, and `/api/users/<name>` with nothing, `password` or `mfa` after the name has
-/// `*` for the name.
+/// The path as the table has it: a path below `/api/generations/`, `/api/account/tokens/`, `/api/tokens/`,
+/// `/api/managed/versions/` or `/api/managed/certificates/` ends in `*`, and `/api/users/<name>` with nothing,
+/// `password` or `mfa` after the name has `*` for the name.
 fn pattern(path: &str) -> &str {
     let rules = waf::pattern(path);
     if rules != path {
@@ -317,6 +317,7 @@ fn pattern(path: &str) -> &str {
         ("/api/account/tokens/", "/api/account/tokens/*"),
         ("/api/tokens/", "/api/tokens/*"),
         ("/api/managed/versions/", "/api/managed/versions/*"),
+        ("/api/managed/certificates/", "/api/managed/certificates/*"),
     ] {
         if path.starts_with(prefix) {
             return star;

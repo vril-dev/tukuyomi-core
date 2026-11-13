@@ -1,12 +1,12 @@
 // The base of the screens of the managed configuration: the layers, the reads that count, the change that runs, the
 // job that it starts, and the confirmation that asks first. A change is answered when its job starts, so the screen
-// watches the job (see `job.js`) until it ends. What the state of a screen says of the proxy is here too. Nothing runs
-// when the module is loaded.
+// watches the job (see `job.js`) until it ends. What the state of a screen says of the proxy is here too, and what the
+// managed store holds of the certificates of the sites of a version. Nothing runs when the module is loaded.
 
 import { ApiError } from '../api.js';
-import { button, el, mount, notice, result } from '../dom.js';
-import { w } from '../i18n.js';
-import { canChange, confirmChange, diffView, fingerprintView, hashOf, isFingerprint, kv, pageHead, panel, perform, restoreFocus, row, runningNotice, setBusy, shortOf, working } from '../parts.js';
+import { badge, button, el, mount, notice, result } from '../dom.js';
+import { t, w } from '../i18n.js';
+import { canChange, confirmChange, diffView, fingerprintView, hashOf, isFingerprint, kv, pageHead, panel, perform, restoreFocus, row, runningNotice, setBusy, shortOf, timeCell, working } from '../parts.js';
 import { Watch, isJob, jobPanel, watchLimit } from './job.js';
 
 /**
@@ -82,6 +82,42 @@ export function diffRows(from, to, before, after, { gone = false } = {}) {
 /** The notice for a configuration with no managed object, with the way to the configuration file for those who may see it. */
 export function unusedNotice(role) {
   return notice('info', w('managed.unused'), canChange(role) ? [' ', el('a', { class: 'tc-link', href: hashOf('config') }, w('managed.unused_link'))] : null);
+}
+
+/**
+ * The states of a certificate in the managed store, by the word that `GET /api/managed/certificates/<name>` gives:
+ * the tone of the badge, its words and the same words as text.
+ */
+const CERTIFICATE_STATES = {
+  present: { tone: 'ok', words: () => w('managed.cert.present'), text: () => t('managed.cert.present') },
+  missing: { tone: 'bad', words: () => w('managed.cert.missing'), text: () => t('managed.cert.missing') },
+  issued: { tone: 'ok', words: () => w('managed.cert.issued'), text: () => t('managed.cert.issued') },
+  waiting: { tone: 'warn', words: () => w('managed.cert.waiting'), text: () => t('managed.cert.waiting') },
+  unreadable: { tone: 'bad', words: () => w('managed.cert.unreadable'), text: () => t('managed.cert.unreadable') },
+  unparsed: { tone: 'warn', words: () => w('managed.cert.unparsed'), text: () => t('managed.cert.unparsed') },
+};
+
+/** The badge of the state `state` of a certificate; a word that this page does not know is shown as it came. */
+export function certificateBadge(state) {
+  if (!Object.hasOwn(CERTIFICATE_STATES, state)) return badge('muted', String(state));
+  return badge(CERTIFICATE_STATES[state].tone, CERTIFICATE_STATES[state].words());
+}
+
+/** The words of `certificateBadge` as text. */
+export function certificateText(state) {
+  return Object.hasOwn(CERTIFICATE_STATES, state) ? CERTIFICATE_STATES[state].text() : String(state);
+}
+
+/** When the certificate of the site `site` of an answer expires, in seconds, and whether the admin process says that is past; null and false when it gave no time. */
+export function certificateExpiry(site) {
+  const notAfter = typeof site.not_after === 'number' && Number.isFinite(site.not_after) ? site.not_after : null;
+  return { notAfter, expired: notAfter !== null && site.expired === true };
+}
+
+/** A cell of a table for the expiry `{ notAfter, expired }` (see `certificateExpiry`), with the badge `more` after it; a dash when there is nothing to show. */
+export function expiryCell({ notAfter, expired }, more = null) {
+  const parts = [notAfter === null ? null : timeCell(notAfter, 's'), expired ? badge('bad', w('managed.cert.expired')) : null, more].filter((part) => part !== null);
+  return parts.length === 0 ? '—' : el('span', { class: 'tc-badges' }, parts);
 }
 
 export class Screen {
@@ -301,6 +337,22 @@ export class Screen {
     try {
       const answer = await this.ctx.api.call('GET', `/api/managed/versions/${name}`);
       return countsOf(answer.version);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * What the managed store holds of the certificates of the sites of the version `name` (the answer of `GET
+   * /api/managed/certificates/<name>`), or null when it cannot be read or is not in the form of one: a screen adds
+   * nothing for a read that failed.
+   */
+  async certificatesOf(name) {
+    if (!isFingerprint(name)) return null;
+    try {
+      const answer = await this.ctx.api.call('GET', `/api/managed/certificates/${name}`);
+      const sites = answer?.sites;
+      return answer?.name === name && Array.isArray(sites) && sites.every((site) => site !== null && typeof site === 'object') ? answer : null;
     } catch {
       return null;
     }

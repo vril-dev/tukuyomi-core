@@ -11,9 +11,10 @@
 //! cannot be read is.
 //!
 //! The routes (a viewer may use the state, the list of the versions, the job and the history, an operator the content
-//! of a version, its check, the values of the main file, the changes and the removal of a version as well; a body is
-//! JSON of at most 64 KiB, the ones of the saving and of the check 12 MiB; the answers are JSON, and `error` is a fixed
-//! sentence, which a 400 of the saving and of the check has with `at`, the place it is about, see `import`):
+//! of a version, its certificates, its check, the values of the main file, the changes and the removal of a version as
+//! well; a body is JSON of at most 64 KiB, the ones of the saving and of the check 12 MiB; the answers are JSON, and
+//! `error` is a fixed sentence, which a 400 of the saving and of the check has with `at`, the place it is about, see
+//! `import`):
 //! - `GET /api/managed`: `{"managed": true, "current", "serving", "reachable", "reloading", "rollback_to", "job"}`:
 //!   the version the store chooses (`null` for none), the version the proxy serves by its control socket (`null` when
 //!   its state cannot be read or it has none), whether the proxy can be reached (a proxy that has no place for the
@@ -29,6 +30,8 @@
 //!   does not have, 500 for one whose bytes are not what its name says.
 //! - `DELETE /api/managed/versions/<name>`: the removal of a version that is neither chosen nor the target of a
 //!   rollback, with the cleaning of what no version names any more; no body (see `remove`).
+//! - `GET /api/managed/certificates/<name>`: the certificates of the sites of a version as the store has them (see
+//!   `certificates`).
 //! - `POST /api/managed/apply`: the saving of a version and its putting in force (see `import`); `POST
 //!   /api/managed/activate` and `POST /api/managed/rollback`: the putting in force of a version of the store (see
 //!   `job`). Each is answered 202 with its job.
@@ -64,7 +67,9 @@ const APPLY_BODY_MAX: usize = 12 << 20;
 const APPLY: &str = "/api/managed/apply";
 const CHECK: &str = "/api/managed/check";
 /// The path of one version in a request; in the table it is `/api/managed/versions/*`.
-const VERSION: &str = "/api/managed/versions/";
+pub(super) const VERSION: &str = "/api/managed/versions/";
+/// The path of the certificates of one version in a request; in the table it is `/api/managed/certificates/*`.
+pub(super) const CERTIFICATES: &str = "/api/managed/certificates/";
 
 /// What a route of the managed configuration does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +85,7 @@ pub enum Op {
     Check,
     Config,
     Remove,
+    Certificates,
 }
 
 impl Op {
@@ -97,6 +103,7 @@ impl Op {
             Op::Check => "managed-check",
             Op::Config => "config",
             Op::Remove => "managed-remove",
+            Op::Certificates => "managed-certificates",
         }
     }
 }
@@ -114,7 +121,7 @@ const fn route(method: Method, path: &'static str, least: Role, op: Op) -> Route
 }
 
 /// The routes of the managed configuration. A `*` at the end of a path stands for the name of a version.
-pub(in crate::admin) static ROUTES: [Route; 11] = [
+pub(in crate::admin) static ROUTES: [Route; 12] = [
     route(Method::GET, "/api/managed", Role::Viewer, Op::State),
     route(
         Method::GET,
@@ -156,6 +163,12 @@ pub(in crate::admin) static ROUTES: [Route; 11] = [
         Role::Operator,
         Op::Remove,
     ),
+    route(
+        Method::GET,
+        "/api/managed/certificates/*",
+        Role::Operator,
+        Op::Certificates,
+    ),
 ];
 
 /// The most bytes of a body, for a request whose body may be longer than the usual limit.
@@ -163,9 +176,9 @@ pub(in crate::admin) fn body_limit(method: &Method, path: &str) -> Option<usize>
     (*method == Method::POST && (path == APPLY || path == CHECK)).then_some(APPLY_BODY_MAX)
 }
 
-/// The version that `path`, a path below `/api/managed/versions/`, names.
-pub(super) fn name_of(path: &str) -> Option<[u8; 32]> {
-    Fingerprint::from_hex(path.strip_prefix(VERSION)?.as_bytes()).map(|name| name.bytes())
+/// The version that `path`, a path below `prefix` (`VERSION` or `CERTIFICATES`), names.
+pub(super) fn name_of(path: &str, prefix: &str) -> Option<[u8; 32]> {
+    Fingerprint::from_hex(path.strip_prefix(prefix)?.as_bytes()).map(|name| name.bytes())
 }
 
 pub(super) fn not_found() -> Answer {
@@ -296,6 +309,7 @@ impl Managed {
             Op::Check => self.check(req),
             Op::Config => self.values(),
             Op::Remove => self.remove(&req.path, who, cx),
+            Op::Certificates => self.certificates(&req.path),
         }
     }
 
@@ -350,7 +364,7 @@ impl Managed {
 
     /// The managed store of the start; 409 for a main file that had no `managed`, 500 for a store that cannot be
     /// opened.
-    fn store(&self) -> Result<Store, Answer> {
+    pub(super) fn store(&self) -> Result<Store, Answer> {
         let dir = self.dir.as_deref().ok_or_else(unmanaged)?;
         Store::open(dir).map_err(failed)
     }
@@ -437,7 +451,7 @@ impl Managed {
             Ok(store) => store,
             Err(answer) => return answer,
         };
-        let Some(name) = name_of(path) else {
+        let Some(name) = name_of(path, VERSION) else {
             return not_found();
         };
         let (list, current) = match (store.versions(), store.current()) {

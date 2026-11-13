@@ -35,7 +35,7 @@ const routeKey = (route) => JSON.stringify([route.host ?? null, route.path ?? nu
 const routeLabel = (route) => `${route.host ?? '*'} ${route.path ?? '*'}`;
 
 const isAcme = (site) => plain(site.certificate) && Object.hasOwn(site.certificate, 'acme');
-const hostsKey = (site) => JSON.stringify([...site.hosts].sort());
+export const hostsKey = (site) => JSON.stringify([...site.hosts].sort());
 
 /**
  * How many sites of `after` need a certificate that is not issued yet: those with ACME whose set of hosts no site with

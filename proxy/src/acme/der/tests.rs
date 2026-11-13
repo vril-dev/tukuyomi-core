@@ -234,3 +234,146 @@ fn the_request_for_a_certificate_verifies_and_holds_the_hosts_as_alternative_nam
     assert_eq!(want, **pem);
     assert!(csr(&key, &[]).is_err());
 }
+
+/// A self-signed certificate with the extension `extension`, written as `openssl req -addext` takes it, as DER.
+fn with_extension(dir: &Scratch, extension: &str) -> Vec<u8> {
+    openssl(
+        dir.path(),
+        &[
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            "c.key",
+            "-out",
+            "c.pem",
+            "-subj",
+            "/CN=x",
+            "-days",
+            "30",
+            "-addext",
+            extension,
+        ],
+    );
+    openssl(
+        dir.path(),
+        &["x509", "-in", "c.pem", "-outform", "DER", "-out", "c.der"],
+    );
+    fs::read(dir.join("c.der")).unwrap()
+}
+
+fn names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[test]
+fn the_dns_names_are_read_in_their_order_and_names_of_other_kinds_are_passed_over() {
+    let dir = Scratch::new();
+    let der = with_extension(
+        &dir,
+        "subjectAltName=DNS:a.test,IP:192.0.2.1,email:x@example.test,DNS:*.b.test",
+    );
+    assert_eq!(
+        dns_names(&der, 100),
+        Ok((names(&["a.test", "*.b.test"]), 0))
+    );
+    // A critical extension, which openssl writes only when it is told to, is read as well.
+    let der = with_extension(&dir, "subjectAltName=critical,DNS:a.test");
+    let critical = [&SUBJECT_ALT_NAME[..], &[BOOLEAN, 1, 0xff]].concat();
+    assert!(
+        der.windows(critical.len()).any(|w| w == critical),
+        "the extension is not critical"
+    );
+    assert_eq!(dns_names(&der, 100), Ok((names(&["a.test"]), 0)));
+    // A certificate without the extension has no name.
+    let (der, _) = certificate(&dir, 30);
+    assert_eq!(dns_names(&der, 100), Ok((Vec::new(), 0)));
+}
+
+#[test]
+fn up_to_the_most_dns_names_are_given_and_the_others_are_counted() {
+    let dir = Scratch::new();
+    for (count, more) in [(100, 0), (101, 1)] {
+        let all: Vec<String> = (0..count).map(|n| format!("n{n}.test")).collect();
+        let listed: Vec<String> = all.iter().map(|name| format!("DNS:{name}")).collect();
+        let der = with_extension(&dir, &format!("subjectAltName={}", listed.join(",")));
+        assert_eq!(dns_names(&der, 100), Ok((all[..100].to_vec(), more)));
+    }
+}
+
+/// A certificate of the third version put together by hand, whose part to be signed ends with `rest` after the public
+/// key. The reader looks at no signature and no key, so neither has to be sound.
+fn by_hand(rest: &[u8]) -> Vec<u8> {
+    let validity = [
+        tlv(UTC_TIME, b"260101000000Z"),
+        tlv(UTC_TIME, b"270101000000Z"),
+    ];
+    let tbs = [
+        tlv(CONTEXT_0, &tlv(INTEGER, &[2])),
+        tlv(INTEGER, &[1]),
+        tlv(SEQUENCE, &ECDSA_WITH_SHA256),
+        tlv(SEQUENCE, &[]),
+        tlv(SEQUENCE, &validity.concat()),
+        tlv(SEQUENCE, &[]),
+        tlv(SEQUENCE, &[]),
+        rest.to_vec(),
+    ];
+    sequence(&[
+        &tlv(SEQUENCE, &tbs.concat()),
+        &tlv(SEQUENCE, &ECDSA_WITH_SHA256),
+        &tlv(BIT_STRING, &[0]),
+    ])
+}
+
+/// The extensions of a certificate, `[3]`, with the alternative-name extension once for each list of `alt_names`.
+fn extensions(alt_names: &[&[Vec<u8>]]) -> Vec<u8> {
+    let list: Vec<u8> = alt_names
+        .iter()
+        .flat_map(|general| {
+            sequence(&[
+                &SUBJECT_ALT_NAME,
+                &tlv(OCTET_STRING, &tlv(SEQUENCE, &general.concat())),
+            ])
+        })
+        .collect();
+    tlv(CONTEXT_3, &tlv(SEQUENCE, &list))
+}
+
+#[test]
+fn a_unique_identifier_is_not_taken_for_a_dns_name_and_the_extension_twice_is_not_read() {
+    let a = [tlv(DNS_NAME, b"a.test")];
+    // The form under test is read, so that each refusal below is for what it adds.
+    assert_eq!(
+        dns_names(&by_hand(&extensions(&[&a])), 100),
+        Ok((names(&["a.test"]), 0))
+    );
+    // A subject unique identifier, whose tag is that of a DNS name, before the extensions.
+    let unique = by_hand(&[tlv(DNS_NAME, b"b.test"), extensions(&[&a])].concat());
+    assert_eq!(dns_names(&unique, 100), Err(Malformed));
+    // The end of such a certificate is read as before.
+    assert_eq!(not_after(&unique), Ok(epoch("2027-01-01 00:00:00")));
+    assert_eq!(
+        dns_names(&by_hand(&extensions(&[&a, &a])), 100),
+        Err(Malformed)
+    );
+}
+
+#[test]
+fn a_dns_name_is_given_when_it_is_1_to_253_graphic_bytes_and_counted_when_it_is_not() {
+    let longest = [b'a'; 253];
+    let odd = [
+        tlv(DNS_NAME, &longest),
+        tlv(DNS_NAME, &[b'a'; 254]),
+        tlv(DNS_NAME, b""),
+        tlv(DNS_NAME, b"a b.test"),
+        tlv(DNS_NAME, b"a\x80.test"),
+    ];
+    assert_eq!(
+        dns_names(&by_hand(&extensions(&[&odd])), 100),
+        Ok((vec!["a".repeat(253)], 4))
+    );
+}

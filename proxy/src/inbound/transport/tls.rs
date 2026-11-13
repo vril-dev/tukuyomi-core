@@ -27,7 +27,7 @@ pub(crate) use certs::check;
 pub use certs::{Fault, Place, Refusal};
 pub use handshake::Handshake;
 pub use keys::{Files, KeySource};
-pub(crate) use keys::{certified, read_file};
+pub(crate) use keys::{certified, chain_of, read_file};
 pub use set::Tls;
 pub use sni::{Hosts, Names, host_name};
 

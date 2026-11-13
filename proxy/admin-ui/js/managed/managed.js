@@ -1,9 +1,9 @@
 // The screen of the versions of the managed configuration: the state of the store and of the proxy (the version that
 // is selected, the one that runs, and whether they differ), the job of a change, the list of the versions, the content
-// of one version for an operator (with an address of its own, `#/managed/<fingerprint>`), the change that applies a
-// version by its name, and the removal of a version from the store. The content of a version may hold secrets, so it
-// stays in this page's memory only while it is open. The small card of the overview is here too. Nothing runs when the
-// module is loaded.
+// of one version for an operator (with an address of its own, `#/managed/<fingerprint>`) and what the managed store
+// holds of the certificates of its sites, the change that applies a version by its name, and the removal of a version
+// from the store. The content of a version may hold secrets, so it stays in this page's memory only while it is open.
+// The small card of the overview is here too. Nothing runs when the module is loaded.
 
 import { ApiError } from '../api.js';
 import { badge, button, buttonClass, el, mount, notice, result } from '../dom.js';
@@ -17,7 +17,7 @@ import { screens as siteScreens } from './edit/screens/sites.js';
 import { screens as upstreamScreens } from './edit/screens/upstreams.js';
 import { screens as historyScreens } from './history.js';
 import { isJob } from './job.js';
-import { Screen, countsOf, defaultGroupView, diffRows, mountScreen, proxyOf, servingView, unusedNotice } from './screen.js';
+import { Screen, certificateBadge, certificateExpiry, certificateText, countsOf, defaultGroupView, diffRows, expiryCell, mountScreen, proxyOf, servingView, unusedNotice } from './screen.js';
 
 // The tone and the short words of what `proxyOf` says.
 const PROXY = {
@@ -33,6 +33,13 @@ const STATES = {
   selected: { tone: 'info', words: () => w('managed.badge.selected'), text: () => t('managed.badge.selected') },
   running: { tone: 'ok', words: () => w('managed.badge.running'), text: () => t('managed.badge.running') },
 };
+
+/** The words of the kind of a certificate, by the word of `GET /api/managed/certificates/<name>`; any other is not known. */
+const CERTIFICATE_KINDS = {
+  files: () => w('edit.site.kind_file'),
+  acme: () => w('edit.site.kind_acme'),
+};
+const kindWords = (kind) => (Object.hasOwn(CERTIFICATE_KINDS, kind) ? CERTIFICATE_KINDS[kind]() : w('managed.cert.kind_unknown'));
 
 /** Why a version cannot be removed, by the word of `versionActions`. */
 const KEPT = {
@@ -81,13 +88,14 @@ export function differs(state, watching) {
 class VersionsScreen extends Screen {
   constructor(ctx, root, route) {
     super(ctx, root, w('nav.managed'), w('managed.intro'));
-    /** The detail that is open: `{ name, data, error }`, or null. */
+    /** The detail that is open: `{ name, data, error, certificates, certificatesFailed }`, or null. */
     this.detail = null;
     this.notes = el('div', { class: 'tc-stack' });
     this.stateBox = el('div');
     this.detailBox = el('div');
     this.detailStates = el('span');
     this.detailActions = el('div', { class: 'tc-panel__foot' });
+    this.detailCertificates = el('div', { class: 'tc-stack' });
     this.table = new Table({
       caption: w('managed.caption'),
       rowKey: (item, at) => (isFingerprint(item.name) ? item.name : String(at)),
@@ -110,12 +118,15 @@ class VersionsScreen extends Screen {
   }
 
   /**
-   * Takes the panel of the detail off the screen. The two parts that follow the list live from one drawing to the next,
-   * so they are taken out of the panel too: else they would still reach the content of the version that it holds.
+   * Takes the panel of the detail off the screen. The two parts that follow the list and the part of the certificates
+   * live from one drawing to the next, so they are taken out of the panel too: else they would still reach the content
+   * of the version that it holds.
    */
   clearDetail() {
     this.detailStates.remove();
     this.detailActions.remove();
+    this.detailCertificates.remove();
+    mount(this.detailCertificates);
     mount(this.detailBox);
   }
 
@@ -165,10 +176,11 @@ class VersionsScreen extends Screen {
   }
 
   async openDetail(name, focus) {
-    const detail = { name, data: null, error: null };
+    const detail = { name, data: null, error: null, certificates: null, certificatesFailed: false };
     this.detail = detail;
     this.table.update({ selected: name });
     this.drawDetail(false);
+    this.readDetailCertificates(detail);
     try {
       detail.data = await this.ctx.api.call('GET', `/api/managed/versions/${name}`);
     } catch (error) {
@@ -176,6 +188,15 @@ class VersionsScreen extends Screen {
     }
     if (!this.alive || this.detail !== detail) return;
     this.drawDetail(focus);
+  }
+
+  /** Reads what the managed store holds of the certificates of the version of `detail`, and draws it when that detail is still the one that is open. */
+  async readDetailCertificates(detail) {
+    const answer = await this.certificatesOf(detail.name);
+    if (!this.alive || this.detail !== detail) return;
+    detail.certificates = answer;
+    detail.certificatesFailed = answer === null;
+    this.drawDetailCertificates();
   }
 
   detailFailure(error) {
@@ -211,12 +232,47 @@ class VersionsScreen extends Screen {
         row(w('managed.diff.access'), present(counts.access)),
         row(w('managed.diff.rate_limit'), present(counts.rateLimit)),
       ),
+      this.detailCertificates,
       el('details', { class: 'tc-details' }, el('summary', {}, w('managed.detail.json')), el('pre', { class: 'tc-raw tc-mono tc-raw--tall' }, JSON.stringify(item.version, null, 2))),
       this.detailActions,
     );
     mount(this.detailBox, node);
     this.drawDetailLive();
+    this.drawDetailCertificates();
     if (focus) heading.focus();
+  }
+
+  /**
+   * The part of the detail that tells what the managed store holds of the certificates of the version. It is a box of
+   * its own, drawn again when the answer comes, so that the JSON that is open and the focus stay; a read that failed is
+   * said, for this is where an expired certificate is seen before a version is applied.
+   */
+  drawDetailCertificates() {
+    const detail = this.detail;
+    if (detail === null || detail.data === null) return;
+    let shown;
+    if (detail.certificates !== null) shown = this.certificateTable(detail.certificates.sites);
+    else shown = el('p', { class: 'tc-muted tc-small' }, detail.certificatesFailed ? w('managed.cert.failed') : w('managed.loading'));
+    mount(this.detailCertificates, el('h3', {}, w('managed.cert.title')), shown, el('p', { class: 'tc-muted tc-small' }, w('managed.cert.unchecked')));
+  }
+
+  /** The table of the certificates of the sites `sites` of an answer, in the order of the version. */
+  certificateTable(sites) {
+    const table = new Table({
+      caption: w('managed.cert.title'),
+      // A version that was put in the store by hand may give two sites one name, so a row is named by its place.
+      rowKey: (site, at) => String(at),
+      filter: false,
+      empty: { title: w('edit.sites.empty') },
+      columns: [
+        { key: 'name', label: w('managed.cert.site'), value: (site) => String(site.name ?? ''), mono: true },
+        { key: 'kind', label: w('edit.col.certificate'), value: (site) => kindWords(site.kind).text(), cell: (site) => kindWords(site.kind) },
+        { key: 'expires', label: timeLabel(w('managed.cert.expires')), value: (site) => certificateExpiry(site).notAfter, tight: true, cell: (site) => expiryCell(certificateExpiry(site)) },
+        { key: 'state', label: w('col.state'), value: (site) => certificateText(site.state), cell: (site) => certificateBadge(site.state) },
+      ],
+    });
+    table.update({ rows: sites });
+    return table.node;
   }
 
   /** The part of the detail that follows the list: the states of the version and its button, as the list shows them now. */
@@ -385,7 +441,7 @@ class VersionsScreen extends Screen {
       const yes = await confirmChange(this.layer, { title: w('edit.from_version.replace_title'), lines: [el('p', {}, w('edit.from_version.replace_what'))], confirm: w('edit.from_version.replace_title'), tone: 'danger' });
       if (!yes || !this.alive) return;
     }
-    draftFromVersion(selected, contents[0], contents[1], () => this.ctx.api.call('GET', '/api/session'));
+    draftFromVersion(selected, contents[0], name, contents[1], () => this.ctx.api.call('GET', '/api/session'));
     mount(this.results, notice('ok', w('edit.from_version.done'), ' ', el('a', { class: 'tc-link', href: hashOf('upstreams') }, w('edit.from_version.open'))));
     this.drawBody();
   }

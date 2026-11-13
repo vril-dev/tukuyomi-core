@@ -2,6 +2,8 @@
 //!
 //! `KeySource` is the one way in for the files of the listeners: it gives the chain and a key that can sign. `Files`
 //! reads two PEM files, and `certified` takes the same from bytes that were read already (those of the managed store).
+//! `chain_of` takes the chain alone from the bytes of a certificate file, for the admin process, which shows the
+//! certificates of the store.
 //! A file is a regular file of at most 1 MiB (`read_file` opens a file so, with the size as a parameter, for the
 //! account key too). The certificate file holds 1 to 10 certificates, the first of which is the one for the host. The
 //! key file holds exactly one private key, in a form (PKCS#8, SEC1 or PKCS#1) of a type that the crypto provider can
@@ -90,7 +92,7 @@ pub(crate) fn certified(chain: &[u8], key: &[u8]) -> Result<CertifiedKey, Fault>
 }
 
 /// The 1 to 10 certificates of the bytes of a certificate file.
-fn chain_of(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>, Fault> {
+pub(crate) fn chain_of(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>, Fault> {
     let chain = CertificateDer::pem_slice_iter(bytes)
         .take(MAX_CHAIN + 1)
         .collect::<Result<Vec<_>, _>>()

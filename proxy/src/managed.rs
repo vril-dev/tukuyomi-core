@@ -41,10 +41,13 @@
 //! the proxy reads its configuration again with the version by a reload order, and the store chooses it only once the
 //! proxy has taken it. It also checks a version that a request sends without saving it (`version::check_sent`, the
 //! route `POST /api/managed/check`), and tells the place in the version of a refusal, and it removes a version as
-//! `managed remove` does (the route `DELETE /api/managed/versions/<name>`). The proxy never writes the store: it only
-//! holds the lock of the file of the version that it reads.
+//! `managed remove` does (the route `DELETE /api/managed/versions/<name>`). It shows the certificates of the sites of a
+//! version as the store has them (`certificates`, the route `GET /api/managed/certificates/<name>`): it reads their
+//! chains, and of their keys only whether they are there. The proxy never writes the store: it only holds the lock of
+//! the file of the version that it reads.
 
 pub mod apply;
+pub(crate) mod certificates;
 pub mod command;
 pub(crate) mod import;
 mod load;
