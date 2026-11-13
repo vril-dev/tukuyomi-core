@@ -357,7 +357,7 @@ test('the page opens the shell for the role of the user, follows the address, an
   globalThis.location.hash = '#/generations';
   hash.handlers.forEach((handler) => handler());
   await wait();
-  assert.equal(main.querySelector('h1').textContent, 'Generations');
+  assert.equal(main.querySelector('h1').textContent, 'Rule generations');
   assert.deepEqual(links().map((link) => link.getAttribute('aria-current')), [null, 'page', null, null, null, null, null]);
   // A value that is not of its form is dropped from the address and told.
   globalThis.location.hash = '#/generations/not-a-fingerprint';
@@ -383,9 +383,9 @@ test('the page opens the shell for the role of the user, follows the address, an
   const select = app.querySelector('select');
   select.value = 'ja';
   select.dispatch('change');
-  assert.equal(main.querySelector('h1').textContent, '世代');
+  assert.equal(main.querySelector('h1').textContent, 'ルールの世代');
   assert.equal(links()[1], menu);
-  assert.equal(menu.textContent, '世代');
+  assert.equal(menu.textContent, 'ルールの世代');
   assert.equal(main.querySelector('input'), filter);
   assert.equal(filter.value, 'typed');
   setLanguage('en');
@@ -821,10 +821,10 @@ test('a key file that is chosen for a site is named on the panel, and what is in
   delete globalThis.FileReader;
 });
 
-test('no default group is told as such in a confirmation and in the content of a version', () => {
+test('no default upstream is told as such in a confirmation and in the content of a version', () => {
   setLanguage('en');
   const version = (name) => ({ sites: [], upstreams: {}, routes: [], default_upstream: name });
-  const row = (before, after) => diffRows(FP, OTHER, before, after).find((one) => String(one.label) === 'Default group');
+  const row = (before, after) => diffRows(FP, OTHER, before, after).find((one) => String(one.label) === 'Default upstream');
   const rows = row(countsOf(version('')), countsOf(version('a')));
   assert.equal(String(rows.now), 'Not set');
   assert.equal(rows.after, 'a');
