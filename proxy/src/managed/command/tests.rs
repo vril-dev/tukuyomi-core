@@ -29,6 +29,13 @@ fn each_command_takes_the_configuration_and_its_own_argument() {
         })
     );
     assert_eq!(
+        parse(&args(&["remove", "/etc/t.json", HEX])),
+        Ok(Command::Remove {
+            config: PathBuf::from("/etc/t.json"),
+            version: Fingerprint::from_hex(HEX.as_bytes()).unwrap().bytes(),
+        })
+    );
+    assert_eq!(
         parse(&args(&["list", "/etc/t.json"])),
         Ok(Command::List {
             config: PathBuf::from("/etc/t.json"),
@@ -40,7 +47,9 @@ fn each_command_takes_the_configuration_and_its_own_argument() {
         &["activate", "/etc/t.json", &HEX[1..]],
         &["activate", "/etc/t.json", &HEX.to_uppercase()],
         &["list", "/etc/t.json", "more"],
-        &["remove", "/etc/t.json", HEX],
+        &["remove", "/etc/t.json"],
+        &["remove", "/etc/t.json", &HEX[1..]],
+        &["prune", "/etc/t.json", HEX],
         &[],
     ] {
         assert!(parse(&args(wrong)).is_err(), "{wrong:?}");
@@ -181,6 +190,25 @@ fn a_version_that_the_proxy_would_refuse_is_not_chosen() {
     // So is a version that is not in the store.
     assert_eq!(command(&["activate", main, HEX]).0, Exit::Failed);
     assert_eq!(fixture.store().current(), Ok(Some(digest(&good).unwrap())));
+}
+
+#[test]
+fn remove_takes_a_version_out_of_the_store_but_not_the_current_one() {
+    let fixture = Fixture::new();
+    let main = fixture.main_file(|_| {});
+    let main = main.to_str().unwrap();
+    let current = hex(&fixture.current(&fixture.plain_version(b"chain 1", b"key 1")));
+    let other = hex(&fixture.version(&fixture.plain_version(b"chain 2", b"key 2")));
+    let (exit, out, lines) = command(&["remove", main, &other]);
+    assert_eq!((exit, out), (Exit::Done, format!("{other} removed\n")));
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(fixture.store().version(digest(&other).unwrap()).is_err());
+    let (exit, out, lines) = command(&["remove", main, &current]);
+    assert_eq!((exit, out.as_str()), (Exit::Failed, ""));
+    assert_eq!(
+        lines,
+        ["managed remove: the managed version is the current one"]
+    );
 }
 
 #[test]

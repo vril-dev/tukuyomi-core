@@ -369,6 +369,17 @@ impl<T> Groups<T> {
     }
 }
 
+impl Groups<StoredTls> {
+    /// The `ca` of each group of a version that has `tls`, as it is written: the files of the store that the groups
+    /// name, for the cleaning of the store (see `managed::version`).
+    pub(crate) fn authorities(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .iter()
+            .filter_map(|(_, Object(group))| group.tls.as_ref())
+            .map(|Object(tls)| tls.ca.as_str())
+    }
+}
+
 impl<T: DeserializeOwned> Groups<T> {
     /// Reads `value` as one group is read here, for the reading of a version item by item (see `managed::version`).
     pub(crate) fn read_one(value: &Value) -> Result<(), ConfigError> {

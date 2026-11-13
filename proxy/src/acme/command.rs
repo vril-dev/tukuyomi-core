@@ -21,10 +21,12 @@
 //! a new key (see `order`, `files`), the chain the CA made is checked as the proxy checks a chain when it reads it
 //! (the key goes with it, and it covers the hosts), and the key and the chain are written. The command takes no lock
 //! of the managed store: it changes no version and not `current`, and two of it are not run on one configuration at
-//! once. The whole command, the CA's answers and its waiting included, takes at most `timeout_ms`; a certificate
-//! that is still due when the time is gone is `failed`, and so is every one after it. SIGINT and SIGTERM end the
-//! command at once, with the files of its challenges removed. However it ends, the command does not wait for the
-//! system to answer the lookup of the name of the CA.
+//! once. It holds the version that it read (see `managed::Hold`) until it ends, so that the version is not removed
+//! meanwhile and the directories of `acme/` of its sites, which it writes, are not cleaned up. The whole command, the
+//! CA's answers and its waiting included, takes at most `timeout_ms`; a certificate that is still due when the time is
+//! gone is `failed`, and so is every one after it. SIGINT and SIGTERM end the command at once, with the files of its
+//! challenges removed. However it ends, the command does not wait for the system to answer the lookup of the name of
+//! the CA.
 //!
 //! The result is one line on the standard output for each certificate with `acme`: its place, a space, and
 //! `renewed`, `valid` or `failed`. The place of a certificate of a listener is `<listener>.<certificate>`, both counted
@@ -254,6 +256,7 @@ fn renew(config: &Path, term: &mut Terminal<'_>) -> Exit {
         term.note(&format!("{NAME}: host check refused: {text}"));
         return Exit::Failed;
     }
+    // With `managed`, `loaded` holds the version it was read with until the command ends.
     let loaded = match config::load(config) {
         Ok(loaded) => loaded,
         Err(e) => {

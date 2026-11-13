@@ -339,3 +339,31 @@ fn a_link_in_the_place_of_a_directory_of_a_site_with_acme_is_refused_for_reading
     assert_eq!(entries, ["chain", "key"]);
     assert_eq!(fs::read(elsewhere.join("chain")).unwrap(), b"chain");
 }
+
+#[test]
+fn a_held_version_is_its_file_in_the_store_and_a_broken_one_that_is_held_is_not_replaced() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let version = fixture.plain_version(b"chain", b"key");
+    let bytes = serde_json::to_vec(&version).unwrap();
+    let name = fixture.version(&version);
+    let path = store.path(Kind::Version, name);
+    // A lock taken on a file that was removed after it was opened holds nothing.
+    let opened = store.open_version(name).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert_eq!(
+        refusal(store.hold_opened(name, opened)),
+        "the managed version is not in the store"
+    );
+    assert_eq!(fixture.version(&version), name);
+    // A version that is held and then broken where it is is not replaced by the same bytes.
+    let (read, hold) = store.hold(name).unwrap();
+    assert_eq!(read, bytes);
+    fs::write(&path, b"broken").unwrap();
+    assert_eq!(
+        refusal(store.put_version(&bytes)),
+        "the managed version is in use"
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"broken");
+    drop(hold);
+}

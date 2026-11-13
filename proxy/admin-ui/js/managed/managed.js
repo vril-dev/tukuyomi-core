@@ -1,12 +1,14 @@
 // The screen of the versions of the managed configuration: the state of the store and of the proxy (the version that
 // is selected, the one that runs, and whether they differ), the job of a change, the list of the versions, the content
-// of one version for an operator (with an address of its own, `#/managed/<fingerprint>`), and the change that applies
-// a version by its name. The content of a version may hold secrets, so it stays in this page's memory only while it is
-// open. The small card of the overview is here too. Nothing runs when the module is loaded.
+// of one version for an operator (with an address of its own, `#/managed/<fingerprint>`), the change that applies a
+// version by its name, and the removal of a version from the store. The content of a version may hold secrets, so it
+// stays in this page's memory only while it is open. The small card of the overview is here too. Nothing runs when the
+// module is loaded.
 
-import { badge, button, buttonClass, el, mount, notice } from '../dom.js';
+import { ApiError } from '../api.js';
+import { badge, button, buttonClass, el, mount, notice, result } from '../dom.js';
 import { t, w } from '../i18n.js';
-import { canChange, confirmChange, fingerprintText, fingerprintView, hashOf, isFingerprint, kv, panel, panelWith, row, shortOf, timeCell, timeCellText, timeLabel, timeView, working } from '../parts.js';
+import { canChange, confirmChange, diffView, fingerprintText, fingerprintView, hashOf, isFingerprint, kv, panel, panelWith, row, shortOf, timeCell, timeCellText, timeLabel, timeView, working } from '../parts.js';
 import { Table } from '../table.js';
 import { draftFromVersion, heldDraft, readableVersion, savingRuns, settleSaving } from './edit/draft.js';
 import { screens as policyScreens } from './edit/screens/policy.js';
@@ -15,7 +17,7 @@ import { screens as siteScreens } from './edit/screens/sites.js';
 import { screens as upstreamScreens } from './edit/screens/upstreams.js';
 import { screens as historyScreens } from './history.js';
 import { isJob } from './job.js';
-import { Screen, countsOf, defaultGroupView, mountScreen, proxyOf, servingView, unusedNotice } from './screen.js';
+import { Screen, countsOf, defaultGroupView, diffRows, mountScreen, proxyOf, servingView, unusedNotice } from './screen.js';
 
 // The tone and the short words of what `proxyOf` says.
 const PROXY = {
@@ -32,14 +34,43 @@ const STATES = {
   running: { tone: 'ok', words: () => w('managed.badge.running'), text: () => t('managed.badge.running') },
 };
 
+/** Why a version cannot be removed, by the word of `versionActions`. */
+const KEPT = {
+  selected: () => w('managed.kept.selected'),
+  running: () => w('managed.kept.running'),
+  rollback: () => w('managed.kept.rollback'),
+};
+
 /**
- * What a user may do with a version of the list: see its content (`open`) and apply it by its name (`apply`), which
- * needs a version that is selected (the store has one, which the request must expect) and is not this one. A version
- * whose name is not one of ours gets neither, and a viewer neither.
+ * What a user may do with a version of the list: see its content (`open`), apply it by its name (`apply`), which
+ * needs a version that is selected (the store has one, which the request must expect) and is not this one, and remove
+ * it from the store (`remove`). `kept` says why it may not be removed: it is the selected version, the one that the
+ * proxy runs, or `rollbackTo`, the version that a rollback would select. When the proxy did not say which version it
+ * runs, none is marked as running, and the store refuses to remove the one that a proxy uses. A version whose name is
+ * not one of ours gets nothing, and a viewer nothing.
  */
-export function versionActions(role, version, selected) {
-  if (!canChange(role) || !isFingerprint(version?.name)) return { open: false, apply: false };
-  return { open: true, apply: isFingerprint(selected) && version.current !== true };
+export function versionActions(role, version, selected, rollbackTo) {
+  if (!canChange(role) || !isFingerprint(version?.name)) return { open: false, apply: false, remove: false, kept: null };
+  let kept = null;
+  if (version.current === true) kept = 'selected';
+  else if (version.serving === true) kept = 'running';
+  else if (version.name === rollbackTo) kept = 'rollback';
+  return { open: true, apply: isFingerprint(selected) && version.current !== true, remove: kept === null, kept };
+}
+
+/**
+ * What the screen tells of the end of a removal of the version `name`, from the `{ body, error }` that `perform` gave:
+ * that it was removed, with a warning when the store did not say that it cleaned up the files that no version names;
+ * that the result is not known (no answer, an answer that does not name the version, or a 503, after which the
+ * removal may still end); or why it was refused (a conflict as a warning, anything else as an error).
+ */
+export function removalView(name, { body, error }, describe) {
+  const kind = error === null ? null : error instanceof ApiError ? error.kind : 'other';
+  if (kind === 'unknown' || kind === 'unavailable' || (error === null && body?.removed !== name)) {
+    return result('warn', w('managed.lost.title'), w('managed.remove.lost'), w('managed.lost.next'));
+  }
+  if (error !== null) return notice(kind === 'conflict' ? 'warn' : 'bad', describe(error, { change: true }));
+  return [result('ok', w('managed.removed_title'), w('managed.removed', { id: shortOf(name) })), body.cleaned === true ? null : notice('warn', w('managed.remove.unclean'))];
 }
 
 /** Whether what the state says is a difference to correct: the screen is not watching a job, the proxy is not reading again, and the two versions are named and differ. */
@@ -100,6 +131,12 @@ class VersionsScreen extends Screen {
   selected() {
     const current = this.data?.state?.current;
     return isFingerprint(current) ? current : null;
+  }
+
+  /** The version that a rollback would select, as the last read found it. */
+  rollbackTo() {
+    const target = this.data?.state?.rollback_to;
+    return isFingerprint(target) ? target : null;
   }
 
   /** The versions of the list, the newest first. */
@@ -221,15 +258,22 @@ class VersionsScreen extends Screen {
     return savingRuns({ workingName: working.name, watching: this.watch.active, job: this.job, user: this.ctx.user.name });
   }
 
-  /** The buttons of a version; applying it is the main button of a detail and an ordinary one in a row, and a draft is made from a detail only. */
+  /**
+   * The buttons of a version; applying it is the main button of a detail and an ordinary one in a row, a draft is made
+   * from a detail only, and removing it is a button of danger set apart, or the words that say why it is kept. Nothing
+   * is offered before the state is read: until then the version that a rollback would select is not known.
+   */
   actions(item, inDetail = false) {
-    if (this.error !== null || !versionActions(this.ctx.user.role, item, this.selected()).apply) return null;
-    return el(
-      'div',
-      { class: 'tc-actions' },
-      button(inDetail ? 'primary' : 'small', w('managed.apply'), () => this.activate(item.name), { disabled: this.busy() }),
-      inDetail ? button('', w('edit.from_version'), () => this.draftFrom(item.name), { disabled: this.saving() }) : null,
-    );
+    if (this.error !== null || this.data?.state?.managed !== true) return null;
+    const can = versionActions(this.ctx.user.role, item, this.selected(), this.rollbackTo());
+    const busy = this.busy();
+    const buttons = [
+      can.apply ? button(inDetail ? 'primary' : 'small', w('managed.apply'), () => this.activate(item.name), { disabled: busy }) : null,
+      can.apply && inDetail ? button('', w('edit.from_version'), () => this.draftFrom(item.name), { disabled: this.saving() }) : null,
+      can.remove ? el('span', { class: 'tc-actions--apart' }, button(inDetail ? 'danger' : 'small danger', w('managed.remove'), () => this.remove(item.name), { disabled: busy })) : null,
+      can.kept === null ? null : el('span', { class: 'tc-muted tc-small' }, KEPT[can.kept]()),
+    ];
+    return buttons.every((one) => one === null) ? null : el('div', { class: 'tc-actions' }, buttons);
   }
 
   drawBody() {
@@ -377,6 +421,42 @@ class VersionsScreen extends Screen {
       path: '/api/managed/activate',
       body: { expect: current, version },
     });
+  }
+
+  /**
+   * Removes the version `name` from the store, after a confirmation that shows its numbers, read just before (a version
+   * that cannot be read can still be removed: only its fingerprint is shown then). A removal starts no job: its answer
+   * tells how it ended. The detail of the version that is gone closes.
+   */
+  async remove(name) {
+    if (this.asking || !isFingerprint(name)) return;
+    this.asking = true;
+    let counts;
+    try {
+      counts = await this.versionCounts(name);
+    } finally {
+      this.asking = false;
+    }
+    if (!this.alive) return;
+    const yes = await confirmChange(this.layer, {
+      title: w('managed.remove.title'),
+      lines: [
+        el('p', {}, w('managed.remove.what')),
+        counts === null ? el('p', { class: 'tc-muted tc-small' }, w('managed.confirm.unread')) : null,
+        notice('warn', w('managed.remove.files')),
+        el('p', { class: 'tc-muted tc-small' }, w('managed.remove.drafts')),
+      ],
+      diff: diffView([w('managed.confirm.now'), w('managed.confirm.after_remove')], diffRows(name, null, counts, null, { gone: true })),
+      confirm: w('managed.remove'),
+      tone: 'danger',
+    });
+    if (!yes || !this.alive) return;
+    const done = await this.change('managed-remove', () => this.ctx.api.call('DELETE', `/api/managed/versions/${name}`));
+    if (done === null) return;
+    mount(this.results, removalView(name, done, this.ctx.describe));
+    // The version is gone, and so is its address.
+    if (done.error === null && done.body?.removed === name && this.detail?.name === name) this.ctx.navigate(hashOf('managed'));
+    await this.load();
   }
 }
 

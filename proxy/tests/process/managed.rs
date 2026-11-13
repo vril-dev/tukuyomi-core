@@ -885,3 +885,109 @@ fn a_link_in_the_place_of_the_directory_of_a_site_with_acme_refuses_the_start_an
         "acme renew: no certificate has acme, neither that of admin route nor a site of the managed version\n"
     );
 }
+
+// ---- the removal of a version ----
+
+/// Whether the managed store of the test root `root` has the file with the bytes of the file `path`.
+fn stored(root: &Path, path: &Path) -> bool {
+    let name = hex(&sha256(&fs::read(path).unwrap()));
+    root.join(MANAGED).join("files").join(name).exists()
+}
+
+/// The directory of `acme/` of the managed store of the test root `root` for a site with acme and these `hosts`.
+fn issued_dir(root: &Path, hosts: &[&str]) -> PathBuf {
+    let mut sorted = hosts.to_vec();
+    sorted.sort_unstable();
+    let named: String = sorted.iter().map(|host| format!("{host}\n")).collect();
+    root.join(MANAGED)
+        .join("acme")
+        .join(hex(&sha256(named.as_bytes())))
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn the_version_that_the_proxy_serves_with_is_not_removed_and_a_removal_cleans_up_what_it_alone_named()
+ {
+    let mut pki = Pki::new("managed_remove");
+    fs::create_dir(pki.path("challenges")).unwrap();
+    let first_site = pki.issue("a1", &["a.example"]);
+    let second_site = pki.issue("a2", &["a.example"]);
+    let tls_port = free_port();
+    let mut first = String::new();
+    let proxy = Proxy::start_with("mng_remove", knobs(), |root| {
+        first = manage(root, |main, document| {
+            let listeners = main["proxy"]["listeners"].as_array_mut().unwrap();
+            listeners.push(tls_listener(tls_port, false));
+            main["acme"] = acme_object(&pki);
+            document["sites"] = json!([
+                {"name": "a", "hosts": ["a.example"], "certificate": {"chain_file": first_site.0, "key_file": first_site.1}},
+                acme_site("c", &["c.example"]),
+            ]);
+        });
+    });
+    let root = proxy.root().to_path_buf();
+    put_issued(&root, &["c.example"], &pki.issue("c", &["c.example"]));
+    put_issued(&root, &["d.example"], &pki.issue("d", &["d.example"]));
+    let in_use = (
+        Some(1),
+        String::new(),
+        "managed remove: the managed version is in use\n".to_owned(),
+    );
+
+    // A second version, with other files for its site and another site with acme, is chosen without SIGHUP: the proxy
+    // serves with the first one still, which is not removed.
+    let mut second = document(&root);
+    second["sites"] = json!([
+        {"name": "a", "hosts": ["a.example"], "certificate": {"chain_file": second_site.0, "key_file": second_site.1}},
+        acme_site("d", &["d.example"]),
+    ]);
+    let name = import_and_activate(&root, &second);
+    assert_eq!(managed(&root, "remove", &[&first]), in_use);
+
+    // Once SIGHUP has replaced it, it is removed, and with it the files and the certificate that it alone named.
+    let config = hex(&sha256(&fs::read(root.join("config.json")).unwrap()));
+    proxy.signal("HUP");
+    let line = format!("reload: configuration replaced {config} managed {name}");
+    proxy
+        .records
+        .wait_lines("the second version", 1, |l| l == line);
+    assert_eq!(
+        managed(&root, "remove", &[&first]),
+        (Some(0), format!("{first} removed\n"), String::new())
+    );
+    assert!(!stored(&root, &first_site.0) && !stored(&root, &first_site.1));
+    assert!(stored(&root, &second_site.0) && stored(&root, &second_site.1));
+    assert!(!issued_dir(&root, &["c.example"]).exists());
+    assert!(issued_dir(&root, &["d.example"]).join("key").exists());
+    // What the proxy serves with is all there: SIGUSR2 reads it again.
+    proxy.signal("USR2");
+    proxy.records.wait_lines("the certificates", 1, |l| {
+        l == "reload: certificates replaced"
+    });
+    let (answer, cert) = over_tls(
+        &pki,
+        tls_port,
+        "a.example",
+        &request("a.example", "192.0.2.1"),
+    );
+    assert_eq!((answer.status(), cert), (200, shown(&second_site.0)));
+
+    // The version that SIGHUP took is held as long as it serves: when a third one is chosen without SIGHUP, and when a
+    // SIGHUP with a value of the main file that cannot change is refused.
+    let mut third = second.clone();
+    third["default_upstream"] = json!("other");
+    import_and_activate(&root, &third);
+    assert_eq!(managed(&root, "remove", &[&name]), in_use);
+    let path = root.join("config.json");
+    let original = fs::read(&path).unwrap();
+    let mut main: Value = serde_json::from_slice(&original).unwrap();
+    main["proxy"]["max_conns"] = json!(main["proxy"]["max_conns"].as_u64().unwrap() + 1);
+    fs::write(&path, main.to_string()).unwrap();
+    proxy.signal("HUP");
+    proxy.records.wait_lines("the refusal", 1, |l| {
+        l == "reload: configuration refused: proxy.max_conns cannot change while running"
+    });
+    assert_eq!(managed(&root, "remove", &[&name]), in_use);
+    fs::write(&path, &original).unwrap();
+    finish(proxy, 1);
+}

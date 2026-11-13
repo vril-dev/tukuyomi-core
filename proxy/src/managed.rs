@@ -11,10 +11,14 @@
 //! name every time it is read, so one whose bytes are not what the name says is refused, never used. A version or a
 //! file is written to `<name>.new`, synced and renamed onto its name, and `current` is replaced through
 //! `current.new` in the same way, the directory being synced after each; a reader sees the old entry or the new one,
-//! whole, and a command that stopped halfway leaves at most a `.new`, which the next write of that name removes. No
-//! version is removed here. Only the store directory itself is examined, as the directory of the rules store is: a real
-//! directory (not a link) owned by the user that the file system sees for this process, without group or other
-//! permission bits. What is read is opened without following a link and without waiting for a writer.
+//! whole, and a command that stopped halfway leaves at most a `.new`, which the next write of that name removes, and so
+//! does the next removal of a version. A version that `current` does not name is removed by its name (see `remove`),
+//! unless it is held: what reads a version to serve with it or to use it holds a shared lock on its file (`Hold`) for
+//! as long as it does, and a removal takes the exclusive one without waiting. A removal takes with it the files and the
+//! certificates of the sites with `acme` that no version names any more. Only the store directory itself is examined,
+//! as the directory of the rules store is: a real directory (not a link) owned by the user that the file system sees
+//! for this process, without group or other permission bits. What is read is opened without following a link and
+//! without waiting for a writer.
 //!
 //! The store also holds `acme/<64 digits>/chain` and `acme/<64 digits>/key`: the certificate chain and the private key
 //! of a site with `acme`, which the command `acme renew` writes and replaces (see `acme`). They are outside the
@@ -25,28 +29,32 @@
 //!
 //! The proxy reads the main file and a version as one configuration (`load`): when it starts, for `config check` and at
 //! SIGHUP, with the version that `current` names, and for a reload order of its control socket with the version that
-//! the order names. Every TLS listener of the main file then chooses, by the name the client asks for, from the
-//! certificates of the sites and that of the way to the admin process, which the main file writes in `admin.route` and
-//! the proxy makes itself (see `config::admin`, `inbound::transport::tls`). The commands (see `command`) make a version
-//! from a document whose files are named by their paths (`managed import`), choose one after the same reading as the
-//! proxy's (`managed activate`), and list them (`managed list`); a running proxy takes the version they choose at the
-//! next SIGHUP or start. The admin process saves a version that a request sends, its files named by their SHA-256 and
-//! the new ones sent with it, in the way of `managed import` (see `import`), and puts a version in force in a running
-//! proxy the other way round (see `apply`): the proxy reads its configuration again with the version by a reload
-//! order, and the store chooses it only once the proxy has taken it. It also checks a version that a request sends
-//! without saving it (`version::check_sent`, the route `POST /api/managed/check`), and tells the place in the version
-//! of a refusal. The proxy never writes the store.
+//! the order names; it holds the version that it serves with, so that the version is not removed, nor what it names,
+//! while SIGUSR2 may read the certificates of its sites again. Every TLS listener of the main file then chooses, by the
+//! name the client asks for, from the certificates of the sites and that of the way to the admin process, which the
+//! main file writes in `admin.route` and the proxy makes itself (see `config::admin`, `inbound::transport::tls`). The
+//! commands (see `command`) make a version from a document whose files are named by their paths (`managed import`),
+//! choose one after the same reading as the proxy's (`managed activate`), remove one (`managed remove`) and list them
+//! (`managed list`); a running proxy takes the version they choose at the next SIGHUP or start. The admin process saves
+//! a version that a request sends, its files named by their SHA-256 and the new ones sent with it, in the way of
+//! `managed import` (see `import`), and puts a version in force in a running proxy the other way round (see `apply`):
+//! the proxy reads its configuration again with the version by a reload order, and the store chooses it only once the
+//! proxy has taken it. It also checks a version that a request sends without saving it (`version::check_sent`, the
+//! route `POST /api/managed/check`), and tells the place in the version of a refusal, and it removes a version as
+//! `managed remove` does (the route `DELETE /api/managed/versions/<name>`). The proxy never writes the store: it only
+//! holds the lock of the file of the version that it reads.
 
 pub mod apply;
 pub mod command;
 pub(crate) mod import;
 mod load;
+pub(crate) mod remove;
 pub(crate) mod store;
 mod version;
 
 #[cfg(test)]
 pub(crate) use load::whole;
 pub use load::{Choice, LoadError, Version, load};
-pub use store::{Listed, ManagedError, Placed, Store, acme_name};
+pub use store::{Hold, Listed, ManagedError, Placed, Store, acme_name};
 pub(crate) use version::{Objection, sent};
 pub use version::{Site, SiteCertificate, SiteOf};

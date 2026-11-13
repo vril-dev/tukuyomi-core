@@ -539,23 +539,38 @@ fn remove_entry(path: &Path) -> io::Result<()> {
     }
 }
 
-/// The content of the regular file at `path`, which must not be a link and must be at most `limit` bytes. When
-/// `same_as` is the device and inode that an earlier `lstat` of the path gave, the file that was opened must be that
-/// one. The kind of fault is `InvalidData` for a file that is not regular, is another one than `same_as`, is over
-/// the limit or changed its size while it was read; the faults of the file system keep their own kind (`NotFound`
-/// for an absent file).
+/// The content of the regular file at `path`, which must not be a link and must be at most `limit` bytes: `open_read`
+/// and then `read_opened`. When `same_as` is the device and inode that an earlier `lstat` of the path gave, the file
+/// that was opened must be that one. The kind of fault is `InvalidData` for a file that is not regular, is another one
+/// than `same_as`, is over the limit or changed its size while it was read; the faults of the file system keep their
+/// own kind (`NotFound` for an absent file).
 pub(crate) fn read_regular(
     path: &Path,
     limit: u64,
     same_as: Option<(u64, u64)>,
 ) -> io::Result<Vec<u8>> {
-    // O_NONBLOCK: opening a FIFO must not wait for a writer; the check of the file type below then refuses it.
-    // It does not affect reads of a regular file. O_NOCTTY: a terminal that is opened before that check is never
+    read_opened(&open_read(path)?, limit, same_as)
+}
+
+/// Opens the file at `path` to be read, without following a link: what `read_regular` reads, for a caller that does
+/// something with the file (takes a lock on it) before it reads it with `read_opened`. Nothing is made.
+pub(crate) fn open_read(path: &Path) -> io::Result<File> {
+    // O_NONBLOCK: opening a FIFO must not wait for a writer; the check of the file type in `read_opened` then refuses
+    // it. It does not affect reads of a regular file. O_NOCTTY: a terminal that is opened before that check is never
     // made the controlling terminal of the process. std adds close-on-exec.
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
-        .open(path)?;
+        .open(path)
+}
+
+/// The content of `file`, which `open_read` opened and nothing has read from yet, as `read_regular` reads it: a regular
+/// file (the one of `same_as`, if it is given) of at most `limit` bytes, read whole.
+pub(crate) fn read_opened(
+    file: &File,
+    limit: u64,
+    same_as: Option<(u64, u64)>,
+) -> io::Result<Vec<u8>> {
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(io::Error::new(

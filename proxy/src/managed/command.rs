@@ -1,15 +1,16 @@
-//! The commands on the managed store: `managed import`, `managed activate` and `managed list`.
+//! The commands on the managed store: `managed import`, `managed activate`, `managed remove` and `managed list`.
 //!
 //! ```text
 //! tukuyomi-proxy managed import <config> <document>
 //! tukuyomi-proxy managed activate <config> <version>
+//! tukuyomi-proxy managed remove <config> <version>
 //! tukuyomi-proxy managed list <config>
 //! ```
 //!
 //! A command is a short process of its own, apart from a running proxy, which does not notice what it does: a proxy
 //! takes the chosen version when it starts or reads its configuration again at SIGHUP. The commands ask no proxy; the
 //! admin process puts a version in force in a running proxy by its control socket (see `apply`), and holds the lock of
-//! the store while it does, so that `import` and `activate` are refused meanwhile (the store is in use). The
+//! the store while it does, so that `import`, `activate` and `remove` are refused meanwhile (the store is in use). The
 //! configuration is the main file of the proxy, as an absolute clean path, and it has `managed`; the document is a
 //! path as the operator writes it, from the working directory, and the version is its 64 lowercase hexadecimal digits.
 //!
@@ -25,21 +26,27 @@
 //! file that was put in the store stays there if that last reading refuses. `activate` takes the lock
 //! of the store and chooses the version only if the steps of the start before the rules store pass with it (see
 //! `run`): the main file with the version, the lookup of the names of the upstream servers and the files of their
-//! authorities, and the certificates of the listeners. `list` shows the versions.
+//! authorities, and the certificates of the listeners. `remove` removes a version that `current` does not name and
+//! that nothing holds (a proxy that serves with it, or a command that reads it), and with it the files and the
+//! certificates of the sites with `acme` that no version names any more (see `remove`); it looks at no rollback.
+//! `list` shows the versions.
 //!
 //! The results go to the standard output, one line each, and the first word of a line is the name of a version:
 //! `import` says `created`, `existing` or `recreated` after it (`recreated`: the store had a broken copy, which was
-//! replaced), `activate` says `current`, and `list` gives the time the version was made (seconds since the epoch), and
-//! `current` for the chosen one. Everything else goes to the standard error, a line each, and starts with the name of
-//! the command; a path that came from the document is written with every byte outside 0x20 to 0x7e as `\xNN`.
+//! replaced), `activate` says `current`, `remove` says `removed`, and `list` gives the time the version was made
+//! (seconds since the epoch), and `current` for the chosen one. Everything else goes to the standard error, a line
+//! each, and starts with the name of the command; a path that came from the document is written with every byte
+//! outside 0x20 to 0x7e as `\xNN`. A removal whose cleaning did not go whole says so there, and ends with 0 all the
+//! same: the version is gone.
 //!
 //! No command runs as root: when any user id of the process is 0, the command writes a `host check refused` line and
 //! ends before it reads the configuration.
 //!
 //! The exit code is 0 for success, 1 for any other end (a refused store, document or file, a store that is in use, a
 //! name that cannot be looked up or a file that cannot be used when the version is chosen, a current version that is
-//! not in the store, a version that `activate` refuses, as a document that `import` refuses, a process that runs as
-//! root) and 2 for a wrong argument or a refused configuration, a main file without `managed` included.
+//! not in the store, a version that `activate` refuses, as a document that `import` refuses, a version that `remove`
+//! refuses, a process that runs as root) and 2 for a wrong argument or a refused configuration, a main file without
+//! `managed` included.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -48,6 +55,7 @@ use std::path::{Path, PathBuf};
 
 use super::import::{self, Placing, Reading};
 use super::load::{Choice, LoadError};
+use super::remove;
 use super::store::{MAX_BYTES, Placed, Store};
 use crate::config::{self, Built};
 use crate::inbound::transport::tls::{Fault, read_file};
@@ -55,7 +63,7 @@ use crate::log::{Log, escaped};
 use crate::rules::bundle::{Fingerprint, hex};
 use crate::run::{EXIT_FAILED, host, read_parts};
 
-const USAGE: &str = "usage: tukuyomi-proxy managed import <config> <document>\n       tukuyomi-proxy managed activate <config> <version>\n       tukuyomi-proxy managed list <config>";
+const USAGE: &str = "usage: tukuyomi-proxy managed import <config> <document>\n       tukuyomi-proxy managed activate <config> <version>\n       tukuyomi-proxy managed remove <config> <version>\n       tukuyomi-proxy managed list <config>";
 
 /// How a command ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +78,7 @@ pub enum Exit {
 enum Command {
     Import { config: PathBuf, document: PathBuf },
     Activate { config: PathBuf, version: [u8; 32] },
+    Remove { config: PathBuf, version: [u8; 32] },
     List { config: PathBuf },
 }
 
@@ -83,13 +92,14 @@ pub fn run(args: &[OsString], out: &mut dyn Write, log: &Log) -> Exit {
         }
         Ok(Command::Import { config, document }) => import(&config, &document, out, log),
         Ok(Command::Activate { config, version }) => activate(&config, version, out, log),
+        Ok(Command::Remove { config, version }) => remove(&config, version, out, log),
         Ok(Command::List { config }) => list(&config, out, log),
     }
 }
 
 fn parse(args: &[OsString]) -> Result<Command, &'static str> {
     let (name, rest) = args.split_first().ok_or("a command is missing")?;
-    if name != "import" && name != "activate" && name != "list" {
+    if name != "import" && name != "activate" && name != "remove" && name != "list" {
         return Err("unknown command");
     }
     let (config, rest) = rest
@@ -111,17 +121,29 @@ fn parse(args: &[OsString]) -> Result<Command, &'static str> {
         match rest {
             [version] => Ok(Command::Activate {
                 config,
-                version: Fingerprint::from_hex(version.as_bytes())
-                    .ok_or("the version is not 64 lowercase hexadecimal digits")?
-                    .bytes(),
+                version: version_name(version)?,
             }),
             _ => Err("activate takes one version"),
+        }
+    } else if name == "remove" {
+        match rest {
+            [version] => Ok(Command::Remove {
+                config,
+                version: version_name(version)?,
+            }),
+            _ => Err("remove takes one version"),
         }
     } else if rest.is_empty() {
         Ok(Command::List { config })
     } else {
         Err("list takes no argument after the configuration file")
     }
+}
+
+fn version_name(arg: &OsString) -> Result<[u8; 32], &'static str> {
+    Fingerprint::from_hex(arg.as_bytes())
+        .map(|name| name.bytes())
+        .ok_or("the version is not 64 lowercase hexadecimal digits")
 }
 
 /// A result line. A write that fails does not change how the command ends.
@@ -247,6 +269,32 @@ fn activate(config: &Path, version: [u8; 32], out: &mut dyn Write, log: &Log) ->
     match store.choose(version) {
         Ok(()) => {
             result(out, &format!("{} current", hex(&version)));
+            Exit::Done
+        }
+        Err(e) => {
+            log.line(&format!("{NAME}: {}", e.0));
+            Exit::Failed
+        }
+    }
+}
+
+fn remove(config: &Path, version: [u8; 32], out: &mut dyn Write, log: &Log) -> Exit {
+    const NAME: &str = "managed remove";
+    if let Err(exit) = not_root(NAME, log) {
+        return exit;
+    }
+    let (_, store) = match open(NAME, config, log) {
+        Ok(opened) => opened,
+        Err(exit) => return exit,
+    };
+    match remove::remove(&store, version) {
+        Ok(removed) => {
+            result(out, &format!("{} removed", hex(&version)));
+            if !removed.cleaned {
+                log.line(&format!(
+                    "{NAME}: the files that no version names were not cleaned up"
+                ));
+            }
             Exit::Done
         }
         Err(e) => {

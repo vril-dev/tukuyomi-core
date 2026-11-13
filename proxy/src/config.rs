@@ -190,7 +190,7 @@ pub struct ProxyConfig {
 
 /// A whole configuration that passed every check: the main file, and for a file with `managed` the version of the
 /// managed store it was read with. The proxy serves with it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Loaded {
     pub proxy: ProxyConfig,
     /// From the main file, or from the version for a file with `managed` (`resolve_timeout` is the main file's).

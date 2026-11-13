@@ -8,7 +8,8 @@
 //! not in the store, is 409). `expect` is the version that the client saw chosen, and `version` a name, each 64
 //! lowercase hexadecimal digits (else 400). The steps before the job, and the first that refuses answers:
 //! 1. The right to change (`routes::Seat`): one change at a time in this process, its job included, so another one
-//!    under way is 409, and a process that stops is 503. Not audited.
+//!    under way is 409, and a process that stops is 503. Not audited. The removal of a version (see `remove`) takes
+//!    the same right.
 //! 2. The main file, read again: one without `managed` (or that had none when the process started), or whose
 //!    `managed.dir` is not the directory of the start, is 409, and no other store is opened; so is one that is
 //!    refused, with its sentence. Audited as denied (`managed`, `configuration`).

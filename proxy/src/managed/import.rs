@@ -24,7 +24,9 @@
 //! `place` takes the lock of the store and holds it until it ends: it puts the files (a file that is there already is
 //! not written again), reads the main file with the version and the files of the store as the proxy would (see
 //! `load`), the country database included or not (`Reading`), and puts the version. It does not choose it. A file that
-//! was put in the store stays there if the reading refuses.
+//! was put in the store stays there if the reading refuses, until a removal of a version cleans it up. A broken copy
+//! of the version that is in the store is replaced, unless something holds it (see `Store::hold`): then the saving is
+//! refused, the version being in use.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;

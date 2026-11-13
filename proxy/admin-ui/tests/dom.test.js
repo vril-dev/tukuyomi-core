@@ -9,7 +9,7 @@ import { screens as generationScreens } from '../js/waf/generations.js';
 import { screens as wafScreens } from '../js/waf/waf.js';
 import { screens as importScreens } from '../js/waf/import.js';
 import { jobResult } from '../js/managed/job.js';
-import { screens as managedScreens } from '../js/managed/managed.js';
+import { removalView, screens as managedScreens } from '../js/managed/managed.js';
 import { countsOf, defaultGroupView, diffRows } from '../js/managed/screen.js';
 import { valueTree } from '../js/managed/history.js';
 import { start } from '../js/app.js';
@@ -395,10 +395,11 @@ test('the page opens the shell for the role of the user, follows the address, an
 test('while a job runs, the screen of the versions holds its buttons and says nothing of a difference', async () => {
   setLanguage('en');
   const job = { kind: 'activate', actor: 'ann', from: FP, to: OTHER, started: 1, state: 'running' };
+  const spare = 'c'.repeat(64);
   const api = {
     async call(method, path) {
       if (path === '/api/managed') return { managed: true, current: FP, serving: OTHER, reachable: true, reloading: false, rollback_to: null, job };
-      if (path === '/api/managed/versions') return { reachable: true, versions: [{ name: FP, made: 1, current: true, serving: false }, { name: OTHER, made: 1, current: false, serving: true }] };
+      if (path === '/api/managed/versions') return { reachable: true, versions: [{ name: FP, made: 1, current: true, serving: false }, { name: OTHER, made: 1, current: false, serving: true }, { name: spare, made: 1, current: false, serving: false }] };
       if (path === '/api/status') return { proxy: { config: 'c'.repeat(64) } };
       return { sha256: 'c'.repeat(64), forward: {} };
     },
@@ -411,8 +412,12 @@ test('while a job runs, the screen of the versions holds its buttons and says no
   await wait();
   await wait();
   const apply = root.querySelectorAll('button').filter((item) => item.textContent === 'Apply this version');
-  assert.equal(apply.length, 1);
-  assert.equal(apply[0].disabled, true);
+  assert.equal(apply.length, 2);
+  assert.equal(apply.every((item) => item.disabled), true);
+  // Only the version that is neither selected nor running may be removed, and not while the job runs.
+  const remove = root.querySelectorAll('button').filter((item) => item.textContent === 'Remove this version');
+  assert.equal(remove.length, 1);
+  assert.equal(remove[0].disabled, true);
   assert.equal(root.textContent.includes('The selected version and the version that the proxy runs differ.'), false);
   screen.stop();
 });
@@ -483,6 +488,19 @@ test('the outcome of a job with a result that this page does not know is told as
   assert.equal(box.textContent.includes('a new word'), true);
   // A word of an object's prototype is no result.
   assert.equal(jobResult({ state: 'ended', result: 'constructor', from: FP, to: OTHER }).textContent.includes('The result is not one that this page knows.'), true);
+});
+
+test('a removal that did not clean up says so, and one with a 503 or with no answer that names the version is not known', () => {
+  setLanguage('en');
+  const text = (body, error = null) => mount(document.createElement('div'), removalView(FP, { body, error }, (failure) => failure.sentence)).textContent;
+  const unclean = 'The files that are no longer used could not all be cleaned up.';
+  const lost = 'it is not known whether the version was removed';
+  assert.equal(text({ removed: FP, cleaned: true }).includes(unclean), false);
+  assert.equal(text({ removed: FP, cleaned: false }).includes(unclean), true);
+  // A 503 also comes when the time of the answer is over and the removal goes on: it is not told as a refusal.
+  assert.equal(text(null, new ApiError('unavailable', 503, 'unavailable')).includes(lost), true);
+  assert.equal(text({ removed: OTHER, cleaned: true }).includes(lost), true);
+  assert.equal(text(null, new ApiError('conflict', 409, 'the managed version is in use')), 'the managed version is in use');
 });
 
 test('the values of the configuration file number a list from 1 and stop drawing below sixteen levels', () => {

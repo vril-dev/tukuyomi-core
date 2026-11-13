@@ -2,10 +2,15 @@
 //! lock, and the certificates of the sites with `acme` (see `managed` for the form). The writes of the versions, the
 //! files and the record are made by the commands of `managed`, by the admin process when it saves a version (the
 //! files and the version, through `import::place`, as `managed import` does) and by its order (`apply`), which hold
-//! the lock; the certificates of the sites with `acme` are written by the command `acme renew`, which does not take
-//! it, for it touches no version and no record. The readings take no lock, for every name they read is replaced whole
-//! or not at all.
+//! the lock, and so are the removal of a version and the cleaning that comes with it (`remove`, which `managed remove`
+//! and the admin process take). The certificates of the sites with `acme` are written by the command `acme renew`,
+//! which does not take it, for it touches no version and no record. A reading takes no lock of the store, for every
+//! name it reads is replaced whole or not at all. A version that is read to be served with or used is read with a
+//! shared lock on its own file (`hold`), which keeps `remove` from removing it, and `put` from replacing a broken copy
+//! of it, while it is held. What the cleaning removes is named by no version that is left, so whatever holds a version
+//! loses no file of it.
 
+use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder, File, TryLockError};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -16,7 +21,9 @@ use zeroize::Zeroizing;
 
 use crate::config;
 use crate::rules::bundle::{Fingerprint, hex, sha256};
-use crate::rules::file_store::{open_lock_file, read_regular, sync_dir, write_new};
+use crate::rules::file_store::{
+    open_lock_file, open_read, read_opened, read_regular, sync_dir, write_new,
+};
 use crate::rules::store::StoreError;
 use crate::run::host;
 
@@ -35,6 +42,8 @@ const VERSION_END: &str = ".json";
 const ACME: &str = "acme";
 const CHAIN: &str = "chain";
 const KEY: &str = "key";
+/// What follows the name of an entry that is being written (see `put`).
+const NEW_END: &str = ".new";
 
 /// The chain and the key of a site with `acme`, as the store has them.
 pub type Issued = (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
@@ -63,6 +72,22 @@ pub const IN_USE: ManagedError = ManagedError("the managed store is in use by an
 /// Why `choose_if_current` refuses when `current` does not name the version that the caller saw as chosen.
 pub const NOT_CURRENT: ManagedError =
     ManagedError("the chosen managed version is not the one that was expected");
+
+/// Why a version is refused that is not there, or not any more.
+const NOT_IN_STORE: ManagedError = ManagedError("the managed version is not in the store");
+/// Why a version is not removed, or not replaced, while another holds the lock of its file (see `Hold`).
+const VERSION_IN_USE: ManagedError = ManagedError("the managed version is in use");
+/// Why the lock of the file of a version is refused when it is not held by another.
+const NO_VERSION_LOCK: ManagedError =
+    ManagedError("the lock of the managed version cannot be taken");
+
+/// A version that was read with a shared lock on its file (see `Store::hold`). While it lives, the version is not
+/// removed and a broken copy of it is not replaced, for both take the exclusive lock first; dropping it gives the
+/// version back.
+#[derive(Debug)]
+pub struct Hold {
+    _file: File,
+}
 
 /// What a write found at its name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,20 +194,83 @@ impl Store {
     /// The bytes of the version `name`, which are what the name says.
     pub fn version(&self, name: [u8; 32]) -> Result<Vec<u8>, ManagedError> {
         self.real_dir(Kind::Version)?;
-        let bytes =
-            read_regular(&self.path(Kind::Version, name), MAX_BYTES, None).map_err(|e| {
-                ManagedError(match e.kind() {
-                    io::ErrorKind::NotFound => "the managed version is not in the store",
-                    io::ErrorKind::InvalidData => {
-                        "the managed version is not a regular file of at most 1 MiB"
-                    }
-                    _ => "the managed version cannot be read, or is a link",
-                })
-            })?;
+        let bytes = read_regular(&self.path(Kind::Version, name), MAX_BYTES, None)
+            .map_err(version_fault)?;
         if sha256(&bytes) != name {
             return Err(ManagedError("the managed version does not match its name"));
         }
         Ok(bytes)
+    }
+
+    /// The bytes of the version `name`, as `version` reads them, with a shared lock on its file that lasts as long as
+    /// the `Hold`: what the proxy and the commands read a version with that they serve with or use, so that it is not
+    /// removed from under them. Nothing is made or written. The order: the file is opened to be read, the lock is
+    /// taken on it without waiting (one whose file another holds the exclusive lock of, see `claim`, is being removed
+    /// or replaced), the bytes are read from the same file and checked against the name, and then the name is looked
+    /// at again: a lock on a file that was removed or replaced after it was opened holds nothing, and that version is
+    /// not in the store.
+    pub fn hold(&self, name: [u8; 32]) -> Result<(Vec<u8>, Hold), ManagedError> {
+        let file = self.open_version(name)?;
+        self.hold_opened(name, file)
+    }
+
+    /// The file of the version `name`, opened to be read without following a link (see `hold`).
+    fn open_version(&self, name: [u8; 32]) -> Result<File, ManagedError> {
+        self.real_dir(Kind::Version)?;
+        open_read(&self.path(Kind::Version, name)).map_err(version_fault)
+    }
+
+    /// The rest of `hold`, for the file of the version `name` that `open_version` opened.
+    fn hold_opened(&self, name: [u8; 32], file: File) -> Result<(Vec<u8>, Hold), ManagedError> {
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(ManagedError(
+                    "the managed version is being removed or replaced",
+                ));
+            }
+            Err(TryLockError::Error(_)) => return Err(NO_VERSION_LOCK),
+        }
+        let bytes = read_opened(&file, MAX_BYTES, None).map_err(version_fault)?;
+        if sha256(&bytes) != name {
+            return Err(ManagedError("the managed version does not match its name"));
+        }
+        let opened = file.metadata().map_err(version_fault)?;
+        match fs::symlink_metadata(self.path(Kind::Version, name)) {
+            Ok(meta) if (meta.dev(), meta.ino()) == (opened.dev(), opened.ino()) => {
+                Ok((bytes, Hold { _file: file }))
+            }
+            _ => Err(NOT_IN_STORE),
+        }
+    }
+
+    /// The exclusive lock on the file of the version `name`, taken without waiting, which lasts as long as the file
+    /// that is returned: what `remove` holds while it removes the version, and `put` while it replaces a broken one. A
+    /// version that is not there is refused, and so is one that is not a regular file, which is not read (a link is
+    /// not followed); one whose file another holds the lock of (see `Hold`) is in use.
+    pub(super) fn claim(&self, name: [u8; 32]) -> Result<File, ManagedError> {
+        self.real_dir(Kind::Version)?;
+        let path = self.path(Kind::Version, name);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) => return Err(ManagedError("the managed version is not a regular file")),
+            Err(e) => return Err(version_fault(e)),
+        }
+        let file = open_read(&path).map_err(|_| NO_VERSION_LOCK)?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => Err(VERSION_IN_USE),
+            Err(TryLockError::Error(_)) => Err(NO_VERSION_LOCK),
+        }
+    }
+
+    /// Removes the version `name` from `versions/`, and syncs the directory. The caller holds the lock of the store
+    /// and the exclusive lock of the version (`claim`).
+    pub(super) fn remove_version(&self, name: [u8; 32]) -> Result<(), ManagedError> {
+        let (dir, _) = Kind::Version.place();
+        fs::remove_file(self.path(Kind::Version, name))
+            .and_then(|()| sync_dir(&self.dir.join(dir)))
+            .map_err(|_| ManagedError("the managed version cannot be removed"))
     }
 
     /// The bytes of the file `name` (a certificate chain, a private key or a file of authorities), which are what the
@@ -333,6 +421,115 @@ impl Store {
         self.choose(name)
     }
 
+    /// Cleans the store for `remove`, which holds its lock: the files of `files/` whose names no version names
+    /// (`files`), the directories of `acme/` whose names no version names (`issued`, see `acme_name`), and what a write
+    /// that stopped halfway left in `files/` and `versions/` (`<name>.new`). A name is removed without following a
+    /// link; a directory in `files/`, a link in `acme/` and every other name are left. Each directory is synced after
+    /// its removals. Whether all of it went: a directory of the store that is not a real one is not cleaned, and a
+    /// directory of `acme/` that holds anything else is left.
+    pub(super) fn clean(&self, files: &BTreeSet<[u8; 32]>, issued: &BTreeSet<[u8; 32]>) -> bool {
+        let files = self.sweep(Kind::File, Some(files));
+        let versions = self.sweep(Kind::Version, None);
+        let issued = self.clean_issued(issued);
+        files && versions && issued
+    }
+
+    /// The part of `clean` for the directory of `kind`: the names of a write that stopped halfway, and with `named` the
+    /// entries whose names it has not.
+    fn sweep(&self, kind: Kind, named: Option<&BTreeSet<[u8; 32]>>) -> bool {
+        let (dir, end) = kind.place();
+        let dir = self.dir.join(dir);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return true,
+            _ => return false,
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return false;
+        };
+        let (mut whole, mut removed) = (true, false);
+        for entry in entries {
+            // An entry that cannot be read stops the look; what went before it is synced all the same.
+            let Ok(entry) = entry else {
+                whole = false;
+                break;
+            };
+            let file_name = entry.file_name();
+            let text = file_name.as_bytes();
+            let gone = match text.strip_suffix(NEW_END.as_bytes()) {
+                Some(stem) => entry_name(stem, end).is_some(),
+                None => named.is_some_and(|named| {
+                    entry_name(text, end).is_some_and(|name| !named.contains(&name))
+                }),
+            };
+            if !gone {
+                continue;
+            }
+            // Not followed: a link goes as a name, and a directory stays.
+            match entry.file_type() {
+                Ok(found) if !found.is_dir() => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    whole = false;
+                    continue;
+                }
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => whole = false,
+            }
+        }
+        if removed && sync_dir(&dir).is_err() {
+            whole = false;
+        }
+        whole
+    }
+
+    /// The part of `clean` for `acme/`: its real directories whose names `named` has not (see `remove_issued`).
+    fn clean_issued(&self, named: &BTreeSet<[u8; 32]>) -> bool {
+        let acme = self.dir.join(ACME);
+        match fs::symlink_metadata(&acme) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return true,
+            _ => return false,
+        }
+        let Ok(entries) = fs::read_dir(&acme) else {
+            return false;
+        };
+        let (mut whole, mut removed) = (true, false);
+        for entry in entries {
+            let Ok(entry) = entry else {
+                whole = false;
+                break;
+            };
+            let Some(name) = entry_name(entry.file_name().as_bytes(), "") else {
+                continue;
+            };
+            if named.contains(&name) {
+                continue;
+            }
+            // Not followed: a link, and anything but a directory, stays.
+            match entry.file_type() {
+                Ok(found) if found.is_dir() => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    whole = false;
+                    continue;
+                }
+            }
+            if remove_issued(&entry.path()) {
+                removed = true;
+            } else {
+                whole = false;
+            }
+        }
+        if removed && sync_dir(&acme).is_err() {
+            whole = false;
+        }
+        whole
+    }
+
     /// The places of the chain and of the key of the site with `acme` whose hosts have the name `name`, for the command
     /// `acme renew` to write the two files there: `acme/` and then its directory `name` are made (0700) when they are
     /// not there, and refused when what is there is not a real directory, for a file that is written beside its place
@@ -377,11 +574,11 @@ impl Store {
         let dir = self.ensure_dir(dir)?;
         let target = self.path(kind, name);
         let found = match fs::symlink_metadata(&target) {
-            Ok(_) => true,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Ok(meta) => Some(meta.file_type()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(_) => return Err(CANNOT),
         };
-        if found {
+        if found.is_some() {
             let sound = match kind {
                 Kind::Version => self.version(name).is_ok(),
                 Kind::File => self.file(name).is_ok(),
@@ -390,8 +587,15 @@ impl Store {
                 return Ok((name, Placed::Existing));
             }
         }
+        // A broken version that is a regular file is held while it is replaced, and is not replaced while another
+        // holds it: the holder would go on with the old file, and the new one would be held by nobody. A link, or
+        // anything else, is replaced as it is.
+        let _claimed = match (kind, found) {
+            (Kind::Version, Some(found)) if found.is_file() => Some(self.claim(name)?),
+            _ => None,
+        };
         let mut new = target.clone().into_os_string();
-        new.push(".new");
+        new.push(NEW_END);
         let new = PathBuf::from(new);
         match fs::remove_file(&new) {
             Ok(()) => {}
@@ -408,7 +612,7 @@ impl Store {
             })?;
         Ok((
             name,
-            if found {
+            if found.is_some() {
                 Placed::Recreated
             } else {
                 Placed::Created
@@ -440,6 +644,68 @@ impl Store {
             )),
         }
     }
+}
+
+/// The refusal of a version whose file cannot be read: it is not there, it is not a regular file of at most 1 MiB, or
+/// any other fault (a link included).
+fn version_fault(e: io::Error) -> ManagedError {
+    ManagedError(match e.kind() {
+        io::ErrorKind::NotFound => NOT_IN_STORE.0,
+        io::ErrorKind::InvalidData => "the managed version is not a regular file of at most 1 MiB",
+        _ => "the managed version cannot be read, or is a link",
+    })
+}
+
+/// The name of the entry `text` of a directory of the store whose names end with `end`: 64 lowercase hexadecimal digits
+/// and `end`, else none.
+fn entry_name(text: &[u8], end: &str) -> Option<[u8; 32]> {
+    text.strip_suffix(end.as_bytes())
+        .and_then(Fingerprint::from_hex)
+        .map(|name| name.bytes())
+}
+
+/// Removes the directory `dir` of `acme/` that no version names: its chain, its key and the files that `acme renew`
+/// writes them to first (`.acme-<16 lowercase hexadecimal digits>.tmp`, see `acme::files`), each as a name, and then
+/// the directory, only if all of them went, and if nothing else is in it. A name that cannot be removed does not keep
+/// the others from going; an entry that cannot be read stops the look. A directory that stays is synced if something
+/// in it went. Whether the directory went.
+fn remove_issued(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let (mut whole, mut removed) = (true, false);
+    for entry in entries {
+        let Ok(entry) = entry else {
+            whole = false;
+            break;
+        };
+        let name = entry.file_name();
+        let name = name.as_bytes();
+        let staged = name
+            .strip_prefix(b".acme-")
+            .and_then(|rest| rest.strip_suffix(b".tmp"))
+            .is_some_and(|digits| {
+                digits.len() == 16
+                    && digits
+                        .iter()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            });
+        if !(staged || name == CHAIN.as_bytes() || name == KEY.as_bytes()) {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => whole = false,
+        }
+    }
+    if whole && fs::remove_dir(dir).is_ok() {
+        return true;
+    }
+    if removed {
+        let _ = sync_dir(dir);
+    }
+    false
 }
 
 #[cfg(test)]

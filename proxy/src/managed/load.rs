@@ -13,11 +13,17 @@
 //! the control socket reads the version it names, and one that is refused changes nothing either. `managed activate`
 //! reads the version it is to choose, and `managed import` and the admin process the version they are to put in the
 //! store, the admin process without the country database (see `import`).
+//!
+//! A version of the store (`Choice::Current`, `Choice::Named`) is read with a shared lock on its file (`Store::hold`)
+//! before its files are read, and the lock lasts as long as the `Version` of the reading: the proxy keeps it while it
+//! serves with the version (see `run`), `acme renew` to its end, and `config check` and `managed activate` while they
+//! read. So the version is not removed, nor are its files cleaned up, while it is in use. A version that is given
+//! (`Choice::Given`) is not in the store yet, and is not held.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::store::{ManagedError, Store};
+use super::store::{Hold, ManagedError, Store};
 use super::version::{self, Site, SiteOf};
 use crate::config::{
     self, Built, ConfigError, ForwardSettings, GeoConfig, Loaded, MainFile, PolicyConfig, RawTls,
@@ -59,12 +65,15 @@ impl LoadError {
     }
 }
 
-/// The version that a whole configuration was read with: its name, the store it is in, and its sites.
-#[derive(Clone, Debug)]
+/// The version that a whole configuration was read with: its name, the store it is in, its sites, and the shared lock
+/// on its file for a version that was read from the store (`Choice::Current` and `Choice::Named`, see `Store::hold`),
+/// which lasts as long as the version does (so it is not `Clone`).
+#[derive(Debug)]
 pub struct Version {
     pub name: [u8; 32],
     pub store: Store,
     pub sites: Vec<Site>,
+    pub hold: Option<Hold>,
 }
 
 /// The main file `main` with its routing, and the version it was read with if the file has `managed`: the whole
@@ -161,7 +170,9 @@ fn with_version(
     store: &Store,
     choice: &Choice,
 ) -> Result<Loaded, LoadError> {
-    let (name, bytes) = match choice {
+    // A version of the store is held from before its files are read, so that it is not removed, and they are not
+    // cleaned up, while it is in use.
+    let (name, bytes, hold) = match choice {
         Choice::Current => {
             let name = store
                 .current()
@@ -169,10 +180,14 @@ fn with_version(
                 .ok_or(LoadError::Store(ManagedError(
                     "no managed version is chosen",
                 )))?;
-            (name, store.version(name).map_err(LoadError::Store)?)
+            let (bytes, hold) = store.hold(name).map_err(LoadError::Store)?;
+            (name, bytes, Some(hold))
         }
-        Choice::Named(name) => (*name, store.version(*name).map_err(LoadError::Store)?),
-        Choice::Given(bytes) => (sha256(bytes), bytes.clone()),
+        Choice::Named(name) => {
+            let (bytes, hold) = store.hold(*name).map_err(LoadError::Store)?;
+            (*name, bytes, Some(hold))
+        }
+        Choice::Given(bytes) => (sha256(bytes), bytes.clone(), None),
     };
     let checked = version::parse(&bytes)
         .and_then(|raw| raw.check(&main, resolve_timeout, geo, version::stored_tls))
@@ -200,6 +215,7 @@ fn with_version(
         name,
         store: store.clone(),
         sites: checked.sites,
+        hold,
     };
     Ok(whole(main, checked.forward, checked.policy, Some(version)))
 }

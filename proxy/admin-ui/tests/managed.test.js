@@ -175,13 +175,18 @@ test('a job of null ends the watch: the admin process has no job to tell of', as
 });
 
 test('a viewer gets no change and no content of a version, an operator what applies to the version', () => {
-  const version = { name: FP, current: false };
-  assert.deepEqual(versionActions('viewer', version, OTHER), { open: false, apply: false });
-  assert.deepEqual(versionActions('operator', version, OTHER), { open: true, apply: true });
-  assert.deepEqual(versionActions('owner', { ...version, current: true }, FP), { open: true, apply: false });
-  // No version is selected, so the request has nothing to expect; a name that is not one of ours gets no way in.
-  assert.deepEqual(versionActions('operator', version, null), { open: true, apply: false });
-  assert.deepEqual(versionActions('operator', { name: 'x' }, OTHER), { open: false, apply: false });
+  const version = { name: FP, current: false, serving: false };
+  const none = { open: false, apply: false, remove: false, kept: null };
+  assert.deepEqual(versionActions('viewer', version, OTHER, null), none);
+  assert.deepEqual(versionActions('viewer', { ...version, current: true }, FP, null), none);
+  assert.deepEqual(versionActions('operator', version, OTHER, null), { open: true, apply: true, remove: true, kept: null });
+  // The selected version, the one that the proxy runs and the target of a rollback are kept.
+  assert.deepEqual(versionActions('owner', { ...version, current: true }, FP, null), { open: true, apply: false, remove: false, kept: 'selected' });
+  assert.deepEqual(versionActions('operator', { ...version, serving: true }, OTHER, null), { open: true, apply: true, remove: false, kept: 'running' });
+  assert.deepEqual(versionActions('operator', version, OTHER, FP), { open: true, apply: true, remove: false, kept: 'rollback' });
+  // No version is selected, so the request has nothing to expect, and nothing to go back to; a name that is not one of ours gets no way in.
+  assert.deepEqual(versionActions('operator', version, null, null), { open: true, apply: false, remove: true, kept: null });
+  assert.deepEqual(versionActions('operator', { name: 'x' }, OTHER, null), none);
   const state = { current: FP, rollback_to: OTHER };
   assert.equal(mayRollBack('viewer', state), false);
   assert.equal(mayRollBack('operator', state), true);

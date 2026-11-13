@@ -2,13 +2,15 @@
 //! and of the proxy, and the versions of the store), `import` (the saving of a version, `POST /api/managed/apply`),
 //! `job` (the steps of a change, the job that puts a version in force in the proxy, and the changes by name and back),
 //! `history` (the history of the changes and the target of a rollback), `check` (the check of a version that saves
-//! nothing, `POST /api/managed/check`) and `config` (the values of the main file, `GET /api/config`).
+//! nothing, `POST /api/managed/check`), `config` (the values of the main file, `GET /api/config`) and `remove` (the
+//! removal of a version, `DELETE /api/managed/versions/<name>`).
 
 mod check;
 mod config;
 mod history;
 mod import;
 mod job;
+mod remove;
 mod routes;
 
 pub use history::{Change, Kind};

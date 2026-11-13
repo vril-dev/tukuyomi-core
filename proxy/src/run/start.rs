@@ -112,6 +112,7 @@ pub fn start(log: &Log) -> u8 {
         policy,
         sha256,
         managed,
+        hold,
         fixed,
     } = match prepare(&path, "start", log) {
         Ok(prepared) => prepared,
@@ -171,6 +172,7 @@ pub fn start(log: &Log) -> u8 {
         path,
         sha256,
         managed,
+        hold,
         fixed,
         log.clone(),
     ))
@@ -200,6 +202,8 @@ struct Prepared {
     sha256: [u8; 32],
     /// The name of the managed version, if the file has `managed`.
     managed: Option<[u8; 32]>,
+    /// The shared lock on the managed version, which the reading of the file again keeps while the version serves.
+    hold: Option<managed::Hold>,
     /// The values that a reading of the file again may not change.
     fixed: Fixed,
 }
@@ -224,6 +228,8 @@ pub(crate) struct Parts {
     pub(super) sha256: [u8; 32],
     /// The name of the managed version that was read with the file, if it has `managed`.
     pub(super) managed: Option<[u8; 32]>,
+    /// The shared lock on that version (see `managed::Hold`), which goes with the parts if they are not served with.
+    pub(super) hold: Option<managed::Hold>,
 }
 
 /// The part of a reading of the configuration that refused it. Its word is the `reason` of a reload order of the
@@ -386,6 +392,9 @@ pub(crate) fn read_parts(
         .as_ref()
         .map_or(&[][..], |version| &version.sites);
     let challenge = Challenge::new(loaded.acme.as_ref(), &loaded.proxy.listeners, route, sites);
+    let (managed, hold) = loaded
+        .version
+        .map_or((None, None), |version| (Some(version.name), version.hold));
     Ok(Parts {
         proxy: loaded.proxy,
         forward,
@@ -399,13 +408,14 @@ pub(crate) fn read_parts(
         policy: loaded.policy,
         fixed,
         sha256: loaded.sha256,
-        managed: loaded.version.map(|version| version.name),
+        managed,
+        hold,
     })
 }
 
 /// The steps of start-up from the configuration to the kernel configuration of the chosen generation, the hold on it
-/// included. `name` is at the head of each line: `start` for the start, `config check` for the command of that name.
-/// A refusal is a line, and its exit code is the error.
+/// and the one on the managed version included. `name` is at the head of each line: `start` for the start, `config
+/// check` for the command of that name. A refusal is a line, and its exit code is the error.
 fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
     let parts = read_parts(path, &Choice::Current, name, log).map_err(|refusal| refusal.exit())?;
     if let Some(version) = parts.managed {
@@ -495,6 +505,7 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         policy: parts.policy,
         sha256: parts.sha256,
         managed: parts.managed,
+        hold: parts.hold,
         fixed: parts.fixed,
     })
 }
@@ -515,7 +526,7 @@ fn config_check(args: &[OsString], log: &Log) -> u8 {
         log.line(&format!("{NAME}: host check refused: {text}"));
         return EXIT_FAILED;
     }
-    // What `prepare` gives is dropped at once, and with it the hold on the generation.
+    // What `prepare` gives is dropped at once, and with it the holds on the generation and on the managed version.
     if let Err(code) = prepare(&path, NAME, log) {
         return code;
     }

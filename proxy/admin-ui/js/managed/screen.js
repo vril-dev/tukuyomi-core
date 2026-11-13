@@ -50,8 +50,12 @@ export function defaultGroupView(name) {
   return name === '' ? w('managed.diff.unset') : name;
 }
 
-/** The lines of a confirmation for the versions `from` and `to` with their numbers (`null`: that version could not be read). */
-export function diffRows(from, to, before, after) {
+/**
+ * The lines of a confirmation for the versions `from` and `to` with their numbers (`null`: that version could not be
+ * read). `gone`: the version `from` is removed, so every line after it says that it is gone, and `to` and `after` are
+ * not read.
+ */
+export function diffRows(from, to, before, after, { gone = false } = {}) {
   const number = (counts, key) => (counts === null || counts[key] === null ? '—' : String(counts[key]));
   const present = (counts, key) => {
     if (counts === null) return '—';
@@ -61,11 +65,11 @@ export function diffRows(from, to, before, after) {
   const counted = (label, key, value) => ({
     label,
     now: value(before, key),
-    after: value(after, key),
-    changed: before === null || after === null ? false : before[key] !== after[key],
+    after: gone ? w('managed.confirm.gone') : value(after, key),
+    changed: gone || (before === null || after === null ? false : before[key] !== after[key]),
   });
   return [
-    { label: w('managed.col.version'), now: short(from), after: short(to), changed: from !== to },
+    { label: w('managed.col.version'), now: short(from), after: gone ? w('managed.confirm.gone') : short(to), changed: gone || from !== to },
     counted(w('managed.diff.sites'), 'sites', number),
     counted(w('managed.diff.upstreams'), 'upstreams', number),
     counted(w('managed.diff.routes'), 'routes', number),

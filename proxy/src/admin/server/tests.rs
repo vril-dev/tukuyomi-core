@@ -967,13 +967,14 @@ fn the_routes_of_the_managed_configuration_are_in_the_table_with_their_roles_and
     let rig = rig();
     let one = format!("/api/managed/versions/{}", "0123456789abcdef".repeat(4));
     let vera = rig.login("vera");
-    // A viewer may not save a version, check one or read one, nor read the values of the main file, and the refusal is
-    // written.
+    // A viewer may not save a version, check one, read one or remove one, nor read the values of the main file, and the
+    // refusal is written.
     for (method, path, action) in [
         ("POST", "/api/managed/apply", "managed-apply"),
         ("POST", "/api/managed/activate", "managed-activate"),
         ("POST", "/api/managed/rollback", "managed-rollback"),
         ("GET", one.as_str(), "managed-version"),
+        ("DELETE", one.as_str(), "managed-remove"),
         ("POST", "/api/managed/check", "managed-check"),
         ("GET", "/api/config", "config"),
     ] {
@@ -1005,6 +1006,7 @@ fn the_routes_of_the_managed_configuration_are_in_the_table_with_their_roles_and
     for (method, path) in [
         ("GET", "/api/managed"),
         ("GET", one.as_str()),
+        ("DELETE", one.as_str()),
         ("POST", "/api/managed/apply"),
         ("POST", "/api/managed/check"),
         ("GET", "/api/config"),

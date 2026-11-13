@@ -17,6 +17,12 @@
 //! could only be refused. The order is answered when its reading has ended (`Control::reload_ended`), with the part
 //! that refused and the sentence of its line when it was refused anywhere, the thread and the main loop alike. A
 //! reading of either kind is counted, and an order that started none is not.
+//!
+//! The managed version of the setup that is current is held (see `managed::Hold`) by the reloader, so that a removal
+//! does not take it, nor the files and `acme/` that SIGUSR2 reads again for it. A reading holds the version it read
+//! from the store; when its setup replaces the current one, its hold replaces the old one, which is given back before
+//! the line that says the configuration is replaced, and a reading that is refused drops its hold and leaves the old
+//! one.
 
 use std::path::PathBuf;
 use std::thread;
@@ -29,27 +35,33 @@ use crate::inbound::conn::{Setup, Shared};
 use crate::inbound::transport::accept::Acceptor;
 use crate::log::Log;
 use crate::log::counters::ReloadResult;
-use crate::managed::Choice;
+use crate::managed::{Choice, Hold};
 use crate::rules::bundle::hex;
 use crate::run::control::{ReloadOrder, Reloaded};
 use crate::run::signals::Waits;
 use crate::run::start::{Parts, Reason, Refusal, read_parts};
 
 /// The reading of the configuration file again: where the file is, the values that do not change while the proxy runs,
-/// and whether SIGUSR2 came while a reading was under way.
+/// the hold on the managed version of the setup that is current, and whether SIGUSR2 came while a reading was under
+/// way.
 pub(in crate::run) struct Reloader {
     path: PathBuf,
     fixed: Fixed,
+    /// The shared lock on the file of the managed version that serves (none without `managed`): the version is not
+    /// removed while the proxy serves with it, and so the files and `acme/` that SIGUSR2 reads again for it are not
+    /// cleaned up. The setup does not hold it, for a retired setup reads nothing of the store any more.
+    hold: Option<Hold>,
     /// The certificates are to be read when the reading that is under way has ended.
     certificates: bool,
 }
 
 impl Reloader {
-    /// For the file at `path`, whose values at the start are `fixed`.
-    pub(in crate::run) fn new(path: PathBuf, fixed: Fixed) -> Reloader {
+    /// For the file at `path`, whose values at the start are `fixed`, and the hold on the version it started with.
+    pub(in crate::run) fn new(path: PathBuf, fixed: Fixed, hold: Option<Hold>) -> Reloader {
         Reloader {
             path,
             fixed,
+            hold,
             certificates: false,
         }
     }
@@ -162,14 +174,18 @@ impl Reloader {
     /// it the current one, with the rate limit of the old setup going on if it can. The listeners of `acceptor` are
     /// put in the order of the file in the same step, so a connection that is accepted from then on is numbered by the
     /// listeners of the setup it takes. The listeners of the addresses that are gone are closed, and the old setup is
-    /// retired.
+    /// retired. The hold on the version of `parts` takes the place of the one of the old setup, which goes before the
+    /// line that says the configuration is replaced. A refusal drops `parts` with its hold before its line, and keeps
+    /// the old one.
     async fn replace(
-        &self,
+        &mut self,
         parts: Parts,
         acceptor: &mut Acceptor,
         shared: &Shared,
     ) -> Result<(), Refusal> {
         if let Some(key) = self.fixed.first_difference(&parts.fixed) {
+            // The hold on the version that was read goes before the line, as the old one does at a replacement.
+            drop(parts);
             return Err(refused(
                 shared,
                 Reason::Fixed,
@@ -180,6 +196,7 @@ impl Reloader {
         let bound = match acceptor.bind_new(&listening).await {
             Ok(bound) => bound,
             Err(at) => {
+                drop(parts);
                 return Err(refused(
                     shared,
                     Reason::Listener,
@@ -213,6 +230,7 @@ impl Reloader {
         acceptor.arrange(&listening, bound);
         shared.setup.replace(setup);
         earlier.retire();
+        self.hold = parts.hold;
         shared.counters.add_config_reload(ReloadResult::Replaced);
         // With `managed`, the line names the version too.
         let managed = parts

@@ -6,8 +6,8 @@
 //! and asks no proxy.
 //!
 //! The steps, with the lock of the store held from the first to the seventh, so that no command changes the store in
-//! between (`managed import` and `managed activate` are refused meanwhile, and wait for nothing; `acme renew` takes no
-//! lock). The lock is a lock of the file, so it goes with a process that ends at any step.
+//! between (`managed import`, `managed activate` and `managed remove` are refused meanwhile, and wait for nothing;
+//! `acme renew` takes no lock). The lock is a lock of the file, so it goes with a process that ends at any step.
 //! 1. The lock: held by another is `busy` (`store in use`), and one that cannot be taken is `store`.
 //! 2. `current`: none, or one that cannot be read, is `store`; another version than `from`, the one the caller saw,
 //!    is `current changed`.

@@ -66,7 +66,7 @@ use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, IgnoredAny};
 use serde_json::Value;
 
-use super::store::MAX_BYTES;
+use super::store::{MAX_BYTES, acme_name};
 use crate::config::{
     self, Address, At, CertificateAcme, ConfigError, ForwardSettings, GeoConfig, Groups,
     ListenerKind, MainFile, Object, PolicyConfig, RawAccess, RawCertificateAcme, RawRateLimit,
@@ -465,6 +465,25 @@ impl<C: Certificate, T> Raw<C, T> {
             forward,
             policy,
         })
+    }
+}
+
+impl RawVersion {
+    /// What the version names outside itself, put in `files` (the names of the files of the store) and `issued` (the
+    /// names of the directories of `acme/`), read without a main file, for the cleaning of the store: an older version
+    /// may not pass the check with the main file of now, and still names what it names. Every `chain`, `key` and `ca`
+    /// of 64 lowercase digits counts, and every site with `acme` counts with `acme_name` of its hosts as they are
+    /// written, which the check passes on as they are; a site with both, which the check refuses, counts with both.
+    pub(crate) fn names(&self, files: &mut BTreeSet<[u8; 32]>, issued: &mut BTreeSet<[u8; 32]>) {
+        for Object(site) in &self.sites {
+            let Object(certificate) = &site.certificate;
+            let named = [&certificate.chain, &certificate.key].into_iter().flatten();
+            files.extend(named.filter_map(|text| digest(text)));
+            if certificate.acme.is_some() {
+                issued.insert(acme_name(&site.hosts));
+            }
+        }
+        files.extend(self.upstreams.authorities().filter_map(digest));
     }
 }
 

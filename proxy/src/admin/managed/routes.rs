@@ -11,9 +11,9 @@
 //! cannot be read is.
 //!
 //! The routes (a viewer may use the state, the list of the versions, the job and the history, an operator the content
-//! of a version, its check, the values of the main file and the changes as well; a body is JSON of at most 64 KiB, the
-//! ones of the saving and of the check 12 MiB; the answers are JSON, and `error` is a fixed sentence, which a 400 of
-//! the saving and of the check has with `at`, the place it is about, see `import`):
+//! of a version, its check, the values of the main file, the changes and the removal of a version as well; a body is
+//! JSON of at most 64 KiB, the ones of the saving and of the check 12 MiB; the answers are JSON, and `error` is a fixed
+//! sentence, which a 400 of the saving and of the check has with `at`, the place it is about, see `import`):
 //! - `GET /api/managed`: `{"managed": true, "current", "serving", "reachable", "reloading", "rollback_to", "job"}`:
 //!   the version the store chooses (`null` for none), the version the proxy serves by its control socket (`null` when
 //!   its state cannot be read or it has none), whether the proxy can be reached (a proxy that has no place for the
@@ -27,6 +27,8 @@
 //!   names its files by their SHA-256 only, and no answer holds the content of a file. The content of a version is
 //!   for an operator, for a route may write a secret for the upstream in its `rewrite`. 404 for a version the store
 //!   does not have, 500 for one whose bytes are not what its name says.
+//! - `DELETE /api/managed/versions/<name>`: the removal of a version that is neither chosen nor the target of a
+//!   rollback, with the cleaning of what no version names any more; no body (see `remove`).
 //! - `POST /api/managed/apply`: the saving of a version and its putting in force (see `import`); `POST
 //!   /api/managed/activate` and `POST /api/managed/rollback`: the putting in force of a version of the store (see
 //!   `job`). Each is answered 202 with its job.
@@ -77,6 +79,7 @@ pub enum Op {
     History,
     Check,
     Config,
+    Remove,
 }
 
 impl Op {
@@ -93,6 +96,7 @@ impl Op {
             Op::History => "managed-history",
             Op::Check => "managed-check",
             Op::Config => "config",
+            Op::Remove => "managed-remove",
         }
     }
 }
@@ -110,7 +114,7 @@ const fn route(method: Method, path: &'static str, least: Role, op: Op) -> Route
 }
 
 /// The routes of the managed configuration. A `*` at the end of a path stands for the name of a version.
-pub(in crate::admin) static ROUTES: [Route; 10] = [
+pub(in crate::admin) static ROUTES: [Route; 11] = [
     route(Method::GET, "/api/managed", Role::Viewer, Op::State),
     route(
         Method::GET,
@@ -146,6 +150,12 @@ pub(in crate::admin) static ROUTES: [Route; 10] = [
     ),
     route(Method::POST, CHECK, Role::Operator, Op::Check),
     route(Method::GET, "/api/config", Role::Operator, Op::Config),
+    route(
+        Method::DELETE,
+        "/api/managed/versions/*",
+        Role::Operator,
+        Op::Remove,
+    ),
 ];
 
 /// The most bytes of a body, for a request whose body may be longer than the usual limit.
@@ -154,7 +164,7 @@ pub(in crate::admin) fn body_limit(method: &Method, path: &str) -> Option<usize>
 }
 
 /// The version that `path`, a path below `/api/managed/versions/`, names.
-fn name_of(path: &str) -> Option<[u8; 32]> {
+pub(super) fn name_of(path: &str) -> Option<[u8; 32]> {
     Fingerprint::from_hex(path.strip_prefix(VERSION)?.as_bytes()).map(|name| name.bytes())
 }
 
@@ -285,6 +295,7 @@ impl Managed {
             Op::History => self.history(),
             Op::Check => self.check(req),
             Op::Config => self.values(),
+            Op::Remove => self.remove(&req.path, who, cx),
         }
     }
 

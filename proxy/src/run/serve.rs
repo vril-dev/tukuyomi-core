@@ -26,12 +26,13 @@ use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::{self, Driver, Ingress, Limits, Msg};
 use crate::log::Log;
 use crate::log::counters::{Counters, SwitchResult};
+use crate::managed::Hold;
 use crate::rules::bundle::{Fingerprint, Mode};
 use crate::rules::routes::{Routes, SharedRoutes};
 use crate::rules::switch::Switcher;
 
-/// The runtime part: handlers, driver, the wait for ready, serving, and the stop. The holds of the switcher live
-/// to the end, so the generations in use are held until the stop is over.
+/// The runtime part: handlers, driver, the wait for ready, serving, and the stop. The holds of the switcher and of the
+/// reloader live to the end, so the generations and the managed version in use are held until the stop is over.
 // One argument for each part of what the configuration, the rules store and the logger give; a struct of them would
 // only repeat their names.
 #[allow(clippy::too_many_arguments)]
@@ -53,6 +54,7 @@ pub(super) async fn run(
     path: PathBuf,
     sha256: [u8; 32],
     managed: Option<[u8; 32]>,
+    hold: Option<Hold>,
     fixed: Fixed,
     log: Log,
 ) -> u8 {
@@ -143,7 +145,7 @@ pub(super) async fn run(
             .with_managed(managed),
         ),
     });
-    let mut reloader = Reloader::new(path, fixed);
+    let mut reloader = Reloader::new(path, fixed, hold);
     let readiness = Arc::new(Readiness::new());
     if let Some(bound) = control_socket {
         let switch_wait = proxy.ready_wait.saturating_add(control::SWITCH_MARGIN);
