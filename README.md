@@ -1,29 +1,58 @@
 # tukuyomi-core
 
-tukuyomi-core は、HTTP・HTTPS のリバースプロキシに組み込んだ WAF（Web Application Firewall）である。受け付けたリクエストを、Coraza か ModSecurity v3 で、OWASP Core Rule Set などのルールセットを使って検査し、アップストリームへ転送する。tukuyomi（tukuyomi WAF）から派生し、WAF の機能に特化したシステムを目指している。
+WAF reverse proxy with Coraza / ModSecurity
 
-## 今の状態
+[English](README.md) | [日本語](README.ja.md)
 
-0.1.0 は最初のリリースである。実装済みの範囲と、まだ無いもの・決まっていないことは、[システム概要](docs/detailed-design/00_overview/system-overview.md) の「現在の状態」に書く。全体としての安全性は、まだ評価していない。
+## Overview
 
-実装済みの主なもの:
+`tukuyomi-core` is an HTTP/HTTPS reverse proxy with a built-in WAF (Web Application Firewall). It inspects incoming requests with Coraza or ModSecurity v3 and forwards them to upstreams. Inspection uses rule sets such as the OWASP Core Rule Set (CRS). It is derived from [tukuyomi](https://github.com/vril-dev/tukuyomi) and aims to be a product focused on the WAF.
 
-- HTTP/1.1 と、TLS の上の HTTP/2 の受付と、アップストリームへの転送
-- Coraza（Go の検査プロセス）か ModSecurity v3 によるリクエストの検査。ルールセットの世代のインポート、切り替え、検知のみのモード
-- IP と国のアクセス制御と、レート制限（全体の設定と、ホストごとの設定）
-- ACME（HTTP-01）による証明書の発行と更新
-- 管理 API と管理画面（managed 設定の編集と反映、ルールセットの世代の操作、ログの検索、監査ログ）
-- ログファイルと、PostgreSQL・MySQL へのログの送信
+Main features:
 
-試したのは、Landlock が有効な Linux の x86_64 だけである。
+- Receiving HTTP/1.1 and HTTP/2 (over TLS) requests and forwarding them to upstreams
+- Request inspection with Coraza or ModSecurity v3 (rule set generations and a detect-only mode)
+- Access control by IP address and country, and rate limiting (global and per host)
+- Certificate issuance and renewal with ACME (HTTP-01)
+- Admin API and admin UI (editing managed configuration and applying it without stopping the proxy, rule set generations, log search, audit log)
+- Log files, and log shipping to PostgreSQL / MySQL
 
-## 入れ方
+For what is and is not implemented, see "現在の状態" (current status) in the [system overview](docs/detailed-design/00_overview/system-overview.md) (Japanese).
 
-- リリースの tarball を使う: [実行ファイルの build と配置](docs/build/binary-deployment.md) の「リリースの tarball」
-- ソースから build する: 同じ文書の「build」
-- 設定と運用: [運用リファレンス](docs/operations/operator-reference.md)、[管理リファレンス](docs/operations/admin-reference.md)
-- 文書の入口: [docs/README.md](docs/README.md)
+> 0.1.0 is the first release. The product as a whole has not had a security review yet.
 
-## ライセンス
+## Installation
 
-BSD 2-Clause License（[LICENSE](LICENSE)）。実行ファイルに入る第三者のソフトウェアとそのライセンスは、[NOTICE](NOTICE) と [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES) に書く。OWASP Core Rule Set は同梱しない（[実行ファイルの build と配置](docs/build/binary-deployment.md) の「CRS の取得」）。
+It has been tested only on Linux x86_64 with Landlock enabled.
+
+Requirements:
+
+- Linux 5.13 or later, with Landlock enabled
+- glibc 2.39 or later (for the release binaries; the ModSecurity inspector also needs libstdc++)
+
+Download the tarball and its checksum file from the [GitHub releases](https://github.com/vril-dev/tukuyomi-core/releases), verify the checksum, and extract the tarball.
+
+```bash
+sha256sum -c tukuyomi-core_v0.1.0_linux_amd64.tar.gz.sha256
+tar -xzf tukuyomi-core_v0.1.0_linux_amd64.tar.gz
+```
+
+The CRS is not bundled. Fetch it with `scripts/fetch-crs.sh`.
+
+For placement, the first start, and building from source (Rust 1.94.1 and Go 1.27.2 are required), see [docs/build/binary-deployment.md](docs/build/binary-deployment.md).
+
+## Documentation
+
+The documentation is in Japanese only.
+
+- Documentation index: [docs/README.md](docs/README.md)
+- Build and deployment: [docs/build/binary-deployment.md](docs/build/binary-deployment.md)
+- Operator reference: [docs/operations/operator-reference.md](docs/operations/operator-reference.md)
+- Admin reference: [docs/operations/admin-reference.md](docs/operations/admin-reference.md)
+- System overview: [docs/detailed-design/00_overview/system-overview.md](docs/detailed-design/00_overview/system-overview.md)
+
+## License
+
+tukuyomi-core is released under the BSD 2-Clause License. See [LICENSE](LICENSE).
+
+For the licenses and copyright notices of the third-party software included in the executables, see [NOTICE](NOTICE) and [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).
