@@ -25,7 +25,8 @@
 //! `access` of a route is (see `rewrite`) and has `allow_cidrs`, which is not empty, so that the way to the admin
 //! process is never open to every address. The proxy makes the route itself (see `forward::group`): a request whose
 //! `Host` is the host goes to `listen`, over a connection of that certificate, and the `access` and `rate_limit` of
-//! the configuration do not apply to it. `route` is the proxy's alone: it is not one of the values the admin process
+//! the configuration and of its host policies do not apply to it. `route` is the proxy's alone: it is not one of the
+//! values the admin process
 //! takes, and a reading of the file again may change it.
 
 use std::net::SocketAddr;

@@ -180,6 +180,7 @@ static TOP: Shown = Object(&[
     ),
     ("access", Plain),
     ("rate_limit", Plain),
+    ("host_policies", Plain),
     ("geo", Object(&[("country_db", Path), ("sha256", Plain)])),
     (
         "admin",

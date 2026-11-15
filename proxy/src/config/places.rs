@@ -14,13 +14,41 @@
 //! of `admin.route` is inside `managed.dir`: the command never writes over a name of the managed store, and the way to
 //! the admin process, which the main file keeps (see `admin`), never rests on a file of the store, which is the part
 //! to be changed from the admin screens.
+//!
+//! The `managed` object itself, `{"dir"}`, is read here too: its directory is written as the rules store `dir` is.
 
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
 
 use super::{
-    AcmeConfig, AdminConfig, AdminRoute, AdminStoreConfig, ConfigError, ManagedConfig, Records,
-    ensure,
+    AcmeConfig, AdminConfig, AdminRoute, AdminStoreConfig, ConfigError, MAX_STORE_DIR, Records,
+    clean_abs, ensure,
 };
+
+/// Where the managed store is, as the file names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedConfig {
+    pub dir: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RawManaged {
+    dir: String,
+}
+
+/// The `managed` object: the directory as the rules store `dir` is written.
+pub(super) fn managed_dir(raw: RawManaged) -> Result<ManagedConfig, ConfigError> {
+    let dir = PathBuf::from(raw.dir);
+    ensure(clean_abs(&dir), "managed dir is not an absolute clean path")?;
+    ensure(
+        dir.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
+        "managed dir is over 3840 bytes",
+    )?;
+    Ok(ManagedConfig { dir })
+}
 
 /// Whether `a` and `b` are the same path or one is inside the other.
 fn overlap(a: &Path, b: &Path) -> bool {

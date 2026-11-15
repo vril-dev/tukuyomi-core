@@ -1,6 +1,7 @@
 //! The managed configuration: the part of the configuration that is to be changed from the admin screens (the sites
-//! with their certificates, the upstream groups, the routes, the default group, and the `access` and `rate_limit` of
-//! the proxy), kept in versions in a directory of its own, the managed store, which the `managed` object of the main
+//! with their certificates, the upstream groups, the routes, the default group, and the `access`, `rate_limit` and
+//! `host_policies` of the proxy), kept in versions in a directory of its own, the managed store, which the `managed`
+//! object of the main
 //! file names (see `config`). The main file keeps the rest, and does not write what a version holds.
 //!
 //! The store holds `versions/<64 lowercase hexadecimal digits>.json`, a version (see `version`), `files/<64 digits>`,

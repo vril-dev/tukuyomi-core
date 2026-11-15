@@ -196,7 +196,7 @@ struct Prepared {
     records: Option<Records>,
     /// The admin process settings, if the configuration has them; the proxy binds its control socket.
     admin: Option<AdminConfig>,
-    /// The `access` and the `rate_limit` of the configuration.
+    /// The `access`, the `rate_limit` and the host policies of the configuration.
     policy: PolicyConfig,
     /// The SHA-256 of the bytes of the configuration file.
     sha256: [u8; 32],

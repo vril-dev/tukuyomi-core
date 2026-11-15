@@ -162,3 +162,70 @@ fn the_lists_of_countries_judge_a_client_that_the_database_does_not_cover_as_unk
     assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
     proxy.finish(1);
 }
+
+/// A GET of `/ok` with the `Host` `host`.
+fn get_for(host: &str) -> Vec<u8> {
+    format!("GET /ok HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn each_host_policy_holds_for_its_hosts_and_a_host_that_cannot_be_read_meets_every_access() {
+    let policies = |rate: u32| {
+        json!([
+            {"name": "a", "hosts": ["a.example"], "rate_limit": {"rate": rate, "burst": 0, "keys": 1024}},
+            {"name": "b", "hosts": ["b.example"], "access": {"allow_cidrs": ["127.0.0.0/8"]}},
+            {"name": "c", "hosts": ["c.example"], "access": {}, "rate_limit": {}},
+            {"name": "d", "hosts": ["d.example"], "access": {"deny_cidrs": ["127.0.0.0/8"]}},
+        ])
+    };
+    let (proxy, status) = policed(
+        "host_policies",
+        vec![
+            ("rate_limit", json!({"rate": 1, "burst": 1, "keys": 1024})),
+            ("host_policies", policies(1)),
+        ],
+    );
+    let ask = |host: &str| exchange(proxy.port, &get_for(host));
+    // A counts in a table of its own: one request, then 429.
+    assert_eq!(ask("a.example").status(), 200);
+    assert_empty_answer(&ask("a.example"), 429);
+    // B leaves the rate limit out, and shares the table of the configuration with a host that has no policy: two
+    // requests, then 429.
+    assert_eq!(ask("b.example").status(), 200);
+    assert_eq!(ask("example.test").status(), 200);
+    assert_empty_answer(&ask("b.example"), 429);
+    // C is counted nowhere, so the full table of the configuration does not turn it away.
+    for _ in 0..2 {
+        assert_eq!(ask("c.example").status(), 200);
+    }
+    // D turns the client away, also with a `Host` that cannot be read, which the default group would serve.
+    for host in ["d.example", "d.example:0443"] {
+        assert_empty_answer(&ask(host), 403);
+    }
+    proxy.records.conns("the 403 records", 2, |l| {
+        is_answer(l, "rejected", 403, "denied by access")
+    });
+    let page = metrics(status);
+    // The client in the table of the configuration and in the table of A.
+    assert_line(&page, "tukuyomi_rate_limit_keys 2");
+    assert_line(
+        &page,
+        "tukuyomi_policy_refusals_total{policy=\"rate_limit\"} 2",
+    );
+    assert_line(&page, "tukuyomi_policy_refusals_total{policy=\"access\"} 2");
+
+    // Read again with another rate for A: its table counts from nothing, and the table of the configuration goes on.
+    add_object(proxy.root(), "host_policies", policies(2));
+    proxy.signal("HUP");
+    proxy.records.wait_lines("the replacement", 1, |l| {
+        l.starts_with("reload: configuration replaced ")
+    });
+    let lines = proxy.records.lines();
+    let anew = "reload: rate limit table of host policy a started anew";
+    assert!(lines.iter().any(|l| l == anew), "{lines:#?}");
+    let configuration = "reload: rate limit table started anew";
+    assert!(!lines.iter().any(|l| l == configuration), "{lines:#?}");
+    assert_line(&metrics(status), "tukuyomi_rate_limit_keys 1");
+    proxy.finish(5);
+}

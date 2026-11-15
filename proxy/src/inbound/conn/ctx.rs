@@ -11,7 +11,6 @@ use std::time::Duration;
 use tokio::sync::{Semaphore, watch};
 
 use crate::config::{ForwardConfig, Keep, PolicyConfig, ProxyConfig};
-use crate::forward::client_ip::Access;
 use crate::forward::group::Upstreams;
 use crate::inbound::challenge::Challenge;
 use crate::inbound::session::RequestIds;
@@ -19,8 +18,8 @@ use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::Ingress;
 use crate::log::Log;
 use crate::log::counters::Counters;
-use crate::policy::RateLimit;
 use crate::policy::country::Geo;
+use crate::policy::{Scope, Scopes};
 use crate::rules::routes::SharedRoutes;
 
 /// What every connection shares for as long as the process runs: the byte budget of held bodies and of the kernel's
@@ -41,8 +40,8 @@ pub struct Shared {
 /// What a configuration makes for the connections: the configuration, the SHA-256 of its file, the time the lookup of
 /// the names of its servers could take, the upstream groups with the routes to them and the connections that wait to be
 /// used again, the TLS of the listeners that end it, the answer to the challenge of the CA, if the configuration has
-/// `acme`, the networks and countries that may not use the proxy at all, the country database if some list of
-/// countries needs one, the rate limit if the configuration has one, and what a route does with a request whose record
+/// `acme`, the `access` and the rate limits of the configuration and of its host policies, the country database if some
+/// list of countries needs one, and what a route does with a request whose record
 /// cannot be kept when it does not say (`records.keep`). It is not
 /// changed once it is made, except that it can be retired, once, and that SIGUSR2 replaces the certificates in its
 /// `tls` (`Tls::reload`).
@@ -58,12 +57,11 @@ pub struct Setup {
     pub upstreams: Upstreams,
     pub tls: Tls,
     pub challenge: Option<Challenge>,
-    /// The `access` of the configuration: asked of every request before its route is looked for.
-    pub access: Access,
-    /// The country database, there if some list of countries of the `access` or of a route needs one.
+    /// The country database, there if some list of countries of the `access`, of a host policy or of a route needs one.
     pub country: Option<Geo>,
-    /// The `rate_limit` of the configuration, if it has one.
-    pub rate_limit: Option<RateLimit>,
+    /// The `access` and the rate limits of the configuration and of its host policies: asked of every request before
+    /// its route is looked for (see `scope`).
+    pub scopes: Scopes,
     /// What a route without `records` does when the record of a request cannot be kept.
     pub keep: Keep,
     /// Set once the setup has been replaced by another. The connections that hold it are told.
@@ -72,9 +70,9 @@ pub struct Setup {
 
 impl Setup {
     /// The setup of `cfg`, which is read from a file whose SHA-256 is `sha256`, with the upstream groups of `forward`,
-    /// and the `access`, the country database and the `rate_limit` of `policy`. The rate limit goes on counting the
-    /// clients of `earlier`, the rate limit of the setup that this one replaces, if there is one and the two have the
-    /// same `keys`, `rate` and `burst`.
+    /// and the country database and the scopes of `policy`. Each table of the rate limits goes on counting the
+    /// clients of the one it follows in `earlier`, the scopes of the setup that this one replaces, if there is one and
+    /// the two have the same `keys`, `rate` and `burst` (see `policy::Scopes`).
     // One argument for each part of what the configuration file gives; a struct of them would only repeat their names.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -83,9 +81,9 @@ impl Setup {
         forward: &ForwardConfig,
         tls: Tls,
         challenge: Option<Challenge>,
-        policy: PolicyConfig,
+        mut policy: PolicyConfig,
         keep: Keep,
-        earlier: Option<&RateLimit>,
+        earlier: Option<&Scopes>,
     ) -> Setup {
         Setup {
             upstreams: Upstreams::new(forward, &cfg),
@@ -95,16 +93,17 @@ impl Setup {
             resolve_timeout: forward.resolve_timeout,
             tls,
             challenge,
-            access: policy.access,
-            country: policy.country,
-            rate_limit: policy.rate_limit.as_ref().map(|config| {
-                earlier
-                    .and_then(|earlier| RateLimit::following(config, earlier))
-                    .unwrap_or_else(|| RateLimit::new(config))
-            }),
+            country: policy.country.take(),
+            scopes: Scopes::new(policy, earlier),
             keep,
             retired: watch::channel(false).0,
         }
+    }
+
+    /// What the policy asks of a request whose `Host` is `host` (see `policy::Scopes::scope`): the request of a
+    /// connection and the first request on the listener that redirects to https alike.
+    pub fn scope(&self, host: Option<&[u8]>) -> Scope<'_> {
+        self.scopes.scope(host)
     }
 
     /// The setup, made with the managed version `name` (none for a file without `managed`).

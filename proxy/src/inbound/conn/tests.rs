@@ -1331,6 +1331,7 @@ fn a_request_is_not_judged_by_the_other_routes_when_no_route_has_an_access_list(
 // ---- the policy of the configuration: the access and the rate limit ----
 
 use crate::config::RateLimitConfig;
+use crate::policy::Scopes;
 
 impl Rig {
     /// The same rig, with this `access` and this `rate_limit` in force.
@@ -1339,10 +1340,7 @@ impl Rig {
         access: Access,
         rate_limit: Option<RateLimit>,
     ) -> Rig {
-        self.amended(|setup| {
-            setup.access = access;
-            setup.rate_limit = rate_limit;
-        })
+        self.amended(|setup| setup.scopes = Scopes::of(access, rate_limit))
     }
 }
 
@@ -1465,10 +1463,7 @@ fn a_client_over_the_rate_limit_gets_429_with_retry_after_and_a_body_that_is_not
             counters.policy_refusals.samples(),
             [("access", 0), ("rate_limit", 2)]
         );
-        assert_eq!(
-            rig.ctx.setup.rate_limit.as_ref().map(RateLimit::keys),
-            Some(1)
-        );
+        assert_eq!(rig.ctx.setup.scopes.keys(), 1);
         let seen = rig.finish(third).await;
         assert_eq!(seen.len(), 1);
         let refused = lines

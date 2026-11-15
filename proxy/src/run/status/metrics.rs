@@ -29,7 +29,8 @@ pub(super) struct Scrape<'a> {
     pub(super) inspections_waiting: usize,
     /// The name of each upstream group and its failures.
     pub(super) upstream_failures: Vec<(&'a str, u64)>,
-    /// The clients that the rate limit counts, and those it dropped to make room; both 0 without a rate limit.
+    /// The clients that the rate limits count in all their tables, and those they dropped to make room; both 0 without
+    /// a rate limit.
     pub(super) rate_limit_keys: usize,
     pub(super) rate_limit_evicted: u64,
     pub(super) records_dropped: u64,
@@ -127,13 +128,13 @@ pub(super) fn render(scrape: &Scrape<'_>) -> String {
     page.single(
         "tukuyomi_rate_limit_keys",
         "gauge",
-        "Clients that the rate limit counts now.",
+        "Clients that the rate limits count now, all tables together.",
         scrape.rate_limit_keys,
     );
     page.single(
         "tukuyomi_rate_limit_evicted_total",
         "counter",
-        "Clients dropped from the rate limit to make room while their count was still in force.",
+        "Clients dropped from the rate limits to make room while their count was still in force, all tables together.",
         scrape.rate_limit_evicted,
     );
     page.single(

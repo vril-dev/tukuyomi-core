@@ -54,15 +54,17 @@
 //! `kernel`. A setup is what the configuration gives the connections: the other values of `proxy`, the upstream groups
 //! and the routes to them (the names of the servers are looked up again, and the CA files of the groups that have `tls`
 //! are read again), the TLS of the listeners with the hosts of their certificates (the certificate and key files are
-//! read again) and the answer to the challenge of the CA, the `access`, the `rate_limit` and the country database (see
-//! `policy`), and the `records.keep`. A connection that starts after that takes the new setup. A connection that is
+//! read again) and the answer to the challenge of the CA, the `access`, the `rate_limit`, the host policies and the
+//! country database (see `policy`), and the `records.keep`. A connection that starts after that takes the new setup.
+//! A connection that is
 //! open keeps the setup it started with for its requests, and is wound down: an HTTP/1.1 connection that waits for its
 //! next request is closed, one with a request under way, or with part of the head of the next one, is closed after its
 //! response, and an HTTP/2 connection is told with a `GOAWAY` and ends when its open streams are done. No request is
 //! turned away for that. A tunnel (a WebSocket that the proxy copies) and a response of a route with a `stream` go on
 //! until their own time. The clients that the rate limit counts go on being counted when the old and the new
 //! configuration both have a `rate_limit` with the same `keys`, `rate` and `burst`; otherwise the new limit counts from
-//! nothing, and a line says so. The listeners can be added, removed and put in another order. A listener whose address
+//! nothing, and a line says so. So it is for the table of a host policy with that of the policy of the same name (see
+//! `policy::Scopes`). The listeners can be added, removed and put in another order. A listener whose address
 //! is still in the file keeps its socket, wherever it is now, so nobody is refused at it; the listener of a new address
 //! is bound before anything is replaced, all of them or none; the listener of an address that is gone is closed, which
 //! cuts the connections that have not started there (the ones still in the backlog of the system, and the one that

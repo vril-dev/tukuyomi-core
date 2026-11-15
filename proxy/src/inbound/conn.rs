@@ -4,8 +4,8 @@
 //! hands it over with the request that hyper made of the same bytes; on an HTTP/2 connection it was made from the
 //! fields of the stream (see `http2::head`). A request for the challenge of the CA that issues the certificates with
 //! `acme`, on a plain listener, is answered before all that follows (see `challenge`). The first thing that follows is
-//! the policy of the configuration (see `policy`): a client that the `access` turns away, by its network or its country,
-//! gets 403, and one that is over the `rate_limit` gets 429 with a `Retry-After`, before any route is looked for,
+//! the policy for the `Host` (see `policy::Scopes`): a client that the `access` turns away, by its network or country,
+//! gets 403, and one that is over the rate limit gets 429 with a `Retry-After`, before any route is looked for,
 //! whether the route skips the inspection or not. The country of the client, which those lists and the lists of the
 //! route may name, is looked up once for the request, if the configuration has a country database (see
 //! `policy::country`). The route for the request is looked up next, by its `Host` and its target as the client sent
@@ -459,8 +459,8 @@ impl Conn {
         })
     }
 
-    /// The route the request takes. Before any route is looked for, a client that the `access` of the configuration
-    /// turns away is answered with 403, and one that is over the `rate_limit` with 429 and the seconds to wait, also
+    /// The route the request takes. Before any route is looked for, a client that the `access` for its `Host`
+    /// turns away is answered with 403, and one that is over the rate limit with 429 and the seconds to wait, also
     /// when the request would take a route that skips the inspection (a client that is in `exempt_cidrs` of the
     /// limit is not counted). A request that no route holds for, and that has no default group, is answered
     /// with 404 here, and one from a client that the access lists turn away with 403, before the body is read. If
@@ -476,8 +476,7 @@ impl Conn {
             return self.admin(route, access);
         }
         policy::check(
-            &ctx.setup.access,
-            ctx.setup.rate_limit.as_ref(),
+            ctx.setup.scope(self.head.host()),
             &ctx.shared.counters,
             client,
             self.country,

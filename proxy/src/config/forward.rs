@@ -114,6 +114,10 @@ pub(crate) enum At {
     Server(usize, usize, &'static str),
     /// The route of this number, and a key in it.
     Route(usize, Option<&'static str>),
+    /// The host policy of this number, a key in it, and a key in that one.
+    HostPolicy(usize, Option<&'static str>, Option<&'static str>),
+    /// A host of a host policy: the numbers of the policy and of the host.
+    PolicyHost(usize, usize),
 }
 
 /// Where a server is, as the file writes it.

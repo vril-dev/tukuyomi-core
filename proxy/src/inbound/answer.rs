@@ -153,7 +153,7 @@ impl Reply {
         Reply::rejected(refusal.status(), refusal.reason())
     }
 
-    /// A policy turned the request away: the `access` or the `rate_limit` of the configuration, or the access list of
+    /// A policy turned the request away: the `access` or the rate limit for the `Host`, or the access list of
     /// the route (see `policy`). No other answer is a rejection with 403 or 429.
     pub(super) fn policy_refused(&self) -> bool {
         self.class == Class::Rejected && matches!(self.status, 403 | 429)

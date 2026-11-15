@@ -217,15 +217,17 @@ impl Reloader {
             parts.challenge,
             parts.policy,
             keep,
-            earlier.rate_limit.as_ref(),
+            Some(&earlier.scopes),
         )
         .with_managed(parts.managed);
-        let carried = match (&setup.rate_limit, &earlier.rate_limit) {
-            (Some(limit), Some(old)) => limit.continues(old),
-            _ => false,
-        };
-        if setup.rate_limit.is_some() && !carried {
-            shared.log.line("reload: rate limit table started anew");
+        // A line for each table of the rate limits that does not go on counting the clients of the one it follows.
+        for anew in setup.scopes.anew(&earlier.scopes) {
+            match anew {
+                None => shared.log.line("reload: rate limit table started anew"),
+                Some(name) => shared.log.line(&format!(
+                    "reload: rate limit table of host policy {name} started anew"
+                )),
+            }
         }
         acceptor.arrange(&listening, bound);
         shared.setup.replace(setup);

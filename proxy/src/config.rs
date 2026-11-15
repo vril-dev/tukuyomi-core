@@ -1,6 +1,6 @@
 //! The configuration file: one JSON object `{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store":
-//! {..}}, "acme": {..}, "status": {..}, "records": {..}, "access": {..}, "rate_limit": {..}, "geo": {..}, "admin":
-//! {..}, "managed": {..}}`; every value is chosen by the operator and checked here.
+//! {..}}, "acme": {..}, "status": {..}, "records": {..}, "access": {..}, "rate_limit": {..}, "host_policies": [..],
+//! "geo": {..}, "admin": {..}, "managed": {..}}`; every value is chosen by the operator and checked here.
 //!
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs; the result keeps the
 //! SHA-256 of the bytes that were read. Every key must be present (a route may leave out its `host`, its `path`,
@@ -9,8 +9,8 @@
 //! `tls`, which may leave out its `server_name`; a listener may leave out its `tls` and its `redirect`, and the `tls`
 //! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
 //! may leave out `acme`, which it must have when a certificate has one, see `acme`, and `status`, which
-//! has the one key `listen`, see `status`, and `records`, `access`, `rate_limit`, `geo` and `admin`, see their files
-//! (`access`, `rate_limit` and `geo` are in `policy`); an unknown or repeated
+//! has the one key `listen`, see `status`, and `records`, `access`, `rate_limit`, `host_policies`, `geo` and `admin`,
+//! see their files (`access`, `rate_limit`, `host_policies` and `geo` are in `policy`); an unknown or repeated
 //! key is refused, and so is a value of the wrong
 //! type, an array in place of an object and `null` for a key that may be left out included (such a key is either left
 //! out or has a value). A refusal is one fixed sentence per kind of fault and never carries a key or a value from the
@@ -18,7 +18,8 @@
 //! `status` object against the listeners (before `forward`, for no server may be at its address), the `forward`
 //! values (see `forward`; the names of the servers are not looked up here, `forward::resolve` does that when the proxy
 //! starts), the `rules.store` values, the `records` object (and that the `records` of the routes suit it), the
-//! `access`, `rate_limit` and `geo` objects (see `policy`) and that `geo` is there if a list of countries is, the
+//! `access`, `rate_limit`, `host_policies` and `geo` objects (see `policy`) and that `geo` is there if a list of
+//! countries is, the
 //! `admin` object against the listeners and the status listener, the `acme` object with the certificates that have
 //! `acme` (that of `admin.route` included), the directories, the control socket and the files of `acme` against each
 //! other (see `places`), the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's
@@ -26,8 +27,9 @@
 //!
 //! `managed` may be left out. When it is there it is `{"dir"}`, the directory of the managed store (see `managed`),
 //! an absolute clean path of at most 3840 bytes, and the file does not write how the proxy routes: `forward` has
-//! `resolve_timeout_ms` only, the `tls` of a listener has no `certificates`, and the file has no `access` and no
-//! `rate_limit`. The upstream groups, the routes, the default group, the `access`, the `rate_limit` and the sites with
+//! `resolve_timeout_ms` only, the `tls` of a listener has no `certificates`, and the file has no `access`, no
+//! `rate_limit` and no `host_policies`. The upstream groups, the routes, the default group, the `access`, the
+//! `rate_limit`, the host policies and the sites with
 //! their certificates come from a version of the store, which is checked after the values of this file and against
 //! them, by the same rules and with the same sentences (see `managed::version`). Its `admin`, if it has one, writes
 //! the way to the admin process (`admin.route`, see `admin`). A file without `managed` is read as it always was.
@@ -105,8 +107,11 @@ pub use listeners::{
     TlsConfig, addresses,
 };
 pub(crate) use listeners::{RawCertificateAcme, certificate_acme, host_ok_for_tls};
-pub use policy::{GeoConfig, PolicyConfig, RateLimitConfig};
-pub(crate) use policy::{RawRateLimit, routed};
+pub use places::ManagedConfig;
+pub use policy::{GeoConfig, HostPolicyConfig, HostRateLimit, PolicyConfig, RateLimitConfig};
+pub(crate) use policy::{
+    RawHostPolicy, RawRateLimit, countries_at, read_countries, routed, uses_countries,
+};
 pub use records::{Driver, Keep, Records, RouteKeep, Ship};
 pub(crate) use records::{MAX_RECORD_FILES, consistent};
 pub(crate) use rewrite::RawAccess;
@@ -203,8 +208,8 @@ pub struct Loaded {
     pub status: Option<StatusConfig>,
     /// There if the file has the `records` object.
     pub records: Option<Records>,
-    /// What turns a request away before its route is looked for: the `access`, `rate_limit` and `geo` objects. For a
-    /// file with `managed` the first two are the version's and `geo` is the main file's.
+    /// What turns a request away before its route is looked for: the `access`, `rate_limit`, `host_policies` and `geo`
+    /// objects. For a file with `managed` the first three are the version's and `geo` is the main file's.
     pub policy: PolicyConfig,
     /// There if the file has the `admin` object.
     pub admin: Option<AdminConfig>,
@@ -236,7 +241,7 @@ pub struct MainFile {
 /// The main file, checked, with its policy and its routing.
 pub(crate) struct Built {
     pub(crate) main: MainFile,
-    /// The `access`, the `rate_limit` and the `geo` of the file; with `managed`, its `geo` only.
+    /// The `access`, the `rate_limit`, the `host_policies` and the `geo` of the file; with `managed`, its `geo` only.
     pub(crate) policy: PolicyConfig,
     pub(crate) routing: Routing,
 }
@@ -252,12 +257,6 @@ pub(crate) enum Routing {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreConfig {
     File { dir: PathBuf },
-}
-
-/// Where the managed store is, as the file names it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ManagedConfig {
-    pub dir: PathBuf,
 }
 
 /// Why the file was refused: a fixed English sentence, never a value taken from the file.
@@ -282,11 +281,13 @@ struct RawFile {
     #[serde(default, deserialize_with = "present")]
     rate_limit: Option<Object<policy::RawRateLimit>>,
     #[serde(default, deserialize_with = "present")]
+    host_policies: Option<Vec<Object<policy::RawHostPolicy>>>,
+    #[serde(default, deserialize_with = "present")]
     geo: Option<Object<policy::RawGeo>>,
     #[serde(default, deserialize_with = "present")]
     admin: Option<Object<admin::RawAdmin>>,
     #[serde(default, deserialize_with = "present")]
-    managed: Option<Object<RawManaged>>,
+    managed: Option<Object<places::RawManaged>>,
 }
 
 #[derive(Deserialize)]
@@ -336,12 +337,6 @@ struct RawRules {
 #[serde(deny_unknown_fields)]
 struct RawStore {
     kind: String,
-    dir: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawManaged {
     dir: String,
 }
 
@@ -405,21 +400,6 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>, ConfigError> {
     Ok(bytes)
 }
 
-/// Reads the country database that the `geo` of a whole configuration names (see `policy`). The database is read and
-/// checked whether or not a list uses it, so that a bad one is found at once; it is kept only if one does.
-pub(crate) fn read_countries(loaded: &mut Loaded) -> Result<(), ConfigError> {
-    if let Some(geo) = &loaded.policy.geo {
-        let country = geo.open()?;
-        let route = loaded.admin_route.as_ref();
-        if uses_countries(&loaded.policy, &loaded.forward)
-            || route.is_some_and(|route| route.access.has_countries())
-        {
-            loaded.policy.country = Some(country);
-        }
-    }
-    Ok(())
-}
-
 /// The bytes of a main file, checked.
 pub(crate) fn main_file(bytes: &[u8]) -> Result<Built, ConfigError> {
     if !u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_FILE) {
@@ -468,15 +448,6 @@ pub(crate) fn refusal(e: &serde_json::Error) -> ConfigError {
 
 pub(crate) fn ensure(ok: bool, text: &'static str) -> Result<(), ConfigError> {
     if ok { Ok(()) } else { Err(ConfigError(text)) }
-}
-
-/// Whether the `access` of the configuration or of some route has a list of countries.
-pub(crate) fn uses_countries(policy: &PolicyConfig, forward: &ForwardSettings) -> bool {
-    policy.access.has_countries()
-        || forward
-            .routes
-            .targets()
-            .any(|route| route.access.has_countries())
 }
 
 /// A list of networks for a `trusted_proxies`: at most `MAX_TRUSTED`, each in the form `Cidr::parse` takes. `many` and
@@ -543,6 +514,7 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Built, ConfigError> {
         records: rec,
         access: ac,
         rate_limit: rl,
+        host_policies: hp,
         geo: ge,
         admin: ad,
         managed: m,
@@ -689,7 +661,7 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Built, ConfigError> {
         dir.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
         "rules store dir is over 3840 bytes",
     )?;
-    let managed = m.map(|Object(raw)| managed_dir(raw)).transpose()?;
+    let managed = m.map(|Object(raw)| places::managed_dir(raw)).transpose()?;
 
     let records = records::check(rec)?;
     if let Some(forward) = &forward {
@@ -699,7 +671,11 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Built, ConfigError> {
         managed.is_none() || (ac.is_none() && rl.is_none()),
         "the configuration has access or rate_limit while it has managed",
     )?;
-    let policy = policy::check(ac, rl, ge)?;
+    ensure(
+        managed.is_none() || hp.is_none(),
+        "the configuration has host_policies while it has managed",
+    )?;
+    let policy = policy::check(ac, rl, hp, ge)?;
     if let Some(forward) = &forward {
         ensure(
             policy.geo.is_some() || !uses_countries(&policy, forward),
@@ -784,17 +760,6 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Built, ConfigError> {
         policy,
         routing,
     })
-}
-
-/// The `managed` object: the directory as the rules store `dir` is written.
-fn managed_dir(raw: RawManaged) -> Result<ManagedConfig, ConfigError> {
-    let dir = PathBuf::from(raw.dir);
-    ensure(clean_abs(&dir), "managed dir is not an absolute clean path")?;
-    ensure(
-        dir.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
-        "managed dir is over 3840 bytes",
-    )?;
-    Ok(ManagedConfig { dir })
 }
 
 #[cfg(test)]

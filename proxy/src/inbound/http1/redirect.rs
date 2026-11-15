@@ -3,7 +3,7 @@
 //! The first head is read as everywhere else, and then it is answered with the redirect, or with 404, without hyper,
 //! the inspection or the upstream, and without reading its body; the connection is closed with the same `linger`
 //! after the answer as any other. The challenge of the CA that issues the certificates with `acme` is answered
-//! first, before the redirect is decided (see `challenge`). Next the policy of the configuration is asked (see
+//! first, before the redirect is decided (see `challenge`). Next the policy for the `Host` is asked (see
 //! `policy`), as at the start of every request on the other listeners: a client that it turns away gets 403, or 429
 //! with a `Retry-After`, instead of the redirect or the 404.
 
@@ -73,8 +73,7 @@ pub(in crate::inbound) async fn redirect_to(
             Ok(())
         } else {
             policy::check(
-                &ctx.setup.access,
-                ctx.setup.rate_limit.as_ref(),
+                ctx.setup.scope(head.host()),
                 &ctx.shared.counters,
                 client.ip(),
                 country_of(ctx, client.ip()),

@@ -37,6 +37,11 @@ fn a_main_file_with_managed_writes_none_of_what_a_version_holds() {
             json!({"deny_cidrs": ["192.0.2.0/24"]})),
         "the configuration has access or rate_limit while it has managed"
     );
+    // Even an empty list: the host policies are the version's.
+    assert_eq!(
+        main_refusal(&fixture, |m| m["host_policies"] = json!([])),
+        "the configuration has host_policies while it has managed"
+    );
     assert_eq!(
         main_refusal(&fixture, |m| {
             m["proxy"]["listeners"] = json!([{"address": "127.0.0.1:8443", "tls": {

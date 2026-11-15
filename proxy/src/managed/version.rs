@@ -2,7 +2,8 @@
 //! files by their paths.
 //!
 //! A version is one JSON object `{"sites": [..], "upstreams": {..}, "routes": [..], "default_upstream": "..",
-//! "access"?: {..}, "rate_limit"?: {..}}`. `upstreams`, `routes`, `default_upstream`, `access` and `rate_limit` are
+//! "access"?: {..}, "rate_limit"?: {..}, "host_policies"?: [..]}`. `upstreams`, `routes`, `default_upstream`, `access`,
+//! `rate_limit` and `host_policies` are
 //! written and checked as in a main file without `managed` (see `config`, whose sentences the refusals are), except the
 //! `tls` of a group, `{"ca", "server_name"?}`, whose `ca` is the SHA-256 of a file of the store: the file of the
 //! authorities. `sites` is a list of 0 to 64 sites `{"name", "hosts", "certificate"}`: the name is written as the
@@ -22,7 +23,8 @@
 //! host of the way (with any port), that no server is at `admin.listen` (the way is the proxy's own; a name that comes
 //! to that address is refused when it is looked up), then the `records` of the routes with the `records` of the main
 //! file, then
-//! `access` and `rate_limit`, and last that the main file has `geo` if a list of countries is there. The files that it
+//! `access`, `rate_limit` and `host_policies` (no host of which is the host of the way), and last that the main file
+//! has `geo` if a list of countries is there. The files that it
 //! names are read by `load`.
 //!
 //! A refusal of `check` is its sentence alone, as for the main file. The admin process checks a version that a request
@@ -32,7 +34,8 @@
 //! and stops at the key above where one sentence is about a list or about two keys: an access list
 //! (`routes[3].access`), the edits of the fields and of the query (`routes[3].rewrite.request_headers`) and `stream`. A
 //! group is named by its name, and only by one that passed the rule of a name (a refusal about a group whose name did
-//! not is about `upstreams`); a site and a route are named by their number. No value of the version is in a place. A
+//! not is about `upstreams`); a site, a route and a host policy are named by their number. No value of the version
+//! is in a place. A
 //! refusal about two items (a name or a host written twice, two routes with the same host and path) is about the later
 //! one, and one about a rule that some items break together is about the first item that breaks it. A refusal that the
 //! main file is to be changed for (`records` with too few `files`) is about no place, and so is one about the version
@@ -41,7 +44,8 @@
 //! `sent` reads the version that a request sends in the form of a version. A repeated key, and a text that is not JSON,
 //! are refused about no place. For any other refusal of that reading, the version is read again item by item, in the
 //! order of the check: the keys at the top (an unknown one is about no place, a missing one about its key), then each
-//! site, each group in the byte order of the names, each route, `default_upstream`, `access` and `rate_limit`, each
+//! site, each group in the byte order of the names, each route, `default_upstream`, `access`, `rate_limit` and each
+//! host policy, each
 //! read in its form; the first item that is refused gives both the sentence and the place, which is the item
 //! (`sites[1]`, `upstreams.app`, `routes[0]`). When no item is refused, the refusal is the sentence of the first
 //! reading, about no place.
@@ -69,9 +73,9 @@ use serde_json::Value;
 use super::store::MAX_BYTES;
 use crate::config::{
     self, Address, At, CertificateAcme, ConfigError, ForwardSettings, GeoConfig, Groups,
-    ListenerKind, MainFile, Object, PolicyConfig, RawAccess, RawCertificateAcme, RawRateLimit,
-    RawRoute, RawTls, RouteKeep, StoredTls, addresses, certificate_acme, clean_abs, ensure,
-    host_ok_for_tls, name_ok, present, same, uses_countries,
+    ListenerKind, MainFile, Object, PolicyConfig, RawAccess, RawCertificateAcme, RawHostPolicy,
+    RawRateLimit, RawRoute, RawTls, RouteKeep, StoredTls, addresses, certificate_acme, clean_abs,
+    ensure, host_ok_for_tls, name_ok, present, same,
 };
 use crate::forward::tls::Authorities;
 use crate::rules::bundle::{Fingerprint, hex};
@@ -81,14 +85,15 @@ pub(super) const MAX_SITES: usize = 64;
 pub(super) const MAX_HOSTS: usize = 64;
 /// The longest path of a document, as for the files of a listener.
 const MAX_PATH: usize = 3840;
-/// The keys at the top of a version: the four that it has, then the two that it may leave out.
-const KEYS: [&str; 6] = [
+/// The keys at the top of a version: the four that it has, then the three that it may leave out.
+const KEYS: [&str; 7] = [
     "sites",
     "upstreams",
     "routes",
     "default_upstream",
     "access",
     "rate_limit",
+    "host_policies",
 ];
 const REQUIRED: usize = 4;
 /// The key of `rate_limit` that each sentence of its check is about.
@@ -161,6 +166,8 @@ fn path(at: At, groups: &[String]) -> String {
             None => "upstreams".to_owned(),
         },
         At::Route(route, key) => keyed(format!("routes[{route}]"), key),
+        At::HostPolicy(at, key, inner) => keyed(keyed(format!("host_policies[{at}]"), key), inner),
+        At::PolicyHost(at, host) => format!("host_policies[{at}].hosts[{host}]"),
     }
 }
 
@@ -179,6 +186,8 @@ pub(crate) struct Raw<C, T> {
     access: Option<Object<RawAccess>>,
     #[serde(default, deserialize_with = "present")]
     rate_limit: Option<Object<RawRateLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    host_policies: Option<Vec<Object<RawHostPolicy>>>,
 }
 
 /// A version as the store keeps it.
@@ -330,7 +339,7 @@ pub(crate) struct Checked<F> {
     pub(crate) sites: Vec<SiteOf<F>>,
     /// The groups, the routes and the default group, with the `resolve_timeout` of the main file.
     pub(crate) forward: ForwardSettings,
-    /// The `access` and the `rate_limit`, with the `geo` of the main file.
+    /// The `access`, the `rate_limit` and the host policies, with the `geo` of the main file.
     pub(crate) policy: PolicyConfig,
 }
 
@@ -438,23 +447,23 @@ impl<C: Certificate, T> Raw<C, T> {
             let at = required.filter(|_| main.records.is_none());
             (e, at.map(|at| At::Route(at, Some("records"))))
         })?;
-        let policy = config::routed(self.access, self.rate_limit, geo).map_err(|(e, key)| {
-            // A sentence of `rate_limit` is about one of its keys; one of `access` is about its lists.
-            let inner = RATE_KEYS
-                .iter()
-                .find(|(text, _)| key == "rate_limit" && *text == e.0);
-            (e, Some(At::Top(key, inner.map(|(_, inner)| *inner))))
-        })?;
-        if policy.geo.is_none() && uses_countries(&policy, &forward) {
-            // The first list of countries: the one of the version, then the one of a route.
-            let route = forward
-                .routes
-                .targets()
-                .position(|route| route.access.has_countries());
-            let at = match route {
-                Some(at) if !policy.access.has_countries() => At::Route(at, Some("access")),
-                _ => At::Top("access", None),
+        let routed = config::routed(self.access, self.rate_limit, self.host_policies, geo, admin);
+        let policy = routed.map_err(|(e, at)| {
+            // A sentence of a `rate_limit` is about one of its keys; one of an `access` is about its lists.
+            let inner = RATE_KEYS.iter().find(|(text, _)| *text == e.0);
+            let inner = inner.map(|(_, inner)| *inner);
+            let at = match at {
+                At::Top("rate_limit", None) => At::Top("rate_limit", inner),
+                At::HostPolicy(at, Some("rate_limit"), None) => {
+                    At::HostPolicy(at, Some("rate_limit"), inner)
+                }
+                at => at,
             };
+            (e, Some(at))
+        })?;
+        if policy.geo.is_none()
+            && let Some(at) = config::countries_at(&policy, &forward)
+        {
             return Err(refuse(
                 "access has a list of countries while geo is left out",
                 at,
@@ -652,6 +661,10 @@ fn item(version: &Value) -> Option<Objection> {
         .or_else(|| one("default_upstream", reads::<String>))
         .or_else(|| one("access", reads::<Object<RawAccess>>))
         .or_else(|| one("rate_limit", reads::<Object<RawRateLimit>>))
+        .or_else(|| {
+            let policy = |at: usize, key: Option<&'static str>| At::HostPolicy(at, key, None);
+            list("host_policies", policy, reads::<Object<RawHostPolicy>>)
+        })
 }
 
 /// The reading of an item of a version in its form, a refusal as its sentence.

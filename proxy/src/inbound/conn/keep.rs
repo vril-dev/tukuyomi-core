@@ -17,7 +17,7 @@
 //!
 //! Only a request that gets as far as the end of the choice of its route is reached. What is answered before that has
 //! no route, or a route that sends nothing to the upstream, so the value of a route cannot hold for it: a request
-//! that the `access` or the `rate_limit` of the configuration turns away, one on TLS whose `Host` the certificate does
+//! that the `access` or the rate limit for its `Host` turns away, one on TLS whose `Host` the certificate does
 //! not cover (421), one for which no route holds (404), the heads that the head check refuses, the answers of a
 //! listener that redirects to https, the answer to the challenge of the CA, the records of a connection and of a
 //! tunnel, and the answers of the route itself that it gives without reading the body: the `access` list of the route

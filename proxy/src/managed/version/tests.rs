@@ -3,7 +3,8 @@ use std::fs;
 use serde_json::json;
 
 use super::*;
-use crate::config::{Built, Routing};
+use crate::config::{Built, HostRateLimit, Routing};
+use crate::forward::client_ip::Access;
 use crate::managed::store::tests::Fixture;
 use crate::managed::{Choice, LoadError};
 
@@ -319,6 +320,199 @@ fn a_sent_version_that_cannot_be_read_is_refused_about_the_first_item_that_canno
             r#"{"version": {"sites": [], "upstreams": {}, "routes": [{"upstream": "a", "upstream": "b"}], "default_upstream": "app"}}"#
         ),
         ("configuration has a repeated key", None)
+    );
+}
+
+/// A host policy named `name` for the hosts `hosts`, with an `access` that turns nobody away.
+fn host_policy(name: &str, hosts: Value) -> Value {
+    json!({"name": name, "hosts": hosts, "access": {}})
+}
+
+/// The policy of `version`, which the check of the admin process accepts.
+fn accepted(built: &Built, version: &Value) -> PolicyConfig {
+    let Routing::Managed { resolve_timeout } = built.routing else {
+        panic!("the main file has no managed object");
+    };
+    let bytes = serde_json::to_vec(version).unwrap();
+    match check_sent(&bytes, &built.main, resolve_timeout, None) {
+        Ok(checked) => checked.policy,
+        Err(objection) => panic!("refused: {} at {:?}", objection.why, objection.at),
+    }
+}
+
+#[test]
+fn the_host_policies_are_bounded_and_a_refusal_is_about_the_policy_the_host_or_the_key() {
+    let fixture = Fixture::new();
+    let built = with_admin(&fixture);
+    let base = fixture.plain_version(b"chain", b"key");
+    let with = |policies: Value| {
+        let mut version = base.clone();
+        version["host_policies"] = policies;
+        version
+    };
+    let hosts = |from: usize, n: usize| {
+        json!(
+            (from..from + n)
+                .map(|i| format!("h{i}.test"))
+                .collect::<Vec<_>>()
+        )
+    };
+    let many = |count: usize, each: usize| {
+        Value::Array(
+            (0..count)
+                .map(|i| host_policy(&format!("p{i}"), hosts(i * each, each)))
+                .collect(),
+        )
+    };
+    // 64 policies, 64 hosts in one and 1024 in all pass, and one more of each is refused.
+    accepted(&built, &with(many(64, 1)));
+    assert_eq!(
+        objection(&built, &with(many(65, 1))),
+        (
+            "host_policies has more than 64 entries",
+            at("host_policies")
+        )
+    );
+    accepted(&built, &with(many(1, 64)));
+    assert_eq!(
+        objection(&built, &with(many(1, 65))),
+        (
+            "a host policy has no host or more than 64",
+            at("host_policies[0].hosts")
+        )
+    );
+    let mut all = many(16, 64);
+    accepted(&built, &with(all.clone()));
+    all.as_array_mut()
+        .unwrap()
+        .push(host_policy("last", hosts(2000, 1)));
+    assert_eq!(
+        objection(&built, &with(all)),
+        (
+            "the host policies have more than 1024 hosts in all",
+            at("host_policies[16].hosts[0]")
+        )
+    );
+
+    // The keys of the configuration and of the policies with a table of their own are 1048576 at most together; a
+    // policy whose rate limit is off counts none.
+    let limited = |name: &str, host: &str, rate_limit: Value| json!({"name": name, "hosts": [host], "rate_limit": rate_limit});
+    let keys = |keys: usize| json!({"rate": 10, "burst": 0, "keys": keys});
+    let mut version = with(json!([
+        limited("a", "a.test", keys(1024)),
+        limited("b", "b.test", keys(1024)),
+        limited("c", "c.test", json!({})),
+    ]));
+    version["rate_limit"] = keys((1 << 20) - 2048);
+    accepted(&built, &version);
+    version["host_policies"][1]["rate_limit"]["keys"] = json!(1025);
+    assert_eq!(
+        objection(&built, &version),
+        (
+            "the rate limits keep count of more than 1048576 clients in all",
+            at("host_policies[1].rate_limit.keys")
+        )
+    );
+
+    // A host is the host of a route without a port, and not the host of the way to the admin process, which a `*.`
+    // host may cover, for the name comes first.
+    let one = |policy: Value| objection(&built, &with(json!([policy])));
+    assert_eq!(
+        one(host_policy("a", json!(["a.test", "b.test", "c.test:8443"]))),
+        (
+            "a host policy host is malformed or has a port",
+            at("host_policies[0].hosts[2]")
+        )
+    );
+    assert_eq!(
+        one(host_policy("a", json!(["admin.test"]))),
+        (
+            "a host policy host is the host of the admin route",
+            at("host_policies[0].hosts[0]")
+        )
+    );
+    accepted(&built, &with(json!([host_policy("a", json!(["*.test"]))])));
+    let two = |a: Value, b: Value| objection(&built, &with(json!([a, b])));
+    assert_eq!(
+        two(
+            host_policy("a", json!(["a.test"])),
+            host_policy("a", json!(["b.test"]))
+        ),
+        (
+            "a host policy name is written twice",
+            at("host_policies[1].name")
+        )
+    );
+    assert_eq!(
+        two(
+            host_policy("a", json!(["a.test"])),
+            host_policy("b", json!(["a.test"]))
+        ),
+        (
+            "a host policy host is written twice in the host policies",
+            at("host_policies[1].hosts[0]")
+        )
+    );
+
+    // `{}` turns each off; a rate limit is that or the whole one, and a policy has one of the two at least.
+    let off = accepted(&built, &with(json!([limited("a", "a.test", json!({}))])));
+    assert_eq!(off.host_policies[0].rate_limit, HostRateLimit::Off);
+    let open = accepted(&built, &with(json!([host_policy("a", json!(["a.test"]))])));
+    assert_eq!(open.host_policies[0].access, Some(Access::default()));
+    assert_eq!(
+        one(limited(
+            "a",
+            "a.test",
+            json!({"exempt_cidrs": ["10.0.0.0/8"]})
+        )),
+        (
+            "a host policy rate_limit is neither empty nor rate, burst and keys",
+            at("host_policies[0].rate_limit")
+        )
+    );
+    assert_eq!(
+        one(json!({"name": "a", "hosts": ["a.test"]})),
+        (
+            "a host policy has neither access nor rate_limit",
+            at("host_policies[0]")
+        )
+    );
+    assert_eq!(
+        one(limited(
+            "a",
+            "a.test",
+            json!({"rate": 0, "burst": 0, "keys": 1024})
+        )),
+        (
+            "rate_limit rate is not 1 to 100000",
+            at("host_policies[0].rate_limit.rate")
+        )
+    );
+
+    // A list of countries needs `geo`: the one of a host policy is found before the one of a route.
+    let mut countries =
+        with(json!([{"name": "a", "hosts": ["a.test"], "access": {"deny_countries": ["JP"]}}]));
+    countries["routes"] =
+        json!([{"path": "/", "upstream": "app", "access": {"deny_countries": ["JP"]}}]);
+    assert_eq!(
+        objection(&built, &countries),
+        (
+            "access has a list of countries while geo is left out",
+            at("host_policies[0].access")
+        )
+    );
+
+    // A policy that cannot be read in its form is the item that is refused.
+    let unreadable = with(json!([
+        host_policy("a", json!(["a.test"])),
+        {"name": 5, "hosts": ["b.test"], "access": {}},
+    ]));
+    assert_eq!(
+        unread(&json!({ "version": unreadable }).to_string()),
+        (
+            "configuration has a value of the wrong type",
+            at("host_policies[1]")
+        )
     );
 }
 

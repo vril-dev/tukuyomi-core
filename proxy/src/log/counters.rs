@@ -9,7 +9,7 @@
 //! the byte budget in use, the inspections that wait) are not kept here: they are read from the permits and the
 //! configuration when the page is asked for. The counts of the upstream groups are kept by the groups
 //! (`forward::group`), and the numbers of the records that were dropped or not written by the logger (`Log`). The
-//! requests that the access list or the rate limit of the configuration turned away are counted where they are turned
+//! requests that the access list or the rate limit for their `Host` turned away are counted where they are turned
 //! away (`policy`), and the clients that the rate limit counts, and those it dropped for lack of room, are read
 //! from it when the page is asked for (`policy::rate`).
 
@@ -81,9 +81,9 @@ impl RuleHit {
 /// What turned a request away before its route was looked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Policy {
-    /// The `access` of the configuration.
+    /// The `access` of the configuration or of a host policy.
     Access,
-    /// The `rate_limit` of the configuration.
+    /// The `rate_limit` of the configuration or of a host policy.
     RateLimit,
 }
 

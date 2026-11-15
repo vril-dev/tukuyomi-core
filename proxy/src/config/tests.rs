@@ -2367,6 +2367,76 @@ fn the_access_and_rate_limit_objects_are_left_out_or_have_their_values_in_range(
     }
 }
 
+// ---- host policies ----
+
+fn host_policies(value: Value) -> Edit {
+    ("", "host_policies", value)
+}
+
+#[test]
+fn the_host_policies_of_a_main_file_are_checked_as_those_of_a_version_and_refused_by_sentence_alone()
+ {
+    let loaded = parse(&doc(&[
+        rate_limit("keys", 4096),
+        host_policies(serde_json::json!([
+            {"name": "own", "hosts": ["app.example.test", "*.app.example.test"],
+             "access": {"deny_cidrs": ["10.0.0.0/8"]}, "rate_limit": {"rate": 5, "burst": 0, "keys": 1024}},
+            {"name": "off", "hosts": ["static.example.test"], "access": {}, "rate_limit": {}},
+            {"name": "inherits", "hosts": ["api.example.test"], "access": {"allow_cidrs": ["10.1.0.0/16"]}},
+        ])),
+    ]))
+    .unwrap();
+    let policies = &loaded.policy.host_policies;
+    let names: Vec<&str> = policies.iter().map(|policy| policy.name.as_str()).collect();
+    assert_eq!(names, ["own", "off", "inherits"]);
+    assert_eq!(
+        policies[0].rate_limit,
+        HostRateLimit::Own(RateLimitConfig {
+            rate: 5,
+            burst: 0,
+            keys: 1024,
+            exempt: Vec::new(),
+        })
+    );
+    assert_eq!(
+        (&policies[1].access, &policies[1].rate_limit),
+        (&Some(Access::default()), &HostRateLimit::Off)
+    );
+    assert_eq!(policies[2].rate_limit, HostRateLimit::Inherited);
+    // Each host is a rule of the table, with the index of its policy.
+    let found: Vec<usize> = loaded.policy.by_host.targets().copied().collect();
+    assert_eq!(found, [0, 0, 1, 2]);
+
+    // The refusals are those of a version, as their sentences.
+    let one = |policy: Value| host_policies(Value::Array(vec![policy]));
+    refuse(
+        &[one(
+            serde_json::json!({"name": "a", "hosts": ["a.test:8080"], "access": {}}),
+        )],
+        "a host policy host is malformed or has a port",
+    );
+    // With 1048576 keys in the table of the configuration, no policy has a table of its own.
+    refuse(
+        &[
+            rate_limit("keys", 1 << 20),
+            one(
+                serde_json::json!({"name": "a", "hosts": ["a.test"], "rate_limit": rate_limit("rate", 1).2}),
+            ),
+        ],
+        "the rate limits keep count of more than 1048576 clients in all",
+    );
+    refuse(
+        &[one(
+            serde_json::json!({"name": "a", "hosts": ["a.test"], "access": {"deny_countries": ["JP"]}}),
+        )],
+        "access has a list of countries while geo is left out",
+    );
+    refuse(
+        &[host_policies(Value::Null)],
+        "configuration has a value of the wrong type",
+    );
+}
+
 // ---- countries and geo ----
 
 const GEO_SHA256: &str = "abababababababababababababababababababababababababababababababab";
@@ -2589,6 +2659,16 @@ fn load_reads_the_country_database_checks_its_sha256_and_keeps_it_only_for_a_lis
     let by_route = [geo(&path, &sha), f("routes", Value::Array(vec![route]))];
     assert!(
         loaded_from(&dir, &by_route)
+            .unwrap()
+            .policy
+            .country
+            .is_some()
+    );
+    // A list of a host policy alone keeps it too.
+    let policies = serde_json::json!([{"name": "a", "hosts": ["a.test"], "access": {"deny_countries": ["JP"]}}]);
+    let by_host = [geo(&path, &sha), host_policies(policies)];
+    assert!(
+        loaded_from(&dir, &by_host)
             .unwrap()
             .policy
             .country

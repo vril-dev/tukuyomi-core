@@ -446,3 +446,42 @@ fn a_key_that_is_not_the_key_of_the_certificate_ends_the_start_with_exit_code_1_
     assert_turned_away(ports.tls);
     proxy.clear_root(&["config.json", STORE]);
 }
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_redirect_listener_asks_the_host_policy_of_the_host_in_the_place_of_the_policy_of_the_configuration()
+ {
+    let mut pki = Pki::new("tls_redirect_hosts");
+    let files = pki.issue("a", &["a.example", "*.a.example"]);
+    let ports = Ports::new();
+    let proxy = Proxy::start_with("tls_redirect_hosts", Knobs::quick(), |root| {
+        ports.add_to(root, &files);
+        add_object(
+            root,
+            "host_policies",
+            json!([
+                {"name": "shut", "hosts": ["shut.a.example"], "access": {"deny_cidrs": ["127.0.0.0/8"]}},
+                {"name": "slow", "hosts": ["slow.a.example"], "rate_limit": {"rate": 1, "burst": 0, "keys": 1024}},
+            ]),
+        );
+    });
+    let ask = |host: &str| exchange(ports.redirect, request("/p", host).as_bytes());
+    // The configuration turns nobody away: a host that no policy names is redirected, as often as it comes.
+    for _ in 0..2 {
+        assert_eq!(ask("www.a.example").message().status(), 308);
+    }
+    // The policy of one host turns the client away, and the policy of another counts it in a table of its own.
+    assert_empty_answer(&ask("shut.a.example"), 403);
+    assert_eq!(ask("slow.a.example").message().status(), 308);
+    let refused = ask("slow.a.example");
+    assert_empty_answer(&refused, 429);
+    assert_eq!(refused.message().values("retry-after"), ["1"]);
+    proxy.records.conn("the 403 record", |l| {
+        is_answer(l, "rejected", 403, "denied by access")
+    });
+    proxy.records.conn("the 429 record", |l| {
+        is_answer(l, "rejected", 429, "too many requests")
+    });
+    assert_eq!(proxy.upstream.connections(), 0);
+    proxy.finish(0);
+}

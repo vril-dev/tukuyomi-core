@@ -2,8 +2,8 @@
 
 use std::net::IpAddr;
 
-use super::RateLimit;
-use crate::forward::client_ip::{Access, Country};
+use super::Scope;
+use crate::forward::client_ip::Country;
 use crate::log::counters::{self, Counters};
 
 /// Why the policy turns a request away. It fixes the status of the answer, the text of the record and the seconds in
@@ -44,22 +44,19 @@ impl Refusal {
 
 /// Asks the policy about `client`, the address that stands for the client of a request (see `forward::client_ip`),
 /// which is in `country`: the `access` first, so that a client it turns away is not counted by the rate limit, and
-/// then the `rate_limit`, if there is one. A request that is turned away is counted in `counters` here, by what turned
+/// then the rate limit, both of `scope`. A request that is turned away is counted in `counters` here, by what turned
 /// it away, so that every place that asks counts alike.
 pub fn check(
-    access: &Access,
-    rate_limit: Option<&RateLimit>,
+    scope: Scope<'_>,
     counters: &Counters,
     client: IpAddr,
     country: Country,
 ) -> Result<(), Refusal> {
-    if !access.permits(client, country) {
+    if !scope.permits(client, country) {
         counters.add_policy_refusal(counters::Policy::Access);
         return Err(Refusal::Access);
     }
-    if let Some(limit) = rate_limit
-        && let Err(seconds) = limit.admit(client)
-    {
+    if let Err(seconds) = scope.admit(client) {
         counters.add_policy_refusal(counters::Policy::RateLimit);
         return Err(Refusal::RateLimit(seconds));
     }

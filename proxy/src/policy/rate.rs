@@ -206,7 +206,7 @@ impl Table {
     }
 }
 
-/// The rate limit of the configuration, and the clients it counts.
+/// A rate limit of the configuration or of a host policy, and the clients it counts.
 pub struct RateLimit {
     /// The networks whose requests are not counted.
     exempt: Vec<Cidr>,

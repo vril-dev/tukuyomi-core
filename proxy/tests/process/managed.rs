@@ -196,6 +196,11 @@ fn the_sites_serve_on_every_tls_listener_and_the_way_to_the_admin_process_is_tak
             ]);
             // Every client of this network is turned away, but on the way to the admin process.
             document["access"] = json!({"deny_cidrs": ["198.51.100.0/24"]});
+            // For a name of the site, of which the host of the way is one, a host policy holds in its place and turns
+            // a client of either network away.
+            document["host_policies"] = json!([
+                {"name": "a", "hosts": ["*.a.example"], "access": {"deny_cidrs": ["198.51.100.0/24", "127.0.0.0/8"]}},
+            ]);
             with_admin(root, main, document, &admin);
         });
     });
@@ -221,15 +226,26 @@ fn the_sites_serve_on_every_tls_listener_and_the_way_to_the_admin_process_is_tak
     assert_eq!((answer.status(), cert), (200, shown(&site_b.0)));
     assert_eq!(other.requests().len(), 1);
 
-    // The access of the version turns the network away, but not on the way to the admin process, which has its own
-    // certificate; its own access list turns another network away.
+    // The access of the version turns the network away for a host that no host policy names. For `www.a.example` the
+    // host policy of `*.a.example` holds in its place, and turns away also a client that the access of the version
+    // lets through. Neither does on the way to the admin process, which has its own certificate; its own access list
+    // turns another network away.
     let (answer, _) = over_tls(
         &pki,
         tls_port,
-        "www.a.example",
-        &request("www.a.example", "198.51.100.9"),
+        "b.example",
+        &request("b.example", "198.51.100.9"),
     );
     assert_eq!(answer.status(), 403);
+    for from in ["198.51.100.9", "127.0.0.1"] {
+        let (answer, _) = over_tls(
+            &pki,
+            tls_port,
+            "www.a.example",
+            &request("www.a.example", from),
+        );
+        assert_eq!(answer.status(), 403, "{from}");
+    }
     let (answer, cert) = over_tls(
         &pki,
         tls_port,
@@ -263,7 +279,8 @@ fn the_sites_serve_on_every_tls_listener_and_the_way_to_the_admin_process_is_tak
     assert_eq!(code, 421);
     drop(client);
     // The listener that redirects sends the host of the way to https, also for a client that the access of the version
-    // turns away, which it turns away for another host.
+    // turns away, which it turns away for another host: by the access of the version for a host that no host policy
+    // names, and by the host policy for `www.a.example`.
     let reply = exchange(
         redirect_port,
         &request("admin.a.example", "198.51.100.9").into_bytes(),
@@ -274,11 +291,10 @@ fn the_sites_serve_on_every_tls_listener_and_the_way_to_the_admin_process_is_tak
         message.values("location"),
         [format!("https://admin.a.example:{tls_port}/").as_str()]
     );
-    let reply = exchange(
-        redirect_port,
-        &request("www.a.example", "198.51.100.9").into_bytes(),
-    );
-    assert_eq!(reply.status(), 403);
+    for host in ["b.example", "www.a.example"] {
+        let reply = exchange(redirect_port, &request(host, "198.51.100.9").into_bytes());
+        assert_eq!(reply.status(), 403, "{host}");
+    }
     // Nor is a plain listener: 404, and the default group gets nothing.
     let reply = exchange(
         proxy.port,

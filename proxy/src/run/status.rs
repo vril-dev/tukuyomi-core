@@ -39,7 +39,6 @@ use tukuyomi_kernel::Phase;
 use crate::inbound::conn::Shared;
 use crate::inbound::session::send_and_close;
 use crate::inspect::driver::State;
-use crate::policy::RateLimit;
 
 mod metrics;
 
@@ -160,8 +159,8 @@ impl Source for View {
                 .wait_queue
                 .saturating_sub(shared.inspect.available_permits()),
             upstream_failures: setup.upstreams.failures().collect(),
-            rate_limit_keys: setup.rate_limit.as_ref().map_or(0, RateLimit::keys),
-            rate_limit_evicted: setup.rate_limit.as_ref().map_or(0, RateLimit::evicted),
+            rate_limit_keys: setup.scopes.keys(),
+            rate_limit_evicted: setup.scopes.evicted(),
             records_dropped: shared.log.dropped(),
             record_write_errors: shared.log.write_errors(),
             record_file_errors: shared.log.file_errors(),
