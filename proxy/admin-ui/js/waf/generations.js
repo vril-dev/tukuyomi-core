@@ -227,10 +227,11 @@ class GenerationsScreen extends Screen {
         hint: canChange(ctx.user.role) ? w('gen.empty_hint') : null,
         action: canChange(ctx.user.role) ? el('a', { class: buttonClass('small'), href: hashOf('import') }, w('nav.import')) : null,
       },
+      dense: true,
       columns: [
         {
           key: 'fingerprint',
-          label: w('col.fingerprint'),
+          label: w('col.sha256'),
           value: (item) => item.fingerprint,
           text: (item) => `${shortOf(item.fingerprint)}…`,
           mono: true,

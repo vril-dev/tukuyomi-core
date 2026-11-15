@@ -43,7 +43,7 @@ class PolicyScreen extends EditScreen {
 
   drawAccess(draft) {
     const { access } = draft;
-    const lists = el('div', { class: 'tc-fields' });
+    const lists = el('div', { class: 'tc-fields tc-fields--two' });
     const list = (key, label, hint) => {
       const box = linesBox(label, access[key], { hint, onInput: (value) => draft.write(access, key, value) });
       this.placeField('access', key, box);
@@ -63,7 +63,7 @@ class PolicyScreen extends EditScreen {
 
   drawRate(draft) {
     const { rate } = draft;
-    const fields = el('div', { class: 'tc-fields' });
+    const fields = el('div', { class: 'tc-fields tc-fields--two' });
     const number = (key, label, hint) => {
       const box = numberBox(label, rate[key], { hint, onInput: (value) => draft.write(rate, key, value) });
       this.placeField('rate', key, box);

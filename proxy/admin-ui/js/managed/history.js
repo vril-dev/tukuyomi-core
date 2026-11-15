@@ -138,17 +138,18 @@ const TREE_DEPTH = 16;
 /**
  * The drawing of a value of the configuration file: an object as a list of its keys and values, an array as a list
  * numbered from 1 (which is how the refusals of the proxy number a place in the file), a text in monospace, `null` as
- * a dash. `depth` counts the steps down from the value that was given.
+ * a dash. The lists are those of `kv`, drawn as a tree (see `.tc-kv--tree` in `app.css`). `depth` counts the steps down
+ * from the value that was given.
  */
 export function valueTree(value, depth = 1) {
   if (depth > TREE_DEPTH) return el('span', { class: 'tc-muted' }, '…');
   if (value === null || value === undefined) return el('span', { class: 'tc-muted' }, '—');
   if (Array.isArray(value)) {
-    return value.length === 0 ? el('code', {}, '[]') : kv(value.map((entry, at) => row(String(at + 1), valueTree(entry, depth + 1))));
+    return value.length === 0 ? el('code', {}, '[]') : el('dl', { class: 'tc-kv tc-kv--tree tc-kv--numbered' }, value.map((entry, at) => row(String(at + 1), valueTree(entry, depth + 1))));
   }
   if (typeof value === 'object') {
     const keys = Object.keys(value);
-    return keys.length === 0 ? el('code', {}, '{}') : kv(keys.map((key) => row(el('code', {}, key), valueTree(value[key], depth + 1))));
+    return keys.length === 0 ? el('code', {}, '{}') : el('dl', { class: 'tc-kv tc-kv--tree' }, keys.map((key) => row(el('code', {}, key), valueTree(value[key], depth + 1))));
   }
   return el('code', {}, String(value));
 }

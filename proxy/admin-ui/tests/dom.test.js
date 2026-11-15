@@ -453,6 +453,31 @@ test('a viewer is not asked about the file, gets no way to correct a difference 
   screen.stop();
 });
 
+test('an admin process that runs without the managed configuration is told so, with the steps that start it, on the screens of the versions, the history and the draft', async () => {
+  setLanguage('en');
+  globalThis.addEventListener = () => {};
+  globalThis.removeEventListener = () => {};
+  const api = {
+    async call(method, path) {
+      if (path === '/api/managed') return { managed: false };
+      if (path === '/api/managed/history') throw new ApiError('conflict', 409, 'the configuration has no managed object');
+      return {};
+    },
+  };
+  const ctx = { user: { name: 'ann', role: 'operator' }, api, describe: String, refreshStatus() {}, navigate() {} };
+  for (const id of ['managed', 'managed-history', 'routes']) {
+    const root = document.createElement('main');
+    document.body.append(root);
+    const screen = managedScreens.find((item) => item.id === id).mount(ctx, root, { id: null, query: {} });
+    await wait();
+    await wait();
+    assert.equal(root.textContent.includes('The admin process started without the managed configuration.'), true, id);
+    assert.equal(root.textContent.includes('Create the first version from that JSON file with the commands managed import and managed activate.'), true, id);
+    assert.equal(root.querySelectorAll('a').some((link) => link.getAttribute('href') === '#/config'), true, id);
+    screen.stop();
+  }
+});
+
 test('once the content of a version is closed, nothing that the screen keeps reaches it', async () => {
   setLanguage('en');
   const ctx = { user: { name: 'ann', role: 'operator' }, api: differingApi(), describe: String, refreshStatus() {}, navigate() {} };
@@ -506,6 +531,7 @@ test('a removal that did not clean up says so, and one with a 503 or with no ans
 test('the values of the configuration file number a list from 1 and stop drawing below sixteen levels', () => {
   const list = valueTree(['a', 'b']);
   assert.deepEqual(list.querySelectorAll('dt').map((node) => node.textContent), ['1', '2']);
+  assert.equal(list.className, 'tc-kv tc-kv--tree tc-kv--numbered');
   // `nested(n)` is n objects, one in the other, with a value in the last: the value is at level n + 1.
   const nested = (n) => {
     let value = 'the end';
@@ -610,6 +636,7 @@ test('the screen of the upstream groups makes a draft from the selected version,
   await wait();
   assert.equal(heldDraft().base, FP);
   assert.equal(root.querySelectorAll('[data-row]').length, 1);
+  assert.equal(root.querySelector('table').className, 'tc-table tc-table--fold');
   const pressed = (label) => press(root.querySelectorAll('button').find((item) => item.textContent === label));
   // The panel of the group opens and takes the focus; what is typed goes to the draft, and the field stays where it is.
   pressed('Edit');

@@ -51,8 +51,9 @@ class UpstreamsScreen extends EditScreen {
       caption: w('edit.upstreams.caption'),
       rowKey: (group) => String(group.cid),
       empty: { title: w('edit.upstreams.empty') },
+      fold: true,
       columns: [
-        { key: 'name', label: w('edit.col.name'), value: (group) => group.name.trim(), mono: true, cell: (group) => nameOf(group) },
+        { key: 'name', label: w('edit.col.name'), value: (group) => group.name.trim(), mono: true, long: true, cell: (group) => nameOf(group) },
         { key: 'servers', label: w('edit.col.servers'), value: (group) => group.servers.length, num: true, filter: false },
         { key: 'tls', label: w('edit.col.tls'), value: (group) => (group.tls ? 1 : 0), filter: false, cell: (group) => (group.tls ? w('edit.col.tls_on') : '—') },
         { key: 'routes', label: w('edit.col.routes'), value: (group) => this.shown.uses(group.cid).routes, num: true, filter: false },
@@ -92,7 +93,7 @@ class UpstreamsScreen extends EditScreen {
     this.defaultKey = key;
     const focused = this.defaultField !== null && globalThis.document.activeElement === this.defaultField.control;
     const options = [{ value: '', label: w('edit.upstreams.no_default') }, ...draft.groups.map((group) => ({ value: group.cid, label: nameOf(group) }))];
-    this.defaultField = selectBox(w('edit.upstreams.default'), options, draft.defaultRef.cid ?? '', { onChange: (value) => draft.setDefault(value) });
+    this.defaultField = selectBox(w('edit.upstreams.default'), options, draft.defaultRef.cid ?? '', { hint: w('edit.upstreams.default_hint'), onChange: (value) => draft.setDefault(value) });
     this.placeField('default', 'default', this.defaultField);
     mount(this.defaultBox, this.defaultField.node);
     if (focused) this.defaultField.control.focus();

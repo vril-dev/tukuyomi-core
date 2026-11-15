@@ -42,6 +42,7 @@ export function rewriteLists(screen, draft, route, part) {
       screen.placeField(item.cid, key, box, part);
       return box.node;
     });
-    return el('div', { class: 'tc-stack' }, el('h3', {}, title()), note, el('div', { class: 'tc-fields' }, boxes));
+    // The four lists of the query stand two by two; a part of the headers has three, which stand as other fields do.
+    return el('div', { class: 'tc-stack' }, el('h3', {}, title()), note, el('div', { class: name === 'query' ? 'tc-fields tc-fields--two' : 'tc-fields' }, boxes));
   });
 }

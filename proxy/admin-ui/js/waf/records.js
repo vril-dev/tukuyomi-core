@@ -565,18 +565,19 @@ class AuditScreen {
       rowKey: (entry, at) => String(at),
       empty: { title: w('audit.empty') },
       dense: true,
+      fold: true,
       columns: [
         { key: 'ts', label: timeLabel(w('col.time')), value: (entry) => instantOf(entry.ts), text: (entry) => timeCellText(entry.ts), tight: true, cell: (entry) => timeCell(entry.ts) },
         { key: 'actor', label: w('col.by'), value: (entry) => textOf(entry.actor) },
         { key: 'action', label: w('audit.action'), value: (entry) => textOf(entry.action), mono: true },
-        { key: 'target', label: w('audit.target'), value: (entry) => textOf(entry.target), text: (entry) => auditText(entry.target), mono: true, cell: (entry) => auditValue(entry.target) },
+        { key: 'target', label: w('audit.target'), value: (entry) => textOf(entry.target), text: (entry) => auditText(entry.target), mono: true, long: true, cell: (entry) => auditValue(entry.target) },
         {
           key: 'result',
           label: w('col.result'),
           value: (entry) => `${textOf(entry.result)} ${textOf(entry.reason)}`,
           cell: (entry) => el('span', { class: 'tc-actions' }, badge(Object.hasOwn(RESULTS, entry.result) ? RESULTS[entry.result] : 'muted', textOf(entry.result)), entry.reason === undefined ? null : el('span', {}, textOf(entry.reason))),
         },
-        { key: 'client', label: w('records.f.client'), value: (entry) => textOf(entry.client), mono: true },
+        { key: 'client', label: w('records.f.client'), value: (entry) => textOf(entry.client), mono: true, long: true },
         {
           key: 'change',
           label: w('audit.change'),
@@ -590,6 +591,7 @@ class AuditScreen {
           label: w('audit.request'),
           value: (entry) => textOf(entry.id),
           mono: true,
+          long: true,
           // A number of the form of a request number opens the record of that request.
           cell: (entry) => (typeof entry.id === 'string' && CHECKS.id(entry.id) ? el('a', { class: 'tc-link tc-mono', href: hashOf('records', { id: entry.id }) }, entry.id) : textOf(entry.id)),
         },

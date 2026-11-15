@@ -86,9 +86,11 @@ export class Table {
    * `text`, the text of the cell, when it is not the value (see `filterRows`); `long` is for a long value with no space
    * in it (a path), which may break anywhere. `rowKey(row, index)` names a row (`index` is its place in the rows that
    * were given); `empty` is `{ title, hint?, action? }` for a list with no rows; `sort` is the starting `{ key, direction }`;
-   * `dense` draws the cells closer, for a table of many columns.
+   * `dense` draws the cells closer, for a table of many columns. `fold` is for a table that does not fit beside the menu
+   * on a screen narrower than 1280px: there each row is one box, as on a narrow screen, and on a wider one each long
+   * value keeps less room, so that the table fits.
    */
-  constructor({ caption, columns, rowKey, empty, filter = true, size = PAGE_SIZE, sort = null, dense = false }) {
+  constructor({ caption, columns, rowKey, empty, filter = true, size = PAGE_SIZE, sort = null, dense = false, fold = false }) {
     this.columns = columns;
     this.rowKey = rowKey;
     this.empty = empty;
@@ -118,7 +120,7 @@ export class Table {
     this.body = el('tbody');
     this.table = el(
       'table',
-      { class: dense ? 'tc-table tc-table--dense' : 'tc-table' },
+      { class: ['tc-table', dense ? 'tc-table--dense' : '', fold ? 'tc-table--fold' : ''].filter(Boolean).join(' ') },
       el('caption', {}, caption),
       el('thead', {}, el('tr', {}, columns.map((column) => this.header(column)))),
       this.body,

@@ -154,8 +154,9 @@ class SitesScreen extends EditScreen {
       caption: w('edit.sites.caption'),
       rowKey: (site) => String(site.cid),
       empty: { title: w('edit.sites.empty') },
+      fold: true,
       columns: [
-        { key: 'name', label: w('edit.col.name'), value: (site) => site.name.trim(), mono: true, cell: (site) => nameOf(site) },
+        { key: 'name', label: w('edit.col.name'), value: (site) => site.name.trim(), mono: true, long: true, cell: (site) => nameOf(site) },
         { key: 'hosts', label: w('edit.col.hosts'), value: (site) => linesOf(site.hosts).map((entry) => entry.text).join(' '), mono: true, long: true, cell: (site) => hostsCell(site) },
         { key: 'certificate', label: w('edit.col.certificate'), value: (site) => site.kind, filter: false, cell: (site) => (site.kind === 'acme' ? w('edit.site.kind_acme') : w('edit.site.kind_file')) },
         { key: 'expires', label: timeLabel(w('managed.cert.expires')), value: (site) => this.listed(site)?.notAfter ?? null, text: (site) => expiresText(this.listed(site)), tight: true, cell: (site) => expiresCell(this.listed(site)) },

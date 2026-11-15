@@ -79,9 +79,27 @@ export function diffRows(from, to, before, after, { gone = false } = {}) {
   ];
 }
 
-/** The notice for a configuration with no managed object, with the way to the configuration file for those who may see it. */
+/**
+ * The notice for an admin process that runs without the managed configuration: what the managed configuration is for,
+ * the steps that start it in their order, and the way to the configuration file for those who may see it. The state is
+ * the one that the admin process read when it started, so the notice does not say what the file holds now.
+ */
 export function unusedNotice(role) {
-  return notice('info', w('managed.unused'), canChange(role) ? [' ', el('a', { class: 'tc-link', href: hashOf('config') }, w('managed.unused_link'))] : null);
+  return notice(
+    'info',
+    el('p', {}, w('managed.unused')),
+    el('p', {}, w('managed.unused_steps')),
+    el(
+      'ol',
+      { class: 'tc-list' },
+      el('li', {}, w('managed.unused_store')),
+      el('li', {}, w('managed.unused_move')),
+      el('li', {}, w('managed.unused_admin')),
+      el('li', {}, w('managed.unused_import')),
+      el('li', {}, w('managed.unused_restart')),
+    ),
+    canChange(role) ? el('p', {}, el('a', { class: 'tc-link', href: hashOf('config') }, w('managed.unused_link'))) : null,
+  );
 }
 
 /**

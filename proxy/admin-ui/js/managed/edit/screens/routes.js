@@ -58,10 +58,11 @@ class RoutesScreen extends EditScreen {
       caption: w('edit.routes.caption'),
       rowKey: (route) => String(route.cid),
       empty: { title: w('edit.routes.empty') },
+      fold: true,
       columns: [
         { key: 'host', label: w('edit.col.host'), value: (route) => this.shapeOf(route).host ?? '', mono: true, long: true, cell: (route) => this.shapeOf(route).host ?? w('edit.col.any') },
         { key: 'path', label: w('edit.col.path'), value: (route) => this.shapeOf(route).path ?? '', mono: true, long: true, cell: (route) => this.shapeOf(route).path ?? w('edit.col.any') },
-        { key: 'upstream', label: w('edit.col.upstream'), value: (route) => this.shown.nameOf(route.ref), mono: true },
+        { key: 'upstream', label: w('edit.col.upstream'), value: (route) => this.shown.nameOf(route.ref), mono: true, long: true },
         { key: 'tags', label: w('edit.col.tags'), value: (route) => routeTags(this.shapeOf(route)).join(' '), filter: false, cell: (route) => this.tagsCell(route) },
         { key: 'marks', label: w('col.state'), value: (route) => this.marksOf(route).map((name) => MARKS[name].text()).join(' '), filter: false, cell: (route) => this.marksCell(route) },
         { key: 'actions', label: w('col.actions'), value: () => '', sortable: false, filter: false, cell: (route) => button('small', w('edit.upstreams.edit'), () => this.openRoute(route.cid)) },
@@ -262,7 +263,7 @@ class RoutesScreen extends EditScreen {
     };
     const lists = el(
       'div',
-      { class: 'tc-fields' },
+      { class: 'tc-fields tc-fields--two' },
       list('deny_cidrs', w('edit.access.deny_cidrs'), w('edit.access.networks_hint')),
       list('allow_cidrs', w('edit.access.allow_cidrs'), w('edit.access.networks_hint')),
       list('deny_countries', w('edit.access.deny_countries'), countryHint),

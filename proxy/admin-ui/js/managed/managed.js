@@ -100,6 +100,7 @@ class VersionsScreen extends Screen {
       caption: w('managed.caption'),
       rowKey: (item, at) => (isFingerprint(item.name) ? item.name : String(at)),
       empty: { title: w('managed.empty') },
+      fold: true,
       columns: [
         { key: 'name', label: w('managed.col.version'), value: (item) => String(item.name), text: (item) => fingerprintText(item.name), mono: true, cell: (item) => this.nameCell(item) },
         { key: 'made', label: timeLabel(w('managed.col.made')), value: (item) => item.made, text: (item) => timeCellText(item.made, 's'), tight: true, cell: (item) => timeCell(item.made, 's') },
@@ -264,8 +265,9 @@ class VersionsScreen extends Screen {
       rowKey: (site, at) => String(at),
       filter: false,
       empty: { title: w('edit.sites.empty') },
+      fold: true,
       columns: [
-        { key: 'name', label: w('managed.cert.site'), value: (site) => String(site.name ?? ''), mono: true },
+        { key: 'name', label: w('managed.cert.site'), value: (site) => String(site.name ?? ''), mono: true, long: true },
         { key: 'kind', label: w('edit.col.certificate'), value: (site) => kindWords(site.kind).text(), cell: (site) => kindWords(site.kind) },
         { key: 'expires', label: timeLabel(w('managed.cert.expires')), value: (site) => certificateExpiry(site).notAfter, tight: true, cell: (site) => expiryCell(certificateExpiry(site)) },
         { key: 'state', label: w('col.state'), value: (site) => certificateText(site.state), cell: (site) => certificateBadge(site.state) },

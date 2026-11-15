@@ -813,7 +813,7 @@ class AccountScreen {
       },
       el('h3', {}, w('tokens.create_title')),
       messages,
-      el('div', { class: 'tc-fields' }, name.node, role.node, days.node, password.node),
+      el('div', { class: 'tc-fields tc-fields--two' }, name.node, role.node, days.node, password.node),
       el('div', { class: 'tc-actions' }, submit),
     );
   }
