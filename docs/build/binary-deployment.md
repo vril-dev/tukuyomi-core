@@ -8,7 +8,7 @@
 
 | 構成要素 | 内容 |
 |---|---|
-| `tukuyomi-proxy`（Rust、`proxy/`） | HTTP／HTTPS のリクエストを受信して転送します。検査核（`kernel/`、Rust のライブラリ）を組み込み、検査プロセスの起動・停止・再起動を受け持ちます。同じ実行ファイルが、ルールストアのコマンド（`rules`）、証明書のコマンド（`acme renew`）、設定の検証（`config check`）、管理プロセス（`admin`）も持ちます |
+| `tukuyomi-proxy`（Rust、`proxy/`） | HTTP／HTTPS のリクエストを受信して転送します。検査カーネル（`kernel/`、Rust のライブラリ）を組み込み、検査プロセスの起動・停止・再起動を受け持ちます。同じ実行ファイルが、ルールストアのコマンド（`rules`）、証明書のコマンド（`acme renew`）、設定の検証（`config check`）、管理プロセス（`admin`）も持ちます |
 | `tukuyomi-inspector`（Go、`inspector/`） | Coraza でリクエストを検査します。プロキシが子プロセスとして起動し、引き継いだ Unix ドメインソケットのペアで通信します。待ち受けるポートは持ちません。設定の `kernel.inspector` に指定します |
 | `tukuyomi-inspector-modsecurity`（Rust と C++、`inspector-modsecurity/`） | ModSecurity v3（libmodsecurity 3.0.17）でリクエストを検査します。ModSecurity の世代（`rules import --engine modsecurity`）を使う場合だけ必要で、使わないホストでは省けます。プロキシが子プロセスとして起動し、引き継いだ Unix ドメインソケットのペアで通信します。待ち受けるポートは持ちません。設定の `kernel.engines.modsecurity.inspector` に指定します |
 | `tukuyomi-records-ship`（Rust、`records-ship/`） | ログ送信プロセスです。プロキシのログファイルの行を、PostgreSQL か MySQL のテーブルへ送ります。ログを DB へ送る場合だけ必要で、送らないホストでは省けます。プロキシとは別のユニットで動き、同じ設定ファイルを読みます。待ち受けるポートは持ちません |
@@ -39,9 +39,9 @@
 - ビルドに必要なもの:
   - Rust 1.94.1 以上（`proxy/Cargo.toml` の `rust-version`）
   - C コンパイラ（TLS に使う aws-lc-rs が C のコードをビルドします）
-  - Go 1.27.2（`inspector/go.mod`）。検査プロセスは、ビルドに使った Go のバージョンを検査核に通知します。検査核は、`go1.27.2` でビルドしたものだけを受け付けます。
+  - Go 1.27.2（`inspector/go.mod`）。検査プロセスは、ビルドに使った Go のバージョンを検査カーネルに通知します。検査カーネルは、`go1.27.2` でビルドしたものだけを受け付けます。
 - ModSecurity の検査プロセスをビルドする場合だけ、さらに次のものが必要です。
-  - `rustc` 1.94.1 ちょうど（`rustc -vV` の `release:` の行が `1.94.1`）。プロキシと違い、別のバージョンでビルドした検査プロセスは検査核が受け付けません（下の「ModSecurity の検査プロセス」）。
+  - `rustc` 1.94.1 ちょうど（`rustc -vV` の `release:` の行が `1.94.1`）。プロキシと違い、別のバージョンでビルドした検査プロセスは検査カーネルが受け付けません（下の「ModSecurity の検査プロセス」）。
   - C と C++ のコンパイラ、make
   - libyajl-dev と libpcre2-dev（静的ライブラリの `libyajl_s.a` と `libpcre2-8.a`）
   - bash、curl、sha256sum、tar（libmodsecurity の取得に使います。アーカイブを `BUILD_MODSECURITY_ARCHIVE_FILE` で渡す場合、curl は不要です）
@@ -74,7 +74,7 @@
 
 ## ソースからのビルド
 
-プロキシは `proxy/` でビルドします。検査核も一緒にビルドされます。
+プロキシは `proxy/` でビルドします。検査カーネルも一緒にビルドされます。
 
 ```bash
 cd proxy && cargo build --release --locked
@@ -122,7 +122,7 @@ cd inspector-modsecurity && TUKUYOMI_MODSECURITY_PREFIX=<new-dir> cargo build --
 - prefix の `archive.sha256` が読めない、または小文字の 16 進数 64 桁の 1 行でない
 - C++ コンパイラが `libpcre2-8.a`（libpcre2-dev）か `libyajl_s.a`（libyajl-dev）を見つけられない
 
-検査プロセスは、ビルドに使ったコンパイラのバージョン、libmodsecurity のバージョン、アーカイブの sha256 を、起動時の最初のメッセージ（HELLO）で検査核に通知します。ModSecurity の検査プロセスについて、検査核は次の 3 つがすべて一致するものだけを受け付けます。
+検査プロセスは、ビルドに使ったコンパイラのバージョン、libmodsecurity のバージョン、アーカイブの sha256 を、起動時の最初のメッセージ（HELLO）で検査カーネルに通知します。ModSecurity の検査プロセスについて、検査カーネルは次の 3 つがすべて一致するものだけを受け付けます。
 
 | 項目 | 受け付ける値 |
 |---|---|
@@ -130,7 +130,7 @@ cd inspector-modsecurity && TUKUYOMI_MODSECURITY_PREFIX=<new-dir> cargo build --
 | libmodsecurity のバージョン | `v3.0.17` |
 | アーカイブの sha256 | 上の `f283b33d…b671a50` |
 
-一致しない場合、検査核は `hello toolchain differs`、`hello engine version differs`、`hello engine source differs` のどれかを出して受け付けず、検査プロセスを再起動しません。プロキシの起動では `stop: the kernel failed: Hello("<message>")` の行が、`rules import` では `rules import: the trial failed: the inspector could not be started (Hello("<message>"))` の行が出ます。
+一致しない場合、検査カーネルは `hello toolchain differs`、`hello engine version differs`、`hello engine source differs` のどれかを出して受け付けず、検査プロセスを再起動しません。プロキシの起動では `stop: the kernel failed: Hello("<message>")` の行が、`rules import` では `rules import: the trial failed: the inspector could not be started (Hello("<message>"))` の行が出ます。
 
 ### ログ送信プロセス
 
@@ -313,9 +313,9 @@ WantedBy=multi-user.target
   - デフォルトの `control-group` では、停止の SIGTERM が検査プロセスにも届きます。
   - 検査プロセスは SIGTERM を処理しないので、その場で終了します。そのため、プロキシが検査プロセスを順に停止すること（残りの検査を終え、終了の通知を受けること）ができません。
   - `mixed` では、SIGTERM はプロキシにだけ届きます。プロキシは、自分で検査プロセスを停止してから終了します。
-- `Type=notify` にします。プロキシは、検査核の準備ができてすべてのリスナーをバインドした後に `READY=1` を、停止の始めに `STOPPING=1` を systemd へ送ります。`systemctl start` と、このユニットの後に `After=` で並べたユニットは、そこまで待ちます。`Type=simple` では、実行した時点で起動したと見なされます。
+- `Type=notify` にします。プロキシは、検査カーネルの準備ができてすべてのリスナーをバインドした後に `READY=1` を、停止の始めに `STOPPING=1` を systemd へ送ります。`systemctl start` と、このユニットの後に `After=` で並べたユニットは、そこまで待ちます。`Type=simple` では、実行した時点で起動したと見なされます。
   - 通知を送るのはプロキシのメインプロセスだけです。`NotifyAccess` はデフォルト（`main`）のままで問題ありません。
-  - `TimeoutStartSec` は、アップストリームの名前解決の時間（`resolve_timeout_ms`）と、検査核の準備を待つ時間（`ready_wait_ms`）を足した時間より長くします。`READY=1` が届かないと、systemd はこの時間の後にプロキシを停止します。
+  - `TimeoutStartSec` は、アップストリームの名前解決の時間（`resolve_timeout_ms`）と、検査カーネルの準備を待つ時間（`ready_wait_ms`）を足した時間より長くします。`READY=1` が届かないと、systemd はこの時間の後にプロキシを停止します。
 - `TimeoutStopSec` は、`stop_wait_ms` と `kill_grace_ms` と、ログの書き出しの 200 ms を足した時間より長くします。短いと、systemd が先に SIGKILL を送ります。停止の流れは、[運用リファレンス](../operations/operator-reference.md) の「停止」を参照してください。
 - `LogRateLimitIntervalSec=0` を指定します。journald のデフォルトのレート制限では、リクエストが集中したときにリクエストのログがジャーナルに入らずに失われます。
 - ログはジャーナルに入ります。設定に `records` があれば、同じログがファイルにも書かれます（上の「OS ユーザーとディレクトリ」）。保存期間と容量は、journald の設定（`/etc/systemd/journald.conf` の `SystemMaxUse`、`MaxRetentionSec` など）で決めます。ログにはクライアントのアドレスとパスが入るので、ジャーナルを読めるグループ（Ubuntu では `adm`・`systemd-journal`）に入れる OS ユーザーは最小限にしてください。ログの形式は、[運用リファレンス](../operations/operator-reference.md) の「記録」を参照してください。
@@ -501,7 +501,7 @@ WantedBy=timers.target
 
 プロキシの起動、`rules import`（事前検証で検査プロセスを起動します）、管理プロセスのコマンド（`admin <config>`、`admin bootstrap`、`admin reset`）は、`/proc` を読んで次の条件も検証します。条件を満たさなければ拒否します。`config check` とほかのコマンドは、root でないことだけを検証します。
 
-- SIGCHLD を無視していないこと。検査核は、子プロセスの終了を自分で待ちます。
+- SIGCHLD を無視していないこと。検査カーネルは、子プロセスの終了を自分で待ちます。
 - 2 より大きいファイルディスクリプターが、すべて close-on-exec であること。検査プロセスに不要なディスクリプターを渡さないためです。
 
 systemd から起動する場合は、どちらの条件も満たされます。
