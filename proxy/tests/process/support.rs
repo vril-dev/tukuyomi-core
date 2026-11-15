@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -500,12 +501,33 @@ pub(crate) fn exchange(port: u16, request: &[u8]) -> Reply {
     collect(&mut sock, start)
 }
 
+/// The ports that `free_port` has given in this run. Such a port is free again once `free_port` returns, until the
+/// process the test starts binds it, so a later bind to port 0 (another `free_port`, or an upstream) could get the
+/// same port. None of these ports is given again, and no upstream takes one.
+static GIVEN: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+
+/// A loopback listener at a port that the system picks and that is not in `given`. A listener that got a port in
+/// `given` stays open until the loop ends, so the system does not pick that port again.
+fn bind_new(given: &BTreeSet<u16>, what: &str) -> TcpListener {
+    let mut held = Vec::new();
+    loop {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect(what);
+        let port = listener.local_addr().expect("the local address").port();
+        if !given.contains(&port) {
+            return listener;
+        }
+        held.push(listener);
+    }
+}
+
 pub(crate) fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind a free port")
+    let mut given = lock(&GIVEN);
+    let port = bind_new(&given, "bind a free port")
         .local_addr()
         .expect("the local address")
-        .port()
+        .port();
+    given.insert(port);
+    port
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -549,7 +571,7 @@ pub(crate) struct Upstream {
 
 impl Upstream {
     fn start(keeps: bool) -> Upstream {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind the upstream");
+        let listener = bind_new(&lock(&GIVEN), "bind the upstream");
         listener
             .set_nonblocking(true)
             .expect("make the upstream non-blocking");
