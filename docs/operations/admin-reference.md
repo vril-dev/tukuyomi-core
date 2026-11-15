@@ -33,7 +33,7 @@ tukuyomi-proxy admin <config>
 
 - 設定ファイルは絶対の path で渡す（[運用リファレンス](operator-reference.md) の「命令」と同じ決まり）。
 - 起動は次の順に進む。
-  1. 起動の前の確かめ（root でないこと、SIGCHLD、file descriptor。proxy と同じで、中身は [ビルドと配置](../build/binary-deployment.md) の「起動の前の確かめ」）
+  1. 起動の前の確かめ（root でないこと、SIGCHLD、file descriptor。proxy と同じで、中身は [ビルドと配置](../build/binary-deployment.md) の「起動前の検証」）
   2. 設定ファイル
   3. 管理の置き場を開き、`process.lock` の lock を取る
   4. 監査の記録を開く
