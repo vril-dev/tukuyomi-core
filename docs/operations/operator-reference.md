@@ -1,6 +1,6 @@
 # 運用リファレンス
 
-この文書は、今の実装の命令、合図、設定ファイルの鍵、ルールセットの扱い、要求の扱い、要求の前の方針、記録、監視を、引いて使える形でまとめる。置き方と systemd の例は [実行ファイルの build と配置](../build/binary-deployment.md) に書く。管理のプロセス（`admin` の命令）の設定と API は [管理リファレンス](admin-reference.md) に書き、この文書には proxy から見えるものだけを書く。
+この文書は、今の実装の命令、合図、設定ファイルの鍵、ルールセットの扱い、managed 設定、要求の扱い、リクエストの前のポリシー、記録、監視を、引いて使える形でまとめる。置き方と systemd の例は [実行ファイルの build と配置](../build/binary-deployment.md) に書く。管理のプロセス（`admin` の命令）の設定と API は [管理リファレンス](admin-reference.md) に書き、この文書には proxy から見えるものだけを書く。
 
 例の path と名前（`/etc/tukuyomi-core/config.json`、利用者 `tukuyomi`、`example.com` など）は例である。
 
@@ -18,7 +18,7 @@ tukuyomi-proxy <config>
 
 - 起動は、次の順に進む。
   1. 起動の前の確かめ（root でないこと、SIGCHLD、file descriptor）
-  2. 設定ファイル（`geo` があれば、国のデータベースの読み込みと確かめも）
+  2. 設定ファイル（`managed` があれば、managed ストアの選択中のバージョンと、それが指すファイルも。`geo` があれば、国のデータベースの読み込みと確かめも）
   3. 上流の server の名前の解決と、上流の組の CA のファイル
   4. TLS の待ち受けの証明書と鍵
   5. ルールの保管場所と、選んだ世代
@@ -38,7 +38,7 @@ tukuyomi-proxy <config>
 | exit code | 意味 |
 |---|---|
 | 0 | 合図で止まり、検査核の停止（検査プロセスの終わりと作業場所の削除）まで確かめられた |
-| 1 | ほかの終わり方。root での起動、起動の前の確かめの失敗、引けない上流の名前、使えない CA のファイル、断られた証明書や鍵、断られた保管場所や世代、開けない記録のファイル、bind できない監視の待ち受けや制御 socket も含む（このときは何も起動していない） |
+| 1 | ほかの終わり方。root での起動、起動の前の確かめの失敗、引けない上流の名前、使えない CA のファイル、断られた証明書や鍵、断られた保管場所や世代、断られた managed ストアやバージョン、開けない記録のファイル、bind できない監視の待ち受けや制御 socket も含む（このときは何も起動していない） |
 | 2 | 引数の誤り、または設定ファイルが断られた |
 
 ### `config check`
@@ -47,23 +47,24 @@ tukuyomi-proxy <config>
 tukuyomi-proxy config check <config>
 ```
 
-- 起動と同じ確かめを、選んだ世代と検査核の設定まで流す（上の 2〜5 と、検査核の設定の値）。起動の前の確かめ（上の 1）は、root でないことだけを見る。
-  - 通れば、標準出力に `accepted` の1行が出て exit 0 になる。
-  - ほかの行は標準エラーに出て、`config check:` で始まる。引数の誤りのときだけ `config:` で始まり、使い方の行が続く。
+- 起動と同じ検証を、選択中の世代と検査核の設定まで流す（上の 2〜5 と、検査核の設定の値）。起動の前の検証（上の 1）は、root でないことだけを見る。
+  - 通れば、標準出力に `accepted` の 1 行が出て exit 0 になる。
+  - ほかの行は標準エラーに出て、`config check:` で始まる。引数のエラーのときだけ `config:` で始まり、使い方の行が続く。
   - exit code は起動と同じである。
-  - 選んだ世代のエンジンが使えるかも確かめる。使えなければ、`config check: rules generation refused: <理由>` の行を出して exit 1 になる。この build が持つ検査のエンジンは `coraza` と `modsecurity` である。`modsecurity` の世代は、設定の `kernel.engines` に検査プロセスがあるときだけ使える（下の「`kernel`」の `engines`）。
-- `geo` があれば、国のデータベースも起動と同じに読んで確かめる（「要求の前の方針」の `geo`）。
-- 確かめないもの:
+  - 選択中の世代のエンジンが使えるかも検証する。使えなければ、`config check: rules generation refused: <reason>` の行を出して exit 1 になる。この build が持つ検査のエンジンは `coraza` と `modsecurity` である。`modsecurity` の世代は、設定の `kernel.engines` に検査プロセスがあるときだけ使える（下の「`kernel`」の `engines`）。
+- `managed` があれば、managed ストアの選択中のバージョン（`current`）を起動と同じに読んで検証し、`config check: managed version <version>` の行を出す。選択中のバージョンが無ければ、`config check: managed store refused: no managed version is chosen` の行を出して exit 1 になる（下の「managed 設定」）。読んでいる間は、そのバージョンの削除を拒否する。
+- `geo` があれば、国のデータベースも起動と同じに読んで検証する（「リクエストの前のポリシー」の `geo`）。
+- 検証しないもの:
   - SIGCHLD と file descriptor（上の 1 のうち、root でないこと以外）
-  - 作業場所（`kernel.tmp_root`）。検査プロセスを起動するときに確かめる
+  - 作業場所（`kernel.tmp_root`）。検査プロセスを起動するときに検証する
   - 検査プロセスの実行ファイルが起動できること、Landlock が使えること
-  - ルールが世代のエンジン（Coraza か ModSecurity）で組めること（起動のときに確かめる。ルールは `rules import` が試してから世代にする）
-  - 記録のファイルを開けること（上の 6）
-  - 待ち受けと監視の待ち受けの port、制御 socket を bind できること
+  - ルールが世代のエンジン（Coraza か ModSecurity）で組めること（起動のときに検証する。ルールは `rules import` が事前検証してから世代にする）
+  - ログファイルを開けること（上の 6）
+  - リスナーと監視のリスナーの port、制御ソケットを bind できること
   - systemd の設定
-  - 動いている proxy が SIGHUP の読み直しで断る理由（動いている間に変えられない鍵の違い、新しい待ち受けの bind。下の「SIGHUP（設定の読み直し）」）
-- この命令が書くものは1つだけである。起動と同じく、選んだ世代を使う印を保管場所の `using/` に作る（まだ無いとき）。命令が終われば、印の lock は外れる。
-- サービスと同じ利用者で流す。別の利用者では、保管場所の持ち主の確かめや、鍵のファイルの読みで断られる。
+  - 動いているプロキシが設定のリロードで拒否する理由（動いている間に変えられない設定キーの違い、新しいリスナーの bind。下の「SIGHUP（設定のリロード）」）
+- このコマンドが書くものは 1 つだけである。起動と同じく、選択中の世代を使う印をルールストアの `using/` に作る（まだ無いとき）。コマンドが終われば、印のロックは外れる。
+- サービスと同じ OS ユーザーで流す。別の OS ユーザーでは、ルールストアと managed ストアの所有者の検証や、鍵のファイルの読み込みで受け付けない。
 
 ### `rules`
 
@@ -74,7 +75,7 @@ tukuyomi-proxy rules remove <config> <fingerprint>
 tukuyomi-proxy rules list <config>
 ```
 
-どれも短い命令で、動いている proxy とは別のプロセスである。動いている proxy は、命令がしたことに気づかない。新しい世代を使わせるには、SIGUSR1 を送る（下の「合図」）。管理のプロセスの API は、世代を選ぶことと、動いている proxy への切り替えの依頼を続けて行う（[管理リファレンス](admin-reference.md)。依頼は「制御 socket」）。
+どれも短い命令で、動いている proxy とは別のプロセスである。動いている proxy は、命令がしたことに気づかない。新しい世代を使わせるには、SIGUSR1 を送る（下の「合図」）。管理のプロセスの API は、世代を選ぶことと、動いている proxy への切り替えの依頼を続けて行う（[管理リファレンス](admin-reference.md)。依頼は「制御ソケット」）。
 
 | 命令 | すること | 標準出力 |
 |---|---|---|
@@ -112,30 +113,61 @@ tukuyomi-proxy rules list <config>
 
 exit code は、0 が成功、1 がほかの終わり方（断られた保管場所や入力、失敗した試し、使用中の保管場所、`list` で manifest が読めない世代や選んだ世代が無い保管場所、root での実行）、2 が引数の誤り、断られた設定ファイル、または使えないエンジン（`import` と `activate`）である。
 
+### `managed`
+
+```text
+tukuyomi-proxy managed import <config> <document>
+tukuyomi-proxy managed activate <config> <version>
+tukuyomi-proxy managed remove <config> <version>
+tukuyomi-proxy managed list <config>
+```
+
+managed 設定のバージョン（下の「managed 設定」）を扱う短いコマンドで、動いているプロキシとは別のプロセスである。コマンドはプロキシに依頼しないので、動いているプロキシは、選択中のバージョンを次の SIGHUP（`systemctl reload`）か起動で読む。管理プロセスの反映は、制御ソケットでプロキシに設定をリロードさせてから選ぶ（下の「managed 設定」の「反映」）。設定ファイルは `managed` を持つこと。`<version>` は、バージョンの SHA-256（64 桁の小文字の 16 進数）である。
+
+| コマンド | すること | 標準出力 |
+|---|---|---|
+| `import` | 文書からバージョンを作って managed ストアに置く。文書が指すファイルを読んでプロキシと同じに検証し、`files/` に置く。バージョンを選びはしない | `<version> created`、`<version> existing`、`<version> recreated, the stored copy was broken` |
+| `activate` | 起動のうちルールストアより前の段（設定ファイルとバージョン、アップストリームの名前の解決と CA のファイル、証明書）を流し、通ったときだけバージョンを選ぶ（`current` を変更する） | `<version> current` |
+| `remove` | 選択中でなく、使用中でもないバージョンを削除し、どのバージョンも指さなくなったファイルと ACME のサイトの証明書を片付ける。ロールバックの先かどうかは見ない | `<version> removed` |
+| `list` | バージョンの一覧 | バージョン、ファイルの更新時刻（epoch からの秒）、選択中のバージョンに `current` |
+
+- `import` の文書のパスは、コマンドを流す場所からの相対のパスでも書ける。文書の形は下の「managed ストアとバージョン」にある。
+- `import` と `activate` は、国のデータベースも読んで検証する。`remove` と `list` は、設定ファイルだけを読む。
+- `import`・`activate`・`remove` は、managed ストアのロックを取る。管理プロセスの反映の間など、ほかがロックを持っていれば、待たずに拒否する（`the managed store is in use by another command`）。
+- `activate` は、ACME のサイトの証明書がまだ無いとき、`managed activate: tls certificate not issued yet (site <name>)` の行を出す。拒否はしない。
+- `activate` で選んだバージョンは、動いているプロキシには次の SIGHUP まで効かない。すぐに `systemctl reload` を流し、`reload: configuration replaced <sha256> managed <version>` の行を確認する（下の「managed 設定」の「反映」）。
+- `remove` で片付けが全部できなかったときは、標準エラーに `managed remove: the files that no version names were not cleaned up` の行を出し、exit 0 で終わる（バージョンは削除した）。次の削除で、また片付ける。
+- 結果の行のほかは標準エラーに出て、コマンドの名前で始まる（`managed import: document refused: <reason>` など）。文書から来たパスは、0x20〜0x7e の外のバイトを `\xNN` にして書く。
+
+exit code は、0 が成功、1 がほかの終わり方（受け付けない managed ストア・文書・ファイル、使用中の managed ストア、`activate` で引けない名前や使えないファイル、`activate` が受け付けないバージョン、`remove` が拒否したバージョン、`list` で `current` が読めないか、`current` が指すバージョンが無い managed ストア、root での実行）、2 が引数のエラーか、受け付けない設定ファイル（`managed` の無い設定ファイルを含む）である。
+
 ### `acme renew`
 
 ```text
 tukuyomi-proxy acme renew <config>
 ```
 
-- `acme` を持つ証明書を、設定の順に見る。次のどれかに当たる証明書を、新しい鍵で注文し直す（期限が来たもの）。
+- `acme` を持つ証明書を、設定の順に見る（`managed` のある設定では、管理画面のルート、バージョンのサイトの順。下の「ACME のサイト」）。次のどれかに当たる証明書は、更新が要るとして、新しい鍵で注文し直す。
   - 証明書か鍵のファイルが読めない
   - 鍵が証明書に合わない
-  - 証明書がすべての host を含まない
+  - 証明書がすべてのホストを含まない
   - 有効期間の終わりまでが `renew_before_days` 日より短い（ちょうどその日数は短くない）
-- 期限が来ていない証明書は `valid` である。
-- 期限が来た証明書が1つでもあれば、account の鍵を読むか作り、CA に account を作るか見つける。account は、CA の利用規約に同意し、`contact_email` を連絡先にして作る。
-- 命令全体（CA の応答と待ちを含む）は `timeout_ms` までである。時間が尽きたとき、まだ更新できていない期限の来た証明書は、その後のものも含めて `failed` になる。期限が来ていない証明書は `valid` のままである。
-- 結果は、`acme` を持つ証明書ごとに標準出力に1行出る。形は `<待ち受けの番号>.<証明書の番号> renewed|valid|failed` である。
-  - どちらも 1 から数える。待ち受けの番号は `proxy.listeners` の並びの位置で、TLS でない待ち受けも数える。
+- 更新が要らない証明書は `valid` である。
+- 更新が要る証明書が 1 つでもあれば、アカウントの鍵を読むか作り、CA にアカウントを作るか見つける。アカウントは、CA の利用規約に同意し、`contact_email` を連絡先にして作る。
+- コマンド全体（CA の応答と待ちを含む）は `timeout_ms` までである。時間が尽きたとき、まだ更新できていない証明書は、その後のものも含めて `failed` になる。更新が要らない証明書は `valid` のままである。
+- 結果は、`acme` を持つ証明書ごとに標準出力に 1 行出る。
+  - `managed` の無い設定では `<listener>.<certificate> renewed|valid|failed` の形である。どちらも 1 から数える。リスナーの番号は `proxy.listeners` の並びの位置で、TLS でないリスナーも数える。
+  - `managed` のある設定では `admin route renewed|valid|failed`、`site <name> renewed|valid|failed` の形である。
   - `failed` の証明書は、ファイルを前のまま残す。
-- CA から受けたものは、問題の文書の `type` だけを記録に出す。
-- SIGINT と SIGTERM で、challenge のファイルを消してすぐ終わる。
-- 動いている proxy は、新しい証明書に気づかない。命令の後に SIGUSR2 を送る（`systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`）。
+- `managed` と `acme` のある設定で、`acme` を持つ証明書が 1 つも無いとき（管理画面のルートにも、バージョンのサイトにも無いとき）は、結果の行を出さず、標準エラーに 1 行出して exit 0 で終わる。
+- `managed` のある設定では、`current` のバージョンを読み、終わるまで、そのバージョンの削除を拒否する。managed ストアのロックは取らない。
+- CA から受けたものは、問題の文書の `type` だけを標準エラーに出す。
+- SIGINT と SIGTERM で、challenge のファイルを削除してすぐ終わる。
+- 動いているプロキシは、新しい証明書に気づかない。コマンドの後に SIGUSR2 を送る（`systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`）。
 - exit code は次のとおりである。
-  - 0: すべてが `renewed` か `valid`
-  - 1: 1つでも `failed`、止められた、流せない、root で流した
-  - 2: 引数の誤り、断られた設定ファイル、`acme` を持つ証明書が無い設定ファイル
+  - 0: すべてが `renewed` か `valid`（`managed` のある設定で、`acme` を持つ証明書が無いときも）
+  - 1: 1 つでも `failed`、止められた、流せない、root で流した
+  - 2: 引数のエラー、受け付けない設定ファイル（`managed` のある設定では、プロキシが起動しない managed ストア・`current`・バージョンも）、`acme` の無い設定ファイル
 
 手順は下の「ACME」にある。
 
@@ -148,7 +180,7 @@ tukuyomi-proxy admin reset <config> <name>
 ```
 
 - 管理のプロセスを動かす命令（`admin <config>`）と、その短い命令（`bootstrap`・`reset`）である。設定ファイルに `admin` が要る。鍵、API、命令の中身は [管理リファレンス](admin-reference.md) に書く。
-- 動いている proxy とは別のプロセスである。proxy に依頼できるのは、状態を尋ねることと、世代の切り替えだけである（下の「制御 socket」）。
+- 動いている proxy とは別のプロセスである。proxy に依頼できるのは、状態を尋ねることと、世代の切り替えと、managed 設定のバージョンでの設定の読み直しだけである（下の「制御ソケット」）。
 - 起動の前の確かめも、root で流れないことも、proxy と同じである（`host check refused`）。
 - 管理のプロセスは、`admin <config>` の間、記録を JSON で標準エラーに出す（systemd では journal）。`bootstrap` と `reset` は、人が読む文の行を出す。
 - exit code は、0 が成功、1 がほかの終わり方、2 が引数の誤り、断られた設定ファイル、`admin` の無い設定ファイルである。
@@ -162,44 +194,46 @@ tukuyomi-proxy admin reset <config> <name>
 | SIGTERM、SIGINT | 止まる（下の「停止」） |
 | SIGHUP | 設定ファイルを読み直し、止まらずに新しい設定に替える |
 | SIGUSR1 | ルールの保管場所が今選んでいる世代へ切り替える |
-| SIGUSR2 | すべての TLS の待ち受けの証明書と鍵のファイルを読み直す |
+| SIGUSR2 | すべての TLS の待ち受けの証明書と鍵のファイルを読み直す（`managed` のある設定では、`admin.route` の証明書と、managed ストアのサイトの証明書） |
 
 SIGHUP で止まる前の版から入れ替えるときは、新しい実行ファイルを入れてから unit を替える（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。前の版は SIGHUP で止まる。
 
-### SIGHUP（設定の読み直し）
+### SIGHUP（設定のリロード）
 
-- 起動のときと同じ path の設定ファイルを、別の thread で読み直す。起動の段のうち、ルールの保管場所より前の段（設定、上流の server の名前の解決と `ca_file`、待ち受けの証明書と鍵、ACME の challenge、`geo` の国のデータベース）を同じ確かめで流し、行の頭は `reload:` になる。
-- すべてが通り、動いている間に変えられない鍵（下）がどれも起動のときと同じなら、新しい設定に一度に替える。最後に `reload: configuration replaced <ファイルの SHA-256>` の文を出す。どのファイルが効いているかは、この SHA-256 で確かめる。
-- どこかで断られたら、何も替えず、理由の文を出す（`reload: configuration refused: <理由>`、`reload: upstream refused: <理由>`、`reload: tls refused: <理由>` など）。断った文に、ファイルの値は出さない。
-- 通っても断っても、`tukuyomi_config_reloads_total` に数える（`replaced`、`refused`）。
-- 替わるもの:
-  - `proxy` の鍵（下の変えられない鍵を除く）、待ち受け（足す、外す、並べ替える、TLS と証明書、`http2`、`redirect`）
-  - `forward`（上流の組と経路）。上流の server の名前は、読み直すたびに引き直す
-  - 上流の組の `ca_file`、待ち受けの証明書と鍵、ACME の challenge
-  - 全体の `access`・`rate_limit`・`geo`（国のデータベースを読み直す）
+- 起動のときと同じパスの設定ファイルを、別のスレッドで読み込む。`managed` があれば、そのときの選択中のバージョン（`current`）と一緒に読む。起動の段のうち、ルールストアより前の段（設定ファイルとバージョン、アップストリームのサーバーの名前の解決と `ca_file`、リスナーの証明書と鍵、ACME の challenge、`geo` の国のデータベース）を同じ検証で流し、行の頭は `reload:` になる。
+- 制御ソケットの `reload` の依頼も、同じ手順で設定をリロードする（`current` の代わりに、依頼が名指したバージョンを読む。下の「制御ソケット」）。リロードは一度に 1 つだけである。
+- すべてが通り、動いている間に変えられない設定キー（下）がどれも起動のときと同じなら、新しい設定に一度に切り替える。最後に `reload: configuration replaced <sha256>` の行を出す（`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`）。どのファイルとバージョンが効いているかは、この値で確認する。
+- どこかで拒否したら、何も変更せず、理由の行を出す（`reload: configuration refused: <reason>`、`reload: upstream refused: <reason>`、`reload: tls refused: <reason>`、`managed` のある設定では `reload: managed store refused: <reason>`・`reload: managed version refused: <reason>` など）。拒否の文に、ファイルの値は出さない。
+- 通っても拒否しても、`tukuyomi_config_reloads_total` に数える（`replaced`、`refused`）。制御ソケットの `reload` で始めたリロードも、同じに数える。
+- 変更できるもの:
+  - `proxy` の設定キー（下の変えられない設定キーを除く）、リスナー（追加、削除、並べ替え、TLS と証明書、`http2`、`redirect`）
+  - `forward`（アップストリームとルート）。アップストリームのサーバーの名前は、リロードのたびに引き直す。`managed` のある設定では、バージョンのサイト、アップストリーム、ルート、デフォルトのアップストリーム
+  - アップストリームの `ca_file`、リスナーの証明書と鍵、ACME の challenge
+  - 全体の `access`・`rate_limit`、`host_policies`、`geo`（国のデータベースを読み込む）
+  - 管理画面のルートの証明書と `access`
   - `records.keep`
-- 動いている間に変えられない鍵: `proxy.max_conns`、`max_buffered_bytes`、`drive_slice_ms`、`ready_wait_ms`、`stop_inspect_ms`、`stop_wait_ms`、`records`（`keep` を除く全部と、有る無し）、`status`、`admin`、`rules.store`、`kernel`（全部）。どれかが起動のときと違う設定は、全体を断る（`reload: configuration refused: <鍵> cannot change while running`）。替えるときは起動し直す。
-  - `records`・`status`・`admin`・`rules.store`・`kernel` は、管理のプロセスと記録の送り手も同じファイルから起動のときに読むので、proxy だけが替えると値がずれる。
+- 動いている間に変えられない設定キー: `proxy.max_conns`、`max_buffered_bytes`、`drive_slice_ms`、`ready_wait_ms`、`stop_inspect_ms`、`stop_wait_ms`、`records`（`keep` を除く全部と、有る無し）、`status`、`admin`、`admin.route.host`、`rules.store`、`managed`（有る無しと `dir`）、`kernel`（全部）。どれかが起動のときと違う設定は、全体を拒否する（`reload: configuration refused: <key> cannot change while running`）。変更するときは再起動する。
+  - `records`・`status`・`admin`・`rules.store`・`managed`・`kernel` は、管理プロセスとログ送信プロセスも同じファイルから起動のときに読むので、プロキシだけが変更すると値がずれる。`admin.route.host` は、管理プロセスが起動のときに読む `admin.origin` と合わせて使うので、変えられない。
 - 接続:
-  - 替えた後に受けた接続は、新しい設定を使う。開いている接続は、受けたときの設定を使い続け、次のように閉じる。要求は断らない。
-  - HTTP/1.1: 答えた後で次の要求を待っている接続は、すぐ閉じる。答えの途中の接続は、その答えに `Connection: close` を付けて閉じる。受けたばかりの接続と、次の要求の head を受けかけの接続は、その要求に答えてから閉じる。
-  - HTTP/2: `GOAWAY` を送り、開いている stream が終わってから閉じる。
-  - WebSocket の tunnel と、経路の `stream` の答えは、前の設定のまま自分の期限まで続く。
-- 待ち受け:
-  - 新しい設定の address のうち、今は待っていないものを、替える前にすべて bind する。1つでも bind できなければ、全体を断る（`reload: configuration refused: listener <番号> cannot be bound`。番号は新しい設定の中の位置で、1 から数える）。
-  - 今もある address は、同じ socket のまま新しい並びの位置へ移る。その address への接続は断られない。
-  - 消えた address は、替えた後に閉じる。そこでまだ始まっていない接続（system の backlog にあるもの、接続の枠を待っているもの）は切れる。開いている接続は上のとおり続く。
-  - 今待っている address と重なる address は bind できず、全体を断る。たとえば `0.0.0.0:8080` で待っているときの `127.0.0.1:8080`（逆も同じ）、`127.0.0.1:8080` のときの `[::ffff:127.0.0.1]:8080` である。替えるときは、外す読み直しと足す読み直しに分けるか、起動し直す。
-  - 記録の `listener` は、その接続を受けたときの設定の中の番号である。並びを替えた後は、同じ番号が別の待ち受けを指すことがある。
+  - 切り替えた後に受けた接続は、新しい設定を使う。開いている接続は、受けたときの設定を使い続け、次のように閉じる。リクエストは拒否しない。
+  - HTTP/1.1: 応答した後で次のリクエストを待っている接続は、すぐ閉じる。応答の途中の接続は、その応答に `Connection: close` を付けて閉じる。受けたばかりの接続と、次のリクエストの head を受けかけの接続は、そのリクエストに応答してから閉じる。
+  - HTTP/2: `GOAWAY` を送り、開いているストリームが終わってから閉じる。
+  - WebSocket のトンネルと、ルートの `stream` の応答は、前の設定のまま自分のタイムアウトまで続く。
+- リスナー:
+  - 新しい設定のアドレスのうち、今は待っていないものを、切り替える前にすべて bind する。1 つでも bind できなければ、全体を拒否する（`reload: configuration refused: listener <number> cannot be bound`。番号は新しい設定の中の位置で、1 から数える）。
+  - 今もあるアドレスは、同じ ソケット のまま新しい並びの位置へ移る。そのアドレスへの接続は拒否しない。
+  - 無くなったアドレスは、切り替えた後に閉じる。そこでまだ始まっていない接続（system の backlog にあるもの、接続の枠を待っているもの）は切れる。開いている接続は上のとおり続く。
+  - 今待っているアドレスと重なるアドレスは bind できず、全体を拒否する。たとえば `0.0.0.0:8080` で待っているときの `127.0.0.1:8080`（逆も同じ）、`127.0.0.1:8080` のときの `[::ffff:127.0.0.1]:8080` である。変更するときは、削除するリロードと追加するリロードに分けるか、再起動する。
+  - ログの `listener` は、その接続を受けたときの設定の中の番号である。並びを変更した後は、同じ番号が別のリスナーを指すことがある。
 - 持ち越すもの:
-  - 流量の制限の表は、新旧の両方に `rate_limit` があり、`keys`・`rate`・`burst` がどれも同じなら続く（`exempt_cidrs` は新しい値を使う）。どれかが違うか、片方に無ければ、新しい表で 0 から数え、`reload: rate limit table started anew` の文を出す。
-  - 上流の組の外れの印と失敗の数、上流への待機中の接続、待ち受けの TLS の session は作り直す。`tukuyomi_upstream_failures_total` は 0 から数え直す。
-  - ルールの世代には触れない。動いている世代はそのままで、保管場所も読まない（世代を替えるのは SIGUSR1）。
-- 同じ中身のファイルでも、上のとおり作り直し、待っている接続を閉じる。
-- 読み直しの途中に受けた SIGHUP は、`reload: a configuration reload is in progress, ignored` の文を出すだけである。合図の処理が入ってから待ち受けを bind するまでの間と、停止の間に受けた SIGHUP も、文を1つ出すだけである。
-- 読み直しの途中に受けた SIGUSR2 は、読み直しが終わった後（替えたときも断ったときも）に、今の設定の証明書を読む。`reload: SIGUSR2` の文は、そのときに出る。
-- 読み直しの途中に停止が始まったら、読み直しは捨てる。
-- SIGHUP の処理が入る前（起動の 6 より前）に届いた SIGHUP は、ほかの合図と同じく proxy を終わらせる。
+  - レート制限の表は、表ごとに持ち越す（下の「レート制限（`rate_limit`）」と「ホストごとの設定（`host_policies`）」）。全体の表は、新旧の両方に全体の `rate_limit` があり、`keys`・`rate`・`burst` がどれも同じなら続く（`exempt_cidrs` は新しい値を使う）。どれかが違うか、片方に無ければ、新しい表で 0 から数え、`reload: rate limit table started anew` の行を出す。
+  - アップストリームのダウン判定と失敗の数、アップストリームへの待機中の接続、リスナーの TLS のセッションは作り直す。`tukuyomi_upstream_failures_total` は 0 から数え直す。
+  - ルールの世代には触れない。稼働中の世代はそのままで、ルールストアも読まない（世代を切り替えるのは SIGUSR1）。
+- 同じ中身のファイルと同じバージョンでも、上のとおり作り直し、待っている接続を閉じる。
+- リロードの途中に受けた SIGHUP は、`reload: a configuration reload is in progress, ignored` の行を出すだけである。シグナルの処理が入ってからリスナーを bind するまでの間と、停止の間に受けた SIGHUP も、行を 1 つ出すだけである。リロードの途中の制御ソケットの `reload` の依頼には、`busy`（`reload under way`）で応答する。
+- リロードの途中に受けた SIGUSR2 は、リロードが終わった後（切り替えたときも拒否したときも）に、今の設定の証明書を読む。`reload: SIGUSR2` の行は、そのときに出る。
+- リロードの途中に停止が始まったら、リロードは捨てる。
+- SIGHUP の処理が入る前（起動の 6 より前）に届いた SIGHUP は、ほかのシグナルと同じくプロキシを終わらせる。
 
 ### SIGUSR1（世代の切り替え）
 
@@ -212,23 +246,24 @@ SIGHUP で止まる前の版から入れ替えるときは、新しい実行フ�
 - 切り替えの間は検査プロセスが2つになり、メモリもおよそ2倍になる。CRS 4.23.0 で測った Coraza の検査プロセスは、1つ約 52 MB だった（ModSecurity の検査プロセスは測っていない）。
 - 合図の処理が入ってから待ち受けを bind するまでの間、切り替えの途中、停止の間に受けた SIGUSR1 は、記録に文を1つ出すだけで何もしない。今と同じ世代が選ばれているときも、その旨の文を出すだけである。
 - 使っている間、proxy は世代の印（保管場所の `using/<指紋>`）に共有の lock を持つ。そのため `rules remove` は、使用中の世代を消せない。
-- 管理のプロセスは、制御 socket でも同じ切り替えを依頼できる（下の「制御 socket」）。切り替えの手順と、`tukuyomi_rules_switches_total` の数え方は SIGUSR1 と同じである。
+- 管理のプロセスは、制御 socket でも同じ切り替えを依頼できる（下の「制御ソケット」）。切り替えの手順と、`tukuyomi_rules_switches_total` の数え方は SIGUSR1 と同じである。
 
 ### SIGUSR2（証明書の読み直し）
 
 - 読み直したすべての証明書と鍵が確かめに通ったときだけ、まとめて入れ替える（確かめの中身は下の `proxy.listeners` の `cert_file`・`key_file`）。入れ替えた後に始まる handshake から、新しいものを使う。開いている接続は、今のものを使い続ける。
+- `managed` のある設定では、`admin.route` の `cert_file`・`key_file` と、managed ストアのサイトの証明書（ACME のサイトは `acme/` の今のファイル）を読み直す。待ち受けには `certificates` が無い。
 - 1つでも通らなければ、どれも入れ替えず、どれが通らなかったかの文を記録に出す。
 - `acme` を持つ証明書でファイルが無いものは、断る理由にならない。行を出して handshake から外し、ファイルができた後の SIGUSR2 で使い始める。動いている間にファイルを消してから SIGUSR2 を送ると、その証明書も handshake から外れ、その host への接続は失敗する。
 - 上流の組の CA のファイルは、SIGUSR2 では読み直さない（SIGHUP で読み直す）。
 - 証明書と鍵だけを読ませたいとき（ACME の更新の後など）は、SIGHUP でなく SIGUSR2 を送る。SIGHUP は設定ファイル全体を読むので、書きかけの設定を拾うことがある。
 - 合図の処理が入ってから待ち受けを bind するまでの間と、停止の間に受けた SIGUSR2 は、記録に文を1つ出すだけである。SIGUSR1 とは関係しない。
 
-### 読み直さないもの
+### リロードしないもの
 
-次のものは起動のときに読み、proxy を起動し直すまでそのままである。
+次のものは起動のときに読み、プロキシを再起動するまでそのままである。
 
-- 上の「SIGHUP（設定の読み直し）」の、動いている間に変えられない鍵（`records` の場所と大きさ、`status`、`admin` の制御 socket の path、`rules.store`、`kernel` など）
-- 管理のプロセスと記録の送り手は、設定を読み直さない（どちらも SIGHUP では止まる）。設定を替えたら、それらは起動し直す（[管理リファレンス](admin-reference.md)、下の「記録の送り手」）。
+- 上の「SIGHUP（設定のリロード）」の、動いている間に変えられない設定キー（`records` の場所と大きさ、`status`、`admin` の制御ソケットのパス、`admin.route.host`、`rules.store`、`managed`、`kernel` など）
+- 管理プロセスとログ送信プロセスは、設定をリロードしない（どちらも SIGHUP では止まる）。設定を変更したら、それらは再起動する（[管理リファレンス](admin-reference.md)、下の「記録の送り手」）。
 
 ## 停止
 
@@ -250,23 +285,24 @@ SIGHUP で止まる前の版から入れ替えるときは、新しい実行フ�
 ### 全体の形
 
 ```text
-{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store": {..}}, "acme": {..}, "status": {..}, "records": {..}, "access": {..}, "rate_limit": {..}, "geo": {..}, "admin": {..}}
+{"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store": {..}}, "acme": {..}, "status": {..}, "records": {..}, "access": {..}, "rate_limit": {..}, "host_policies": [..], "geo": {..}, "admin": {..}, "managed": {..}}
 ```
 
-- `acme`、`status`、`records`、`access`、`rate_limit`、`geo`、`admin` は省いてよい（下のそれぞれの節）。
+- `acme`、`status`、`records`、`access`、`rate_limit`、`host_policies`、`geo`、`admin`、`managed` は省いてよい（下のそれぞれの節）。
 
-- UTF-8 の JSON の1つの object で、256 KiB までである。
-- 値に既定値は無い。省いてよいと書いた鍵のほかは、すべて書く。
-- 知らない鍵、同じ鍵の重複、型の違う値、object の代わりの配列は断る。省いてよい鍵に `null` を書くことも断る（省くか、値を書く）。
-- 断るときの文は、誤りの種類ごとに決まった英語の1文で、ファイルの値を含まない。
-  - 形の誤り（JSON でない、鍵が無い・知らない・重複、型の違い）は、どの鍵かを言わない。
-  - 範囲と関係の誤りは、破った決まりの鍵の名前を言う（例: `max_conns is out of range`）。
-  - 値は決まった順に確かめ、最初に破った決まりを返す。
-- 設定の中の path は、どれも絶対の path で、`.`・`..`・空の要素・末尾の `/` を含まない形で書く。
-- 時間は、名前が `_ms` で終わる鍵に、ミリ秒の整数で書く。
-- バイト数の鍵の 1 KiB は 1024、1 MiB は 1048576 である。
-- `acme` は、`acme` を持つ証明書があるときだけ書き、そのときは必ず書く。
-- `geo` は、国の一覧（全体の `access` か、経路の `access` の `deny_countries`・`allow_countries`）が1つでもあるときは、必ず書く。
+- UTF-8 の JSON の 1 つの object で、256 KiB までである。
+- 値にデフォルト値は無い。省いてよいと書いた設定キーのほかは、すべて書く。
+- 知らない設定キー、同じ設定キーの重複、型の違う値、object の代わりの配列は受け付けない。省いてよい設定キーに `null` を書くことも受け付けない（省くか、値を書く）。
+- 受け付けないときの文は、エラーの種類ごとに決まった英語の 1 文で、ファイルの値を含まない。
+  - 形のエラー（JSON でない、設定キーが無い・知らない・重複、型の違い）は、どの設定キーかを言わない。
+  - 範囲と関係のエラーは、破った決まりの設定キーの名前を言う（例: `max_conns is out of range`）。
+  - 値は決まった順に検証し、最初に破った決まりを返す。
+- 設定の中のパスは、どれも絶対のパスで、`.`・`..`・空の要素・末尾の `/` を含まない形で書く。
+- 時間は、名前が `_ms` で終わる設定キーに、ミリ秒の整数で書く。
+- バイト数の設定キーの 1 KiB は 1024、1 MiB は 1048576 である。
+- `acme` は、`managed` の無い設定ファイルでは、`acme` を持つ証明書があるときだけ書き、そのときは必ず書く。`managed` のある設定ファイルでは、`acme` を持つ管理画面のルートの証明書があれば必ず書き、無くても書ける（ACME のサイトはバージョンの中にあるため。下の「ACME のサイト」）。
+- `geo` は、国の一覧（全体の `access`、`host_policies` の `access`、ルートの `access` の `deny_countries`・`allow_countries`）が 1 つでもあるときは、必ず書く。`managed` のある設定では、バージョンの国の一覧にも要る。
+- `managed` のある設定ファイルでは、`forward` は `resolve_timeout_ms` だけになり、TLS のリスナーの `certificates`、全体の `access`・`rate_limit`、`host_policies` は書けない（書けば受け付けない）。これらはバージョンに書く。`admin` があれば、`admin.route` が要る（下の「managed 設定」）。
 
 ### 例
 
@@ -441,32 +477,32 @@ TLS の待ち受け（HTTP/2 と ACME の証明書）、https への redirect �
 - `address`: IP の literal と port（IPv6 は `[..]:port`）。port 0 は断る。
 - どちらも無いとき: 普通の待ち受け。HTTP で受け、上流へ転送する。
 - `tls` があるとき: TLS を終えてから同じことをする。
-- `redirect` があるとき: すべての要求に https への redirect（308）か 404 で答え、何も転送しない。全体の `access` や `rate_limit` に断られた client には、403 か 429 で答える（下の「要求の前の方針」）。
+- `redirect` があるとき: すべての要求に https への redirect（308）か 404 で答え、何も転送しない。全体の `access` や `rate_limit`、ホストごとの設定に断られた client には、403 か 429 で答える（下の「リクエストの前のポリシー」）。
 - `tls` と `redirect` は一緒に書けない。
 - 待ち受けの間の決まり:
   - 普通の待ち受けか `tls` の待ち受けが、少なくとも1つ要る。
   - `redirect` の待ち受けがあるなら、`tls` の待ち受けも要る。
   - 2つの待ち受けで同じ address は書けない。片方が `0.0.0.0` や `::` で、もう片方と同じ port のものも書けない。
 
-`tls` は `{"min_version", "certificates", "http2"?}` である。
+`tls` は `{"min_version", "certificates", "http2"?}` である。`managed` のある設定ファイルでは `{"min_version", "http2"?}` で、`certificates` を書くと断る（`a tls listener has certificates while the configuration has managed`）。証明書は、managed 設定のバージョンのサイトと `admin.route` に書く（下の「managed 設定」）。
 
 | 鍵 | 範囲 | 意味 |
 |---|---|---|
 | `min_version` | `"1.2"`、`"1.3"` | 受ける TLS の最も古い版。TLS 1.3 はいつも受ける |
 | `certificates` | 1〜16 個 | `{"cert_file", "key_file", "hosts", "acme"?}` |
-| `cert_file`、`key_file` | 絶対の path、3840 バイトまで | 証明書の chain と秘密鍵のファイル。起動のとき、SIGHUP と SIGUSR2 で読む |
+| `cert_file`、`key_file` | 絶対の path、3840 バイトまで | 証明書の chain と秘密鍵のファイル。起動のとき、SIGHUP と制御 socket の `reload` の読み直し、SIGUSR2 で読む |
 | `hosts` | 1〜64 個 | 証明書が受け持つ名前（小文字の英字・数字・`-`・`.`）か、`*.` と名前。IP の literal は書けない。1つの待ち受けの中で同じ host は1回だけ |
 | `acme` | `{"renew_before_days"}`（1〜60） | `acme renew` で発行・更新する証明書の印。host に `*.` は書けない。ファイルは起動のときに無くてもよい |
 | `http2` | object | HTTP/2 を受ける（下の `http2`）。無ければ HTTP/1.1 だけ |
 
-- `cert_file` と `key_file` は、起動のとき、SIGHUP と SIGUSR2 で、次を確かめる。
+- `cert_file` と `key_file` は、起動のとき、SIGHUP と制御 socket の `reload` の読み直し、SIGUSR2 で、次を確かめる。
   - どちらも 1 MiB までの普通のファイルである。
   - 証明書のファイルは PEM の証明書を 1〜10 枚持ち、先頭が host の証明書である。鍵のファイルは鍵をちょうど1つ持つ。
   - 鍵が先頭の証明書と対になり、先頭の証明書が `hosts` のすべてを受け持つ。
   - 有効期間は確かめない。
 - handshake では、client が送った server name で、`hosts` から証明書を選ぶ。名前が、wildcard より先に当たる。server name の無い handshake と、合う host の無い handshake は失敗する。
 - `*.` と名前は、名前の前のちょうど1つの label に当たる（`*.a.example` は `www.a.example` に当たり、`a.example` と `x.y.a.example` には当たらない）。英字の大小は区別しない。
-- TLS の接続の要求は、`Host` が handshake で使った証明書の host に入っていなければ 421 で答える（全体の `access` と `rate_limit` の後、経路を引く前）。
+- TLS の接続の要求は、`Host` が handshake で使った証明書の host に入っていなければ 421 で答える（全体の `access` と `rate_limit`、ホストごとの設定の後、経路を引く前）。
 
 `http2` の5つの鍵は、すべて書く。
 
@@ -493,7 +529,7 @@ TLS の待ち受け（HTTP/2 と ACME の証明書）、https への redirect �
 - redirect するのは、`Host` がどれかの TLS の待ち受けの証明書の host に入り、かつ経路（または既定の組）が要求に当たるときだけである。
 - `Host` が IP の literal のとき、読めないとき、そうして受け持たない名前のときは 404 になる。
 - 本文は読まない。
-- 全体の `access` と `rate_limit` に断られた client は、redirect も 404 も受けず、403 か 429 を受ける（下の「要求の前の方針」）。この判定は、ACME の challenge の後、redirect の前にする。
+- 全体の `access` と `rate_limit`、ホストごとの設定に断られた client は、redirect も 404 も受けず、403 か 429 を受ける（下の「リクエストの前のポリシー」）。この判定は、ACME の challenge の後、redirect の前にする。管理画面のルート（`admin.route`）のホストは、これらに掛けずに redirect する。
 - ACME の challenge の要求には、redirect より先に答える（下の「ACME」）。
 
 ### `forward`
@@ -502,9 +538,11 @@ TLS の待ち受け（HTTP/2 と ACME の証明書）、https への redirect �
 {"resolve_timeout_ms", "upstreams": {"<名前>": {..}}, "routes": [..], "default_upstream"}
 ```
 
+`managed` のある設定ファイルでは、`forward` は `{"resolve_timeout_ms"}` だけで、`upstreams`・`routes`・`default_upstream` を書くと断る（`forward has upstreams, routes or default_upstream while the configuration has managed`）。上流の組、経路、既定の組は、managed 設定のバージョンに同じ形で書く（下の「managed 設定」）。
+
 | 鍵 | 範囲 | 意味 |
 |---|---|---|
-| `resolve_timeout_ms` | 1 ms〜3600 s | 起動のときと SIGHUP の読み直しで、上流の server の名前を引き終える時間 |
+| `resolve_timeout_ms` | 1 ms〜3600 s | 起動のときと、SIGHUP と制御 socket の `reload` の読み直しで、上流の server の名前を引き終える時間。制御 socket の `reload` の依頼と、管理のプロセスの反映が答えを待つ時間にも効く（下の「制御ソケット」と「managed 設定」の「反映」） |
 | `upstreams` | 1〜64 組 | 組の名前（1〜64 文字の英字・数字・`-`・`_`）から `{"servers", "tls"?}` へ |
 | `routes` | 0〜1024 個 | 要求の `Host` と path から組を選ぶ経路 |
 | `default_upstream` | 組の名前か空の文字列 | どの経路にも当たらない要求の組。空なら、そうした要求は 404 |
@@ -513,13 +551,13 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 | 鍵 | 範囲 | 意味 |
 |---|---|---|
-| `address` | IP の literal と port、または名前と port（`name:port`） | 名前は、小文字の英字・数字・`-`・`_`・`.` で 253 バイトまで。各 label は 1〜63 バイトで、最後の label は英字で始まる。port は 1〜65535 で、先頭に 0 を付けない。IP の literal には、未指定の address（`0.0.0.0`、`::`）、multicast の address、待ち受けの address（待ち受けが未指定の address なら、その port の loopback）は書けない。管理のプロセスの待ち受け（`admin.listen`）は書いてよい（proxy の経路から管理のプロセスへ入れるようにするため） |
+| `address` | IP の literal と port、または名前と port（`name:port`） | 名前は、小文字の英字・数字・`-`・`_`・`.` で 253 バイトまで。各 label は 1〜63 バイトで、最後の label は英字で始まる。port は 1〜65535 で、先頭に 0 を付けない。IP の literal には、未指定の address（`0.0.0.0`、`::`）、multicast の address、待ち受けの address（待ち受けが未指定の address なら、その port の loopback）は書けない。管理のプロセスの待ち受け（`admin.listen`）は書いてよい（proxy の経路から管理のプロセスへ入れるようにするため）。`managed` のある設定のバージョンには書けない（管理画面へは `admin.route` で入る） |
 | `weight` | 1〜100 | 重み |
 | `max_fails` | 0〜100 | `fail_timeout_ms` の中にこの回数失敗したら、server を `fail_timeout_ms` の間外す。0 なら数えない |
 | `fail_timeout_ms` | 1 ms〜3600 s | 上の失敗を数える時間と、外す時間 |
 | `backup` | true、false | ほかのどの server も使えないときだけ使う |
 
-- 名前は起動のときと SIGHUP の読み直しのたびに引き、その間は引き直さない（SIGUSR1 でも引き直さない）。
+- 名前は起動のときと、SIGHUP と制御 socket の `reload` の読み直しのたびに引き、その間は引き直さない（SIGUSR1 でも引き直さない）。
   - 名前の address が変わったら（コンテナの名前など）、SIGHUP で読み直す。
   - 名前の address はどれも、書いた server と同じ値を持つ、組の server になる。名前を引いた後で、組の server は 64 個までである。
   - 名前が引けないとき、address が無いとき、未指定・multicast・待ち受けの address を指すとき、時間の中に引き終わらないときは、起動しない。SIGHUP の読み直しでは、その設定を断る。
@@ -552,7 +590,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 | `host` | 小文字の名前と、任意で `:port`（`*.` と port を含めて 253 バイトまで）。port を書けばその port だけに、書かなければどの port にも当たる。`*.` で始めると、前の1つ以上の label に当たる |
 | `path` | `/` で始まる 1〜255 バイトの path。`/` で終われば、それで始まる path すべてに当たり、そうでなければその path だけに当たる。使えるバイトは英数字と `-._~!$&'()*+,=:@/%` で、`%` の後は16進数2桁。読み方が複数ある形（下の「`access` を使うときの注意」）は書けない |
 | `upstream` | 組の名前 |
-| `access` | `{"deny_cidrs"?, "allow_cidrs"?, "deny_countries"?, "allow_countries"?}`。network は一覧ごとに 256 個まで、国は一覧ごとに 256 個まで（下の「要求の前の方針」の `access`） |
+| `access` | `{"deny_cidrs"?, "allow_cidrs"?, "deny_countries"?, "allow_countries"?}`。network は一覧ごとに 256 個まで、国は一覧ごとに 256 個まで（下の「リクエストの前のポリシー」の `access`） |
 | `rewrite` | 上流へ送る要求と、返す応答の書き換え（下） |
 | `stream` | `{"idle_ms", "total_ms", "websocket"}`。3つとも書く（下の「長い応答と WebSocket」） |
 | `max_body` | その経路の本文の上限。`proxy.max_body` 以下で、下げることしかできない。0 なら本文を受けない |
@@ -567,12 +605,12 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
   - 先に host で決める。名前が wildcard より先、長い wildcard が短いものより先、port のある経路が無いものより先、host のある経路が無いものより先である。
   - 次に path で決める。その path だけの経路が接頭辞より先、長い接頭辞が短いものより先、path のある経路が無いものより先である。
 - 既定の組には、`access`・`rewrite`・`stream`・`max_body`・`records` は無い。既定の組へ回る要求の記録は、`records.keep` に従う。
-- 経路を引く前に、全体の `access`・`rate_limit` と、TLS の接続の `Host` の確かめがある（下の「要求の前の方針」の「要求の確かめの順」）。
+- 経路を引く前に、管理画面のルート、全体の `access`・`rate_limit` とホストごとの設定、TLS の接続の `Host` の確かめがある（下の「リクエストの前のポリシー」の「リクエストの検証の順」）。
 - 経路を引いた後、本文を読む前と検査の前に、次を答える。
   - どの経路にも当たらず既定の組も無い: 404
   - `access` に断られた client: 403
   - `Content-Length` が経路の `max_body` を超える: 413
-- `access`: client の address（下の「client の address」）が `deny_cidrs` に入るか、その国が `deny_countries` に入れば断る。`allow_cidrs` が空でなく、client がそこに入らなければ断り、`allow_countries` が空でなく、その国がそこに入らなくても断る。`allow_cidrs` と `allow_countries` を両方書けば、両方に入る client だけが通る。国は、全体の `geo` のデータベースで引く。国の一覧を書くには `geo` が要る（下の「要求の前の方針」の `geo`）。
+- `access`: client の address（下の「client の address」）が `deny_cidrs` に入るか、その国が `deny_countries` に入れば断る。`allow_cidrs` が空でなく、client がそこに入らなければ断り、`allow_countries` が空でなく、その国がそこに入らなくても断る。`allow_cidrs` と `allow_countries` を両方書けば、両方に入る client だけが通る。国は、全体の `geo` のデータベースで引く。国の一覧を書くには `geo` が要る（下の「リクエストの前のポリシー」の `geo`）。
 
 `access` を使うときの注意:
 
@@ -679,20 +717,22 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 ### `acme`
 
-`acme` を持つ証明書があるときだけ書き、そのときはすべての鍵を書く。
+`managed` の無い設定ファイルでは、`acme` を持つ証明書があるときだけ書く。`managed` のある設定ファイルでは、上の「全体の形」のとおりである。書くときは、すべての設定キーを書く。
 
-| 鍵 | 範囲 | 意味 |
+| 設定キー | 範囲 | 意味 |
 |---|---|---|
 | `directory_url` | `https://` の URL、2048 バイトまで | CA の ACME の directory |
-| `contact_email` | 254 バイトまで | CA に届ける連絡先。形だけを確かめる |
-| `account_key_file` | 絶対の path | ACME の account の鍵。無ければ命令が作る（0600） |
-| `challenge_dir` | 絶対の path | challenge のファイルを置くディレクトリ |
-| `ca_file` | 絶対の path | CA の server 証明書を確かめる root（上流の組の `ca_file` と同じ形。1〜100 枚） |
-| `timeout_ms` | 1 ms〜600 s | 命令全体の時間 |
+| `contact_email` | 254 バイトまで | CA に届ける連絡先。形だけを検証する |
+| `account_key_file` | 絶対のパス | ACME のアカウントの鍵。無ければコマンドが作る（0600） |
+| `challenge_dir` | 絶対のパス | challenge のファイルを置くディレクトリ |
+| `ca_file` | 絶対のパス | CA のサーバー証明書を検証するルート証明書（アップストリームの `ca_file` と同じ形。1〜100 枚） |
+| `timeout_ms` | 1 ms〜600 s | コマンド全体のタイムアウト |
 
-- `account_key_file`、`ca_file`、`acme` を持つ証明書の `cert_file`・`key_file` は、すべて別のファイルにする。`acme` を持たない証明書の `cert_file`・`key_file` も、これらのどれとも別のファイルにする。
-- `challenge_dir` の直下に、これらのファイルや、ほかの証明書の `cert_file`・`key_file` を置かない。
-- 普通の待ち受けか redirect の待ち受けが、少なくとも1つ要る（CA は平文の HTTP で challenge を取りに来る）。
+- `account_key_file`、`ca_file`、`acme` を持つ証明書（管理画面のルートの証明書を含む）の `cert_file`・`key_file` は、すべて別のファイルにする。`acme` を持たない証明書の `cert_file`・`key_file` も、これらのどれとも別のファイルにする。
+- `challenge_dir` の直下に、これらのファイルや、ほかの証明書の `cert_file`・`key_file` を置かない（下の「置き方の注意」）。
+- `challenge_dir` は、ルールストア、`records.dir`、管理データの保存先（`admin.store.dir`）、制御ソケットのあるディレクトリ、managed ストアと同じにも、互いの中にも置けない。`managed` の無い設定でも同じである。重なりは書いたままのパスで比べるので、シンボリックリンクを使わない（下の「値どうしの関係」）。
+- `managed` のある設定では、`account_key_file` と `ca_file` を managed ストアの中に置けない。
+- 通常のリスナーか redirect のリスナーが、少なくとも 1 つ要る（CA は平文の HTTP で challenge を取りに来る）。
 
 ### `status`
 
@@ -709,69 +749,102 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 ### `admin`
 
-管理のプロセス（`tukuyomi-proxy admin`）の設定である。省いてよい。省けば、管理のプロセスは無く、proxy は制御 socket を作らない。
+管理プロセス（`tukuyomi-proxy admin`）の設定である。省いてよい。省けば、管理プロセスは無く、プロキシは制御ソケットを作らない。
 
 ```text
-{"listen", "control", "store", "origin", "trusted_proxies", "mfa", "session_idle_ms", "session_total_ms", "crs_dir"?}
+{"listen", "control", "store", "origin", "trusted_proxies", "mfa", "session_idle_ms", "session_total_ms", "crs_dir"?, "route"?}
 ```
 
-- proxy と管理のプロセスは、同じ設定ファイルを読む。proxy が使う鍵は `listen` と `control` で、ほかの鍵は値を確かめるだけである。proxy と管理のプロセスが、同じファイルを同じに受けるか断るかにするためである。ほかの鍵の意味と範囲は [管理リファレンス](admin-reference.md) に書く。
+- プロキシと管理プロセスは、同じ設定ファイルを読む。プロキシが使う設定キーは `listen`、`control`、`route` で、ほかの設定キーは値を検証するだけである。プロキシと管理プロセスが、同じファイルを同じに受け付けるか受け付けないかにするためである。ほかの設定キーの意味と範囲は [管理リファレンス](admin-reference.md) に書く。
 
-| 鍵 | 範囲 | 意味 |
+| 設定キー | 範囲 | 意味 |
 |---|---|---|
-| `listen` | loopback の IP（`127.0.0.0/8` か `::1`）と port（0 は不可） | 管理のプロセスの待ち受けの address。`::ffff:127.0.0.1` の形は loopback と見なさない。待ち受け（`proxy.listeners`）とも監視の待ち受けとも重ならない（待ち受けどうしと同じ決まり）。上流の server は、この address にしてよい |
-| `control` | 絶対の path、107 バイトまで | 管理のプロセスが proxy に依頼を送る制御 socket の path（下） |
+| `listen` | loopback の IP（`127.0.0.0/8` か `::1`）と port（0 は不可） | 管理プロセスのリスナーのアドレス。`::ffff:127.0.0.1` の形は loopback と見なさない。リスナー（`proxy.listeners`）とも監視のリスナーとも重ならない（リスナーどうしと同じ決まり）。`managed` の無い設定では、アップストリームのサーバーをこのアドレスにしてよい。`managed` のある設定のバージョンでは、できない |
+| `control` | 絶対のパス、107 バイトまで | 管理プロセスがプロキシに依頼を送る制御ソケットのパス（下） |
+| `route` | `{"host", "certificate", "access"}` | 管理画面のルート（下）。`managed` のある設定ファイルでは必ず書き、`managed` の無い設定ファイルには書けない |
 
-- `rules.store.dir`、`records.dir`、`admin.store.dir`、`admin.control` のあるディレクトリの重なりは、断る（下の「値どうしの関係」）。記録のファイルの回しが、同じディレクトリにある socket を置き換えてしまうなど、一方が他方の中身を替えないようにするためである。
+- `rules.store.dir`、`records.dir`、`admin.store.dir`、`admin.control` のあるディレクトリ、`managed.dir` の重なりは、受け付けない（下の「値どうしの関係」）。ログファイルの回しが、同じディレクトリにある ソケット を置き換えてしまうなど、一方が他方の中身を変更しないようにするためである。
 
-#### 制御 socket
+`route` は、`managed` のある設定で、プロキシが管理プロセスへ届けるルートである。
 
-管理のプロセスが、proxy に状態を尋ね、世代の切り替えを依頼するための Unix domain socket である。
+| 設定キー | 範囲 | 意味 |
+|---|---|---|
+| `host` | 名前 1 つ（`*.` は書けない） | 管理画面のホスト名。`Host` がこの名前のリクエストは、バージョンのルートを引かずに `admin.listen` へ転送する |
+| `certificate` | `{"cert_file", "key_file", "acme"?}` | 管理画面のルートの証明書。リスナーの証明書（`hosts` が `host` だけのもの）と同じに検証して読む。`acme` を付けると `acme renew` が発行し、ファイルは起動のときに無くてよい（そのときは設定ファイルに `acme` が要る） |
+| `access` | ルートの `access` と同じ形。`allow_cidrs` は必ず書き、空にしない | 管理画面のルートに掛かるアクセス制御 |
+
+- 全体の設定（全体の `access`・`rate_limit`）もホストごとの設定も、管理画面のルートには掛からない。管理画面のルートに掛かるネットワークの制限は、`access` だけである（下の「リクエストの検証の順」）。WAF の検査は通る。
+- TLS のリスナーは、管理画面のルートの証明書を、バージョンのサイトの証明書と一緒に SNI で選ぶ。管理画面のホストのリクエストを、ほかの証明書の接続で受けると 421 で、redirect でない平文のリスナーで受けると 404 で応答し、転送しない。redirect のリスナーは、https へ redirect する。
+- `host` は、バージョンのサイトの `hosts`、ルートの `host`、ホストごとの設定の `hosts` に書けない（`*.` で含むのはよい。管理画面のルートが先に当たる）。
+- 証明書と `access` は設定のリロードで変更できる。`host` は動いている間に変えられないので、変更するときはプロキシと管理プロセスを再起動する。
+- `managed` の無い設定では、`admin.listen` を指すアップストリームとルートで、管理画面へ届ける（[管理リファレンス](admin-reference.md) の「外から使う」）。そのルートには、全体の設定とホストごとの設定が掛かる。
+
+#### 制御ソケット
+
+管理プロセスが、プロキシに状態を問い、世代の切り替えと、managed 設定のバージョンでの設定のリロードを依頼するための Unix domain socket である。
 
 - 作り方:
-  - socket のあるディレクトリは、本物のディレクトリで、持ち主が proxy の利用者、group と other の権限が無いこと（ルールの保管場所と同じ確かめ）。socket は 0600 で作る。
-  - 検査核を起動する前に bind する。path に既にあるものが、proxy の利用者の socket で、待っているプロセスが無い（接続を断られる）ときだけ、消して作り直す。待っているプロセスがあるもの、socket でないもの、別の利用者のものは、`start: control socket refused: ...` の文を出して断る（exit 1）。
-  - 停止では、待ち受けを閉じる段で一緒に閉じて、ファイルを消す。ファイルが、作ったものと同じときだけ消す。
-- 使える人: proxy と同じ利用者で動くプロセスは、どれも使える。socket の先に認証は無く、守るのはディレクトリの権限と socket の 0600 だけである。管理のプロセスは、proxy と同じ利用者で動かす。
-- 1つの接続は、2 秒の中に JSON の1行（4 KiB まで）を送り、1行の答えを受けて閉じる。同時に 4 接続まで答え、それを超えた接続は、受けてすぐ閉じる。行が来ない接続と、切れた接続には、答えない。
+  - ソケット のあるディレクトリは、シンボリックリンクでないディレクトリで、所有者がプロキシの OS ユーザー、group と other の権限が無いこと（ルールストアと同じ検証）。ソケット は 0600 で作る。
+  - 検査核を起動する前に bind する。パスに既にあるものが、プロキシの OS ユーザーの ソケット で、待っているプロセスが無い（接続を拒否される）ときだけ、削除して作り直す。待っているプロセスがあるもの、ソケット でないもの、別の OS ユーザーのものは、`start: control socket refused: ...` の行を出して拒否する（exit 1）。
+  - 停止では、リスナーを閉じる段で一緒に閉じて、ファイルを削除する。ファイルが、作ったものと同じときだけ削除する。
+- 使える人: プロキシと同じ OS ユーザーで動くプロセスは、どれも使える。ソケット の先に認証は無く、守るのはディレクトリの権限と ソケット の 0600 だけである。管理プロセスは、プロキシと同じ OS ユーザーで動かす。
+- 1 つの接続は、2 秒の中に JSON の 1 行（4 KiB まで）を送り、1 行の応答を受けて閉じる。同時に 4 接続まで応答し、それを超えた接続は、受けてすぐ閉じる。行が来ない接続と、切れた接続には、応答しない。
 
-依頼と答えは次のとおりである。
+依頼と応答は次のとおりである。
 
-| 依頼 | 答え |
+| 依頼 | 応答 |
 |---|---|
-| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures", "config", "config_reloads"}`。使っている世代の指紋（64 桁）、その世代のモード（`block`、`detect`）、その世代のエンジン（`coraza` か `modsecurity`）、検査核の段（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、`/readyz` が `ready` と答える状態か。続く7つは proxy の数である（下） |
-| `{"op":"switch","expect":"<指紋 64 桁>"}` | ルールの保管場所が今選んでいる世代が `expect` と同じときだけ、SIGUSR1 と同じ切り替えをする。切り替えが終わってから、`{"result", "reason"?, "generation"}` で答える。`generation` は、答えるときに使っている世代である |
-| ほかの行 | `{"result":"error","reason":..}`。`reason` は `line too long`、`malformed request`、`unknown op`、`bad expect` |
+| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "reloading", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures", "config", "managed", "resolve_timeout_ms", "config_reloads"}`。稼働中の世代のフィンガープリント（64 桁の 16 進数）、その世代のモード（`block`、`detect`）、エンジン（`coraza` か `modsecurity`）、検査核の段（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、設定のリロード（SIGHUP か `reload` の依頼）の途中か、`/readyz` が `ready` と応答する状態か。続く 9 つは、プロキシの数と値である（下） |
+| `{"op":"switch","expect":"<fingerprint>"}` | ルールストアの選択中の世代が `expect` と同じときだけ、SIGUSR1 と同じ切り替えをする。切り替えが終わってから、`{"result", "reason"?, "generation"}` で応答する。`generation` は、応答するときに稼働中の世代である |
+| `{"op":"reload","managed":"<version>"}` | 設定ファイルと、名指したバージョンで、SIGHUP と同じ設定のリロードをする。managed ストアの `current` は読まない。同じバージョンでもリロードする。リロードが終わってから応答する（下） |
+| ほかの行 | `{"result":"error","reason":..}`。`reason` は `line too long`、`malformed request`、`unknown op`、`bad expect`、`bad managed` |
 
-`status` の答えの数は、答えを作るときに読む。`uptime_ms` と `config` のほかは、`/metrics` が見せる数と同じである（下の「数（`/metrics`）」）。
+`status` の数と値は、応答を作るときに読む。`uptime_ms`、`config`、`managed`、`resolve_timeout_ms` のほかは、`/metrics` が見せる数と同じである（下の「数（`/metrics`）」）。
 
-| 鍵 | 中身 |
+| 項目 | 中身 |
 |---|---|
-| `uptime_ms` | proxy が起動してからのミリ秒 |
-| `requests` | 要求の数。記録の7つの `class` のすべてを数える（`tukuyomi_requests_total` の合計） |
-| `blocked` | 規則が遮断した要求の数（`tukuyomi_waf_rule_hits_total` の `block`） |
-| `policy_refused` | 要求の前の方針で断った要求の数。全体の `access` の 403 と `rate_limit` の 429 で、経路の `access` の 403 は数えない（`tukuyomi_policy_refusals_total` の合計） |
-| `upstream_failures` | 効いている設定の、すべての上流の組の server の失敗の数（`tukuyomi_upstream_failures_total` の合計）。SIGHUP の読み直しで設定が替わると、`/metrics` と同じく 0 から数え直す |
-| `config` | 効いている設定ファイル（起動のときか、最後に替えた読み直しで読んだファイル）の SHA-256（64 桁の小文字の 16 進数）。読み直しで替えた後は、その `reload: configuration replaced` の文に出た SHA-256 と同じ値である |
-| `config_reloads` | `{"replaced", "refused"}`。SIGHUP による設定の読み直しの数を、替えたか断ったかで分けたもの（`tukuyomi_config_reloads_total`） |
+| `uptime_ms` | プロキシが起動してからのミリ秒 |
+| `requests` | リクエストの数。ログの 7 つの `class` のすべてを数える（`tukuyomi_requests_total` の合計） |
+| `blocked` | ルールがブロックしたリクエストの数（`tukuyomi_waf_rule_hits_total` の `block`） |
+| `policy_refused` | リクエストの前のポリシーで拒否したリクエストの数。全体の設定とホストごとの設定の、アクセス制御の 403 とレート制限の 429 で、ルートの `access` と `admin.route.access` の 403 は数えない（`tukuyomi_policy_refusals_total` の合計） |
+| `upstream_failures` | 効いている設定の、すべてのアップストリームのサーバーの失敗の数（`tukuyomi_upstream_failures_total` の合計）。設定のリロードで設定が切り替わると、`/metrics` と同じく 0 から数え直す |
+| `config` | 効いている設定ファイル（起動のときか、最後に切り替えたリロードで読んだファイル）の SHA-256（64 桁の小文字の 16 進数）。リロードで切り替えた後は、その `reload: configuration replaced` の行に出た値と同じである |
+| `managed` | 稼働中の managed 設定のバージョン（64 桁の小文字の 16 進数）。`managed` の無い設定では `null` |
+| `resolve_timeout_ms` | 効いている設定の `forward.resolve_timeout_ms` |
+| `config_reloads` | `{"replaced", "refused"}`。SIGHUP と `reload` の依頼による設定のリロードの数を、切り替えたか拒否したかで分けたもの（`tukuyomi_config_reloads_total`） |
 
-- この7つの無い答えは、前の版の proxy の答えである。管理のプロセスは、無い数を `null` として扱う（[管理リファレンス](admin-reference.md) の「一覧と中身」）。
+- これらの無い応答は、前の build のプロキシの応答である。管理プロセスは、無い値を `null` として扱う（[管理リファレンス](admin-reference.md) の「一覧と中身」）。
 
 `switch` の `result` は次のとおりである。
 
 | `result` | `reason` | とき |
 |---|---|---|
-| `switched` | 無し | 切り替えが終わり、選ばれた世代で動いている |
-| `unchanged` | `already serving` | 選ばれた世代を、もう使っている |
-| `refused` | `current changed` | ルールの保管場所が選んでいる世代が、`expect` と違う。何もしない |
-| `refused` | `store refused` | 保管場所か設定が断った |
+| `switched` | 無し | 切り替えが終わり、選択中の世代で動いている |
+| `unchanged` | `already serving` | 選択中の世代を、もう使っている |
+| `refused` | `current changed` | ルールストアの選択中の世代が、`expect` と違う。何もしない |
+| `refused` | `store refused` | ルールストアか設定を受け付けなかった |
 | `failed` | `driver did not take the order`、`not switched` | 切り替えを始められなかった、または新しい世代が起動しなかった |
 | `busy` | `starting`、`switch under way`、`too many orders`、`stopping` | 検査核の準備ができる前、別の切り替えの途中、依頼が多すぎる、停止の間 |
 
-- 切り替えの結果は、SIGUSR1 と同じに `tukuyomi_rules_switches_total` に数える。数えないのは、`unchanged`、`busy`、`current changed` の答えだけである。`store refused` は `refused` に、`driver did not take the order` と `not switched` は `failed` に数える。
-- 切り替えの依頼は、`ready_wait_ms` に 5 秒を足した時間まで答えを待つ。それを過ぎると `busy`（`switch under way`）で答え、切り替えは続く。
-- 状態の問いに 2 秒の中に答えられないとき（依頼が多すぎるとき、停止の間を含む）は、`{"result":"error","reason":"no answer"}` を返す。
-- 切り替えの依頼は、答えるたびに、記録に `control: switch expect <指紋>: <result> (<reason>), serving <指紋>` の文を1つ出す。`busy` の答えも含む。`busy` で答えた切り替えが後で終わると、終わったときにもう1つ出る。
+- 切り替えの結果は、SIGUSR1 と同じに `tukuyomi_rules_switches_total` に数える。数えないのは、`unchanged`、`busy`、`current changed` の応答だけである。`store refused` は `refused` に、`driver did not take the order` と `not switched` は `failed` に数える。
+- 切り替えの依頼は、`ready_wait_ms` に 5 秒を足した時間まで応答を待つ。それを過ぎると `busy`（`switch under way`）で応答し、切り替えは続く。
+- 状態の問いに 2 秒の中に応答できないとき（依頼が多すぎるとき、停止の間を含む）は、`{"result":"error","reason":"no answer"}` を返す。
+- 切り替えの依頼は、応答するたびに、ログに `control: switch expect <fingerprint>: <result> (<reason>), serving <fingerprint>` の行を 1 つ出す。`busy` の応答も含む。`busy` で応答した切り替えが後で終わると、終わったときにもう 1 つ出る。
+
+`reload` の応答は、どれも、応答するときに稼働中のバージョンを `managed` に持つ（`managed` の無い設定では `null`）。
+
+| `result` | 形 | とき |
+|---|---|---|
+| `replaced` | `{"result":"replaced","config":"<sha256>","managed":"<version>"}` | 切り替えた。2 つの値は、`reload: configuration replaced <sha256> managed <version>` の行と同じである |
+| `refused` | `{"result":"refused","reason":..,"detail":..,"managed":..}` | 何も変更していない。`reason` は拒否した所で、`configuration`（設定ファイルか国のデータベース）、`version`（バージョンの検証）、`store`（managed ストア、バージョンやファイルの名前と中身）、`upstream`（名前の解決、アップストリームの CA）、`tls`（リスナーの証明書、サイト、管理画面のルート）、`fixed`（動いている間に変えられない設定キー）、`listener`（新しいリスナーを bind できない）、`thread`（リロードのスレッドを始められない、スレッドが応答せずに終わった）のどれか。`detail` は、ログの行の `refused: ` の後ろと同じ文である |
+| `refused` | `reason` が `unmanaged`、`detail` が `the configuration in force has no managed object` | 動いている設定に `managed` が無い。リロードを始めずに拒否する |
+| `busy` | `{"result":"busy","reason":..,"managed":..}` | `starting`（リスナーを bind する前）、`reload under way`（SIGHUP かほかの `reload` のリロードの途中。または、この依頼のリロードが待つ時間の内に終わらなかった。そのときもリロードは続く）、`too many orders`、`stopping` |
+
+- `reload` の依頼は、効いている設定の `forward.resolve_timeout_ms` に 5 秒を足した時間まで応答を待つ。
+- 依頼のバージョンは、64 桁の小文字の 16 進数だけを受け付け（ほかは `bad managed`）、managed ストアの外を指せない。この依頼で使える力は、同じ OS ユーザーが `current` を書いて SIGHUP を送るのと同じである。
+- `reload` の依頼で始めたリロードは、SIGHUP と同じに `tukuyomi_config_reloads_total` に数える。リロードを始めなかった依頼（`busy`、`unmanaged`、`error`）は数えない。
+- 依頼でリロードを始めるときに、ログに `reload: control reload <version>` の行を出し、応答ごとに `control: reload <version>: <result> (<reason>)` の行を 1 つ出す（`replaced` には `(<reason>)` が無い）。待ちきれずに `busy` で応答した依頼は、リロードが終わったときにもう 1 つ出る。
+- 管理プロセスがこの依頼で反映する手順は、下の「managed 設定」の「反映」にある。
 
 ### 値どうしの関係
 
@@ -801,8 +874,11 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 | `wait_queue ≤ max_conns` | 1つの接続が持つ検査は1つ |
 | `kernel.records ≥ slots + wait_queue` | 検査核の記録 |
 | `tick ≤ 1 s`、`tick` はほかの検査核のどの時間以下 | 検査核の1歩 |
-| 国の一覧（全体の `access` と経路の `access` の `deny_countries`・`allow_countries`）があれば `geo` もある | 国を引くデータベースが要る |
+| 国の一覧（全体の `access`、`host_policies` の `access`、経路の `access` の `deny_countries`・`allow_countries`）があれば `geo` もある | 国を引くデータベースが要る |
 | `rules.store.dir`、`records.dir`、`admin.store.dir`、`admin.control` のあるディレクトリは、互いに同じでなく、どれも他の中にない。`admin.control` 自身は前の3つの中にない | 一方の回しや書き換えが、他方の中身を置き換えないため |
+| `managed.dir` は、上の4つのディレクトリと同じでなく、どれの中にも外にもない | 同上 |
+| `acme.challenge_dir` は、上の5つ（`managed.dir` を含む）と同じでなく、どれの中にも外にもない。`managed` の無い設定でも同じ | `acme renew` は challenge のファイルを置き換えて消す。challenge の答えに、ほかのディレクトリの中のファイルを返さないため |
+| `managed` のある設定では、`acme.account_key_file`・`acme.ca_file`、`admin.route` の `cert_file`・`key_file` は `managed.dir` の中にない | `acme renew` が managed ストアの中の名前を上書きしないため |
 | `admin.listen` は `proxy.listeners` と `status.listen` に重ならない | 同じ port を2つの待ち受けで bind できない |
 | 経路の `records` が `required` なら `records` がある | 残す先のファイルが要る |
 | `records.ship` があり、`records.keep` か経路の `records` に `required` があれば `records.files ≥ 3` | 送り手の遅れで断る閾値（ファイル `files − 2` 個分）が 0 にならないため |
@@ -944,7 +1020,7 @@ Coraza の世代と違うところは次のとおりである。同じルール�
 - `host` は省ける。ほかの鍵は取らない。`action` は `bypass` だけである。
 - 経路に当たる要求は検査せず、上流へ転送する。
   - proxy が自分でする確かめ（head、本文の大きさの上限）は、その前にする。本文の型は確かめない（下の「本文の型」）。
-  - 上流は、検査しない経路ではなく、`forward` の経路か既定の組で選ぶ。そこで 404・403・421 になる要求と、全体の `access` と `rate_limit` で断られる要求（403・429）は、検査しない経路に当たっても答えは変わらない。
+  - 上流は、検査しない経路ではなく、`forward` の経路か既定の組で選ぶ。そこで 404・403・421 になる要求と、全体の `access` と `rate_limit`、ホストごとの設定で断られる要求（403・429）、管理画面のルート（`admin.route`）で断られる要求（421・404・403）は、検査しない経路に当たっても答えは変わらない。
   - 検査の枠を取らないので、検査が混んでいるときや、検査プロセスが止まっているときも通る。
 - `path` と `host` の形と当たり方は、`forward` の経路と同じである。ほかに次の決まりがある。
   - `path` は `/` だけにはできない（すべての要求の検査を外してしまう）。2〜255 バイトで書く。
@@ -953,6 +1029,297 @@ Coraza の世代と違うところは次のとおりである。同じルール�
 - `host` を持つ検査しない経路は、末尾が `.` の `Host`（`app.example.com.`）には当たらず、検査する。上流がそれを別の host と読むかもしれないためである。`host` を持たない経路は、末尾が `.` の `Host` にも当たる。
 - path が読み方を複数持つ要求（「`access` を使うときの注意」に挙げた形）は、検査しない経路に当たらず、検査する。
 - 経路は世代の manifest に入り、指紋の一部になる。動いている proxy は、世代の切り替えで経路を替える。
+
+## managed 設定
+
+managed 設定は、サイト（ホストと証明書）、アップストリーム、ルート、デフォルトのアップストリーム、全体のアクセス制御とレート制限、ホストごとの設定を、設定ファイルの外の managed ストアにバージョンとして持つ形である。設定ファイルの `managed` で使い始める。管理画面と管理 API から編集して、動いているプロキシに反映できる（[管理リファレンス](admin-reference.md) の「managed 設定の操作」）。コマンドは上の「`managed`」に書く。`managed` の無い設定ファイルは、今までと同じに読む。
+
+### managed 設定を使うかどうか
+
+できること:
+
+- 上に挙げた設定を、管理画面と管理 API で編集し、検証してから保存して、動いているプロキシに反映する。反映では、プロキシがそのバージョンで設定のリロードを通した後にだけ、選択中のバージョンを進める。そのため、プロキシが拒否したバージョンが、次の起動で使われることはない（下の「反映」）。
+- 保存したバージョンは残り、前のバージョンに戻せる（ロールバック、名前での反映）。
+- 管理画面と管理 API からの反映は管理プロセスの変更履歴に、操作は監査ログに残る（[管理リファレンス](admin-reference.md) の「設定の変更履歴」と「監査」）。コマンドでの変更は、どちらにも残らない。
+
+代わりに要ること:
+
+- 設定ファイルに書けなくなる設定キーがある。`forward` は `resolve_timeout_ms` だけになり、TLS のリスナーの `certificates`、全体の `access`・`rate_limit`、`host_policies` も書けない（書くと設定を受け付けない）。これらはバージョンに書く。
+- 設定に `admin` があれば、管理画面のルート（`admin.route`）が必ず要る（上の「`admin`」）。管理画面のルートはプロキシが作り、全体の設定もホストごとの設定も掛からない。管理画面のルートに掛かるネットワークの制限は、`admin.route.access` の `allow_cidrs` だけである。
+- `managed` の有る無しと `managed.dir` は、動いている間に変えられない設定キーである。`managed` を追加するときと外すときは、プロキシと管理プロセスを再起動する（設定のリロードは拒否する）。
+- 管理画面のルートのリクエストも WAF の検査を通る。管理画面からの検証と保存のリクエストは、証明書と秘密鍵を含むことがあり、ブロックの世代でブロックされうるので、その 2 つのパスを検査除外のルートにした世代を使う（[管理リファレンス](admin-reference.md) の「managed のある設定の管理画面のルート」）。
+- ACME で発行するサイトの証明書チェーンと秘密鍵は、設定ファイルのパスでなく、managed ストアの `acme/` に置く（下の「ACME のサイト」）。
+- ログ送信プロセスを使うなら、プロキシと同じ build に入れ替えてから、設定ファイルに `managed` を書く。ログ送信プロセスも設定ファイルを読み、`managed` を知らない前の build は、知らない設定キーのある設定ファイルを受け付けずに起動しない（下の「送り手の起動」）。
+
+設定をファイルだけで管理し、管理画面から変えないなら、`managed` は要らない。
+
+### managed ストアとバージョン
+
+設定キー `managed` は `{"dir"}` だけを持つ。`dir` は managed ストアのディレクトリで、絶対のパスで 3840 バイトまでである。
+
+- ディレクトリは、シンボリックリンクでないディレクトリで、所有者がプロキシの OS ユーザー、group と other の権限が無いこと（0700）。プロキシもコマンドもこのディレクトリは作らないので、先に作る。開くたびに検証し、違えば拒否する。
+- ルールストア、`records.dir`、管理データの保存先（`admin.store.dir`）、制御ソケットのあるディレクトリ、`acme.challenge_dir` と同じにも、互いの中にも置けない。`acme.account_key_file`・`acme.ca_file` と、管理画面のルートの証明書と秘密鍵のファイルは、managed ストアの中に置けない（上の「値どうしの関係」）。
+
+managed ストアの中身:
+
+| 名前 | 中身 |
+|---|---|
+| `versions/<version>.json` | バージョン。1 MiB まで |
+| `files/<sha256>` | バージョンが指す証明書チェーン、秘密鍵、アップストリームの CA のファイル。1 MiB まで |
+| `acme/<hosts-sha256>/chain`、`acme/<hosts-sha256>/key` | ACME のサイトの証明書チェーンと秘密鍵（下の「ACME のサイト」） |
+| `current` | 選択中のバージョンの SHA-256（64 桁の 16 進数）と改行 |
+| `lock` | managed ストアを変えるコマンドと管理プロセスが持つロック |
+
+- バージョンとファイルの名前は、中身の SHA-256（64 桁の小文字の 16 進数）である。作った後は変えない。読むたびに名前と中身を照らし、合わないものは使わない。
+- `versions/` と `files/` はインポートのときに、`acme/` は `acme renew` が、無ければ作る（0700）。バージョン、ファイル、`current` は、`.new` の名前に書いて同期してから置き換えるので、途中で止まっても、読む側は前のものか新しいものを丸ごと見る。
+- バージョンは、決まった書き方（空白の無い JSON で、object の設定キーをバイトの順に並べたもの）だけを受け付ける。同じ中身は、いつも同じ名前のバージョンになる。バージョンは手で書かず、`managed import` か管理画面で作る。
+- `managed list` の時刻は、バージョンのファイルの更新時刻である。
+
+バージョンは次の形の JSON である。
+
+```text
+{"sites": [..], "upstreams": {..}, "routes": [..], "default_upstream": "..", "access"?: {..}, "rate_limit"?: {..}, "host_policies"?: [..]}
+```
+
+- `upstreams`、`routes`、`default_upstream`、`access`、`rate_limit`、`host_policies` は、`managed` の無い設定ファイルの `forward`（上の「`forward`」）と、下の「リクエストの前のポリシー」と同じ形と決まりで書く。拒否するときの文も同じである。違うのは、アップストリームの `tls` が `{"ca", "server_name"?}` で、`ca` が managed ストアの `files/` のファイルの SHA-256 であることだけである。
+- `sites` はサイトの一覧で、0〜64 個である。サイトは `{"name", "hosts", "certificate"}` と書く。
+  - `name` は、アップストリームの名前と同じ決まり（1〜64 文字の英数字・`-`・`_`）で、サイトどうしで同じ名前は書けない。
+  - `hosts` は 1〜64 個で、リスナーの証明書の `hosts` と同じに書く（名前か、`*.` と名前）。同じホストを 2 つのサイトに書けない。
+  - `certificate` は、`{"chain", "key"}`（managed ストアの `files/` の証明書チェーンと秘密鍵の SHA-256）か、`{"acme": {"renew_before_days"}}`（下の「ACME のサイト」）のどちらかである。
+- バージョンにパスは書かない。
+- 設定ファイルと合わせて検証する。管理画面のルートのホスト（`admin.route.host`）は、サイトの `hosts` にも、ルートの `host` にも書けない（`*.` のサイトがそれを含むのはよい。管理画面のルートが先に当たる）。アップストリームのサーバーは、`admin.listen` のアドレスにできない（名前を解決したアドレスも）。TLS のリスナーがあれば、サイトか管理画面のルートの証明書が 1 つ以上要る。
+- TLS のリスナーは、どれも、管理画面のルートとすべてのサイトの証明書から、クライアントが SNI で名指したホストで証明書を選ぶ。名前が同じ証明書を、`*.` で含む証明書より先に選ぶ。
+
+`managed import` の文書は、バージョンと同じ形で、ファイルを SHA-256 でなくパスで書く。サイトの `certificate` は `{"chain_file", "key_file"}` か `{"acme": {..}}`、アップストリームの `tls` は `{"ca_file", "server_name"?}` である。パスは絶対のパスで 3840 バイトまでである。文書は 1 MiB までで、空白などの書き方は自由である。
+
+- コマンドは、文書が指すファイルを 1 回ずつ読み（1 MiB までの通常のファイル）、プロキシと同じに検証する（証明書チェーンと秘密鍵が組になり、サイトのホストを含むこと。CA のファイルが使えること）。通れば、ファイルを `files/` に置き、それを SHA-256 で指すバージョンを `versions/` に置く。
+- インポートの後は、文書と、文書が指すサイトの証明書チェーン・秘密鍵・CA のファイルを使わない。managed ストアに写してあるので、削除してよい。
+
+管理画面と管理 API で変えたときの変更履歴は、管理プロセスが別に持つ（[管理リファレンス](admin-reference.md) の「設定の変更履歴」）。
+
+### managed で初めて起動する
+
+`managed` のある設定で、初めてプロキシを起動する手順である。選択中のバージョンが無いと、起動も `config check` も拒否する（`config check: managed store refused: no managed version is chosen`、exit 1）。そのため、起動の前にバージョンをインポートして選ぶ。ほかの段は [実行ファイルの build と配置](../build/binary-deployment.md) の「初めて起動する手順」と同じである。
+
+例は、redirect のリスナーと TLS のリスナー、ファイルの証明書を持つサイト 1 つ、アップストリーム 1 つ、管理画面のルートを持つ形である。ACME のサイトは下の「ACME のサイト」に書く。
+
+1. ディレクトリを作る。[実行ファイルの build と配置](../build/binary-deployment.md) の「OS ユーザーとディレクトリ」の表のディレクトリに加えて、managed ストアのディレクトリを 0700 で作る。
+
+   ```bash
+   sudo install -d -m 0700 -o tukuyomi -g tukuyomi /var/lib/tukuyomi-core/managed
+   ```
+
+2. 証明書のファイルを置く。
+   - 管理画面のルートの証明書と秘密鍵（例: `/var/lib/tukuyomi-core/tls/admin.pem`・`admin.key`）。設定ファイルが、このパスで指す。
+   - サイトの証明書チェーンと秘密鍵（例: `/var/lib/tukuyomi-core/import/www.pem`・`www.key`）。インポートの入力で、サービスの OS ユーザーが読める所に置く。
+3. 設定ファイルを書く。`managed` の無い設定ファイルとの違いは次のとおりである（ほかの設定キーは同じに書く）。
+
+   ```json
+   "proxy": {
+     "listeners": [
+       {"address": "0.0.0.0:80", "redirect": {"https_port": 443}},
+       {"address": "0.0.0.0:443", "tls": {"min_version": "1.2"}}
+     ]
+   },
+   "forward": {"resolve_timeout_ms": 5000},
+   "managed": {"dir": "/var/lib/tukuyomi-core/managed"},
+   "admin": {
+     "listen": "127.0.0.1:9100",
+     "control": "/var/lib/tukuyomi-core/control/proxy.sock",
+     "store": {"kind": "file", "dir": "/var/lib/tukuyomi-core/admin"},
+     "origin": "https://admin.example.com",
+     "trusted_proxies": ["127.0.0.1/32"],
+     "mfa": "required",
+     "session_idle_ms": 1800000,
+     "session_total_ms": 43200000,
+     "route": {
+       "host": "admin.example.com",
+       "certificate": {
+         "cert_file": "/var/lib/tukuyomi-core/tls/admin.pem",
+         "key_file": "/var/lib/tukuyomi-core/tls/admin.key"
+       },
+       "access": {"allow_cidrs": ["203.0.113.0/24"]}
+     }
+   }
+   ```
+
+   - `proxy` は、`listeners` のほかの設定キーを省いて示した。TLS のリスナーには `certificates` を書かない（`http2` は書ける）。
+   - `forward` には `resolve_timeout_ms` だけを書く。全体の `access`・`rate_limit` と `host_policies` は、バージョンに書く。
+   - `admin.route.access` の `allow_cidrs` には、管理画面を使う人のネットワークを書く。
+4. バージョンの文書を書く（例: `/etc/tukuyomi-core/managed-import.json`）。サービスの OS ユーザーが読めるように置く。
+
+   ```json
+   {
+     "sites": [
+       {
+         "name": "www",
+         "hosts": ["www.example.com"],
+         "certificate": {
+           "chain_file": "/var/lib/tukuyomi-core/import/www.pem",
+           "key_file": "/var/lib/tukuyomi-core/import/www.key"
+         }
+       }
+     ],
+     "upstreams": {
+       "web": {"servers": [{"address": "127.0.0.1:8080", "weight": 1, "max_fails": 0, "fail_timeout_ms": 10000, "backup": false}]}
+     },
+     "routes": [],
+     "default_upstream": "web"
+   }
+   ```
+
+5. ルールセットをインポートし、世代を選ぶ（[実行ファイルの build と配置](../build/binary-deployment.md) の「初めて起動する手順」の 2〜4）。`rules` のコマンドは設定ファイルだけを読み、managed ストアを読まないので、`current` がまだ無くても通る（下の 6・7 の後に流してもよい）。
+6. バージョンをインポートする。
+
+   ```bash
+   sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy managed import /etc/tukuyomi-core/config.json /etc/tukuyomi-core/managed-import.json
+   ```
+
+   - `<version> created` が出る。バージョンを置くだけで、選ばない（`current` はまだ無い）。
+   - この後、サイトの入力のファイル（`www.pem`・`www.key`）は使わないので、削除してよい。
+7. バージョンを選ぶ。
+
+   ```bash
+   sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy managed activate /etc/tukuyomi-core/config.json <version>
+   ```
+
+   - 起動と同じ検証（設定ファイルとバージョン、アップストリームの名前の解決と CA のファイル、証明書）を流し、通ったときだけ選ぶ。`<version> current` が出る。
+8. 設定を検証する。
+
+   ```bash
+   sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy config check /etc/tukuyomi-core/config.json
+   ```
+
+   - 通れば、標準出力に `accepted` が出る。標準エラーに `config check: managed version <version>` の行が出る。
+9. サービスを起動する（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。ログに `start: managed version <version>` の行が出る。
+10. 管理プロセスを起動し、最初のユーザーを作る（[実行ファイルの build と配置](../build/binary-deployment.md) の「初めて起動する手順」の 7）。管理画面には、`admin.route.access` が許すネットワークから、`admin.route.host` のホスト名で入る。この後の変更は、管理画面か管理 API で行う（下の「反映」）。
+
+### managed の無い設定ファイルから移す
+
+`managed` の無い設定ファイルで動いているプロキシと管理プロセスを、managed 設定に移す手順である。移すと、設定ファイルのルートなどはバージョンへ、管理画面のホストへのルートは `admin.route` へ移る。変換のコマンドは無いので、設定ファイルとバージョンの文書は手で書く。
+
+先に、ログ送信プロセスを使っているなら、プロキシと同じ build の実行ファイルに入れ替えておく（上の「managed 設定を使うかどうか」）。
+
+何がどこへ移るか:
+
+| 今の設定ファイル | 移した後 |
+|---|---|
+| TLS のリスナーの `certificates` のうち、管理画面のホストの証明書 | `admin.route.certificate`（`cert_file`・`key_file`・`acme` はそのまま） |
+| ほかの証明書 | バージョンのサイト。ファイルの証明書は文書の `chain_file`・`key_file`、ACME の証明書は `{"acme": {..}}`（パスは書かない） |
+| `forward.upstreams` のうち、`admin.listen` を指すアップストリーム | 外す（バージョンのサーバーには `admin.listen` を書けない） |
+| ほかのアップストリーム | バージョンの `upstreams` |
+| `forward.routes` のうち、管理画面のホストのルート | 外し、その `access` を `admin.route.access` に写す（`allow_cidrs` が要る） |
+| ほかのルートと `default_upstream` | バージョンの `routes`・`default_upstream` |
+| 全体の `access`・`rate_limit`、`host_policies` | バージョンの同じ設定キー |
+| `forward.resolve_timeout_ms`、`acme`、`admin` のほかの設定キー（`origin` を含む） | 設定ファイルにそのまま残す |
+
+- `admin.route.host` は、今の管理画面のホスト（`admin.origin` のホスト）にする。
+- 管理画面のルートには全体の設定が掛からないので、今のルートの `access` を写し損ねると、管理画面に誰が届くかが変わる。
+
+手順:
+
+1. managed ストアのディレクトリを作る（上の「managed で初めて起動する」の 1）。
+2. 移した後の設定ファイルを別の名前（例: `/etc/tukuyomi-core/config.managed.json`）で書き、バージョンの文書（例: `/etc/tukuyomi-core/managed-import.json`）も書く。
+3. 新しい設定ファイルで、インポートしてバージョンを選ぶ。
+
+   ```bash
+   sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy managed import /etc/tukuyomi-core/config.managed.json /etc/tukuyomi-core/managed-import.json
+   sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy managed activate /etc/tukuyomi-core/config.managed.json <version>
+   ```
+
+   - ACME のサイトの証明書がまだ managed ストアに無いので、`managed activate` は `managed activate: tls certificate not issued yet (site <name>)` の行を出す。拒否はしない。
+4. ACME のサイトごとに、今の証明書チェーンと秘密鍵を `acme/<hosts-sha256>/` に写す（`<hosts-sha256>` の作り方は下の「ACME のサイト」）。写さないと、`acme renew` と SIGUSR2 の後まで、そのサイトのホストに TLS で接続できない。
+
+   ```bash
+   sudo -u tukuyomi mkdir -m 0700 /var/lib/tukuyomi-core/managed/acme
+   d=/var/lib/tukuyomi-core/managed/acme/$(printf '%s\n' www.example.com | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+   sudo -u tukuyomi mkdir -m 0700 "$d"
+   sudo -u tukuyomi install -m 0600 /var/lib/tukuyomi-core/tls/www.pem "$d/chain"
+   sudo -u tukuyomi install -m 0600 /var/lib/tukuyomi-core/tls/www.key "$d/key"
+   ```
+
+5. 新しい設定ファイルで `config check` を流し、`accepted` が出て、`not issued yet` の行が無いことを確認する。`acme renew` を流すと、写した証明書は、有効期限までが `renew_before_days` 日より短くなければ `site <name> valid`、短ければ発行し直して `site <name> renewed` になる。
+6. 前の形を残す（前の設定ファイルを `config.json.before-managed` などの名前で、前の実行ファイルと unit も）。
+7. 新しい設定ファイルを元のパス（例: `/etc/tukuyomi-core/config.json`）に置く。同じディレクトリに写してから、名前を変更して置き換える。
+8. 管理プロセス、プロキシ、ログ送信プロセスの順に再起動する（`systemctl restart`）。
+   - この手順は `admin.route` を追加するので、動いている間に変えられない設定キー（`admin.route.host` と `managed`）が違い、`systemctl reload` は拒否する（`reload: configuration refused: admin.route.host cannot change while running`。比べる順で、`admin.route.host` が先に出る）。
+   - 管理プロセスを再起動してからプロキシを再起動するまでの間、管理画面は前のルートで届き、managed 設定の変更の依頼は 409 で拒否する（何も変更されない）。
+   - プロキシの再起動の間は、接続が切れる。
+9. 確認する。
+   - プロキシのログに `start: managed version <version>` の行が出る。ログ送信プロセスのログに `records-ship: configuration accepted` の行が出る。
+   - どのホストにも前と同じ証明書が返り、ルートと `access` が前と同じに効く。
+   - 管理画面に、管理画面のルートで入れる。
+
+前の形に戻す手順は、上の 6 で残したものを使う。移した後に `acme renew` が更新したサイトの証明書は managed ストアにだけあり、前の設定ファイルが指すファイルは古いままである。
+
+### 反映
+
+動いているプロキシに別のバージョンを使わせる道は 2 つある。
+
+1. 管理画面と管理 API の反映（保存して反映、名前で反映、ロールバック）: 管理プロセスが、制御ソケットの `reload` の依頼で、プロキシにそのバージョンで設定をリロードさせる（上の「制御ソケット」）。プロキシの設定が切り替わった後にだけ、`current` をそのバージョンにする。プロキシが拒否したバージョンは `current` にならない。操作と応答は [管理リファレンス](admin-reference.md) の「managed 設定の操作」に書く。
+   - 反映の間、管理プロセスは managed ストアのロックを持つ。その間の `managed import`・`managed activate`・`managed remove` は拒否する（`the managed store is in use by another command`）。
+   - プロキシは、効いている設定の `forward.resolve_timeout_ms` に 5 秒を足した時間まで、リロードの終わりを待って応答する。`resolve_timeout_ms` を長くすると、反映も長くかかり、その間はコマンドも拒否される。
+   - 管理プロセスが応答を待つ時間と、証明書の検証での拒否（`tls`。`acme renew` が証明書を置き換えている瞬間と重なったときなど）の扱いは、[管理リファレンス](admin-reference.md) の「制御ソケット」に書く。
+2. コマンドと SIGHUP: `managed activate` が、起動と同じ検証を流して `current` を変更する。コマンドはプロキシに頼まないので、動いているプロキシは、次の SIGHUP（`systemctl reload`）か起動で `current` のバージョンを読む（上の「SIGHUP（設定のリロード）」）。
+   - SIGHUP が拒否されると（動いている間に変えられない設定キーの違い、新しいリスナーの bind など）、`current` は、動いているプロキシが拒否したバージョンのまま残り、次の起動はそのバージョンで起きる。
+   - 動いているプロキシのバージョンは、管理画面か管理 API で変更する。コマンドで変更したときは、すぐに `systemctl reload` を流し、`reload: configuration replaced <sha256> managed <version>` の行を確認する。
+
+どちらの道も、次のとおりである。
+
+- リロードは、バージョンと一緒に設定ファイルも読み込む。設定ファイルを書き換えて、まだ SIGHUP を送っていなければ、管理画面からの反映でその書き換えも効く。設定ファイルにエラーがあれば、反映も拒否する（`configuration`）。
+- 同じバージョンでもリロードする。SIGHUP と同じく、待っている keep-alive の接続を閉じ、HTTP/2 の接続には `GOAWAY` を送り、アップストリームのダウン判定と失敗の数を初期化する（上の「SIGHUP（設定のリロード）」）。
+- ログには、`reload: control reload <version>`（制御ソケットの依頼で始めたとき）、SIGHUP と同じ `reload:` の行、`control: reload <version>: <result> (<reason>)` が出る（下の「ほかのログ」）。
+
+途中で止まったとき:
+
+| 状態 | 起きるとき | SIGHUP と再起動 | 直し方 |
+|---|---|---|---|
+| 使われないバージョンが残る | 管理画面で保存した後、リロードを頼む前に、管理プロセスが止まった | `current`（前のバージョン）のまま | 害は無い。要らなければ削除する（下の「バージョンの削除」） |
+| 何も変更されない | リロードの途中でプロキシが止まった、またはリロードが拒否された | `current`（前のバージョン）のまま | 止まったときは再起動し、もう一度反映する |
+| プロキシは新しいバージョン、`current` は前のバージョン | プロキシの設定が切り替わった後、`current` を変更する前に管理プロセスが止まった。`current` を書けなかった。結果が分からないまま終わった反映で、後からプロキシの設定が切り替わった | 前のバージョンに戻る | 同じバージョンをもう一度反映する（前のバージョンを反映してもそろう） |
+| プロキシは前のバージョン、`current` は新しいバージョン | プロキシの設定が切り替わった後、`current` を変更するまでの間に SIGHUP が来た。その間にプロキシが止まり、前のバージョンで再起動した | 新しいバージョンに切り替わる | もう一度反映する |
+
+- 稼働中のバージョンは制御ソケットの `status` の `managed`、選択中のバージョンは `managed list` の `current` で分かる。管理画面と管理 API での見え方は [管理リファレンス](admin-reference.md) の「managed 設定の操作」に書く。
+- プロキシと管理プロセスは、この違いを自分では直さない。どちらのバージョンが正しいかは、止まった理由によって違うためである。
+
+### 置き方の注意
+
+- `acme.challenge_dir` は、challenge のためだけのディレクトリにし、ほかのファイルを置かない。ログ送信プロセスの接続の文字列のファイル、国のデータベース、アップストリームの CA のファイル、検査プロセスの実行ファイルなども置かない。
+- `acme.challenge_dir` と managed ストアには、シンボリックリンクを使わない。ディレクトリの重なりの検証は、書いたままのパスで比べる。
+- `acme.account_key_file` と、管理画面のルートの証明書と秘密鍵のファイルは、ルールストア、`records.dir`、管理データの保存先、managed ストアの中に置かない。`acme renew` は、これらのファイルを書き換える。
+
+### ACME のサイト
+
+バージョンのサイトの `certificate` を `{"acme": {"renew_before_days": 30}}`（1〜60）にすると、`acme renew` がそのサイトの証明書を発行し、更新する。`managed import` の文書にも、同じ形で書く（パスは書かない）。
+
+- ACME のサイトの `hosts` は名前だけで、`*.` は書けない。設定ファイルに `acme` が要る。
+- `managed` のある設定ファイルは、`acme` を持つ証明書が設定ファイルに無くても `acme` を書ける（ACME のサイトはバージョンの中にあるため）。
+- 証明書チェーンと秘密鍵は、managed ストアの `acme/<hosts-sha256>/chain` と `key` にある。`<hosts-sha256>` は、サイトの `hosts` をバイトの順に並べ、1 つずつ後ろに改行を付けてつないだバイトの SHA-256 である。サイトの名前は入らないので、同じホストの組なら、名前を変更しても、ほかのバージョンでも、同じディレクトリを使う。
+
+  ```bash
+  printf '%s\n' www.example.com app.example.com | LC_ALL=C sort | sha256sum | cut -d' ' -f1
+  ```
+
+- `acme/` と、その中のディレクトリは、`acme renew` が無ければ作る（0700）。シンボリックリンクなど、ディレクトリでないものがあると、そのサイトは CA に注文せずに `failed` になる。
+- `acme renew` は、`current` のバージョンを読む。対象は、`acme` を持つ管理画面のルート、バージョンのサイトの順である。結果の行は `admin route renewed|valid|failed`、`site <name> renewed|valid|failed` になる。
+  - `acme` を持つ管理画面のルートも ACME のサイトも無いときは、結果の行を出さず、標準エラーに 1 行出して exit 0 で終わる（timer を失敗させないため）。
+  - `current` かバージョンが読めないときは、設定を受け付けずに exit 2 で終わる。設定ファイルにある管理画面のルートの証明書も更新しない。
+- ファイルがまだ無いサイトは、まだ発行していない証明書である。起動、設定のリロード、`config check`、`managed activate` は拒否せず、`tls certificate not issued yet (site <name>)` の行を出して、そのサイトのホストへのハンドシェイクを拒否する。ファイルができた後の SIGUSR2 で使い始める。
+- ホストの組を変更したバージョン（サイトにホストを追加した、変更した、`{"chain", "key"}` から `acme` に変更した）に反映すると、新しいディレクトリにはまだ証明書が無い。そのサイトのすべてのホスト（前から接続できたホストも）に、TLS で接続できなくなる。反映の後すぐに、`acme renew` と SIGUSR2 を流す（[実行ファイルの build と配置](../build/binary-deployment.md) の「証明書の更新の timer」の service を `systemctl start tukuyomi-core-acme.service` で流す）。timer に任せると、次の timer まで接続できない。
+- 前のバージョンに戻す（ロールバック、名前での反映）と、そのホストの組のディレクトリに前の証明書が残っていれば、発行し直さずに使う。プロキシは証明書の有効期限を見ないので、有効期限の切れた証明書もそのまま使う。戻した後は `acme renew` を流す（有効期限が近ければ発行し直す）。
+- challenge に応答するホストは、`acme` を持つ管理画面のルートのホストと、稼働中のバージョンの ACME のサイトのホストである。反映でバージョンが切り替わると、一緒に切り替わる。`admin.route.access` は challenge に掛からない（CA はどのアドレスからも来る）。
+  - コマンドで `managed activate` した後、SIGHUP の前に `acme renew` を流すと、新しいバージョンだけにあるホストは、プロキシが challenge に応答しないので `failed` になる。`managed activate` の後は、すぐに設定をリロードする（上の「反映」）。
+- 管理画面のルートの証明書に `acme` を付けたときは、ファイルは設定ファイルの `cert_file`・`key_file` に書く（起動のときに無くてよい）。ファイルが無い間は、管理画面のルートのハンドシェイクを拒否する。初めての発行は、下の「ACME」の「初めての発行」と同じである。
+- バージョンを削除すると、残るどのバージョンのサイトでもないホストの組の `acme/` のディレクトリも削除される（下の「バージョンの削除」）。
+
+### バージョンの削除
+
+バージョンは、`managed remove`（上の「`managed`」）と管理 API（[管理リファレンス](admin-reference.md) の「managed 設定の操作」）で削除する。
+
+- 選択中のバージョン（`current`）と、使用中のバージョンは削除できない（`the managed version is the current one`、`the managed version is in use`）。使用中なのは、プロキシが稼働中のバージョンと、設定のリロードで読んでいるバージョン、`acme renew` が終わるまで読んでいるバージョン、`config check` と `managed activate` が読んでいる間のバージョンである。`acme renew` などが読んでいる間の拒否は、終わった後にもう一度流せば通る。管理 API は、ロールバックの先のバージョンも削除しない。
+- 一緒に、どのバージョンも指さなくなったファイルを片付ける。`files/` の証明書チェーン、秘密鍵、CA のファイルと、`acme/` のディレクトリ（ACME のサイトの証明書と秘密鍵）も削除される。後で同じホストの組の ACME のサイトを使うと、発行し直す（CA の発行の回数に数える）。
+- プロキシの build を入れ替えたときは、プロキシを新しい build で再起動してから、バージョンを削除する。
+- managed ストアは、`flock` のロックが使えるファイルシステムに置く。削除とプロキシの読み込みは、バージョンのファイルのロックで守る。ロックが取れないと、インポート、削除、起動を拒否する。
 
 ## 要求の扱い
 
@@ -987,7 +1354,7 @@ Coraza の世代と違うところは次のとおりである。同じルール�
 
 ### 本文の型
 
-本文の型は、head の確かめの後、経路を引いてから確かめる（下の「要求の確かめの順」の 9）。検査する経路かどうかで、決まりが違う。
+本文の型は、head の確かめの後、経路を引いてから確かめる（下の「リクエストの検証の順」の 10）。検査する経路かどうかで、決まりが違う。
 
 - 検査する経路では、空でない本文は `Content-Type` をちょうど1つ持ち、それは次のどれかである（`;` より前を、大小を区別せずに比べる）。違えば 415。
   - `application/x-www-form-urlencoded`
@@ -1007,10 +1374,10 @@ Coraza の世代と違うところは次のとおりである。同じルール�
 |---|---|
 | 規則の状態コード | 規則が遮断した（200〜599 の外なら 500） |
 | 400、408、413、414、415、417、431 | head か本文が断られた |
-| 403 | 全体の `access` か、経路の `access` に断られた |
-| 404 | 当たる経路も既定の組も無い。redirect しない `Host` |
-| 421 | `Host` が TLS の証明書に入っていない |
-| 429 | 全体の `rate_limit` に断られた。`Retry-After` を持つ |
+| 403 | 全体の `access`、ホストごとの設定の `access`、経路の `access`、管理画面のルートの `admin.route.access`（`denied by route access`）に断られた |
+| 404 | 当たる経路も既定の組も無い。redirect しない `Host`。redirect でない平文の待ち受けで受けた、管理画面のルートのホスト（`admin host over plain http`） |
+| 421 | `Host` が TLS の証明書に入っていない。管理画面のルートのホストを、その証明書でない接続で受けた（`admin host on another certificate`） |
+| 429 | 全体の `rate_limit` かホストごとの設定の `rate_limit` に断られた。`Retry-After` を持つ |
 | 502 | 上流につながらない、上流の応答の誤り、上流の時間切れ、組のどの server も使えない |
 | 503 | 検査できない（検査プロセスが使えない、検査の待ちが満ちた・時間切れ）、予算が尽きた、要求の時間が尽きた、proxy 自身が上流への接続を作れない |
 | 500 | proxy の中の不整合（記録に `internal fault` の行も出る） |
@@ -1019,37 +1386,40 @@ proxy が自分で作る答えは、本文が空で `Content-Length: 0` を持�
 
 proxy が返すすべての応答（上流の応答、遮断、head の拒否、redirect も含む）は、要求の番号を `X-Request-ID` に1つ持つ。上流の応答に同じ名前の field があれば置き換える。番号は、その要求の記録の `id` と同じなので、断られた人が番号を伝えれば記録を引ける。
 
-## 要求の前の方針
+## リクエストの前のポリシー
 
-設定ファイルの最上位の `access`、`rate_limit`、`geo` は、経路を探す前に要求を断る方針を決める。3つとも省いてよく、省いた方針は無い。値は起動のときと SIGHUP の読み直しで読む（上の「SIGHUP（設定の読み直し）」）。
+設定ファイルの最上位の `access`、`rate_limit`、`host_policies`、`geo` は、ルートを探す前にリクエストを拒否するポリシーを決める。`access` と `rate_limit` は全体の設定（全体のアクセス制御と全体のレート制限）で、`host_policies` は、ホストごとに全体の設定の代わりに掛けるホストごとの設定である。どれも省いてよく、省いたポリシーは無い。`managed` のある設定では、`access`・`rate_limit`・`host_policies` は設定ファイルに書かず、バージョンに書く（上の「managed ストアとバージョン」）。値は、起動のときと設定のリロードで読む（上の「SIGHUP（設定のリロード）」）。管理画面のルート（`admin.route`）には、どのポリシーも掛からない。
 
-### 要求の確かめの順
+### リクエストの検証の順
 
-要求は、次の順に確かめる。最初に断った確かめが、その要求の答えになる。
+リクエストは、次の順に検証する。最初に拒否した検証が、そのリクエストの応答になる。
 
-| 順 | 確かめ | 答え | 記録の `reason` |
+| 順 | 検証 | 応答 | ログの `reason` |
 |---|---|---|---|
 | 1 | head の確かめ（上の「head の確かめ」） | 400、414、431 など | head ごとに決まった語句 |
-| 2 | ACME の challenge（`acme` を持つ証明書があるときの、普通の待ち受けと redirect の待ち受け） | challenge のファイルを本文にした 200、または 404 | `acme challenge` |
-| 3 | 全体の `access` | 403 | `denied by access` |
-| 4 | `rate_limit` | 429（`Retry-After: 1`） | `too many requests` |
-| 5 | TLS の接続の `Host` が、handshake で使った証明書の host に入っているか | 421 | `host not covered by the certificate` |
-| 6 | 経路（無ければ既定の組） | 404 | `no route matches` |
-| 7 | 経路の `access` | 403 | `denied by route access` |
-| 8 | `Content-Length` と経路の `max_body` | 413 | `body over the limit of the route` |
-| 9 | 本文の型（上の「本文の型」） | 415 | `body type not supported` |
+| 2 | ACME の challenge（`acme` を持つ証明書があるときの、通常のリスナーと redirect のリスナー） | challenge のファイルをボディにした 200、または 404 | `acme challenge` |
+| 3 | 管理画面のルート（`managed` のある設定で、`Host` が `admin.route.host` のとき）。TLS の接続でハンドシェイクに管理画面のルートの証明書を使ったか、平文の接続でないか、`admin.route.access` が許すか | 421、404、403 | `admin host on another certificate`、`admin host over plain http`、`denied by route access` |
+| 4 | そのリクエストに掛かるアクセス制御（`Host` が当たるホストごとの設定の `access`、無ければ全体の `access`） | 403 | `denied by access` |
+| 5 | そのリクエストに掛かるレート制限（同じく、ホストごとの設定か全体の `rate_limit`） | 429（`Retry-After: 1`） | `too many requests` |
+| 6 | TLS の接続の `Host` が、ハンドシェイクで使った証明書のホストに入っているか | 421 | `host not covered by the certificate` |
+| 7 | ルート（無ければデフォルトのアップストリーム） | 404 | `no route matches` |
+| 8 | ルートの `access` | 403 | `denied by route access` |
+| 9 | `Content-Length` とルートの `max_body` | 413 | `body over the limit of the route` |
+| 10 | ボディの型（上の「本文の型」） | 415 | `body type not supported` |
 
-9 は、`Content-Length` のある本文では本文を読む前に、chunked の本文では読んだ後に確かめる。その後に、検査し、転送する。redirect の待ち受けは、4 の後に redirect か 404 で答え、本文を読まない。
+10 は、`Content-Length` のあるボディではボディを読む前に、chunked のボディでは読んだ後に検証する。その後に、検査し、転送する。redirect のリスナーは、5 の後に redirect か 404 で応答し、ボディを読まない。
 
-- 3 と 4 は、検査しない経路に当たる要求にも、redirect の待ち受けにも、同じに効く。検査プロセスが止まっていても、断る答えは変わらない。監視の待ち受けには掛からない。
-- 断るのは、head を読んだ後の要求である。接続を受けることと TLS の handshake は、断る client にも行い、その間は `max_conns` の枠を使う。
-- 1 で断った要求と、2 で答えた challenge は、`access` にも `rate_limit` にも数えない。
-- 3〜8 で断った要求は、本文を読む前に答える。HTTP/1.1 の接続では、本文を持つ要求を断ると、答えの後に接続を閉じる。本文の無い要求なら、接続は続く。HTTP/2 では、その stream だけが終わる。
-- 断った要求は、要求の記録に出る（`class` は `rejected`）。3 と 4 で断った要求は、`/metrics` の `tukuyomi_policy_refusals_total` にも数える。
+- 3 に当たるリクエストは、4 から 9 を通らず、管理プロセスへ転送する（WAF の検査は通る。ボディの上限は `proxy.max_body`）。3 の 421 は、HTTP/2 のクライアントが、管理画面のホストのリクエストを、別のサイトの証明書（`*.example.com` など）の接続で送ったときである。クライアントは、正しい SNI で接続し直す。redirect のリスナーは、管理画面のルートのホストを、ポリシーを掛けずに https へ redirect する。
+- 4 と 5 で掛かる設定は、リクエストの `Host` で決める（下の「ホストごとの設定（`host_policies`）」）。
+- 4 と 5 は、検査除外のルートに当たるリクエストにも、redirect のリスナーにも、同じに効く。検査プロセスが止まっていても、拒否する応答は変わらない。監視のリスナーには掛からない。
+- 拒否するのは、head を読んだ後のリクエストである。接続を受けることと TLS のハンドシェイクは、拒否するクライアントにも行い、その間は `max_conns` の枠を使う。
+- 1 で拒否したリクエストと、2 で応答した challenge は、アクセス制御にもレート制限にも数えない。
+- 3〜9 で拒否したリクエストは、ボディを読む前に応答する。HTTP/1.1 の接続では、ボディを持つリクエストを拒否すると、応答の後に接続を閉じる。ボディの無いリクエストなら、接続は続く。HTTP/2 では、そのストリームだけが終わる。
+- 拒否したリクエストは、ログに出る（`class` は `rejected`）。4 と 5 で拒否したリクエストは、全体の設定でもホストごとの設定でも、`/metrics` の `tukuyomi_policy_refusals_total` に数える。
 
 ### client と国
 
-- 全体の `access`、`rate_limit`、経路の `access` は、どれも上の「client の address」で決めた address を見る。国も、その address から引く。
+- 全体の `access`、`rate_limit`、ホストごとの設定、経路の `access`、`admin.route.access` は、どれも上の「client の address」で決めた address を見る。国も、その address から引く。
 - `trusted_proxies` に入る相手でも、`X-Forwarded-For` の行を付けなければ、その相手が client である。`trusted_proxies` に入れない相手も同じである。前に置いた中継が client の address を伝えないと、その後ろの client は区別されず、国は中継の address で決まり、流量の制限は1つの client として数える。
 
 ### `access`
@@ -1058,21 +1428,21 @@ proxy が返すすべての応答（上流の応答、遮断、head の拒否、
 {"deny_cidrs"?, "allow_cidrs"?, "deny_countries"?, "allow_countries"?}
 ```
 
-経路の `access` と同じ形で、同じ決まりで断る。全体の `access` は、head の確かめに通った要求（ACME の challenge を除く）に効く。
+全体のアクセス制御である。ルートの `access` と同じ形で、同じ決まりで拒否する。全体の `access` は、head の確かめに通ったリクエスト（ACME の challenge と管理画面のルートを除く）に効く。ただし、自分の `access` を持つホストごとの設定のホストへのリクエストには、全体の `access` の代わりに、その `access` が効く（下の「ホストごとの設定（`host_policies`）」）。
 
-| 鍵 | 中身 |
+| 設定キー | 中身 |
 |---|---|
-| `deny_cidrs`、`allow_cidrs` | network の一覧。256 個まで。書き方は `trusted_proxies` と同じ |
-| `deny_countries`、`allow_countries` | 国の一覧。256 個まで。国は、ISO 3166-1 alpha-2 の英大文字2字（`JP` など）か、`UNKNOWN`。小文字や、2字でないものは断る。2字が ISO 3166 の一覧にあるかは見ない |
+| `deny_cidrs`、`allow_cidrs` | ネットワークの一覧。256 個まで。書き方は `trusted_proxies` と同じ |
+| `deny_countries`、`allow_countries` | 国の一覧。256 個まで。国は、ISO 3166-1 alpha-2 の英大文字 2 字（`JP` など）か、`UNKNOWN`。小文字や、2 字でないものは受け付けない。2 字が ISO 3166 の一覧にあるかは見ない |
 
-- 4つとも省いてよい。省いた鍵は空の一覧で、4つとも空なら、誰も断らない。
-- 次の client を断る。
+- 4 つとも省いてよい。省いた設定キーは空の一覧で、4 つとも空なら、誰も拒否しない。
+- 次のクライアントを拒否する。
   - `deny_cidrs` に入る
   - 国が `deny_countries` に入る
   - `allow_cidrs` が空でなく、そこに入らない
   - `allow_countries` が空でなく、国がそこに入らない
-- `allow_cidrs` と `allow_countries` を両方書けば、両方に入る client だけが通る。network を国に関係なく通す書き方は無い。
-- 断るときの答えは、本文が空の 403 で、`Retry-After` は付けない。
+- `allow_cidrs` と `allow_countries` を両方書けば、両方に入るクライアントだけが通る。ネットワークを国に関係なく通す書き方は無い。
+- 拒否するときの応答は、ボディが空の 403 で、`Retry-After` は付けない。
 - 国の一覧を書くには、`geo` が要る。
 
 例:
@@ -1084,40 +1454,95 @@ proxy が返すすべての応答（上流の応答、遮断、head の拒否、
 }
 ```
 
-この例は、`198.51.100.0/24` の client と、`JP` と `UNKNOWN` 以外の国の client を断る。
+この例は、`198.51.100.0/24` のクライアントと、`JP` と `UNKNOWN` 以外の国のクライアントを拒否する。
 
-### 流量の制限（`rate_limit`）
+### レート制限（`rate_limit`）
 
 ```text
 {"rate", "burst", "keys", "exempt_cidrs"?}
 ```
 
-| 鍵 | 範囲 | 意味 |
+全体のレート制限である。自分の `rate_limit` を持つホストごとの設定のホストへのリクエストは、全体の表でなく、そのホストごとの設定の表で数える（下の「ホストごとの設定（`host_policies`）」）。
+
+| 設定キー | 範囲 | 意味 |
 |---|---|---|
-| `rate` | 1〜100000 | 1つの client が続けてよい、1秒あたりの要求の数 |
-| `burst` | 0〜100000 | 休んだ後に、間を空けずに通す要求の余裕。続けて `burst + 1` 件まで通り、次の1件から断る |
-| `keys` | 1024〜1048576 | 数える client の数の上限（下の「表の大きさ」） |
-| `exempt_cidrs` | 0〜256 個の network | 数えない client。書き方は `trusted_proxies` と同じ。省けば空 |
+| `rate` | 1〜100000 | 1 つのクライアントが続けてよい、1 秒あたりのリクエスト数 |
+| `burst` | 0〜100000 | 休んだ後に、間を空けずに通すリクエストの余裕（バースト）。続けて `burst + 1` 件まで通り、次の 1 件から拒否する |
+| `keys` | 1024〜1048576 | 追跡するクライアント数の上限（下の「表の大きさ」） |
+| `exempt_cidrs` | 0〜256 個のネットワーク | 数えないクライアント（除外するネットワーク）。書き方は `trusted_proxies` と同じ。省けば空 |
 
 - 数え方:
-  - 要求を1件ずつ数える（接続ではなく、HTTP/2 では stream ごと）。
-  - 休んでいた client は、間を空けずに `burst + 1` 件まで通る。次の1件は断る。その後は、待った時間が 1/`rate` 秒になるごとに1件通る。
-  - 1/`rate` 秒は、ナノ秒に切り上げる。そのため、client が `rate` を超えて通ることは無い。
-  - 断られた要求は、client の count を変えない。
-  - 初めて来る client の要求は、必ず通る。
-- client の単位:
-  - IPv4 は address ごと。IPv6 は上位 64 bit（/64）ごとである。同じ /64 の中で address を変えても、count は増えない。
-  - IPv4-mapped IPv6 address（`::ffff:192.0.2.1`）は、IPv4 として数える。port は見ない。
-  - 信じる相手が `X-Forwarded-For` を付けないと、その相手が client になる（上の「client と国」）。そのとき `rate` と `burst` は、その相手を通るすべての client の合計に対する値になる。
-- 断るときの答え: 本文が空の 429 で、`Retry-After` を付ける。値は、次の1件が通るまでの時間を秒に切り上げたもので、最小は 1 である。`rate` は 1 以上で、次の1件までは 1 秒を超えないので、いつも `1` になる。
-- `exempt_cidrs` に入る client は、数えない。ただし、全体の `access` には先に断られる。監視の program などを入れる。
+  - リクエストを 1 件ずつ数える（接続ではなく、HTTP/2 ではストリームごと）。
+  - 休んでいたクライアントは、間を空けずに `burst + 1` 件まで通る。次の 1 件は拒否する。その後は、待った時間が 1/`rate` 秒になるごとに 1 件通る。
+  - 1/`rate` 秒は、ナノ秒に切り上げる。そのため、クライアントが `rate` を超えて通ることは無い。
+  - 拒否したリクエストは、そのクライアントの数を変えない。
+  - 初めて来るクライアントのリクエストは、必ず通る。
+- クライアントの単位:
+  - IPv4 はアドレスごと。IPv6 は上位 64 bit（/64）ごとである。同じ /64 の中でアドレスを変えても、数は増えない。
+  - IPv4-mapped IPv6 アドレス（`::ffff:192.0.2.1`）は、IPv4 として数える。port は見ない。
+  - 信じる相手が `X-Forwarded-For` を付けないと、その相手がクライアントになる（上の「client と国」）。そのとき `rate` と `burst` は、その相手を通るすべてのクライアントの合計に対する値になる。
+- 拒否するときの応答: ボディが空の 429 で、`Retry-After` を付ける。値は、次の 1 件が通るまでの時間を秒に切り上げたもので、最小は 1 である。`rate` は 1 以上で、次の 1 件までは 1 秒を超えないので、いつも `1` になる。
+- `exempt_cidrs` に入るクライアントは、数えない。ただし、アクセス制御には先に拒否される。監視のプログラムなどを入れる。
 - 表の大きさ:
-  - `keys` は、同時に数える client の数の上限である。1 client は約 100 バイトで、`keys` が 1048576 なら約 100 MB になる。
-  - 要求のたびに、表の古い方から最大 4 client を調べ、count が残っていないもの（待ち時間が過ぎたもの）を外す。count が残っていない client は新しい client と同じ扱いなので、外しても結果は変わらない。
-  - 表が満ちていて、いちばん古い client の count がまだ残っているときは、その client を外して、新しい client の場所を作る。外された client は、次に来たときに新しい client として始まり、また `burst + 1` 件まで通る。つまり、その client の制限が一度ゆるむ。新しい client が、場所が無いために断られることは無い。
-  - 外した数は `tukuyomi_rate_limit_evicted_total` に、数えている client の数は `tukuyomi_rate_limit_keys` に出る。多くの address から要求が来ると、実際の client の count が外れてゆるむ。`keys` は、同時に来る client の数より十分大きくする。
-  - 表は proxy のメモリの中にあり、起動し直すと空になる。SIGHUP の読み直しでは、`keys`・`rate`・`burst` がどれも同じなら続き、どれかが違えば空から数える。
-- 断った要求は、`tukuyomi_policy_refusals_total` の `rate_limit` に数える。記録の `reason` は `too many requests` である。
+  - `keys` は、同時に数えるクライアントの数の上限である。1 クライアントは約 100 バイトで、`keys` が 1048576 なら約 100 MB になる。
+  - 全体の `keys` と、自分の表を持つホストごとの設定の `keys` の合計は、1048576 までである。越えると設定を受け付けない（`the rate limits keep count of more than 1048576 clients in all`）。
+  - リクエストのたびに、表の古い方から最大 4 クライアントを調べ、数が残っていないもの（待ち時間が過ぎたもの）を外す。数が残っていないクライアントは新しいクライアントと同じ扱いなので、外しても結果は変わらない。
+  - 表が満ちていて、いちばん古いクライアントの数がまだ残っているときは、そのクライアントを外して、新しいクライアントの場所を作る。外されたクライアントは、次に来たときに新しいクライアントとして始まり、また `burst + 1` 件まで通る。つまり、そのクライアントの制限が一度ゆるむ。新しいクライアントが、場所が無いために拒否されることは無い。
+  - 外した数は `tukuyomi_rate_limit_evicted_total` に、数えているクライアントの数は `tukuyomi_rate_limit_keys` に出る（どちらも、すべての表の合計）。多くのアドレスからリクエストが来ると、実際のクライアントの数が外れてゆるむ。`keys` は、同時に来るクライアントの数より十分大きくする。
+  - 表はプロキシのメモリの中にあり、再起動すると空になる。設定のリロードでは、表ごとに持ち越す。全体の表は、新旧の両方に全体の `rate_limit` があり、`keys`・`rate`・`burst` がどれも同じなら続く（`exempt_cidrs` は新しい値を使う）。どれかが違うか、片方に無ければ、新しい表で 0 から数え、`reload: rate limit table started anew` の行を出す。ホストごとの設定の表は、下の「ホストごとの設定（`host_policies`）」に書く。
+- 拒否したリクエストは、`tukuyomi_policy_refusals_total` の `rate_limit` に数える。ログの `reason` は `too many requests` である。
+
+### ホストごとの設定（`host_policies`）
+
+```text
+[{"name", "hosts", "access"?, "rate_limit"?}, ..]
+```
+
+ホストごとに、全体のアクセス制御とレート制限の代わりに掛ける設定である。省いてよい。`managed` の無い設定ファイルでは最上位に書き、`managed` のある設定ではバージョンに書く（設定ファイルに書くと受け付けない）。
+
+| 設定キー | 範囲 | 意味 |
+|---|---|---|
+| `name` | 1〜64 文字の英数字・`-`・`_` | 名前。項目どうしで同じ名前は書けない。レート制限の表の持ち越しに使う（下） |
+| `hosts` | 1〜64 個 | 当てるホスト。ルートの `host` と同じ形で、port は書かない（英小文字の名前か、`*.` と名前） |
+| `access` | 全体の `access` と同じ形 | このホストのアクセス制御 |
+| `rate_limit` | `{}`、または `rate`・`burst`・`keys` を全部書いた全体の `rate_limit` と同じ形 | このホストのレート制限 |
+
+- 項目は 64 個まで、すべての項目のホストは合わせて 1024 個までである。同じホストを 2 度書けない（別の項目でも）。管理画面のルートのホスト（`admin.route.host`）と同じホストは書けない（`*.` のホストがそれを含むのはよい。管理画面のルートが先に当たる）。
+- `access` も `rate_limit` も無い項目は、受け付けない。
+- 当て方: リクエストの `Host` で、ルートと同じに引く。大文字と小文字を区別せず、末尾の `.` を 1 つ落とし、port は見ない。名前が `*.` のホストより先に、長い `*.` のホストが短いものより先に当たる。どの項目にも当たらないリクエストには、全体の設定が掛かる。
+- 重ね方: アクセス制御とレート制限は、それぞれ次の 3 つのどれかになる（管理画面の語も示す）。
+
+| 書き方 | 管理画面の語 | アクセス制御 | レート制限 |
+|---|---|---|---|
+| 設定キーを書かない | 引き継ぐ | 全体の `access` を掛ける | 全体の表で数える。同じクライアントのリクエストは、ほかのホストへのものと合わせて数える |
+| 値を書く | このホストの設定 | 全体の代わりに、この `access` を掛ける | 全体の代わりに、このホストごとの設定の表で数える |
+| `{}` | 使わない | 誰も拒否しない | 数えない |
+
+- 「このホストの設定」と「使わない」では、全体の設定の拒否（急いで追加した `deny_cidrs` も）が、そのホストには効かない。全体の設定を変更するときは、それを引き継がないホストごとの設定も見直す。
+- ホストごとの設定は、その `Host` で来たリクエストにだけ掛かる。デフォルトのアップストリーム、`host` の無いルート、`*.` のルートで同じアップストリームに届く、ほかの `Host`（IP アドレスの `Host`、どの項目にも無い名前）のリクエストには、全体の設定だけが掛かる。ホストごとにルートを書き、デフォルトのアップストリームを空にすれば、この形は無くなる。
+  - IPv6 アドレスの `Host`（`[2001:db8::1]` など）は、どの項目にも当たらない。国際化ドメイン名は、punycode の形（`xn--` で始まる名前）で書く。
+- 読めない `Host`（head の確かめは通るが、port が `0` で始まる `www.example.com:0443` など）は、どのホストへのリクエストにもなりうるとして扱う。全体の `access` と、自分の `access` を持つすべての項目の `access` の全部に通らなければ拒否する。レート制限は、全体の表と、自分の表を持つすべての項目の表で順に数え、最初に拒否した表で止める。
+- redirect のリスナーも、同じ引き方で掛かる設定を決める。管理画面のルートには掛からない。
+- 国の一覧を書くには、`geo` が要る。
+- レート制限の表:
+  - 全体の `keys` と、自分の表を持つ項目の `keys` の合計は、1048576 までである（上の「レート制限（`rate_limit`）」）。
+  - 表は項目ごとに別なので、ホストをまたいだ合計の上限は無い。1 つのクライアントは、全体の `rate` と、各項目の `rate` を足した分まで通せる。
+  - 設定のリロードでは、同じ `name` の項目が前も後も自分の表を持ち、`keys`・`rate`・`burst` がどれも同じなら、表を持ち越す（`hosts` だけを変更したときも）。自分の表を持つ項目のうち、`name` を変更したもの、引き継ぐか使わないから「このホストの設定」に切り替えたもの、新しく追加したものは、空から数え、`reload: rate limit table of host policy <name> started anew` の行を出す。2 つの項目の `name` を入れ替えると、表も名前に付いて移る。
+  - `/metrics` の `tukuyomi_rate_limit_keys` と `tukuyomi_rate_limit_evicted_total` は、すべての表の合計である。引き継ぐホストは全体の表で数えるので、2 度は数えない。
+- ホストごとの設定で拒否したリクエストも、ログの `reason`（`denied by access`、`too many requests`）と `/metrics` の label は、全体の設定のものと同じである。どのホストかは、ログの `host` で分かる。
+- `host_policies` を書いた設定ファイルやバージョンを、この設定キーを知らない前の build で読むと、知らない設定キーとして受け付けない。build を前に戻すときは気を付ける。ログ送信プロセスも設定ファイルを読むので、設定ファイルに `host_policies` を書く前に、ログ送信プロセスをプロキシと同じ build にする（下の「送り手の起動」）。
+
+例:
+
+```json
+"host_policies": [
+  {"name": "app", "hosts": ["app.example.com"], "access": {"allow_cidrs": ["203.0.113.0/24"]}},
+  {"name": "api", "hosts": ["api.example.com", "*.api.example.com"], "rate_limit": {"rate": 20, "burst": 40, "keys": 65536}},
+  {"name": "status", "hosts": ["status.example.com"], "access": {}, "rate_limit": {}}
+]
+```
+
+この例では、`app.example.com` は `203.0.113.0/24` のクライアントだけが使え（全体の `access` は掛からない）、レート制限は全体の表で数える。`api.example.com` と `*.api.example.com` には全体の `access` が掛かり、レート制限はこの項目の表で数える。`status.example.com` には、アクセス制御もレート制限も掛からない。
 
 ### 国のデータベース（`geo`）
 
@@ -1149,20 +1574,20 @@ proxy が返すすべての応答（上流の応答、遮断、head の拒否、
   - IPv4 の address だけのデータベース（metadata の `ip_version` が 4）では、IPv6 の client はすべて `UNKNOWN` になる。
 - `UNKNOWN` に気を付ける。`allow_countries` に `UNKNOWN` を書かないと、private な address の client（同じ network の監視など）も、IPv4 だけのデータベースでの IPv6 の client も、すべて断られる。`deny_countries` に `UNKNOWN` を書けば、それらを断る。
 - 読むとき:
-  - 設定ファイルを読む命令は、すべて `geo` のファイルを読んで確かめる。proxy の起動、`config check`、`rules` の各命令、`acme renew`、`admin` の各命令である。どれも、サービスの利用者がファイルを読めること。
+  - 設定の全体を読む命令は、`geo` のファイルを読んで確かめる。proxy の起動、`config check`、SIGHUP と制御 socket の `reload` の読み直し、`acme renew`、`managed import`、`managed activate` である。どれも、サービスの利用者がファイルを読めること。設定ファイルだけを読む命令（`rules` の各命令、`managed list`・`managed remove`、`admin` の各命令と管理のプロセス、記録の送り手）は、`geo` の値の形だけを確かめ、ファイルは読まない。
   - 次を確かめる。
     - 普通のファイルで、link でなく、256 MiB までである。全体を読む。
     - SHA-256 が `sha256` と合う。
     - MaxMind DB として読める。metadata の版が 2、record の大きさが 24・28・32 bit、`ip_version` が 4 か 6、検索の木が壊れていない。木が指す記録をすべて確かめ、読めない記録があれば断る。
     - 国のデータベースである。`database_type` に `Country` を含むか、ISO コードを持つ記録が1つ以上ある。
-  - 国の一覧があれば、proxy と管理のプロセスは、確かめたファイルの全体をメモリに持つ。どの命令も読むたびに全体を確かめるので、大きいファイルでは時間とメモリを使う。
-  - 国の一覧がどこにも無ければ、読んで確かめた後で使わずに捨てる。国の一覧があって `geo` が無い設定は断る（`access has a list of countries while geo is left out`）。
-  - proxy は、起動のときと SIGHUP の読み直しのたびに読む。その間は読み直さない。読み直すたびに全体を確かめるので、大きいファイルでは読み直しのたびに時間とメモリを使う。
-- 替える手順: 新しいファイルを別の名前で置き、`country_db` と `sha256` を1回の置き換えで書き換え、`config check` で確かめてから、proxy に読み直させる（SIGHUP、`systemctl reload`）。管理のプロセスは、起動のときに設定とデータベースを確かめるので、その後に起動し直す。同じ名前のファイルだけを替えて `sha256` が合わないと、その間に流す命令と、起動し直したプロセスは設定を断り、proxy の読み直しも断られる。
+  - 国の一覧があれば、proxy は、確かめたファイルの全体をメモリに持つ。読む命令は、読むたびに全体を確かめるので、大きいファイルでは時間とメモリを使う。
+  - 国の一覧（全体の `access`、`host_policies` の `access`、経路の `access`）がどこにも無ければ、読んで確かめた後で使わずに捨てる。国の一覧があって `geo` が無い設定は断る（`access has a list of countries while geo is left out`）。
+  - proxy は、起動のときと、SIGHUP と制御 socket の `reload` の読み直しのたびに読む。その間は読み直さない。読み直すたびに全体を確かめるので、大きいファイルでは読み直しのたびに時間とメモリを使う。
+- 替える手順: 新しいファイルを別の名前で置き、`country_db` と `sha256` を1回の置き換えで書き換え、`config check` で確かめてから、proxy に読み直させる（SIGHUP、`systemctl reload`）。管理のプロセスは、データベースを読まない。同じ名前のファイルだけを替えて `sha256` が合わないと、その間に流す、設定の全体を読む命令と、起動し直した proxy は設定を断り、proxy の読み直しも断られる。
 
 ## 記録
 
-記録は、標準エラーに1行1件の JSON で出る（systemd では journal）。設定に `records` があれば、同じ行をファイルにも書く（下の「記録のファイル」）。さらに `records.ship` があれば、別のプロセス（記録の送り手）がファイルの行を PostgreSQL か MySQL へ送る（下の「記録の送り手」）。記録を残せないときに要求を通すか断るかは、経路ごとに選べる（下の「記録の残し方」）。短い命令（`config check`・`rules`・`acme`・`admin bootstrap`・`admin reset`）の出力は、人が読む文の行のままである。
+記録は、標準エラーに1行1件の JSON で出る（systemd では journal）。設定に `records` があれば、同じ行をファイルにも書く（下の「記録のファイル」）。さらに `records.ship` があれば、別のプロセス（記録の送り手）がファイルの行を PostgreSQL か MySQL へ送る（下の「記録の送り手」）。記録を残せないときに要求を通すか断るかは、経路ごとに選べる（下の「記録の残し方」）。短い命令（`config check`・`rules`・`managed`・`acme`・`admin bootstrap`・`admin reset`）の出力は、人が読む文の行のままである。
 
 どの記録も、次の2つの項目で始まる。値の無い項目は書かない（`null` にしない）。
 
@@ -1210,7 +1635,7 @@ client へ答えを書いた要求ごとに1件出る。head の拒否、redirec
 |---|---|
 | `forwarded` | 上流の応答を返した |
 | `blocked` | 規則が遮断した |
-| `rejected` | head か本文が断られた。全体の `access` の 403 と `rate_limit` の 429、経路で断った 403・404・421、redirect の待ち受けの 404 も含む |
+| `rejected` | head か本文が断られた。全体の `access`・`rate_limit` とホストごとの設定の 403・429、経路で断った 403・404・421、管理画面のルートで断った 421・404・403、redirect の待ち受けの 404 も含む |
 | `redirected` | https へ redirect した |
 | `answered` | ACME の challenge に答えた |
 | `failed` | こちらの理由で答えられなかった（混んでいる、検査できない、上流の失敗） |
@@ -1227,27 +1652,29 @@ client へ答えを書いた要求ごとに1件出る。head の拒否、redirec
 
 query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）、規則に一致した値と変数の名前、規則の `msg` は記録しない。path に秘密の値を入れる作りのサイトでは、その値が記録に残る。
 
-### ほかの記録
+### ほかのログ
 
 | type | 項目 | とき |
 |---|---|---|
-| `connection` | `conn`、`listener`、`client`、`class`、`status`、`reason`、`ms`、`streams` | 答えを書かずに終わった接続（要求の前に閉じた、2つ目からの head を断った、TLS の handshake に失敗したなど）と、HTTP/2 の接続の終わり（`streams` は受けた stream の数） |
-| `tunnel` | `id`（tunnel を開いた要求の番号）、`conn`、`client`、`upstream`、`server`、`end`、`ms`、`to_upstream`、`from_upstream` | WebSocket の tunnel が終わった（動く前に終わったときも出る）。`end` は `closed`（両方の向きが終わった）、`idle`、`total`、`error`、`stop`（停止で打ち切った）のどれか。バイト数は handshake の後に各向きで読んだ量 |
+| `connection` | `conn`、`listener`、`client`、`class`、`status`、`reason`、`ms`、`streams` | 応答を書かずに終わった接続（リクエストの前に閉じた、2 つ目からの head を拒否した、TLS のハンドシェイクに失敗したなど）と、HTTP/2 の接続の終わり（`streams` は受けたストリームの数） |
+| `tunnel` | `id`（トンネルを開いたリクエストの ID）、`conn`、`client`、`upstream`、`server`、`end`、`ms`、`to_upstream`、`from_upstream` | WebSocket のトンネルが終わった（動く前に終わったときも出る）。`end` は `closed`（両方の向きが終わった）、`idle`、`total`、`error`、`stop`（停止で打ち切った）のどれか。バイト数はハンドシェイクの後に各向きで読んだ量 |
 | `line` | `line` | 下の表の文。512 バイトまでで、長い文は切る。制御文字は空白にする |
-| `audit` | （[管理リファレンス](admin-reference.md) に書く） | 管理のプロセスの監査の記録。管理のプロセスだけが出す。proxy の記録のファイルには入らない |
-| `dropped` | `count` | 書けずに捨てた記録の数（前の `dropped` の記録の後に捨てた分） |
+| `audit` | （[管理リファレンス](admin-reference.md) に書く） | 管理プロセスの監査ログ。管理プロセスだけが出す。プロキシのログファイルには入らない |
+| `dropped` | `count` | 書けずに捨てたログの数（前の `dropped` のログの後に捨てた分） |
 
 `line` の文は次のとおり。
 
 | 文 | とき |
 |---|---|
-| `start: ...` | 起動の各段（`start: rules generation <指紋>`、`start: rules engine <名前>`、`start: rules mode <block か detect>`、`start: rules generation refused: <理由>`、`start: the kernel is ready`、`start: listening`、`start: record file refused: <理由>`、`start: control socket refused: <理由>` など） |
-| `reload: ...` | SIGHUP・SIGUSR1・SIGUSR2 を受けたこと、設定の読み直しの各段と結果（`reload: configuration replaced <SHA-256>`、`reload: configuration refused: <理由>`、`reload: rate limit table started anew` など。上の「SIGHUP（設定の読み直し）」）、切り替え（SIGUSR1 と制御 socket。始めるときに `reload: rules engine <名前>`、断られたときに `reload: rules store refused: <理由>`）と証明書の入れ替えの結果 |
-| `control: switch ...` | 制御 socket の切り替えの依頼への答え（上の「制御 socket」） |
-| `driver: inspector incarnation changed, inc <回>, restarts <回>` | 検査プロセスが起動し直した |
-| `conn <番号>: internal fault: <理由>` | proxy の中の不整合 |
-| `notify: <知らせ> not sent ...` | systemd への知らせを送れなかった |
+| `start: ...` | 起動の各段（`start: managed version <version>`、`start: rules generation <fingerprint>`、`start: rules engine <name>`、`start: rules mode block`（か `detect`）、`start: rules generation refused: <reason>`、`start: tls certificate not issued yet (<place>)`、`start: the kernel is ready`、`start: listening`、`start: record file refused: <reason>`、`start: control socket refused: <reason>` など） |
+| `reload: ...` | SIGHUP・SIGUSR1・SIGUSR2 と、制御ソケットの `reload` の依頼を受けたこと（`reload: SIGHUP`、`reload: control reload <version>` など）。設定のリロードの各段と結果（`reload: configuration replaced <sha256>`、`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`、`reload: configuration refused: <reason>`、`reload: tls certificate not issued yet (<place>)`、`reload: rate limit table started anew`、`reload: rate limit table of host policy <name> started anew` など。上の「SIGHUP（設定のリロード）」）。切り替え（SIGUSR1 と制御ソケット。始めるときに `reload: rules engine <name>`、拒否したときに `reload: rules store refused: <reason>`）と、証明書の入れ替えの結果 |
+| `control: switch ...`、`control: reload ...` | 制御ソケットの切り替えとリロードの依頼への応答（`control: reload <version>: <result> (<reason>)` など。上の「制御ソケット」） |
+| `driver: inspector incarnation changed, inc <count>, restarts <count>` | 検査プロセスが再起動した |
+| `conn <number>: internal fault: <reason>` | プロキシの中の不整合 |
+| `notify: <notice> not sent ...` | systemd への通知を送れなかった |
 | `stop: ...` | 停止の理由と、最後の停止の結果 |
+
+- `<sha256>` は設定ファイルの SHA-256、`<version>` は managed 設定のバージョン（どちらも 64 桁の 16 進数）、`<fingerprint>` はルールの世代のフィンガープリントである。`<place>` は、`managed` の無い設定では `listener <number>, certificate <number>`、`managed` のある設定では `admin route` か `site <name>` である。
 
 ### 書けないとき
 
@@ -1311,7 +1738,7 @@ query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）�
 |---|---|---|
 | `best_effort` | 記録を捨てて数え、要求は通す（上の「書けないとき」） | すべて |
 | `required` | その経路の新しい要求を 503 で断る | すべて |
-| `security` | `best_effort` と同じ | 規則が判定した要求（遮断と、検知だけのモードで当たったもの）、検査できなかった要求（検査プロセスに頼めなかった 503 を含む）、受け付けた後に答えの前に切れた要求（下）だけ。普通に通した要求の記録は書かない |
+| `security` | `best_effort` と同じ | 規則が判定した要求（遮断と、検知だけのモードで当たったもの）、検査できなかった要求（検査プロセスに頼めなかった 503 を含む）、全体の `access`・`rate_limit` とホストごとの設定で断った要求、受け付けた後に答えの前に切れた要求（下）だけ。普通に通した要求の記録は書かない |
 
 `required` の経路は、次の3つがそろうときだけ要求を受け付ける。
 
@@ -1330,7 +1757,7 @@ query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）�
 
 経路を決める前、または本文を読まずに答える次の要求は、経路の値と `records.keep` にかかわらず、記録を「できる限り」で書く。どれも上流へ何も送らない答えである。
 
-- 全体の `access` の 403 と `rate_limit` の 429
+- 全体の `access`・`rate_limit` とホストごとの設定の 403 と 429
 - TLS の接続で、証明書が `Host` を持たない要求の 421
 - どの経路にも当たらず、既定の組も無い要求の 404
 - head の確かめで断った要求、https への redirect、ACME の challenge の答え
@@ -1354,6 +1781,7 @@ tukuyomi-records-ship <config>
 ```
 
 - `<config>` は proxy と同じ設定ファイルで、絶対の path で書く。proxy と同じ確かめで読み、`records.ship` が要る。無ければ `records-ship: configuration refused: there is no records.ship object` の行を出して終わる。
+- 読むのは設定ファイルだけで、managed ストアのバージョンと国のデータベースは読まない。知らない鍵のある設定ファイルは断るので、設定に新しい鍵（`managed`、`host_policies` など）を書く前に、送り手を proxy と同じ build に入れ替える（[実行ファイルの build と配置](../build/binary-deployment.md) の「記録の送り手」）。
 - proxy と同じ利用者で動かす。root では動かない（user id の4つのどれかが 0 なら断る）。記録のディレクトリが、この利用者の本物のディレクトリで、group と other の権限が無いことも確かめる。`ship.state` をそこに書くためである。
 - 記録のディレクトリのファイルシステムは、ファイルの生まれた時刻（`statx` の btime）を返すこと。送り手は、記録のファイルを inode と生まれた時刻の組で見分ける（ファイルシステムは、消したファイルの inode の番号をすぐに使い回す）。返さないファイルシステムでは、送り手は起動を断り、proxy は遅れを「分からない」として `required` の要求を断る。
 - 起動の順は、設定、記録のディレクトリ、接続の文字列のファイル（下）、合図の受け付け、`NOTIFY_SOCKET` があれば `READY=1` である。DB には最初の回でつなぐ。届かない DB は、動いている間に止まったときと同じに、待って試し直す。
@@ -1475,41 +1903,41 @@ TLS は次のとおりである。
 - 準備ができているのは、検査プロセスが動いていて、待ち受けを全部 bind し、停止が始まっていないときである。世代の切り替えの間は、古い世代が答えるので準備ができたままである。
 - `HEAD` は、同じ状態コードで本文を返さない。ほかの method は 405、ほかの target（query の付いたものも）は 404、HTTP/1.1 でない要求と、4 KiB に収まらない head は 400 で答える。
 - 1つの接続で1つの要求に答え、答えたら閉じる。同時に答える接続は 8 つまでで、転送の `max_conns` とは別に数える。それを超えた接続は、受けてすぐ閉じる。head を待つのは 2 秒、答えを書くのは 2 秒までである。
-- 監視の要求は、検査も転送もせず、記録もしない。全体の `access` と `rate_limit` も掛からない。
+- 監視の要求は、検査も転送もせず、記録もしない。全体の `access` と `rate_limit`、ホストごとの設定も掛からない。
 - 監視の待ち受けは、検査プロセスより前に bind し、停止の 3 の後に閉じる。それまで `/healthz` は 200 を返す。
 
 ### 数（`/metrics`）
 
-数は proxy のメモリの中にあり、起動し直すと 0 から数える。label の値は、決まった語か、設定の名前だけである（要求から来る値は label にしない）。
+数はプロキシのメモリの中にあり、再起動すると 0 から数える。label の値は、決まった語か、設定の名前だけである（リクエストから来る値は label にしない）。
 
 | 名前 | 型 | label | 中身 |
 |---|---|---|---|
-| `tukuyomi_requests_total` | counter | `class` | 要求の数。記録を書かない要求も数える（`class` は記録と同じ7つ） |
-| `tukuyomi_waf_rule_hits_total` | counter | `decision`（`block`、`detect`） | 規則が遮断した要求と、検知だけのモードで規則に当たった要求 |
-| `tukuyomi_uninspectable_total` | counter | `reason` | 検査できなかった要求（`invalid`、`queue_full`、`unavailable`、`wait_deadline`、`verdict_deadline`、`inspector_lost`、`protocol`、`inspector_error`、`not_created`、`cancelled`） |
-| `tukuyomi_policy_refusals_total` | counter | `policy`（`access`、`rate_limit`） | 要求の前の方針で断った要求（全体の `access` の 403、`rate_limit` の 429）。経路の `access` の 403 は数えない |
-| `tukuyomi_rate_limit_keys` | gauge | | 流量の制限が今数えている client の数（`keys` のうち使っている分）。`rate_limit` が無ければ 0 |
-| `tukuyomi_rate_limit_evicted_total` | counter | | count が残っているのに、場所を空けるために表から外した client の数。`rate_limit` が無ければ 0 |
+| `tukuyomi_requests_total` | counter | `class` | リクエストの数。ログを書かないリクエストも数える（`class` はログと同じ 7 つ） |
+| `tukuyomi_waf_rule_hits_total` | counter | `decision`（`block`、`detect`） | ルールがブロックしたリクエストと、検知のみのモードでルールに当たったリクエスト |
+| `tukuyomi_uninspectable_total` | counter | `reason` | 検査できなかったリクエスト（`invalid`、`queue_full`、`unavailable`、`wait_deadline`、`verdict_deadline`、`inspector_lost`、`protocol`、`inspector_error`、`not_created`、`cancelled`） |
+| `tukuyomi_policy_refusals_total` | counter | `policy`（`access`、`rate_limit`） | リクエストの前のポリシーで拒否したリクエスト（全体の設定とホストごとの設定の、アクセス制御の 403 とレート制限の 429）。ルートの `access` と `admin.route.access` の 403 は数えない |
+| `tukuyomi_rate_limit_keys` | gauge | | レート制限が今数えているクライアントの数。全体とホストごとの設定のすべての表の合計（`keys` のうち使っている分）。レート制限が無ければ 0 |
+| `tukuyomi_rate_limit_evicted_total` | counter | | 数が残っているのに、場所を空けるために表から外したクライアントの数。すべての表の合計で、設定のリロードで表が切り替わっても減らない。レート制限が無ければ 0 |
 | `tukuyomi_connections_accepted_total` | counter | | 受けた接続 |
 | `tukuyomi_connections_open` | gauge | | 開いている接続 |
 | `tukuyomi_connection_permit_waits_total` | counter | | 受付が接続の枠を待った回数（`max_conns` に届いた回数の目安） |
-| `tukuyomi_tls_handshake_failures_total` | counter | | TLS の handshake の失敗と時間切れ |
-| `tukuyomi_body_buffer_bytes` | gauge | | 本文などをためている予算のバイト数（`max_buffered_bytes` のうち使っている分） |
-| `tukuyomi_inspections_waiting` | gauge | | 検査の待ちの席を持っている要求（`wait_queue` のうち使っている分） |
-| `tukuyomi_inspector_up` | gauge | | 要求を受けている検査核の準備ができていれば 1、でなければ 0 |
-| `tukuyomi_inspector_restarts_total` | counter | | 検査プロセスの起動し直し |
-| `tukuyomi_rules_generation_info` | gauge | `generation`（指紋の先頭16桁）、`mode`、`engine` | 要求を受けている世代。値はいつも 1 |
-| `tukuyomi_rules_switches_total` | counter | `result`（`switched`、`refused`、`failed`） | SIGUSR1 と制御 socket による世代の切り替え |
-| `tukuyomi_certificate_reloads_total` | counter | `result`（`replaced`、`refused`） | SIGUSR2 による証明書の読み直し |
-| `tukuyomi_config_reloads_total` | counter | `result`（`replaced`、`refused`） | SIGHUP による設定の読み直し。読み直しの途中に受けて捨てた SIGHUP は数えない |
-| `tukuyomi_upstream_failures_total` | counter | `group` | 上流の組の server の失敗。SIGHUP の読み直しで、0 から数え直す |
-| `tukuyomi_records_dropped_total` | counter | | 捨てた記録（上の「書けないとき」） |
-| `tukuyomi_record_write_errors_total` | counter | | 書き込みに失敗した記録 |
-| `tukuyomi_record_file_errors_total` | counter | | 記録のファイルに書けなかった記録と、失敗した同期（上の「記録のファイル」） |
-| `tukuyomi_records_refused_total` | counter | | `required` の経路で、記録を残せないために 503 で断った要求（上の「記録の残し方」） |
-| `tukuyomi_records_healthy` | gauge | | 記録のファイルへの最後の書き込みが通り、記録を書く thread が動いていれば 1、でなければ 0 |
-| `tukuyomi_records_admitting` | gauge | | `required` の経路の要求を今受け付けるなら 1、断るなら 0（上の「記録の残し方」の3つ）。`required` の経路が無くても出る |
-| `tukuyomi_records_unshipped_bytes` | gauge | | 送り手がまだ送っていない、記録のファイルのバイト数。`records.ship` があるときだけ出る。送り手の遅れが分からない間は、値が無い |
+| `tukuyomi_tls_handshake_failures_total` | counter | | TLS のハンドシェイクの失敗とタイムアウト |
+| `tukuyomi_body_buffer_bytes` | gauge | | ボディなどをためている予算のバイト数（`max_buffered_bytes` のうち使っている分） |
+| `tukuyomi_inspections_waiting` | gauge | | 検査の待ちの席を持っているリクエスト（`wait_queue` のうち使っている分） |
+| `tukuyomi_inspector_up` | gauge | | リクエストを受けている検査核の準備ができていれば 1、でなければ 0 |
+| `tukuyomi_inspector_restarts_total` | counter | | 検査プロセスの再起動 |
+| `tukuyomi_rules_generation_info` | gauge | `generation`（フィンガープリントの先頭 16 桁）、`mode`、`engine` | リクエストを受けている世代。値はいつも 1 |
+| `tukuyomi_rules_switches_total` | counter | `result`（`switched`、`refused`、`failed`） | SIGUSR1 と制御ソケットによる世代の切り替え |
+| `tukuyomi_certificate_reloads_total` | counter | `result`（`replaced`、`refused`） | SIGUSR2 による証明書の再読み込み |
+| `tukuyomi_config_reloads_total` | counter | `result`（`replaced`、`refused`） | SIGHUP と制御ソケットの `reload` による設定のリロード。リロードの途中に受けて無視した SIGHUP と、リロードを始めなかった `reload` の依頼（`busy`、`unmanaged`、`error` の応答）は数えない |
+| `tukuyomi_upstream_failures_total` | counter | `group` | アップストリームのサーバーの失敗。設定のリロードで、0 から数え直す |
+| `tukuyomi_records_dropped_total` | counter | | 捨てたログ（上の「書けないとき」） |
+| `tukuyomi_record_write_errors_total` | counter | | 書き込みに失敗したログ |
+| `tukuyomi_record_file_errors_total` | counter | | ログファイルに書けなかったログと、失敗した同期（上の「記録のファイル」） |
+| `tukuyomi_records_refused_total` | counter | | `required` のルートで、ログを残せないために 503 で拒否したリクエスト（上の「記録の残し方」） |
+| `tukuyomi_records_healthy` | gauge | | ログファイルへの最後の書き込みが通り、ログを書くスレッドが動いていれば 1、でなければ 0 |
+| `tukuyomi_records_admitting` | gauge | | `required` のルートのリクエストを今受け付けるなら 1、拒否するなら 0（上の「記録の残し方」の 3 つ）。`required` のルートが無くても出る |
+| `tukuyomi_records_unshipped_bytes` | gauge | | ログ送信プロセスがまだ送っていない、ログファイルのバイト数。`records.ship` があるときだけ出る。ログ送信プロセスの遅れが分からない間は、値が無い |
 | `tukuyomi_start_time_seconds` | gauge | | 起動した時刻（Unix 時間の秒） |
 
 ### systemd への知らせ
@@ -1527,42 +1955,46 @@ TLS は次のとおりである。
 
 ### 要るもの
 
-- CA は、証明書の名前の port 80 へ、平文の HTTP で challenge を取りに来る。port 80 で普通の待ち受けか redirect の待ち受けを持つ。
-  - proxy は port の番号を確かめない。
-- 普通の待ち受けと redirect の待ち受けは、次の要求に、全体の `access` と `rate_limit`・経路・経路の `access`・検査・転送・redirect より先に答える。TLS の待ち受けは答えない。
+- CA は、証明書のホストの port 80 へ、平文の HTTP で challenge を取りに来る。port 80 で、通常のリスナーか redirect のリスナーを持つ。
+  - プロキシは port の番号を検証しない。
+- 通常のリスナーと redirect のリスナーは、次のリクエストに、管理画面のルート、ポリシー（全体の設定とホストごとの設定）、ルート、ルートの `access`、検査、転送、redirect より先に応答する。TLS のリスナーは応答しない。
   - method が `GET` か `HEAD`
-  - target が `/.well-known/acme-challenge/<token>` で、後ろに何も無い（query や escape も無い）。token は 1〜128 文字の英数字・`-`・`_` である
-  - `Host` が `acme` を持つ証明書の host（大小を区別せず、port と末尾の `.` は見ない）
-- 上の形でない要求は challenge として扱わず、ほかの要求と同じに経路と検査へ回る。
-- 答えは、`challenge_dir` の `<token>` のファイル（1 KiB までの普通のファイル）を本文にした 200 か、404 である。link はたどらない。
-- `ca_file` には、CA の API の server 証明書を出した root だけを入れる。100 枚までなので、OS の root の束をそのまま使うことはできない。
+  - target が `/.well-known/acme-challenge/<token>` で、後ろに何も無い（クエリやエスケープも無い）。token は 1〜128 文字の英数字・`-`・`_` である
+  - `Host` が、`acme` を持つ証明書のホスト（大文字と小文字を区別せず、port と末尾の `.` は見ない）。`managed` のある設定では、`acme` を持つ管理画面のルートのホストと、稼働中のバージョンの ACME のサイトのホストである（上の「ACME のサイト」）
+- 上の形でないリクエストは challenge として扱わず、ほかのリクエストと同じにルートと検査へ回る。
+- 応答は、`challenge_dir` の `<token>` のファイル（1 KiB までの通常のファイル）をボディにした 200 か、404 である。シンボリックリンクはたどらない。
+- `admin.route.access` は challenge に掛からない（CA はどのアドレスからも来る）。
+- `ca_file` には、CA の API のサーバー証明書を出したルート証明書だけを入れる。100 枚までなので、OS のルート証明書の束をそのまま使うことはできない。
 
 ### 初めての発行
 
 1. 設定に `acme` と、`acme` を持つ証明書を書く。証明書のファイルはまだ無くてよい。
-   - proxy は、行を出してその証明書を handshake から外したまま起動する。
+   - `managed` の無い設定では、リスナーの証明書に `acme` を付ける。`managed` のある設定では、管理画面のルートの証明書（`admin.route.certificate`）とバージョンのサイト（上の「ACME のサイト」）に付ける。
+   - プロキシは、行（`start: tls certificate not issued yet (<place>)`）を出して、その証明書をハンドシェイクから外したまま起動する。
    - 試すときは、CA の試験用の directory（Let's Encrypt なら staging）を `directory_url` に書く。
-2. proxy を起動する。
-3. サービスの利用者で `acme renew` を流す。
+2. プロキシを起動する。
+3. サービスの OS ユーザーで `acme renew` を流す。
 
    ```bash
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy acme renew /etc/tukuyomi-core/config.json
    ```
 
-   `2.1 renewed` のような行が出る。
-4. `systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`（SIGUSR2）で、proxy が証明書を使い始める。
-5. 試験用の CA で通ったら、本番の CA へ替える。
-   - 試験用の CA の証明書は、期限が来ていないので、そのままでは置き換わらない（`valid`）。その証明書の `cert_file` と `key_file` を消す。
-   - `directory_url` を本番の CA のものに替える。CA の API の server 証明書の root が違うなら、`ca_file` も替える。
-   - もう一度 `acme renew` を流してから、SIGUSR2 を送る。ファイルを消してから `acme renew` が終わるまでの間に SIGUSR2 を送ると（証明書も読む SIGHUP の読み直しも含む）、その証明書は handshake から外れる。この順を守れば、その間も proxy は読み込み済みの証明書を使い続ける。
-   - `directory_url`・`ca_file`・`contact_email` など、`acme` の多くの鍵は命令だけが読むので、proxy の起動し直しは要らない。`challenge_dir` と、`acme` を持つ証明書の host は proxy も読むので、替えたときは proxy に読み直させる（SIGHUP、`systemctl reload`）。
+   `2.1 renewed` のような行が出る（`managed` のある設定では `admin route renewed`、`site www renewed` のような行）。
+4. `systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`（SIGUSR2）で、プロキシが証明書を使い始める。
+5. 試験用の CA で通ったら、本番の CA に切り替える。
+   - 試験用の CA の証明書は、有効期限が来ていないので、そのままでは置き換わらない（`valid`）。その証明書のファイルを削除する。リスナーと管理画面のルートの証明書は `cert_file` と `key_file`、ACME のサイトは managed ストアの `acme/<hosts-sha256>/` の `chain` と `key` である。
+   - `directory_url` を本番の CA のものに変更する。CA の API のサーバー証明書のルート証明書が違うなら、`ca_file` も変更する。
+   - もう一度 `acme renew` を流してから、SIGUSR2 を送る。ファイルを削除してから `acme renew` が終わるまでの間に SIGUSR2 を送ると（証明書も読む設定のリロードも含む）、その証明書はハンドシェイクから外れる。この順を守れば、その間もプロキシは読み込み済みの証明書を使い続ける。
+   - `directory_url`・`ca_file`・`contact_email` など、`acme` の多くの設定キーはコマンドだけが読むので、プロキシの再起動は要らない。`challenge_dir` と、`acme` を持つ証明書のホストはプロキシも読むので、変更したときはプロキシに設定をリロードさせる（SIGHUP、`systemctl reload`。ACME のサイトのホストは、バージョンの反映で切り替わる）。
 6. 毎日の timer を置く（[実行ファイルの build と配置](../build/binary-deployment.md) の「証明書の更新の timer」）。
 
 ### 注意
 
-- 同じ設定で `acme renew` を2つ同時に流さない。止める仕組みが無い。
-- 命令の後に SIGUSR2 を送らないと、新しい証明書は使われない。
+- 同じ設定で `acme renew` を 2 つ同時に流さない。止める仕組みが無い。
+- コマンドの後に SIGUSR2 を送らないと、新しい証明書は使われない。
 - 鍵と証明書は別のファイルに書いて同期してから、鍵、証明書の順に置き換える。
-  - 2つの置き換えの間で止まると、鍵が証明書に合わない組が残る。動いている proxy は、SIGUSR2 でその組を断って今のものを使い続け、次の命令が作り直す。ただし、その間に proxy を起動すると、その組を断って起動しない（exit 1）。
-- `cert_file`・`key_file`・`challenge_dir` の置かれたディレクトリに、サービスの利用者が書けること（[実行ファイルの build と配置](../build/binary-deployment.md) の「利用者と置き場」）。
+  - 2 つの置き換えの間で止まると、鍵が証明書に合わない組が残る。動いているプロキシは、SIGUSR2 でその組を拒否して今のものを使い続け、次のコマンドが作り直す。ただし、その間にプロキシを起動すると、その組を拒否して起動しない（exit 1）。
+  - 2 つの置き換えの間と、設定のリロード（SIGHUP、制御ソケットの `reload`）、`managed activate`、`config check`、起動が重なると、証明書の検証で拒否されることがある（`tls refused`）。そのときは、もう一度流す。管理画面と管理 API の反映での扱いは、[管理リファレンス](admin-reference.md) の「制御ソケット」に書く。
+- `cert_file`・`key_file`・`challenge_dir` の置かれたディレクトリと、managed ストアに、サービスの OS ユーザーが書けること（[実行ファイルの build と配置](../build/binary-deployment.md) の「OS ユーザーとディレクトリ」）。
   - 鍵は 0600、証明書は 0644 で書く（umask の分は引かれる）。
+- ACME のサイトのホストの組を変更したバージョンに反映したときと、前のバージョンに戻したときは、すぐに `acme renew` を流す（上の「ACME のサイト」）。
