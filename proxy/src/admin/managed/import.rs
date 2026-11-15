@@ -36,8 +36,8 @@
 //!    it does not take is 503, and nothing is saved.
 //! 6. The files and the version are put in the store under its lock: a lock that a command holds is 409 (`the managed
 //!    store is in use by another command`), and so is another refusal of the store; a version that the reading with
-//!    the files of the store refuses is 400, about no place, and a main file that it refuses (its country database) is
-//!    409. These are audited as failed (`store`, `version`, `configuration`).
+//!    the files of the store refuses is 400, about no place, and a main file that it refuses is 409 (the country
+//!    database is not read here, as in 4). These are audited as failed (`store`, `version`, `configuration`).
 //! 7. The job starts (see `job`). A saved version that no job puts in force (the time of the answer was over, the
 //!    process is stopping, the thread could not be started) stays in the store; it does no harm.
 //!

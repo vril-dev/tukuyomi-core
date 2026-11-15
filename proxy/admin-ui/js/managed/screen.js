@@ -100,6 +100,7 @@ export function unusedNotice(role) {
       el('li', {}, w('managed.unused_move')),
       el('li', {}, w('managed.unused_admin')),
       el('li', {}, w('managed.unused_import')),
+      el('li', {}, w('managed.unused_acme')),
       el('li', {}, w('managed.unused_restart')),
     ),
     canChange(role) ? el('p', {}, el('a', { class: 'tc-link', href: hashOf('config') }, w('managed.unused_link'))) : null,
