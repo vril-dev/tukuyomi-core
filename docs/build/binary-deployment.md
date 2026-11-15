@@ -224,11 +224,11 @@ sudo -u tukuyomi scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
   ```
 
 - データベースを入れ替えるときは、新しいファイルを別の名前で置き、設定の `geo.country_db` と `geo.sha256` を 1 回の置き換えで書き換えます。`config check` で検証してから、プロキシにリロードさせます（`systemctl reload`）。プロキシは、起動時とリロードのたびにデータベースを読みます。管理プロセスは、データベースを読みません。
-- 設定キーと、国の判定の方法（プライベートアドレスや、IPv4 だけのデータベースでの IPv6 アドレスは `UNKNOWN`）は、[運用リファレンス](../operations/operator-reference.md) の「リクエストの前のポリシー」を参照してください。
+- 設定キーと、国の判定の方法（プライベートアドレスや、IPv4 だけのデータベースでの IPv6 アドレスは `UNKNOWN`）は、[運用リファレンス](../operations/operator-reference.md) の「アクセス制御とレート制限」を参照してください。
 
 ## 初回起動の手順
 
-設定ファイルに `managed` を書く（managed 設定を使う）場合は、[運用リファレンス](../operations/operator-reference.md) の「managed で初めて起動する」の手順で進めてください。managed 設定を使うかどうかの判断は、同じ文書の「managed 設定を使うかどうか」を参照してください。その手順では、下の 2〜4 と 7 をそのまま使います。
+設定ファイルに `managed` を書く（managed 設定を使う）場合は、[運用リファレンス](../operations/operator-reference.md) の「managed 設定での初回起動」の手順で進めてください。managed 設定を使うかどうかの判断は、同じ文書の「managed 設定を使うかどうか」を参照してください。その手順では、下の 2〜4 と 7 をそのまま使います。
 
 1. 設定ファイルを書きます。設定キーの一覧と例は、[運用リファレンス](../operations/operator-reference.md) を参照してください。上の表のディレクトリを先に作ります。国の指定を使う場合は、国のデータベースも置き、`sha256` を書きます（上の「国のデータベース」）。
 2. CRS を取得します（上の「CRS の取得」）。
@@ -271,7 +271,7 @@ sudo -u tukuyomi scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
    - 作るユーザーのロールは `owner` です。成功すると `created owner <name>` が出ます。管理データの保存先にユーザーが 1 人でもいれば、拒否されます（exit 1）。
    - 管理プロセスの起動の前でも後でも実行できます。パスワードを忘れたユーザーには `admin reset` を使います。
    - 管理 API、ロール、画面については、[管理リファレンス](../operations/admin-reference.md) を参照してください。
-8. ログを DB へ送る場合は、DB のユーザーと DB を用意し、接続文字列のファイルを、所有者をサービスの OS ユーザーにして 0600 で置きます。設定に `records.ship` を書いて、ログ送信プロセスのユニットを起動します（下の「ログ送信プロセスのユニット」）。テーブルは、ログ送信プロセスが最初に接続したときに作ります。テーブルの権限と接続文字列の形式は、[運用リファレンス](../operations/operator-reference.md) の「記録の送り手」を参照してください。
+8. ログを DB へ送る場合は、DB のユーザーと DB を用意し、接続文字列のファイルを、所有者をサービスの OS ユーザーにして 0600 で置きます。設定に `records.ship` を書いて、ログ送信プロセスのユニットを起動します（下の「ログ送信プロセスのユニット」）。テーブルは、ログ送信プロセスが最初に接続したときに作ります。テーブルの権限と接続文字列の形式は、[運用リファレンス](../operations/operator-reference.md) の「ログ送信プロセス」を参照してください。
 
 ## systemd
 
@@ -318,7 +318,7 @@ WantedBy=multi-user.target
   - `TimeoutStartSec` は、アップストリームの名前解決の時間（`resolve_timeout_ms`）と、検査カーネルの準備を待つ時間（`ready_wait_ms`）を足した時間より長くします。`READY=1` が届かないと、systemd はこの時間の後にプロキシを停止します。
 - `TimeoutStopSec` は、`stop_wait_ms` と `kill_grace_ms` と、ログの書き出しの 200 ms を足した時間より長くします。短いと、systemd が先に SIGKILL を送ります。停止の流れは、[運用リファレンス](../operations/operator-reference.md) の「停止」を参照してください。
 - `LogRateLimitIntervalSec=0` を指定します。journald のデフォルトのレート制限では、リクエストが集中したときにリクエストのログがジャーナルに入らずに失われます。
-- ログはジャーナルに入ります。設定に `records` があれば、同じログがファイルにも書かれます（上の「OS ユーザーとディレクトリ」）。保存期間と容量は、journald の設定（`/etc/systemd/journald.conf` の `SystemMaxUse`、`MaxRetentionSec` など）で決めます。ログにはクライアントのアドレスとパスが入るので、ジャーナルを読めるグループ（Ubuntu では `adm`・`systemd-journal`）に入れる OS ユーザーは最小限にしてください。ログの形式は、[運用リファレンス](../operations/operator-reference.md) の「記録」を参照してください。
+- ログはジャーナルに入ります。設定に `records` があれば、同じログがファイルにも書かれます（上の「OS ユーザーとディレクトリ」）。保存期間と容量は、journald の設定（`/etc/systemd/journald.conf` の `SystemMaxUse`、`MaxRetentionSec` など）で決めます。ログにはクライアントのアドレスとパスが入るので、ジャーナルを読めるグループ（Ubuntu では `adm`・`systemd-journal`）に入れる OS ユーザーは最小限にしてください。ログの形式は、[運用リファレンス](../operations/operator-reference.md) の「ログ」を参照してください。
 - 監視用のリスナー（設定の `status`）を置くと、同じホストの監視プログラムから `/healthz`・`/readyz`・`/metrics` にアクセスできます。ロードバランサーの準備状態の確認には `/readyz` を使います。
 - シグナルは、プロキシのメインプロセスにだけ送ります（`ExecReload` の `$MAINPID`、または `systemctl kill --kill-whom=main`）。
   - `--kill-whom=main` を付けない `systemctl kill` は、検査プロセスにもシグナルを送ります。
@@ -384,7 +384,7 @@ WantedBy=multi-user.target
 - 管理プロセスは、`admin.listen` のループバックアドレスで、平文の HTTP で待ち受けます。1024 以上のポートなら、`AmbientCapabilities` は不要です。
 - 管理プロセスは、設定ファイルを起動時に 1 回だけ読みます（プロキシと違い、SIGHUP でリロードしません）。設定を変更したら、`config check` で検証してから、`systemctl restart` で再起動します。`ExecReload` は置きません（管理プロセスにとって SIGHUP は停止のシグナルです）。
 - プロキシが動いていなくても、管理プロセスは起動します。その間は、世代の切り替えも managed 設定の反映も依頼できません。
-- 外部から使う場合は、プロキシの TLS リスナーのルートから `admin.listen` のアドレスへ転送します。`admin.listen` はアップストリームのサーバーに指定できます。`managed` のある設定では、ルートではなく `admin.route` で転送し、`admin.listen` をアップストリームのサーバーには指定できません（[運用リファレンス](../operations/operator-reference.md) の「`admin`」）。ルートの書き方は [管理リファレンス](../operations/admin-reference.md) の「外から使う」を、画面と API の使い方は同じ文書を参照してください。
+- 外部から使う場合は、プロキシの TLS リスナーのルートから `admin.listen` のアドレスへ転送します。`admin.listen` はアップストリームのサーバーに指定できます。`managed` のある設定では、ルートではなく `admin.route` で転送し、`admin.listen` をアップストリームのサーバーには指定できません（[運用リファレンス](../operations/operator-reference.md) の「`admin`」）。ルートの書き方は [管理リファレンス](../operations/admin-reference.md) の「外部からの利用」を、画面と API の使い方は同じ文書を参照してください。
 - ログはジャーナルに入ります。監査ログは、管理データの保存先の `audit/` にも書かれます。
 
 ### ログ送信プロセスのユニット
@@ -422,7 +422,7 @@ WantedBy=multi-user.target
 - DB がログインを拒否すると、ログ送信プロセスは exit 1 で終了し、`Restart=on-failure` により `RestartSec` ごとに再起動します。接続文字列を直すまで、これを繰り返します。
 - DB サーバーの証明書を独自の認証局で発行したときは、その証明書のファイルを `Environment=SSL_CERT_FILE=<path>` で渡します。
 - 設定ファイルと接続文字列のファイルは、起動時に 1 回だけ読みます（プロキシと違い、SIGHUP でリロードしません）。変更したら、`systemctl restart` で再起動します。`ExecReload` は置きません（ログ送信プロセスにとって SIGHUP は停止のシグナルです）。
-- ログ送信プロセスはプロキシと同じ設定ファイルを読み、未知の設定キーを含む設定ファイルは受け付けません。設定に新しい設定キー（`managed`、`host_policies` など）を書く前に、ログ送信プロセスの実行ファイルをプロキシと同じビルドに入れ替えてください。前のビルドのままだと、ログ送信プロセスは次の起動で設定を受け付けず、起動しません（[運用リファレンス](../operations/operator-reference.md) の「送り手の起動」）。
+- ログ送信プロセスはプロキシと同じ設定ファイルを読み、未知の設定キーを含む設定ファイルは受け付けません。設定に新しい設定キー（`managed`、`host_policies` など）を書く前に、ログ送信プロセスの実行ファイルをプロキシと同じビルドに入れ替えてください。前のビルドのままだと、ログ送信プロセスは次の起動で設定を受け付けず、起動しません（[運用リファレンス](../operations/operator-reference.md) の「ログ送信プロセスの起動」）。
 - プロキシが動いていなくても、ログ送信プロセスは起動し、ファイルにあるログを送ります。プロキシは、ログ送信プロセスが動いていないこと（`ship.state` が 90 秒より古いこと）を、`required` のルートのリクエストを拒否することで示します。
 - ログ送信プロセスのログはジャーナルに入ります。
 
