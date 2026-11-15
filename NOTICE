@@ -1,0 +1,48 @@
+tukuyomi-core includes third-party open source software.
+
+Key dependencies and their license families include:
+
+tukuyomi-proxy and tukuyomi-records-ship (Rust):
+- tokio, hyper, h2                        MIT License
+- http, serde, serde_json, flate2         MIT / Apache 2.0
+- rustls                                  Apache 2.0 / ISC / MIT
+- aws-lc-rs, aws-lc-sys (AWS-LC)          ISC, Apache 2.0, MIT, BSD-style
+
+tukuyomi-records-ship also includes:
+- tokio-postgres, mysql_async             MIT / Apache 2.0
+- ICU4X (icu_* and related crates)        Unicode License v3
+- webpki-roots                            CDLA-Permissive-2.0
+
+tukuyomi-inspector (Go):
+- github.com/corazawaf/coraza/v3          Apache License 2.0
+- github.com/corazawaf/libinjection-go    BSD-style License
+- golang.org/x/net, x/sync, x/text        BSD-style License
+
+tukuyomi-inspector-modsecurity (Rust and C++):
+- libmodsecurity (ModSecurity v3)         Apache License 2.0
+- libinjection (bundled)                  BSD-style License
+- Mbed TLS (bundled, part)                Apache License 2.0
+- PCRE2                                   BSD-style License
+- YAJL                                    ISC License
+
+The OWASP Core Rule Set (CRS) is not included. scripts/fetch-crs.sh downloads
+it from the release of the CRS project; the CRS is distributed under the
+Apache License 2.0.
+
+The license texts and copyright notices of these and all other third-party
+components included in the executables are in THIRD-PARTY-LICENSES.
+Redistribution of binaries must continue to comply with the applicable
+third-party license notices.
+
+tukuyomi-proxy and tukuyomi-records-ship include AWS-LC through the aws-lc-rs
+and aws-lc-sys crates. The NOTICE files of the AWS-LC and aws-lc-rs projects
+contain the following notices:
+
+AWS-LC
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+AWS Libcrypto for Rust
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+Based on ring
+Copyright Brian Smith

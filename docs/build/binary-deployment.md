@@ -50,6 +50,28 @@
   - PostgreSQL か MySQL の server。試したのは PostgreSQL 16・18 と MySQL 8.0 である。
   - 記録のディレクトリのファイルシステムが、ファイルの生まれた時刻（`statx` の btime）を返すこと。試したのは ext4 だけである。
 
+## リリースの tarball
+
+0.1.0 から、GitHub のリリースに、Linux x86_64 の実行ファイルの tarball を置く。ソースから build しないときは、これを使う。
+
+| ファイル | 中身 |
+|---|---|
+| `tukuyomi-core_v0.1.0_linux_amd64.tar.gz` | ディレクトリ `tukuyomi-core_v0.1.0_linux_amd64/` に、4つの実行ファイル（上の「動くもの」）、`README.md`、`LICENSE`、`NOTICE`、`THIRD-PARTY-LICENSES`、`docs/`、`scripts/fetch-crs.sh` |
+| `tukuyomi-core_v0.1.0_linux_amd64.tar.gz.sha256` | tarball の SHA-256 |
+| `tukuyomi-core_v0.1.0_SHA256SUMS` | 上と同じ行 |
+
+- 取ったら、展開の前に SHA-256 を確かめる。
+
+  ```bash
+  sha256sum -c tukuyomi-core_v0.1.0_linux_amd64.tar.gz.sha256
+  tar -xzf tukuyomi-core_v0.1.0_linux_amd64.tar.gz
+  ```
+
+- 実行ファイルは、Ubuntu 26.04.1 LTS（glibc 2.43、gcc 15.2.0）で、`rustc` 1.94.1 と Go 1.27.2 を使って build した。動かして確かめたのは、build したホストだけである。
+- 動かすホストの glibc は 2.39 以上が要る（`tukuyomi-proxy` が `GLIBC_2.39` の記号を使う）。ModSecurity の検査プロセスには、さらに libstdc++ の `GLIBCXX_3.4.29` と `CXXABI_1.3.15` の記号が要る。これより古い Linux では動かないので、ソースから build する（下の「build」）。
+- 検査プロセス（`tukuyomi-inspector`）は、静的に link してある。TLS の library（aws-lc）も、実行ファイルに静的に入っている。
+- 実行ファイルは、例えば `/opt/tukuyomi-core/bin/` に置く。その後の手順は、ソースから build したときと同じである（下の「OS ユーザーとディレクトリ」と「初めて起動する手順」）。
+
 ## build
 
 proxy は `proxy/` で build する。検査核は、そこから一緒に build される。
@@ -122,7 +144,7 @@ cd records-ship && cargo build --release --locked
 
 ### CRS の取得
 
-CRS（OWASP Core Rule Set）は同梱しない。`scripts/fetch-crs.sh` で取得する。サービスの利用者で流す。
+CRS（OWASP Core Rule Set）は同梱しない。`scripts/fetch-crs.sh` で取得する。サービスの利用者で流す。CRS は Apache License 2.0 で配布されている。台本はルールのファイルだけを取り出し、archive の `LICENSE` は取り出さない。
 
 ```bash
 sudo -u tukuyomi scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0

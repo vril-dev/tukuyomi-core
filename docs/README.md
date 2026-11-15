@@ -2,7 +2,7 @@
 
 tukuyomi-core の設計文書を置くディレクトリ。tukuyomi-core は、tukuyomi（tukuyomi WAF）から派生し、WAF 機能に特化したシステムを目指す。
 
-現時点で実装しているのは、初回の検査核、HTTP・HTTPS の受付と転送、要求の前の方針、管理のプロセス（管理 API と管理画面）、managed 設定、記録の送り手である。Rust のライブラリ [`kernel/`](../kernel/)、Go の検査プロセス [`inspector/`](../inspector/)、ModSecurity の検査プロセス [`inspector-modsecurity/`](../inspector-modsecurity/)、HTTP の実行体 [`proxy/`](../proxy/)（管理のプロセスと、その画面 [`proxy/admin-ui/`](../proxy/admin-ui/) を含む）、記録の送り手 [`records-ship/`](../records-ship/) のソースがあり、配布物はまだない。`detailed-design/` の文書は初期草案で、目標・前提・候補・未決事項を記録している。実装済みの範囲は [システム概要](detailed-design/00_overview/system-overview.md) の「現在の状態」に書く。`build/` と `operations/` の文書は、今の実装の動かし方を書く。
+現時点で実装しているのは、初回の検査核、HTTP・HTTPS の受付と転送、要求の前の方針、管理のプロセス（管理 API と管理画面）、managed 設定、記録の送り手である。Rust のライブラリ [`kernel/`](../kernel/)、Go の検査プロセス [`inspector/`](../inspector/)、ModSecurity の検査プロセス [`inspector-modsecurity/`](../inspector-modsecurity/)、HTTP の実行体 [`proxy/`](../proxy/)（管理のプロセスと、その画面 [`proxy/admin-ui/`](../proxy/admin-ui/) を含む）、記録の送り手 [`records-ship/`](../records-ship/) のソースがある。0.1.0 から、Linux x86_64 の4つの実行ファイルを1つの tarball にして、GitHub のリリースに置く（[実行ファイルの build と配置](build/binary-deployment.md) の「リリースの tarball」）。`detailed-design/` の文書は初期草案で、目標・前提・候補・未決事項を記録している。実装済みの範囲は [システム概要](detailed-design/00_overview/system-overview.md) の「現在の状態」に書く。`build/` と `operations/` の文書は、今の実装の動かし方を書く。
 
 ## 作成済みの文書
 
@@ -11,7 +11,7 @@ tukuyomi-core の設計文書を置くディレクトリ。tukuyomi-core は、t
 | [システム概要](detailed-design/00_overview/system-overview.md) | 目的、現在の状態、前提・候補・未決定の区別、検討の対象とする範囲、用語 |
 | [アーキテクチャ概要](detailed-design/00_overview/architecture.md) | 構成の候補、責務の分担、障害の影響範囲、要求処理の流れの例、設計上の義務、状態 × 操作、採用判断に必要な検証の候補 |
 | [設計方針・制約](detailed-design/00_overview/design-principles.md) | 設計原則とその適用、検査モードと技術障害の区別、fail-closed の適用範囲、記録と管理機能の扱い、移植と前例、版の方針 |
-| [実行ファイルの build と配置](build/binary-deployment.md) | 要るもの、build、CRS の取得、OS ユーザーとディレクトリ、国のデータベース、初めて起動する手順、systemd の例（管理のプロセスと記録の送り手を含む）、検査プロセスの絞り |
+| [実行ファイルの build と配置](build/binary-deployment.md) | 要るもの、リリースの tarball、build、CRS の取得、OS ユーザーとディレクトリ、国のデータベース、初めて起動する手順、systemd の例（管理のプロセスと記録の送り手を含む）、検査プロセスの絞り |
 | [運用リファレンス](operations/operator-reference.md) | 命令、合図、停止、設定ファイルの鍵と値どうしの関係、本文と予算、ルールセットと世代、managed 設定（使うかどうか、managed ストアとバージョン、初めて起動する手順、移し方、反映）、要求の扱い、リクエストの前のポリシー（全体の許可・拒否、レート制限、ホストごとの設定、国のデータベース）、記録の行と記録のファイル、記録の残し方、記録の送り手（PostgreSQL・MySQL）、監視、ACME |
 | [管理リファレンス](operations/admin-reference.md) | 管理のプロセスの命令と待ち受け、設定の `admin`、外から使う経路（managed のある設定の管理画面のルートを含む）、利用者と役割、ログインと第二要素、API の token、監査、世代の操作、managed 設定の操作、切り替えの履歴、設定の変更履歴、記録の読み出し、管理画面、API の path の一覧 |
 
