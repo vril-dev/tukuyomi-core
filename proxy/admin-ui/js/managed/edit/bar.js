@@ -10,7 +10,7 @@ import { badge, button, el, mount, notice } from '../../dom.js';
 import { lazy, t, w } from '../../i18n.js';
 import { confirmChange, diffView, fingerprintView, hashOf, isFingerprint, panelWith, setBusy, shortOf, working } from '../../parts.js';
 import { Screen, countsOf, diffRows, unusedNotice } from '../screen.js';
-import { changesBetween, sitesToIssue } from './changes.js';
+import { changesBetween, notReached, sitesToIssue } from './changes.js';
 import { forgetDraft, heldDraft, readableVersion, savingRuns, settleSaving, syncDraft, watchDraft } from './draft.js';
 import { barFault, faultAt } from './locate.js';
 
@@ -26,8 +26,14 @@ const AREAS = {
   default: () => w('edit.area.default'),
   access: () => w('edit.area.access'),
   rate_limit: () => w('edit.area.rate_limit'),
+  host_policy: () => w('edit.area.host_policy'),
   site: () => w('edit.area.site'),
   route: () => w('edit.area.route'),
+};
+// What a change of the global access control or rate limit says of the host policies that it does not reach.
+const UNREACHED = {
+  access: (n, names) => w('edit.reach.access', { n, names }),
+  rate_limit: (n, names) => w('edit.reach.rate_limit', { n, names }),
 };
 const ACTIONS = {
   add: () => w('edit.change.add'),
@@ -85,6 +91,21 @@ export function checkFinding(draft, asked, { answer, error }, describe) {
   return answer.version === draft.base ? { kind: 'same' } : { kind: 'passed', to: answer.version };
 }
 
+/**
+ * The notice that a change of the global `kind` (`access` or `rate_limit`) does not reach the host policies `names`
+ * (see `notReached`), with the first names and how many more there are; null when there are none.
+ */
+export function unreachedNotice(kind, names) {
+  if (names.length === 0) return null;
+  const shown = names.slice(0, CHANGES_SHOWN);
+  const more = names.length - shown.length;
+  const listed = lazy(() => {
+    const named = shown.map((name) => (name === '' ? t('edit.group.unnamed') : name)).join(', ');
+    return more > 0 ? `${named} ${t('edit.site.cert_more', { n: more })}` : named;
+  });
+  return notice('warn', UNREACHED[kind](names.length, listed));
+}
+
 /** The lines of what a change does (see `changesBetween`): the first ones, and how many more there are. */
 function changesView(changes) {
   const shown = changes.slice(0, CHANGES_SHOWN);
@@ -135,7 +156,9 @@ export class EditScreen extends Screen {
   stop() {
     super.stop();
     this.unwatchDraft();
-    if (heldDraft() !== null && !heldDraft().changed) forgetDraft();
+    // Only a draft that was not revised goes: nothing was typed in it and it was not made from a version. One that was
+    // typed in stays even when it builds its base again, for a part that is turned off keeps what was typed in it.
+    if (heldDraft() !== null && !heldDraft().revised) forgetDraft();
   }
 
   onDraft() {
@@ -205,9 +228,9 @@ export class EditScreen extends Screen {
     return !this.busy() && !draft.checking && draft.reading === 0 && draft.changed && draft.base === this.data?.state?.current;
   }
 
-  /** Whether the draft holds changes and the version that it started from is no longer selected. */
+  /** Whether the draft was revised and the version that it started from is no longer selected (see `syncDraft`). */
   moved(draft) {
-    return draft.changed && isFingerprint(this.data?.state?.current) && draft.base !== this.data.state.current;
+    return draft.revised && isFingerprint(this.data?.state?.current) && draft.base !== this.data.state.current;
   }
 
   drawBar(draft) {
@@ -398,6 +421,8 @@ export class EditScreen extends Screen {
         changesView(changesBetween(draft.baseVersion, checked.version)),
         this.fileWaits() ? notice('warn', w('managed.file_waits')) : null,
         toIssue > 0 ? notice('warn', w('edit.confirm.to_issue', { n: toIssue })) : null,
+        unreachedNotice('access', notReached(draft.baseVersion, checked.version, 'access')),
+        unreachedNotice('rate_limit', notReached(draft.baseVersion, checked.version, 'rate_limit')),
         draft.choseChain() ? notice('info', w('edit.confirm.expiry')) : null,
         el('p', { class: 'tc-muted tc-small' }, w('managed.confirm.groups_reset')),
       ],

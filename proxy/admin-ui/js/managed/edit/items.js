@@ -1,7 +1,7 @@
 // The items of a draft of the managed configuration and how each goes to and from a version: the groups of upstreams with
-// their servers, the access control, the rate limit and the sites. An item holds the text that was typed and a number of
-// its own (`cid`) that never leaves the page; what is built from it starts from the object that it was read from, so a
-// key that no form holds stays as it was. Nothing runs when the module is loaded.
+// their servers, the access control, the rate limit, the sites and the host policies. An item holds the text that was
+// typed and a number of its own (`cid`) that never leaves the page; what is built from it starts from the object that it
+// was read from, so a key that no form holds stays as it was. Nothing runs when the module is loaded.
 
 import { w } from '../../i18n.js';
 import { emptyField } from '../../parts.js';
@@ -171,9 +171,10 @@ export function accessOf(raw, cid) {
   };
 }
 
-export function rateOf(raw) {
+/** The item of a rate limit that a version holds as `raw` (or does not hold). */
+export function rateOf(raw, cid) {
   return {
-    cid: 'rate',
+    cid,
     on: raw !== undefined,
     rate: String(raw?.rate ?? ''),
     burst: String(raw?.burst ?? ''),
@@ -186,19 +187,29 @@ export function rateOf(raw) {
 /** The `access` of a screen and a panel, or undefined when it is turned off. */
 export function builtAccess(access, screen, panel, faults) {
   if (!access.on) return undefined;
+  return accessLists(access, screen, panel, faults);
+}
+
+/** The lists of `access` written over the object that it was read from. */
+function accessLists(access, screen, panel, faults) {
   const built = { ...access.raw };
   for (const [key, pattern, problem] of ACCESS_LISTS) withList(built, access, key, builtList(screen, panel, access, key, pattern, problem, faults));
   return built;
 }
 
-/** The `rate_limit`, or undefined when it is turned off. */
-export function builtRate(rate, faults) {
+/** The `rate_limit` of the policy screen and the panel `panel` (null: none), or undefined when it is turned off. */
+export function builtRate(rate, panel, faults) {
   if (!rate.on) return undefined;
+  return rateNumbers(rate, panel, faults);
+}
+
+/** The numbers and the list of `rate` written over the object that it was read from. */
+function rateNumbers(rate, panel, faults) {
   const built = { ...rate.raw };
   for (const [key, pattern, digits] of RATE_NUMBERS) {
-    built[key] = numberOf(rate[key], pattern, digits, (words) => faults.push(fault('policy', null, rate.cid, key, words)));
+    built[key] = numberOf(rate[key], pattern, digits, (words) => faults.push(fault('policy', panel, rate.cid, key, words)));
   }
-  withList(built, rate, 'exempt_cidrs', builtList('policy', null, rate, 'exempt_cidrs', NETWORK, networkLine, faults));
+  withList(built, rate, 'exempt_cidrs', builtList('policy', panel, rate, 'exempt_cidrs', NETWORK, networkLine, faults));
   return built;
 }
 
@@ -261,4 +272,111 @@ export function builtSite(site, faults) {
     certificate = { chain: site.chain, key: site.key };
   }
   return { ...site.raw, name, hosts, certificate };
+}
+
+// ---- the host policies ----
+
+/** Whether an `access` that a version holds turns nobody away: none of its lists has an entry. */
+const holdsNoEntry = (raw) => ACCESS_LISTS.every(([key]) => !Array.isArray(raw[key]) || raw[key].length === 0);
+
+/**
+ * The state of the `access` of a host policy, from what the version holds (`raw`, or undefined): `inherit` (left out:
+ * the global one holds), `off` (an `access` that turns nobody away, as `{}` does) or `own`.
+ */
+function accessMode(raw) {
+  if (raw === undefined) return 'inherit';
+  return holdsNoEntry(raw) ? 'off' : 'own';
+}
+
+/** The state of the `rate_limit` of a host policy, from what the version holds: `inherit`, `off` (`{}`) or `own`. */
+function rateMode(raw) {
+  if (raw === undefined) return 'inherit';
+  return Object.keys(raw).length === 0 ? 'off' : 'own';
+}
+
+/** A part of a host policy: the item of an access control or a rate limit, with the state `mode` in the place of its switch (`on`). */
+const hostPart = ({ on, ...fields }, mode) => ({ ...fields, mode });
+
+/** What a host policy holds as text, to tell whether it has changed since the draft was made: of each part, only what its state uses. */
+export function hostPolicyText(policy) {
+  const { access, rate } = policy;
+  const lists = access.mode === 'own' ? ACCESS_LISTS.map(([key]) => access[key]) : null;
+  const numbers = rate.mode === 'own' ? [rate.rate, rate.burst, rate.keys, rate.exempt_cidrs] : null;
+  return JSON.stringify([policy.name, policy.hosts, access.mode, lists, rate.mode, numbers]);
+}
+
+/** The item of a host policy of a version. Its two parts have numbers of their own, made from its number, so that a refusal of a part as a whole goes when the part is written to. */
+export function hostPolicyOf(raw) {
+  const cid = nextCid();
+  const policy = {
+    cid,
+    fresh: false,
+    name: raw.name,
+    hosts: linesText(raw.hosts),
+    access: hostPart(accessOf(raw.access, `${cid}.access`), accessMode(raw.access)),
+    rate: hostPart(rateOf(raw.rate_limit, `${cid}.rate`), rateMode(raw.rate_limit)),
+    raw,
+  };
+  policy.origin = hostPolicyText(policy);
+  return policy;
+}
+
+/** A new host policy, which inherits both parts until it says otherwise. */
+export function newHostPolicy() {
+  const cid = nextCid();
+  return {
+    cid,
+    fresh: true,
+    name: '',
+    hosts: '',
+    access: hostPart(accessOf(undefined, `${cid}.access`), 'inherit'),
+    rate: hostPart(rateOf(undefined, `${cid}.rate`), 'inherit'),
+    raw: {},
+  };
+}
+
+/** Whether the host policy `raw` of a version has the form that its item is made from. */
+export function readableHostPolicy(raw) {
+  const part = (key) => !Object.hasOwn(raw, key) || plain(raw[key]);
+  return plain(raw) && typeof raw.name === 'string' && texts(raw.hosts) && part('access') && part('rate_limit');
+}
+
+/**
+ * The `access` of a host policy, or undefined when it is inherited. Off, it is `{}`, or the object that was read when
+ * that one turned nobody away either, so that a policy that was not touched is built as it was read. Its own, it is
+ * written over what was read, and with no line in any list it would turn nobody away, which is what off is for: that is
+ * told at the part.
+ */
+function builtHostAccess(policy, faults) {
+  const { access, raw } = policy;
+  if (access.mode === 'inherit') return undefined;
+  if (access.mode === 'off') return Object.hasOwn(raw, 'access') && holdsNoEntry(raw.access) ? { ...raw.access } : {};
+  if (ACCESS_LISTS.every(([key]) => linesOf(access[key]).length === 0)) faults.push(fault('policy', policy.cid, access.cid, 'notice', w('edit.fault.host_lists')));
+  return accessLists(access, 'policy', policy.cid, faults);
+}
+
+/** The `rate_limit` of a host policy, or undefined when it is inherited: `{}` when it is off, and its numbers written over what was read when it is its own. */
+function builtHostRate(policy, faults) {
+  const { rate } = policy;
+  if (rate.mode === 'inherit') return undefined;
+  if (rate.mode === 'off') return {};
+  return rateNumbers(rate, policy.cid, faults);
+}
+
+/** The host policy as the version holds it. A part that is inherited is not written. */
+export function builtHostPolicy(policy, faults) {
+  const report = (key) => (words) => faults.push(fault('policy', policy.cid, policy.cid, key, words));
+  const name = policy.name.trim();
+  if (name === '') report('name')(emptyField());
+  const hosts = linesOf(policy.hosts).map((entry) => entry.text);
+  if (hosts.length === 0) report('hosts')(emptyField());
+  const built = { ...policy.raw, name, hosts };
+  for (const [key, value] of [
+    ['access', builtHostAccess(policy, faults)],
+    ['rate_limit', builtHostRate(policy, faults)],
+  ]) {
+    if (value === undefined) delete built[key];
+    else built[key] = value;
+  }
+  return built;
 }

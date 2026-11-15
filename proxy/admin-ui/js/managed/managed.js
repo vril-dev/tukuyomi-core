@@ -232,6 +232,7 @@ class VersionsScreen extends Screen {
         row(w('managed.diff.default'), defaultGroupView(counts.defaultUpstream)),
         row(w('managed.diff.access'), present(counts.access)),
         row(w('managed.diff.rate_limit'), present(counts.rateLimit)),
+        row(w('managed.diff.host_policies'), number(counts.hostPolicies)),
       ),
       this.detailCertificates,
       el('details', { class: 'tc-details' }, el('summary', {}, w('managed.detail.json')), el('pre', { class: 'tc-raw tc-mono tc-raw--tall' }, JSON.stringify(item.version, null, 2))),

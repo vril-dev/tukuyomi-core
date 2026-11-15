@@ -1,11 +1,12 @@
-// What a saving changes, for the confirmation: the groups, the default group, the access list, the rate limit, the
-// sites and the routes that are added, taken away or changed. A line names a group or a site, or the host and the path
-// of a route, and none of its values, for a rewrite can hold a secret. Nothing runs when the module is loaded.
+// What a saving changes, for the confirmation: the groups, the default group, the access list, the rate limit, the host
+// policies, the sites and the routes that are added, taken away or changed. A line names a group, a host policy or a
+// site, or the host and the path of a route, and none of its values, for a rewrite can hold a secret. Nothing runs when
+// the module is loaded.
 
 const plain = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 /** Whether two values of JSON are the same; the order of the keys of an object does not matter. */
-function same(a, b) {
+export function same(a, b) {
   if (Array.isArray(a)) return Array.isArray(b) && a.length === b.length && a.every((item, at) => same(item, b[at]));
   if (!plain(a) || !plain(b)) return a === b;
   const keys = Object.keys(a);
@@ -47,11 +48,26 @@ export function sitesToIssue(before, after) {
   return after.sites.filter((site) => isAcme(site) && !issued.has(hostsKey(site))).length;
 }
 
+/** The host policies of a version, which may leave them out. */
+const hostPoliciesOf = (version) => (Array.isArray(version.host_policies) ? version.host_policies : []);
+
+/**
+ * The names of the host policies of `after` that a change of the global `kind` (`access` or `rate_limit`) from
+ * `before` to `after` does not reach, for each holds a `kind` of its own (`{}` too); none when the global one is the
+ * same in both. `changes` says that the global one of `after` changes whatever it holds: it is not in its form.
+ */
+export function notReached(before, after, kind, changes = false) {
+  if (!changes && same(before[kind], after[kind])) return [];
+  return hostPoliciesOf(after)
+    .filter((policy) => Object.hasOwn(policy, kind))
+    .map((policy) => String(policy.name));
+}
+
 /**
  * The lines of what changes from the version `before` to the version `after`: `{ area, action, label }` with `area`
- * one of `upstream`, `default`, `access`, `rate_limit`, `site` and `route`, and `action` one of `add`, `remove` and
- * `change`. Groups and sites are matched by their names and routes by their hosts and paths, so a renamed one is one
- * taken away and one added.
+ * one of `upstream`, `default`, `access`, `rate_limit`, `host_policy`, `site` and `route`, and `action` one of `add`,
+ * `remove` and `change`. Groups, host policies and sites are matched by their names and routes by their hosts and
+ * paths, so a renamed one is one taken away and one added.
  */
 export function changesBetween(before, after) {
   const out = [];
@@ -59,6 +75,8 @@ export function changesBetween(before, after) {
   if (before.default_upstream !== after.default_upstream) out.push({ area: 'default', action: 'change', label: '' });
   single('access', before.access, after.access, out);
   single('rate_limit', before.rate_limit, after.rate_limit, out);
+  const policies = (version) => new Map(hostPoliciesOf(version).map((policy) => [String(policy.name), policy]));
+  changed('host_policy', policies(before), policies(after), (key) => key, out);
   const sites = (version) => new Map(version.sites.map((site) => [String(site.name), site]));
   changed('site', sites(before), sites(after), (key) => key, out);
   const routes = (version) => new Map(version.routes.map((route) => [routeKey(route), route]));

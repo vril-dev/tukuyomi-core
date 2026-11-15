@@ -6,7 +6,7 @@ import { ApiError } from '../js/api.js';
 import { lazy, setLanguage } from '../js/i18n.js';
 import { BODY_MAX, EditScreen, FILES_MAX, bodySize, checkFinding } from '../js/managed/edit/bar.js';
 import { Screen } from '../js/managed/screen.js';
-import { changesBetween, sitesToIssue } from '../js/managed/edit/changes.js';
+import { changesBetween, notReached, sitesToIssue } from '../js/managed/edit/changes.js';
 import { Draft, caKey, forgetDraft, heldDraft, holdDraft, isOwnJob, readableVersion, savingRuns, settleSaving, settleSent, siteFileKey, syncDraft, watchDraft } from '../js/managed/edit/draft.js';
 import { barFault as barFaultOf, faultAt, locate } from '../js/managed/edit/locate.js';
 import { PEM_MAX, pemFromBytes, pickPem } from '../js/managed/edit/pem.js';
@@ -319,6 +319,9 @@ test('a draft with no change follows the selected version, one with changes stay
   assert.equal(remade.base, FP);
   assert.deepEqual(remade.groups.map((group) => group.name), held);
   assert.equal(EditScreen.prototype.maySave.call(screen, remade), true);
+  // A base that holds what the draft builds leaves nothing to save, and the page no longer asks before it goes away.
+  remade.rebase(OTHER, remade.build().version);
+  assert.deepEqual([remade.changed, beforeunload.size], [false, 0]);
   forgetDraft();
 });
 
@@ -329,11 +332,39 @@ test('forgetting the draft says whether it held changes, and the page asks befor
   assert.equal(beforeunload.size, 0);
   assert.equal(forgetDraft(), false);
   holdDraft(draft);
-  draft.edited();
+  draft.write(draft.groups[0], 'name', 'renamed');
   assert.equal(beforeunload.size, 1);
   assert.equal(forgetDraft(), true);
   assert.equal(beforeunload.size, 0);
   assert.equal(heldDraft(), null);
+});
+
+test('a draft holds a change only while the version it builds is not its base, and a field that is not in its form is one', () => {
+  // A part turned on and off again builds the base, though something was typed.
+  const draft = draftOf(sampleVersion());
+  draft.write(draft.rate, 'on', true);
+  assert.equal(draft.changed, true);
+  draft.write(draft.rate, 'on', false);
+  assert.deepEqual([draft.revised, draft.changed], [true, false]);
+  // A number typed and typed back is no change, and what is not a number is one.
+  const limited = draftOf({ ...sampleVersion(), rate_limit: { rate: 10, burst: 5, keys: 2048 } });
+  limited.write(limited.rate, 'rate', '11');
+  assert.equal(limited.changed, true);
+  limited.write(limited.rate, 'rate', '10');
+  assert.equal(limited.changed, false);
+  limited.write(limited.rate, 'rate', 'ten');
+  assert.equal(limited.changed, true);
+  // A draft made from a version with the content of the base holds no change (one with other content does, see above).
+  assert.equal(new Draft({ base: FP, baseVersion: sampleVersion(), source: sampleVersion(), fromVersion: true }).changed, false);
+  // A draft that was typed in and typed back is not made again for a new selected version.
+  assert.equal(syncDraft(FP, sampleVersion(), null), 'made');
+  const typed = heldDraft();
+  typed.write(typed.groups[0], 'name', 'renamed');
+  typed.write(typed.groups[0], 'name', 'app');
+  assert.equal(typed.changed, false);
+  assert.equal(syncDraft(OTHER, sampleVersion(), null), 'moved');
+  assert.equal(heldDraft(), typed);
+  assert.equal(forgetDraft(), false);
 });
 
 test('an edit keeps the session alive at most once in 30 seconds, and a time without edits asks for nothing', () => {
@@ -476,7 +507,7 @@ test('saving and checking are off in each state that holds them, and a saving ru
   const maySave = (screen) => EditScreen.prototype.maySave.call(screen, draft);
   const mayCheck = (screen) => EditScreen.prototype.mayCheck.call(screen, draft);
   assert.equal(maySave(free), false);
-  draft.edited();
+  draft.write(draft.groups[0], 'name', 'renamed');
   assert.equal(maySave(free), true);
   assert.equal(maySave({ ...free, busy: () => true }), false);
   assert.equal(maySave({ ...free, data: { state: { current: OTHER } } }), false);
@@ -624,7 +655,7 @@ test('the first fault of a screen opens the panel of that screen alone', () => {
   const words = lazy(() => 'wrong');
   draft.putFaults([{ screen: 'routes', panel: 77, cid: 77, field: 'host', words }]);
   assert.equal(draft.firstFault('routes').panel, 77);
-  assert.deepEqual(draft.openPanels, { upstreams: null, sites: null, routes: 77 });
+  assert.deepEqual(draft.openPanels, { upstreams: null, sites: null, routes: 77, policy: null });
 });
 
 const pemOf = (sha) => ({ sha256: sha.repeat(64), text: `text-of-${sha}`, name: 'file.pem', size: 3 });
@@ -693,6 +724,7 @@ test('a version whose sites and routes are not in their forms is not edited', ()
   assert.equal(readableVersion(route({ access: { deny_cidrs: 'x' } })), false);
   assert.equal(readableVersion(route({ stream: { idle_ms: 1, total_ms: '2', websocket: true } })), false);
   assert.equal(readableVersion(route({ rewrite: { query: { set: ['a=b'] } } })), false);
+  assert.equal(readableVersion({ ...sampleVersion(), host_policies: [{ name: 'x', hosts: 'a.example', access: {} }] }), false);
 });
 
 test('what was read of a file is wiped once it has served, on the way out of a refusal as well', async () => {
@@ -857,4 +889,104 @@ test('a certificate of the store is matched with a site by what is in it, and it
   draft.write(acme, 'hosts', 'b.example');
   assert.equal(certificateOf(acme, index), null);
   assert.equal(certificateOf(acme, null), null);
+});
+
+/** A version with host policies: one whose access turns nobody away though it writes a list, one that counts nothing, and one with both parts of its own. */
+function hostedVersion() {
+  return {
+    ...sampleVersion(),
+    rate_limit: { rate: 10, burst: 5, keys: 2048 },
+    host_policies: [
+      { name: 'open', hosts: ['open.example'], access: { deny_cidrs: [] } },
+      { name: 'free', hosts: ['*.free.example'], rate_limit: {} },
+      { name: 'own', hosts: ['own.example', 'www.own.example'], access: { allow_cidrs: ['10.0.0.0/8'] }, rate_limit: { rate: 5, burst: 1, keys: 1024 } },
+    ],
+  };
+}
+
+test('host policies build back to what the version held, and a draft from a version without them writes none', () => {
+  const version = hostedVersion();
+  assert.equal(readableVersion(version), true);
+  const draft = draftOf(version);
+  assert.deepEqual(draft.hostPolicies.map((policy) => [policy.access.mode, policy.rate.mode]), [['off', 'inherit'], ['inherit', 'off'], ['own', 'own']]);
+  assert.deepEqual(draft.build().version, version);
+  // An access that turns nobody away, put in another state and back, is written as it was read: the draft holds no change.
+  const [open] = draft.hostPolicies;
+  draft.setHostMode(open, 'access', 'own');
+  draft.setHostMode(open, 'access', 'off');
+  assert.deepEqual(draft.build().version, version);
+  assert.deepEqual([draft.revised, draft.changed], [true, false]);
+  const carried = new Draft({ base: FP, baseVersion: version, source: sampleVersion(), fromVersion: true });
+  assert.equal(Object.hasOwn(carried.build().version, 'host_policies'), false);
+});
+
+test('each part of a host policy is left out, {} or written whole by its state, and a list of its own with no line is told at the part', () => {
+  const draft = draftOf(hostedVersion());
+  const own = draft.hostPolicies[2];
+  draft.setHostMode(own, 'access', 'inherit');
+  draft.setHostMode(own, 'rate', 'off');
+  assert.deepEqual(draft.build().version.host_policies[2], { name: 'own', hosts: ['own.example', 'www.own.example'], rate_limit: {} });
+  draft.setHostMode(own, 'access', 'off');
+  assert.deepEqual(draft.build().version.host_policies[2].access, {});
+  // Back to their own, the parts are written with what their fields kept.
+  draft.setHostMode(own, 'access', 'own');
+  draft.setHostMode(own, 'rate', 'own');
+  assert.deepEqual(draft.build().version.host_policies[2], hostedVersion().host_policies[2]);
+  const fresh = draft.addHostPolicy();
+  assert.equal(draft.openPanels.policy, fresh.cid);
+  draft.write(fresh, 'name', 'new');
+  draft.write(fresh, 'hosts', 'new.example');
+  draft.setHostMode(fresh, 'access', 'own');
+  assert.deepEqual(
+    draft.build().faults.map((one) => [one.screen, one.panel, one.cid, one.field]),
+    [['policy', fresh.cid, `${fresh.cid}.access`, 'notice']],
+  );
+  draft.write(fresh.access, 'deny_cidrs', '192.0.2.0/24');
+  assert.deepEqual(draft.build().version.host_policies[3], { name: 'new', hosts: ['new.example'], access: { deny_cidrs: ['192.0.2.0/24'] } });
+});
+
+test('a change of a global part names the host policies that hold one of their own, which it does not reach', () => {
+  const before = hostedVersion();
+  const after = { ...hostedVersion(), access: { deny_cidrs: ['192.0.2.0/24'] } };
+  // `open` has the state off, `own` its own, and `free` inherits.
+  assert.deepEqual(notReached(before, after, 'access'), ['open', 'own']);
+  assert.deepEqual(notReached(before, after, 'rate_limit'), []);
+  // The draft compares the global part alone with its base, and one that is not in its form changes.
+  const draft = draftOf(hostedVersion());
+  assert.deepEqual(draft.unreached('rate_limit'), []);
+  draft.write(draft.rate, 'rate', 'ten');
+  assert.deepEqual(draft.unreached('rate_limit'), ['free', 'own']);
+});
+
+test('a refusal about a host policy is found at its field, at the note of its part, or at the line of its host', () => {
+  setLanguage('ja');
+  const draft = draftOf(hostedVersion());
+  const own = draft.hostPolicies[2];
+  draft.write(own, 'hosts', '\nown.example\n\nwww.own.example');
+  const { map } = draft.build();
+  assert.deepEqual(locate('host_policies', map), { screen: 'policy', panel: null, cid: 'host_policies', field: 'notice' });
+  assert.deepEqual(locate('host_policies[2]', map), { screen: 'policy', panel: own.cid, cid: own.cid, field: 'notice' });
+  assert.deepEqual(locate('host_policies[2].access', map), { screen: 'policy', panel: own.cid, cid: `${own.cid}.access`, field: 'notice' });
+  assert.deepEqual(locate('host_policies[2].rate_limit.keys', map), { screen: 'policy', panel: own.cid, cid: `${own.cid}.rate`, field: 'keys' });
+  const sentence = lazy(() => 'refused');
+  const line = faultAt('host_policies[2].hosts[1]', map, sentence);
+  assert.deepEqual([line.panel, line.field, String(line.words)], [own.cid, 'hosts', '4 行目: refused']);
+  // A number past what the request held goes to the band.
+  for (const at of ['host_policies[3].name', 'host_policies[2].hosts[2]']) assert.equal(faultAt(at, map, sentence).screen, null, at);
+  setLanguage('en');
+});
+
+test('the lines of what a change does name the host policies that are added, taken away and changed', () => {
+  const after = hostedVersion();
+  after.host_policies[0] = { ...after.host_policies[0], access: {} };
+  after.host_policies.splice(1, 1);
+  after.host_policies.push({ name: 'added', hosts: ['added.example'], rate_limit: {} });
+  const lines = changesBetween(hostedVersion(), after).map((line) => [line.area, line.action, line.label]);
+  assert.deepEqual(lines, [
+    ['host_policy', 'change', 'open'],
+    ['host_policy', 'remove', 'free'],
+    ['host_policy', 'add', 'added'],
+  ]);
+  // A version that leaves them out has none.
+  assert.deepEqual(changesBetween(sampleVersion(), { ...sampleVersion(), host_policies: [] }), []);
 });

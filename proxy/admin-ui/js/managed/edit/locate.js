@@ -15,6 +15,8 @@ const FILE = /^files\[([0-9]{1,3})\]$/;
 const SITE = /^sites\[([0-9]{1,4})\](?:\.(name|hosts|certificate|certificate\.chain|certificate\.key|certificate\.acme))?$/;
 const SITE_HOST = /^sites\[([0-9]{1,4})\]\.hosts\[([0-9]{1,4})\]$/;
 const ROUTE = /^routes\[([0-9]{1,4})\](?:\.(host|path|upstream|max_body|records|access|stream|rewrite\.host|rewrite\.path|rewrite\.query|rewrite\.request_headers|rewrite\.response_headers))?$/;
+const HOST_POLICY = /^host_policies\[([0-9]{1,4})\](?:\.(name|hosts|access|rate_limit|rate_limit\.rate|rate_limit\.burst|rate_limit\.keys|rate_limit\.exempt_cidrs))?$/;
+const HOST_POLICY_HOST = /^host_policies\[([0-9]{1,4})\]\.hosts\[([0-9]{1,4})\]$/;
 
 // The places that are a key alone. A `Map`, so that a name from outside cannot find what every object has.
 const FIXED = new Map([
@@ -24,6 +26,7 @@ const FIXED = new Map([
   ['rate_limit', { screen: 'policy', panel: null, cid: 'rate', field: 'notice' }],
   ['sites', { screen: 'sites', panel: null, cid: 'sites', field: 'notice' }],
   ['routes', { screen: 'routes', panel: null, cid: 'routes', field: 'notice' }],
+  ['host_policies', { screen: 'policy', panel: null, cid: 'host_policies', field: 'notice' }],
 ]);
 
 // What a key under a site stands for, as the field of its panel. A `Map`, for the same reason as above.
@@ -60,9 +63,29 @@ function placeOfRoute(cid, key) {
   return { screen: 'routes', panel: cid, cid, field: ROUTE_FIELDS.get(key) };
 }
 
+// What a key under a host policy stands for: the field of the policy, or of one of its two parts (null: the policy),
+// which have numbers of their own, made from the number of the policy. A part as a whole is told above its fields.
+const HOST_POLICY_FIELDS = new Map([
+  ['name', { part: null, field: 'name' }],
+  ['hosts', { part: null, field: 'hosts' }],
+  ['access', { part: 'access', field: 'notice' }],
+  ['rate_limit', { part: 'rate', field: 'notice' }],
+  ['rate_limit.rate', { part: 'rate', field: 'rate' }],
+  ['rate_limit.burst', { part: 'rate', field: 'burst' }],
+  ['rate_limit.keys', { part: 'rate', field: 'keys' }],
+  ['rate_limit.exempt_cidrs', { part: 'rate', field: 'exempt_cidrs' }],
+]);
+
+function placeOfHostPolicy(cid, key) {
+  if (key === undefined) return { screen: 'policy', panel: cid, cid, field: 'notice' };
+  const { part, field } = HOST_POLICY_FIELDS.get(key);
+  return { screen: 'policy', panel: cid, cid: part === null ? cid : `${cid}.${part}`, field };
+}
+
 /**
  * The place of `at` in the draft: `{ screen, panel, cid, field }`, with `line` the line of its box (from 1) for one host
- * of a site, or null for a place that the table does not hold. A number past what the request held is such a place.
+ * of a site or of a host policy, or null for a place that the table does not hold. A number past what the request held
+ * is such a place.
  */
 export function locate(at, map) {
   if (typeof at !== 'string') return null;
@@ -87,6 +110,17 @@ export function locate(at, map) {
   if (match !== null) {
     const cid = map.routes[Number(match[1])];
     return cid === undefined ? null : placeOfRoute(cid, match[2]);
+  }
+  match = HOST_POLICY_HOST.exec(at);
+  if (match !== null) {
+    const policy = map.hostPolicies[Number(match[1])];
+    const line = policy?.hostLines[Number(match[2])];
+    return line === undefined ? null : { screen: 'policy', panel: policy.cid, cid: policy.cid, field: 'hosts', line };
+  }
+  match = HOST_POLICY.exec(at);
+  if (match !== null) {
+    const policy = map.hostPolicies[Number(match[1])];
+    return policy === undefined ? null : placeOfHostPolicy(policy.cid, match[2]);
   }
   match = SERVER_FIELD.exec(at);
   if (match !== null) {

@@ -727,7 +727,7 @@ test('the screen of the sites opens a site, and a refusal of a check names the l
   pressed('Edit');
   const hosts = control('Hosts');
   assert.equal(hosts.value, 'a.example\nb.example');
-  hosts.value = 'a.example\n\nb.example';
+  hosts.value = 'a.example\n\nc.example';
   hosts.dispatch('input');
   assert.equal(heldDraft().revision, 1);
   pressed('Close');
@@ -735,7 +735,7 @@ test('the screen of the sites opens a site, and a refusal of a check names the l
   await wait();
   await wait();
   assert.equal(sent[0], '/api/managed/check');
-  assert.deepEqual(sent[1].version.sites[0].hosts, ['a.example', 'b.example']);
+  assert.deepEqual(sent[1].version.sites[0].hosts, ['a.example', 'c.example']);
   assert.deepEqual(sent[1].version.sites[0].certificate, { chain: 'c'.repeat(64), key: 'd'.repeat(64) });
   // The panel opens again for the fault; the number of the API is turned into the line that the box shows.
   const refused = control('Hosts');

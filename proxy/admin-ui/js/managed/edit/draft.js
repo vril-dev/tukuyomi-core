@@ -1,14 +1,17 @@
 // The draft of the managed configuration: what the user has changed on the screens that edit it, and has not saved.
 // There is one, kept here and only in the memory of this page: nothing of it goes to the storage of the browser, the
-// address or the history. A draft with no change is dropped when the screens are left, and one with changes stays while
-// the user is signed in (`forgetDraft` gives it up with the sign-in). The fields hold the text that was typed, and
-// `build` is the one place that makes a version of it: what no form has touched is carried over from the version the
-// draft was made from, as it was. Nothing runs when the module is loaded.
+// address or the history. A draft that nothing was typed in and that was not made from a version is dropped when the
+// screens are left, and any other stays while the user is signed in (`forgetDraft` gives it up with the sign-in), even
+// when it builds its base again. Whether it holds a change is whether the version that it builds differs from the
+// version it started from. The fields hold the text that was typed, and `build` is the one place that makes a version
+// of it: what no form has touched is carried over from the version the draft was made from, as it was. Nothing runs
+// when the module is loaded.
 
 import { w } from '../../i18n.js';
 import { emptyField } from '../../parts.js';
 import { isJob, sameJob } from '../job.js';
-import { NAME, accessOf, builtAccess, builtRate, builtServer, builtSite, builtTls, fault, groupOf, linesOf, newGroup, newServer, newSite, plain, rateOf, readableSite, siteOf, siteText, snapshot } from './items.js';
+import { notReached, same } from './changes.js';
+import { NAME, accessOf, builtAccess, builtHostPolicy, builtRate, builtServer, builtSite, builtTls, fault, groupOf, hostPolicyOf, hostPolicyText, linesOf, newGroup, newHostPolicy, newServer, newSite, plain, rateOf, readableHostPolicy, readableSite, siteOf, siteText, snapshot } from './items.js';
 import { builtRoute, makeForm, newRoute, readableRoute, routeChanged, routeLine, routeOf } from './route-items.js';
 
 // An edit of a draft with changes that comes this long after the last request keeps the session alive: an edit is use.
@@ -31,7 +34,8 @@ export function readableVersion(version) {
     version.routes.every(readableRoute) &&
     typeof version.default_upstream === 'string' &&
     optional('access') &&
-    optional('rate_limit')
+    optional('rate_limit') &&
+    (!Object.hasOwn(version, 'host_policies') || (Array.isArray(version.host_policies) && version.host_policies.every(readableHostPolicy)))
   );
 }
 
@@ -40,6 +44,8 @@ export function readableVersion(version) {
 export class Draft {
   #session;
   #touched;
+  /** What `changed` found, with the revision and the base version that it found it for. */
+  #compared = null;
 
   /**
    * `base` is the version that a saving expects to be selected and `baseVersion` its content, which is only compared
@@ -64,7 +70,7 @@ export class Draft {
     /** What the band says of the last check, `{ tone, words }`. */
     this.said = [];
     /** The item whose panel is open, by the screens that have panels. */
-    this.openPanels = { upstreams: null, sites: null, routes: null };
+    this.openPanels = { upstreams: null, sites: null, routes: null, policy: null };
     this.checking = false;
     /** How many files are being read, and the reading of each field that still counts. */
     this.reading = 0;
@@ -80,12 +86,28 @@ export class Draft {
     this.routes = source.routes.map((raw) => routeOf(raw, refOf(raw.upstream)));
     this.sites = source.sites.map(siteOf);
     this.access = accessOf(source.access, 'access');
-    this.rate = rateOf(source.rate_limit);
+    this.rate = rateOf(source.rate_limit, 'rate');
+    this.hostPolicies = (source.host_policies ?? []).map(hostPolicyOf);
   }
 
-  /** Whether the draft holds something that a saving would keep: an edit, or the version that it was made from. */
-  get changed() {
+  /** Whether something was typed in the draft, or it was made from a version: such a draft stays when the screens are left, and is not made again for a new selected version. */
+  get revised() {
     return this.revision > 0 || this.fromVersion;
+  }
+
+  /**
+   * Whether a saving would change something: the draft is revised, and the version that it builds is not the base
+   * version. A draft with a field that is not in its form is changed, so that what was typed is not given up. It is
+   * worked out again only when the revision or the base version is no longer the one it was worked out for.
+   */
+  get changed() {
+    if (!this.revised) return false;
+    const known = this.#compared;
+    if (known === null || known.revision !== this.revision || known.baseVersion !== this.baseVersion) {
+      const built = this.build();
+      this.#compared = { revision: this.revision, baseVersion: this.baseVersion, changed: built.faults !== undefined || !same(built.version, this.baseVersion) };
+    }
+    return this.#compared.changed;
   }
 
   /** The user changed something in the draft. */
@@ -179,6 +201,8 @@ export class Draft {
     this.baseVersion = baseVersion;
     this.said = [];
     this.faults = this.faults.filter((one) => one.screen !== null);
+    // The draft may hold a change no more, or hold one now.
+    guard();
     tell();
   }
 
@@ -356,6 +380,60 @@ export class Draft {
     return this.sites.some((site) => site.kind === 'file' && this.files.has(site.chain));
   }
 
+  // ---- the host policies ----
+
+  hostPolicy(cid) {
+    return this.hostPolicies.find((one) => one.cid === cid) ?? null;
+  }
+
+  /** Whether a host policy differs from what it was when the draft was made; a new one is told as new. */
+  hostPolicyChanged(policy) {
+    return !policy.fresh && hostPolicyText(policy) !== policy.origin;
+  }
+
+  addHostPolicy() {
+    const policy = newHostPolicy();
+    this.hostPolicies.push(policy);
+    this.openPanels.policy = policy.cid;
+    this.clearFault('host_policies', 'notice');
+    this.edited();
+    return policy;
+  }
+
+  /** Takes the host policy `cid` away, with what is told of it. Nothing refers to a host policy, so any may go. */
+  removeHostPolicy(cid) {
+    this.hostPolicies = this.hostPolicies.filter((one) => one.cid !== cid);
+    if (this.openPanels.policy === cid) this.openPanels.policy = null;
+    this.putFaults(this.faults.filter((one) => one.panel !== cid));
+    this.clearFault('host_policies', 'notice');
+    this.edited();
+  }
+
+  /**
+   * The part `part` (`access` or `rate`) of the host policy `policy` is in the state `mode`: `inherit`, `own` or `off`.
+   * What its fields hold stays in the draft. What was told of the policy as a whole goes, for it may be about its
+   * parts, and so does what was told of the part when its fields are hidden.
+   */
+  setHostMode(policy, part, mode) {
+    const item = policy[part];
+    if (item.mode === mode) return;
+    if (mode !== 'own') this.clearFaultsOf(item.cid);
+    this.clearFault(policy.cid, 'notice');
+    this.write(item, 'mode', mode);
+  }
+
+  /**
+   * The names of the host policies that a change of the global `kind` (`access` or `rate_limit`) would not reach, as
+   * the draft holds them now (see `notReached`). The global part is built alone and compared with the base version, and
+   * one that is not in its form is told as a change.
+   */
+  unreached(kind) {
+    const faults = [];
+    const global = kind === 'access' ? builtAccess(this.access, 'policy', null, faults) : builtRate(this.rate, null, faults);
+    const after = { [kind]: global, host_policies: this.hostPolicies.map((policy) => builtHostPolicy(policy, [])) };
+    return notReached(this.baseVersion, after, kind, faults.length > 0);
+  }
+
   // ---- the files ----
 
   /** Starts a reading for the field `key`: a reading of it that runs on no longer counts. Gives the mark of this one. */
@@ -393,8 +471,9 @@ export class Draft {
    * The draft as what a request carries: `{ version, files, map }`, or `{ faults }` when a field is not in its form. `map`
    * says what the numbers and the names of the request stand for: `groups` a `Map` from a name to `{ cid, servers }`
    * (the numbers of its servers by their place), `files` the place of the field that chose each file of `files`, `sites`
-   * `{ cid, hostLines }` by their place (the line of the box of each host), and `routes` the number of each route. It is
-   * a copy of that moment: an answer speaks of the request as it was sent.
+   * and `hostPolicies` `{ cid, hostLines }` by their place (the line of the box of each host), and `routes` the number
+   * of each route. It is a copy of that moment: an answer speaks of the request as it was sent. The host policies are
+   * written when the version that the draft carries wrote them or the draft has some.
    */
   build() {
     const faults = [];
@@ -436,7 +515,8 @@ export class Draft {
     }
     const routes = this.routes.map((route) => builtRoute(route, this.nameOf(route.ref), faults));
     const access = builtAccess(this.access, 'policy', null, faults);
-    const rate = builtRate(this.rate, faults);
+    const rate = builtRate(this.rate, null, faults);
+    const hostPolicies = this.hostPolicies.map((policy) => builtHostPolicy(policy, faults));
     if (faults.length > 0) return { faults };
     const version = {
       ...this.source,
@@ -447,10 +527,13 @@ export class Draft {
     };
     delete version.access;
     delete version.rate_limit;
+    delete version.host_policies;
     if (access !== undefined) version.access = access;
     if (rate !== undefined) version.rate_limit = rate;
+    if (hostPolicies.length > 0 || Object.hasOwn(this.source, 'host_policies')) version.host_policies = hostPolicies;
     map.sites = this.sites.map((site) => ({ cid: site.cid, hostLines: linesOf(site.hosts).map((entry) => entry.line) }));
     map.routes = this.routes.map((route) => route.cid);
+    map.hostPolicies = this.hostPolicies.map((policy) => ({ cid: policy.cid, hostLines: linesOf(policy.hosts).map((entry) => entry.line) }));
     return { version, files, map };
   }
 }
@@ -518,13 +601,13 @@ export function watchDraft(watcher) {
 
 /**
  * Brings the draft in step with the version `current` that the store selects, whose content is `version`: makes the
- * draft when there is none, and again for a draft with no change whose base is no longer selected. A draft that is
- * still on `current` is left as it is. Gives `moved` for a draft with changes whose base is no longer selected, the
- * user's to decide; else `made` or `same`.
+ * draft when there is none, and again for a draft that was not revised whose base is no longer selected. A draft that
+ * is still on `current` is left as it is. Gives `moved` for a revised draft whose base is no longer selected, the
+ * user's to decide, even when it builds its base again: what was typed is not made again; else `made` or `same`.
  */
 export function syncDraft(current, version, session) {
   if (held !== null && held.base === current) return 'same';
-  if (held !== null && held.changed) return 'moved';
+  if (held !== null && held.revised) return 'moved';
   holdDraft(new Draft({ base: current, baseVersion: version, source: version, sourceName: current, session }));
   return 'made';
 }

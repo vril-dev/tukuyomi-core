@@ -30,7 +30,8 @@ export function servingView(state) {
 
 /** The numbers of a version that a confirmation and the detail of a version show; none of its text but the name of the default group. */
 export function countsOf(version) {
-  const object = version !== null && typeof version === 'object' ? version : {};
+  const readable = version !== null && typeof version === 'object';
+  const object = readable ? version : {};
   const length = (value) => (Array.isArray(value) ? value.length : null);
   const groups = object.upstreams !== null && typeof object.upstreams === 'object' && !Array.isArray(object.upstreams) ? Object.keys(object.upstreams).length : null;
   const has = (value) => value !== undefined && value !== null;
@@ -38,6 +39,8 @@ export function countsOf(version) {
     sites: length(object.sites),
     upstreams: groups,
     routes: length(object.routes),
+    // A version may leave the host policies out, and then it has none.
+    hostPolicies: readable && !Object.hasOwn(object, 'host_policies') ? 0 : length(object.host_policies),
     defaultUpstream: typeof object.default_upstream === 'string' ? object.default_upstream : null,
     access: has(object.access),
     rateLimit: has(object.rate_limit),
@@ -76,6 +79,7 @@ export function diffRows(from, to, before, after, { gone = false } = {}) {
     counted(w('managed.diff.default'), 'defaultUpstream', (counts, key) => (counts === null ? '—' : defaultGroupView(counts[key]))),
     counted(w('managed.diff.access'), 'access', present),
     counted(w('managed.diff.rate_limit'), 'rateLimit', present),
+    counted(w('managed.diff.host_policies'), 'hostPolicies', number),
   ];
 }
 
