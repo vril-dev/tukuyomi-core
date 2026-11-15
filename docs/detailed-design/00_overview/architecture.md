@@ -359,4 +359,4 @@ sequenceDiagram
 
 - [システム概要](system-overview.md)
 - [設計方針・制約](design-principles.md)
-- [設計文書の入口](../../README.md)
+- [ドキュメントの索引](../../README.md)

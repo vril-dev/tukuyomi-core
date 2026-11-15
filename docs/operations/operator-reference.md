@@ -1,6 +1,6 @@
 # 運用リファレンス
 
-この文書は、今の実装の命令、合図、設定ファイルの鍵、ルールセットの扱い、managed 設定、要求の扱い、リクエストの前のポリシー、記録、監視を、引いて使える形でまとめる。置き方と systemd の例は [実行ファイルの build と配置](../build/binary-deployment.md) に書く。管理のプロセス（`admin` の命令）の設定と API は [管理リファレンス](admin-reference.md) に書き、この文書には proxy から見えるものだけを書く。
+この文書は、今の実装の命令、合図、設定ファイルの鍵、ルールセットの扱い、managed 設定、要求の扱い、リクエストの前のポリシー、記録、監視を、引いて使える形でまとめる。置き方と systemd の例は [ビルドと配置](../build/binary-deployment.md) に書く。管理のプロセス（`admin` の命令）の設定と API は [管理リファレンス](admin-reference.md) に書き、この文書には proxy から見えるものだけを書く。
 
 例の path と名前（`/etc/tukuyomi-core/config.json`、利用者 `tukuyomi`、`example.com` など）は例である。
 
@@ -109,7 +109,7 @@ tukuyomi-proxy rules list <config>
   - 遮断の世代では、試しの要求が1つでも遮断されると失敗にする（`--accept-block` を付けたときを除く）。検知だけの世代では、規則に当たっても失敗にしない。
   - 試しは、ルールセットが起動し、普通の形の要求を通すことを示すだけで、ルールが正しいことは示さない。
 - 試しの間に SIGINT（Ctrl-C）か SIGTERM を受けると、試しを止め、検査プロセスと作業場所を片付けて、世代を作らずに終わる。試しの後は、この2つの合図で命令は止まらない。
-- `import` は検査プロセスを起動するので、起動の前の確かめ（[実行ファイルの build と配置](../build/binary-deployment.md) の「起動の前の確かめ」）も流す。
+- `import` は検査プロセスを起動するので、起動の前の確かめ（[ビルドと配置](../build/binary-deployment.md) の「起動の前の確かめ」）も流す。
 
 exit code は、0 が成功、1 がほかの終わり方（断られた保管場所や入力、失敗した試し、使用中の保管場所、`list` で manifest が読めない世代や選んだ世代が無い保管場所、root での実行）、2 が引数の誤り、断られた設定ファイル、または使えないエンジン（`import` と `activate`）である。
 
@@ -196,7 +196,7 @@ tukuyomi-proxy admin reset <config> <name>
 | SIGUSR1 | ルールの保管場所が今選んでいる世代へ切り替える |
 | SIGUSR2 | すべての TLS の待ち受けの証明書と鍵のファイルを読み直す（`managed` のある設定では、`admin.route` の証明書と、managed ストアのサイトの証明書） |
 
-SIGHUP で止まる前の版から入れ替えるときは、新しい実行ファイルを入れてから unit を替える（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。前の版は SIGHUP で止まる。
+SIGHUP で止まる前の版から入れ替えるときは、新しい実行ファイルを入れてから unit を替える（[ビルドと配置](../build/binary-deployment.md) の「systemd」）。前の版は SIGHUP で止まる。
 
 ### SIGHUP（設定のリロード）
 
@@ -958,7 +958,7 @@ server は `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で
 
 ### ModSecurity の世代
 
-`rules import --engine modsecurity` で作る世代は、libmodsecurity（ModSecurity v3.0.17）で要求を検査する。検査プロセスは別の実行ファイル（`tukuyomi-inspector-modsecurity`）で、設定の `kernel.engines.modsecurity.inspector` に書く（[実行ファイルの build と配置](../build/binary-deployment.md)）。取り込みの手順、試し、`--detect-only`、検査しない経路、CRS の取り込みは、Coraza の世代と同じである。
+`rules import --engine modsecurity` で作る世代は、libmodsecurity（ModSecurity v3.0.17）で要求を検査する。検査プロセスは別の実行ファイル（`tukuyomi-inspector-modsecurity`）で、設定の `kernel.engines.modsecurity.inspector` に書く（[ビルドと配置](../build/binary-deployment.md)）。取り込みの手順、試し、`--detect-only`、検査しない経路、CRS の取り込みは、Coraza の世代と同じである。
 
 検査プロセスが足す決まり（運用者のルールで替えることはできない）:
 
@@ -1099,11 +1099,11 @@ managed ストアの中身:
 
 ### managed で初めて起動する
 
-`managed` のある設定で、初めてプロキシを起動する手順である。選択中のバージョンが無いと、起動も `config check` も拒否する（`config check: managed store refused: no managed version is chosen`、exit 1）。そのため、起動の前にバージョンをインポートして選ぶ。ほかの段は [実行ファイルの build と配置](../build/binary-deployment.md) の「初めて起動する手順」と同じである。
+`managed` のある設定で、初めてプロキシを起動する手順である。選択中のバージョンが無いと、起動も `config check` も拒否する（`config check: managed store refused: no managed version is chosen`、exit 1）。そのため、起動の前にバージョンをインポートして選ぶ。ほかの段は [ビルドと配置](../build/binary-deployment.md) の「初めて起動する手順」と同じである。
 
 例は、redirect のリスナーと TLS のリスナー、ファイルの証明書を持つサイト 1 つ、アップストリーム 1 つ、管理画面のルートを持つ形である。ACME のサイトは下の「ACME のサイト」に書く。
 
-1. ディレクトリを作る。[実行ファイルの build と配置](../build/binary-deployment.md) の「OS ユーザーとディレクトリ」の表のディレクトリに加えて、managed ストアのディレクトリを 0700 で作る。
+1. ディレクトリを作る。[ビルドと配置](../build/binary-deployment.md) の「OS ユーザーとディレクトリ」の表のディレクトリに加えて、managed ストアのディレクトリを 0700 で作る。
 
    ```bash
    sudo install -d -m 0700 -o tukuyomi -g tukuyomi /var/lib/tukuyomi-core/managed
@@ -1168,7 +1168,7 @@ managed ストアの中身:
    }
    ```
 
-5. ルールセットをインポートし、世代を選ぶ（[実行ファイルの build と配置](../build/binary-deployment.md) の「初めて起動する手順」の 2〜4）。`rules` のコマンドは設定ファイルだけを読み、managed ストアを読まないので、`current` がまだ無くても通る（下の 6・7 の後に流してもよい）。
+5. ルールセットをインポートし、世代を選ぶ（[ビルドと配置](../build/binary-deployment.md) の「初めて起動する手順」の 2〜4）。`rules` のコマンドは設定ファイルだけを読み、managed ストアを読まないので、`current` がまだ無くても通る（下の 6・7 の後に流してもよい）。
 6. バージョンをインポートする。
 
    ```bash
@@ -1191,8 +1191,8 @@ managed ストアの中身:
    ```
 
    - 通れば、標準出力に `accepted` が出る。標準エラーに `config check: managed version <version>` の行が出る。
-9. サービスを起動する（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。ログに `start: managed version <version>` の行が出る。
-10. 管理プロセスを起動し、最初のユーザーを作る（[実行ファイルの build と配置](../build/binary-deployment.md) の「初めて起動する手順」の 7）。管理画面には、`admin.route.access` が許すネットワークから、`admin.route.host` のホスト名で入る。この後の変更は、管理画面か管理 API で行う（下の「反映」）。
+9. サービスを起動する（[ビルドと配置](../build/binary-deployment.md) の「systemd」）。ログに `start: managed version <version>` の行が出る。
+10. 管理プロセスを起動し、最初のユーザーを作る（[ビルドと配置](../build/binary-deployment.md) の「初めて起動する手順」の 7）。管理画面には、`admin.route.access` が許すネットワークから、`admin.route.host` のホスト名で入る。この後の変更は、管理画面か管理 API で行う（下の「反映」）。
 
 ### managed の無い設定ファイルから移す
 
@@ -1305,7 +1305,7 @@ managed ストアの中身:
   - `acme` を持つ管理画面のルートも ACME のサイトも無いときは、結果の行を出さず、標準エラーに 1 行出して exit 0 で終わる（timer を失敗させないため）。
   - `current` かバージョンが読めないときは、設定を受け付けずに exit 2 で終わる。設定ファイルにある管理画面のルートの証明書も更新しない。
 - ファイルがまだ無いサイトは、まだ発行していない証明書である。起動、設定のリロード、`config check`、`managed activate` は拒否せず、`tls certificate not issued yet (site <name>)` の行を出して、そのサイトのホストへのハンドシェイクを拒否する。ファイルができた後の SIGUSR2 で使い始める。
-- ホストの組を変更したバージョン（サイトにホストを追加した、変更した、`{"chain", "key"}` から `acme` に変更した）に反映すると、新しいディレクトリにはまだ証明書が無い。そのサイトのすべてのホスト（前から接続できたホストも）に、TLS で接続できなくなる。反映の後すぐに、`acme renew` と SIGUSR2 を流す（[実行ファイルの build と配置](../build/binary-deployment.md) の「証明書の更新の timer」の service を `systemctl start tukuyomi-core-acme.service` で流す）。timer に任せると、次の timer まで接続できない。
+- ホストの組を変更したバージョン（サイトにホストを追加した、変更した、`{"chain", "key"}` から `acme` に変更した）に反映すると、新しいディレクトリにはまだ証明書が無い。そのサイトのすべてのホスト（前から接続できたホストも）に、TLS で接続できなくなる。反映の後すぐに、`acme renew` と SIGUSR2 を流す（[ビルドと配置](../build/binary-deployment.md) の「証明書の更新の timer」の service を `systemctl start tukuyomi-core-acme.service` で流す）。timer に任せると、次の timer まで接続できない。
 - 前のバージョンに戻す（ロールバック、名前での反映）と、そのホストの組のディレクトリに前の証明書が残っていれば、発行し直さずに使う。プロキシは証明書の有効期限を見ないので、有効期限の切れた証明書もそのまま使う。戻した後は `acme renew` を流す（有効期限が近ければ発行し直す）。
 - challenge に応答するホストは、`acme` を持つ管理画面のルートのホストと、稼働中のバージョンの ACME のサイトのホストである。反映でバージョンが切り替わると、一緒に切り替わる。`admin.route.access` は challenge に掛からない（CA はどのアドレスからも来る）。
   - コマンドで `managed activate` した後、SIGHUP の前に `acme renew` を流すと、新しいバージョンだけにあるホストは、プロキシが challenge に応答しないので `failed` になる。`managed activate` の後は、すぐに設定をリロードする（上の「反映」）。
@@ -1768,11 +1768,11 @@ query、本文、`Host` のほかの field（`User-Agent`、`Cookie` など）�
 
 ### 記録を読める人
 
-記録には、client の address と path が入る。journal を読める利用者（root と、Ubuntu では `adm`・`systemd-journal` の組の利用者）は、それを読める。組に入れる人を絞る。保存の期間と容量は journald の設定で決める（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。記録のファイル（`records`）は 0600 で、0700 のディレクトリにある。読めるのは、proxy の利用者と root である。管理のプロセスは、同じ利用者としてこのファイルを読み、管理の利用者に見せる（[管理リファレンス](admin-reference.md)）。送り手を使うときは、DB の表にも同じ記録が入る。表を読める DB の利用者も絞る。
+記録には、client の address と path が入る。journal を読める利用者（root と、Ubuntu では `adm`・`systemd-journal` の組の利用者）は、それを読める。組に入れる人を絞る。保存の期間と容量は journald の設定で決める（[ビルドと配置](../build/binary-deployment.md) の「systemd」）。記録のファイル（`records`）は 0600 で、0700 のディレクトリにある。読めるのは、proxy の利用者と root である。管理のプロセスは、同じ利用者としてこのファイルを読み、管理の利用者に見せる（[管理リファレンス](admin-reference.md)）。送り手を使うときは、DB の表にも同じ記録が入る。表を読める DB の利用者も絞る。
 
 ## 記録の送り手
 
-記録の送り手（`tukuyomi-records-ship`）は、proxy の記録のファイルを読み、行を PostgreSQL か MySQL の表へ順に入れる、別のプロセスである。proxy は送り手を動かさず、DB にもつながない。DB につなぐ部品と DB のパスワードは、送り手の実行ファイルとプロセスにだけある。build と unit は [実行ファイルの build と配置](../build/binary-deployment.md) にある。試したのは PostgreSQL 16・18 と MySQL 8.0 である。
+記録の送り手（`tukuyomi-records-ship`）は、proxy の記録のファイルを読み、行を PostgreSQL か MySQL の表へ順に入れる、別のプロセスである。proxy は送り手を動かさず、DB にもつながない。DB につなぐ部品と DB のパスワードは、送り手の実行ファイルとプロセスにだけある。build と unit は [ビルドと配置](../build/binary-deployment.md) にある。試したのは PostgreSQL 16・18 と MySQL 8.0 である。
 
 ### 送り手の起動
 
@@ -1781,7 +1781,7 @@ tukuyomi-records-ship <config>
 ```
 
 - `<config>` は proxy と同じ設定ファイルで、絶対の path で書く。proxy と同じ確かめで読み、`records.ship` が要る。無ければ `records-ship: configuration refused: there is no records.ship object` の行を出して終わる。
-- 読むのは設定ファイルだけで、managed ストアのバージョンと国のデータベースは読まない。知らない鍵のある設定ファイルは断るので、設定に新しい鍵（`managed`、`host_policies` など）を書く前に、送り手を proxy と同じ build に入れ替える（[実行ファイルの build と配置](../build/binary-deployment.md) の「記録の送り手」）。
+- 読むのは設定ファイルだけで、managed ストアのバージョンと国のデータベースは読まない。知らない鍵のある設定ファイルは断るので、設定に新しい鍵（`managed`、`host_policies` など）を書く前に、送り手を proxy と同じ build に入れ替える（[ビルドと配置](../build/binary-deployment.md) の「記録の送り手」）。
 - proxy と同じ利用者で動かす。root では動かない（user id の4つのどれかが 0 なら断る）。記録のディレクトリが、この利用者の本物のディレクトリで、group と other の権限が無いことも確かめる。`ship.state` をそこに書くためである。
 - 記録のディレクトリのファイルシステムは、ファイルの生まれた時刻（`statx` の btime）を返すこと。送り手は、記録のファイルを inode と生まれた時刻の組で見分ける（ファイルシステムは、消したファイルの inode の番号をすぐに使い回す）。返さないファイルシステムでは、送り手は起動を断り、proxy は遅れを「分からない」として `required` の要求を断る。
 - 起動の順は、設定、記録のディレクトリ、接続の文字列のファイル（下）、合図の受け付け、`NOTIFY_SOCKET` があれば `READY=1` である。DB には最初の回でつなぐ。届かない DB は、動いている間に止まったときと同じに、待って試し直す。
@@ -1947,7 +1947,7 @@ TLS は次のとおりである。
 - `NOTIFY_SOCKET` は、絶対の path か、`@` で始まる名前（Linux の abstract の名前）である。ほかの値なら `start:` の文を1行出し、知らせを送らずに動く。
 - 送れなかったときは `notify:` の文を1行出すだけで、動きは変えない。待たずに送るので、受ける側が読まなくても proxy は止まらない。
 - 検査プロセスの環境は空なので、検査プロセスは知らせを送らない。
-- unit を `Type=notify` にすると、`systemctl start` は検査核の準備と待ち受けの bind まで待つ（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）。
+- unit を `Type=notify` にすると、`systemctl start` は検査核の準備と待ち受けの bind まで待つ（[ビルドと配置](../build/binary-deployment.md) の「systemd」）。
 
 ## ACME
 
@@ -1986,7 +1986,7 @@ TLS は次のとおりである。
    - `directory_url` を本番の CA のものに変更する。CA の API のサーバー証明書のルート証明書が違うなら、`ca_file` も変更する。
    - もう一度 `acme renew` を流してから、SIGUSR2 を送る。ファイルを削除してから `acme renew` が終わるまでの間に SIGUSR2 を送ると（証明書も読む設定のリロードも含む）、その証明書はハンドシェイクから外れる。この順を守れば、その間もプロキシは読み込み済みの証明書を使い続ける。
    - `directory_url`・`ca_file`・`contact_email` など、`acme` の多くの設定キーはコマンドだけが読むので、プロキシの再起動は要らない。`challenge_dir` と、`acme` を持つ証明書のホストはプロキシも読むので、変更したときはプロキシに設定をリロードさせる（SIGHUP、`systemctl reload`。ACME のサイトのホストは、バージョンの反映で切り替わる）。
-6. 毎日の timer を置く（[実行ファイルの build と配置](../build/binary-deployment.md) の「証明書の更新の timer」）。
+6. 毎日の timer を置く（[ビルドと配置](../build/binary-deployment.md) の「証明書の更新の timer」）。
 
 ### 注意
 
@@ -1995,6 +1995,6 @@ TLS は次のとおりである。
 - 鍵と証明書は別のファイルに書いて同期してから、鍵、証明書の順に置き換える。
   - 2 つの置き換えの間で止まると、鍵が証明書に合わない組が残る。動いているプロキシは、SIGUSR2 でその組を拒否して今のものを使い続け、次のコマンドが作り直す。ただし、その間にプロキシを起動すると、その組を拒否して起動しない（exit 1）。
   - 2 つの置き換えの間と、設定のリロード（SIGHUP、制御ソケットの `reload`）、`managed activate`、`config check`、起動が重なると、証明書の検証で拒否されることがある（`tls refused`）。そのときは、もう一度流す。管理画面と管理 API の反映での扱いは、[管理リファレンス](admin-reference.md) の「制御ソケット」に書く。
-- `cert_file`・`key_file`・`challenge_dir` の置かれたディレクトリと、managed ストアに、サービスの OS ユーザーが書けること（[実行ファイルの build と配置](../build/binary-deployment.md) の「OS ユーザーとディレクトリ」）。
+- `cert_file`・`key_file`・`challenge_dir` の置かれたディレクトリと、managed ストアに、サービスの OS ユーザーが書けること（[ビルドと配置](../build/binary-deployment.md) の「OS ユーザーとディレクトリ」）。
   - 鍵は 0600、証明書は 0644 で書く（umask の分は引かれる）。
 - ACME のサイトのホストの組を変更したバージョンに反映したときと、前のバージョンに戻したときは、すぐに `acme renew` を流す（上の「ACME のサイト」）。

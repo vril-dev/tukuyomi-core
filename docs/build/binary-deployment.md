@@ -1,4 +1,4 @@
-# 実行ファイルの build と配置
+# ビルドと配置
 
 この文書は、今の実装を1台の Linux のホストで動かす手順を示す。設定の鍵の意味と範囲、命令、合図、記録、監視は [運用リファレンス](../operations/operator-reference.md) に書く。管理のプロセスの設定と API は [管理リファレンス](../operations/admin-reference.md) に書く。
 

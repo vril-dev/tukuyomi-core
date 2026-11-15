@@ -25,7 +25,7 @@ tukuyomi-core は、tukuyomi（tukuyomi WAF）から派生し、WAF 機能に特
 | 項目 | 現在の状態 |
 |---|---|
 | 製品のコード | 初回の検査核、HTTP・HTTPS の受付と転送、リクエストの前のポリシー、管理プロセス（管理 API と管理画面）、managed 設定、ログ送信プロセスのソースがある（下の各節）。ほかはない |
-| ビルド済みの実行ファイル・配布物 | 0.1.0 から、Linux x86_64 の4つの実行ファイルを1つの tarball にして、GitHub のリリースに置く。ソースからも build できる（[実行ファイルの build と配置](../../build/binary-deployment.md) の「リリースの tarball」と「build」） |
+| ビルド済みの実行ファイル・配布物 | 0.1.0 から、Linux x86_64 の4つの実行ファイルを1つの tarball にして、GitHub のリリースに置く。ソースからも build できる（[ビルドと配置](../../build/binary-deployment.md) の「リリースの tarball」と「build」） |
 | リクエストの検査（URI、ヘッダー、ボディ） | 受け付けたリクエストの URI、ヘッダー、ボディの先頭を、初回の検査核で検査する。検査できるボディの型は限られる（下の2つの節）。範囲全体は設計の検討中 |
 | 応答の検査 | 未実装。行うかどうかも未決定（OV-04） |
 | ルールの世代 | ルールセットのインポート、世代の選択と切り替え、検知のみのモード、検査除外のルートを実装した（下の「HTTP・HTTPS の受付と転送」）。管理 API と管理画面からも、インポート、選択、切り替え、前の世代へのロールバックができる（下の「管理プロセス」） |
@@ -35,7 +35,7 @@ tukuyomi-core は、tukuyomi（tukuyomi WAF）から派生し、WAF 機能に特
 | 管理UI | ある。管理プロセスが、実行ファイルに組み込んだ画面を配る（下の「管理プロセス」）。コマンド（`rules`、`managed`、`acme renew`、`config check`）でも操作できる。tukuyomi の管理UIの再利用と改善の範囲は未決定（OV-03） |
 | OS 上の分離・権限の制限 | root では動かない。検査プロセスは、起動のときに Landlock と capability の放棄で自分を絞る。検査プロセス、管理プロセス、ログ送信プロセスはプロキシと同じ OS ユーザーで動く（AR-04） |
 | 対応する環境・デプロイ構成 | 未決定（OV-06）。今の実装は Linux の1台で動き、systemd の例がある |
-| 文書 | [設計文書の入口](../../README.md)、00_overview の3文書（この文書を含む。いずれも初期草案）、[実行ファイルの build と配置](../../build/binary-deployment.md)、[運用リファレンス](../../operations/operator-reference.md)、[管理リファレンス](../../operations/admin-reference.md) |
+| 文書 | [ドキュメントの索引](../../README.md)、00_overview の3文書（この文書を含む。いずれも初期草案）、[ビルドと配置](../../build/binary-deployment.md)、[運用リファレンス](../../operations/operator-reference.md)、[管理リファレンス](../../operations/admin-reference.md) |
 
 ### 初回の検査核（実装済みの範囲）
 
@@ -259,4 +259,4 @@ tukuyomi-core は、tukuyomi（tukuyomi WAF）から派生し、WAF 機能に特
 
 - [アーキテクチャ概要](architecture.md)
 - [設計方針・制約](design-principles.md)
-- [設計文書の入口](../../README.md)
+- [ドキュメントの索引](../../README.md)

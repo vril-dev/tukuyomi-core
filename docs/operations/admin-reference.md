@@ -1,6 +1,6 @@
 # 管理リファレンス
 
-この文書は、今の実装の管理のプロセス、設定の `admin`、管理 API、管理画面を、引いて使える形でまとめる。proxy の設定と命令は [運用リファレンス](operator-reference.md)、置き方と systemd の例は [実行ファイルの build と配置](../build/binary-deployment.md) に書く。
+この文書は、今の実装の管理のプロセス、設定の `admin`、管理 API、管理画面を、引いて使える形でまとめる。proxy の設定と命令は [運用リファレンス](operator-reference.md)、置き方と systemd の例は [ビルドと配置](../build/binary-deployment.md) に書く。
 
 例の path と名前（`/etc/tukuyomi-core/config.json`、利用者 `tukuyomi`、`admin.example.com`、`192.0.2.0/24` など）は例である。
 
@@ -33,7 +33,7 @@ tukuyomi-proxy admin <config>
 
 - 設定ファイルは絶対の path で渡す（[運用リファレンス](operator-reference.md) の「命令」と同じ決まり）。
 - 起動は次の順に進む。
-  1. 起動の前の確かめ（root でないこと、SIGCHLD、file descriptor。proxy と同じで、中身は [実行ファイルの build と配置](../build/binary-deployment.md) の「起動の前の確かめ」）
+  1. 起動の前の確かめ（root でないこと、SIGCHLD、file descriptor。proxy と同じで、中身は [ビルドと配置](../build/binary-deployment.md) の「起動の前の確かめ」）
   2. 設定ファイル
   3. 管理の置き場を開き、`process.lock` の lock を取る
   4. 監査の記録を開く
@@ -136,7 +136,7 @@ tukuyomi-proxy admin reset <config> <name>
 - `NOTIFY_SOCKET` の決まりは proxy と同じである（[運用リファレンス](operator-reference.md) の「systemd への知らせ」）。扱う合図はこの3つだけで、SIGUSR1 と SIGUSR2 は扱わない（送ると既定の動きでプロセスが終わる）。
 - session、締め出しの数、設定中の第二要素の秘密、managed 設定の反映の処理はメモリだけにあるので、起動し直すと全員がログインし直し、反映の処理も残らない。API token、利用者、監査、切り替えの履歴、設定の変更履歴は置き場に残る。
 
-systemd の unit は、proxy の unit（[実行ファイルの build と配置](../build/binary-deployment.md) の「systemd」）に合わせて作る。管理のプロセスの違いは次のとおりである。
+systemd の unit は、proxy の unit（[ビルドと配置](../build/binary-deployment.md) の「systemd」）に合わせて作る。管理のプロセスの違いは次のとおりである。
 
 - `ExecStart` は `tukuyomi-proxy admin <config>`、`User` と `Group` は proxy と同じにする。
 - `Type=notify` にする。待ち受けを bind した後に `READY=1` を送る。
@@ -177,7 +177,7 @@ systemd の unit は、proxy の unit（[実行ファイルの build と配置](
 | `mfa` | `"optional"`、`"required"` | 第二要素を求めるか。`required` は、第二要素を持たない利用者に設定だけをさせる（下の「ログインと第二要素」） |
 | `session_idle_ms` | 1 分〜24 時間 | session が使われないまま続く時間 |
 | `session_total_ms` | `session_idle_ms` 〜 7 日 | session が続く時間の上限 |
-| `crs_dir` | 絶対の path、3840 バイトまで。省いてよい | 取り込みで使える CRS のディレクトリ。`scripts/fetch-crs.sh` で取得したもの（[実行ファイルの build と配置](../build/binary-deployment.md) の「CRS の取得」）。省くと、取り込みで CRS を使えない |
+| `crs_dir` | 絶対の path、3840 バイトまで。省いてよい | 取り込みで使える CRS のディレクトリ。`scripts/fetch-crs.sh` で取得したもの（[ビルドと配置](../build/binary-deployment.md) の「CRS の取得」）。省くと、取り込みで CRS を使えない |
 | `route` | `managed` のある設定だけ。そのときは必須 | 管理画面のルート（host、証明書、`access`）。proxy だけが使う。形と決まりは [運用リファレンス](operator-reference.md) の「`admin`」、使い方は下の「managed のある設定の管理画面のルート」 |
 
 - `listen` は、待ち受け（`proxy.listeners`）と `status.listen` のどれとも重ならない。重なりの決まりは待ち受けどうしと同じで、同じ address と port、または片方が `0.0.0.0` や `::` で port が同じものである。
