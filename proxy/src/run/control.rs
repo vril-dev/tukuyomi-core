@@ -67,7 +67,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::error::TrySendError;
@@ -76,6 +75,8 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 use tukuyomi_kernel::Phase;
 
+use self::answer::{reload_line, switch_line};
+use self::order::{Ask, SwitchOrder, parse};
 use super::host;
 use super::start::Refusal;
 use super::status::Readiness;
@@ -83,7 +84,13 @@ use crate::inbound::conn::{Setup, SharedSetup};
 use crate::inbound::session::send_and_close;
 use crate::inspect::driver::State;
 use crate::log::Log;
-use crate::rules::bundle::{Fingerprint, hex};
+use crate::rules::bundle::Fingerprint;
+
+mod answer;
+mod order;
+
+pub(super) use self::answer::{Answer, Figures, Outcome, Reloaded};
+pub(super) use self::order::{Order, ReloadOrder};
 
 /// The most connections served at once; another one is accepted and closed.
 const SEATS: usize = 4;
@@ -97,327 +104,6 @@ const WRITE_WAIT: Duration = Duration::from_secs(2);
 pub(super) const SWITCH_MARGIN: Duration = Duration::from_secs(5);
 /// The pause after an accept failed.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
-
-/// How a switch order ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Outcome {
-    Switched,
-    Unchanged,
-    Refused,
-    Failed,
-    Busy,
-}
-
-impl Outcome {
-    fn word(self) -> &'static str {
-        match self {
-            Outcome::Switched => "switched",
-            Outcome::Unchanged => "unchanged",
-            Outcome::Refused => "refused",
-            Outcome::Failed => "failed",
-            Outcome::Busy => "busy",
-        }
-    }
-}
-
-/// How a reload order ended.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Reloaded {
-    /// The configuration was replaced: the main file and the version that the order named serve now.
-    Replaced,
-    /// Nothing was replaced, for the reason that the refusal gives.
-    Refused(Refusal),
-    /// No reading was started for the order, or its end was not waited for; the word says why.
-    Busy(&'static str),
-}
-
-impl Reloaded {
-    fn word(&self) -> &'static str {
-        match self {
-            Reloaded::Replaced => "replaced",
-            Reloaded::Refused(_) => "refused",
-            Reloaded::Busy(_) => "busy",
-        }
-    }
-
-    /// The reason of the answer and of its record line; `replaced` has none.
-    fn reason(&self) -> Option<&'static str> {
-        match self {
-            Reloaded::Replaced => None,
-            Reloaded::Refused(refusal) => Some(refusal.reason.word()),
-            Reloaded::Busy(why) => Some(why),
-        }
-    }
-}
-
-/// The figures of the proxy that a status answer holds besides its state: what `/metrics` shows of the same, taken
-/// when the answer is made.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Figures {
-    /// The milliseconds since the proxy started.
-    pub(super) uptime_ms: u64,
-    /// The requests of every class of the records, `closed` (no answer) included, and those of a route that writes no
-    /// record.
-    pub(super) requests: u64,
-    /// The requests that a rule blocked.
-    pub(super) blocked: u64,
-    /// The requests that the access list or the rate limit turned away.
-    pub(super) policy_refused: u64,
-    /// The failures of the servers of every upstream group of the configuration in force.
-    pub(super) upstream_failures: u64,
-    /// The SHA-256 of the configuration file in force.
-    pub(super) config: [u8; 32],
-    /// The name of the managed version in force, for a file with `managed`.
-    pub(super) managed: Option<[u8; 32]>,
-    /// The `forward.resolve_timeout_ms` of the configuration in force.
-    pub(super) resolve_timeout_ms: u64,
-    /// The readings of the configuration file again, by how they ended.
-    pub(super) config_replaced: u64,
-    pub(super) config_refused: u64,
-}
-
-/// The answer to a line, as the connection writes it.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Answer {
-    Status {
-        generation: Fingerprint,
-        mode: &'static str,
-        engine: &'static str,
-        phase: &'static str,
-        switching: bool,
-        reloading: bool,
-        ready: bool,
-        figures: Figures,
-    },
-    Switch {
-        outcome: Outcome,
-        reason: Option<&'static str>,
-        generation: Fingerprint,
-    },
-    /// The answer to a reload order, with the SHA-256 of the main file and the managed version in force when it is
-    /// given.
-    Reload {
-        reloaded: Reloaded,
-        config: [u8; 32],
-        managed: Option<[u8; 32]>,
-    },
-    Error(&'static str),
-}
-
-/// The answer to a reload order, written by the JSON writer with its keys in this order: `config` only for `replaced`,
-/// and `managed` always (`null` for none). The writer escapes the sentence of a refusal, which has names of the
-/// configuration in it.
-#[derive(Serialize)]
-struct ReloadLine<'a> {
-    result: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    config: Option<String>,
-    managed: Option<String>,
-}
-
-impl Answer {
-    /// The answer to a reload order that ended as `reloaded`, while `setup` is in force.
-    pub(super) fn reload(reloaded: Reloaded, setup: &Setup) -> Answer {
-        Answer::Reload {
-            reloaded,
-            config: setup.sha256,
-            managed: setup.managed,
-        }
-    }
-
-    /// The line of JSON with its line feed. Every value but the sentence of a refused reload order is a fixed word, a
-    /// boolean, a number or hexadecimal digits, so those lines are written as they are, with nothing to escape; the
-    /// answer to a reload order is written by the JSON writer.
-    fn line(&self) -> String {
-        match self {
-            Answer::Status {
-                generation,
-                mode,
-                engine,
-                phase,
-                switching,
-                reloading,
-                ready,
-                figures,
-            } => format!(
-                "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"engine\":\"{engine}\",\"phase\":\"{phase}\",\"switching\":{switching},\"reloading\":{reloading},\"ready\":{ready},\"uptime_ms\":{},\"requests\":{},\"blocked\":{},\"policy_refused\":{},\"upstream_failures\":{},\"config\":\"{}\",\"managed\":{},\"resolve_timeout_ms\":{},\"config_reloads\":{{\"replaced\":{},\"refused\":{}}}}}\n",
-                generation.hex(),
-                figures.uptime_ms,
-                figures.requests,
-                figures.blocked,
-                figures.policy_refused,
-                figures.upstream_failures,
-                hex(&figures.config),
-                figures
-                    .managed
-                    .map_or_else(|| "null".to_owned(), |name| format!("\"{}\"", hex(&name))),
-                figures.resolve_timeout_ms,
-                figures.config_replaced,
-                figures.config_refused
-            ),
-            Answer::Switch {
-                outcome,
-                reason: Some(reason),
-                generation,
-            } => format!(
-                "{{\"result\":\"{}\",\"reason\":\"{reason}\",\"generation\":\"{}\"}}\n",
-                outcome.word(),
-                generation.hex()
-            ),
-            Answer::Switch {
-                outcome,
-                reason: None,
-                generation,
-            } => format!(
-                "{{\"result\":\"{}\",\"generation\":\"{}\"}}\n",
-                outcome.word(),
-                generation.hex()
-            ),
-            Answer::Reload {
-                reloaded,
-                config,
-                managed,
-            } => {
-                let line = ReloadLine {
-                    result: reloaded.word(),
-                    reason: reloaded.reason(),
-                    detail: match reloaded {
-                        Reloaded::Refused(refusal) => Some(&refusal.detail),
-                        Reloaded::Replaced | Reloaded::Busy(_) => None,
-                    },
-                    config: matches!(reloaded, Reloaded::Replaced).then(|| hex(config)),
-                    managed: managed.map(|name| hex(&name)),
-                };
-                // The writer does not fail on these fields; an empty line would not be taken for an answer.
-                let mut text = serde_json::to_string(&line).unwrap_or_default();
-                text.push('\n');
-                text
-            }
-            Answer::Error(reason) => format!("{{\"result\":\"error\",\"reason\":\"{reason}\"}}\n"),
-        }
-    }
-}
-
-/// The record line of an answer to a switch order. `serving` is the generation that serves then.
-fn switch_line(
-    expect: Fingerprint,
-    outcome: Outcome,
-    reason: Option<&'static str>,
-    serving: Fingerprint,
-) -> String {
-    let why = reason.map_or_else(String::new, |reason| format!(" ({reason})"));
-    format!(
-        "control: switch expect {}: {}{why}, serving {}",
-        expect.hex(),
-        outcome.word(),
-        serving.hex()
-    )
-}
-
-/// A request to switch, and where its answer goes.
-pub(super) struct SwitchOrder {
-    expect: Fingerprint,
-    reply: oneshot::Sender<Answer>,
-}
-
-impl SwitchOrder {
-    /// The generation the client expects the store to choose.
-    pub(super) fn expect(&self) -> Fingerprint {
-        self.expect
-    }
-
-    /// Answers the client, and writes the record line of the order. `serving` is the generation that serves now.
-    pub(super) fn finish(
-        self,
-        outcome: Outcome,
-        reason: Option<&'static str>,
-        serving: Fingerprint,
-        log: &Log,
-    ) {
-        log.line(&switch_line(self.expect, outcome, reason, serving));
-        let _ = self.reply.send(Answer::Switch {
-            outcome,
-            reason,
-            generation: serving,
-        });
-    }
-}
-
-/// The record line of an answer to a reload order for the version `managed`.
-fn reload_line(managed: [u8; 32], reloaded: &Reloaded) -> String {
-    let why = reloaded
-        .reason()
-        .map_or_else(String::new, |reason| format!(" ({reason})"));
-    format!(
-        "control: reload {}: {}{why}",
-        hex(&managed),
-        reloaded.word()
-    )
-}
-
-/// A request to read the configuration again with a managed version, and where its answer goes.
-pub(super) struct ReloadOrder {
-    managed: [u8; 32],
-    reply: oneshot::Sender<Answer>,
-}
-
-impl ReloadOrder {
-    /// The name of the version the configuration is to be read with.
-    pub(super) fn managed(&self) -> [u8; 32] {
-        self.managed
-    }
-
-    /// Answers the client, and writes the record line of the order. `setup` is the setup in force now.
-    pub(super) fn finish(self, reloaded: Reloaded, setup: &Setup, log: &Log) {
-        log.line(&reload_line(self.managed, &reloaded));
-        let _ = self.reply.send(Answer::reload(reloaded, setup));
-    }
-}
-
-/// What a connection asks of the main loop.
-pub(super) enum Order {
-    Status(oneshot::Sender<Answer>),
-    Switch(SwitchOrder),
-    Reload(ReloadOrder),
-}
-
-/// What a line asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ask {
-    Status,
-    Switch(Fingerprint),
-    /// A reading of the configuration with the managed version of this name.
-    Reload([u8; 32]),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Raw {
-    op: String,
-    expect: Option<String>,
-    managed: Option<String>,
-}
-
-/// What the line asks for, or the word that says why it is not a request. A name is 64 lowercase hexadecimal digits.
-fn parse(line: &[u8]) -> Result<Ask, &'static str> {
-    const MALFORMED: &str = "malformed request";
-    let raw: Raw = serde_json::from_slice(line).map_err(|_| MALFORMED)?;
-    match (raw.op.as_str(), raw.expect, raw.managed) {
-        ("status", None, None) => Ok(Ask::Status),
-        ("switch", Some(expect), None) => Fingerprint::from_hex(expect.as_bytes())
-            .map(Ask::Switch)
-            .ok_or("bad expect"),
-        ("reload", None, Some(managed)) => Fingerprint::from_hex(managed.as_bytes())
-            .map(|name| Ask::Reload(name.bytes()))
-            .ok_or("bad managed"),
-        ("status" | "switch" | "reload", _, _) => Err(MALFORMED),
-        _ => Err("unknown op"),
-    }
-}
 
 /// The word for the phase of a kernel.
 fn phase_word(phase: Phase) -> &'static str {

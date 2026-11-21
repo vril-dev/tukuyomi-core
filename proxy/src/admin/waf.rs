@@ -5,8 +5,9 @@
 //! with a token may use all of these routes; the audit log shows the token (`auth`) where it shows the session.
 //!
 //! The parts, one file each: `control` (the control socket of the proxy), `history` (what is kept of each switch),
-//! `import` (the body of an import and the trial), `records` (reading the record files) and `status` (the status
-//! route).
+//! `import` (the body of an import and the trial), `records` (reading the record files), `status` (the status
+//! route), `generations` (the list of the generations, one generation and the removal) and `activate` (the switch to
+//! a generation and the way back).
 //!
 //! The routes (a viewer may use the status, the generations, the history and the records, an operator the import, the
 //! switch, the rollback and the removal as well; a body is JSON of at most 64 KiB, the one of the import 12 MiB; the
@@ -70,31 +71,29 @@ pub mod import;
 pub mod records;
 pub mod status;
 
+mod activate;
+mod generations;
+
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use http::{Method, StatusCode};
-use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::json;
 
-use self::control::{Control, Reply, Seen};
-use self::history::{Ended, Kind, rollback_target};
+use self::control::Control;
 use self::import::{Inspector, Trial};
 use super::audit::{AuditLog, Event, Outcome};
 use super::auth::{Cx, Who};
-use super::password::hex;
-use super::server::{Answer, Gate, Handler, Req, Route, json_body};
+use super::server::{Answer, Gate, Handler, Req, Route};
 use super::store::AdminStore;
 use super::users::Role;
 use crate::config::{AdminConfig, MainFile, ProxyConfig, Records, StoreConfig};
 use crate::log::escaped;
-use crate::rules::bundle::Fingerprint;
 use crate::rules::collect::CollectError;
-use crate::rules::store::{self, NOT_EXPECTED, RuleStore, StoreError};
+use crate::rules::store::{self, RuleStore, StoreError};
 
 /// The most bytes of the body of an import: JSON with the files in base64.
 const IMPORT_BODY_MAX: usize = 12 << 20;
@@ -105,10 +104,6 @@ const IMPORT_LEAST: Role = Role::Operator;
 const GENERATION: &str = "/api/generations/";
 /// A margin on the time that something is waited for.
 const SLACK: Duration = Duration::from_secs(7);
-/// The time between two looks at the proxy while a switch is under way.
-const POLL: Duration = Duration::from_millis(250);
-/// The looks in a row at a proxy that is idle and does not serve the generation, after which the switch is lost.
-const IDLE_LOOKS: u32 = 2;
 /// The most bytes of the name of an input that an answer shows.
 const SUBJECT_MAX: usize = 128;
 
@@ -203,11 +198,6 @@ pub(super) fn slow(method: &Method, path: &str) -> bool {
     *method == Method::POST && matches!(path, IMPORT | "/api/activate" | "/api/rollback")
 }
 
-/// The generation that `path`, a path below `/api/generations/`, names.
-fn fingerprint_of(path: &str) -> Option<Fingerprint> {
-    Fingerprint::from_hex(path.strip_prefix(GENERATION)?.as_bytes())
-}
-
 /// How long the routes wait, from the `proxy` object of the configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct Waits {
@@ -285,64 +275,6 @@ fn invalid(e: CollectError) -> Answer {
         body["subject"] = escaped(&bytes[..bytes.len().min(SUBJECT_MAX)]).into();
     }
     Answer::json(StatusCode::BAD_REQUEST, body)
-}
-
-fn digits(text: &str) -> Result<Fingerprint, Answer> {
-    Fingerprint::from_hex(text.as_bytes()).ok_or_else(|| {
-        Answer::error(
-            StatusCode::BAD_REQUEST,
-            "a generation is not 64 lowercase hexadecimal digits",
-        )
-    })
-}
-
-/// The answer to a request to switch. `ids` are the generation before and the one asked for; `chosen`: the rules
-/// store chooses the latter now; `written`: the history has the line.
-fn reply(ended: Ended, ids: (Fingerprint, Fingerprint), chosen: bool, written: bool) -> Answer {
-    let (status, error) = match ended {
-        Ended::Switched | Ended::Unchanged => (StatusCode::OK, None),
-        Ended::Refused => (StatusCode::CONFLICT, Some("the proxy refused the switch")),
-        Ended::Failed => (StatusCode::BAD_GATEWAY, Some("the proxy did not switch")),
-        Ended::Unreachable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some("the proxy cannot be reached"),
-        ),
-        Ended::Unconfirmed => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some("the proxy did not say how the switch ended"),
-        ),
-    };
-    let mut body = json!({
-        "result": ended.word(),
-        "from": ids.0.hex(),
-        "generation": ids.1.hex(),
-        "chosen": chosen,
-    });
-    if let Some(error) = error {
-        body["error"] = error.into();
-    }
-    unwritten(Answer::json(status, body), written)
-}
-
-/// The answer, with `history` saying so when the history does not have the line of the request.
-fn unwritten(mut answer: Answer, written: bool) -> Answer {
-    if !written {
-        answer.body["history"] = "not written".into();
-    }
-    answer
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActivateBody {
-    generation: String,
-    expect: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RollbackBody {
-    expect: String,
 }
 
 /// The routes of the rules.
@@ -463,324 +395,6 @@ impl Waf {
         let _ = self
             .audit
             .write(&caller.event(action, outcome).target(target).reason(reason));
-    }
-
-    fn generations(&self) -> Answer {
-        let store = match self.rules() {
-            Ok(store) => store,
-            Err(answer) => return answer,
-        };
-        let (list, current) = match (store.list(), store.current()) {
-            (Ok(list), Ok(current)) => (list, current),
-            (Err(e), _) | (_, Err(e)) => return failed(e),
-        };
-        let proxy = self.control.status();
-        let serving = proxy.state().map(|status| status.generation);
-        let items: Vec<Value> = list
-            .iter()
-            .rev()
-            .map(|g| {
-                let (mode, engine, routes) = store
-                    .manifest(g.fingerprint)
-                    .map_or(("unknown", "unknown", 0), |m| {
-                        (m.mode().name(), m.engine().name(), m.routes().len())
-                    });
-                json!({
-                    "fingerprint": g.fingerprint.hex(),
-                    "made": g.made,
-                    "mode": mode,
-                    "engine": engine,
-                    "routes": routes,
-                    "current": current == Some(g.fingerprint),
-                    "serving": serving == Some(g.fingerprint),
-                })
-            })
-            .collect();
-        Answer::json(
-            StatusCode::OK,
-            json!({"reachable": proxy.reachable(), "generations": items}),
-        )
-    }
-
-    fn generation(&self, path: &str) -> Answer {
-        let Some(fingerprint) = fingerprint_of(path) else {
-            return not_found();
-        };
-        let store = match self.rules() {
-            Ok(store) => store,
-            Err(answer) => return answer,
-        };
-        let (list, current) = match (store.list(), store.current()) {
-            (Ok(list), Ok(current)) => (list, current),
-            (Err(e), _) | (_, Err(e)) => return failed(e),
-        };
-        let Some(entry) = list.iter().find(|g| g.fingerprint == fingerprint) else {
-            return not_found();
-        };
-        let manifest = match store.manifest(fingerprint) {
-            Ok(manifest) => manifest,
-            Err(e) => return failed(e),
-        };
-        let serving = self
-            .control
-            .status()
-            .state()
-            .map(|status| status.generation);
-        let files: Vec<Value> = manifest
-            .files()
-            .iter()
-            .map(|f| json!({"path": f.path.as_str(), "size": f.size, "sha256": hex(&f.sha256)}))
-            .collect();
-        let load: Vec<&str> = manifest.load().iter().map(|path| path.as_str()).collect();
-        let routes: Vec<Value> = manifest
-            .routes()
-            .iter()
-            .map(|rule| {
-                let mut route = Map::new();
-                if let Some(host) = rule.host() {
-                    route.insert("host".to_owned(), host.into());
-                }
-                route.insert("path".to_owned(), rule.path().unwrap_or_default().into());
-                route.insert("action".to_owned(), "bypass".into());
-                Value::Object(route)
-            })
-            .collect();
-        Answer::json(
-            StatusCode::OK,
-            json!({
-                "fingerprint": fingerprint.hex(),
-                "made": entry.made,
-                "mode": manifest.mode().name(),
-                "engine": manifest.engine().name(),
-                "current": current == Some(fingerprint),
-                "serving": serving == Some(fingerprint),
-                "load": load,
-                "files": files,
-                "routes": routes,
-            }),
-        )
-    }
-
-    fn activate(&self, req: &Req, caller: &Caller<'_>) -> Answer {
-        let body: ActivateBody = match json_body(req) {
-            Ok(body) => body,
-            Err(answer) => return answer,
-        };
-        match (digits(&body.generation), digits(&body.expect)) {
-            (Ok(to), Ok(expect)) => self.switch_to(caller, Kind::Activate, Some(to), expect),
-            (Err(answer), _) | (_, Err(answer)) => answer,
-        }
-    }
-
-    fn rollback(&self, req: &Req, caller: &Caller<'_>) -> Answer {
-        let body: RollbackBody = match json_body(req) {
-            Ok(body) => body,
-            Err(answer) => return answer,
-        };
-        match digits(&body.expect) {
-            Ok(expect) => self.switch_to(caller, Kind::Rollback, None, expect),
-            Err(answer) => answer,
-        }
-    }
-
-    /// The generation a request to switch is for, which the store must have: `asked`, or for a rollback the target
-    /// of the history when the store chooses `chosen`.
-    fn target(
-        &self,
-        store: &dyn RuleStore,
-        kind: Kind,
-        asked: Option<Fingerprint>,
-        chosen: Fingerprint,
-    ) -> Result<Fingerprint, Answer> {
-        let to = match asked {
-            Some(to) => to,
-            None => rollback_target(&self.lines()?, chosen).map_err(conflict)?,
-        };
-        if store
-            .list()
-            .map_err(failed)?
-            .iter()
-            .any(|g| g.fingerprint == to)
-        {
-            return Ok(to);
-        }
-        Err(match kind {
-            Kind::Activate => Answer::error(StatusCode::NOT_FOUND, "no such generation"),
-            Kind::Rollback => conflict("the generation to go back to is not in the store"),
-        })
-    }
-
-    /// A request to switch to `asked` (for a rollback: to the target of the history) when the rules store chooses
-    /// `expect`. See the module documentation for the steps.
-    fn switch_to(
-        &self,
-        caller: &Caller<'_>,
-        kind: Kind,
-        asked: Option<Fingerprint>,
-        expect: Fingerprint,
-    ) -> Answer {
-        let action = kind.word();
-        let _changing = match self.changing() {
-            Ok(guard) => guard,
-            Err(answer) => return answer,
-        };
-        let mut store = match self.rules() {
-            Ok(store) => store,
-            Err(answer) => return answer,
-        };
-        let to = match self.target(store.as_ref(), kind, asked, expect) {
-            Ok(to) => to,
-            Err(answer) => return answer,
-        };
-        let to_hex = to.hex();
-        // Nothing is changed unless the rules store chooses what the client saw and the proxy can be asked. The
-        // generation before is the one the store gave, which is `expect`.
-        let from = match store.current() {
-            Ok(Some(current)) if current == expect => current,
-            Ok(_) => {
-                self.note(caller, action, Outcome::Denied, "expect", &to_hex);
-                return refused(NOT_EXPECTED);
-            }
-            Err(e) => return failed(e),
-        };
-        let (ids, from_hex) = ((from, to), from.hex());
-        // Before the proxy is asked and before the store chooses: a generation whose engine cannot be used here
-        // would be refused by the proxy, and left as the chosen one it would end the next start. A manifest that
-        // cannot be read is not answered here: the store refuses it when it chooses, and that answer stands.
-        if let Ok(engine) = store.engine(to)
-            && let Err(text) = self.trial.usable(engine)
-        {
-            self.note(caller, action, Outcome::Denied, "engine", &to_hex);
-            return conflict(text);
-        }
-        match self.control.status() {
-            Seen::State(_) => {}
-            Seen::Busy => {
-                self.note(caller, action, Outcome::Denied, "busy", &to_hex);
-                return Answer::error(StatusCode::SERVICE_UNAVAILABLE, "the proxy is busy");
-            }
-            Seen::Unreachable => {
-                self.note(caller, action, Outcome::Denied, "unreachable", &to_hex);
-                let written = self.record(caller, kind, ids, Ended::Unreachable);
-                return reply(Ended::Unreachable, ids, false, written);
-            }
-        }
-        let event = caller
-            .event(action, Outcome::Ok)
-            .target(&to_hex)
-            .change(&from_hex, &to_hex);
-        if self.audit.write(&event).is_err() {
-            return Answer::unavailable();
-        }
-        if let Err(e) = store.activate_if_current(from, to) {
-            // A generation that another process chose since the check above stays, and nothing is written to the
-            // history, as for a wrong `expect`.
-            if e == NOT_EXPECTED {
-                self.note(caller, action, Outcome::Failed, "expect", &to_hex);
-                return refused(e);
-            }
-            self.note(caller, action, Outcome::Failed, "store", &to_hex);
-            let written = self.record(caller, kind, ids, Ended::Refused);
-            return unwritten(refused(e), written);
-        }
-        let ended = self.switch(to);
-        if !matches!(ended, Ended::Switched | Ended::Unchanged) {
-            self.note(caller, action, Outcome::Failed, ended.word(), &to_hex);
-        }
-        let written = self.record(caller, kind, ids, ended);
-        reply(ended, ids, true, written)
-    }
-
-    /// Orders the proxy to switch to `to`, and waits for the end of the switch.
-    fn switch(&self, to: Fingerprint) -> Ended {
-        match self.control.switch(to) {
-            None => Ended::Unconfirmed,
-            Some(Reply::Switched) => Ended::Switched,
-            Some(Reply::Unchanged) => Ended::Unchanged,
-            Some(Reply::Refused) => Ended::Refused,
-            Some(Reply::Failed) => Ended::Failed,
-            Some(Reply::Busy) => self.await_switch(to),
-        }
-    }
-
-    /// The proxy did not finish the switch within the time it waits (or did not take the order): looks at its state
-    /// until it serves `to`. A proxy that has no place for a look is looked at again; one that cannot be reached
-    /// leaves the end of the switch unconfirmed.
-    fn await_switch(&self, to: Fingerprint) -> Ended {
-        let now = Instant::now();
-        let by = now
-            .checked_add(self.waits.stop.saturating_add(SLACK))
-            .unwrap_or(now);
-        let mut idle = 0;
-        loop {
-            sleep(POLL);
-            match self.control.status() {
-                Seen::Unreachable => return Ended::Unconfirmed,
-                Seen::Busy => idle = 0,
-                Seen::State(status) if status.generation == to => return Ended::Switched,
-                Seen::State(status) if status.switching => idle = 0,
-                Seen::State(_) => {
-                    idle += 1;
-                    if idle >= IDLE_LOOKS {
-                        return Ended::Failed;
-                    }
-                }
-            }
-            if Instant::now() >= by {
-                return Ended::Failed;
-            }
-        }
-    }
-
-    fn remove(&self, path: &str, caller: &Caller<'_>) -> Answer {
-        let Some(generation) = fingerprint_of(path) else {
-            return not_found();
-        };
-        let hex = generation.hex();
-        let _changing = match self.changing() {
-            Ok(guard) => guard,
-            Err(answer) => return answer,
-        };
-        let mut store = match self.rules() {
-            Ok(store) => store,
-            Err(answer) => return answer,
-        };
-        match store.list() {
-            Ok(list) if list.iter().any(|g| g.fingerprint == generation) => {}
-            Ok(_) => return not_found(),
-            Err(e) => return failed(e),
-        }
-        let chosen = match store.current() {
-            Ok(Some(current)) if current == generation => {
-                self.note(caller, "remove", Outcome::Denied, "chosen", &hex);
-                return conflict("the generation is the one the rules store chooses");
-            }
-            Ok(current) => current,
-            Err(e) => return failed(e),
-        };
-        // A rollback has a target only while the history ends at the chosen generation.
-        let lines = match self.lines() {
-            Ok(lines) => lines,
-            Err(answer) => return answer,
-        };
-        if chosen.is_some_and(|chosen| rollback_target(&lines, chosen) == Ok(generation)) {
-            self.note(caller, "remove", Outcome::Denied, "rollback target", &hex);
-            return conflict("the generation is the target of a rollback");
-        }
-        if self
-            .audit
-            .write(&caller.event("remove", Outcome::Ok).target(&hex))
-            .is_err()
-        {
-            return Answer::unavailable();
-        }
-        match store.remove(generation) {
-            Ok(()) => Answer::json(StatusCode::OK, json!({"removed": hex})),
-            Err(e) => {
-                self.note(caller, "remove", Outcome::Failed, "store", &hex);
-                refused(e)
-            }
-        }
     }
 }
 
