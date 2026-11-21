@@ -50,13 +50,14 @@
 //! it, and the lock of the store goes with the process. The job is `{"kind", "actor", "from", "to", "started", "ended",
 //! "state", "result", "reason", "detail", "config_before", "config_after", "history"}`: `started` and `ended` are
 //! seconds since the epoch, `state` is `running` or `ended`, and while it runs `ended`, `result` and `history` are
-//! `null`. `result` is the end of the order (`applied`, `refused`, `busy`, `current changed`, `no version`, `unmanaged`,
-//! `store`, `audit`, `error`, `unreachable`, `failed`, `unconfirmed`, `not recorded`); `reason` its fixed word (the
-//! part of the proxy that refused, the reason of `busy` or `error`, `current changed` or `store` for `not recorded`);
-//! `detail` the sentence of the proxy that refused, or of the store; `config_before` and `config_after` the SHA-256 of
-//! the main file in force before and after the order, when they are known; and `history` whether the history took
-//! its line (`null` when the end has none). A job that panics ends as `unconfirmed`, and the process writes a line to
-//! its records. A job cannot be stopped, and a change of the role of its user does not stop it.
+//! `null`. `result` is the end of the order (`applied`, `refused`, `busy`, `current changed`, `no version`,
+//! `unmanaged`, `store`, `audit`, `error`, `unreachable`, `failed`, `unconfirmed`, `not recorded`); `reason` its fixed
+//! word (the part of the proxy that refused, the reason of `busy` or `error`, `current changed` or `store` for
+//! `not recorded`); `detail` the sentence of the proxy that refused, or of the store; `config_before` and
+//! `config_after` the SHA-256 of the main file in force before and after the order, when they are known; and `history`
+//! whether the history took its line (`null` when the end has none). A job that panics ends as `unconfirmed`, and the
+//! process writes a line to its records. A job cannot be stopped, and a change of the role of its user does not stop
+//! it.
 
 use std::cell::Cell;
 use std::net::IpAddr;

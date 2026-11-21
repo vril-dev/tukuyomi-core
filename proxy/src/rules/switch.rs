@@ -17,7 +17,7 @@ use tukuyomi_kernel::Engine;
 use crate::config::KernelSettings;
 use crate::rules::bundle::{Fingerprint, Mode};
 use crate::rules::routes::Routes;
-use crate::rules::store::{ENGINES, Hold, RuleStore};
+use crate::rules::store::{ENGINES, Hold, RuleStore, index};
 
 /// A generation with the hold that keeps it from being removed.
 struct Held {
@@ -53,14 +53,6 @@ pub struct Switcher {
     next: Option<(Engine, Held)>,
 }
 
-/// The place of `engine` in the table of the engines that run.
-fn place(engine: Engine) -> usize {
-    ENGINES
-        .iter()
-        .position(|&known| known == engine)
-        .unwrap_or(0)
-}
-
 impl Switcher {
     /// `started` are the generations that the proxy started with, one for each engine that runs, each with its hold.
     pub fn new(
@@ -70,7 +62,7 @@ impl Switcher {
     ) -> Switcher {
         let mut running = [const { None }; ENGINES.len()];
         for (engine, generation, hold) in started {
-            running[place(engine)] = Some(Held {
+            running[index(engine)] = Some(Held {
                 generation,
                 _hold: hold,
             });
@@ -139,7 +131,7 @@ impl Switcher {
 
     /// The generation that serves `engine`, if the engine runs.
     pub fn running(&self, engine: Engine) -> Option<Fingerprint> {
-        self.running[place(engine)]
+        self.running[index(engine)]
             .as_ref()
             .map(|held| held.generation)
     }
@@ -154,10 +146,10 @@ impl Switcher {
         if let Some((engine, next)) = self.next.take()
             && switched
         {
-            self.running[place(engine)] = Some(next);
+            self.running[index(engine)] = Some(next);
         }
     }
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

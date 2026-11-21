@@ -2,11 +2,12 @@
 //! certificate and key files again. SIGUSR1 reads the generation chosen for each engine, the default engine first and
 //! the others in the order of their names, and switches the engines whose chosen generation is not the one that runs,
 //! one after the other: the next engine is taken when the switch of the one before has ended, for there is one switch
-//! under way at a time. An engine that has a generation chosen and does not run is started by its switch. The orders
-//! of the control socket are carried out here too: a status is answered, a switch is the switch of SIGUSR1 for the
-//! engine of the order once the store chooses the generation that the order expects, and a reload is the reading of
-//! SIGHUP with the managed version that the order names. SIGHUP, the reading of the configuration file again, is in
-//! `config`, with the values that it may not change in `fixed`.
+//! under way at a time, and a SIGUSR1 that comes while one is under way is a line and nothing more. An engine that has
+//! a generation chosen and does not run is started by its switch. The orders of the control socket are carried out here
+//! too: a status is answered, a switch is the switch of SIGUSR1 for the engine of the order once the store chooses the
+//! generation that the order expects, and a reload is the reading of SIGHUP with the managed version that the order
+//! names. SIGHUP, the reading of the configuration file again, is in `config`, with the values that it may not change
+//! in `fixed`.
 
 mod config;
 mod fixed;
@@ -52,8 +53,10 @@ enum Begun {
 
 /// SIGUSR1: reads the rules store for each engine, the default engine first, and orders the driver to switch to the
 /// generation chosen for an engine that is not the one that runs. The first switch is started here and the others
-/// when each switch before it has ended (`continue_reload`); the answer of each comes as `Event::Switched`. Every other
-/// case is a record line, and the proxy goes on as it is.
+/// when each switch before it has ended (`continue_reload`); the answer of each comes as `Event::Switched`. A switch
+/// that is under way when SIGUSR1 comes is a record line and nothing more: the engines that an earlier SIGUSR1 has
+/// still to switch stay in the queue, and go on when that switch has ended. Every other case is a record line too, and
+/// the proxy goes on as it is.
 pub(super) fn reload(
     waits: &mut Waits,
     switcher: &mut Switcher,
@@ -62,13 +65,17 @@ pub(super) fn reload(
     log: &Log,
 ) {
     log.line("reload: SIGUSR1");
+    if waits.switch.is_some() {
+        log.line("reload: a switch is in progress, ignored");
+        return;
+    }
     waits.queue = engines_from(switcher.default_engine()).collect();
     continue_reload(waits, switcher, ingress, counters, log);
 }
 
 /// Takes the engines that SIGUSR1 has still to switch, in order, until a switch is started; an engine that needs none
-/// is passed over. Called when a switch has ended. A switch that is under way when SIGUSR1 comes ends the reading of
-/// the engines: it is a line, as ever.
+/// is passed over. Called when SIGUSR1 comes and no switch is under way, and when a switch has ended: no switch is
+/// under way then, so the switcher is never busy here.
 pub(super) fn continue_reload(
     waits: &mut Waits,
     switcher: &mut Switcher,
@@ -76,17 +83,9 @@ pub(super) fn continue_reload(
     counters: &Counters,
     log: &Log,
 ) {
-    while waits.switch.is_none() {
-        let Some(engine) = waits.queue.pop_front() else {
+    while let Some(engine) = waits.queue.pop_front() {
+        if let Begun::Started = begin(waits, switcher, ingress, counters, log, engine, None) {
             return;
-        };
-        match begin(waits, switcher, ingress, counters, log, engine, None) {
-            Begun::Started => return,
-            Begun::Busy => {
-                waits.queue.clear();
-                return;
-            }
-            _ => {}
         }
     }
 }
@@ -282,3 +281,6 @@ pub(super) fn reload_certificates(shared: &Shared, setup: &Setup) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

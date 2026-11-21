@@ -29,8 +29,8 @@ impl Conn {
     }
 
     /// Hands the request to the driver, for the engine of the group it goes to, and waits for the verdict. `cut` tells
-    /// that the body goes on after the bytes in `body`. `Ok` is how the request is let through (an `Allow` or a `Detected`); everything else is
-    /// the answer to give.
+    /// that the body goes on after the bytes in `body`. `Ok` is how the request is let through (an `Allow` or a
+    /// `Detected`); everything else is the answer to give.
     pub(super) async fn ask(
         &self,
         engine: Engine,

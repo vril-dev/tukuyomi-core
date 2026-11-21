@@ -33,13 +33,14 @@
 //! `websocket` tells whether a WebSocket handshake is let through. `records` is `best_effort`, `required` or `security`
 //! and says how the records of the requests of the route are kept (see `records`); left out, `records.keep` holds.
 //! `max_body` is the most bytes a request body may have on the route
-//! (0: none); it is not above the `max_body` of the proxy, which the route can only lower. `default_upstream` is the group that serves a request no route
-//! holds for, or the empty string, and then such a request is answered with 404. The default group has no
-//! `access`, no `rewrite`, no `stream`, no `max_body` and no `records`. The `path` of a route that has an access list is in its canonical
-//! form (see `route`): its escapes are in uppercase and none stands for a byte that a path holds as it is, for a
-//! request is held to the list of the route that its path in canonical form meets, and would not meet this one. If
-//! any route has an access list, no route has a port in its `host`: the client writes the port, and a request that
-//! writes a port that a route names would meet that route and not the one with the list.
+//! (0: none); it is not above the `max_body` of the proxy, which the route can only lower. `default_upstream` is the
+//! group that serves a request no route holds for, or the empty string, and then such a request is answered with 404.
+//! The default group has no `access`, no `rewrite`, no `stream`, no `max_body` and no `records`. The `path` of a route
+//! that has an access list is in its canonical form (see `route`): its escapes are in uppercase and none stands for a
+//! byte that a path holds as it is, for a request is held to the list of the route that its path in canonical form
+//! meets, and would not meet this one. If any route has an access list, no route has a port in its `host`: the client
+//! writes the port, and a request that writes a port that a route names would meet that route and not the one with the
+//! list.
 //!
 //! In a file with `managed`, `forward` has `resolve_timeout_ms` alone: the groups, the routes and the default group
 //! are those of the managed version, checked by the same rules (`located`, which `managed::version` calls), but for

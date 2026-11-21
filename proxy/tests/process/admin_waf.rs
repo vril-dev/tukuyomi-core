@@ -398,8 +398,8 @@ fn a_generation_of_an_engine_with_no_inspector_in_the_configuration_is_refused_b
         assert_eq!(refused["error"], NOT_NAMED);
         assert_eq!(session.engines(), before);
 
-        // An activation of the one that is in the store is 409 with the sentence (no generation is chosen for its engine,
-        // so `null` is what is expected), and the store still chooses the generation it chose.
+        // An activation of the one that is in the store is 409 with the sentence (no generation is chosen for its
+        // engine, so `null` is what is expected), and the store still chooses the generation it chose.
         let (status, refused) = session.post(
             "/api/activate",
             &json!({"generation": other, "expect": null}),

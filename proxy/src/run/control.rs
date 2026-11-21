@@ -21,24 +21,26 @@
 //! is under way, whether a reading of the configuration file again is under way (of SIGHUP or of a reload order), and
 //! whether `/readyz` says `ready`. The same object has `engines`, the state of every engine that runs, in the order of
 //! their names: `[{"engine":..,"generation":..,"mode":..,"phase":..}, ..]`, in the words of the fields above. An answer
-//! without `engines` is the answer of a proxy that runs one engine only. The same object holds the figures of the proxy: `uptime_ms` (the milliseconds since
-//! the proxy started), `requests` (the requests of every class of the records, `closed` included, which got no answer,
-//! and those of a route that writes no record for them), `blocked` (the requests a rule blocked), `policy_refused` (the
-//! requests the access list or the rate limit turned away), `upstream_failures` (the failures of the servers of every
-//! upstream group of the configuration in force; they start from 0 when a reading of the configuration file again
-//! replaces it, as they do in `/metrics`), `config` (the 64 digits of the SHA-256 of the configuration file in force),
-//! `managed` (the 64 digits of the name of the managed version in force, or `null` for a file without `managed`),
-//! `resolve_timeout_ms` (the `forward.resolve_timeout_ms` of the configuration in force) and `config_reloads`
-//! (`{"replaced":..,"refused":..}`, the readings of the configuration file again by how they ended). The counts are
-//! those that `/metrics` shows; an answer without the figures is the answer of an older proxy.
+//! without `engines` is the answer of a proxy of an older version, which runs one engine for everything. The same
+//! object holds the figures of the proxy: `uptime_ms` (the milliseconds since the proxy started), `requests` (the
+//! requests of every class of the records, `closed` included, which got no answer, and those of a route that writes no
+//! record for them), `blocked` (the requests a rule blocked), `policy_refused` (the requests the access list or the
+//! rate limit turned away), `upstream_failures` (the failures of the servers of every upstream group of the
+//! configuration in force; they start from 0 when a reading of the configuration file again replaces it, as they do in
+//! `/metrics`), `config` (the 64 digits of the SHA-256 of the configuration file in force), `managed` (the 64 digits of
+//! the name of the managed version in force, or `null` for a file without `managed`), `resolve_timeout_ms` (the
+//! `forward.resolve_timeout_ms` of the configuration in force) and `config_reloads` (`{"replaced":..,"refused":..}`,
+//! the readings of the configuration file again by how they ended). The counts are those that `/metrics` shows; an
+//! answer without the figures is the answer of an older proxy.
 //! `{"op":"switch","engine"?:"<engine>","expect":"<64 digits>"}` reads the rules store for the engine (the default
 //! engine if the order names none), and if the generation it chooses is not `expect` it does nothing and answers
 //! `refused` (`current changed`). Otherwise it does what SIGUSR1 does for that engine, which starts the engine if it
 //! does not run, and answers when the switch has ended, `{"result":..,"generation":..}` with the generation that serves
-//! the engine then (`null` if the engine does not run) and, when the result is not `switched`, a `reason`: `unchanged` (`already serving`), `refused` (`current changed`, `store refused`), `failed`
-//! (`driver did not take the order`, `not switched`) or `busy` (`starting`, `switch under way`, `too many orders`,
-//! `stopping`). A switch is waited for as long as the kernel may take to be ready and a margin; a client that has
-//! waited that long gets `busy` and `switch under way`, and the switch goes on.
+//! the engine then (`null` if the engine does not run) and, when the result is not `switched`, a `reason`: `unchanged`
+//! (`already serving`), `refused` (`current changed`, `store refused`), `failed` (`driver did not take the order`,
+//! `not switched`) or `busy` (`starting`, `switch under way`, `too many orders`, `stopping`). A switch is waited for as
+//! long as the kernel may take to be ready and a margin; a client that has waited that long gets `busy` and
+//! `switch under way`, and the switch goes on.
 //! `{"op":"reload","managed":"<64 digits>"}` reads the configuration file again as SIGHUP does (see `reload`), with the
 //! managed version of that name in the place of the one that the managed store chooses: its record `current` is not
 //! read. The version is read again also when it is the one in force. The order gives the user of the socket no power
@@ -54,11 +56,11 @@
 //! long as the names of the configuration in force may take to be looked up (`resolve_timeout`) and the margin; a
 //! client that has waited that long gets `busy` and `reload under way`, and the reading goes on.
 //! A line that is not a request gets `{"result":"error","reason":..}` with `line too long`, `malformed request`,
-//! `unknown op`, `bad expect`, `bad engine` or `bad managed`, and a status that the main loop does not answer within 2 s gets `no
-//! answer`. Each answer to a switch order or a reload order is one line in the records (`control: switch ..`,
-//! `control: reload <64 digits>: <result> (<reason>)`), the busy answers of the connection itself included (the queue
-//! of orders is full, the wait is over, the order was dropped); an order that gets such an answer and then ends gets a
-//! second line when it ends.
+//! `unknown op`, `bad expect`, `bad engine` or `bad managed`, and a status that the main loop does not answer within
+//! 2 s gets `no answer`. Each answer to a switch order or a reload order is one line in the records
+//! (`control: switch ..`, `control: reload <64 digits>: <result> (<reason>)`), the busy answers of the connection
+//! itself included (the queue of orders is full, the wait is over, the order was dropped); an order that gets such an
+//! answer and then ends gets a second line when it ends.
 
 use std::fs;
 use std::future::poll_fn;
@@ -353,8 +355,8 @@ impl Drop for Control {
 }
 
 /// Starts to serve `bound`. A switch is waited for `switch_wait`, and a reading of the configuration as `setup`, the
-/// setup in force, says when it is asked for. `default_engine` is the engine of an order that names none. `log` gets the
-/// lines of the busy answers of the connections. The runtime has to be entered.
+/// setup in force, says when it is asked for. `default_engine` is the engine of an order that names none. `log` gets
+/// the lines of the busy answers of the connections. The runtime has to be entered.
 pub(super) fn serve(
     bound: Bound,
     state: watch::Receiver<States>,

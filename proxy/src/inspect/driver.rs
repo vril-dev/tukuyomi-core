@@ -45,12 +45,12 @@ use tukuyomi_kernel::{
 };
 
 use self::core::Core;
-use crate::inspect::engines::{Gates, Lane, Publisher, States, Told, index};
+use crate::inspect::engines::{Gates, Lane, Publisher, States, Told};
 use crate::inspect::slot::Slot;
 use crate::log::Log;
 use crate::rules::bundle::{self, Fingerprint};
 use crate::rules::routes::Routes;
-use crate::rules::store::ENGINES;
+use crate::rules::store::{ENGINES, index};
 
 mod core;
 
@@ -68,8 +68,8 @@ pub struct InspectReq {
     pub proto: &'static [u8],
 }
 
-/// The decoded body, or its first bytes if it is cut, shared by the connection and the ticket. Its share of the byte budget returns when the last
-/// holder drops it.
+/// The decoded body, or its first bytes if it is cut, shared by the connection and the ticket. Its share of the byte
+/// budget returns when the last holder drops it.
 pub struct BodyHold {
     pub bytes: Bytes,
     _budget: OwnedSemaphorePermit,
@@ -303,8 +303,8 @@ pub struct Start {
 /// waiting queue holds `wait_queue`. An intake takes at most every waiting ticket of every engine and the stop message.
 /// The channel has room for one more, a switch (the main thread has one under way at a time, of any engine). So the
 /// channel has room for every message that can be waiting, by construction: the tickets are held back by the permits
-/// of their engine, as many as the waiting queue. A count that cannot be added to cannot pass the kernel's
-/// configuration check either, so any capacity will do for it.
+/// of their engine, as many as the waiting queue. The configuration check keeps `wait_queue` at or below `max_conns`,
+/// and `max_conns` at or below 65536, so the sum cannot overflow; a count that was not checked gets the least sizes.
 pub(super) fn intake_sizes(wait_queue: usize) -> (usize, usize) {
     let take = wait_queue
         .checked_mul(ENGINES.len())

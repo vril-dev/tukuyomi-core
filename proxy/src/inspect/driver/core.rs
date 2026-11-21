@@ -28,8 +28,9 @@ use tokio::sync::oneshot;
 use tukuyomi_kernel::{Engine, Shutdown, Status};
 
 use super::{End, Kernel, Limits, Msg, Outcome, Switched, Ticket};
-use crate::inspect::engines::{Lane, MIN_SLICE, Publisher, Switching, Told, index};
+use crate::inspect::engines::{Lane, MIN_SLICE, Publisher, Switching, Told};
 use crate::log::Log;
+use crate::rules::store::index;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mode {
@@ -142,10 +143,14 @@ impl<K: Kernel> Core<K> {
         }
         self.wait()?;
         let slice = self.limits.slice;
-        // A lane with nothing to do is stepped for the shortest step, unless no lane has anything to do.
-        let alone = !self.lanes.iter().any(Lane::working);
+        // A lane with nothing to do is stepped for the shortest step, unless no lane has anything to do: then the first
+        // lane that has a kernel is stepped for the slice and the others for the shortest step, so that the round
+        // waits for a frame for one slice.
+        let mut none_working = !self.lanes.iter().any(Lane::working);
         for lane in &mut self.lanes {
-            lane.step(slice, alone, &self.log)?;
+            let leads = none_working && lane.active.is_some();
+            none_working &= !leads;
+            lane.step(slice, leads, &self.log)?;
         }
         // The state is published before the main thread is told that a kernel is ready, so that a main thread that
         // has been told never finds the older state.
@@ -162,8 +167,12 @@ impl<K: Kernel> Core<K> {
             lane.advance(&self.limits, &self.log)?;
         }
         let done = self.finish_if_due()?;
-        // Again, for what the switch and the shutdown of this round changed.
+        // Again, for what the switch and the shutdown of this round changed; then the main thread is told what that
+        // holds.
         self.publisher.publish(&self.lanes);
+        for lane in &mut self.lanes {
+            lane.tell();
+        }
         Ok(done)
     }
 
@@ -274,10 +283,13 @@ impl<K: Kernel> Core<K> {
         }
     }
 
-    /// Calls `shutdown` when it is due and delivers its results. Every kernel but one goes on a thread of its own,
-    /// all at the same time, the one that is left here: the end of that `shutdown` is the end of the driver. Every
-    /// request is decided by then, so a ticket that is left in a table breaks the promise that every result comes out
-    /// once.
+    /// Calls `shutdown` when it is due and delivers its results. Every kernel but one goes on a thread of its own, the
+    /// one that is left here: the end of that `shutdown` is the end of the driver. They are all started before any of
+    /// them is waited for, so that the stop of one kernel never delays the start of another: a lane holds one
+    /// retirement at a time, so when the old kernel of its switch is going, the one that serves is held here (`apart`)
+    /// and waited for last. So every `shutdown` ends by `inspect_by` and the grace of the kernel, which `stop_wait`
+    /// leaves room for. Every request is decided by then, so a ticket that is left in a table breaks the promise that
+    /// every result comes out once.
     fn finish_if_due(&mut self) -> Result<Option<Shutdown>, &'static str> {
         let Mode::Stopping { inspect_by } = self.mode else {
             return Ok(None);
@@ -291,6 +303,7 @@ impl<K: Kernel> Core<K> {
             return Ok(None);
         }
         let mut here = None;
+        let mut apart = Vec::new();
         for (at, lane) in self.lanes.iter_mut().enumerate() {
             match mem::replace(&mut lane.switching, Switching::Idle) {
                 Switching::Draining { old, .. } => lane.retire(old, inspect_by, Switched::Yes),
@@ -302,9 +315,7 @@ impl<K: Kernel> Core<K> {
             if here.is_none() {
                 here = Some(at);
             } else if let Some(active) = lane.active.take() {
-                // The retirement that the lane has is over first: a lane has one at a time.
-                lane.collect(&self.log)?;
-                lane.retire(active, inspect_by, Switched::Yes);
+                apart.push((at, active.retire(inspect_by)));
             }
         }
         let Some(active) = here.and_then(|at| self.lanes[at].active.as_mut()) else {
@@ -314,6 +325,10 @@ impl<K: Kernel> Core<K> {
         self.mode = Mode::Down;
         for lane in &mut self.lanes {
             lane.collect(&self.log)?;
+        }
+        for (at, retirement) in apart {
+            let retired = retirement.wait()?;
+            self.lanes[at].retired(&retired, Switched::Yes, &self.log);
         }
         Ok(Some(done))
     }

@@ -2,7 +2,8 @@
 //! `rules remove` and `rules list`.
 //!
 //! ```text
-//! tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--engine <name>] [--accept-block] [--detect-only]
+//! tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... \
+//!     [--routes <file>] [--engine <name>] [--accept-block] [--detect-only]
 //! tukuyomi-proxy rules activate <config> <fingerprint>
 //! tukuyomi-proxy rules deactivate <config> <engine>
 //! tukuyomi-proxy rules remove <config> <fingerprint>

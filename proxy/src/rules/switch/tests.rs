@@ -14,7 +14,7 @@ use tukuyomi_kernel::Engine;
 const CONFIG: &str = r#"{"proxy":{"listeners":[{"address":"127.0.0.1:8080"}],"max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"inspect_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"forward":{"resolve_timeout_ms":30000,"upstreams":{"main":{"servers":[{"address":"127.0.0.1:9000","weight":1,"max_fails":1,"fail_timeout_ms":10000,"backup":false}]},"api":{"servers":[{"address":"127.0.0.1:9001","weight":3,"max_fails":2,"fail_timeout_ms":5000,"backup":false},{"address":"127.0.0.1:9002","weight":1,"max_fails":0,"fail_timeout_ms":5000,"backup":true}]}},"routes":[{"host":"api.example.test","path":"/v1/","upstream":"api"}],"default_upstream":"main"},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"@DIR@"}}}"#;
 
 /// A fresh 0700 directory under the temp directory (`TMPDIR`), removed with everything in it when dropped.
-struct TestDir(PathBuf);
+pub(crate) struct TestDir(pub(crate) PathBuf);
 
 impl Drop for TestDir {
     fn drop(&mut self) {
@@ -22,7 +22,7 @@ impl Drop for TestDir {
     }
 }
 
-fn scratch() -> TestDir {
+pub(crate) fn scratch() -> TestDir {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
         "tukuyomi-proxy-switch-{}-{}",
@@ -47,7 +47,7 @@ fn bundle(name: &str) -> Bundle {
 }
 
 /// The store of `dir` that the commands use, with the generations `names` made (the first one chosen).
-fn made_in(dir: &Path, names: &[&str]) -> (FileStore, Vec<Fingerprint>) {
+pub(crate) fn made_in(dir: &Path, names: &[&str]) -> (FileStore, Vec<Fingerprint>) {
     let mut store = FileStore::open(dir).unwrap();
     let made: Vec<Fingerprint> = names
         .iter()
@@ -63,7 +63,7 @@ fn made_in(dir: &Path, names: &[&str]) -> (FileStore, Vec<Fingerprint>) {
 }
 
 /// A switcher that runs `generation`, on the store of `dir`.
-fn switcher(dir: &Path, generation: Fingerprint) -> Switcher {
+pub(crate) fn switcher(dir: &Path, generation: Fingerprint) -> Switcher {
     switcher_of(dir, generation, CONFIG)
 }
 

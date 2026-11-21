@@ -39,6 +39,11 @@ pub(super) const EXIT_OK: u8 = 0;
 pub const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const CHECK_USAGE: &str = "usage: tukuyomi-proxy config check <config>";
+/// Why the start refuses a store that chooses a generation for an engine and none for the default engine: the store was
+/// made when the one engine of the proxy was whichever one the single `current` named, and `kernel.default_engine`
+/// has to name that engine.
+const DEFAULT_UNCHOSEN: &str =
+    "no generation is chosen for kernel.default_engine, but one is chosen for another engine";
 const ADMIN_USAGE: [&str; 3] = [
     "usage: tukuyomi-proxy admin <config>",
     "       tukuyomi-proxy admin bootstrap <config> <name>",
@@ -424,8 +429,10 @@ pub(crate) fn read_parts(
 /// The steps of start-up from the configuration to the kernel configuration of the generation chosen for each engine,
 /// the holds on them and the one on the managed version included. The engines that start are those that have a
 /// generation chosen and an inspector in the configuration, the default engine first; the engine of an upstream group
-/// and the default engine have to be among them. `name` is at the head of each line: `start` for the start, `config
-/// check` for the command of that name. A refusal is a line, and its exit code is the error.
+/// and the default engine have to be among them, and so is refused an engine that is used and has none chosen or has
+/// no inspector (`DEFAULT_UNCHOSEN` is the sentence for a default engine that has none while another engine has).
+/// `name` is at the head of each line: `start` for the start, `config check` for the command of that name. A refusal
+/// is a line, and its exit code is the error.
 fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
     let parts = read_parts(path, &Choice::Current, name, log).map_err(|refusal| refusal.exit())?;
     if let Some(version) = parts.managed {
@@ -445,6 +452,15 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
                 .iter()
                 .any(|group| group.engine == engine)
     };
+    // Whether a generation is chosen for an engine other than the default engine.
+    let chosen_elsewhere = || -> Result<bool, u8> {
+        for engine in engines_from(default).skip(1) {
+            if rules.current(engine).map_err(|e| refused(e.0))?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
     let mut starts = Vec::new();
     let mut held = Vec::new();
     // The lines of the engines come after the last refusal, so that a refusal is not preceded by lines about an
@@ -454,11 +470,17 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         let chosen = rules.current(engine).map_err(|e| refused(e.0))?;
         let Some(generation) = chosen else {
             if used(engine) {
+                if engine == default && chosen_elsewhere()? {
+                    return Err(refused(DEFAULT_UNCHOSEN));
+                }
                 return Err(refused("no generation is chosen"));
             }
             continue;
         };
-        if parts.kernel.check_engine(engine).is_err() {
+        if let Err(e) = parts.kernel.check_engine(engine) {
+            if used(engine) {
+                return Err(refused(e.0));
+            }
             // An engine that nothing uses and the configuration has no inspector for is not started.
             continue;
         }

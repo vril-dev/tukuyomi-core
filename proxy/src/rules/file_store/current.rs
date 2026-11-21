@@ -12,6 +12,9 @@
 //! `choose` writes `current.<engine>.new`, syncs it and renames it over `current.<engine>`, syncs the directory, and
 //! then removes the older file when it names a generation of the same engine, or cannot be told (a record that cannot
 //! be read, or one whose generation has no manifest): a choice that fails to read what it replaces still replaces it.
+//! A `current.<engine>.new` that a choice left when it stopped halfway is removed by the next `choose` for the same
+//! engine, and by nothing else; nothing reads it.
+//!
 //! This version never writes `current`. An older version reads `current` only, so to go back to it the operator
 //! removes the `current.*` files and chooses with it.
 

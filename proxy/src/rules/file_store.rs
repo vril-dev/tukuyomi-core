@@ -17,7 +17,8 @@
 //! Only the store directory itself is examined (a real directory, owned by this process's user, no group or other
 //! bits): a user who cannot write there cannot make or replace a name inside it. What is read is opened without
 //! following a link and without waiting for a writer. A command that stopped halfway leaves at most a bundle in
-//! `staging/` or a `current.<engine>.new`, which the next `stage` or `activate` removes.
+//! `staging/`, which the next `stage` removes, or a `current.<engine>.new`, which only the next choice of a
+//! generation for the same engine (`activate`) removes; nothing reads it.
 
 use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
@@ -424,7 +425,8 @@ fn read_manifest(dir: &Path, generation: Fingerprint) -> Result<Manifest, StoreE
 
 /// Opens the file at `path` that a lock is taken on, and makes it (empty, 0600) when it is not there. It is opened
 /// like every file that is read: a link is not followed, a FIFO does not make the open wait, a terminal does not
-/// become the controlling terminal, and what is not a regular file is refused. `cannot_open` and `not_regular` are the two sentences of the refusal.
+/// become the controlling terminal, and what is not a regular file is refused. `cannot_open` and `not_regular` are the
+/// two sentences of the refusal.
 pub(crate) fn open_lock_file(
     path: &Path,
     cannot_open: StoreError,

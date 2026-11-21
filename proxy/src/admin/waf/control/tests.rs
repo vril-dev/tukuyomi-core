@@ -222,12 +222,14 @@ fn the_engines_of_a_status_are_read_by_engine_and_a_line_with_a_wrong_entry_is_n
 fn the_answer_to_a_switch_has_a_generation_or_null_for_an_engine_that_does_not_run() {
     let dir = scratch();
     for (generation, taken) in [
-        (format!("\"{}\"", fp(2).hex()), true),
-        ("null".to_owned(), true),
-        ("\"abc\"".to_owned(), false),
-        ("5".to_owned(), false),
+        (format!(",\"generation\":\"{}\"", fp(2).hex()), true),
+        (",\"generation\":null".to_owned(), true),
+        (",\"generation\":\"abc\"".to_owned(), false),
+        (",\"generation\":5".to_owned(), false),
+        // The key is there in every answer, `null` for an engine that does not run.
+        (String::new(), false),
     ] {
-        let line = format!("{{\"result\":\"refused\",\"generation\":{generation}}}\n");
+        let line = format!("{{\"result\":\"refused\"{generation}}}\n");
         let (path, thread) = serve(dir.path(), Some(line), Duration::ZERO);
         let reply = control(&path).switch(Engine::ModSecurity, fp(2));
         thread.join().unwrap();

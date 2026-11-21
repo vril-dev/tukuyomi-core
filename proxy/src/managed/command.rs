@@ -26,10 +26,11 @@
 //! file that was put in the store stays there if that last reading refuses. `activate` takes the lock
 //! of the store and chooses the version only if the steps of the start before the rules store pass with it (see
 //! `run`): the main file with the version, the lookup of the names of the upstream servers and the files of their
-//! authorities, and the certificates of the listeners. `remove` removes a version that `current` does not name and
-//! that nothing holds (a proxy that serves with it, or a command that reads it), and with it the files and the
-//! certificates of the sites with `acme` that no version names any more (see `remove`); it looks at no rollback.
-//! `list` shows the versions.
+//! authorities, and the certificates of the listeners; and only if the rules store has a generation chosen for the
+//! engine of each of its upstream groups (it reads the rules store for that, and chooses no generation). `remove`
+//! removes a version that `current` does not name and that nothing holds (a proxy that serves with it, or a command
+//! that reads it), and with it the files and the certificates of the sites with `acme` that no version names any more
+//! (see `remove`); it looks at no rollback. `list` shows the versions.
 //!
 //! The results go to the standard output, one line each, and the first word of a line is the name of a version:
 //! `import` says `created`, `existing` or `recreated` after it (`recreated`: the store had a broken copy, which was

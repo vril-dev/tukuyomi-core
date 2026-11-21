@@ -115,6 +115,51 @@ fn an_upstream_whose_engine_has_no_generation_chosen_ends_config_check_and_the_s
 
 #[test]
 #[ignore = "needs a built inspector"]
+fn a_store_that_chooses_a_generation_for_another_engine_only_is_refused_with_a_sentence_for_the_default_engine()
+ {
+    // The store of a version that had one engine, which was the one that its single `current` named: `current` names
+    // a generation of ModSecurity, and the file does not say `kernel.default_engine`, which is Coraza then.
+    let only_modsecurity = |root: &Path| {
+        name_modsecurity_inspector(root);
+        let name = add_generation(root);
+        fs::write(root.join(STORE).join("current"), format!("{name}\n"))
+            .expect("choose the generation");
+    };
+    let moved =
+        "no generation is chosen for kernel.default_engine, but one is chosen for another engine";
+    let idle = Idle::new("engine_moved", &Knobs::quick(), only_modsecurity);
+    let ran = config_check(&idle);
+    assert_eq!(ran.code, Some(1), "{}", ran.err);
+    assert_eq!(
+        ran.err,
+        format!(
+            "config check: configuration accepted\nconfig check: rules store refused: {moved}\n"
+        )
+    );
+    assert_start_refused(
+        "engine_moved_start",
+        only_modsecurity,
+        &[STORE],
+        &format!("start: rules store refused: {moved}"),
+    );
+
+    // With no generation chosen for any engine the sentence is the one that it has always been.
+    let none = |root: &Path| {
+        name_modsecurity_inspector(root);
+        add_generation(root);
+        fs::remove_file(root.join(STORE).join("current")).expect("remove the record of Coraza");
+    };
+    let idle = Idle::new("engine_none", &Knobs::quick(), none);
+    let ran = config_check(&idle);
+    assert_eq!(ran.code, Some(1), "{}", ran.err);
+    assert_eq!(
+        ran.err,
+        "config check: configuration accepted\nconfig check: rules store refused: no generation is chosen\n"
+    );
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
 fn a_request_goes_to_the_inspector_of_the_engine_of_its_upstream_and_follows_the_mode_of_that_generation()
  {
     let knobs = Knobs {

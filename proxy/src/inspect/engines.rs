@@ -6,7 +6,9 @@
 //! switch of the engine that is under way, the table of the requests of its generation that skip the inspection, and
 //! the part of the signals that the engine has. The lanes are stepped one after the other in a round of the driver,
 //! on its one thread; a lane whose slot holds nothing is stepped for the shortest step that can read a frame, so that
-//! an engine that has nothing to do does not delay the one that has.
+//! an engine that has nothing to do does not delay the one that has. When no lane holds anything, the first lane that
+//! has a slot is stepped for the whole slice and the others for the shortest step: the round waits for a frame for one
+//! slice, as it does with one lane.
 //!
 //! A connection takes the gate of the engine of the upstream group its request goes to: the routes of that engine's
 //! generation and the inspection permits of that engine, as many as the kernel's waiting queue. So an engine whose
@@ -26,18 +28,10 @@ use super::driver::{Kernel, Limits, Outcome, State, Switch, Switched, Ticket};
 use super::slot::{Retired, Retirement, Slot};
 use crate::log::{Log, escaped};
 use crate::rules::routes::{Routes, SharedRoutes};
-use crate::rules::store::ENGINES;
+use crate::rules::store::{ENGINES, index};
 
 /// The shortest slice of one kernel step. A shorter one would end a step before it could read anything.
 pub(super) const MIN_SLICE: Duration = Duration::from_millis(1);
-
-/// The place of `engine` in a table of the engines. It follows `ENGINES`.
-pub(super) fn index(engine: Engine) -> usize {
-    match engine {
-        Engine::Coraza => 0,
-        Engine::ModSecurity => 1,
-    }
-}
 
 /// What the connections share of one engine.
 #[derive(Clone)]
@@ -192,6 +186,9 @@ pub(super) struct Lane<K> {
     pub(super) switching: Switching<K>,
     /// Where to tell the main thread how the switch ended.
     reply: Option<oneshot::Sender<Switched>>,
+    /// The answer to the switch that started the kernel of an engine that had none, kept until the state of the lanes
+    /// is published (`tell`), so that the main thread that is told finds the engine in it.
+    started: Option<oneshot::Sender<Switched>>,
     pub(super) signals: Signals,
     /// The restarts that the kernels made which served before the one that serves now.
     restarts_before: u32,
@@ -214,6 +211,7 @@ impl<K: Kernel> Lane<K> {
             routes,
             switching: Switching::Idle,
             reply: None,
+            started: None,
             signals,
             restarts_before: 0,
             retired_clean: true,
@@ -297,20 +295,21 @@ impl<K: Kernel> Lane<K> {
             .is_some_and(|active| !active.pending.is_empty() || active.status().records != 0)
     }
 
-    /// Steps the kernel that serves: for `slice` if the lane is working or `alone` (no lane is), else for the
-    /// shortest step that can read a frame, so that a lane with nothing to do does not hold up one that has. Then
+    /// Steps the kernel that serves: for `slice` if the lane is working or `leads` (no lane is working, and this is
+    /// the first lane that has a kernel), else for the shortest step that can read a frame, so that a lane with nothing
+    /// to do does not hold up one that has, and the lanes that have nothing to do do not wait one slice each. Then
     /// the kernel that does not get new tickets, for the shortest step as well. A step whose end has passed writes
     /// but reads nothing (`Supervisor::poll`), and a kernel that is not the one that serves has a frame to read: the
     /// HELLO of a new inspector, the verdicts of an old one.
     pub(super) fn step(
         &mut self,
         slice: Duration,
-        alone: bool,
+        leads: bool,
         log: &Log,
     ) -> Result<(), &'static str> {
         let working = self.working();
         if let Some(active) = self.active.as_mut() {
-            let slice = if working || alone { slice } else { MIN_SLICE };
+            let slice = if working || leads { slice } else { MIN_SLICE };
             active.step(after(Instant::now(), slice))?;
         }
         let until = after(Instant::now(), MIN_SLICE);
@@ -457,11 +456,9 @@ impl<K: Kernel> Lane<K> {
                     }
                     None => {
                         // An engine that had no kernel: nothing is left to finish, and the proxy is told if this
-                        // kernel fails from now on.
+                        // kernel fails from now on. The main thread is told that the switch ended in `tell`.
                         self.signals = Signals::Running;
-                        if let Some(reply) = self.reply.take() {
-                            let _ = reply.send(Switched::Yes);
-                        }
+                        self.started = self.reply.take();
                     }
                 }
             }
@@ -515,9 +512,17 @@ impl<K: Kernel> Lane<K> {
         };
     }
 
+    /// Tells the main thread that the switch which started the kernel of an engine that had none has ended. It is
+    /// called after the state of the lanes is published.
+    pub(super) fn tell(&mut self) {
+        if let Some(reply) = self.started.take() {
+            let _ = reply.send(Switched::Yes);
+        }
+    }
+
     /// A retirement is over: one record line, and the main thread is told how the switch ended (when there is a
     /// switch to tell).
-    fn retired(&mut self, retired: &Retired, switched: Switched, log: &Log) {
+    pub(super) fn retired(&mut self, retired: &Retired, switched: Switched, log: &Log) {
         log.line(&format!(
             "reload: generation {} retired, clean {}",
             retired.generation.hex(),

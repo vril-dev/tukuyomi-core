@@ -36,6 +36,15 @@ pub const UNCHOSEN: &str = "no generation is chosen for the engine of an upstrea
 /// The engines, in the order of their names.
 pub const ENGINES: [Engine; 2] = [Engine::Coraza, Engine::ModSecurity];
 
+/// The place of `engine` in `ENGINES`, which is its place in every table that has one entry for each engine. The
+/// `match` names every engine, so an engine that the kernel gets does not build until it has its place here.
+pub fn index(engine: Engine) -> usize {
+    match engine {
+        Engine::Coraza => 0,
+        Engine::ModSecurity => 1,
+    }
+}
+
 /// The engines with `first` first and the others after it in the order of their names: the order in which the start
 /// and SIGUSR1 take them.
 pub fn engines_from(first: Engine) -> impl Iterator<Item = Engine> {
@@ -86,7 +95,8 @@ impl Hold {
 
 /// Where rule generations are kept. `FileStore` is the only implementation; the configuration's `kind` picks it.
 pub trait RuleStore {
-    /// The generation chosen for `engine`; `Ok(None)` when none was chosen yet.
+    /// The generation chosen for `engine`; `Ok(None)` when none was chosen yet. The engine in the manifest of the
+    /// generation it returns is `engine`: a record that names a generation of another engine is an error.
     fn current(&self, engine: Engine) -> Result<Option<Fingerprint>, StoreError>;
     /// The directory of a generation for the inspector: absolute and clean, checked to be a real directory.
     fn generation_dir(&self, generation: Fingerprint) -> Result<PathBuf, StoreError>;

@@ -281,8 +281,8 @@ impl Waf {
     }
 
     /// The proxy did not finish the switch within the time it waits (or did not take the order): looks at its state
-    /// until it serves `to` for `engine`. A proxy that has no place for a look is looked at again; one that cannot be reached
-    /// leaves the end of the switch unconfirmed.
+    /// until it serves `to` for `engine`. A proxy that has no place for a look is looked at again; one that cannot be
+    /// reached leaves the end of the switch unconfirmed.
     fn await_switch(&self, engine: Engine, to: Fingerprint) -> Ended {
         let now = Instant::now();
         let by = now

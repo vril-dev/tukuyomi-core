@@ -12,23 +12,28 @@
 //! The routes (a viewer may use the status, the generations, the history and the records, an operator the import, the
 //! switch, the rollback and the removal as well; a body is JSON of at most 64 KiB, the one of the import 12 MiB; the
 //! answers are JSON, and `error` is a fixed sentence):
-//! - `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "crs"}`: the generation the rules store
-//!   chooses, the state of the proxy from its control socket (`proxy` is `null` when the state could not be read, and
-//!   `reachable` is false when the proxy cannot be reached; a proxy that has no place for the question is reachable;
-//!   `proxy` has the `mode` and the `engine` of the generation it serves, and its figures: the time since it started,
-//!   its counts and the SHA-256 of its configuration file, each `null` when an older proxy does not send it), the
-//!   generation a rollback would go to now (`null` for none), and the CRS of the configuration (see `status`).
+//! - `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "engines", "crs"}`: the generation the rules
+//!   store chooses for the default engine, the state of the proxy from its control socket (`proxy` is `null` when the
+//!   state could not be read, and `reachable` is false when the proxy cannot be reached; a proxy that has no place for
+//!   the question is reachable; `proxy` has the `mode` and the `engine` of the generation that serves the default
+//!   engine, `engines`, the `generation`, `mode`, `engine` and `phase` of each engine it runs, and its figures: the
+//!   time since it started, its counts and the SHA-256 of its configuration file, each `null` when an older proxy does
+//!   not send it), the generation a rollback of the default engine would go to now (`null` for none), for each engine
+//!   the generation the rules store chooses for it and the one a rollback of it would go to (`engines`), and the CRS
+//!   of the configuration (see `status`).
 //! - `GET /api/generations`: `{"reachable", "generations"}`, the newest first, each with its `fingerprint`, `made`
-//!   (seconds since the epoch), `mode`, `engine`, number of `routes`, and whether it is `current` and `serving`.
+//!   (seconds since the epoch), `mode`, `engine`, number of `routes`, and whether it is `current` (chosen for its
+//!   engine) and `serving`.
 //! - `GET /api/generations/<fingerprint>`: that, and the `load` order, the `files` (path, size, SHA-256) and the
 //!   `routes` of its manifest. 404 for a generation the store does not have.
 //! - `POST /api/generations`: the import (see `import`): the same steps as `rules import`: the files are collected
 //!   from the body, staged, tried with an inspector, and made a generation only if the trial passes. 200 with the
 //!   `fingerprint`, `result` (`created`, `existing` or `repaired`) and the `trial`; 400 for input that is refused; 422
 //!   when the trial fails; 409 when the rules store refuses or is in use. The generation is not chosen.
-//! - `POST /api/activate` with `{"generation", "expect"}` and `POST /api/rollback` with `{"expect"}`: see below.
-//! - `DELETE /api/generations/<fingerprint>`: 409 for the generation the store chooses, the target of a rollback,
-//!   and one that a proxy uses (the store refuses it); else it is removed.
+//! - `POST /api/activate` with `{"generation", "expect"}` and `POST /api/rollback` with `{"engine", "expect"}` (the
+//!   engine to roll back, which is the default engine when `engine` is left out): see below.
+//! - `DELETE /api/generations/<fingerprint>`: 409 for the generation the store chooses for its engine, the target of a
+//!   rollback of its engine, and one that a proxy uses (the store refuses it); else it is removed.
 //! - `GET /api/history`: the newest 200 requests to switch (see `history`).
 //! - `GET /api/records`: the lines of the record files (see `records`), 404 when the configuration has no `records`.
 //!
@@ -42,13 +47,16 @@
 //! files, the query), and the name of an input only when the request gave it; the directory of the CRS is told by its
 //! last name.
 //!
-//! A switch (activate, rollback): the generation the rules store chooses must be `expect`, the one the client saw
-//! (else 409; the store checks it again when it chooses, under its lock, so that a generation another process chose
-//! in between is not overwritten: also 409), the engine of the generation to switch to must be usable here (else 409
+//! A switch (activate, rollback) is for the engine of the generation to switch to: the generation the rules store
+//! chooses for that engine must be `expect`, the one the client saw, or `null` when the client saw none chosen (else
+//! 409; the store checks it again when it chooses, under its lock, so that a generation another process chose in
+//! between is not overwritten: also 409), the engine of the generation to switch to must be usable here (else 409
 //! with the sentence of the check, audited as denied with the reason `engine`; the store is not touched, so it never
 //! chooses a generation that the proxy would refuse; a manifest that cannot be read is left to the store, which
-//! refuses it when it chooses), and the proxy must be reachable (else 503, nothing is changed,
-//! the history has an `unreachable` line; a proxy that has no place for the question is 503 too, with no line). Then
+//! refuses it when it chooses), the proxy must report its engines (a proxy of an older version does not: 409 with a
+//! fixed sentence, audited as denied with the reason `version`, and the rules store is not touched), and the proxy
+//! must be reachable (else 503, nothing is changed, the history has an `unreachable` line; a proxy that has no place
+//! for the question is 503 too, with no line). Then
 //! the generation is chosen (`activate_if_current` of the store, which verifies it), and the proxy is ordered to
 //! switch to it by its control socket. If the proxy says the switch is under way (`busy`) its state is looked at
 //! every 250 ms until it serves the generation, or has been idle twice without it, or the time the old inspector may
@@ -58,9 +66,9 @@
 //! `chosen` in the answer says whether the rules store chooses the generation now: it does not when nothing was
 //! changed (the proxy could not be reached first), and it does when the switch then was refused, failed or
 //! unconfirmed: the store is not put back. A history line that cannot be written is told by `history` in the answer.
-//! A rollback goes to the target of the history: the generation before the last switch, if that switch ended at the
-//! generation the rules store chooses now; there is none, or the history ends at another generation, or the target is
-//! not in the store any more: 409.
+//! A rollback goes to the target of the history for its engine: the generation before the last switch of that engine,
+//! if that switch ended at the generation the rules store chooses now for the engine; there is none, or the history
+//! ends at another generation, or the target is not in the store any more: 409.
 //!
 //! The longest time the import, the switch and the rollback may need is `Waf::longest`; the server gives the answer
 //! that time, and every other route its usual 30 s.

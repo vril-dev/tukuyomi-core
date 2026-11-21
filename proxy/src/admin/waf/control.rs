@@ -13,26 +13,25 @@
 //! runtime of the admin process, where a runtime can be driven and dropped, and a runtime that lived longer could be
 //! dropped on the thread of the other one, which tokio refuses.
 //!
-//! No socket, a socket that nobody answers at, a line that is not one of the proxy's, and no line in time are all
-//! the same to the caller: the proxy cannot be reached. For a reload order they are `None` instead, an end that is
-//! not known, for the order may have come to the proxy and its reading may go on. A connection that the proxy takes
-//! and closes before it says
-//! anything is another case: the proxy has no place for it (it serves 4 connections at once). A status question that
-//! meets it is asked once more after 250 ms, and then the answer is `Seen::Busy`; a switch order that meets it is
-//! `Reply::Busy`, which is also what the order of a switch that goes on is. A reload order that meets it has no answer
-//! (`None`), as when no line came in time: the reading may or may not go on. A line is taken only if it has the fields
-//! of an answer, 64 digits for the generation and one of the words of the proxy for the rest. `engines` of a status, the
-//! state of each engine that the proxy runs, is not needed either: a proxy of an older version, which runs one engine
-//! for everything, does not send it, and then it is `None` (the routes that switch refuse such a proxy, see `activate`);
-//! when it is there each of its entries has an engine (at most once), a generation, a mode and a phase in the words of
-//! the proxy, or the line is not the proxy's. The generation of an answer to a switch order is 64 digits, or `null` for
-//! an engine that the proxy does not run. The figures of a status
-//! (`reloading`, `uptime_ms`, `requests`, `blocked`, `policy_refused`, `upstream_failures`, `config`, `managed`,
-//! `resolve_timeout_ms` and `config_reloads`) are not needed for that: a proxy of an older version does not send them,
-//! and each one that is missing is `None`, as `managed` is when it is `null`. One that is there and is not what it
-//! should be (a boolean or a number; for `config` and `managed`, 64 lowercase digits; for `resolve_timeout_ms`, 1 ms
-//! to 3600 s, the range that the configuration allows) makes the line one that is not
-//! the proxy's. The answer to a reload order is taken only if its `result` is one of `replaced`, `refused`, `busy` and
+//! No socket, a socket that nobody answers at, a line that is not one of the proxy's, and no line in time are all the
+//! same to the caller: the proxy cannot be reached. For a reload order they are `None` instead, an end that is not
+//! known, for the order may have come to the proxy and its reading may go on. A connection that the proxy takes and
+//! closes before it says anything is another case: the proxy has no place for it (it serves 4 connections at once). A
+//! status question that meets it is asked once more after 250 ms, and then the answer is `Seen::Busy`; a switch order
+//! that meets it is `Reply::Busy`, which is also what the order of a switch that goes on is. A reload order that meets
+//! it has no answer (`None`), as when no line came in time: the reading may or may not go on. A line is taken only if
+//! it has the fields of an answer, 64 digits for the generation and one of the words of the proxy for the rest.
+//! `engines` of a status, the state of each engine that the proxy runs, is not needed either: a proxy of an older
+//! version, which runs one engine for everything, does not send it, and then it is `None` (the routes that switch
+//! refuse such a proxy, see `activate`); when it is there each of its entries has an engine (at most once), a
+//! generation, a mode and a phase in the words of the proxy, or the line is not the proxy's. The answer to a
+//! switch order always has its `generation`: 64 digits, or `null` for an engine that the proxy does not run. The
+//! figures of a status (`reloading`, `uptime_ms`, `requests`, `blocked`, `policy_refused`, `upstream_failures`,
+//! `config`, `managed`, `resolve_timeout_ms` and `config_reloads`) are not needed for that: a proxy of an older version
+//! does not send them, and each one that is missing is `None`, as `managed` is when it is `null`. One that is there and
+//! is not what it should be (a boolean or a number; for `config` and `managed`, 64 lowercase digits; for
+//! `resolve_timeout_ms`, 1 ms to 3600 s, the range that the configuration allows) makes the line one that is not the
+//! proxy's. The answer to a reload order is taken only if its `result` is one of `replaced`, `refused`, `busy` and
 //! `error`, its `reason` one of the words of that result (none for `replaced`), `config` 64 lowercase digits for
 //! `replaced` and nothing else, `managed` 64 lowercase digits or `null` (none for `error`), and `detail`, for `refused`
 //! only, 1 to 512 bytes from 0x20 to 0x7e. The answer of a proxy that does not know the order (`error`, `unknown op`)
@@ -52,7 +51,7 @@ use tukuyomi_kernel::Engine;
 
 use crate::managed::apply::{self, Answered, Look};
 use crate::rules::bundle::{Fingerprint, hex};
-use crate::rules::store::ENGINES;
+use crate::rules::store::{ENGINES, index};
 
 /// The longest line of an answer in bytes, its line feed included.
 const LINE_MAX: usize = 4096;
@@ -108,8 +107,7 @@ pub struct Engines([Option<EngineStatus>; ENGINES.len()]);
 impl Engines {
     /// The state of `engine`, if the proxy runs it.
     pub fn of(&self, engine: Engine) -> Option<&EngineStatus> {
-        let place = ENGINES.iter().position(|&known| known == engine)?;
-        self.0[place].as_ref()
+        self.0[index(engine)].as_ref()
     }
 
     /// The engines that run, in the order of their names, with their states.
@@ -308,7 +306,8 @@ struct EngineLine {
 #[derive(Deserialize)]
 struct SwitchLine {
     result: String,
-    /// 64 digits, or `null` for an engine that the proxy does not run.
+    /// 64 digits, or `null` for an engine that the proxy does not run. The key is there in every answer.
+    #[serde(deserialize_with = "Option::deserialize")]
     generation: Option<String>,
 }
 
@@ -348,7 +347,7 @@ fn engines_of(lines: Vec<EngineLine>) -> Option<Engines> {
     let mut engines = Engines::default();
     for line in lines {
         let engine = Engine::parse(&line.engine)?;
-        let place = ENGINES.iter().position(|&known| known == engine)?;
+        let place = index(engine);
         if engines.0[place].is_some() {
             return None;
         }

@@ -306,9 +306,9 @@ fn engines_chosen(
 }
 
 /// Checks the stored version `bytes` against the main file `built` as the proxy would when it takes the version, and
-/// that the rules store has a generation chosen for the engine of each of its groups, for a version that is put in force
-/// by its name. A version that the check with the main file refuses is not looked at here: the proxy refuses it, with
-/// its own sentence, when it is told to take it.
+/// that the rules store has a generation chosen for the engine of each of its groups, for a version that is put in
+/// force by its name. A version that the check with the main file refuses is not looked at here: the proxy refuses it,
+/// with its own sentence, when it is told to take it.
 pub fn stored_engines_chosen(built: &Built, bytes: &[u8]) -> Result<(), Refused> {
     let Routing::Managed { resolve_timeout } = built.routing else {
         return Ok(());

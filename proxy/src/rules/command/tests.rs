@@ -339,6 +339,31 @@ fn marked(main: &str) -> Vec<String> {
 }
 
 #[test]
+fn deactivate_refuses_an_engine_that_a_group_of_the_chosen_managed_version_uses() {
+    let fixture = Fixture::new();
+    // The main file has `managed` and no group of its own: the groups are the version's.
+    let main = fixture.main_file(|m| {
+        m["kernel"]["engines"] =
+            json!({"modsecurity": {"inspector": "/opt/tukuyomi/inspector-modsecurity"}});
+    });
+    let main = main.to_str().unwrap().to_owned();
+    fixture.choose_rules(Engine::ModSecurity);
+    let mut version = fixture.plain_version(b"chain", b"key");
+    version["upstreams"]["app"]["engine"] = json!("modsecurity");
+    fixture.current(&version);
+    let (exit, out, err) = command(&["deactivate", &main, "modsecurity"]);
+    let uses = "rules deactivate: the configuration uses the engine\n";
+    assert_eq!((exit, out.as_str(), err.as_str()), (Exit::Failed, "", uses));
+    let store = FileStore::open(&fixture.rules()).unwrap();
+    assert!(store.current(Engine::ModSecurity).unwrap().is_some());
+    // The version that is chosen after it names no engine, so the engine can be left with none.
+    fixture.current(&fixture.plain_version(b"chain", b"key"));
+    let (exit, _, err) = command(&["deactivate", &main, "modsecurity"]);
+    assert_eq!((exit, err.as_str()), (Exit::Done, ""));
+    assert!(store.current(Engine::ModSecurity).unwrap().is_none());
+}
+
+#[test]
 fn each_engine_has_the_generation_chosen_for_it_and_deactivate_leaves_an_engine_with_none() {
     let fixture = Fixture::new();
     let main = main_with(&fixture, None);
