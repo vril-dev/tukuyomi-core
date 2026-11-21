@@ -22,7 +22,7 @@ const TOUCH_MS = 30_000;
  * in this form is not edited.
  */
 export function readableVersion(version) {
-  const group = (raw) => plain(raw) && Array.isArray(raw.servers) && raw.servers.every(plain) && (!Object.hasOwn(raw, 'tls') || plain(raw.tls));
+  const group = (raw) => plain(raw) && Array.isArray(raw.servers) && raw.servers.every(plain) && (!Object.hasOwn(raw, 'tls') || plain(raw.tls)) && (!Object.hasOwn(raw, 'engine') || typeof raw.engine === 'string');
   const optional = (key) => !Object.hasOwn(version, key) || plain(version[key]);
   return (
     plain(version) &&
@@ -497,6 +497,8 @@ export class Draft {
       else if (seen.has(name)) nameFault(w('edit.fault.group_twice'));
       seen.add(name);
       const built = { ...group.raw, servers: group.servers.map((server) => builtServer(group, server, faults)) };
+      if (group.engine === '') delete built.engine;
+      else built.engine = group.engine;
       const tls = builtTls(group, faults);
       if (tls === undefined) {
         delete built.tls;

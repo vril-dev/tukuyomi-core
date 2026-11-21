@@ -196,9 +196,15 @@ test('a call that gets no answer has an unknown result', async () => {
 
 test('the chosen and the serving generation are compared only when the proxy said which it serves', () => {
   const [a, b] = ['a'.repeat(64), 'b'.repeat(64)];
-  assert.equal(generationState({ current: a, proxy: { generation: a, switching: false } }), 'same');
-  assert.equal(generationState({ current: a, proxy: { generation: b, switching: false } }), 'differ');
-  assert.equal(generationState({ current: a, proxy: { generation: b, switching: true } }), 'switching');
-  assert.equal(generationState({ current: null, proxy: { generation: b, switching: false } }), 'differ');
-  assert.equal(generationState({ current: a, proxy: null }), 'unknown');
+  // The answer of this version: the generation chosen for each engine, and the engines that the proxy runs.
+  const status = (current, serving, switching = false) => ({
+    engines: [{ engine: 'coraza', current, rollback_to: null }, { engine: 'modsecurity', current: null, rollback_to: null }],
+    proxy: { switching, engines: [{ engine: 'coraza', generation: serving, mode: 'block', phase: 'ready' }] },
+  });
+  assert.equal(generationState(status(a, a)), 'same');
+  assert.equal(generationState(status(a, b)), 'differ');
+  assert.equal(generationState(status(a, b, true)), 'switching');
+  // An engine that runs with none chosen (after `rules deactivate`) is no difference.
+  assert.equal(generationState(status(null, b)), 'same');
+  assert.equal(generationState({ ...status(a, a), proxy: null }), 'unknown');
 });

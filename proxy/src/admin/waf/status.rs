@@ -1,4 +1,5 @@
-//! The status route, `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "engines", "crs"}`.
+//! The status route, `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "default_engine", "engines",
+//! "crs"}`.
 //!
 //! `current` is the generation the rules store chooses for the default engine (`null` when it chooses none), and
 //! `reachable` and `proxy` are what the control socket says of the proxy (see `control`): `proxy` is `{"generation",
@@ -9,9 +10,12 @@
 //! send `engines` and the figures (`reloading` and the last nine), and each one it does not send is `null`, as
 //! `managed` is for a proxy whose configuration has no `managed`; the answer is not refused for that. `rollback_to` is
 //! the generation a rollback of the default engine would go to if it were asked for now: the target of the history
-//! (`history::rollback_target`) when the rules store still has that generation, else `null`. `engines` has an entry for
-//! each engine, `{"engine", "current", "rollback_to"}`, the same two for that engine. A history that cannot be read
-//! makes the answer 503, as it does for the history route.
+//! (`history::rollback_target`) when the rules store still has that generation, else `null`. `default_engine` is the
+//! default engine, `coraza` or `modsecurity`, as this process read `kernel.default_engine` when it started (`coraza`
+//! when the configuration leaves it out); `current` and `rollback_to` are those of it. It can differ from the `engine`
+//! of `proxy`, which the proxy read when it started, while only one of the two has been restarted after the
+//! configuration changed. `engines` has an entry for each engine, `{"engine", "current", "rollback_to"}`, the same two
+//! for that engine. A history that cannot be read makes the answer 503, as it does for the history route.
 //!
 //! `crs` is `{"available", "files"}`: `available` says whether the configuration names a directory of the CRS
 //! (`admin.crs_dir`), and `files` are the names of the `.conf` files in its `rules` directory, which an import may turn
@@ -105,6 +109,7 @@ impl Waf {
                 "reachable": proxy.reachable(),
                 "proxy": proxy.state().map(|status| status.json()),
                 "rollback_to": default.1.map(|target| target.hex()),
+                "default_engine": self.default_engine.name(),
                 "engines": engines
                     .iter()
                     .map(|(engine, current, rollback_to)| json!({

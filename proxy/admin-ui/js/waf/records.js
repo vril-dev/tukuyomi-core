@@ -7,13 +7,13 @@
 // back `{ stop, show }`. Nothing runs when the module is loaded.
 
 import { badge, button, buttonClass, el, mount, notice } from '../dom.js';
-import { w } from '../i18n.js';
-import { Field, checkFields, checkbox, choice, fingerprintText, fingerprintView, hashOf, instantOf, isFingerprint, kv, pageHead, panelWith, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeView } from '../parts.js';
+import { lazy, w } from '../i18n.js';
+import { ENGINE_IDS, Field, checkFields, checkbox, choice, engineBadge, engineName, fingerprintText, fingerprintView, hashOf, instantOf, isFingerprint, kv, pageHead, panelWith, restoreFocus, row, setBusy, textInput, timeCell, timeCellText, timeLabel, timeView } from '../parts.js';
 import { Table } from '../table.js';
 
 /** The types of record there are. */
 export const TYPES = ['request', 'connection', 'tunnel', 'line', 'audit', 'dropped'];
-const FIELDS = ['from', 'to', 'type', 'class', 'status', 'rule', 'id', 'client', 'generation'];
+const FIELDS = ['from', 'to', 'type', 'class', 'status', 'rule', 'id', 'client', 'engine', 'generation'];
 const TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
 /** The names of the filters, for the screen. */
 const LABELS = {
@@ -25,6 +25,7 @@ const LABELS = {
   rule: () => w('records.f.rule'),
   id: () => w('records.f.id'),
   client: () => w('records.f.client'),
+  engine: () => w('col.engine'),
   generation: () => w('records.f.generation'),
 };
 /** What to write when a filter is not of its form. */
@@ -37,6 +38,7 @@ const PROBLEMS = {
   rule: () => w('records.p_rule'),
   id: () => w('records.p_id'),
   client: () => w('records.p_client'),
+  engine: () => w('records.p_engine'),
   generation: () => w('records.p_generation'),
 };
 /** The forms of the filters, as the API takes them (it checks them again, and the dates in full). */
@@ -49,6 +51,7 @@ export const CHECKS = {
   rule: (value) => /^-?\d{1,19}$/.test(value),
   id: (value) => /^[0-9a-f-]{1,40}$/.test(value),
   client: (value) => value.length <= 45 && /^[0-9a-fA-F:.]+$/.test(value),
+  engine: (value) => ENGINE_IDS.includes(value),
   generation: (value) => /^([0-9a-f]{16}|[0-9a-f]{64})$/.test(value),
 };
 /** The words of each class of a request record, and the tone of its badge. A class that is not here is shown as the API gave it. */
@@ -240,9 +243,10 @@ class RecordsScreen {
     this.edgeFrom = null;
 
     const typeSelect = el('select', { class: 'tc-select', name: 'type' }, [el('option', { value: '' }, w('records.any')), ...TYPES.map((type) => el('option', { value: type }, type))]);
+    const engineSelect = el('select', { class: 'tc-select', name: 'engine' }, [el('option', { value: '' }, w('records.any')), ...ENGINE_IDS.map((id) => el('option', { value: id }, lazy(() => engineName(id))))]);
     this.fields = Object.fromEntries(
       FIELDS.map((field) => {
-        const control = field === 'type' ? typeSelect : textInput({ name: field, autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false' });
+        const control = { type: typeSelect, engine: engineSelect }[field] ?? textInput({ name: field, autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false' });
         return [field, new Field(LABELS[field](), control, { hint: field === 'from' || field === 'to' ? w('records.time_hint') : null })];
       }),
     );
@@ -500,6 +504,7 @@ class RecordsScreen {
       lines.push(row(w('records.summary'), el('span', { class: 'tc-mono' }, summaryOf(record))));
     }
     if (typeof record.generation === 'string') lines.push(row(w('records.generation'), fingerprintView(record.generation, { copy: false })));
+    if (typeof record.engine === 'string') lines.push(row(w('col.engine'), engineBadge(record.engine)));
     return lines;
   }
 

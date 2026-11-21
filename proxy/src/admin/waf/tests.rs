@@ -312,10 +312,10 @@ struct Rig {
 }
 
 fn rig(with_proxy: bool) -> Rig {
-    rig_with(with_proxy, None)
+    rig_with(with_proxy, None, Engine::Coraza)
 }
 
-fn rig_with(with_proxy: bool, records: Option<Records>) -> Rig {
+fn rig_with(with_proxy: bool, records: Option<Records>, default_engine: Engine) -> Rig {
     let dir = scratch();
     fs::DirBuilder::new()
         .mode(0o700)
@@ -348,7 +348,7 @@ fn rig_with(with_proxy: bool, records: Option<Records>) -> Rig {
         crs_dir: None,
         records: records.as_ref(),
         waits: WAITS,
-        default_engine: Engine::Coraza,
+        default_engine,
     };
     let modsecurity = Arc::new(AtomicBool::new(false));
     let trial = FakeTrial {
@@ -1140,7 +1140,7 @@ fn the_records_route_reads_the_record_files_or_says_that_there_are_none() {
         sync_ms: None,
         ship: None,
     };
-    let rig = rig_with(false, Some(config));
+    let rig = rig_with(false, Some(config), Engine::Coraza);
     let found = rig.get(Op::Records, "/api/records", "id=0123456789abcdef-3");
     assert_eq!(found.status, StatusCode::OK);
     assert_eq!(found.body["records"], json!([record]));
@@ -1184,7 +1184,7 @@ fn the_records_route_filters_by_the_engine_that_judged_the_request() {
         sync_ms: None,
         ship: None,
     };
-    let rig = rig_with(false, Some(config));
+    let rig = rig_with(false, Some(config), Engine::Coraza);
     let of = |query: &str| rig.get(Op::Records, "/api/records", query);
     assert_eq!(of("engine=modsecurity").body["records"], json!([b]));
     assert_eq!(of("engine=coraza").body["records"], json!([a]));
@@ -1580,4 +1580,16 @@ fn the_status_and_the_generations_tell_each_engine_its_chosen_and_serving_genera
         answer.body["error"],
         "the generation is the target of a rollback"
     );
+}
+
+#[test]
+fn the_status_names_the_default_engine() {
+    for (engine, name) in [
+        (Engine::Coraza, "coraza"),
+        (Engine::ModSecurity, "modsecurity"),
+    ] {
+        let rig = rig_with(false, None, engine);
+        let status = rig.get(Op::Status, "/api/status", "").body;
+        assert_eq!(status["default_engine"], name);
+    }
 }

@@ -12,15 +12,15 @@
 //! The routes (a viewer may use the status, the generations, the history and the records, an operator the import, the
 //! switch, the rollback and the removal as well; a body is JSON of at most 64 KiB, the one of the import 12 MiB; the
 //! answers are JSON, and `error` is a fixed sentence):
-//! - `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "engines", "crs"}`: the generation the rules
-//!   store chooses for the default engine, the state of the proxy from its control socket (`proxy` is `null` when the
-//!   state could not be read, and `reachable` is false when the proxy cannot be reached; a proxy that has no place for
-//!   the question is reachable; `proxy` has the `mode` and the `engine` of the generation that serves the default
-//!   engine, `engines`, the `generation`, `mode`, `engine` and `phase` of each engine it runs, and its figures: the
-//!   time since it started, its counts and the SHA-256 of its configuration file, each `null` when an older proxy does
-//!   not send it), the generation a rollback of the default engine would go to now (`null` for none), for each engine
-//!   the generation the rules store chooses for it and the one a rollback of it would go to (`engines`), and the CRS
-//!   of the configuration (see `status`).
+//! - `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "default_engine", "engines", "crs"}`: the
+//!   generation the rules store chooses for the default engine, the state of the proxy from its control socket (`proxy`
+//!   is `null` when the state could not be read, and `reachable` is false when the proxy cannot be reached; a proxy
+//!   that has no place for the question is reachable; `proxy` has the `mode` and the `engine` of the generation that
+//!   serves the default engine, `engines`, the `generation`, `mode`, `engine` and `phase` of each engine it runs, and
+//!   its figures: the time since it started, its counts and the SHA-256 of its configuration file, each `null` when an
+//!   older proxy does not send it), the generation a rollback of the default engine would go to now (`null` for none),
+//!   the name of the default engine (`default_engine`), for each engine the generation the rules store chooses for it
+//!   and the one a rollback of it would go to (`engines`), and the CRS of the configuration (see `status`).
 //! - `GET /api/generations`: `{"reachable", "generations"}`, the newest first, each with its `fingerprint`, `made`
 //!   (seconds since the epoch), `mode`, `engine`, number of `routes`, and whether it is `current` (chosen for its
 //!   engine) and `serving`.

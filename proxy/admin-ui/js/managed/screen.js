@@ -5,8 +5,9 @@
 
 import { ApiError } from '../api.js';
 import { badge, button, el, mount, notice, result } from '../dom.js';
-import { t, w } from '../i18n.js';
-import { canChange, confirmChange, diffView, fingerprintView, hashOf, isFingerprint, kv, pageHead, panel, perform, restoreFocus, row, runningNotice, setBusy, shortOf, timeCell, working } from '../parts.js';
+import { lazy, t, w } from '../i18n.js';
+import { ENGINE_IDS, canChange, confirmChange, defaultEngine, diffView, engineName, engineStates, fingerprintView, hashOf, isFingerprint, kv, pageHead, panel, perform, restoreFocus, row, runningNotice, setBusy, shortOf, timeCell, working } from '../parts.js';
+import { ENGINE_FIELD } from './edit/locate.js';
 import { Watch, isJob, jobPanel, watchLimit } from './job.js';
 
 /**
@@ -28,16 +29,26 @@ export function servingView(state) {
   return proxy === 'unmanaged' ? w('managed.proxy.unmanaged_short') : w('managed.unknown');
 }
 
-/** The numbers of a version that a confirmation and the detail of a version show; none of its text but the name of the default group. */
-export function countsOf(version) {
+/**
+ * The numbers of a version that a confirmation and the detail of a version show; none of its text but the name of the
+ * default group. The groups are counted by the engine that inspects them: the one they name, else `defaultName` (the
+ * default engine; null when it is not known, and then the groups that name one are counted, as `pinned`). A number is a
+ * value, so that a line of a confirmation can tell whether it changes.
+ */
+export function countsOf(version, defaultName = null) {
   const readable = version !== null && typeof version === 'object';
   const object = readable ? version : {};
   const length = (value) => (Array.isArray(value) ? value.length : null);
-  const groups = object.upstreams !== null && typeof object.upstreams === 'object' && !Array.isArray(object.upstreams) ? Object.keys(object.upstreams).length : null;
+  const named = object.upstreams !== null && typeof object.upstreams === 'object' && !Array.isArray(object.upstreams) ? Object.values(object.upstreams) : null;
+  const groups = named === null ? null : named.length;
+  const engineOf = (group) => (typeof group?.engine === 'string' ? group.engine : defaultName);
+  const inEngine = (engine) => (named === null || defaultName === null ? null : named.filter((group) => engineOf(group) === engine).length);
   const has = (value) => value !== undefined && value !== null;
   return {
     sites: length(object.sites),
     upstreams: groups,
+    ...Object.fromEntries(ENGINE_IDS.map((engine) => [engine, inEngine(engine)])),
+    pinned: named === null ? null : named.filter((group) => typeof group?.engine === 'string').length,
     routes: length(object.routes),
     // A version may leave the host policies out, and then it has none.
     hostPolicies: readable && !Object.hasOwn(object, 'host_policies') ? 0 : length(object.host_policies),
@@ -54,11 +65,21 @@ export function defaultGroupView(name) {
 }
 
 /**
+ * The lines of the numbers of the groups by engine (see `countsOf`): one for each engine when the default engine is
+ * known (`named`), else one for the groups that name an engine themselves. `engine` is null for that one.
+ */
+export function engineLines(named) {
+  if (!named) return [{ key: 'pinned', engine: null, label: w('managed.diff.engine_set') }];
+  return ENGINE_IDS.map((engine) => ({ key: engine, engine, label: w('managed.diff.engine', { engine: engineName(engine) }) }));
+}
+
+/**
  * The lines of a confirmation for the versions `from` and `to` with their numbers (`null`: that version could not be
  * read). `gone`: the version `from` is removed, so every line after it says that it is gone, and `to` and `after` are
- * not read.
+ * not read. `detecting` are the engines that the proxy runs with a generation that only detects: a line of such an
+ * engine that has groups after the change says so.
  */
-export function diffRows(from, to, before, after, { gone = false } = {}) {
+export function diffRows(from, to, before, after, { gone = false, detecting = [] } = {}) {
   const number = (counts, key) => (counts === null || counts[key] === null ? '—' : String(counts[key]));
   const present = (counts, key) => {
     if (counts === null) return '—';
@@ -75,6 +96,10 @@ export function diffRows(from, to, before, after, { gone = false } = {}) {
     { label: w('managed.col.version'), now: short(from), after: gone ? w('managed.confirm.gone') : short(to), changed: gone || from !== to },
     counted(w('managed.diff.sites'), 'sites', number),
     counted(w('managed.diff.upstreams'), 'upstreams', number),
+    ...engineLines([before, after].some((counts) => counts !== null && counts.coraza !== null)).map(({ key, engine, label }) => {
+      const line = counted(label, key, number);
+      return engine !== null && detecting.includes(engine) && !gone && after !== null && after[key] > 0 ? { ...line, after: [line.after, ' ', badge('warn', w('managed.diff.detecting'))] } : line;
+    }),
     counted(w('managed.diff.routes'), 'routes', number),
     counted(w('managed.diff.default'), 'defaultUpstream', (counts, key) => (counts === null ? '—' : defaultGroupView(counts[key]))),
     counted(w('managed.diff.access'), 'access', present),
@@ -345,9 +370,16 @@ export class Screen {
     }
     const kind = done.error instanceof ApiError ? done.error.kind : 'other';
     if (kind === 'unknown') mount(this.results, this.resultLost());
-    else if (heard === null) mount(this.results, notice(kind === 'conflict' ? 'warn' : 'bad', this.ctx.describe(done.error, { change: true })));
+    else if (heard === null) mount(this.results, notice(kind === 'conflict' ? 'warn' : 'bad', this.refusal(done.error)));
     else mount(this.results);
     await this.load();
+  }
+
+  /** The words of a refusal of a change: one that names the engine of a group says which group, before the sentence. */
+  refusal(error) {
+    const words = this.ctx.describe(error, { change: true });
+    const name = error instanceof ApiError && error.kind === 'conflict' && typeof error.body?.at === 'string' ? ENGINE_FIELD.exec(error.body.at)?.[1] : undefined;
+    return name === undefined ? words : lazy(() => `${t('managed.at.upstream', { name })} ${words}`);
   }
 
   /** No answer to a change came, so its job may have started or not: the state and the job read after it tell. */
@@ -355,11 +387,21 @@ export class Screen {
     return result('warn', w('managed.lost.title'), w('managed.lost.what'), w('managed.lost.next'));
   }
 
+  /** The default engine, as the status that was read says (null when it names none, or the proxy runs another one). */
+  defaultName() {
+    return defaultEngine(this.data?.status).name;
+  }
+
+  /** The engines that the proxy runs with a generation that only detects, from the status that was read. */
+  detecting() {
+    return engineStates(this.data?.status).filter((state) => state.mode === 'detect').map((state) => state.engine);
+  }
+
   /** The numbers of the version `name`, or null when it cannot be read; its content is not kept. */
   async versionCounts(name) {
     try {
       const answer = await this.ctx.api.call('GET', `/api/managed/versions/${name}`);
-      return countsOf(answer.version);
+      return countsOf(answer.version, this.defaultName());
     } catch {
       return null;
     }
@@ -413,7 +455,7 @@ export class Screen {
         this.fileWaits() ? notice('warn', w('managed.file_waits')) : null,
         el('p', { class: 'tc-muted tc-small' }, w('managed.confirm.groups_reset')),
       ],
-      diff: diffView([w('managed.confirm.now'), w('managed.confirm.after')], diffRows(from, to, before, after)),
+      diff: diffView([w('managed.confirm.now'), w('managed.confirm.after')], diffRows(from, to, before, after, { detecting: this.detecting() })),
       confirm,
       tone,
     });
@@ -434,17 +476,18 @@ export class Screen {
 
   /**
    * The values of the configuration file that the screens use (its SHA-256, the time of the lookup of the names, the
-   * limit of a body of the proxy, whether it names a country database, an ACME account and records, and the host of the
-   * route to this admin screen; `geo`, `acme`, `records` and `adminHost` are null when the file could not be read), or
+   * limit of a body of the proxy, whether it names a country database, an ACME account, records and an inspector of
+   * ModSecurity, and the host of the route to this admin screen; `geo`, `acme`, `records`, `modsecurity` and
+   * `adminHost` are null when the file could not be read), or
    * why it was refused (a 409): its other values are not kept.
    */
   async readFile() {
     try {
       const answer = await this.ctx.api.call('GET', '/api/config');
       const present = (value) => value !== undefined && value !== null;
-      return { sha256: answer.sha256, resolveMs: answer.forward?.resolve_timeout_ms, maxBody: answer.proxy?.max_body, geo: present(answer.geo), acme: present(answer.acme), records: present(answer.records), adminHost: answer.admin?.route?.host ?? null, refused: null };
+      return { sha256: answer.sha256, resolveMs: answer.forward?.resolve_timeout_ms, maxBody: answer.proxy?.max_body, geo: present(answer.geo), acme: present(answer.acme), records: present(answer.records), modsecurity: present(answer.kernel?.engines?.modsecurity?.inspector), adminHost: answer.admin?.route?.host ?? null, refused: null };
     } catch (error) {
-      return { sha256: null, resolveMs: null, maxBody: null, geo: null, acme: null, records: null, adminHost: null, refused: error instanceof ApiError && error.status === 409 ? error : null };
+      return { sha256: null, resolveMs: null, maxBody: null, geo: null, acme: null, records: null, modsecurity: null, adminHost: null, refused: error instanceof ApiError && error.status === 409 ? error : null };
     }
   }
 }

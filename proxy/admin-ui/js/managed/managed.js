@@ -17,7 +17,7 @@ import { screens as siteScreens } from './edit/screens/sites.js';
 import { screens as upstreamScreens } from './edit/screens/upstreams.js';
 import { screens as historyScreens } from './history.js';
 import { isJob } from './job.js';
-import { Screen, certificateBadge, certificateExpiry, certificateText, countsOf, defaultGroupView, diffRows, expiryCell, mountScreen, proxyOf, servingView, unusedNotice } from './screen.js';
+import { Screen, certificateBadge, certificateExpiry, certificateText, countsOf, defaultGroupView, diffRows, engineLines, expiryCell, mountScreen, proxyOf, servingView, unusedNotice } from './screen.js';
 
 // The tone and the short words of what `proxyOf` says.
 const PROXY = {
@@ -217,7 +217,7 @@ class VersionsScreen extends Screen {
       return;
     }
     const item = detail.data;
-    const counts = countsOf(item.version);
+    const counts = countsOf(item.version, this.defaultName());
     const number = (value) => (value === null ? '—' : String(value));
     const present = (value) => (value ? w('managed.diff.set') : w('managed.diff.unset'));
     const { node, heading } = panelWith(
@@ -228,6 +228,7 @@ class VersionsScreen extends Screen {
         row(w('managed.col.made'), timeView(item.made, 's')),
         row(w('managed.diff.sites'), number(counts.sites)),
         row(w('managed.diff.upstreams'), number(counts.upstreams)),
+        engineLines(counts.coraza !== null).map(({ key, label }) => row(label, number(counts[key]))),
         row(w('managed.diff.routes'), number(counts.routes)),
         row(w('managed.diff.default'), defaultGroupView(counts.defaultUpstream)),
         row(w('managed.diff.access'), present(counts.access)),

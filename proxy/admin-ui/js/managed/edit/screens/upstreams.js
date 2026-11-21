@@ -1,11 +1,12 @@
 // The screen of the upstream groups: the default group, the list of the groups, and one panel below the list that edits
-// the group that is open (its servers, and TLS with the file of its authorities). What is typed goes to the draft, and
-// nothing is saved here: the band above the form checks and saves it. The list is drawn again with every change and the
-// panel is not, so that what is typed and the focus stay. Nothing runs when the module is loaded.
+// the group that is open (its servers, the engine that inspects what goes to it, and TLS with the file of its
+// authorities). What is typed goes to the draft, and nothing is saved here: the band above the form checks and saves
+// it. The list is drawn again with every change and the panel is not, so that what is typed and the focus stay. Nothing
+// runs when the module is loaded.
 
-import { badge, button, el, mount } from '../../../dom.js';
-import { t, w } from '../../../i18n.js';
-import { bytesText, checkbox, choice, fingerprintView, panelWith } from '../../../parts.js';
+import { badge, button, el, mount, notice } from '../../../dom.js';
+import { lazy, t, w } from '../../../i18n.js';
+import { ENGINE_IDS, bytesText, checkbox, choice, defaultEngine, engineBadge, engineName, engineStates, fingerprintView, panelWith } from '../../../parts.js';
 import { Table } from '../../../table.js';
 import { mountScreen } from '../../screen.js';
 import { EditScreen } from '../bar.js';
@@ -39,6 +40,9 @@ class UpstreamsScreen extends EditScreen {
     /** What the lines of the list were last drawn from. */
     this.listKey = null;
     this.groupsNote = el('div', { class: 'tc-stack', tabindex: '-1' });
+    /** The notice that the two processes have another default engine, and whether it is drawn. */
+    this.defaultsNote = el('div', { class: 'tc-stack' });
+    this.defaultsDiffer = null;
     this.panelBox = el('div');
     /** The group whose panel is drawn, what shows the file of its authorities, the rows of its servers, and the part with its button that takes it away. */
     this.panelOf = null;
@@ -46,6 +50,9 @@ class UpstreamsScreen extends EditScreen {
     this.rows = null;
     this.removeBox = null;
     this.removeKey = null;
+    /** The notices of the engine of the open group, and what they were last drawn from. */
+    this.engineNote = null;
+    this.engineNoteKey = null;
     this.addButton = button('small', w('edit.upstreams.add'), () => this.addGroup());
     this.table = new Table({
       caption: w('edit.upstreams.caption'),
@@ -56,12 +63,13 @@ class UpstreamsScreen extends EditScreen {
         { key: 'name', label: w('edit.col.name'), value: (group) => group.name.trim(), mono: true, long: true, cell: (group) => nameOf(group) },
         { key: 'servers', label: w('edit.col.servers'), value: (group) => group.servers.length, num: true, filter: false },
         { key: 'tls', label: w('edit.col.tls'), value: (group) => (group.tls ? 1 : 0), filter: false, cell: (group) => (group.tls ? w('edit.col.tls_on') : '—') },
+        { key: 'engine', label: w('col.engine'), value: (group) => this.engineOf(group) ?? '', text: (group) => this.engineText(group), cell: (group) => this.engineCell(group) },
         { key: 'routes', label: w('edit.col.routes'), value: (group) => this.shown.uses(group.cid).routes, num: true, filter: false },
         { key: 'marks', label: w('col.state'), value: (group) => this.marksOf(group).map((name) => MARKS[name].text()).join(' '), cell: (group) => this.marksCell(group) },
         { key: 'actions', label: w('col.actions'), value: () => '', sortable: false, filter: false, cell: (group) => button('small', w('edit.upstreams.edit'), () => this.openGroup(group.cid)) },
       ],
     });
-    mount(this.form, panelWith(w('edit.upstreams.default_title'), [], this.defaultBox).node, panelWith(w('edit.upstreams.list_title'), [this.addButton], this.groupsNote, this.table.node).node, this.panelBox);
+    mount(this.form, panelWith(w('edit.upstreams.default_title'), [], this.defaultBox).node, panelWith(w('edit.upstreams.list_title'), [this.addButton], this.groupsNote, this.defaultsNote, this.table.node).node, this.panelBox);
   }
 
   drawForm(draft) {
@@ -76,12 +84,18 @@ class UpstreamsScreen extends EditScreen {
     this.shown = draft;
     this.drawDefault(draft);
     // Only when a line would change: a drawing writes the count, which is read out, and takes the focus from a button of the list.
-    const key = JSON.stringify(draft.groups.map((group) => [group.cid, group.name, group.servers.length, group.tls, draft.uses(group.cid).routes, this.marksOf(group)]));
+    const key = JSON.stringify([defaultEngine(this.data?.status).name, draft.groups.map((group) => [group.cid, group.name, group.servers.length, group.tls, group.engine, draft.uses(group.cid).routes, this.marksOf(group)])]);
     if (key !== this.listKey) {
       this.listKey = key;
       this.table.update({ rows: draft.groups, loading: false });
     }
     this.drawRemove(draft);
+    const { differs } = defaultEngine(this.data?.status);
+    if (differs !== this.defaultsDiffer) {
+      this.defaultsDiffer = differs;
+      mount(this.defaultsNote, differs ? notice('warn', w('engine.defaults_differ')) : null);
+    }
+    this.drawEngineNote(draft.group(this.panelOf));
   }
 
   // ---- the default group ----
@@ -109,6 +123,23 @@ class UpstreamsScreen extends EditScreen {
     else if (draft.groupChanged(group)) names.push('changed');
     if (draft.faults.some((one) => one.panel === group.cid)) names.push('fault');
     return names;
+  }
+
+  /** The engine that inspects what goes to `group`: the one it names, else the default engine (null when that is not known). */
+  engineOf(group) {
+    return group.engine === '' ? defaultEngine(this.data?.status).name : group.engine;
+  }
+
+  /** The words of the engine of `group` in the list; for a default engine that is not known, the words that say so. */
+  engineText(group) {
+    const engine = this.engineOf(group);
+    return engine === null ? t('engine.default_name') : engineName(engine);
+  }
+
+  engineCell(group) {
+    const engine = this.engineOf(group);
+    if (engine === null) return w('engine.default_name');
+    return el('span', { class: 'tc-badges' }, engineBadge(engine), group.engine === '' ? el('span', { class: 'tc-muted tc-small' }, w('edit.engine.by_default')) : null);
   }
 
   marksCell(group) {
@@ -150,6 +181,7 @@ class UpstreamsScreen extends EditScreen {
     if (group === null) {
       this.rows = null;
       this.removeBox = null;
+      this.engineNote = null;
       mount(this.panelBox);
       return;
     }
@@ -157,6 +189,8 @@ class UpstreamsScreen extends EditScreen {
     this.placeField(group.cid, 'name', name);
     const serversNote = el('div', { class: 'tc-stack', tabindex: '-1' });
     this.placeNote(group.cid, 'servers', serversNote);
+    this.engineNote = el('div', { class: 'tc-stack' });
+    this.engineNoteKey = null;
     this.rows = new Rows();
     for (const server of group.servers) this.rows.add(this.serverLine(draft, group, server));
     this.removeBox = el('div', { class: 'tc-actions' });
@@ -166,6 +200,8 @@ class UpstreamsScreen extends EditScreen {
         w('edit.group.title'),
         [button('small quiet', w('edit.group.close'), () => this.closePanel(draft))],
         name.node,
+        this.engineBox(draft, group).node,
+        this.engineNote,
         el('h3', {}, w('edit.group.servers')),
         serversNote,
         this.rows.node,
@@ -175,6 +211,52 @@ class UpstreamsScreen extends EditScreen {
       ).node,
     );
     this.drawRemove(draft);
+    this.drawEngineNote(group);
+  }
+
+  /** The choice of the engine of `group`: the default engine, or one of the engines. */
+  engineBox(draft, group) {
+    const { name } = defaultEngine(this.data?.status);
+    const options = [
+      { value: '', label: name === null ? w('engine.default_name') : lazy(() => t('edit.engine.default_of', { engine: engineName(name) })) },
+      ...ENGINE_IDS.map((engine) => ({ value: engine, label: lazy(() => engineName(engine)) })),
+    ];
+    // A word that is not an engine stays in the choice, so that the choice does not read as the default engine: the check refuses it.
+    if (group.engine !== '' && !ENGINE_IDS.includes(group.engine)) options.push({ value: group.engine, label: group.engine });
+    const box = selectBox(w('col.engine'), options, group.engine, {
+      hint: w('edit.group.engine_hint'),
+      onChange: (value) => {
+        draft.write(group, 'engine', value);
+        this.drawEngineNote(group);
+      },
+    });
+    this.placeField(group.cid, 'engine', box);
+    return box;
+  }
+
+  /**
+   * What the screen knows before a saving of the engine of `group`, from the status and the file that it read: no
+   * generation is chosen for the engine, the proxy does not run it or is starting it, or the file has no inspector for
+   * ModSecurity. What it cannot know is left to the check. Drawn again only when the notices change.
+   */
+  drawEngineNote(group) {
+    if (group === null || this.engineNote === null) return;
+    const status = this.data?.status;
+    const engine = this.engineOf(group);
+    const state = engine === null ? undefined : engineStates(status).find((one) => one.engine === engine);
+    const words = { engine: engine === null ? '' : engineName(engine) };
+    const notes = [];
+    if (state !== undefined && state.running !== null) {
+      // An engine counts as running when the proxy has it and its kernel is ready; one that is starting is waited for, and one that is stopping or has stopped or failed is not running.
+      if (state.current === null) notes.push(['unchosen', notice('warn', w('edit.engine.unchosen', words))]);
+      else if (state.phase === 'starting') notes.push(['starting', notice('warn', w('edit.engine.starting', words))]);
+      else if (state.running === false || state.phase !== 'ready') notes.push(['unstarted', notice('warn', w('edit.engine.unstarted', words))]);
+    }
+    if (engine === 'modsecurity' && this.data?.file?.modsecurity === false) notes.push(['no_inspector', notice('warn', w('edit.engine.no_inspector'))]);
+    const key = `${group.cid} ${engine} ${notes.map(([id]) => id).join(' ')}`;
+    if (key === this.engineNoteKey) return;
+    this.engineNoteKey = key;
+    mount(this.engineNote, notes.map(([, node]) => node));
   }
 
   /** Opens the panel that holds the fault first: the first fault of the draft has made it the open one. */

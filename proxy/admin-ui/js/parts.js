@@ -545,14 +545,18 @@ const BUSY = 'the proxy is busy';
  * `perform` gave. The word is one of `switched`, `unchanged`, `refused`, `failed`, `unreachable` and `unconfirmed`
  * (the proxy's own, named in the body of the answer whatever the status is), or `busy` (the proxy had no room for
  * the switch), `lost` (no answer: the result is not known), `conflict` (the state moved under the request),
- * `unavailable`, `forbidden`, `limited`, or `other`. `ids` are the generation before and the one asked for, `chosen`
- * says whether the rules store chooses the latter now, and `unwritten` that the history has no line for the request.
+ * `unavailable`, `forbidden`, `limited`, or `other`. `ids` are the generation before and the one asked for, `engine`
+ * is the engine that was switched (`engine` here is the one of the request, for an answer that did not name it),
+ * `chosen` says whether the rules store chooses the latter now, and `unwritten` that the history has no line for the
+ * request.
  */
-export function switchOutcome({ body, error }) {
+export function switchOutcome({ body, error }, engine = null) {
   const source = error === null ? body : error?.body;
   const detail = source !== null && typeof source === 'object' ? source : {};
   const base = {
     ids: { from: detail.from, to: detail.generation },
+    // The engine that the proxy says it switched; when it said nothing, the one that the request was for.
+    engine: typeof detail.engine === 'string' ? detail.engine : engine,
     chosen: detail.chosen === true,
     unwritten: detail.history === 'not written',
     error,
@@ -568,17 +572,26 @@ export function switchOutcome({ body, error }) {
   return { ...base, word: 'other' };
 }
 
-const ids = (outcome) => ({ from: shortOf(outcome.ids.from), to: shortOf(outcome.ids.to) });
+const ids = (outcome) => ({ from: shortOf(outcome.ids.from), to: shortOf(outcome.ids.to), engine: engineName(outcome.engine) });
 const said = (outcome, describe) => describe(outcome.error, { change: true });
+// A request that chose, applied or started the generation that was chosen has no earlier generation to choose again.
+const again = (outcome) => outcome.ids.from === outcome.ids.to;
+
+// What a refusal says of the engine, by whether the proxy ran it before the request (`running`: true, false, or null when
+// that was not known): one that ran is still served by its earlier generation, one that did not run is still not run.
+const refusedWords = (o) => {
+  if (o.running === true) return w('out.refused', ids(o));
+  return o.running === false ? w('out.refused_new', ids(o)) : w('out.refused_any', ids(o));
+};
 
 // For each word: the tone, the name, what happened, and what to do next (null for nothing).
 const OUTCOMES = {
   switched: ['ok', () => w('word.switched'), (o) => w('out.switched', ids(o)), null],
   unchanged: ['ok', () => w('word.unchanged'), (o) => w('out.unchanged', ids(o)), null],
-  refused: ['bad', () => w('word.refused'), (o) => w('out.refused', ids(o)), (o) => w('next.refused', ids(o))],
-  failed: ['bad', () => w('word.failed'), (o) => w('out.failed', ids(o)), (o) => w('next.failed', ids(o))],
+  refused: ['bad', () => w('word.refused'), refusedWords, (o) => (again(o) ? w('next.check') : w('next.refused', ids(o)))],
+  failed: ['bad', () => w('word.failed'), (o) => w('out.failed', ids(o)), (o) => (again(o) ? w('next.check') : w('next.failed', ids(o)))],
   unreachable: ['bad', () => w('word.unreachable'), () => w('out.unreachable'), () => w('next.unreachable')],
-  unconfirmed: ['warn', () => w('word.unconfirmed'), (o) => w('out.unconfirmed', ids(o)), (o) => w('next.unconfirmed', ids(o))],
+  unconfirmed: ['warn', () => w('word.unconfirmed'), (o) => w('out.unconfirmed', ids(o)), (o) => (again(o) ? w('next.check') : w('next.unconfirmed', ids(o)))],
   busy: ['warn', () => w('word.busy'), () => w('out.busy'), () => w('next.busy')],
   lost: ['warn', () => w('word.lost'), () => w('out.lost'), () => w('next.lost')],
   conflict: ['warn', () => w('word.conflict'), said, () => w('next.conflict')],
@@ -594,6 +607,9 @@ const ENGINES = {
   coraza: () => t('engine.coraza'),
   modsecurity: () => t('engine.modsecurity'),
 };
+
+/** The engines, by the words the API gives, in the order that the screens offer them. */
+export const ENGINE_IDS = Object.keys(ENGINES);
 
 /** The name of an engine, by the word the API gives. */
 export function engineName(engine) {
@@ -638,20 +654,73 @@ export function outcomeView(outcome, describe) {
 }
 
 /**
- * How the generation that the rules store chooses compares with the one that the proxy serves, from the answer of
- * `GET /api/status`: `same`; `switching` (they differ while a switch is under way); `differ`; or `unknown` when the
- * proxy did not say which it serves (it cannot be reached, or has no room to answer).
+ * The default engine, from the answer of `GET /api/status`: `{ name, differs }`. The name is the one that the admin
+ * process was started with (`default_engine`), and null when the answer names none, or when the proxy says that it runs
+ * another one (`differs`: the two processes were started apart, and which of them is right is not known). The engine
+ * of a proxy of an older version is not a default engine, so it is not compared. A screen that needs the engine of what
+ * names none asks here, so that all of them tell the same.
  */
-export function generationState(data) {
-  const proxy = data?.proxy ?? null;
-  if (proxy === null || typeof proxy !== 'object') return 'unknown';
-  if (data.current === proxy.generation) return 'same';
-  return proxy.switching === true ? 'switching' : 'differ';
+export function defaultEngine(status) {
+  const mine = ENGINE_IDS.includes(status?.default_engine) ? status.default_engine : null;
+  const theirs = Array.isArray(status?.proxy?.engines) && ENGINE_IDS.includes(status.proxy.engine) ? status.proxy.engine : null;
+  const differs = mine !== null && theirs !== null && mine !== theirs;
+  return { name: differs ? null : mine, differs };
 }
 
-/** What the screen found when it read the status and the history again: where the result of a request shows. */
-export function findingsView(status, history) {
-  const proxy = status?.proxy ?? null;
+/** Whether the proxy answered without the state of its engines, as a proxy of an older version does. */
+export function oldProxy(status) {
+  const proxy = status?.proxy;
+  return proxy !== null && typeof proxy === 'object' && !Array.isArray(proxy.engines);
+}
+
+/**
+ * The state of each engine (in the order of `ENGINE_IDS`) from the answer of `GET /api/status`: `{ engine, current,
+ * rollbackTo, serving, mode, phase, running, isDefault, state }`. `current` and `rollbackTo` are what the rules store
+ * says, and `serving`, `mode` and `phase` what the proxy says of the engine that it runs (null when it runs none).
+ * `running` says whether the proxy runs the engine: true, false, or null when the proxy did not say. `state` is
+ * `same` (the proxy serves the generation that is chosen), `differ`, `switching` (a switch is under way, which the
+ * proxy tells once for all engines, and the engine is not what it is to be yet), `unstarted` (a generation is chosen
+ * and the proxy does not run the engine), `unchosen` (it runs the engine and none is chosen), `idle` (neither), or
+ * `unknown` for every engine when the proxy did not say what it runs: it cannot be reached, has no room to answer, or
+ * is of an older version.
+ */
+export function engineStates(status) {
+  const ran = status?.proxy?.engines;
+  const { name } = defaultEngine(status);
+  return ENGINE_IDS.map((engine) => {
+    const kept = Array.isArray(status?.engines) ? status.engines.find((one) => one?.engine === engine) : undefined;
+    const run = Array.isArray(ran) ? ran.find((one) => one?.engine === engine) : undefined;
+    const current = typeof kept?.current === 'string' ? kept.current : null;
+    const serving = typeof run?.generation === 'string' ? run.generation : null;
+    const under = status?.proxy?.switching === true ? 'switching' : null;
+    let state = 'unknown';
+    if (Array.isArray(ran)) {
+      if (run === undefined) state = current === null ? 'idle' : (under ?? 'unstarted');
+      else if (current === null) state = 'unchosen';
+      else state = current === serving ? 'same' : (under ?? 'differ');
+    }
+    const running = state === 'unknown' ? null : serving !== null;
+    return { engine, current, rollbackTo: typeof kept?.rollback_to === 'string' ? kept.rollback_to : null, serving, mode: run?.mode ?? null, phase: run?.phase ?? null, running, isDefault: engine === name, state };
+  });
+}
+
+/**
+ * How the generations that the rules store chooses compare with the ones that the proxy serves, from the answer of
+ * `GET /api/status`, for all engines: `differ` when one does not match or is chosen and not run; else `switching`
+ * (one is not what it is to be, while a switch is under way); else `unknown` when the proxy did not say what it runs
+ * (it cannot be reached, has no room to answer, or does not report its engines); else `same`. An engine that runs with
+ * no generation chosen is no difference.
+ */
+export function generationState(data) {
+  const states = engineStates(data).map((one) => one.state);
+  if (states.includes('differ') || states.includes('unstarted')) return 'differ';
+  if (states.includes('switching')) return 'switching';
+  return states.includes('unknown') ? 'unknown' : 'same';
+}
+
+/** What the screen found when it read the status and the history again for a request about `engine`: where the result of a request shows. */
+export function findingsView(status, history, engine) {
+  const state = engineStates(status).find((one) => one.engine === engine);
   const newest = Array.isArray(history) && history.length > 0 ? history[0] : null;
   return panel(
     w('found.title'),
@@ -659,8 +728,9 @@ export function findingsView(status, history) {
     status === null || history === null
       ? notice('bad', w('found.failed'))
       : kv(
-          row(w('status.chosen'), fingerprintView(status.current)),
-          row(w('status.serving'), proxy !== null && typeof proxy === 'object' ? fingerprintView(proxy.generation) : w('status.unknown')),
+          row(w('col.engine'), engineBadge(engine)),
+          row(w('status.chosen'), fingerprintView(state?.current ?? null)),
+          row(w('status.serving'), state === undefined || state.state === 'unknown' ? w('status.unknown') : fingerprintView(state.serving)),
           row(
             w('found.newest'),
             newest === null

@@ -9,6 +9,7 @@ import { lazy, t } from '../../i18n.js';
 const SERVER_FIELD = /^upstreams\.([A-Za-z0-9_-]{1,64})\.servers\[([0-9]{1,3})\]\.(address|weight|max_fails|fail_timeout_ms)$/;
 const TLS_FIELD = /^upstreams\.([A-Za-z0-9_-]{1,64})\.tls\.(ca|server_name)$/;
 const SERVERS = /^upstreams\.([A-Za-z0-9_-]{1,64})\.servers$/;
+export const ENGINE_FIELD = /^upstreams\.([A-Za-z0-9_-]{1,64})\.engine$/;
 const GROUP = /^upstreams\.([A-Za-z0-9_-]{1,64})$/;
 const RATE_FIELD = /^rate_limit\.(rate|burst|keys|exempt_cidrs)$/;
 const FILE = /^files\[([0-9]{1,3})\]$/;
@@ -130,6 +131,8 @@ export function locate(at, map) {
   }
   match = TLS_FIELD.exec(at);
   if (match !== null) return placeOfGroup(map, match[1], match[2]);
+  match = ENGINE_FIELD.exec(at);
+  if (match !== null) return placeOfGroup(map, match[1], 'engine');
   match = SERVERS.exec(at);
   if (match !== null) return placeOfGroup(map, match[1], 'servers');
   match = GROUP.exec(at);
