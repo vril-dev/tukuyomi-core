@@ -1,16 +1,17 @@
 //! What the running process waits for, behind one poll: the signals, the answers of the driver, the end of a
 //! connection and the accept side.
 
+use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, timeout_at};
-use tukuyomi_kernel::Failure;
+use tukuyomi_kernel::{Engine, Failure};
 
 use super::control::{Control, Order};
 use super::start::{Parts, Refusal};
@@ -71,8 +72,11 @@ pub(super) enum Event {
     Reload,
     /// SIGUSR2.
     Certificates,
-    /// The driver answered a switch: whether the new generation serves.
-    Switched(bool),
+    /// The driver answered the switch of `engine`: whether the new generation serves.
+    Switched {
+        engine: Engine,
+        switched: bool,
+    },
     /// The thread that reads the configuration file again answered: the parts it made, or why it refused the file (it
     /// wrote the line that says so).
     Configured(Result<Box<Parts>, Refusal>),
@@ -102,9 +106,11 @@ pub(super) struct Waits {
     usr1: Signal,
     usr2: Signal,
     ready: Option<oneshot::Receiver<Result<(), Failure>>>,
-    failed: Option<oneshot::Receiver<Failure>>,
-    /// The answer to the switch that is under way, if there is one.
-    pub(super) switch: Option<oneshot::Receiver<Switched>>,
+    failed: Option<mpsc::Receiver<Failure>>,
+    /// The engine and the answer of the switch that is under way, if there is one. There is one at a time.
+    pub(super) switch: Option<(Engine, oneshot::Receiver<Switched>)>,
+    /// The engines that SIGUSR1 has still to switch, after the one under way.
+    pub(super) queue: VecDeque<Engine>,
     /// The answer of the thread that reads the configuration file again, if one is under way.
     pub(super) config: Option<oneshot::Receiver<Result<Box<Parts>, Refusal>>>,
     end: Option<oneshot::Receiver<End>>,
@@ -118,7 +124,7 @@ impl Waits {
     pub(super) fn new(
         signals: Signals,
         ready: oneshot::Receiver<Result<(), Failure>>,
-        failed: oneshot::Receiver<Failure>,
+        failed: mpsc::Receiver<Failure>,
         end: oneshot::Receiver<End>,
     ) -> Waits {
         Waits {
@@ -130,6 +136,7 @@ impl Waits {
             ready: Some(ready),
             failed: Some(failed),
             switch: None,
+            queue: VecDeque::new(),
             config: None,
             end: Some(end),
             accept: None,
@@ -170,17 +177,25 @@ impl Waits {
             return Poll::Ready(Event::Certificates);
         }
         if let Some(failed) = self.failed.as_mut()
-            && let Poll::Ready(answer) = Pin::new(failed).poll(cx)
+            && let Poll::Ready(answer) = failed.poll_recv(cx)
         {
-            self.failed = None;
+            // The channel closes only when the driver is gone: a kernel that failed is the answer, and later ones
+            // are heard too.
+            if answer.is_none() {
+                self.failed = None;
+            }
             return Poll::Ready(answer.map_or(Event::Lost(Source::Failed), Event::Failed));
         }
-        if let Some(switch) = self.switch.as_mut()
+        if let Some((engine, switch)) = self.switch.as_mut()
             && let Poll::Ready(answer) = Pin::new(switch).poll(cx)
         {
+            let engine = *engine;
             self.switch = None;
             return Poll::Ready(answer.map_or(Event::Lost(Source::Switch), |switched| {
-                Event::Switched(switched == Switched::Yes)
+                Event::Switched {
+                    engine,
+                    switched: switched == Switched::Yes,
+                }
             }));
         }
         if let Some(config) = self.config.as_mut()

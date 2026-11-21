@@ -3,30 +3,38 @@
 
 use serde::Deserialize;
 use tokio::sync::oneshot;
+use tukuyomi_kernel::Engine;
 
 use super::answer::{Answer, Outcome, Reloaded, reload_line, switch_line};
 use crate::inbound::conn::Setup;
 use crate::log::Log;
 use crate::rules::bundle::Fingerprint;
 
-/// A request to switch, and where its answer goes.
+/// A request to switch an engine, and where its answer goes.
 pub(in crate::run) struct SwitchOrder {
+    pub(super) engine: Engine,
     pub(super) expect: Fingerprint,
     pub(super) reply: oneshot::Sender<Answer>,
 }
 
 impl SwitchOrder {
-    /// The generation the client expects the store to choose.
+    /// The engine to switch.
+    pub(in crate::run) fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    /// The generation the client expects the store to choose for the engine.
     pub(in crate::run) fn expect(&self) -> Fingerprint {
         self.expect
     }
 
-    /// Answers the client, and writes the record line of the order. `serving` is the generation that serves now.
+    /// Answers the client, and writes the record line of the order. `serving` is the generation that serves the engine
+    /// now, none if the engine does not run.
     pub(in crate::run) fn finish(
         self,
         outcome: Outcome,
         reason: Option<&'static str>,
-        serving: Fingerprint,
+        serving: Option<Fingerprint>,
         log: &Log,
     ) {
         log.line(&switch_line(self.expect, outcome, reason, serving));
@@ -68,7 +76,9 @@ pub(in crate::run) enum Order {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Ask {
     Status,
-    Switch(Fingerprint),
+    /// A switch of the engine (the default engine if the line names none) for the generation that the store is
+    /// expected to choose for it.
+    Switch(Option<Engine>, Fingerprint),
     /// A reading of the configuration with the managed version of this name.
     Reload([u8; 32]),
 }
@@ -79,21 +89,27 @@ struct Raw {
     op: String,
     expect: Option<String>,
     managed: Option<String>,
+    engine: Option<String>,
 }
 
-/// What the line asks for, or the word that says why it is not a request. A name is 64 lowercase hexadecimal digits.
+/// What the line asks for, or the word that says why it is not a request. A name is 64 lowercase hexadecimal digits,
+/// and an engine is `coraza` or `modsecurity`.
 pub(super) fn parse(line: &[u8]) -> Result<Ask, &'static str> {
     const MALFORMED: &str = "malformed request";
     let raw: Raw = serde_json::from_slice(line).map_err(|_| MALFORMED)?;
-    match (raw.op.as_str(), raw.expect, raw.managed) {
-        ("status", None, None) => Ok(Ask::Status),
-        ("switch", Some(expect), None) => Fingerprint::from_hex(expect.as_bytes())
-            .map(Ask::Switch)
-            .ok_or("bad expect"),
-        ("reload", None, Some(managed)) => Fingerprint::from_hex(managed.as_bytes())
+    match (raw.op.as_str(), raw.expect, raw.managed, raw.engine) {
+        ("status", None, None, None) => Ok(Ask::Status),
+        ("switch", Some(expect), None, engine) => {
+            let expect = Fingerprint::from_hex(expect.as_bytes()).ok_or("bad expect")?;
+            let engine = engine
+                .map(|name| Engine::parse(&name).ok_or("bad engine"))
+                .transpose()?;
+            Ok(Ask::Switch(engine, expect))
+        }
+        ("reload", None, Some(managed), None) => Fingerprint::from_hex(managed.as_bytes())
             .map(|name| Ask::Reload(name.bytes()))
             .ok_or("bad managed"),
-        ("status" | "switch" | "reload", _, _) => Err(MALFORMED),
+        ("status" | "switch" | "reload", ..) => Err(MALFORMED),
         _ => Err("unknown op"),
     }
 }

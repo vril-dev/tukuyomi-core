@@ -14,7 +14,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle as Served;
 use tokio::time::{sleep, timeout};
-use tukuyomi_kernel::{Matched, Reason, Verdict};
+use tukuyomi_kernel::{Engine, Matched, Reason, Verdict};
 
 use super::*;
 use crate::config::{ForwardConfig, Keep, PolicyConfig, ProxyConfig, RouteConfig};
@@ -23,12 +23,14 @@ use crate::inbound::http1::run as run_session;
 use crate::inbound::session::{RequestIds, serve, serve_on};
 use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::{Answer, Ingress, Outcome};
+use crate::inspect::engines::Gates;
 use crate::log::counters::Counters;
 use crate::log::{Lines, recording};
 use crate::policy::RateLimit;
 use crate::route::{Rule, Table};
 use crate::rules::bundle::{self, Fingerprint};
-use crate::rules::routes::{Route, Routes, SharedRoutes};
+use crate::rules::routes::{Route, Routes};
+use crate::rules::store::ENGINES;
 
 pub(in crate::inbound) const FORM: &str = "application/x-www-form-urlencoded";
 const BUDGET: usize = 1 << 20;
@@ -105,6 +107,8 @@ pub(in crate::inbound) fn config() -> ProxyConfig {
 pub(in crate::inbound) enum Mode {
     /// Answers every ticket with this.
     Answer(Outcome),
+    /// Answers a ticket for Coraza with the first and one for ModSecurity with the second.
+    Split(Outcome, Outcome),
     /// Keeps every ticket and never answers.
     Hold,
     /// The driver is gone: the way to it is closed.
@@ -118,6 +122,8 @@ pub(in crate::inbound) struct Seen {
     pub(in crate::inbound) method: String,
     pub(in crate::inbound) uri: String,
     pub(in crate::inbound) proto: String,
+    /// The engine that the ticket was made for.
+    pub(in crate::inbound) engine: Engine,
     /// The address the inspection was told is the client's.
     pub(in crate::inbound) client: SocketAddr,
     pub(in crate::inbound) headers: Vec<(String, String)>,
@@ -128,13 +134,13 @@ pub(in crate::inbound) struct Seen {
     abandoned: bool,
 }
 
-/// What the driver answers for `outcome`: a verdict comes with the generation that gave it, as it does from the
-/// driver.
-fn answered(outcome: Outcome) -> Answer {
+/// What the driver answers for `outcome` of `engine`: a verdict comes with the generation that gave it, as it does
+/// from the driver.
+fn answered(outcome: Outcome, engine: Engine) -> Answer {
     let by = match outcome {
         Outcome::Verdict(verdict) => Some(Judge {
             generation: Fingerprint::from_hex(&[b'7'; 64]).unwrap(),
-            engine: tukuyomi_kernel::Engine::Coraza,
+            engine,
             mode: bundle::Mode::Block,
             verdict,
             matched: Matched::NONE,
@@ -144,13 +150,15 @@ fn answered(outcome: Outcome) -> Answer {
     Answer { outcome, by }
 }
 
-fn driver(rx: Receiver<Msg>, answer: Option<Outcome>) -> JoinHandle<Vec<Seen>> {
+/// The driver of a test: `answer` is what it answers a ticket for Coraza and a ticket for ModSecurity, or none.
+fn driver(rx: Receiver<Msg>, answer: Option<[Outcome; 2]>) -> JoinHandle<Vec<Seen>> {
     thread::spawn(move || {
         let mut kept = Vec::new();
         while let Ok(msg) = rx.recv() {
             let Msg::Ticket(ticket) = msg else { continue };
             let req = &ticket.req;
             let seen = Seen {
+                engine: ticket.engine,
                 method: String::from_utf8_lossy(&req.method).into_owned(),
                 uri: String::from_utf8_lossy(&req.uri).into_owned(),
                 proto: String::from_utf8_lossy(req.proto).into_owned(),
@@ -170,8 +178,9 @@ fn driver(rx: Receiver<Msg>, answer: Option<Outcome>) -> JoinHandle<Vec<Seen>> {
                 abandoned: false,
             };
             match answer {
-                Some(outcome) => {
-                    let _ = ticket.reply.send(answered(outcome));
+                Some(outcomes) => {
+                    let outcome = outcomes[usize::from(ticket.engine == Engine::ModSecurity)];
+                    let _ = ticket.reply.send(answered(outcome, ticket.engine));
                     kept.push((seen, None));
                 }
                 None => kept.push((seen, Some(ticket))),
@@ -243,8 +252,7 @@ impl Rig {
         let (log, lines) = recording();
         let shared = Arc::new(Shared {
             budget,
-            inspect: Arc::new(Semaphore::new(PERMITS)),
-            routes: SharedRoutes::new(Routes::default()),
+            gates: Gates::new(PERMITS),
             log,
             ingress: Arc::new(Ingress::new(tx.clone())),
             ids: RequestIds::new().unwrap(),
@@ -265,7 +273,10 @@ impl Rig {
             shared,
         });
         let (driver, full) = match mode {
-            Mode::Answer(outcome) => (Some(driver(rx, Some(outcome))), None),
+            Mode::Answer(outcome) => (Some(driver(rx, Some([outcome, outcome]))), None),
+            Mode::Split(coraza, modsecurity) => {
+                (Some(driver(rx, Some([coraza, modsecurity]))), None)
+            }
             Mode::Hold => (Some(driver(rx, None)), None),
             Mode::Gone => (None, None),
             Mode::Full => {
@@ -293,8 +304,7 @@ impl Rig {
             Arc::try_unwrap(ctx.shared).unwrap_or_else(|_| panic!("no connection has started"));
         let Shared {
             budget,
-            inspect,
-            routes,
+            gates,
             log,
             ingress,
             ids,
@@ -308,8 +318,7 @@ impl Rig {
         change(&mut setup);
         let shared = Arc::new(Shared {
             budget,
-            inspect,
-            routes,
+            gates,
             log,
             ingress,
             ids,
@@ -351,11 +360,16 @@ impl Rig {
     }
 
     /// Waits for the connection to end and the driver to stop; checks that nothing is held any more.
-    pub(in crate::inbound) async fn finish(mut self, served: Served<()>) -> Vec<Seen> {
+    pub(in crate::inbound) async fn finish(self, served: Served<()>) -> Vec<Seen> {
         timeout(Duration::from_secs(30), served)
             .await
             .expect("the connection ended")
             .unwrap();
+        self.finish_ctx().await
+    }
+
+    /// The same for a rig whose connections have all ended.
+    async fn finish_ctx(mut self) -> Vec<Seen> {
         self.ctx.shared.ingress.close();
         drop(self.tx.take());
         // The driver stops when the last sender is gone. The streams of an HTTP/2 connection are tasks of their own
@@ -377,7 +391,10 @@ impl Rig {
             self.ctx.shared.budget.available_permits(),
             self.ctx.setup.cfg.max_buffered_bytes
         );
-        assert_eq!(self.ctx.shared.inspect.available_permits(), PERMITS);
+        for engine in ENGINES {
+            let gate = self.ctx.shared.gates.of(engine);
+            assert_eq!(gate.inspect.available_permits(), PERMITS);
+        }
         seen
     }
 }
@@ -501,6 +518,8 @@ pub(in crate::inbound) fn form_post(body_lines: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+const ALLOW: Outcome = Outcome::Verdict(Verdict::Allow);
+
 pub(in crate::inbound) const BLOCK: Outcome = Outcome::Verdict(Verdict::Block {
     phase: 2,
     rule_id: 9202,
@@ -622,11 +641,18 @@ fn the_inspection_is_told_the_client_that_a_trusted_peer_names_and_the_peer_othe
 async fn routed(mode: Mode, used_up: bool, path: &str) -> (u16, Vec<Seen>) {
     let rig = Rig::new(config(), mode).await;
     let table = Routes::new(vec![Route::new(None, "/static/").unwrap()]).unwrap();
-    rig.ctx.shared.routes.replace(table);
+    rig.ctx
+        .shared
+        .gates
+        .of(Engine::Coraza)
+        .routes
+        .replace(table);
     let permits = u32::try_from(PERMITS).unwrap();
     let held = used_up.then(|| {
         rig.ctx
             .shared
+            .gates
+            .of(Engine::Coraza)
             .inspect
             .clone()
             .try_acquire_many_owned(permits)
@@ -1683,5 +1709,105 @@ fn the_record_of_a_request_turned_away_by_country_says_whether_the_configuration
         )
         .await;
         assert_eq!(both.2, "denied by access");
+    });
+}
+
+/// Two groups at an address where nothing listens: `main`, which Coraza inspects, takes every request but those for
+/// the host `second.test`, which go to `second`, which ModSecurity inspects.
+fn two_engines() -> ForwardConfig {
+    let mut forward = ForwardConfig::of(&["127.0.0.1:2".parse().unwrap()]);
+    let mut second = forward.groups[0].clone();
+    second.name = "second".to_owned();
+    second.engine = Engine::ModSecurity;
+    forward.groups.push(second);
+    let rule = Rule::forward(Some("second.test"), None).unwrap();
+    forward.routes = Table::new(vec![(rule, RouteConfig::plain(1))]).unwrap();
+    forward
+}
+
+/// The status of the answer to a request for `/path` with the host `host`, on its own connection.
+async fn status_of(rig: &Rig, host: &str, path: &str) -> u16 {
+    let (client, task) = rig.connect().await;
+    put(
+        &client,
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await;
+    let status = parse_response(&read_all(&client).await).status;
+    drop(client);
+    timeout(Duration::from_secs(30), task)
+        .await
+        .unwrap()
+        .unwrap();
+    status
+}
+
+#[test]
+fn a_request_is_inspected_by_the_engine_of_its_group_and_by_no_other() {
+    run(async {
+        // The two engines judge alike a request: one allows and the other blocks. The same request is let through to
+        // the group of the one and stopped for the group of the other.
+        let rig = Rig::with(config(), Mode::Split(ALLOW, BLOCK), &two_engines()).await;
+        assert_eq!(status_of(&rig, "h.test", "/a").await, 502);
+        assert_eq!(status_of(&rig, "second.test", "/a").await, 403);
+        let seen = rig.finish_ctx().await;
+        let engines: Vec<_> = seen.iter().map(|seen| seen.engine).collect();
+        assert_eq!(engines, [Engine::Coraza, Engine::ModSecurity]);
+    });
+}
+
+#[test]
+fn the_routes_that_skip_the_inspection_are_those_of_the_engine_of_the_group() {
+    run(async {
+        // Every ticket is blocked. The table of ModSecurity has the route `/skip/` and the table of Coraza has none:
+        // a request under it is blocked for the group of Coraza and goes on for the group of ModSecurity.
+        let rig = Rig::with(config(), Mode::Answer(BLOCK), &two_engines()).await;
+        let table = Routes::new(vec![Route::new(None, "/skip/").unwrap()]).unwrap();
+        rig.ctx
+            .shared
+            .gates
+            .of(Engine::ModSecurity)
+            .routes
+            .replace(table);
+        assert_eq!(status_of(&rig, "h.test", "/skip/a").await, 403);
+        assert_eq!(status_of(&rig, "second.test", "/skip/a").await, 502);
+        // Nothing else is skipped: the other path is blocked for both.
+        assert_eq!(status_of(&rig, "second.test", "/other").await, 403);
+        assert_eq!(rig.finish_ctx().await.len(), 2);
+    });
+}
+
+#[test]
+fn the_inspection_permits_are_those_of_the_engine_and_the_other_engine_is_not_held_up() {
+    run(async {
+        let rig = Rig::with(config(), Mode::Answer(BLOCK), &two_engines()).await;
+        let permits = u32::try_from(PERMITS).unwrap();
+        // Every permit of ModSecurity is in use: its group is answered 503, and the group of Coraza is inspected.
+        let held = rig
+            .ctx
+            .shared
+            .gates
+            .of(Engine::ModSecurity)
+            .inspect
+            .clone()
+            .try_acquire_many_owned(permits)
+            .unwrap();
+        assert_eq!(status_of(&rig, "second.test", "/a").await, 503);
+        assert_eq!(status_of(&rig, "h.test", "/a").await, 403);
+        drop(held);
+        // And the other way round.
+        let held = rig
+            .ctx
+            .shared
+            .gates
+            .of(Engine::Coraza)
+            .inspect
+            .clone()
+            .try_acquire_many_owned(permits)
+            .unwrap();
+        assert_eq!(status_of(&rig, "h.test", "/a").await, 503);
+        assert_eq!(status_of(&rig, "second.test", "/a").await, 403);
+        drop(held);
+        assert_eq!(rig.finish_ctx().await.len(), 2);
     });
 }

@@ -3085,3 +3085,65 @@ fn an_engine_can_be_used_only_with_an_inspector_in_the_configuration() {
         PathBuf::from("/opt/tukuyomi/inspector-modsecurity")
     );
 }
+
+#[test]
+fn the_default_engine_is_coraza_or_the_engine_the_file_names_and_needs_an_inspector() {
+    let engines = |bytes: &[u8]| {
+        let loaded = parse(bytes).unwrap();
+        let default = loaded.kernel.default_engine();
+        (
+            default,
+            loaded
+                .forward
+                .groups
+                .iter()
+                .map(|g| g.engine)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let default = |name: &str| k("default_engine", name);
+    let group = |name: &str| ("/forward/upstreams/api", "engine", Value::from(name));
+    let ms = || modsecurity("/opt/tukuyomi/inspector-modsecurity");
+    // Left out, it is Coraza; and so is the engine of every group that names none.
+    assert_eq!(
+        engines(BASE.as_bytes()),
+        (Engine::Coraza, vec![Engine::Coraza, Engine::Coraza])
+    );
+    // Named, it is the engine of the groups that name none, and a group that names one keeps it.
+    assert_eq!(
+        engines(&doc(&[ms(), default("modsecurity")])),
+        (
+            Engine::ModSecurity,
+            vec![Engine::ModSecurity, Engine::ModSecurity]
+        )
+    );
+    // The groups are in the byte order of their names here: `api`, then `main`.
+    assert_eq!(
+        engines(&doc(&[ms(), default("modsecurity"), group("coraza")])),
+        (
+            Engine::ModSecurity,
+            vec![Engine::Coraza, Engine::ModSecurity]
+        )
+    );
+    assert_eq!(
+        engines(&doc(&[ms(), group("modsecurity")])),
+        (Engine::Coraza, vec![Engine::ModSecurity, Engine::Coraza])
+    );
+    pass(&[default("coraza")]);
+    // The name is the lowercase one, exactly; and the file has to have an inspector for it.
+    let bad = "kernel.default_engine is not coraza or modsecurity";
+    refuse(&[default("Coraza")], bad);
+    refuse(&[default("")], bad);
+    refuse(
+        &[default("modsecurity")],
+        "kernel.engines has no inspector for kernel.default_engine",
+    );
+    refuse(
+        &[group("modsecurity")],
+        "kernel.engines has no inspector for the engine of an upstream",
+    );
+    // A value of another type is the wrong type, `null` included.
+    let wrong = "configuration has a value of the wrong type";
+    refuse(&[k("default_engine", 1)], wrong);
+    refuse(&[k("default_engine", Value::Null)], wrong);
+}

@@ -1,9 +1,10 @@
-//! The commands that change and show the rules store: `rules import`, `rules activate`, `rules remove` and
-//! `rules list`.
+//! The commands that change and show the rules store: `rules import`, `rules activate`, `rules deactivate`,
+//! `rules remove` and `rules list`.
 //!
 //! ```text
 //! tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--engine <name>] [--accept-block] [--detect-only]
 //! tukuyomi-proxy rules activate <config> <fingerprint>
+//! tukuyomi-proxy rules deactivate <config> <engine>
 //! tukuyomi-proxy rules remove <config> <fingerprint>
 //! tukuyomi-proxy rules list <config>
 //! ```
@@ -20,17 +21,21 @@
 //! bundle has the routes of the file, a JSON array of
 //! `{"host": "<host>", "path": "<path>", "action": "bypass"}` (`host` is optional, no other key is taken): a request
 //! that a route matches is not inspected and goes on to the upstream. The routes are checked as the module `routes`
-//! says, and a running proxy takes them when it switches to the generation. `activate` chooses a generation, which
-//! a proxy that starts later
+//! says, and a running proxy takes them when it switches to the generation. `activate` chooses a generation for its
+//! engine (each engine has its own chosen generation, see `file_store`), which a proxy that starts later
 //! uses, and a running proxy that is told to switch; it is refused, before it chooses, for a generation whose engine
-//! cannot be used (the same check). `remove` deletes a generation that is not the chosen one and
-//! that no running proxy uses. `list` shows the generations.
+//! cannot be used (the same check). `deactivate` leaves an engine with no chosen generation, so that a proxy that
+//! starts later does not start the engine; it is refused while the configuration uses the engine, as the default
+//! engine or as the engine of an upstream group of the main file or of the chosen managed version, and for an engine
+//! that has none chosen. A proxy that runs keeps the engine it has started. `remove` deletes a generation that is not
+//! chosen for any engine and that no running proxy uses. `list` shows the generations.
 //!
 //! The results go to the standard output, one line each, and the first word of a line is the fingerprint: `import`
-//! says `created`, `already exists` or `recreated` after it, `activate` says `current`, `remove` says `removed`, and
+//! says `created`, `already exists` or `recreated` after it, `activate` says `current`, `deactivate` says
+//! `deactivated` (the generation that was chosen), `remove` says `removed`, and
 //! `list` gives the time the generation was made (seconds since the epoch), its mode (`block` or `detect`, and
 //! `unknown` when its manifest cannot be read), its engine (`coraza` or `modsecurity`, and `unknown` likewise),
-//! `routes` and their number for a generation that has routes, and `current` for the chosen one.
+//! `routes` and their number for a generation that has routes, and `current` for the one chosen for its engine.
 //! Everything else goes to the
 //! standard error, a line each, and starts with the name of the command. Whatever came from outside (an entry of a
 //! directory, the line an inspector left behind) is written with every byte outside 0x20 to 0x7e as `\xNN`.
@@ -58,11 +63,11 @@ use crate::config::{self, MainFile};
 use crate::log::escaped;
 use crate::rules::bundle::{Fingerprint, Mode};
 use crate::rules::collect::{self, CollectError, Inputs};
-use crate::rules::store::{self, Committed, RuleStore, Staged};
+use crate::rules::store::{self, Committed, ENGINES, RuleStore, Staged, StoreError};
 use crate::rules::trial::{self, Accepted, Failed, Finish, Limits};
 use crate::run::host;
 
-const USAGE: &str = "usage: tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--engine <name>] [--accept-block] [--detect-only]\n       tukuyomi-proxy rules activate <config> <fingerprint>\n       tukuyomi-proxy rules remove <config> <fingerprint>\n       tukuyomi-proxy rules list <config>";
+const USAGE: &str = "usage: tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--engine <name>] [--accept-block] [--detect-only]\n       tukuyomi-proxy rules activate <config> <fingerprint>\n       tukuyomi-proxy rules deactivate <config> <engine>\n       tukuyomi-proxy rules remove <config> <fingerprint>\n       tukuyomi-proxy rules list <config>";
 
 /// How a command ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +88,10 @@ enum Command {
     Activate {
         config: PathBuf,
         generation: Fingerprint,
+    },
+    Deactivate {
+        config: PathBuf,
+        engine: Engine,
     },
     Remove {
         config: PathBuf,
@@ -125,6 +134,7 @@ pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> Exit 
             accept_block,
         }) => import(&config, &inputs, accept_block, &mut term),
         Ok(Command::Activate { config, generation }) => activate(&config, generation, &mut term),
+        Ok(Command::Deactivate { config, engine }) => deactivate(&config, engine, &mut term),
         Ok(Command::Remove { config, generation }) => remove(&config, generation, &mut term),
         Ok(Command::List { config }) => list(&config, &mut term),
     }
@@ -132,7 +142,12 @@ pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> Exit 
 
 fn parse(args: &[OsString]) -> Result<Command, &'static str> {
     let (name, rest) = args.split_first().ok_or("a command is missing")?;
-    if name != "import" && name != "activate" && name != "remove" && name != "list" {
+    if name != "import"
+        && name != "activate"
+        && name != "deactivate"
+        && name != "remove"
+        && name != "list"
+    {
         return Err("unknown command");
     }
     let (config, rest) = rest
@@ -151,6 +166,17 @@ fn parse(args: &[OsString]) -> Result<Command, &'static str> {
                 generation: fingerprint(generation)?,
             }),
             _ => Err("activate takes one fingerprint"),
+        }
+    } else if name == "deactivate" {
+        match rest {
+            [engine] => Ok(Command::Deactivate {
+                config,
+                engine: engine
+                    .to_str()
+                    .and_then(Engine::parse)
+                    .ok_or("the engine is not the name of an engine (coraza or modsecurity)")?,
+            }),
+            _ => Err("deactivate takes one engine"),
         }
     } else if name == "remove" {
         match rest {
@@ -492,6 +518,49 @@ fn activate(config: &Path, generation: Fingerprint, term: &mut Terminal) -> Exit
     }
 }
 
+fn deactivate(config: &Path, engine: Engine, term: &mut Terminal) -> Exit {
+    const NAME: &str = "rules deactivate";
+    if let Err(exit) = not_root(NAME, term) {
+        return exit;
+    }
+    let (_, mut store) = match open_store(NAME, config, term) {
+        Ok(opened) => opened,
+        Err(exit) => return exit,
+    };
+    // The whole configuration, the chosen managed version included, for the engines that its groups have.
+    let loaded = match config::load(config) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            term.note(&format!("{NAME}: configuration refused: {}", e.0));
+            return Exit::Usage;
+        }
+    };
+    if loaded.kernel.default_engine() == engine
+        || loaded
+            .forward
+            .groups
+            .iter()
+            .any(|group| group.engine == engine)
+    {
+        term.note(&format!("{NAME}: the configuration uses the engine"));
+        return Exit::Failed;
+    }
+    match store.deactivate(engine) {
+        Ok(Some(generation)) => {
+            term.result(&format!("{} deactivated", generation.hex()));
+            Exit::Done
+        }
+        Ok(None) => {
+            term.note(&format!("{NAME}: no generation is chosen"));
+            Exit::Failed
+        }
+        Err(e) => {
+            term.note(&format!("{NAME}: {}", e.0));
+            Exit::Failed
+        }
+    }
+}
+
 fn remove(config: &Path, generation: Fingerprint, term: &mut Terminal) -> Exit {
     const NAME: &str = "rules remove";
     if let Err(exit) = not_root(NAME, term) {
@@ -529,8 +598,17 @@ fn list(config: &Path, term: &mut Terminal) -> Exit {
             return Exit::Failed;
         }
     };
-    let current = store.current();
-    let chosen = current.as_ref().ok().copied().flatten();
+    // The generation chosen for each engine. A record that cannot be told is a fault, noted once.
+    let mut chosen = Vec::new();
+    let mut faults: Vec<StoreError> = Vec::new();
+    for engine in ENGINES {
+        match store.current(engine) {
+            Ok(Some(generation)) => chosen.push(generation),
+            Ok(None) => {}
+            Err(e) if faults.contains(&e) => {}
+            Err(e) => faults.push(e),
+        }
+    }
     let mut unreadable = Vec::new();
     for generation in &generations {
         let (mode, engine, routes) = match store.manifest(generation.fingerprint) {
@@ -549,7 +627,7 @@ fn list(config: &Path, term: &mut Terminal) -> Exit {
         } else {
             format!(" routes {routes}")
         };
-        let mark = if Some(generation.fingerprint) == chosen {
+        let mark = if chosen.contains(&generation.fingerprint) {
             " current"
         } else {
             ""
@@ -560,8 +638,8 @@ fn list(config: &Path, term: &mut Terminal) -> Exit {
             generation.made
         ));
     }
-    // The list is complete either way; a generation whose manifest cannot be read, or a current generation that a
-    // start could not use, ends the command with 1.
+    // The list is complete either way; a generation whose manifest cannot be read, or a choice that cannot be told,
+    // ends the command with 1.
     for (fingerprint, e) in &unreadable {
         term.note(&format!("{NAME}: {}: {}", fingerprint.hex(), e.0));
     }
@@ -570,18 +648,9 @@ fn list(config: &Path, term: &mut Terminal) -> Exit {
     } else {
         Exit::Failed
     };
-    match current {
-        Err(e) => {
-            term.note(&format!("{NAME}: {}", e.0));
-            exit = Exit::Failed;
-        }
-        Ok(Some(chosen)) if !generations.iter().any(|g| g.fingerprint == chosen) => {
-            term.note(&format!(
-                "{NAME}: the current generation is not in the store"
-            ));
-            exit = Exit::Failed;
-        }
-        Ok(_) => {}
+    for e in &faults {
+        term.note(&format!("{NAME}: {}", e.0));
+        exit = Exit::Failed;
     }
     exit
 }

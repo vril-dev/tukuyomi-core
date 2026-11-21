@@ -1,13 +1,15 @@
 //! Where rule generations are kept.
 //!
-//! A generation is one rule bundle under the name of its fingerprint. The proxy reads the chosen generation
-//! (`current`, `generation_dir`) when it starts and again when it is told to switch, and it holds the generation it
-//! uses (`hold`) for as long as it uses it. The commands change the store in this order: `stage` writes a bundle
+//! A generation is one rule bundle under the name of its fingerprint, and it is for one engine, which its manifest
+//! says. Each engine has its own chosen generation (`current`). The proxy reads the chosen generations
+//! (`current`, `generation_dir`) when it starts and again when it is told to switch, and it holds the generations it
+//! uses (`hold`) for as long as it uses them. The commands change the store in this order: `stage` writes a bundle
 //! where the inspector can read it and takes the lock of the store, the caller tries the bundle, then `commit`
 //! makes it a generation or `discard` throws it away, and either gives the lock back. `activate` chooses a
-//! generation, `activate_if_current` does so only if the chosen generation is the one the caller saw, `remove`
-//! deletes one that is neither chosen nor held, `list`, `verify`, `engine`, `mode`, `routes` and `manifest` only
-//! read.
+//! generation for its engine, `activate_if_current` does so only if the generation chosen for that engine is the one
+//! the caller saw (or none, which the caller saw), `deactivate` leaves an engine with none chosen, `remove` deletes
+//! one that is not chosen for any engine and not held, `list`, `verify`, `engine`, `mode`, `routes` and `manifest`
+//! only read.
 
 use std::any::Any;
 use std::path::PathBuf;
@@ -26,6 +28,19 @@ pub struct StoreError(pub &'static str);
 /// Why `activate_if_current` refuses a generation that is not the one the caller saw as chosen.
 pub const NOT_EXPECTED: StoreError =
     StoreError("the chosen generation is not the one that was expected");
+
+/// Why a configuration is refused whose upstream group has an engine for which no generation is chosen (see
+/// `unchosen`).
+pub const UNCHOSEN: &str = "no generation is chosen for the engine of an upstream";
+
+/// The engines, in the order of their names.
+pub const ENGINES: [Engine; 2] = [Engine::Coraza, Engine::ModSecurity];
+
+/// The engines with `first` first and the others after it in the order of their names: the order in which the start
+/// and SIGUSR1 take them.
+pub fn engines_from(first: Engine) -> impl Iterator<Item = Engine> {
+    std::iter::once(first).chain(ENGINES.into_iter().filter(move |&engine| engine != first))
+}
 
 /// A bundle written for a trial, not yet a generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,8 +86,8 @@ impl Hold {
 
 /// Where rule generations are kept. `FileStore` is the only implementation; the configuration's `kind` picks it.
 pub trait RuleStore {
-    /// The chosen generation; `Ok(None)` when none was chosen yet.
-    fn current(&self) -> Result<Option<Fingerprint>, StoreError>;
+    /// The generation chosen for `engine`; `Ok(None)` when none was chosen yet.
+    fn current(&self, engine: Engine) -> Result<Option<Fingerprint>, StoreError>;
     /// The directory of a generation for the inspector: absolute and clean, checked to be a real directory.
     fn generation_dir(&self, generation: Fingerprint) -> Result<PathBuf, StoreError>;
     /// Writes the bundle for a trial and takes the lock of the store, which is kept until `commit` or `discard`.
@@ -83,16 +98,20 @@ pub trait RuleStore {
     fn commit(&mut self) -> Result<Committed, StoreError>;
     /// Throws the staged bundle away, if there is one, and gives the lock back.
     fn discard(&mut self) -> Result<(), StoreError>;
-    /// Chooses a generation, after `verify`. A proxy that runs does not notice; one that starts later uses it.
+    /// Chooses a generation for its engine, after `verify`. A proxy that runs does not notice; one that starts later
+    /// uses it.
     fn activate(&mut self, generation: Fingerprint) -> Result<(), StoreError>;
-    /// `activate`, but only if the chosen generation is `expect`: it is read and the generation is chosen under the
-    /// same lock, so a choice that another process made in between is not overwritten. Another choice, or none, is
-    /// refused with `NOT_EXPECTED`.
+    /// `activate`, but only if the generation chosen for the engine of `generation` is `expect`, where `None` is no
+    /// choice: it is read and the generation is chosen under the same lock, so a choice that another process made in
+    /// between is not overwritten. Another choice, or one where none was expected, is refused with `NOT_EXPECTED`.
     fn activate_if_current(
         &mut self,
-        expect: Fingerprint,
+        expect: Option<Fingerprint>,
         generation: Fingerprint,
     ) -> Result<(), StoreError>;
+    /// Leaves `engine` with no chosen generation, and gives the one that was chosen for it, `None` if there was none.
+    /// A proxy that runs does not notice; one that starts later does not start the engine for want of a generation.
+    fn deactivate(&mut self, engine: Engine) -> Result<Option<Fingerprint>, StoreError>;
     /// The generations of the store, the oldest first. The lock is not needed.
     fn list(&self) -> Result<Vec<Generation>, StoreError>;
     /// Checks that the manifest of a generation is as its name says and that every file is as the manifest says.
@@ -114,8 +133,21 @@ pub trait RuleStore {
     /// that is being removed is refused. The generation itself is not looked at: the caller asks `generation_dir`
     /// after the hold is taken, which is how it learns that a removal has finished.
     fn hold(&self, generation: Fingerprint) -> Result<Hold, StoreError>;
-    /// Removes a generation that is neither the chosen one nor held. Takes the lock of the store.
+    /// Removes a generation that is not chosen for any engine and not held. Takes the lock of the store.
     fn remove(&mut self, generation: Fingerprint) -> Result<(), StoreError>;
+}
+
+/// The place, among `engines`, of the first one that has no generation chosen in `store`.
+pub fn unchosen(
+    store: &dyn RuleStore,
+    engines: impl IntoIterator<Item = Engine>,
+) -> Result<Option<usize>, StoreError> {
+    for (at, engine) in engines.into_iter().enumerate() {
+        if store.current(engine)?.is_none() {
+            return Ok(Some(at));
+        }
+    }
+    Ok(None)
 }
 
 /// Opens the store that the configuration names.

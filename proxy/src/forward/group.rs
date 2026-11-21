@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::time::Instant;
+use tukuyomi_kernel::Engine;
 
 use crate::config::{
     AdminWay, ForwardConfig, GroupConfig, ProxyConfig, RouteConfig, RouteKeep, ServerConfig, Stream,
@@ -260,9 +261,11 @@ impl Server {
     }
 }
 
-/// A group: its name, its servers and the state of the choice among them.
+/// A group: its name, the engine that inspects the requests that go to it, its servers and the state of the choice
+/// among them.
 pub struct Group {
     name: Arc<str>,
+    engine: Engine,
     servers: Vec<Server>,
     turn: Turn,
     born: Instant,
@@ -283,6 +286,7 @@ impl Admin {
                 backup: false,
             }],
             tls: None,
+            engine: way.engine,
         };
         Admin {
             host: way.host.clone(),
@@ -298,6 +302,7 @@ impl Group {
         let pool = Pool::new(proxy);
         Group {
             name: Arc::from(cfg.name.as_str()),
+            engine: cfg.engine,
             servers: cfg
                 .servers
                 .iter()
@@ -315,6 +320,11 @@ impl Group {
 
     pub fn name(&self) -> &Arc<str> {
         &self.name
+    }
+
+    /// The engine that inspects the requests that go to the group.
+    pub fn engine(&self) -> Engine {
+        self.engine
     }
 
     /// The number of servers: a request tries each of them once at most.

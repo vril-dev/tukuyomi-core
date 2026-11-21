@@ -313,9 +313,14 @@ impl Conn {
     async fn exchange(&self, parts: Parts, body: Incoming) -> Result<Answered, Stop> {
         let route = self.route()?;
         let cfg = &self.ctx.setup.cfg;
+        // The engine is the one of the group that the request goes to, taken once: the routes that skip the
+        // inspection and the ticket are those of this engine, and of no other.
+        let engine = route.group.engine();
         let bypass = self
             .ctx
             .shared
+            .gates
+            .of(engine)
             .routes
             .current()
             .matches(self.head.host(), self.head.target());
@@ -376,7 +381,7 @@ impl Conn {
         let passed = if bypass {
             self.bypassed()
         } else {
-            self.ask(headers, field_bytes, &body, cut)
+            self.ask(engine, headers, field_bytes, &body, cut)
                 .await
                 .inspect_err(|_| self.inspection_stopped())?
         };

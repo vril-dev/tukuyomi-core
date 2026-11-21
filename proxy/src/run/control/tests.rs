@@ -8,6 +8,7 @@ use tukuyomi_kernel::Failure;
 use super::*;
 use crate::config::{self, ForwardConfig, Keep, PolicyConfig};
 use crate::inbound::transport::tls::Tls;
+use crate::inspect::driver::State;
 use crate::log::recording;
 use crate::managed::store::tests::Fixture;
 use crate::rules::bundle::Mode;
@@ -50,14 +51,34 @@ fn fingerprint(c: u8) -> Fingerprint {
     Fingerprint::from_hex(&[c; 64]).unwrap()
 }
 
-fn state(phase: Phase) -> State {
+fn one(engine: Engine, generation: u8, mode: Mode, phase: Phase) -> State {
     State {
         phase,
         restarts: 0,
-        generation: fingerprint(b'a'),
-        engine: Engine::Coraza,
-        mode: Mode::Block,
+        generation: fingerprint(generation),
+        engine,
+        mode,
     }
+}
+
+/// The states of a proxy that runs the engine Coraza only.
+fn state(phase: Phase) -> States {
+    let mut states = States::none();
+    states.set(
+        Engine::Coraza,
+        Some(one(Engine::Coraza, b'a', Mode::Block, phase)),
+    );
+    states
+}
+
+/// The states of a proxy that runs both engines.
+fn both(coraza: Phase, modsecurity: Phase) -> States {
+    let mut states = state(coraza);
+    states.set(
+        Engine::ModSecurity,
+        Some(one(Engine::ModSecurity, b'd', Mode::Detect, modsecurity)),
+    );
+    states
 }
 
 /// The setup in force of a main file with `managed`, made with the version `managed`, whose names may take
@@ -89,7 +110,7 @@ fn serving(
     switch_wait: Duration,
     setup: Setup,
     log: &Log,
-) -> (Control, watch::Sender<State>) {
+) -> (Control, watch::Sender<States>) {
     let bound = bind(path).unwrap();
     let (changes, state) = watch::channel(state(Phase::Ready));
     let readiness = Arc::new(Readiness::new());
@@ -98,6 +119,7 @@ fn serving(
         serve(
             bound,
             state,
+            Engine::Coraza,
             readiness,
             switch_wait,
             SharedSetup::new(setup),
@@ -138,8 +160,13 @@ fn figures() -> Figures {
 }
 
 fn status_line(phase: &str, switching: bool, reloading: bool, ready: bool) -> String {
+    status_with(phase, switching, reloading, ready, "")
+}
+
+/// The line of a status whose `engines` has the entries `more` after the one of Coraza (each starts with a comma).
+fn status_with(phase: &str, switching: bool, reloading: bool, ready: bool, more: &str) -> String {
     format!(
-        "{{\"generation\":\"{}\",\"mode\":\"block\",\"engine\":\"coraza\",\"phase\":\"{phase}\",\"switching\":{switching},\"reloading\":{reloading},\"ready\":{ready},\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{}\",\"managed\":null,\"resolve_timeout_ms\":30000,\"config_reloads\":{{\"replaced\":5,\"refused\":1}}}}\n",
+        "{{\"generation\":\"{0}\",\"mode\":\"block\",\"engine\":\"coraza\",\"phase\":\"{phase}\",\"switching\":{switching},\"reloading\":{reloading},\"ready\":{ready},\"uptime_ms\":1234,\"requests\":50,\"blocked\":3,\"policy_refused\":2,\"upstream_failures\":4,\"config\":\"{1}\",\"managed\":null,\"resolve_timeout_ms\":30000,\"config_reloads\":{{\"replaced\":5,\"refused\":1}},\"engines\":[{{\"engine\":\"coraza\",\"generation\":\"{0}\",\"mode\":\"block\",\"phase\":\"{phase}\"}}{more}]}}\n",
         "a".repeat(64),
         "ab".repeat(32)
     )
@@ -149,6 +176,15 @@ fn switch_request(c: u8) -> Vec<u8> {
     format!(
         "{{\"op\":\"switch\",\"expect\":\"{}\"}}\n",
         char::from(c).to_string().repeat(64)
+    )
+    .into_bytes()
+}
+
+/// A switch order for the engine `engine`.
+fn switch_on(engine: &str) -> Vec<u8> {
+    format!(
+        "{{\"op\":\"switch\",\"engine\":\"{engine}\",\"expect\":\"{}\"}}\n",
+        "b".repeat(64)
     )
     .into_bytes()
 }
@@ -251,8 +287,9 @@ fn a_status_and_a_switch_go_to_the_main_loop_and_its_answers_to_the_client() {
             panic!("no switch order");
         };
         assert_eq!(order.expect(), fingerprint(b'b'));
+        assert_eq!(order.engine(), Engine::Coraza);
         control.hold(order);
-        control.switch_ended(true, fingerprint(b'b'), &log);
+        control.switch_ended(Engine::Coraza, true, Some(fingerprint(b'b')), &log);
         assert_eq!(
             client.await.unwrap(),
             format!(
@@ -265,7 +302,7 @@ fn a_status_and_a_switch_go_to_the_main_loop_and_its_answers_to_the_client() {
             panic!("no switch order");
         };
         control.hold(order);
-        control.switch_ended(false, fingerprint(b'b'), &log);
+        control.switch_ended(Engine::Coraza, false, Some(fingerprint(b'b')), &log);
         assert_eq!(
             client.await.unwrap(),
             format!(
@@ -280,7 +317,7 @@ fn a_status_and_a_switch_go_to_the_main_loop_and_its_answers_to_the_client() {
         order.finish(
             Outcome::Refused,
             Some("current changed"),
-            fingerprint(b'a'),
+            Some(fingerprint(b'a')),
             &log,
         );
         assert_eq!(
@@ -304,6 +341,89 @@ fn a_status_and_a_switch_go_to_the_main_loop_and_its_answers_to_the_client() {
 }
 
 #[test]
+fn a_status_names_every_engine_that_runs_and_a_switch_is_for_one_engine_and_answered_by_its_end_only()
+ {
+    runtime().block_on(async {
+        let dir = scratch();
+        let path = dir.path().join("c.sock");
+        let (log, lines) = recording();
+        let (mut control, changes) = serving(&path, Duration::from_millis(200), unused(), &log);
+
+        // Two engines run: the fields of an older status are those of the default engine, `engines` has both, and the
+        // proxy is not ready while the kernel of one of them is not.
+        changes.send_replace(both(Phase::Ready, Phase::Starting));
+        let client = tokio::spawn(ask(path.clone(), b"{\"op\":\"status\"}\n".to_vec()));
+        let Some(Order::Status(reply)) = control.orders.recv().await else {
+            panic!("no status order");
+        };
+        reply.send(control.status(false, false, figures())).unwrap();
+        let more = format!(
+            ",{{\"engine\":\"modsecurity\",\"generation\":\"{}\",\"mode\":\"detect\",\"phase\":\"starting\"}}",
+            "d".repeat(64)
+        );
+        assert_eq!(
+            client.await.unwrap(),
+            status_with("ready", false, false, false, &more)
+        );
+        changes.send_replace(both(Phase::Ready, Phase::Ready));
+        let client = tokio::spawn(ask(path.clone(), b"{\"op\":\"status\"}\n".to_vec()));
+        let Some(Order::Status(reply)) = control.orders.recv().await else {
+            panic!("no status order");
+        };
+        reply.send(control.status(false, false, figures())).unwrap();
+        let more = more.replace("starting", "ready");
+        assert_eq!(
+            client.await.unwrap(),
+            status_with("ready", false, false, true, &more)
+        );
+
+        // A switch that names the engine is for it; the end of the switch of another engine does not answer it.
+        let client = tokio::spawn(ask(path.clone(), switch_on("modsecurity")));
+        let Some(Order::Switch(order)) = control.orders.recv().await else {
+            panic!("no switch order");
+        };
+        assert_eq!(order.engine(), Engine::ModSecurity);
+        control.hold(order);
+        control.switch_ended(Engine::Coraza, true, Some(fingerprint(b'a')), &log);
+        control.switch_ended(Engine::ModSecurity, true, Some(fingerprint(b'd')), &log);
+        assert_eq!(
+            client.await.unwrap(),
+            format!(
+                "{{\"result\":\"switched\",\"generation\":\"{}\"}}\n",
+                "d".repeat(64)
+            )
+        );
+        assert_eq!(
+            lines.texts(),
+            [format!(
+                "control: switch expect {}: switched, serving {}",
+                "b".repeat(64),
+                "d".repeat(64)
+            )]
+        );
+
+        // An engine that does not run has no generation that serves: a busy answer says `null`.
+        changes.send_replace(state(Phase::Ready));
+        let client = tokio::spawn(ask(path.clone(), switch_on("modsecurity")));
+        let Some(Order::Switch(_order)) = control.orders.recv().await else {
+            panic!("no switch order");
+        };
+        assert_eq!(
+            client.await.unwrap(),
+            "{\"result\":\"busy\",\"reason\":\"switch under way\",\"generation\":null}\n"
+        );
+        // A switch that names no engine is for the default engine.
+        let client = tokio::spawn(ask(path.clone(), switch_request(b'b')));
+        let Some(Order::Switch(order)) = control.orders.recv().await else {
+            panic!("no switch order");
+        };
+        assert_eq!(order.engine(), Engine::Coraza);
+        order.finish(Outcome::Unchanged, Some("already serving"), None, &log);
+        client.await.unwrap();
+    });
+}
+
+#[test]
 fn a_line_that_is_not_a_request_is_answered_with_a_word_and_never_reaches_the_main_loop() {
     runtime().block_on(async {
         let dir = scratch();
@@ -322,7 +442,7 @@ fn a_line_that_is_not_a_request_is_answered_with_a_word_and_never_reaches_the_ma
         );
         let mut past_the_limit = vec![b' '; LINE_MAX];
         past_the_limit.push(b'\n');
-        let cases: [(Vec<u8>, &str); 15] = [
+        let cases: [(Vec<u8>, &str); 18] = [
             (b"not json\n".to_vec(), "malformed request"),
             (b"{\"op\":\"stop\"}\n".to_vec(), "unknown op"),
             (
@@ -339,6 +459,13 @@ fn a_line_that_is_not_a_request_is_answered_with_a_word_and_never_reaches_the_ma
                 "malformed request",
             ),
             (upper.into_bytes(), "bad expect"),
+            // An engine is `coraza` or `modsecurity` exactly, and only a switch names one.
+            (switch_on("Coraza"), "bad engine"),
+            (switch_on(""), "bad engine"),
+            (
+                b"{\"op\":\"status\",\"engine\":\"coraza\"}\n".to_vec(),
+                "malformed request",
+            ),
             (
                 b"{\"op\":\"switch\",\"expect\":\"abc\"}\n".to_vec(),
                 "bad expect",

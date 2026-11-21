@@ -1,9 +1,9 @@
 //! The engine ModSecurity in real processes: the configuration names the built inspector of that engine in
-//! `kernel.engines`, and the rules store holds a generation of that engine. The generation of a test is made from the
-//! test rules with a manifest of version 4 (`engines::add_generation`), or by `rules import --engine modsecurity`,
-//! which tries it with the real inspector. The tests show that the engine can be chosen, started, blocking or only
-//! detecting, switched to and from Coraza, and imported. The last one is the acceptance run of the engine with the
-//! Core Rule Set, which needs `TUKUYOMI_TEST_CRS`.
+//! `kernel.engines`, a group of the configuration names that engine, and the rules store holds a generation of it. The
+//! generation of a test is made from the test rules with a manifest of version 4 (`engines::add_generation`), or by
+//! `rules import --engine modsecurity`, which tries it with the real inspector. The tests show that the engine can be
+//! chosen, started, blocking or only detecting, switched with SIGUSR1 one engine after the other, and imported. The
+//! last one is the acceptance run of the engine with the Core Rule Set, which needs `TUKUYOMI_TEST_CRS`.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -12,21 +12,29 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::config_check::config_check;
-use crate::engines::{add_generation, choose};
+use crate::engines::{add_generation, choose, two_engines};
 use crate::rules::rules;
 use crate::support::*;
+use crate::upstreams::get_for;
 
-/// The built inspector of ModSecurity is named in the configuration of the test root `root`, and a generation of that
-/// engine is added to the store, beside the one of the test. Returns the name of the generation.
+/// The built inspector of ModSecurity is named in the configuration of the test root `root`, its one group uses that
+/// engine, and a generation of that engine is added to the store, beside the one of the test. Returns the name of the
+/// generation.
 fn add_modsecurity(root: &Path) -> String {
     name_modsecurity_inspector(root);
+    use_modsecurity(root, "main");
     add_generation(root)
 }
 
 /// Imports the rules `args` for the engine ModSecurity, chooses the generation that the import makes, and returns its
 /// name.
 fn import_and_choose(root: &Path, args: &[&OsStr]) -> String {
-    let mut all = vec![OsStr::new("--engine"), OsStr::new("modsecurity")];
+    import_and_choose_for(root, "modsecurity", args)
+}
+
+/// The same for the engine `engine`.
+fn import_and_choose_for(root: &Path, engine: &str, args: &[&OsStr]) -> String {
+    let mut all = vec![OsStr::new("--engine"), OsStr::new(engine)];
     all.extend_from_slice(args);
     let imported = rules(root, "import", &all);
     assert_eq!(imported.code, Some(0), "{}", imported.err);
@@ -50,7 +58,7 @@ fn from_engine(record: &Value, engine: &str) -> bool {
 fn a_chosen_generation_of_modsecurity_passes_config_check_and_the_proxy_blocks_with_it() {
     let idle = Idle::new("modsec_check", &Knobs::quick(), |root| {
         let name = add_modsecurity(root);
-        choose(root, &name);
+        choose(root, "modsecurity", &name);
     });
     let ran = config_check(&idle);
     assert_eq!(ran.code, Some(0), "{}", ran.err);
@@ -63,7 +71,7 @@ fn a_chosen_generation_of_modsecurity_passes_config_check_and_the_proxy_blocks_w
 
     let proxy = Proxy::start_with("modsec_block", Knobs::quick(), |root| {
         let name = add_modsecurity(root);
-        choose(root, &name);
+        choose(root, "modsecurity", &name);
     });
     let lines = proxy.records.lines();
     for line in ["start: rules engine modsecurity", "start: rules mode block"] {
@@ -87,56 +95,77 @@ fn a_chosen_generation_of_modsecurity_passes_config_check_and_the_proxy_blocks_w
     proxy.finish(1);
 }
 
-/// Chooses the generation `to`, tells the proxy to switch to it from `from`, and waits until the inspector of `engine`
-/// runs and the one of `from` is retired: a proxy ignores the signal while a switch is going on.
-fn switch_to(proxy: &mut Proxy, from: &str, to: &str, engine: &str) {
-    let root = proxy.root().to_path_buf();
-    let chosen = rules(&root, "activate", &[OsStr::new(to)]);
-    assert_eq!(chosen.code, Some(0), "{}", chosen.err);
-    let before = proxy.inspector();
-    proxy.signal("USR1");
-    let switched = format!("reload: generation {to} is ready, switched");
-    proxy
-        .records
-        .wait_lines("the switch", 1, |l| l == switched.as_str());
-    proxy.wait_inspector(Some(before));
-    let line = format!("reload: rules engine {engine}");
-    proxy
-        .records
-        .wait_lines("the engine of the switch", 1, |l| l == line.as_str());
-    let retired = format!("reload: generation {from} retired, clean true");
-    proxy
-        .records
-        .wait_lines("the old generation to retire", 1, |l| l == retired.as_str());
-}
-
 #[test]
 #[ignore = "needs a built inspector"]
-fn the_proxy_switches_from_coraza_to_modsecurity_and_back_and_the_records_name_the_engine() {
-    let mut other = String::new();
-    let mut proxy = Proxy::start_with("modsec_switch", Knobs::quick(), |root| {
-        other = add_modsecurity(root);
+fn sigusr1_switches_the_engines_one_after_the_other_and_each_group_follows_the_generation_of_its_engine()
+ {
+    let knobs = Knobs {
+        upstreams: 2,
+        forward: two_engines,
+        ..Knobs::quick()
+    };
+    let proxy = Proxy::start_with("modsec_switch", knobs, |root| {
+        name_modsecurity_inspector(root);
+        let name = add_generation(root);
+        choose(root, "modsecurity", &name);
     });
-    // The store chooses the generation of Coraza.
-    assert_empty_answer(&exchange(proxy.port, &get("/block-probe/x")), 403);
-    proxy.records.conn("the record of Coraza", |l| {
-        blocked_by(l, 9201) && from_engine(l, "coraza")
-    });
+    // Both engines have a generation that blocks.
+    for (host, engine) in [
+        ("example.test", "coraza"),
+        ("m.example.test", "modsecurity"),
+    ] {
+        assert_empty_answer(&exchange(proxy.port, &get_for(host, "/block-probe/x")), 403);
+        proxy.records.conn(&format!("the record of {engine}"), |l| {
+            blocked_by(l, 9201) && from_engine(l, engine)
+        });
+    }
 
-    // The same rules, in the generation of ModSecurity: the switch replaces the inspector, and the record says so.
-    switch_to(&mut proxy, &generation(), &other, "modsecurity");
-    assert_empty_answer(&exchange(proxy.port, &get("/block-probe/x")), 403);
-    proxy.records.conn("the record of ModSecurity", |l| {
-        blocked_by(l, 9201) && from_engine(l, "modsecurity")
-    });
+    // The store chooses a generation that only detects for each engine, and SIGUSR1 switches them: the default engine
+    // first, and the other when the switch of the first has ended.
+    let root = proxy.root().to_path_buf();
+    let conf = rules_file();
+    let args = [
+        OsStr::new("--rules"),
+        conf.as_os_str(),
+        OsStr::new("--detect-only"),
+    ];
+    let coraza = import_and_choose_for(&root, "coraza", &args);
+    let modsecurity = import_and_choose_for(&root, "modsecurity", &args);
+    proxy.signal("USR1");
+    for name in [&coraza, &modsecurity] {
+        let switched = format!("reload: generation {name} is ready, switched");
+        proxy
+            .records
+            .wait_lines("the switch", 1, |l| l == switched.as_str());
+    }
+    let lines = proxy.records.lines();
+    let at = |line: String| {
+        lines
+            .iter()
+            .position(|l| *l == line)
+            .unwrap_or_else(|| panic!("no {line:?} in {lines:#?}"))
+    };
+    assert!(
+        at(format!("reload: generation {coraza} is ready, switched"))
+            < at(format!("reload: starting generation {modsecurity}")),
+        "records: {lines:#?}"
+    );
 
-    // The way back is the same switch.
-    switch_to(&mut proxy, &other, &generation(), "coraza");
-    assert_empty_answer(&exchange(proxy.port, &get("/block-probe/x")), 403);
-    proxy.records.conns("the records of Coraza", 2, |l| {
-        blocked_by(l, 9201) && from_engine(l, "coraza")
-    });
-    proxy.finish(0);
+    // Each group is now judged by the generation of its engine, which only detects.
+    for (host, engine, generation) in [
+        ("example.test", "coraza", &coraza),
+        ("m.example.test", "modsecurity", &modsecurity),
+    ] {
+        let reply = exchange(proxy.port, &get_for(host, "/block-probe/x"));
+        assert_eq!(reply.status(), 200, "answer: {:?}", reply.text());
+        let record = proxy
+            .records
+            .conn(&format!("the detection record of {engine}"), |l| {
+                is_answer(l, "forwarded", 200, "detected by a rule") && from_engine(l, engine)
+            });
+        assert_eq!(record["generation"], generation[..16], "{record}");
+    }
+    proxy.finish(1);
 }
 
 #[test]
@@ -146,6 +175,7 @@ fn a_detect_only_generation_of_modsecurity_lets_a_matched_request_through_and_th
     let mut detect = String::new();
     let proxy = Proxy::start_with("modsec_detect", Knobs::quick(), |root| {
         name_modsecurity_inspector(root);
+        use_modsecurity(root, "main");
         let conf = rules_file();
         detect = import_and_choose(
             root,
@@ -281,6 +311,7 @@ fn the_core_rule_set_imported_for_modsecurity_forwards_the_requests_of_the_trial
     let mut crs = String::new();
     let proxy = Proxy::start_with("modsec_crs", Knobs::quick(), |root| {
         name_modsecurity_inspector(root);
+        use_modsecurity(root, "main");
         let dir = crs_dir();
         crs = import_and_choose(root, &[OsStr::new("--crs"), dir.as_os_str()]);
     });

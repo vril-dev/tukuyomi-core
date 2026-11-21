@@ -82,6 +82,7 @@ use std::time::Duration;
 
 use http::{Method, StatusCode};
 use serde_json::json;
+use tukuyomi_kernel::Engine;
 
 use self::control::Control;
 use self::import::{Inspector, Trial};
@@ -231,6 +232,9 @@ pub struct Config<'a> {
     pub crs_dir: Option<&'a Path>,
     pub records: Option<&'a Records>,
     pub waits: Waits,
+    /// The engine that inspects what names none (`kernel.default_engine`): the one whose chosen generation `status`
+    /// shows.
+    pub default_engine: Engine,
 }
 
 /// Who asked, for the audit log.
@@ -284,6 +288,7 @@ pub struct Waf {
     crs_dir: Option<PathBuf>,
     records: Option<Records>,
     waits: Waits,
+    default_engine: Engine,
     store: Arc<dyn AdminStore>,
     audit: Arc<AuditLog>,
     trial: Box<dyn Trial>,
@@ -307,6 +312,7 @@ impl Waf {
             crs_dir: config.crs_dir.map(Path::to_path_buf),
             records: config.records.cloned(),
             waits: config.waits,
+            default_engine: config.default_engine,
             store,
             audit,
             trial,
@@ -334,6 +340,7 @@ impl Waf {
             crs_dir: admin.crs_dir.as_deref(),
             records: loaded.records.as_ref(),
             waits,
+            default_engine: loaded.kernel.default_engine(),
         };
         let trial = Box::new(Inspector::new(loaded.kernel.clone(), waits));
         Waf::new(config, store, audit, trial)

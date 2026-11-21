@@ -1,6 +1,6 @@
 //! The control socket: how another process of this user (the admin process) asks the proxy for its state, to switch
-//! to the generation of rules that the rules store chooses, and to read the configuration again with a managed
-//! version. The path is `admin.control` of the configuration.
+//! an engine to the generation of rules that the rules store chooses for it, and to read the configuration again with
+//! a managed version. The path is `admin.control` of the configuration.
 //!
 //! The socket is bound after `prepare` and before the driver starts, so a path that cannot be used ends the start
 //! before the inspector runs. Its directory must be a real directory owned by this user without group or other bits:
@@ -16,10 +16,12 @@
 //! line in time, or goes away, gets no answer. The ops are carried out by the main loop (`Order`), which owns the
 //! switcher and the reading of the configuration. `{"op":"status"}` is answered with
 //! `{"generation":..,"mode":..,"engine":..,"phase":..,"switching":..,"reloading":..,"ready":..}`: the 64 digits of the
-//! generation that serves, what its rules do (`block` or `detect`), the engine that applies them (`coraza` or
+//! generation that serves the default engine, what its rules do (`block` or `detect`), that engine (`coraza` or
 //! `modsecurity`), the phase of its kernel (`starting`, `ready`, `stopping`, `stopped` or `failed`), whether a switch
 //! is under way, whether a reading of the configuration file again is under way (of SIGHUP or of a reload order), and
-//! whether `/readyz` says `ready`. The same object holds the figures of the proxy: `uptime_ms` (the milliseconds since
+//! whether `/readyz` says `ready`. The same object has `engines`, the state of every engine that runs, in the order of
+//! their names: `[{"engine":..,"generation":..,"mode":..,"phase":..}, ..]`, in the words of the fields above. An answer
+//! without `engines` is the answer of a proxy that runs one engine only. The same object holds the figures of the proxy: `uptime_ms` (the milliseconds since
 //! the proxy started), `requests` (the requests of every class of the records, `closed` included, which got no answer,
 //! and those of a route that writes no record for them), `blocked` (the requests a rule blocked), `policy_refused` (the
 //! requests the access list or the rate limit turned away), `upstream_failures` (the failures of the servers of every
@@ -29,10 +31,11 @@
 //! `resolve_timeout_ms` (the `forward.resolve_timeout_ms` of the configuration in force) and `config_reloads`
 //! (`{"replaced":..,"refused":..}`, the readings of the configuration file again by how they ended). The counts are
 //! those that `/metrics` shows; an answer without the figures is the answer of an older proxy.
-//! `{"op":"switch","expect":"<64 digits>"}` reads the rules store, and if the generation it chooses is not `expect` it
-//! does nothing and answers `refused` (`current changed`). Otherwise it does what SIGUSR1 does and answers when the
-//! switch has ended, `{"result":..,"generation":..}` with the generation that serves then and, when the result is not
-//! `switched`, a `reason`: `unchanged` (`already serving`), `refused` (`current changed`, `store refused`), `failed`
+//! `{"op":"switch","engine"?:"<engine>","expect":"<64 digits>"}` reads the rules store for the engine (the default
+//! engine if the order names none), and if the generation it chooses is not `expect` it does nothing and answers
+//! `refused` (`current changed`). Otherwise it does what SIGUSR1 does for that engine, which starts the engine if it
+//! does not run, and answers when the switch has ended, `{"result":..,"generation":..}` with the generation that serves
+//! the engine then (`null` if the engine does not run) and, when the result is not `switched`, a `reason`: `unchanged` (`already serving`), `refused` (`current changed`, `store refused`), `failed`
 //! (`driver did not take the order`, `not switched`) or `busy` (`starting`, `switch under way`, `too many orders`,
 //! `stopping`). A switch is waited for as long as the kernel may take to be ready and a margin; a client that has
 //! waited that long gets `busy` and `switch under way`, and the switch goes on.
@@ -51,7 +54,7 @@
 //! long as the names of the configuration in force may take to be looked up (`resolve_timeout`) and the margin; a
 //! client that has waited that long gets `busy` and `reload under way`, and the reading goes on.
 //! A line that is not a request gets `{"result":"error","reason":..}` with `line too long`, `malformed request`,
-//! `unknown op`, `bad expect` or `bad managed`, and a status that the main loop does not answer within 2 s gets `no
+//! `unknown op`, `bad expect`, `bad engine` or `bad managed`, and a status that the main loop does not answer within 2 s gets `no
 //! answer`. Each answer to a switch order or a reload order is one line in the records (`control: switch ..`,
 //! `control: reload <64 digits>: <result> (<reason>)`), the busy answers of the connection itself included (the queue
 //! of orders is full, the wait is over, the order was dropped); an order that gets such an answer and then ends gets a
@@ -73,16 +76,16 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
-use tukuyomi_kernel::Phase;
+use tukuyomi_kernel::{Engine, Phase};
 
-use self::answer::{reload_line, switch_line};
+use self::answer::{EngineLine, reload_line, switch_line};
 use self::order::{Ask, SwitchOrder, parse};
 use super::host;
 use super::start::Refusal;
 use super::status::Readiness;
 use crate::inbound::conn::{Setup, SharedSetup};
 use crate::inbound::session::send_and_close;
-use crate::inspect::driver::State;
+use crate::inspect::engines::States;
 use crate::log::Log;
 use crate::rules::bundle::Fingerprint;
 
@@ -183,7 +186,9 @@ pub(super) fn bind(path: &Path) -> Result<Bound, &'static str> {
 /// What the connections share.
 struct Shared {
     orders: mpsc::Sender<Order>,
-    state: watch::Receiver<State>,
+    state: watch::Receiver<States>,
+    /// The engine of a switch order that names none.
+    default_engine: Engine,
     /// How long a switch is waited for.
     switch_wait: Duration,
     /// The setup in force: how long a reading of the configuration is waited for, and the managed version that a busy
@@ -200,8 +205,12 @@ impl Shared {
         let (reply, told) = oneshot::channel();
         let (order, wait, late) = match ask {
             Ask::Status => (Order::Status(reply), READ_WAIT, "no answer"),
-            Ask::Switch(expect) => (
-                Order::Switch(SwitchOrder { expect, reply }),
+            Ask::Switch(engine, expect) => (
+                Order::Switch(SwitchOrder {
+                    engine: engine.unwrap_or(self.default_engine),
+                    expect,
+                    reply,
+                }),
                 self.switch_wait,
                 "switch under way",
             ),
@@ -232,8 +241,9 @@ impl Shared {
     fn busy(&self, reason: &'static str, ask: Ask) -> Answer {
         match ask {
             Ask::Status => Answer::Error("no answer"),
-            Ask::Switch(expect) => {
-                let generation = self.state.borrow().generation;
+            Ask::Switch(engine, expect) => {
+                let engine = engine.unwrap_or(self.default_engine);
+                let generation = self.state.borrow().of(engine).map(|state| state.generation);
                 self.log.line(&switch_line(
                     expect,
                     Outcome::Busy,
@@ -324,7 +334,9 @@ async fn accept(listener: UnixListener, shared: Arc<Shared>) {
 pub(super) struct Control {
     task: JoinHandle<()>,
     orders: mpsc::Receiver<Order>,
-    state: watch::Receiver<State>,
+    state: watch::Receiver<States>,
+    /// The engine whose state the fields of a status answer have besides `engines`.
+    default_engine: Engine,
     readiness: Arc<Readiness>,
     /// The switch order whose switch is under way.
     asked: Option<SwitchOrder>,
@@ -341,11 +353,12 @@ impl Drop for Control {
 }
 
 /// Starts to serve `bound`. A switch is waited for `switch_wait`, and a reading of the configuration as `setup`, the
-/// setup in force, says when it is asked for. `log` gets the lines of the busy answers of the connections. The runtime
-/// has to be entered.
+/// setup in force, says when it is asked for. `default_engine` is the engine of an order that names none. `log` gets the
+/// lines of the busy answers of the connections. The runtime has to be entered.
 pub(super) fn serve(
     bound: Bound,
-    state: watch::Receiver<State>,
+    state: watch::Receiver<States>,
+    default_engine: Engine,
     readiness: Arc<Readiness>,
     switch_wait: Duration,
     setup: SharedSetup,
@@ -356,6 +369,7 @@ pub(super) fn serve(
     let shared = Arc::new(Shared {
         orders,
         state: state.clone(),
+        default_engine,
         switch_wait,
         setup,
         log,
@@ -364,6 +378,7 @@ pub(super) fn serve(
         task: tokio::spawn(accept(listener, shared)),
         orders: taken,
         state,
+        default_engine,
         readiness,
         asked: None,
         reload: None,
@@ -380,16 +395,31 @@ impl Control {
     /// The answer to a status order. `switching`: a switch is under way; `reloading`: a reading of the configuration
     /// file again. `figures` are read by the caller.
     pub(super) fn status(&self, switching: bool, reloading: bool, figures: Figures) -> Answer {
-        let state = *self.state.borrow();
+        let states = *self.state.borrow();
+        let Some(lead) = states
+            .of(self.default_engine)
+            .or_else(|| states.started().next())
+        else {
+            return Answer::Error("no answer");
+        };
         Answer::Status {
-            generation: state.generation,
-            mode: state.mode.name(),
-            engine: state.engine.name(),
-            phase: phase_word(state.phase),
+            generation: lead.generation,
+            mode: lead.mode.name(),
+            engine: lead.engine.name(),
+            phase: phase_word(lead.phase),
             switching,
             reloading,
-            ready: self.readiness.check(state.phase).is_ok(),
+            ready: self.readiness.check(&states).is_ok(),
             figures,
+            engines: states
+                .started()
+                .map(|state| EngineLine {
+                    engine: state.engine.name(),
+                    generation: state.generation,
+                    mode: state.mode.name(),
+                    phase: phase_word(state.phase),
+                })
+                .collect(),
         }
     }
 
@@ -398,9 +428,22 @@ impl Control {
         self.asked = Some(order);
     }
 
-    /// The driver answered the switch that is under way: the order that asked for it, if there is one, gets its
-    /// answer. `serving` is the generation that serves now.
-    pub(super) fn switch_ended(&mut self, switched: bool, serving: Fingerprint, log: &Log) {
+    /// The driver answered the switch of `engine` that is under way: the order that asked for it, if there is one and
+    /// it is for that engine, gets its answer. `serving` is the generation that serves the engine now.
+    pub(super) fn switch_ended(
+        &mut self,
+        engine: Engine,
+        switched: bool,
+        serving: Option<Fingerprint>,
+        log: &Log,
+    ) {
+        if self
+            .asked
+            .as_ref()
+            .is_some_and(|order| order.engine() != engine)
+        {
+            return;
+        }
         if let Some(order) = self.asked.take() {
             if switched {
                 order.finish(Outcome::Switched, None, serving, log);

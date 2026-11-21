@@ -9,7 +9,11 @@
 //! accept side put in the order of the file. A file that is refused anywhere, or has an address that cannot be bound,
 //! leaves everything as it is. The listeners of the addresses that are gone are closed, and the old setup is retired:
 //! the connections that hold it wind down after the request they serve, and the ones that are idle end. The rules store
-//! is not read, so the generation that serves stays as it is.
+//! is not read, so the generations that serve stay as they are, and no inspector is started: a configuration that has
+//! an upstream group whose engine does not serve, or is not ready (its kernel is not in the phase `Ready`), is refused
+//! (`fixed`: the engines that run are those of the start and of the switches), so that a request is never answered
+//! 503 by a group that the reading has just put in place. A line follows a replacement for each group whose engine runs
+//! a generation that only detects.
 //!
 //! One reading is under way at a time, of either: SIGHUP while one is under way is a line, and a reload order then is
 //! answered `busy` (`reload under way`). A reload order for a configuration without `managed` is refused
@@ -27,16 +31,18 @@
 use std::path::PathBuf;
 use std::thread;
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
+use tukuyomi_kernel::Phase;
 
 use super::{Fixed, reload_certificates};
 use crate::config::{Keep, addresses};
 use crate::inbound::conn::{Setup, Shared};
 use crate::inbound::transport::accept::Acceptor;
+use crate::inspect::engines::States;
 use crate::log::Log;
 use crate::log::counters::ReloadResult;
 use crate::managed::{Choice, Hold};
-use crate::rules::bundle::hex;
+use crate::rules::bundle::{Mode, hex};
 use crate::run::control::{ReloadOrder, Reloaded};
 use crate::run::signals::Waits;
 use crate::run::start::{Parts, Reason, Refusal, read_parts};
@@ -53,16 +59,25 @@ pub(in crate::run) struct Reloader {
     hold: Option<Hold>,
     /// The certificates are to be read when the reading that is under way has ended.
     certificates: bool,
+    /// What the driver tells of the engines that run.
+    states: watch::Receiver<States>,
 }
 
 impl Reloader {
     /// For the file at `path`, whose values at the start are `fixed`, and the hold on the version it started with.
-    pub(in crate::run) fn new(path: PathBuf, fixed: Fixed, hold: Option<Hold>) -> Reloader {
+    /// `states` is what the driver tells of the engines that run.
+    pub(in crate::run) fn new(
+        path: PathBuf,
+        fixed: Fixed,
+        hold: Option<Hold>,
+        states: watch::Receiver<States>,
+    ) -> Reloader {
         Reloader {
             path,
             fixed,
             hold,
             certificates: false,
+            states,
         }
     }
 
@@ -192,6 +207,22 @@ impl Reloader {
                 &format!("{key} cannot change while running"),
             ));
         }
+        // The engines that the groups name have to serve now: the reading starts no inspector.
+        let states = *self.states.borrow();
+        let unready = parts.forward.groups.iter().find(|group| {
+            states
+                .of(group.engine)
+                .is_none_or(|state| state.phase != Phase::Ready)
+        });
+        if let Some(group) = unready {
+            let name = group.name.clone();
+            drop(parts);
+            return Err(refused(
+                shared,
+                Reason::Fixed,
+                &format!("the engine of an upstream is not ready (upstream {name})"),
+            ));
+        }
         let listening = addresses(&parts.proxy.listeners);
         let bound = match acceptor.bind_new(&listening).await {
             Ok(bound) => bound,
@@ -234,6 +265,19 @@ impl Reloader {
         earlier.retire();
         self.hold = parts.hold;
         shared.counters.add_config_reload(ReloadResult::Replaced);
+        // A group that is not blocked, for its engine runs a generation that only detects.
+        for group in &parts.forward.groups {
+            if states
+                .of(group.engine)
+                .is_some_and(|state| state.mode == Mode::Detect)
+            {
+                shared.log.line(&format!(
+                    "reload: upstream {}: engine {}, mode detect",
+                    group.name,
+                    group.engine.name()
+                ));
+            }
+        }
         // With `managed`, the line names the version too.
         let managed = parts
             .managed

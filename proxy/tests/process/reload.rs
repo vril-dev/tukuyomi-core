@@ -5,6 +5,7 @@
 //! can be asked. The connections that wait are kept (`keepalive_timeout_ms`), and a request that is under way is a slow
 //! inspection (see `main`). The tests of the listeners change the listeners of the file instead.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
@@ -20,8 +21,10 @@ use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 use tukuyomi_proxy::rules::bundle::{hex, sha256};
 
+use crate::engines::add_generation;
 use crate::http2::{Client, add_listener};
 use crate::keepalive::read_response;
+use crate::rules::rules;
 use crate::support::*;
 use crate::tls::Pki;
 
@@ -431,4 +434,54 @@ fn listeners_in_another_order_answer_each_as_its_own_plain_or_tls_listener() {
     assert_eq!(reloads(status, "replaced"), "1");
     assert_eq!(reloads(status, "refused"), "0");
     proxy.finish(2);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_file_that_names_an_engine_that_does_not_run_is_refused_until_sigusr1_starts_the_engine() {
+    let status = free_port();
+    let mut other = String::new();
+    let proxy = Proxy::start_with("reload_engine", Knobs::quick(), |root| {
+        add_object(
+            root,
+            "status",
+            json!({ "listen": format!("127.0.0.1:{status}") }),
+        );
+        name_modsecurity_inspector(root);
+        other = add_generation(root);
+    });
+    let root = proxy.root().to_path_buf();
+    // The store chooses the generation of ModSecurity, but no inspector of that engine runs yet.
+    let chosen = rules(&root, "activate", &[OsStr::new(&other)]);
+    assert_eq!(chosen.code, Some(0), "{}", chosen.err);
+    rewrite(&root, |config| {
+        config["forward"]["upstreams"]["main"]["engine"] = json!("modsecurity");
+    });
+    proxy.signal("HUP");
+    proxy.records.wait_lines("the refusal", 1, |l| {
+        l == "reload: configuration refused: the engine of an upstream is not ready (upstream main)"
+    });
+    assert!(alive(&proxy));
+    wait_reloads(status, "refused", "1");
+    assert_eq!(reloads(status, "replaced"), "0");
+    // The request is still inspected by the engine it had.
+    assert_empty_answer(&exchange(proxy.port, &get("/block-probe/x")), 403);
+    proxy.records.conn("the record of Coraza", |l| {
+        blocked_by(l, 9201) && l["engine"] == "coraza"
+    });
+
+    // SIGUSR1 starts the inspector of the engine whose generation is chosen, and then the file is read.
+    proxy.signal("USR1");
+    let switched = format!("reload: generation {other} is ready, switched");
+    proxy
+        .records
+        .wait_lines("the start of the engine", 1, |l| l == switched.as_str());
+    proxy.signal("HUP");
+    wait_reloads(status, "replaced", "1");
+    assert_eq!(reloads(status, "refused"), "1");
+    assert_empty_answer(&exchange(proxy.port, &get("/block-probe/x")), 403);
+    proxy.records.conn("the record of ModSecurity", |l| {
+        blocked_by(l, 9201) && l["engine"] == "modsecurity"
+    });
+    proxy.finish(0);
 }

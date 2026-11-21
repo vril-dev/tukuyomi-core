@@ -7,6 +7,7 @@ use std::sync::{Arc, PoisonError};
 use bytes::Bytes;
 use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout_at};
+use tukuyomi_kernel::Engine;
 
 use super::{Conn, stage};
 use crate::inbound::answer::{Decision, Passed, Reply, Stop, decide};
@@ -27,11 +28,12 @@ impl Conn {
         Passed::Bypassed
     }
 
-    /// Hands the request to the driver and waits for the verdict. `cut` tells that the body goes on after the
-    /// bytes in `body`. `Ok` is how the request is let through (an `Allow` or a `Detected`); everything else is
+    /// Hands the request to the driver, for the engine of the group it goes to, and waits for the verdict. `cut` tells
+    /// that the body goes on after the bytes in `body`. `Ok` is how the request is let through (an `Allow` or a `Detected`); everything else is
     /// the answer to give.
     pub(super) async fn ask(
         &self,
+        engine: Engine,
         headers: Vec<(Bytes, Bytes)>,
         field_bytes: usize,
         body: &Arc<BodyHold>,
@@ -40,6 +42,8 @@ impl Conn {
         let permit = self
             .ctx
             .shared
+            .gates
+            .of(engine)
             .inspect
             .clone()
             .try_acquire_owned()
@@ -47,6 +51,7 @@ impl Conn {
         let copy = self.take(body.bytes.len().saturating_add(field_bytes))?;
         let (reply, verdict) = oneshot::channel();
         let ticket = Ticket {
+            engine,
             req: InspectReq {
                 client: self.client,
                 server: self.local,

@@ -144,15 +144,23 @@ fn a_directory_of_another_owner_is_refused() {
 #[test]
 fn without_a_record_no_generation_is_chosen() {
     let root = scratch();
-    assert_eq!(opened(root.path()).current(), Ok(None));
+    let store = opened(root.path());
+    assert_eq!(store.current(Engine::Coraza), Ok(None));
+    assert_eq!(store.current(Engine::ModSecurity), Ok(None));
 }
 
 #[test]
-fn a_record_of_64_lowercase_digits_and_a_newline_names_the_generation() {
+fn a_record_of_64_lowercase_digits_and_a_newline_names_the_generation_of_its_engine() {
     let root = scratch();
-    let store = opened(root.path());
-    fs::write(root.path().join("current"), format!("{HEX}\n")).unwrap();
-    assert_eq!(store.current(), Ok(Some(generation())));
+    let mut store = opened(root.path());
+    let first = made(&mut store, &rules());
+    fs::write(
+        root.path().join("current.coraza"),
+        format!("{}\n", first.hex()),
+    )
+    .unwrap();
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(first)));
+    assert_eq!(store.current(Engine::ModSecurity), Ok(None));
 }
 
 #[test]
@@ -161,12 +169,12 @@ fn a_record_of_another_shape_is_broken() {
     let store = opened(root.path());
     // 65 bytes, as long as a record, with capitals.
     fs::write(
-        root.path().join("current"),
+        root.path().join("current.coraza"),
         format!("{}\n", HEX.to_uppercase()),
     )
     .unwrap();
     assert_eq!(
-        refusal(store.current()),
+        refusal(store.current(Engine::Coraza)),
         "the current generation record is broken"
     );
 }
@@ -175,9 +183,9 @@ fn a_record_of_another_shape_is_broken() {
 fn a_record_of_66_bytes_cannot_be_read() {
     let root = scratch();
     let store = opened(root.path());
-    fs::write(root.path().join("current"), format!("{HEX}\n\n")).unwrap();
+    fs::write(root.path().join("current.coraza"), format!("{HEX}\n\n")).unwrap();
     assert_eq!(
-        refusal(store.current()),
+        refusal(store.current(Engine::Coraza)),
         "the current generation record cannot be read"
     );
 }
@@ -188,9 +196,9 @@ fn a_link_as_the_record_cannot_be_read() {
     // A link to a file with a right record is not followed, and is not "no record" either.
     let target = root.path().join("record");
     fs::write(&target, format!("{HEX}\n")).unwrap();
-    symlink(&target, root.path().join("current")).unwrap();
+    symlink(&target, root.path().join("current.coraza")).unwrap();
     assert_eq!(
-        refusal(opened(root.path()).current()),
+        refusal(opened(root.path()).current(Engine::Coraza)),
         "the current generation record cannot be read"
     );
 }
@@ -198,10 +206,10 @@ fn a_link_as_the_record_cannot_be_read() {
 #[test]
 fn a_fifo_as_the_record_is_refused_without_waiting_for_a_writer() {
     let root = scratch();
-    make_fifo(&root.path().join("current"));
+    make_fifo(&root.path().join("current.coraza"));
     let store = opened(root.path());
     assert_eq!(
-        refusal(within(move || store.current())),
+        refusal(within(move || store.current(Engine::Coraza))),
         "the current generation record cannot be read"
     );
 }
@@ -265,13 +273,17 @@ fn a_link_as_the_generation_is_not_a_real_directory() {
 // ---- the write side ----
 
 fn bundle(files: &[(&str, &str)], load: &[&str]) -> Bundle {
+    bundle_of(Engine::Coraza, files, load)
+}
+
+fn bundle_of(engine: Engine, files: &[(&str, &str)], load: &[&str]) -> Bundle {
     let path = |text: &str| BundlePath::parse(text).unwrap();
     let files = files
         .iter()
         .map(|(name, data)| (path(name), data.as_bytes().to_vec()))
         .collect();
     Bundle::new(
-        Engine::Coraza,
+        engine,
         Mode::Block,
         files,
         load.iter().map(|name| path(name)).collect(),
@@ -288,6 +300,15 @@ fn rules() -> Bundle {
             ("rules/local.conf", "SecDebugLogLevel 0\n"),
         ],
         &["crs/rules/a.conf", "rules/local.conf"],
+    )
+}
+
+/// Rules for `engine` that no other bundle of these tests has.
+fn rules_of(engine: Engine) -> Bundle {
+    bundle_of(
+        engine,
+        &[("rules/engine.conf", "SecDebugLogLevel 2\n")],
+        &["rules/engine.conf"],
     )
 }
 
@@ -338,7 +359,7 @@ fn a_staged_bundle_becomes_a_generation_and_nothing_stays_staged() {
     assert!(names(&root.path().join("staging")).is_empty());
     assert_eq!(store.verify(bundle.fingerprint()), Ok(()));
     // Making a generation does not choose it.
-    assert_eq!(store.current(), Ok(None));
+    assert_eq!(store.current(Engine::Coraza), Ok(None));
     let listed = store.list().unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].fingerprint, bundle.fingerprint());
@@ -444,7 +465,10 @@ fn one_command_at_a_time_changes_the_store() {
     assert_eq!(refusal(second.stage(&bundle)), busy);
     assert_eq!(refusal(second.activate(bundle.fingerprint())), busy);
     let expect = bundle.fingerprint();
-    assert_eq!(refusal(second.activate_if_current(expect, expect)), busy);
+    assert_eq!(
+        refusal(second.activate_if_current(Some(expect), expect)),
+        busy
+    );
     // Reading does not need the lock.
     assert_eq!(second.list(), Ok(Vec::new()));
     assert_eq!(refusal(first.stage(&bundle)), "a bundle is staged already");
@@ -472,19 +496,22 @@ fn activate_verifies_the_generation_before_it_replaces_the_record() {
         "the generation is not a real directory"
     );
 
-    // A `current.new` that was left behind, also a link, is replaced.
+    // A `current.coraza.new` that was left behind, also a link, is replaced.
     let target = root.path().join("record");
     fs::write(&target, "x").unwrap();
-    symlink(&target, root.path().join("current.new")).unwrap();
+    symlink(&target, root.path().join("current.coraza.new")).unwrap();
     assert_eq!(store.activate(bundle.fingerprint()), Ok(()));
-    assert_eq!(store.current(), Ok(Some(bundle.fingerprint())));
-    let record = fs::read(root.path().join("current")).unwrap();
+    assert_eq!(
+        store.current(Engine::Coraza),
+        Ok(Some(bundle.fingerprint()))
+    );
+    let record = fs::read(root.path().join("current.coraza")).unwrap();
     assert_eq!(
         record,
         format!("{}\n", bundle.fingerprint().hex()).as_bytes()
     );
     assert_eq!(fs::read(&target).unwrap(), b"x");
-    assert!(!root.path().join("current.new").exists());
+    assert!(!root.path().join("current.coraza.new").exists());
 
     // A generation that is broken is not chosen, and the record stays.
     let generation = root
@@ -492,12 +519,15 @@ fn activate_verifies_the_generation_before_it_replaces_the_record() {
         .join("generations")
         .join(bundle.fingerprint().hex());
     fs::write(generation.join("crs/rules/a.data"), "three\n").unwrap();
-    let before = fs::read(root.path().join("current")).unwrap();
+    let before = fs::read(root.path().join("current.coraza")).unwrap();
     assert_eq!(
         refusal(store.activate(bundle.fingerprint())),
         "a file of the generation differs from its manifest"
     );
-    assert_eq!(fs::read(root.path().join("current")).unwrap(), before);
+    assert_eq!(
+        fs::read(root.path().join("current.coraza")).unwrap(),
+        before
+    );
 }
 
 #[test]
@@ -506,30 +536,56 @@ fn a_generation_is_chosen_only_if_the_chosen_one_is_the_one_expected() {
     let mut store = opened(root.path());
     let first = made(&mut store, &rules());
     let second = made(&mut store, &other_rules());
-    // Nothing is chosen yet, so nothing is expected.
+    // Nothing is chosen yet, so something expected is not the choice.
     assert_eq!(
-        refusal(store.activate_if_current(first, second)),
+        refusal(store.activate_if_current(Some(first), second)),
         NOT_EXPECTED.0
     );
-    assert_eq!(store.current(), Ok(None));
+    assert_eq!(store.current(Engine::Coraza), Ok(None));
     store.activate(first).unwrap();
     // Another command chose `second` after the caller saw `first`: that choice stays.
     opened(root.path()).activate(second).unwrap();
     assert_eq!(
-        refusal(store.activate_if_current(first, first)),
+        refusal(store.activate_if_current(Some(first), first)),
         NOT_EXPECTED.0
     );
-    assert_eq!(store.current(), Ok(Some(second)));
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(second)));
     // The generation that is chosen is the one expected: it is replaced, and the lock is free again.
-    assert_eq!(store.activate_if_current(second, first), Ok(()));
-    assert_eq!(store.current(), Ok(Some(first)));
+    assert_eq!(store.activate_if_current(Some(second), first), Ok(()));
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(first)));
     assert_eq!(store.activate(second), Ok(()));
     // A generation that is not sound is refused after the check, and the record stays.
     assert_eq!(
-        refusal(store.activate_if_current(second, generation())),
+        refusal(store.activate_if_current(Some(second), generation())),
         "the generation is not a real directory"
     );
-    assert_eq!(store.current(), Ok(Some(second)));
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(second)));
+}
+
+#[test]
+fn none_expected_means_no_generation_is_chosen_for_the_engine_of_the_generation() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let first = made(&mut store, &rules());
+    let second = made(&mut store, &other_rules());
+    let engine_two = made(&mut store, &rules_of(Engine::ModSecurity));
+    // Nothing is chosen for Coraza: none expected is right, and the choice is made.
+    assert_eq!(store.activate_if_current(None, first), Ok(()));
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(first)));
+    // Something is chosen now: none expected is wrong, and the choice stays.
+    assert_eq!(
+        refusal(store.activate_if_current(None, second)),
+        NOT_EXPECTED.0
+    );
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(first)));
+    // What is chosen for Coraza is not what is chosen for ModSecurity: nothing is chosen for it.
+    assert_eq!(
+        refusal(store.activate_if_current(Some(first), engine_two)),
+        NOT_EXPECTED.0
+    );
+    assert_eq!(store.activate_if_current(None, engine_two), Ok(()));
+    assert_eq!(store.current(Engine::ModSecurity), Ok(Some(engine_two)));
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(first)));
 }
 
 #[test]
@@ -690,4 +746,144 @@ fn the_manifest_of_a_generation_lists_its_files_in_the_order_of_their_paths() {
         refusal(store.manifest(generation())),
         "the generation is not a real directory"
     );
+}
+
+// ---- the record of each engine ----
+
+/// Writes the record file `name` of the store at `root`: the generation and a newline.
+fn record(root: &Path, name: &str, generation: Fingerprint) {
+    fs::write(root.join(name), format!("{}\n", generation.hex())).unwrap();
+}
+
+const DISAGREE: &str = "the current generation records of the engine disagree";
+
+#[test]
+fn a_record_of_an_older_version_is_the_choice_of_the_engine_of_its_generation() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let coraza = made(&mut store, &rules());
+    let modsecurity = made(&mut store, &rules_of(Engine::ModSecurity));
+    record(root.path(), "current", coraza);
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(coraza)));
+    assert_eq!(store.current(Engine::ModSecurity), Ok(None));
+    record(root.path(), "current", modsecurity);
+    assert_eq!(store.current(Engine::Coraza), Ok(None));
+    assert_eq!(store.current(Engine::ModSecurity), Ok(Some(modsecurity)));
+}
+
+#[test]
+fn the_older_record_and_the_record_of_the_engine_are_one_choice_only_if_they_name_one_generation() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let (first, second) = (made(&mut store, &rules()), made(&mut store, &other_rules()));
+    // The same generation twice is one choice.
+    record(root.path(), "current", first);
+    record(root.path(), "current.coraza", first);
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(first)));
+    // Two generations are no choice at all, for every reader of the choice, and the other engine is not touched.
+    record(root.path(), "current.coraza", second);
+    assert_eq!(refusal(store.current(Engine::Coraza)), DISAGREE);
+    assert_eq!(store.current(Engine::ModSecurity), Ok(None));
+    assert_eq!(
+        refusal(store.activate_if_current(Some(first), first)),
+        DISAGREE
+    );
+    assert_eq!(
+        refusal(store.activate_if_current(Some(second), first)),
+        DISAGREE
+    );
+    // `activate` does not read the choice, and makes it whole: the older record is gone.
+    assert_eq!(store.activate(first), Ok(()));
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(first)));
+    assert!(!root.path().join("current").exists());
+}
+
+#[test]
+fn a_record_of_an_engine_that_names_a_generation_of_another_engine_is_broken() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let coraza = made(&mut store, &rules());
+    record(root.path(), "current.modsecurity", coraza);
+    assert_eq!(
+        refusal(store.current(Engine::ModSecurity)),
+        "the current generation record is broken"
+    );
+    assert_eq!(store.current(Engine::Coraza), Ok(None));
+}
+
+#[test]
+fn a_choice_replaces_the_older_record_of_its_engine_only() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let first = made(&mut store, &rules());
+    let second = made(&mut store, &other_rules());
+    let modsecurity = made(&mut store, &rules_of(Engine::ModSecurity));
+    record(root.path(), "current", first);
+    // A generation of the other engine leaves the older record, which is the choice of Coraza still.
+    assert_eq!(store.activate(modsecurity), Ok(()));
+    assert!(root.path().join("current").exists());
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(first)));
+    assert_eq!(store.current(Engine::ModSecurity), Ok(Some(modsecurity)));
+    // A generation of the same engine replaces it, and the older record is removed after the new one is written.
+    assert_eq!(store.activate(second), Ok(()));
+    assert!(!root.path().join("current").exists());
+    assert_eq!(store.current(Engine::Coraza), Ok(Some(second)));
+    assert_eq!(store.current(Engine::ModSecurity), Ok(Some(modsecurity)));
+}
+
+#[test]
+fn a_choice_removes_an_older_record_that_cannot_be_told() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let first = made(&mut store, &rules());
+    // A record that is broken, and one whose generation is not there, are each replaced and not kept.
+    for text in ["not a record\n".to_owned(), format!("{HEX}\n")] {
+        fs::write(root.path().join("current"), text).unwrap();
+        assert!(store.current(Engine::Coraza).is_err());
+        assert_eq!(store.activate(first), Ok(()));
+        assert!(!root.path().join("current").exists());
+        assert_eq!(store.current(Engine::Coraza), Ok(Some(first)));
+    }
+}
+
+#[test]
+fn a_generation_chosen_for_any_engine_is_not_removed() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let coraza = made(&mut store, &rules());
+    let modsecurity = made(&mut store, &rules_of(Engine::ModSecurity));
+    let unchosen = made(&mut store, &other_rules());
+    store.activate(coraza).unwrap();
+    store.activate(modsecurity).unwrap();
+    let chosen = "the generation is the current one";
+    assert_eq!(refusal(store.remove(coraza)), chosen);
+    assert_eq!(refusal(store.remove(modsecurity)), chosen);
+    assert_eq!(store.remove(unchosen), Ok(()));
+}
+
+#[test]
+fn deactivate_leaves_the_engine_with_nothing_chosen_and_the_other_engine_alone() {
+    let root = scratch();
+    let mut store = opened(root.path());
+    let first = made(&mut store, &rules());
+    let modsecurity = made(&mut store, &rules_of(Engine::ModSecurity));
+    store.activate(first).unwrap();
+    store.activate(modsecurity).unwrap();
+    // The older record of the engine goes with its own, and an older record of the other engine stays.
+    record(root.path(), "current", first);
+    assert_eq!(store.deactivate(Engine::Coraza), Ok(Some(first)));
+    assert!(!root.path().join("current").exists());
+    assert!(!root.path().join("current.coraza").exists());
+    assert_eq!(store.current(Engine::Coraza), Ok(None));
+    assert_eq!(store.current(Engine::ModSecurity), Ok(Some(modsecurity)));
+    // There is nothing left to leave; and the generation can be removed now.
+    assert_eq!(store.deactivate(Engine::Coraza), Ok(None));
+    assert_eq!(store.remove(first), Ok(()));
+    record(root.path(), "current", modsecurity);
+    assert_eq!(store.deactivate(Engine::Coraza), Ok(None));
+    assert!(root.path().join("current").exists());
+    // A choice that cannot be told is not left.
+    record(root.path(), "current", generation());
+    assert!(store.deactivate(Engine::ModSecurity).is_err());
+    assert!(root.path().join("current.modsecurity").exists());
 }

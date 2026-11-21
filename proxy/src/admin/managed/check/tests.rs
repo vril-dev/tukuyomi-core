@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use serde_json::Value;
+use tukuyomi_kernel::Engine;
 
 use super::*;
 use crate::admin::managed::Op;
@@ -24,7 +25,7 @@ fn a_version_is_checked_without_a_change_and_a_refusal_is_about_its_place() {
         let answer = check(&rig, &body);
         assert_eq!(
             (answer.status, answer.body),
-            (StatusCode::OK, json!({ "version": name }))
+            (StatusCode::OK, json!({ "version": name, "detect": [] }))
         );
     }
     let mut broken = bare_version();
@@ -74,5 +75,45 @@ fn one_check_runs_at_a_time_for_the_saving_and_the_check() {
         );
     }
     drop(held);
+    assert_eq!(check(&rig, &body).status, StatusCode::OK);
+}
+
+#[test]
+fn a_group_whose_engine_has_no_generation_chosen_is_refused_about_its_engine_and_an_unreadable_rules_store_is_500()
+ {
+    let rig = rig(true);
+    // The main file names an inspector for ModSecurity, as a main file that can use that engine does; the rules store
+    // has a generation chosen for Coraza only.
+    rig.fixture.main_file(|m| {
+        m["kernel"]["engines"] =
+            json!({"modsecurity": {"inspector": "/opt/tukuyomi/inspector-modsecurity"}});
+    });
+    let mut version = bare_version();
+    version["upstreams"]["app"]["engine"] = json!("modsecurity");
+    let body = json!({"version": version, "files": []});
+    let answer = check(&rig, &body);
+    assert_eq!(
+        (answer.status, answer.body),
+        (
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "no generation is chosen for the engine of an upstream",
+                "at": "upstreams.app.engine",
+            })
+        )
+    );
+    // A record that cannot be told is a fault of the process: 500, with the sentence of the rules store.
+    let record = rig.fixture.rules().join("current.modsecurity");
+    std::fs::write(&record, "x").unwrap();
+    let answer = check(&rig, &body);
+    assert_eq!(
+        (answer.status, &answer.body["error"]),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!("the current generation record is broken")
+        )
+    );
+    std::fs::remove_file(&record).unwrap();
+    rig.fixture.choose_rules(Engine::ModSecurity);
     assert_eq!(check(&rig, &body).status, StatusCode::OK);
 }

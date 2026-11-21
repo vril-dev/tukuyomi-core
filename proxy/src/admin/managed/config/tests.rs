@@ -58,8 +58,10 @@ fn the_values_of_the_main_file_are_shown_without_its_paths() {
         json!({
             "servers": [{"address": "127.0.0.1:9000", "weight": 1, "max_fails": 1, "fail_timeout_ms": 1000, "backup": false}],
             "tls": {"ca_file": true, "server_name": "app.test"},
+            "engine": "coraza",
         })
     );
+    assert_eq!(unmanaged["kernel"]["default_engine"], json!("coraza"));
     assert_eq!(
         (
             &unmanaged["admin"]["control"],
@@ -86,7 +88,9 @@ fn fixture_without_managed(fixture: &crate::managed::store::tests::Fixture) {
         m["forward"]["upstreams"] = json!({"app": {
             "servers": [{"address": "127.0.0.1:9000", "weight": 1, "max_fails": 1, "fail_timeout_ms": 1000, "backup": false}],
             "tls": {"ca_file": "/etc/tukuyomi/ca.pem", "server_name": "app.test"},
+            "engine": "coraza",
         }});
+        m["kernel"]["default_engine"] = json!("coraza");
         m["forward"]["routes"] = json!([]);
         m["forward"]["default_upstream"] = json!("app");
         m["admin"] = json!({

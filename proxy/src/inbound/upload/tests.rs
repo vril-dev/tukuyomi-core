@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
-use tukuyomi_kernel::Verdict;
+use tukuyomi_kernel::{Engine, Verdict};
 
 use crate::config::{ForwardConfig, ProxyConfig, RouteConfig};
 use crate::inbound::conn::tests::{
@@ -216,7 +216,12 @@ async fn through(
 ) -> Done {
     let rig = Rig::with(cfg, mode, forward).await;
     if let Some(routes) = routes {
-        rig.ctx.shared.routes.replace(routes);
+        rig.ctx
+            .shared
+            .gates
+            .of(Engine::Coraza)
+            .routes
+            .replace(routes);
     }
     let (client, task) = rig.connect().await;
     put(&client, request).await;

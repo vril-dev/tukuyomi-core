@@ -3,7 +3,7 @@
 //! `resolve_timeout_ms` is the time the proxy may take to look up the names of the servers each time it reads the
 //! configuration: when it starts, at SIGHUP, and for a reload order of the control socket, whose answer is waited for
 //! that long and a margin (1 ms to 3600 s).
-//! `upstreams` is an object from the name of a group to `{"servers": [..], "tls"?}`. A name is 1 to 64
+//! `upstreams` is an object from the name of a group to `{"servers": [..], "tls"?, "engine"?}`. A name is 1 to 64
 //! letters, digits, `-` and `_`, and there are 1 to 64 groups. A group has 1 to 64 servers, each `{"address", "weight",
 //! "max_fails", "fail_timeout_ms", "backup"}` with every key present: the address is an IP literal and a port
 //! (`[..]:port` for IPv6) or a name and a port (`name:port`), the weight is 1 to 100, `max_fails` is 0 to 100 (0:
@@ -18,7 +18,12 @@
 //! over TLS, and its certificate is checked against the authorities in `ca_file` (see `forward::tls`). `ca_file` is
 //! an absolute clean path of at most 3840 bytes; the file is not read here. `server_name` is a name of the form of a
 //! server name, and TLS has to be able to use it; without it each server is checked for its own name (so every name
-//! of a server of such a group must be one TLS can use), or, written as an IP literal, for its address.
+//! of a server of such a group must be one TLS can use), or, written as an IP literal, for its address. `engine` of a
+//! group is `coraza` or `modsecurity`, the engine that inspects the requests that go to the group, and the
+//! configuration must have an inspector for it (`kernel`); left out, it is `kernel.default_engine`, which the check
+//! resolves, so that a group always has the engine it is inspected by. No two groups with a server at the same address
+//! have different engines: a request reaches that backend through whichever of the groups its `Host` chooses, and the
+//! weakest of their engines and modes would be the protection of the backend.
 //! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?,
 //! "records"?}`.
 //! The `host` and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access`
@@ -48,11 +53,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde::Deserialize;
+use tukuyomi_kernel::Engine;
 
-use self::group::{MAX_GROUPS, servers, tls};
+use self::group::{MAX_GROUPS, engine, engines_apart, servers, tls};
 use super::records;
 use super::rewrite::{self, RawAccess, RawRewrite};
-use super::{ConfigError, MAX_CONN_MS, Object, RouteKeep, ensure, millis};
+use super::{ConfigError, KernelSettings, MAX_CONN_MS, Object, RouteKeep, ensure, millis};
 use crate::forward::client_ip::Access;
 use crate::forward::rewrite::Rewrite;
 use crate::forward::tls::{Authorities, Client, Settings};
@@ -143,6 +149,9 @@ pub struct GroupConfig<A = SocketAddr, T = Client> {
     pub name: String,
     pub servers: Vec<ServerConfig<A>>,
     pub tls: Option<T>,
+    /// The engine that inspects the requests that go to the group: the one it names, or the default of the
+    /// configuration, which the check resolves (see `kernel`).
+    pub engine: Engine,
 }
 
 /// The times of a response on a route that may take long, and whether the route lets a WebSocket through.
@@ -210,12 +219,13 @@ pub struct ForwardConfig {
 }
 
 /// The way to the admin process that the proxy makes itself: a request whose `Host` is `host` goes to the one server
-/// at `server` (`admin.listen`), if `access` lets its client.
+/// at `server` (`admin.listen`), if `access` lets its client. `engine` inspects such a request: the default engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdminWay {
     pub host: String,
     pub access: Access,
     pub server: SocketAddr,
+    pub engine: Engine,
 }
 
 #[cfg(test)]
@@ -239,6 +249,7 @@ impl ForwardConfig {
                 name: "main".to_string(),
                 servers,
                 tls: None,
+                engine: Engine::Coraza,
             }],
             routes: Table::default(),
             default: Some(0),
@@ -332,6 +343,7 @@ pub(super) fn check(
     raw: RawForward,
     listeners: &[SocketAddr],
     max_body: usize,
+    kernel: &KernelSettings,
 ) -> Result<ForwardSettings, ConfigError> {
     let (Some(upstreams), Some(routes), Some(default_upstream)) =
         (raw.upstreams, raw.routes, raw.default_upstream)
@@ -347,6 +359,7 @@ pub(super) fn check(
         &default_upstream,
         listeners,
         max_body,
+        kernel,
         RawTls::split,
     )
 }
@@ -361,8 +374,10 @@ pub(super) fn timeout_only(raw: RawForward) -> Result<Duration, ConfigError> {
 }
 
 /// The upstream groups, the routes and the default group of the `forward` object of a file without `managed`, checked,
-/// with `resolve_timeout` taken as it is. `listeners` and `max_body` are as for `check`, and `split` checks the `tls`
-/// of a group as it is written. A refusal is the sentence of `located`.
+/// with `resolve_timeout` taken as it is. `listeners`, `max_body` and `kernel` are as for `check`, and `split` checks
+/// the `tls` of a group as it is written. A refusal is the sentence of `located`.
+// One argument for each part of what the configuration file gives; a struct of them would only repeat their names.
+#[allow(clippy::too_many_arguments)]
 fn routing<T>(
     resolve_timeout: Duration,
     upstreams: Groups<T>,
@@ -370,6 +385,7 @@ fn routing<T>(
     default_upstream: &str,
     listeners: &[SocketAddr],
     max_body: usize,
+    kernel: &KernelSettings,
     split: impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
 ) -> Result<ForwardSettings, ConfigError> {
     located(
@@ -379,6 +395,7 @@ fn routing<T>(
         default_upstream,
         listeners,
         max_body,
+        kernel,
         split,
     )
     .map_err(|(e, _)| e)
@@ -387,7 +404,10 @@ fn routing<T>(
 /// The upstream groups, the routes and the default group, checked: the routing of a managed version (see
 /// `managed::version`), and, through `routing`, that of a file without `managed`. A refusal also tells where in a
 /// managed version it is (see `At`): a refusal about two items is about the later one, and one about a rule that the
-/// routes break together is about the first route that breaks it.
+/// routes break together is about the first route that breaks it. The engine of a group is checked against `kernel`,
+/// whose default engine is the one of a group that names none.
+// One argument for each part of what the configuration file gives; a struct of them would only repeat their names.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn located<T>(
     resolve_timeout: Duration,
     upstreams: Groups<T>,
@@ -395,6 +415,7 @@ pub(crate) fn located<T>(
     default_upstream: &str,
     listeners: &[SocketAddr],
     max_body: usize,
+    kernel: &KernelSettings,
     split: impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
 ) -> Result<ForwardSettings, (ConfigError, Option<At>)> {
     let top = |key: &'static str| move |e: ConfigError| (e, Some(At::Top(key, None)));
@@ -414,8 +435,15 @@ pub(crate) fn located<T>(
         .map_err(top("upstreams"))?;
         let servers = servers(at, group.servers, listeners).map_err(placed)?;
         let tls = tls(at, group.tls, &servers, &split).map_err(placed)?;
-        groups.push(GroupConfig { name, servers, tls });
+        let engine = engine(at, group.engine, kernel).map_err(placed)?;
+        groups.push(GroupConfig {
+            name,
+            servers,
+            tls,
+            engine,
+        });
     }
+    engines_apart(&groups).map_err(placed)?;
     ensure(
         routes.len() <= MAX_ROUTES,
         "routes has more than 1024 entries",

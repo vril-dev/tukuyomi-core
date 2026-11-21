@@ -2,6 +2,7 @@ use std::fs;
 use std::sync::atomic::Ordering;
 
 use serde_json::json;
+use tukuyomi_kernel::Engine;
 
 use super::*;
 use crate::admin::managed::Op;
@@ -163,6 +164,67 @@ fn a_refused_version_leaves_current_and_a_job_whose_audit_line_cannot_be_written
     );
     assert_eq!(rig.proxy().orders.lock().unwrap().len(), orders);
     assert_eq!(current(&rig), Some(rig.first));
+}
+
+#[test]
+fn a_version_whose_engine_has_no_generation_chosen_is_not_put_in_force_by_name() {
+    let rig = rig(true);
+    // The main file names an inspector for ModSecurity; the rules store has a generation chosen for Coraza only.
+    rig.fixture.main_file(|m| {
+        m["kernel"]["engines"] =
+            json!({"modsecurity": {"inspector": "/opt/tukuyomi/inspector-modsecurity"}});
+    });
+    let mut version = bare_version();
+    version["upstreams"]["app"]["engine"] = json!("modsecurity");
+    let second = rig.fixture.version(&version);
+    let answer = activate(&rig, rig.first, second);
+    assert_eq!(
+        (answer.status, &answer.body["error"], &answer.body["at"]),
+        (
+            StatusCode::CONFLICT,
+            &json!("no generation is chosen for the engine of an upstream"),
+            &json!("upstreams.app.engine")
+        )
+    );
+    // The line of the audit log says it was denied for the engine, and the proxy is not asked or ordered.
+    let audit = rig.audit().pop().unwrap();
+    assert_eq!(
+        (
+            &audit["action"],
+            &audit["result"],
+            &audit["reason"],
+            &audit["target"]
+        ),
+        (
+            &json!("managed-activate"),
+            &json!("denied"),
+            &json!("engine"),
+            &json!(hex(&second))
+        )
+    );
+    assert!(rig.proxy().orders.lock().unwrap().is_empty());
+    assert_eq!(current(&rig), Some(rig.first));
+    // A record that cannot be told is a fault of the process: 500, with the sentence of the rules store.
+    let record = rig.fixture.rules().join("current.modsecurity");
+    fs::write(&record, "x").unwrap();
+    let answer = activate(&rig, rig.first, second);
+    assert_eq!(
+        (answer.status, &answer.body["error"]),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!("the current generation record is broken")
+        )
+    );
+    assert_eq!(current(&rig), Some(rig.first));
+    // Once a generation is chosen for ModSecurity, the same version is put in force.
+    fs::remove_file(&record).unwrap();
+    rig.fixture.choose_rules(Engine::ModSecurity);
+    assert_eq!(
+        activate(&rig, rig.first, second).status,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(rig.ended_job()["result"], "applied");
+    assert_eq!(current(&rig), Some(second));
 }
 
 #[test]

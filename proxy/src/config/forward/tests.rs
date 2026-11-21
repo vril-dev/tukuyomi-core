@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
+use tukuyomi_kernel::Engine;
+
 use super::*;
 
 fn server(address: &str) -> Value {
@@ -24,9 +26,36 @@ fn forward(group: Value) -> Value {
     })
 }
 
-fn load(value: Value) -> Result<ForwardSettings, ConfigError> {
+/// The kernel values of a file whose `kernel` object has these keys besides the ones every file has.
+fn kernel_with(extra: Value) -> KernelSettings {
+    let mut object = json!({
+        "inspector": "/opt/tukuyomi/inspector", "tmp_root": "/var/lib/tukuyomi/tmp", "gomaxprocs": 2,
+        "gomemlimit": 1073741824u64, "slots": 4, "wait_queue": 16, "records": 20, "discard_limit": 4,
+        "tick_ms": 100, "hello_wait_ms": 5000, "frame_io_ms": 1000, "verdict_wait_ms": 2000,
+        "wait_deadline_ms": 3000, "closed_wait_ms": 2000, "stop_after_ms": 2000, "drain_wait_ms": 1000,
+        "exit_wait_ms": 1000, "kill_grace_ms": 1000, "restarts": 3, "restart_window_ms": 60000,
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        object[key] = value.clone();
+    }
+    let raw = serde_json::from_value(object).unwrap();
+    super::super::kernel::settings(raw, std::path::Path::new("/var/lib/tukuyomi/rules")).unwrap()
+}
+
+/// The kernel values of a file that has an inspector for ModSecurity too.
+fn kernel_modsecurity(extra: Value) -> KernelSettings {
+    let mut extra = extra;
+    extra["engines"] = json!({"modsecurity": {"inspector": "/opt/tukuyomi/inspector-modsecurity"}});
+    kernel_with(extra)
+}
+
+fn load_with(value: Value, kernel: &KernelSettings) -> Result<ForwardSettings, ConfigError> {
     let raw: RawForward = serde_json::from_value(value).map_err(|e| super::super::refusal(&e))?;
-    check(raw, &[], 1 << 20)
+    check(raw, &[], 1 << 20, kernel)
+}
+
+fn load(value: Value) -> Result<ForwardSettings, ConfigError> {
+    load_with(value, &kernel_with(json!({})))
 }
 
 /// The group `g` with a server at `address` and this `tls`.
@@ -179,4 +208,134 @@ fn a_route_may_lower_the_limit_on_the_body_and_not_raise_it() {
     for bad in [Value::Null, json!("1024"), json!(-1)] {
         assert_eq!(refusal(with(bad.clone())), wrong, "{bad:?}");
     }
+}
+
+/// The groups `a` and `b`, with these two objects.
+fn two_groups(a: Value, b: Value) -> Value {
+    let mut object = forward(a);
+    object["upstreams"] = json!({"a": object["upstreams"]["g"].clone(), "b": b});
+    object["default_upstream"] = json!("a");
+    object
+}
+
+#[test]
+fn a_group_has_the_engine_it_names_or_the_default_one() {
+    let group = |engine: Value| {
+        let mut group = json!({"servers": [server("192.0.2.1:80")]});
+        if !engine.is_null() {
+            group["engine"] = engine;
+        }
+        forward(group)
+    };
+    let engine_of = |loaded: ForwardSettings| loaded.groups[0].engine;
+    let kernel = kernel_modsecurity(json!({}));
+    let named = |engine: &str| engine_of(load_with(group(json!(engine)), &kernel).unwrap());
+    assert_eq!(named("coraza"), Engine::Coraza);
+    assert_eq!(named("modsecurity"), Engine::ModSecurity);
+    // A group that names none has the default engine of the file.
+    assert_eq!(
+        engine_of(load_with(group(Value::Null), &kernel).unwrap()),
+        Engine::Coraza
+    );
+    let by_default = kernel_modsecurity(json!({"default_engine": "modsecurity"}));
+    assert_eq!(
+        engine_of(load_with(group(Value::Null), &by_default).unwrap()),
+        Engine::ModSecurity
+    );
+    assert_eq!(
+        engine_of(load_with(group(json!("coraza")), &by_default).unwrap()),
+        Engine::Coraza
+    );
+    // The name is the lowercase one, exactly, and a value that is not text is the wrong type.
+    let bad = "an upstream engine is not coraza or modsecurity";
+    for name in ["Coraza", ""] {
+        assert_eq!(
+            refusal(load_with(group(json!(name)), &kernel)),
+            bad,
+            "{name:?}"
+        );
+    }
+    let wrong = "configuration has a value of the wrong type";
+    for value in [json!(1), json!(["coraza"])] {
+        assert_eq!(refusal(load_with(group(value), &kernel)), wrong);
+    }
+}
+
+#[test]
+fn the_engine_of_a_group_needs_an_inspector_in_the_file() {
+    let group =
+        |engine: &str| forward(json!({"servers": [server("192.0.2.1:80")], "engine": engine}));
+    let missing = "kernel.engines has no inspector for the engine of an upstream";
+    assert_eq!(refusal(load(group("modsecurity"))), missing);
+    assert!(load(group("coraza")).is_ok());
+    assert!(load_with(group("modsecurity"), &kernel_modsecurity(json!({}))).is_ok());
+}
+
+#[test]
+fn two_groups_with_a_server_at_the_same_address_have_the_same_engine() {
+    let kernel = kernel_modsecurity(json!({}));
+    let one = |address: &str| json!({"servers": [server(address)], "engine": "coraza"});
+    let other = |servers: Vec<Value>, engine: &str| json!({"servers": servers, "engine": engine});
+    let apart = "two upstreams with a server at the same address have different engines";
+    let load = |value: Value| load_with(value, &kernel);
+    // The same address, written as a name or as an IP literal, is refused with another engine and taken with the
+    // same one; a different address, or the same name at another port, is taken with any.
+    assert_eq!(
+        refusal(load(two_groups(
+            one("192.0.2.1:80"),
+            other(vec![server("192.0.2.1:80")], "modsecurity")
+        ))),
+        apart
+    );
+    assert!(
+        load(two_groups(
+            one("192.0.2.1:80"),
+            other(vec![server("192.0.2.1:80")], "coraza")
+        ))
+        .is_ok()
+    );
+    assert!(
+        load(two_groups(
+            one("192.0.2.1:80"),
+            other(vec![server("192.0.2.1:81")], "modsecurity")
+        ))
+        .is_ok()
+    );
+    assert_eq!(
+        refusal(load(two_groups(
+            one("app.test:80"),
+            other(vec![server("app.test:80")], "modsecurity")
+        ))),
+        apart
+    );
+    // One server in common among several is enough, and an IPv4 address is the same address as its IPv6 form.
+    assert_eq!(
+        refusal(load(two_groups(
+            one("192.0.2.1:80"),
+            other(
+                vec![server("192.0.2.9:80"), server("192.0.2.1:80")],
+                "modsecurity"
+            )
+        ))),
+        apart
+    );
+    assert_eq!(
+        refusal(load(two_groups(
+            one("192.0.2.1:80"),
+            other(vec![server("[::ffff:192.0.2.1]:80")], "modsecurity")
+        ))),
+        apart
+    );
+    // A group that names no engine has the default one, and the check is made on that.
+    let by_default = |default: &str| {
+        load_with(
+            two_groups(
+                json!({"servers": [server("192.0.2.1:80")]}),
+                other(vec![server("192.0.2.1:80")], "modsecurity"),
+            ),
+            &kernel_modsecurity(json!({"default_engine": default})),
+        )
+    };
+    assert_eq!(refusal(by_default("coraza")), apart);
+    assert!(by_default("modsecurity").is_ok());
 }

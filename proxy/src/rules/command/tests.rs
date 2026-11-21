@@ -1,4 +1,7 @@
 use super::*;
+use crate::managed::store::tests::Fixture;
+use crate::rules::file_store::FileStore;
+use serde_json::json;
 
 const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -151,6 +154,33 @@ fn a_wrong_argument_is_a_usage_error() {
 }
 
 #[test]
+fn deactivate_takes_the_lowercase_name_of_one_engine() {
+    let config = "/etc/tukuyomi.json";
+    for (name, engine) in [
+        ("coraza", Engine::Coraza),
+        ("modsecurity", Engine::ModSecurity),
+    ] {
+        assert_eq!(
+            parse(&args(&["deactivate", config, name])),
+            Ok(Command::Deactivate {
+                config: PathBuf::from(config),
+                engine
+            })
+        );
+    }
+    let wrong = "the engine is not the name of an engine (coraza or modsecurity)";
+    for name in ["Coraza", ""] {
+        assert_eq!(refusal(&["deactivate", config, name]), wrong, "{name:?}");
+    }
+    let one = "deactivate takes one engine";
+    assert_eq!(refusal(&["deactivate", config]), one);
+    assert_eq!(
+        refusal(&["deactivate", config, "coraza", "modsecurity"]),
+        one
+    );
+}
+
+#[test]
 fn what_came_from_outside_is_written_with_every_byte_outside_ascii_escaped() {
     assert_eq!(
         escaped(b"tkv0-inspector: start: rules \"x\" 1/2"),
@@ -265,4 +295,96 @@ fn engine_names_the_engine_of_the_bundle_wherever_it_stands_and_is_coraza_when_l
         refusal(&["import", config, "--engine"]),
         "an option needs a value that does not start with --"
     );
+}
+
+/// Runs the command `text` and gives how it ended, the standard output and the standard error.
+fn command(text: &[&str]) -> (Exit, String, String) {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let exit = run(&args(text), &mut out, &mut err);
+    (
+        exit,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+/// The main file of `fixture` without `managed`, which has an inspector for ModSecurity and the one group `app`, which
+/// names `engine` if there is one and has the default engine if there is none. Gives its path.
+fn main_with(fixture: &Fixture, engine: Option<&str>) -> String {
+    let path = fixture.main_file(|m| {
+        m.as_object_mut().unwrap().remove("managed");
+        let mut group = json!({"servers": [{
+            "address": "127.0.0.1:9000", "weight": 1, "max_fails": 1, "fail_timeout_ms": 1000, "backup": false,
+        }]});
+        if let Some(engine) = engine {
+            group["engine"] = json!(engine);
+        }
+        m["forward"] = json!({
+            "resolve_timeout_ms": 1000, "upstreams": {"app": group}, "routes": [], "default_upstream": "app",
+        });
+        m["kernel"]["engines"] =
+            json!({"modsecurity": {"inspector": "/opt/tukuyomi/inspector-modsecurity"}});
+    });
+    path.to_str().unwrap().to_owned()
+}
+
+/// The fingerprints that `rules list` marks as chosen.
+fn marked(main: &str) -> Vec<String> {
+    let (exit, out, err) = command(&["list", main]);
+    assert_eq!(exit, Exit::Done, "{err}");
+    out.lines()
+        .filter(|line| line.ends_with(" current"))
+        .map(|line| line.split(' ').next().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn each_engine_has_the_generation_chosen_for_it_and_deactivate_leaves_an_engine_with_none() {
+    let fixture = Fixture::new();
+    let main = main_with(&fixture, None);
+    // The rules store has a generation chosen for Coraza, and one chosen for ModSecurity: the list marks both.
+    fixture.choose_rules(Engine::ModSecurity);
+    let store = FileStore::open(&fixture.rules()).unwrap();
+    let chosen = |engine| store.current(engine).unwrap().unwrap().hex();
+    let (coraza, modsecurity) = (chosen(Engine::Coraza), chosen(Engine::ModSecurity));
+    assert_ne!(coraza, modsecurity);
+    let mut both = vec![coraza.clone(), modsecurity.clone()];
+    both.sort();
+    let mut seen = marked(&main);
+    seen.sort();
+    assert_eq!(seen, both);
+
+    // The default engine is Coraza and no group names ModSecurity: ModSecurity can be left with none.
+    let (exit, out, err) = command(&["deactivate", &main, "modsecurity"]);
+    assert_eq!(
+        (exit, out, err),
+        (
+            Exit::Done,
+            format!("{modsecurity} deactivated\n"),
+            String::new()
+        )
+    );
+    assert_eq!(marked(&main), std::slice::from_ref(&coraza));
+    // The default engine is used by the group `app`, and an engine with none chosen has nothing to leave.
+    let (exit, out, err) = command(&["deactivate", &main, "coraza"]);
+    let uses = "rules deactivate: the configuration uses the engine\n";
+    assert_eq!((exit, out.as_str(), err.as_str()), (Exit::Failed, "", uses));
+    assert_eq!(marked(&main), std::slice::from_ref(&coraza));
+    let (exit, out, err) = command(&["deactivate", &main, "modsecurity"]);
+    let none = "rules deactivate: no generation is chosen\n";
+    assert_eq!((exit, out.as_str(), err.as_str()), (Exit::Failed, "", none));
+    // `activate` chooses a generation for its engine again, and a group that names the engine uses it.
+    let (exit, out, err) = command(&["activate", &main, &modsecurity]);
+    assert_eq!(
+        (exit, out, err),
+        (
+            Exit::Done,
+            format!("{modsecurity} current\n"),
+            String::new()
+        )
+    );
+    let main = main_with(&fixture, Some("modsecurity"));
+    let (exit, out, err) = command(&["deactivate", &main, "modsecurity"]);
+    assert_eq!((exit, out.as_str(), err.as_str()), (Exit::Failed, "", uses));
+    assert_eq!(chosen(Engine::ModSecurity), modsecurity);
 }

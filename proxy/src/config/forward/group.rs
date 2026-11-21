@@ -1,7 +1,7 @@
 //! The groups of `upstreams` as they are written, and what is checked of them: the name of a group, the address of a
-//! server, and the `tls` of a group.
+//! server, the `tls` of a group, and its `engine`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -11,9 +11,12 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, Deserializer, Error, MapAccess, Visitor};
 use serde_json::Value;
+use tukuyomi_kernel::Engine;
 
-use super::{Address, At, ServerConfig};
-use crate::config::{ConfigError, MAX_STORE_DIR, Object, clean_abs, ensure, millis, same};
+use super::{Address, At, GroupConfig, ServerConfig};
+use crate::config::{
+    ConfigError, KernelSettings, MAX_STORE_DIR, Object, clean_abs, ensure, millis, same,
+};
 use crate::forward::tls::{self, Authorities, Settings};
 use crate::route::parse_port;
 
@@ -30,6 +33,8 @@ pub(super) struct RawGroup<T> {
     pub(super) servers: Vec<Object<RawServer>>,
     #[serde(default, deserialize_with = "crate::config::present")]
     pub(super) tls: Option<Object<T>>,
+    #[serde(default, deserialize_with = "crate::config::present")]
+    pub(super) engine: Option<String>,
 }
 
 /// The `tls` of a group that names the file of its authorities by its path.
@@ -268,4 +273,75 @@ pub(super) fn tls<T>(
         authorities,
         server_name,
     }))
+}
+
+/// The engine that inspects the requests to the group at `group`: the one `raw` names, `coraza` or `modsecurity`, or
+/// the default of the configuration when the group names none. The configuration must have an inspector for it.
+pub(super) fn engine(
+    group: usize,
+    raw: Option<String>,
+    kernel: &KernelSettings,
+) -> Result<Engine, (ConfigError, At)> {
+    let at = At::Group(group, Some("engine"));
+    let engine = match raw {
+        None => kernel.default_engine(),
+        Some(name) => Engine::parse(&name).ok_or((
+            ConfigError("an upstream engine is not coraza or modsecurity"),
+            at,
+        ))?,
+    };
+    kernel.check_engine(engine).map_err(|_| {
+        (
+            ConfigError("kernel.engines has no inspector for the engine of an upstream"),
+            at,
+        )
+    })?;
+    Ok(engine)
+}
+
+/// Where a server is, as two groups can be told to have the same one: an IP literal in its canonical form (an IPv4
+/// address written as IPv6 is the IPv4 address) and the port, or a name and the port. Two names that come to the same
+/// address are not told apart.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Backend<'a> {
+    Literal(SocketAddr),
+    Name(&'a str, u16),
+}
+
+impl<'a> Backend<'a> {
+    fn of(address: &'a Address) -> Backend<'a> {
+        match address {
+            Address::Literal(literal) => {
+                Backend::Literal(SocketAddr::new(literal.ip().to_canonical(), literal.port()))
+            }
+            Address::Name { name, port } => Backend::Name(name, *port),
+        }
+    }
+}
+
+/// Checks that no two groups that have a server at the same address have different engines: a request reaches the
+/// backend through whichever of its groups the client's `Host` chooses, so the weakest engine and mode among them
+/// would be its protection. The refusal is about the engine of the later group.
+pub(super) fn engines_apart(
+    groups: &[GroupConfig<Address, Settings>],
+) -> Result<(), (ConfigError, At)> {
+    let mut seen = BTreeMap::new();
+    for (at, group) in groups.iter().enumerate() {
+        for server in &group.servers {
+            let backend = Backend::of(&server.address);
+            if seen
+                .get(&backend)
+                .is_some_and(|engine| *engine != group.engine)
+            {
+                return Err((
+                    ConfigError(
+                        "two upstreams with a server at the same address have different engines",
+                    ),
+                    At::Group(at, Some("engine")),
+                ));
+            }
+            seen.insert(backend, group.engine);
+        }
+    }
+    Ok(())
 }

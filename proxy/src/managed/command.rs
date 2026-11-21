@@ -61,6 +61,7 @@ use crate::config::{self, Built};
 use crate::inbound::transport::tls::{Fault, read_file};
 use crate::log::{Log, escaped};
 use crate::rules::bundle::{Fingerprint, hex};
+use crate::rules::store::UNCHOSEN;
 use crate::run::{EXIT_FAILED, host, read_parts};
 
 const USAGE: &str = "usage: tukuyomi-proxy managed import <config> <document>\n       tukuyomi-proxy managed activate <config> <version>\n       tukuyomi-proxy managed remove <config> <version>\n       tukuyomi-proxy managed list <config>";
@@ -259,13 +260,32 @@ fn activate(config: &Path, version: [u8; 32], out: &mut dyn Write, log: &Log) ->
         }
     };
     // The check comes before the store chooses: a version that the proxy would refuse is never the chosen one.
-    if let Err(refusal) = read_parts(config, &Choice::Named(version), NAME, log) {
-        return if refusal.exit() == EXIT_FAILED {
-            Exit::Failed
-        } else {
-            Exit::Usage
-        };
+    let parts = match read_parts(config, &Choice::Named(version), NAME, log) {
+        Ok(parts) => parts,
+        Err(refusal) => {
+            return if refusal.exit() == EXIT_FAILED {
+                Exit::Failed
+            } else {
+                Exit::Usage
+            };
+        }
+    };
+    // So is a version whose groups have an engine for which the rules store has no generation chosen.
+    match parts.unchosen() {
+        Ok(None) => {}
+        Ok(Some(group)) => {
+            log.line(&format!(
+                "{NAME}: rules store refused: {UNCHOSEN} (upstream {group})"
+            ));
+            return Exit::Failed;
+        }
+        Err(e) => {
+            log.line(&format!("{NAME}: rules store refused: {}", e.0));
+            return Exit::Failed;
+        }
     }
+    // The shared lock on the version is given back before the store chooses.
+    drop(parts);
     match store.choose(version) {
         Ok(()) => {
             result(out, &format!("{} current", hex(&version)));

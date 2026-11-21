@@ -95,9 +95,12 @@ fn a_file_with_another_value_that_cannot_change_is_refused_by_the_first_such_key
 #[test]
 fn a_file_with_managed_keeps_its_dir_and_may_read_another_version() {
     let (one, two) = (Fixture::new(), Fixture::new());
+    // Both read the rules store of the first, so that the managed store is the one thing that differs.
+    let rules = one.rules();
     let fixed = |fixture: &Fixture| {
         fixture.current(&fixture.plain_version(b"chain", b"key"));
-        Fixed::of(&config::load(&fixture.main_file(|_| {})).unwrap())
+        let main = fixture.main_file(|m| m["rules"]["store"]["dir"] = json!(rules));
+        Fixed::of(&config::load(&main).unwrap())
     };
     let running = fixed(&one);
     let mut other = one.plain_version(b"chain", b"key");

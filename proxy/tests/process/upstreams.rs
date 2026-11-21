@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::support::*;
 
-fn get_for(host: &str, path: &str) -> Vec<u8> {
+pub(crate) fn get_for(host: &str, path: &str) -> Vec<u8> {
     format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
 }
 

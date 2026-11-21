@@ -2,8 +2,11 @@ use std::future::Future;
 use std::sync::Mutex;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tukuyomi_kernel::{Engine, Phase};
 
 use super::*;
+use crate::inspect::driver::State;
+use crate::rules::bundle::{Fingerprint, Mode};
 use crate::run::signals::tests::runtime;
 
 const METRICS: &str = "tukuyomi_test_total 1\n";
@@ -282,15 +285,46 @@ fn dropping_the_status_closes_the_listener() {
 }
 
 #[test]
-fn the_proxy_is_ready_only_when_it_is_bound_not_stopping_and_the_kernel_is_ready() {
+fn the_proxy_is_ready_only_when_it_is_bound_not_stopping_and_every_kernel_is_ready() {
+    // The kernels of the engines that run, in these phases.
+    let kernels = |coraza: Phase, modsecurity: Option<Phase>| {
+        let state = |engine: Engine, phase: Phase| State {
+            phase,
+            restarts: 0,
+            generation: Fingerprint::from_hex(&[b'a'; 64]).unwrap(),
+            engine,
+            mode: Mode::Block,
+        };
+        let mut states = States::none();
+        states.set(Engine::Coraza, Some(state(Engine::Coraza, coraza)));
+        states.set(
+            Engine::ModSecurity,
+            modsecurity.map(|phase| state(Engine::ModSecurity, phase)),
+        );
+        states
+    };
     let readiness = Readiness::new();
-    assert_eq!(readiness.check(Phase::Starting), Err("starting"));
-    assert_eq!(readiness.check(Phase::Ready), Err("starting"));
+    let ready = kernels(Phase::Ready, Some(Phase::Ready));
+    assert_eq!(
+        readiness.check(&kernels(Phase::Starting, None)),
+        Err("starting")
+    );
+    assert_eq!(readiness.check(&ready), Err("starting"));
     readiness.bound();
-    assert_eq!(readiness.check(Phase::Ready), Ok(()));
-    // The restart of the inspector, and a kernel that failed.
-    assert_eq!(readiness.check(Phase::Starting), Err("inspector down"));
-    assert_eq!(readiness.check(Phase::Stopping), Err("inspector down"));
+    assert_eq!(readiness.check(&ready), Ok(()));
+    // An engine that does not run is not waited for.
+    assert_eq!(readiness.check(&kernels(Phase::Ready, None)), Ok(()));
+    // The restart of an inspector, and a kernel that failed, of either engine: one that serves is not enough.
+    for phase in [Phase::Starting, Phase::Stopping] {
+        assert_eq!(
+            readiness.check(&kernels(phase, Some(Phase::Ready))),
+            Err("inspector down")
+        );
+        assert_eq!(
+            readiness.check(&kernels(Phase::Ready, Some(phase))),
+            Err("inspector down")
+        );
+    }
     readiness.stopping();
-    assert_eq!(readiness.check(Phase::Ready), Err("stopping"));
+    assert_eq!(readiness.check(&ready), Err("stopping"));
 }

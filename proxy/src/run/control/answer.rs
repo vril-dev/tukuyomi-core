@@ -89,6 +89,7 @@ pub(in crate::run) struct Figures {
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::run) enum Answer {
     Status {
+        /// The state of the default engine, as the status of a proxy of an older version has it (see `engines`).
         generation: Fingerprint,
         mode: &'static str,
         engine: &'static str,
@@ -97,11 +98,14 @@ pub(in crate::run) enum Answer {
         reloading: bool,
         ready: bool,
         figures: Figures,
+        /// The engines that run, in the order of their names, with the generation each serves.
+        engines: Vec<EngineLine>,
     },
     Switch {
         outcome: Outcome,
         reason: Option<&'static str>,
-        generation: Fingerprint,
+        /// The generation that serves the engine of the order, none if the engine does not run.
+        generation: Option<Fingerprint>,
     },
     /// The answer to a reload order, with the SHA-256 of the main file and the managed version in force when it is
     /// given.
@@ -111,6 +115,15 @@ pub(in crate::run) enum Answer {
         managed: Option<[u8; 32]>,
     },
     Error(&'static str),
+}
+
+/// The state of one engine that runs, as a status answer shows it.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::run) struct EngineLine {
+    pub(in crate::run) engine: &'static str,
+    pub(in crate::run) generation: Fingerprint,
+    pub(in crate::run) mode: &'static str,
+    pub(in crate::run) phase: &'static str,
 }
 
 /// The answer to a reload order, written by the JSON writer with its keys in this order: `config` only for `replaced`,
@@ -152,8 +165,9 @@ impl Answer {
                 reloading,
                 ready,
                 figures,
+                engines,
             } => format!(
-                "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"engine\":\"{engine}\",\"phase\":\"{phase}\",\"switching\":{switching},\"reloading\":{reloading},\"ready\":{ready},\"uptime_ms\":{},\"requests\":{},\"blocked\":{},\"policy_refused\":{},\"upstream_failures\":{},\"config\":\"{}\",\"managed\":{},\"resolve_timeout_ms\":{},\"config_reloads\":{{\"replaced\":{},\"refused\":{}}}}}\n",
+                "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"engine\":\"{engine}\",\"phase\":\"{phase}\",\"switching\":{switching},\"reloading\":{reloading},\"ready\":{ready},\"uptime_ms\":{},\"requests\":{},\"blocked\":{},\"policy_refused\":{},\"upstream_failures\":{},\"config\":\"{}\",\"managed\":{},\"resolve_timeout_ms\":{},\"config_reloads\":{{\"replaced\":{},\"refused\":{}}},\"engines\":[{}]}}\n",
                 generation.hex(),
                 figures.uptime_ms,
                 figures.requests,
@@ -166,25 +180,36 @@ impl Answer {
                     .map_or_else(|| "null".to_owned(), |name| format!("\"{}\"", hex(&name))),
                 figures.resolve_timeout_ms,
                 figures.config_replaced,
-                figures.config_refused
+                figures.config_refused,
+                engines
+                    .iter()
+                    .map(|line| format!(
+                        "{{\"engine\":\"{}\",\"generation\":\"{}\",\"mode\":\"{}\",\"phase\":\"{}\"}}",
+                        line.engine,
+                        line.generation.hex(),
+                        line.mode,
+                        line.phase
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
             ),
             Answer::Switch {
                 outcome,
                 reason: Some(reason),
                 generation,
             } => format!(
-                "{{\"result\":\"{}\",\"reason\":\"{reason}\",\"generation\":\"{}\"}}\n",
+                "{{\"result\":\"{}\",\"reason\":\"{reason}\",\"generation\":{}}}\n",
                 outcome.word(),
-                generation.hex()
+                quoted(*generation)
             ),
             Answer::Switch {
                 outcome,
                 reason: None,
                 generation,
             } => format!(
-                "{{\"result\":\"{}\",\"generation\":\"{}\"}}\n",
+                "{{\"result\":\"{}\",\"generation\":{}}}\n",
                 outcome.word(),
-                generation.hex()
+                quoted(*generation)
             ),
             Answer::Reload {
                 reloaded,
@@ -211,19 +236,28 @@ impl Answer {
     }
 }
 
-/// The record line of an answer to a switch order. `serving` is the generation that serves then.
+/// A generation as a JSON value: the 64 digits in quotes, or `null` for none.
+fn quoted(generation: Option<Fingerprint>) -> String {
+    generation.map_or_else(
+        || "null".to_owned(),
+        |generation| format!("\"{}\"", generation.hex()),
+    )
+}
+
+/// The record line of an answer to a switch order. `serving` is the generation that serves the engine of the order
+/// then, none if it does not run.
 pub(super) fn switch_line(
     expect: Fingerprint,
     outcome: Outcome,
     reason: Option<&'static str>,
-    serving: Fingerprint,
+    serving: Option<Fingerprint>,
 ) -> String {
     let why = reason.map_or_else(String::new, |reason| format!(" ({reason})"));
     format!(
         "control: switch expect {}: {}{why}, serving {}",
         expect.hex(),
         outcome.word(),
-        serving.hex()
+        serving.map_or_else(|| "none".to_owned(), |generation| generation.hex())
     )
 }
 

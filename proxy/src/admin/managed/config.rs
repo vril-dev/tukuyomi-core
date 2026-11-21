@@ -107,6 +107,7 @@ static TOP: Shown = Object(&[
                 Named(&Object(&[
                     ("servers", Plain),
                     ("tls", Object(&[("ca_file", Path), ("server_name", Plain)])),
+                    ("engine", Plain),
                 ])),
             ),
             ("routes", Plain),
@@ -121,6 +122,7 @@ static TOP: Shown = Object(&[
                 "engines",
                 Object(&[("modsecurity", Object(&[("inspector", Path)]))]),
             ),
+            ("default_engine", Plain),
             ("tmp_root", Path),
             ("gomaxprocs", Plain),
             ("gomemlimit", Plain),

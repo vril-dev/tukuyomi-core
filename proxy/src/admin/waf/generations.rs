@@ -4,16 +4,42 @@
 use http::StatusCode;
 use serde_json::{Map, Value, json};
 
+use super::control::Seen;
 use super::history::rollback_target;
 use super::{Caller, GENERATION, Waf, conflict, failed, not_found, refused};
 use crate::admin::audit::Outcome;
 use crate::admin::password::hex;
 use crate::admin::server::Answer;
 use crate::rules::bundle::Fingerprint;
+use crate::rules::store::{ENGINES, RuleStore, StoreError};
 
 /// The generation that `path`, a path below `/api/generations/`, names.
 fn fingerprint_of(path: &str) -> Option<Fingerprint> {
     Fingerprint::from_hex(path.strip_prefix(GENERATION)?.as_bytes())
+}
+
+/// The generations that the proxy serves, one for each engine that it runs; the one of a proxy that does not report
+/// its engines (an older version).
+fn serving_of(proxy: &Seen) -> Vec<Fingerprint> {
+    match proxy.state() {
+        Some(status) => match status.engines {
+            Some(engines) => engines
+                .running()
+                .map(|(_, state)| state.generation)
+                .collect(),
+            None => vec![status.generation],
+        },
+        None => Vec::new(),
+    }
+}
+
+/// The generations chosen for the engines, which `current` of a generation is told by.
+fn chosen(store: &dyn RuleStore) -> Result<Vec<Fingerprint>, StoreError> {
+    let mut chosen = Vec::new();
+    for engine in ENGINES {
+        chosen.extend(store.current(engine)?);
+    }
+    Ok(chosen)
 }
 
 impl Waf {
@@ -22,12 +48,12 @@ impl Waf {
             Ok(store) => store,
             Err(answer) => return answer,
         };
-        let (list, current) = match (store.list(), store.current()) {
+        let (list, current) = match (store.list(), chosen(store.as_ref())) {
             (Ok(list), Ok(current)) => (list, current),
             (Err(e), _) | (_, Err(e)) => return failed(e),
         };
         let proxy = self.control.status();
-        let serving = proxy.state().map(|status| status.generation);
+        let serving = serving_of(&proxy);
         let items: Vec<Value> = list
             .iter()
             .rev()
@@ -43,8 +69,8 @@ impl Waf {
                     "mode": mode,
                     "engine": engine,
                     "routes": routes,
-                    "current": current == Some(g.fingerprint),
-                    "serving": serving == Some(g.fingerprint),
+                    "current": current.contains(&g.fingerprint),
+                    "serving": serving.contains(&g.fingerprint),
                 })
             })
             .collect();
@@ -62,7 +88,7 @@ impl Waf {
             Ok(store) => store,
             Err(answer) => return answer,
         };
-        let (list, current) = match (store.list(), store.current()) {
+        let (list, current) = match (store.list(), chosen(store.as_ref())) {
             (Ok(list), Ok(current)) => (list, current),
             (Err(e), _) | (_, Err(e)) => return failed(e),
         };
@@ -73,11 +99,7 @@ impl Waf {
             Ok(manifest) => manifest,
             Err(e) => return failed(e),
         };
-        let serving = self
-            .control
-            .status()
-            .state()
-            .map(|status| status.generation);
+        let serving = serving_of(&self.control.status());
         let files: Vec<Value> = manifest
             .files()
             .iter()
@@ -104,8 +126,8 @@ impl Waf {
                 "made": entry.made,
                 "mode": manifest.mode().name(),
                 "engine": manifest.engine().name(),
-                "current": current == Some(fingerprint),
-                "serving": serving == Some(fingerprint),
+                "current": current.contains(&fingerprint),
+                "serving": serving.contains(&fingerprint),
                 "load": load,
                 "files": files,
                 "routes": routes,
@@ -131,20 +153,29 @@ impl Waf {
             Ok(_) => return not_found(),
             Err(e) => return failed(e),
         }
-        let chosen = match store.current() {
-            Ok(Some(current)) if current == generation => {
+        // A generation whose manifest cannot be read is chosen for no engine that can be told; the store refuses to
+        // remove it if a record names it all the same.
+        let engine = store.engine(generation).ok();
+        let chosen = match engine.map(|engine| store.current(engine)) {
+            Some(Ok(Some(current))) if current == generation => {
                 self.note(caller, "remove", Outcome::Denied, "chosen", &hex);
                 return conflict("the generation is the one the rules store chooses");
             }
-            Ok(current) => current,
-            Err(e) => return failed(e),
+            Some(Ok(current)) => current,
+            Some(Err(e)) => return failed(e),
+            None => None,
         };
         // A rollback has a target only while the history ends at the chosen generation.
         let lines = match self.lines() {
             Ok(lines) => lines,
             Err(answer) => return answer,
         };
-        if chosen.is_some_and(|chosen| rollback_target(&lines, chosen) == Ok(generation)) {
+        // The target of the rollback of the engine of the generation: a generation that the history of another engine
+        // goes back to is not held by it.
+        let held = engine.zip(chosen).is_some_and(|(engine, chosen)| {
+            rollback_target(&lines, chosen, engine, |g| store.engine(g).ok()) == Ok(generation)
+        });
+        if held {
             self.note(caller, "remove", Outcome::Denied, "rollback target", &hex);
             return conflict("the generation is the target of a rollback");
         }

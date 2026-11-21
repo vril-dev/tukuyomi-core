@@ -11,8 +11,8 @@
 //!
 //! The pages: `/healthz` is 200 `ok` as long as the process answers; `/readyz` is 200 `ready`, or 503 and a word that
 //! says why not (`stopping` from the first cause of a stop, then `starting` until the forwarding listeners are bound,
-//! then `inspector down` while the kernel that serves is not in the phase `Ready`, as in the restart of the
-//! inspector; a switch to another generation keeps it ready); `/metrics` is the text of `metrics`. A `HEAD` has the
+//! then `inspector down` while the kernel of any engine that runs is not in the phase `Ready`, as in the restart of
+//! an inspector; a switch to another generation keeps it ready); `/metrics` is the text of `metrics`. A `HEAD` has the
 //! status and the fields of the `GET` and no body. Another method is 405 (with `Allow`), another target, a query
 //! included, is 404. HTTP/1.1 only: a head that is not one (HTTP/1.0 included), that `httparse` refuses, or that is
 //! not complete in 4 KiB is 400; a head that is not complete within 2 s, or a client that is gone, gets no answer.
@@ -29,16 +29,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
+use crate::inbound::conn::Shared;
+use crate::inbound::session::send_and_close;
+use crate::inspect::engines::States;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
-use tukuyomi_kernel::Phase;
-
-use crate::inbound::conn::Shared;
-use crate::inbound::session::send_and_close;
-use crate::inspect::driver::State;
 
 mod metrics;
 
@@ -82,14 +80,14 @@ impl Readiness {
         self.stopping.store(true, Ordering::Release);
     }
 
-    /// `Ok` if requests can be served: the stop has not begun, the forwarding listeners are bound and the kernel that
-    /// serves is in `phase` `Ready`. Otherwise the word that says why not.
-    pub(super) fn check(&self, phase: Phase) -> Result<(), &'static str> {
+    /// `Ok` if requests can be served: the stop has not begun, the forwarding listeners are bound and the kernel of
+    /// every engine that runs is in the phase `Ready`. Otherwise the word that says why not.
+    pub(super) fn check(&self, states: &States) -> Result<(), &'static str> {
         if self.stopping.load(Ordering::Acquire) {
             Err("stopping")
         } else if !self.bound.load(Ordering::Acquire) {
             Err("starting")
-        } else if phase != Phase::Ready {
+        } else if !states.all_ready() {
             Err("inspector down")
         } else {
             Ok(())
@@ -115,7 +113,7 @@ pub(super) struct View {
     wait_queue: usize,
     /// The byte budget `shared` holds was made for this many bytes.
     max_buffered_bytes: usize,
-    state: watch::Receiver<State>,
+    state: watch::Receiver<States>,
     readiness: Arc<Readiness>,
 }
 
@@ -124,7 +122,7 @@ impl View {
         shared: Arc<Shared>,
         wait_queue: usize,
         max_buffered_bytes: usize,
-        state: watch::Receiver<State>,
+        state: watch::Receiver<States>,
         readiness: Arc<Readiness>,
     ) -> View {
         View {
@@ -139,25 +137,23 @@ impl View {
 
 impl Source for View {
     fn ready(&self) -> Result<(), &'static str> {
-        let phase = self.state.borrow().phase;
-        self.readiness.check(phase)
+        let states = *self.state.borrow();
+        self.readiness.check(&states)
     }
 
     fn metrics(&self) -> String {
         let shared = &self.shared;
         let setup = shared.setup.current();
-        let state = *self.state.borrow();
+        let states = *self.state.borrow();
         metrics::render(&metrics::Scrape {
             counters: &shared.counters,
-            state,
+            states,
             connections_open: shared.counters.open.get(),
             permit_waits: shared.ingress.drains(),
             body_buffer_bytes: self
                 .max_buffered_bytes
                 .saturating_sub(shared.budget.available_permits()),
-            inspections_waiting: self
-                .wait_queue
-                .saturating_sub(shared.inspect.available_permits()),
+            inspections_waiting: shared.gates.waiting(self.wait_queue),
             upstream_failures: setup.upstreams.failures().collect(),
             rate_limit_keys: setup.scopes.keys(),
             rate_limit_evicted: setup.scopes.evicted(),

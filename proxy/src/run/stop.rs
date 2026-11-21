@@ -50,7 +50,7 @@ impl Cause {
             | Event::ConfigurationLost
             | Event::Reload
             | Event::Certificates
-            | Event::Switched(_)
+            | Event::Switched { .. }
             | Event::Control(_)
             | Event::Conn(_)
             | Event::AcceptErr(_)
@@ -112,7 +112,7 @@ impl Stop {
             Event::Certificates => log.line("reload: certificates ignored while stopping"),
             Event::Lost(_)
             | Event::Ready(_)
-            | Event::Switched(_)
+            | Event::Switched { .. }
             | Event::Configured(_)
             | Event::ConfigurationLost
             | Event::Control(_)

@@ -10,6 +10,8 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use tukuyomi_kernel::Engine;
+
 use super::host;
 use super::reload::Fixed;
 use super::serve::run;
@@ -24,13 +26,13 @@ use crate::forward::tls::{self, Authorities, Fault};
 use crate::inbound::challenge::Challenge;
 use crate::inbound::session::RequestIds;
 use crate::inbound::transport::tls::{Files, Tls};
+use crate::inspect::driver::Start;
 use crate::log::Log;
 use crate::log::sink::RecordFile;
 use crate::managed::{self, Choice, LoadError};
-use crate::rules::bundle::{Fingerprint, Mode, hex};
+use crate::rules::bundle::{Mode, hex};
 use crate::rules::command;
-use crate::rules::routes::Routes;
-use crate::rules::store;
+use crate::rules::store::{self, StoreError, engines_from};
 use crate::rules::switch::Switcher;
 
 pub(super) const EXIT_OK: u8 = 0;
@@ -101,10 +103,7 @@ pub fn start(log: &Log) -> u8 {
         forward,
         tls,
         challenge,
-        kernel,
-        generation,
-        mode,
-        routes,
+        starts,
         switcher,
         status,
         records,
@@ -159,10 +158,7 @@ pub fn start(log: &Log) -> u8 {
         forward,
         tls,
         challenge,
-        kernel,
-        generation,
-        mode,
-        routes,
+        starts,
         switcher,
         ids,
         status,
@@ -184,11 +180,10 @@ struct Prepared {
     forward: ForwardConfig,
     tls: Tls,
     challenge: Option<Challenge>,
-    kernel: tukuyomi_kernel::Config,
-    generation: Fingerprint,
-    mode: Mode,
-    routes: Routes,
-    /// Keeps the hold on `generation`, and the store for the switches.
+    /// The kernels to start with, one for each engine that runs: the generation chosen for it, what its rules do, its
+    /// routes and its kernel configuration.
+    starts: Vec<Start>,
+    /// Keeps the holds on the generations, and the store for the switches.
     switcher: Switcher,
     /// Where the status listener is bound, if the configuration has one.
     status: Option<StatusConfig>,
@@ -232,6 +227,17 @@ pub(crate) struct Parts {
     pub(super) hold: Option<managed::Hold>,
 }
 
+impl Parts {
+    /// The name of the first group whose engine has no generation chosen in the rules store; none when every group
+    /// has.
+    pub(crate) fn unchosen(&self) -> Result<Option<&str>, StoreError> {
+        let rules = store::open(&self.store)?;
+        let engines = self.forward.groups.iter().map(|group| group.engine);
+        let at = store::unchosen(rules.as_ref(), engines)?;
+        Ok(at.map(|at| self.forward.groups[at].name.as_str()))
+    }
+}
+
 /// The part of a reading of the configuration that refused it. Its word is the `reason` of a reload order of the
 /// control socket that the reading refused (see `control`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,7 +252,8 @@ pub(super) enum Reason {
     Upstream,
     /// A certificate or key file: of a listener, of a site or of the way to the admin process.
     Tls,
-    /// A value that cannot change while the proxy runs (see `reload::Fixed`), `managed` being there or not included.
+    /// A value that cannot change while the proxy runs (see `reload::Fixed`), `managed` being there or not included,
+    /// and an upstream group that names an engine that does not serve: the reading starts no inspector.
     Fixed,
     /// The address of a new listener cannot be bound.
     Listener,
@@ -368,6 +375,7 @@ pub(crate) fn read_parts(
             host: route.host.clone(),
             access: route.access.clone(),
             server: admin.listen,
+            engine: loaded.kernel.default_engine(),
         });
     let route = loaded.admin_route.as_ref().map(|route| &route.certificate);
     let loaded_tls = match &loaded.version {
@@ -413,92 +421,83 @@ pub(crate) fn read_parts(
     })
 }
 
-/// The steps of start-up from the configuration to the kernel configuration of the chosen generation, the hold on it
-/// and the one on the managed version included. `name` is at the head of each line: `start` for the start, `config
+/// The steps of start-up from the configuration to the kernel configuration of the generation chosen for each engine,
+/// the holds on them and the one on the managed version included. The engines that start are those that have a
+/// generation chosen and an inspector in the configuration, the default engine first; the engine of an upstream group
+/// and the default engine have to be among them. `name` is at the head of each line: `start` for the start, `config
 /// check` for the command of that name. A refusal is a line, and its exit code is the error.
 fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
     let parts = read_parts(path, &Choice::Current, name, log).map_err(|refusal| refusal.exit())?;
     if let Some(version) = parts.managed {
         log.line(&format!("{name}: managed version {}", hex(&version)));
     }
-    let rules = match store::open(&parts.store) {
-        Ok(rules) => rules,
-        Err(e) => {
-            log.line(&format!("{name}: rules store refused: {}", e.0));
-            return Err(EXIT_FAILED);
-        }
+    let refused = |why: &str| {
+        log.line(&format!("{name}: rules store refused: {why}"));
+        EXIT_FAILED
     };
-    let generation = match rules.current() {
-        Ok(Some(generation)) => generation,
-        Ok(None) => {
-            log.line(&format!(
-                "{name}: rules store refused: no generation is chosen"
-            ));
-            return Err(EXIT_FAILED);
-        }
-        Err(e) => {
-            log.line(&format!("{name}: rules store refused: {}", e.0));
-            return Err(EXIT_FAILED);
-        }
+    let rules = store::open(&parts.store).map_err(|e| refused(e.0))?;
+    let default = parts.kernel.default_engine();
+    let used = |engine: Engine| {
+        engine == default
+            || parts
+                .forward
+                .groups
+                .iter()
+                .any(|group| group.engine == engine)
     };
-    // The hold comes before the directory is looked at: a removal that has finished is found there, and one that
-    // is going on keeps the hold from being taken.
-    let hold = match rules.hold(generation) {
-        Ok(hold) => hold,
-        Err(e) => {
-            log.line(&format!("{name}: rules store refused: {}", e.0));
-            return Err(EXIT_FAILED);
+    let mut starts = Vec::new();
+    let mut held = Vec::new();
+    // The lines of the engines come after the last refusal, so that a refusal is not preceded by lines about an
+    // engine that passed.
+    let mut said = Vec::new();
+    for engine in engines_from(default) {
+        let chosen = rules.current(engine).map_err(|e| refused(e.0))?;
+        let Some(generation) = chosen else {
+            if used(engine) {
+                return Err(refused("no generation is chosen"));
+            }
+            continue;
+        };
+        if parts.kernel.check_engine(engine).is_err() {
+            // An engine that nothing uses and the configuration has no inspector for is not started.
+            continue;
         }
-    };
-    let dir = match rules.generation_dir(generation) {
-        Ok(dir) => dir,
-        Err(e) => {
-            log.line(&format!("{name}: rules store refused: {}", e.0));
-            return Err(EXIT_FAILED);
-        }
-    };
-    let engine = match rules.engine(generation) {
-        Ok(engine) => engine,
-        Err(e) => {
-            log.line(&format!("{name}: rules store refused: {}", e.0));
-            return Err(EXIT_FAILED);
-        }
-    };
-    let mode = match rules.mode(generation) {
-        Ok(mode) => mode,
-        Err(e) => {
-            log.line(&format!("{name}: rules store refused: {}", e.0));
-            return Err(EXIT_FAILED);
-        }
-    };
-    let routes = match rules.routes(generation) {
-        Ok(routes) => routes,
-        Err(e) => {
-            log.line(&format!("{name}: rules store refused: {}", e.0));
-            return Err(EXIT_FAILED);
-        }
-    };
-    let kernel = match parts.kernel.for_generation(dir, generation, engine) {
-        Ok(kernel) => kernel,
-        Err(e) => {
-            log.line(&format!("{name}: rules generation refused: {}", e.0));
-            return Err(EXIT_FAILED);
-        }
-    };
-    log.line(&format!("{name}: rules generation {}", generation.hex()));
-    log.line(&format!("{name}: rules engine {}", engine.name()));
-    log.line(&format!("{name}: rules mode {}", mode.name()));
-    log.line(&format!("{name}: rules routes {}", routes.len()));
+        // The hold comes before the directory is looked at: a removal that has finished is found there, and one that
+        // is going on keeps the hold from being taken.
+        let hold = rules.hold(generation).map_err(|e| refused(e.0))?;
+        let dir = rules.generation_dir(generation).map_err(|e| refused(e.0))?;
+        let mode = rules.mode(generation).map_err(|e| refused(e.0))?;
+        let routes = rules.routes(generation).map_err(|e| refused(e.0))?;
+        let kernel = match parts.kernel.for_generation(dir, generation, engine) {
+            Ok(kernel) => kernel,
+            Err(e) => {
+                log.line(&format!("{name}: rules generation refused: {}", e.0));
+                return Err(EXIT_FAILED);
+            }
+        };
+        said.push(format!("{name}: rules generation {}", generation.hex()));
+        said.push(format!("{name}: rules engine {}", engine.name()));
+        said.push(format!("{name}: rules mode {}", mode.name()));
+        said.push(format!("{name}: rules routes {}", routes.len()));
+        held.push((engine, generation, hold));
+        starts.push(Start {
+            generation,
+            mode,
+            routes,
+            kernel,
+        });
+    }
+    for line in &said {
+        log.line(line);
+    }
+    detecting(name, &parts, &starts, log);
     Ok(Prepared {
         proxy: parts.proxy,
         forward: parts.forward,
         tls: parts.tls,
         challenge: parts.challenge,
-        kernel,
-        generation,
-        mode,
-        routes,
-        switcher: Switcher::new(rules, parts.kernel, generation, hold),
+        starts,
+        switcher: Switcher::new(rules, parts.kernel, held),
         status: parts.status,
         records: parts.records,
         admin: parts.admin,
@@ -508,6 +507,23 @@ fn prepare(path: &Path, name: &str, log: &Log) -> Result<Prepared, u8> {
         hold: parts.hold,
         fixed: parts.fixed,
     })
+}
+
+/// A line for each upstream group whose engine runs a generation that only detects: the requests to the group are
+/// not blocked. Fixed text and the name of the group, which is letters, digits, `-` and `_`.
+fn detecting(name: &str, parts: &Parts, starts: &[Start], log: &Log) {
+    for group in &parts.forward.groups {
+        let detects = starts
+            .iter()
+            .any(|start| start.kernel.engine == group.engine && start.mode == Mode::Detect);
+        if detects {
+            log.line(&format!(
+                "{name}: upstream {}: engine {}, mode detect",
+                group.name,
+                group.engine.name()
+            ));
+        }
+    }
 }
 
 /// The command `config check`: the host check against root and `prepare`, and nothing of what follows them. `args`

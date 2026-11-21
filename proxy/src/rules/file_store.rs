@@ -1,12 +1,12 @@
 //! The rules store in a directory of the file system.
 //!
 //! The directory holds one directory per generation, `generations/<64 lowercase hex digits>/`, which is never
-//! changed after it was made, and the file `current`, which names the chosen generation: its 64 digits and a
-//! newline. `staging/<32 lowercase hex digits>/` is a bundle between `stage` and `commit` or `discard`, and `lock`
-//! is the file that a command holds with `File::try_lock` from `stage` (or `activate` or `remove`) to its end, so that only one
-//! command changes the store at a time. `current` is replaced by writing `current.new`, syncing it and renaming it
-//! over `current`, and then syncing the directory; a generation becomes visible by one rename from `staging/` after
-//! its files and directories were synced.
+//! changed after it was made, and for each engine the file `current.<engine>`, which names the generation chosen for
+//! the engine: its 64 digits and a newline (see `current`). `staging/<32 lowercase hex digits>/` is a bundle between
+//! `stage` and `commit` or `discard`, and `lock` is the file that a command holds with `File::try_lock` from `stage`
+//! (or `activate` or `remove`) to its end, so that only one command changes the store at a time. A choice is made by
+//! writing `current.<engine>.new`, syncing it and renaming it over `current.<engine>`, and then syncing the
+//! directory; a generation becomes visible by one rename from `staging/` after its files and directories were synced.
 //!
 //! `using/<64 lowercase hex digits>` is an empty file for a generation that a proxy uses or a command removes. A
 //! running proxy holds a shared lock on it (`File::try_lock_shared`) for as long as it uses the generation, and
@@ -17,7 +17,7 @@
 //! Only the store directory itself is examined (a real directory, owned by this process's user, no group or other
 //! bits): a user who cannot write there cannot make or replace a name inside it. What is read is opened without
 //! following a link and without waiting for a writer. A command that stopped halfway leaves at most a bundle in
-//! `staging/` or a `current.new`, which the next `stage` or `activate` removes.
+//! `staging/` or a `current.<engine>.new`, which the next `stage` or `activate` removes.
 
 use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
@@ -34,9 +34,11 @@ use crate::rules::bundle::{
 };
 use crate::rules::routes::Routes;
 use crate::rules::store::{
-    Committed, Generation, Hold, NOT_EXPECTED, RuleStore, Staged, StoreError,
+    Committed, ENGINES, Generation, Hold, NOT_EXPECTED, RuleStore, Staged, StoreError,
 };
 use crate::run::host;
+
+mod current;
 
 /// `O_NOFOLLOW` of Linux, which std has no name for. x86_64: the UAPI header `asm-generic/fcntl.h` (and Go's
 /// `syscall/zerrors_linux_amd64.go`). aarch64: Go's `syscall/zerrors_linux_arm64.go`, where the value differs.
@@ -58,7 +60,6 @@ const STAGE_NAME_LEN: usize = 32;
 const GENERATIONS: &str = "generations";
 const STAGING: &str = "staging";
 const CURRENT: &str = "current";
-const CURRENT_NEW: &str = "current.new";
 const LOCK: &str = "lock";
 const USING: &str = "using";
 
@@ -167,26 +168,6 @@ impl FileStore {
         }
     }
 
-    /// Chooses `generation`, after `verify`. The lock is held by the caller.
-    fn choose(&self, generation: Fingerprint) -> Result<(), StoreError> {
-        const CANNOT: StoreError = StoreError("the current generation record cannot be written");
-        self.verify(generation)?;
-        let new = self.dir.join(CURRENT_NEW);
-        match fs::remove_file(&new) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return Err(CANNOT),
-        }
-        let record = format!("{}\n", generation.hex());
-        write_new(&new, record.as_bytes())
-            .and_then(|()| fs::rename(&new, self.dir.join(CURRENT)))
-            .and_then(|()| sync_dir(&self.dir))
-            .map_err(|_| {
-                let _ = fs::remove_file(&new);
-                CANNOT
-            })
-    }
-
     /// Puts the staged bundle at its name in `generations/`, and reports what was there.
     fn place(&self, import: &Import) -> Result<Committed, StoreError> {
         const CANNOT: StoreError = StoreError("the generation cannot be made");
@@ -223,20 +204,9 @@ impl FileStore {
 }
 
 impl RuleStore for FileStore {
-    /// Reads `current`: absent is no choice yet; a link, a special file, a file over 65 bytes or any failure to
-    /// read it is a refusal, and so is a content other than 64 lowercase digits and one newline.
-    fn current(&self) -> Result<Option<Fingerprint>, StoreError> {
-        const UNREADABLE: StoreError = StoreError("the current generation record cannot be read");
-        const BROKEN: StoreError = StoreError("the current generation record is broken");
-        let record = match read_regular(&self.dir.join(CURRENT), CURRENT_LEN, None) {
-            Ok(record) => record,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(UNREADABLE),
-        };
-        match record.split_last() {
-            Some((b'\n', hex)) => Fingerprint::from_hex(hex).map(Some).ok_or(BROKEN),
-            _ => Err(BROKEN),
-        }
+    /// See `current`.
+    fn current(&self, engine: Engine) -> Result<Option<Fingerprint>, StoreError> {
+        self.chosen(engine)
     }
 
     /// `<dir>/generations/<digits>`, after `lstat` has shown that `generations` and the generation are real
@@ -307,18 +277,24 @@ impl RuleStore for FileStore {
         self.choose(generation)
     }
 
-    /// The order: the lock, the chosen generation (a record that cannot be read is a refusal, as for `remove`), then
-    /// the choice as `activate` makes it.
+    /// The order: the lock, the engine of the generation, the generation chosen for it (a record that cannot be read
+    /// is a refusal, as for `remove`), then the choice as `activate` makes it.
     fn activate_if_current(
         &mut self,
-        expect: Fingerprint,
+        expect: Option<Fingerprint>,
         generation: Fingerprint,
     ) -> Result<(), StoreError> {
         let _lock = self.lock()?;
-        if self.current()? != Some(expect) {
+        let engine = self.engine(generation)?;
+        if self.chosen(engine)? != expect {
             return Err(NOT_EXPECTED);
         }
         self.choose(generation)
+    }
+
+    fn deactivate(&mut self, engine: Engine) -> Result<Option<Fingerprint>, StoreError> {
+        let _lock = self.lock()?;
+        self.leave(engine)
     }
 
     fn list(&self) -> Result<Vec<Generation>, StoreError> {
@@ -398,14 +374,16 @@ impl RuleStore for FileStore {
         }
     }
 
-    /// The order: the lock of the store, the chosen generation (a record that cannot be read leaves it unknown, and
-    /// then nothing is removed), the generation, the exclusive lock on its `using` file, then one rename out of
-    /// `generations` that is made durable before the files go, as `place` does for a broken generation.
+    /// The order: the lock of the store, the generations chosen for the engines (a record that cannot be read leaves
+    /// them unknown, and then nothing is removed), the generation, the exclusive lock on its `using` file, then one
+    /// rename out of `generations` that is made durable before the files go, as `place` does for a broken generation.
     fn remove(&mut self, generation: Fingerprint) -> Result<(), StoreError> {
         const CANNOT: StoreError = StoreError("the generation cannot be removed");
         let _lock = self.lock()?;
-        if self.current()? == Some(generation) {
-            return Err(StoreError("the generation is the current one"));
+        for engine in ENGINES {
+            if self.chosen(engine)? == Some(generation) {
+                return Err(StoreError("the generation is the current one"));
+            }
         }
         let dir = self.generation_dir(generation)?;
         let using = self.using_file(generation)?;

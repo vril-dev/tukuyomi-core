@@ -105,6 +105,8 @@ fn metrics_count_a_forwarded_and_a_blocked_request_and_a_scrape_is_no_request() 
         "tukuyomi_connections_accepted_total 2",
         "tukuyomi_inspector_up 1",
         "tukuyomi_inspector_restarts_total 0",
+        "tukuyomi_inspector_engine_up{engine=\"coraza\"} 1",
+        "tukuyomi_inspector_engine_restarts_total{engine=\"coraza\"} 0",
         "tukuyomi_upstream_failures_total{group=\"main\"} 0",
         "tukuyomi_records_dropped_total 0",
         "tukuyomi_record_write_errors_total 0",
@@ -150,8 +152,8 @@ fn metrics_count_a_forwarded_and_a_blocked_request_and_a_scrape_is_no_request() 
     unique.sort();
     unique.dedup();
     // There is no shipper here, so the family of its distance is not there.
-    assert_eq!(helped.len(), 26, "{helped:?}");
-    assert_eq!((unique.len(), &typed), (26, &helped));
+    assert_eq!(helped.len(), 28, "{helped:?}");
+    assert_eq!((unique.len(), &typed), (28, &helped));
     assert!(!text.contains("tukuyomi_records_unshipped_bytes"), "{text}");
 
     // The scrape and the other pages were not requests: the two records are the only ones.

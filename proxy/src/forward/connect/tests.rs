@@ -13,6 +13,7 @@ use rustls::{ServerConfig, SupportedProtocolVersion, version};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+use tukuyomi_kernel::Engine;
 
 use super::*;
 use crate::config::{Address, ForwardConfig, GroupConfig};
@@ -353,6 +354,7 @@ fn a_group_without_tls_speaks_plain_and_a_group_with_it_speaks_tls() {
             name: "plain".to_string(),
             servers: ForwardConfig::of(&[plain]).groups.remove(0).servers,
             tls: None,
+            engine: Engine::Coraza,
         });
         let ctx = ctx_of(&forward, keeping());
         for group in [0, 1, 0, 1] {

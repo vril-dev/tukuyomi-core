@@ -323,6 +323,73 @@ fn a_sent_version_that_cannot_be_read_is_refused_about_the_first_item_that_canno
     );
 }
 
+#[test]
+fn the_engine_of_a_group_is_checked_with_the_main_file_and_a_refusal_is_about_its_engine() {
+    let fixture = Fixture::new();
+    let plain = with_admin(&fixture);
+    let named = {
+        let path = fixture.main_file(|m| {
+            m["kernel"]["engines"] =
+                json!({"modsecurity": {"inspector": "/opt/tukuyomi/inspector-modsecurity"}});
+        });
+        config::main_file(&fs::read(path).unwrap()).unwrap()
+    };
+    let base = fixture.plain_version(b"chain", b"key");
+    let with = |engine: Value| {
+        let mut version = base.clone();
+        version["upstreams"]["app"]["engine"] = engine;
+        version
+    };
+    // The two names are taken, with an inspector in the main file for each.
+    let Routing::Managed { resolve_timeout } = named.routing else {
+        panic!("the main file has no managed object");
+    };
+    for name in ["coraza", "modsecurity"] {
+        let bytes = serde_json::to_vec(&with(json!(name))).unwrap();
+        let checked = check_sent(&bytes, &named.main, resolve_timeout, None).unwrap();
+        assert_eq!(checked.forward.groups[0].engine.name(), name);
+    }
+    // The name is the lowercase one, exactly, and the engine has to be one the main file has an inspector for.
+    let bad = "an upstream engine is not coraza or modsecurity";
+    for name in ["Coraza", ""] {
+        assert_eq!(
+            objection(&plain, &with(json!(name))),
+            (bad, at("upstreams.app.engine"))
+        );
+    }
+    assert_eq!(
+        objection(&plain, &with(json!("modsecurity"))),
+        (
+            "kernel.engines has no inspector for the engine of an upstream",
+            at("upstreams.app.engine")
+        )
+    );
+    // A group that has a server at the address of a group before it has the engine of that one: the later group is
+    // the one that the refusal is about.
+    let mut version = base.clone();
+    version["upstreams"]["g1"] =
+        json!({"servers": [server("127.0.0.1:9000")], "engine": "modsecurity"});
+    assert_eq!(
+        objection(&named, &version),
+        (
+            "two upstreams with a server at the same address have different engines",
+            at("upstreams.g1.engine")
+        )
+    );
+    version["upstreams"]["g1"]["servers"] = json!([server("127.0.0.1:9001")]);
+    let bytes = serde_json::to_vec(&version).unwrap();
+    assert!(check_sent(&bytes, &named.main, resolve_timeout, None).is_ok());
+    // A value that is not text is refused about the group when the version is read item by item.
+    let body = json!({"version": with(json!(5))}).to_string();
+    assert_eq!(
+        unread(&body),
+        (
+            "configuration has a value of the wrong type",
+            at("upstreams.app")
+        )
+    );
+}
+
 /// A host policy named `name` for the hosts `hosts`, with an `access` that turns nobody away.
 fn host_policy(name: &str, hosts: Value) -> Value {
     json!({"name": name, "hosts": hosts, "access": {}})

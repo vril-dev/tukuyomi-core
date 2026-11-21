@@ -1000,6 +1000,15 @@ pub(crate) fn name_modsecurity_inspector(root: &Path) {
     fs::write(&path, config.to_string()).expect("write the configuration");
 }
 
+/// Makes the upstream group `group` of the configuration in the test root `root` use the engine ModSecurity.
+pub(crate) fn use_modsecurity(root: &Path, group: &str) {
+    let path = root.join("config.json");
+    let text = fs::read_to_string(&path).expect("read the configuration");
+    let mut config: Value = serde_json::from_str(&text).expect("parse the configuration");
+    config["forward"]["upstreams"][group]["engine"] = json!("modsecurity");
+    fs::write(&path, config.to_string()).expect("write the configuration");
+}
+
 pub(crate) fn run_kill(signal: &str, pid: u32) {
     let status = Command::new("kill")
         .arg("-s")
@@ -1051,12 +1060,12 @@ pub(crate) fn assert_gone(pids: &[u32]) {
     }
 }
 
-/// The kernel's numbers in the record line that the driver writes when it is told to stop: the records, the
-/// requests held and the requests waiting.
+/// The numbers of the kernel of Coraza in the record line that the driver writes when it is told to stop: the
+/// records, the requests held and the requests waiting.
 fn stop_counts(lines: &[String]) -> [u64; 3] {
     let line = lines
         .iter()
-        .find(|l| l.starts_with("driver: stop, records "))
+        .find(|l| l.starts_with("driver: stop, engine coraza, records "))
         .unwrap_or_else(|| panic!("no stop line in {lines:#?}"));
     let numbers: Vec<u64> = line
         .split(|c: char| !c.is_ascii_digit())
@@ -1131,7 +1140,14 @@ impl Proxy {
         proxy
             .records
             .wait_lines("the proxy to listen", 1, |l| l == "start: listening");
-        proxy.wait_inspector(None);
+        // Every engine that started has its line before the proxy listens, and its inspector.
+        let engines = proxy
+            .records
+            .lines()
+            .iter()
+            .filter(|l| l.starts_with("start: rules engine "))
+            .count();
+        proxy.wait_inspectors(engines);
         proxy
     }
 
@@ -1231,6 +1247,19 @@ impl Proxy {
         let pid = found.expect("an inspector was found");
         self.inspectors.push(pid);
         pid
+    }
+
+    /// Waits until exactly `count` inspector processes (at least one) are children of the proxy.
+    fn wait_inspectors(&mut self, count: usize) {
+        let mut live = Vec::new();
+        wait_until("the inspector processes", || {
+            live = children_of(self.pid)
+                .into_iter()
+                .filter(|&pid| is_inspector(pid))
+                .collect();
+            live.len() == count.max(1)
+        });
+        self.inspectors.extend(live);
     }
 
     /// The root of the test: the configuration, the store, and what the test adds.

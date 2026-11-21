@@ -22,9 +22,9 @@ use crate::inbound::conn::{Setup, Shared, SharedSetup};
 use crate::inbound::session::RequestIds;
 use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::Ingress;
+use crate::inspect::engines::Gates;
 use crate::log::counters::Counters;
 use crate::log::{Format, start_logger};
-use crate::rules::routes::{Routes, SharedRoutes};
 
 const BUDGET: usize = 4 << 20;
 const PEER: &str = "203.0.113.9:5555";
@@ -82,8 +82,7 @@ pub(in crate::forward) fn ctx_of(forward: &ForwardConfig, cfg: ProxyConfig) -> C
     let (to_driver, _) = std::sync::mpsc::sync_channel(1);
     let shared = Arc::new(Shared {
         budget: Arc::new(Semaphore::new(cfg.max_buffered_bytes)),
-        inspect: Arc::new(Semaphore::new(1)),
-        routes: SharedRoutes::new(Routes::default()),
+        gates: Gates::new(1),
         log: start_logger(Format::Json).unwrap(),
         ingress: Arc::new(Ingress::new(to_driver)),
         ids: RequestIds::new().unwrap(),
