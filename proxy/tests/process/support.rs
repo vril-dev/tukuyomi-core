@@ -1000,6 +1000,16 @@ pub(crate) fn name_modsecurity_inspector(root: &Path) {
     fs::write(&path, config.to_string()).expect("write the configuration");
 }
 
+/// Makes ModSecurity the default engine of the configuration in the test root `root`, which has to name the inspector
+/// of that engine (`name_modsecurity_inspector`).
+pub(crate) fn make_modsecurity_default(root: &Path) {
+    let path = root.join("config.json");
+    let text = fs::read_to_string(&path).expect("read the configuration");
+    let mut config: Value = serde_json::from_str(&text).expect("parse the configuration");
+    config["kernel"]["default_engine"] = json!("modsecurity");
+    fs::write(&path, config.to_string()).expect("write the configuration");
+}
+
 /// Makes the upstream group `group` of the configuration in the test root `root` use the engine ModSecurity.
 pub(crate) fn use_modsecurity(root: &Path, group: &str) {
     let path = root.join("config.json");

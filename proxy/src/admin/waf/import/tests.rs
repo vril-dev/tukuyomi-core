@@ -6,7 +6,7 @@ fn body(text: &str) -> Body {
 }
 
 fn refusal(text: &str, crs_dir: Option<&Path>) -> (&'static str, Option<OsString>) {
-    match body(text).request(crs_dir) {
+    match body(text).request(crs_dir, Engine::Coraza) {
         Err(e) => (e.reason, e.subject),
         Ok(_) => panic!("accepted"),
     }
@@ -19,7 +19,7 @@ fn the_body_makes_the_uploads_and_the_options_of_rules_import() {
             "crs":true,"crs_off":["X.conf"],"routes":[{"path":"/api/generations","action":"bypass"}],
             "detect_only":true,"accept_block":true}"#,
     )
-    .request(Some(Path::new("/crs")))
+    .request(Some(Path::new("/crs")), Engine::Coraza)
     .unwrap();
     assert!(request.accept_block);
     let uploads = request.uploads;
@@ -37,7 +37,7 @@ fn the_body_makes_the_uploads_and_the_options_of_rules_import() {
     let routes: Value = serde_json::from_slice(&uploads.routes.unwrap()).unwrap();
     assert_eq!(routes[0]["path"], "/api/generations");
     // Every key may be left out.
-    let empty = body("{}").request(None).unwrap();
+    let empty = body("{}").request(None, Engine::Coraza).unwrap();
     assert!(!empty.accept_block);
     assert_eq!((empty.uploads.crs, empty.uploads.mode), (None, Mode::Block));
 }

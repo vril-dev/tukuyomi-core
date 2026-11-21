@@ -6,9 +6,10 @@
 //! and its content in the standard base64 with padding), `crs` (true: the CRS of the directory `admin.crs_dir` is
 //! taken; the request never names a directory, and it is refused when the configuration has none), `crs_off` (the
 //! names of the files of the CRS that are not loaded), `routes` (the routes of the bundle, in the form of the file that
-//! `--routes` names), `engine` (`coraza`, the default, or `modsecurity`: the option `--engine` of `rules import`;
-//! it is refused with 400 before anything is staged when the engine cannot be used here), `detect_only` and
-//! `accept_block` (as the options of `rules import`). The limits are those of
+//! `--routes` names), `engine` (`coraza` or `modsecurity`: the option `--engine` of `rules import`; left out, it is
+//! the default engine of this process, `kernel.default_engine` as the process read it when it started, which
+//! `GET /api/status` gives as `default_engine`; it is refused with 400 before anything is staged when the engine
+//! cannot be used here), `detect_only` and `accept_block` (as the options of `rules import`). The limits are those of
 //! `rules import`: 128 files, 2 MiB for a file and 8 MiB for all (`collect` checks them); a file of the request that
 //! is over 2 MiB is refused before it is decoded.
 //!
@@ -102,8 +103,12 @@ fn uploads(parts: Vec<Part>) -> Result<Vec<Upload>, CollectError> {
 
 impl Body {
     /// The request that the body makes, or why it is refused. `crs_dir` is the directory that the configuration
-    /// gives for the CRS, if it does.
-    pub fn request(self, crs_dir: Option<&Path>) -> Result<Request, CollectError> {
+    /// gives for the CRS, if it does, and `default_engine` is the engine of a body that names none.
+    pub fn request(
+        self,
+        crs_dir: Option<&Path>,
+        default_engine: Engine,
+    ) -> Result<Request, CollectError> {
         let refuse = |reason: &'static str| CollectError {
             reason,
             subject: None,
@@ -129,7 +134,7 @@ impl Body {
             .transpose()
             .map_err(|_| refuse("the routes cannot be read"))?;
         let engine = match self.engine.as_deref() {
-            None => Engine::default(),
+            None => default_engine,
             Some(name) => Engine::parse(name).ok_or_else(|| {
                 refuse("engine is not the name of an engine (coraza or modsecurity)")
             })?,
@@ -260,7 +265,7 @@ impl Waf {
             Ok(body) => body,
             Err(answer) => return answer,
         };
-        let request = match body.request(self.crs_dir.as_deref()) {
+        let request = match body.request(self.crs_dir.as_deref(), self.default_engine) {
             Ok(request) => request,
             Err(e) => return invalid(e),
         };

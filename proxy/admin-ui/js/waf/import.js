@@ -122,7 +122,8 @@ export function toBase64(bytes) {
 
 /** The body of the request to import. `rules` and `data` hold `{ name, data }` with the data in base64. */
 export function importBody({ engine, rules, data, crs, crsOff, routes, detectOnly, acceptBlock }) {
-  // A missing engine would be left out of the JSON, and the server would take Coraza for it.
+  // A missing engine would be left out of the JSON, and the server would take its default engine for it, whatever
+  // engine the screen shows.
   if (!ENGINE_IDS.includes(engine)) throw new RangeError(`not an engine: ${engine}`);
   const body = { engine };
   if (rules.length > 0) body.rules = rules;

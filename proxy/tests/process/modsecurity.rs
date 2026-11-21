@@ -286,6 +286,37 @@ fn an_import_for_modsecurity_is_tried_by_its_inspector_and_a_rule_that_its_reade
     assert_eq!(taken.code, Some(0), "{}", taken.err);
 }
 
+#[test]
+#[ignore = "needs a built inspector"]
+fn an_import_that_names_no_engine_is_for_the_default_engine_of_the_configuration() {
+    let idle = Idle::new("modsec_default", &Knobs::quick(), |root| {
+        name_modsecurity_inspector(root);
+        make_modsecurity_default(root);
+    });
+    let root = idle.root();
+    let conf = rules_file();
+    // The store has the generation of the test, which is one of Coraza. Without `--engine` the import is for the
+    // default engine, ModSecurity; with `--engine` it is for the engine that is named, whatever the default is.
+    let import_for = |args: &[&OsStr], engine: &str| {
+        let mut all = args.to_vec();
+        all.extend([OsStr::new("--rules"), conf.as_os_str()]);
+        let imported = rules(root, "import", &all);
+        assert_eq!(imported.code, Some(0), "{}", imported.err);
+        let made = imported.out.split(' ').next().unwrap();
+        let listed = rules(root, "list", &[]);
+        assert!(
+            listed
+                .out
+                .lines()
+                .any(|l| l.starts_with(made) && l.contains(&format!(" block {engine}"))),
+            "{}",
+            listed.out
+        );
+    };
+    import_for(&[], "modsecurity");
+    import_for(&[OsStr::new("--engine"), OsStr::new("coraza")], "coraza");
+}
+
 /// A request as the trial of an import sends it: with a name as `Host`, and a `User-Agent` and an `Accept`, which the
 /// Core Rule Set looks for. A body has its type and its length.
 fn browser_request(start: &str, body: Option<(&str, &[u8])>) -> Vec<u8> {

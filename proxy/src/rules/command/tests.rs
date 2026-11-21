@@ -17,6 +17,7 @@ fn import(text: &[&str]) -> (Inputs, bool) {
             config,
             inputs,
             accept_block,
+            ..
         }) => {
             assert_eq!(config, Path::new("/etc/tukuyomi.json"));
             (inputs, accept_block)
@@ -267,19 +268,29 @@ fn the_end_of_a_trial_is_reported_with_the_rule_the_exit_and_the_escaped_line() 
 }
 
 #[test]
-fn engine_names_the_engine_of_the_bundle_wherever_it_stands_and_is_coraza_when_left_out() {
-    assert_eq!(import(&["--rules", "a.conf"]).0.engine, Engine::Coraza);
+fn engine_names_the_engine_of_the_bundle_wherever_it_stands_and_is_the_default_when_left_out() {
+    let config = "/etc/tukuyomi.json";
+    let named = |text: &[&str]| {
+        let mut all = vec!["import", config];
+        all.extend_from_slice(text);
+        match parse(&args(&all)) {
+            Ok(Command::Import { engine, .. }) => engine,
+            other => panic!("{text:?}: {other:?}"),
+        }
+    };
+    // Left out, the engine is the default engine of the configuration, which `import` reads.
+    assert_eq!(named(&["--rules", "a.conf"]), None);
     for text in [
         ["--engine", "modsecurity", "--rules", "a.conf"],
         ["--rules", "a.conf", "--engine", "modsecurity"],
     ] {
-        let (inputs, _) = import(&text);
-        assert_eq!(inputs.engine, Engine::ModSecurity);
-        assert_eq!(inputs.rules, [PathBuf::from("a.conf")]);
+        assert_eq!(named(&text), Some(Engine::ModSecurity));
+        assert_eq!(import(&text).0.rules, [PathBuf::from("a.conf")]);
     }
-    let (inputs, _) = import(&["--engine", "coraza", "--rules", "a.conf"]);
-    assert_eq!(inputs.engine, Engine::Coraza);
-    let config = "/etc/tukuyomi.json";
+    assert_eq!(
+        named(&["--engine", "coraza", "--rules", "a.conf"]),
+        Some(Engine::Coraza)
+    );
     assert_eq!(
         refusal(&["import", config, "--engine", "coraza", "--engine", "coraza"]),
         "--engine is given twice"

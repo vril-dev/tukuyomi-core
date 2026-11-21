@@ -16,10 +16,11 @@
 //! store, tries it (`trial`: an inspector is started on it, three requests are inspected) and makes it a generation
 //! only if the trial passes; it does not choose it. With `--detect-only` the bundle is a detect bundle: a request that
 //! a rule matches is let through and the match is reported, and the trial passes on such a match and writes a line
-//! for each; without it the bundle blocks. With `--engine` the bundle is for that engine (`coraza`, the default, or
-//! `modsecurity`): its rules are inspected by that engine, and the import is refused, before anything is staged,
-//! when the configuration has no inspector for the engine (`KernelSettings::check_engine`). With `--routes` the
-//! bundle has the routes of the file, a JSON array of
+//! for each; without it the bundle blocks. The bundle is for the engine that `--engine` names (`coraza` or
+//! `modsecurity`), or, without `--engine`, for the default engine of the configuration (`kernel.default_engine`,
+//! which is `coraza` when the file leaves it out): its rules are inspected by that engine, and the import is refused,
+//! before anything is staged, when the configuration has no inspector for the engine
+//! (`KernelSettings::check_engine`). With `--routes` the bundle has the routes of the file, a JSON array of
 //! `{"host": "<host>", "path": "<path>", "action": "bypass"}` (`host` is optional, no other key is taken): a request
 //! that a route matches is not inspected and goes on to the upstream. The routes are checked as the module `routes`
 //! says, and a running proxy takes them when it switches to the generation. `activate` chooses a generation for its
@@ -83,7 +84,11 @@ pub enum Exit {
 enum Command {
     Import {
         config: PathBuf,
+        /// What the options name. `inputs.engine` is not set here: `import` sets it, from `engine` or from the
+        /// configuration, once it has read the configuration.
         inputs: Inputs,
+        /// The engine that `--engine` names. Left out, it is the default engine of the configuration.
+        engine: Option<Engine>,
         accept_block: bool,
     },
     Activate {
@@ -132,8 +137,9 @@ pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> Exit 
         Ok(Command::Import {
             config,
             inputs,
+            engine,
             accept_block,
-        }) => import(&config, &inputs, accept_block, &mut term),
+        }) => import(&config, inputs, engine, accept_block, &mut term),
         Ok(Command::Activate { config, generation }) => activate(&config, generation, &mut term),
         Ok(Command::Deactivate { config, engine }) => deactivate(&config, engine, &mut term),
         Ok(Command::Remove { config, generation }) => remove(&config, generation, &mut term),
@@ -244,13 +250,13 @@ fn parse_import(config: PathBuf, rest: &[OsString]) -> Result<Command, &'static 
             return Err("unknown option");
         }
     }
-    inputs.engine = engine.unwrap_or_default();
     if inputs.crs.is_none() && !inputs.crs_off.is_empty() {
         return Err("--crs-off needs --crs");
     }
     Ok(Command::Import {
         config,
         inputs,
+        engine,
         accept_block,
     })
 }
@@ -289,7 +295,13 @@ fn open_store(
     }
 }
 
-fn import(config: &Path, inputs: &Inputs, accept_block: bool, term: &mut Terminal) -> Exit {
+fn import(
+    config: &Path,
+    mut inputs: Inputs,
+    engine: Option<Engine>,
+    accept_block: bool,
+    term: &mut Terminal,
+) -> Exit {
     const NAME: &str = "rules import";
     // The kernel requires this of its host process, as the proxy checks it before it starts.
     if let Err(text) = host::check() {
@@ -300,11 +312,12 @@ fn import(config: &Path, inputs: &Inputs, accept_block: bool, term: &mut Termina
         Ok(opened) => opened,
         Err(exit) => return exit,
     };
+    inputs.engine = engine.unwrap_or(loaded.kernel.default_engine());
     if let Err(e) = loaded.kernel.check_engine(inputs.engine) {
         term.note(&format!("{NAME}: configuration refused: {}", e.0));
         return Exit::Usage;
     }
-    let bundle = match collect::collect(inputs) {
+    let bundle = match collect::collect(&inputs) {
         Ok(bundle) => bundle,
         Err(CollectError { reason, subject }) => {
             term.note(&format!("{NAME}: {reason}{}", subject_of(&subject)));

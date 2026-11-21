@@ -522,6 +522,13 @@ impl Rig {
         )
     }
 
+    /// The engine of the generation that the answer of an import says it made, as the rules store has it.
+    fn made_for(&self, made: &Answer) -> Engine {
+        let fingerprint = made.body["fingerprint"].as_str().unwrap();
+        let fingerprint = Fingerprint::from_hex(fingerprint.as_bytes()).unwrap();
+        self.store().engine(fingerprint).unwrap()
+    }
+
     /// The lines of the audit log, the newest first.
     fn lines(&self) -> Vec<Value> {
         self.audit.recent(100).unwrap()
@@ -1411,9 +1418,26 @@ fn a_generation_of_an_engine_that_cannot_be_used_is_refused_at_import_activate_a
     }
     assert_eq!(rig.runs.load(Ordering::SeqCst), 0);
     assert_eq!(rig.store().list().unwrap().len(), 3);
-    // Without the key the engine is Coraza, and the import goes on to its trial.
-    assert_eq!(rig.import(&json!({"rules": rules})).status, StatusCode::OK);
+    // Without the key the engine is the default engine, which is Coraza in this rig, and the import goes on to its
+    // trial.
+    let made = rig.import(&json!({"rules": rules}));
+    assert_eq!(made.status, StatusCode::OK);
     assert_eq!(rig.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.made_for(&made), Engine::Coraza);
+}
+
+#[test]
+fn an_import_is_for_the_default_engine_unless_the_body_names_an_engine() {
+    let rig = rig_with(false, None, Engine::ModSecurity);
+    // Both engines can be used here, so that the engine of the generation tells which one the import was for.
+    rig.modsecurity.store(true, Ordering::SeqCst);
+    let rules = json!([{"name": "a.conf", "data": "YQo="}]);
+    let made = rig.import(&json!({"rules": rules}));
+    assert_eq!(made.status, StatusCode::OK, "{:?}", made.body);
+    assert_eq!(rig.made_for(&made), Engine::ModSecurity);
+    let made = rig.import(&json!({"rules": rules, "engine": "coraza"}));
+    assert_eq!(made.status, StatusCode::OK, "{:?}", made.body);
+    assert_eq!(rig.made_for(&made), Engine::Coraza);
 }
 
 // ---- the engines ----
