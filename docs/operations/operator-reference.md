@@ -2170,10 +2170,30 @@ If the environment has `NOTIFY_SOCKET`, the proxy sends `READY=1` to that socket
 
 ## Version Updates
 
-These are the steps to update from 0.1.0 and the steps to go back to 0.1.0. The updated version can choose the inspection engine for each upstream (see "Choosing the Inspection Engine" above). For how to write the unit, see "systemd" in the [build and deployment guide](../build/binary-deployment.md).
+Until 1.0, only updates from the previous release are supported. To skip releases in between, update one release at a time, in order. To go back to the previous version, restore the copy taken before the update (see "Going Back to the Previous Version" below). For how to write the unit, see "systemd" in the [build and deployment guide](../build/binary-deployment.md).
+
+### Copy Before an Update
+
+Before an update, take a copy of the following:
+
+- The configuration file
+- The rules store (`rules.store.dir`)
+- The managed store (`managed.dir`, when you use the managed configuration)
+- The admin store (`admin.store.dir`, when you use the admin process)
+
+While you take the copy, keep the admin process, the proxy, the records shipper, and the certificate renewal timer stopped. Keep the owners and permissions as they are (the rules store and the others are checked for their owner and permissions). The copy also holds the password hashes and API tokens of the admin store, the private keys of the managed store, and so on, so put it in a directory that only root can read. The following copies the example directories and units of the [build and deployment guide](../build/binary-deployment.md). Leave out of the arguments any directory that you do not use.
+
+```bash
+sudo systemctl stop tukuyomi-core-admin.service tukuyomi-core.service tukuyomi-core-records-ship.service tukuyomi-core-acme.timer
+sudo install -d -m 0700 /var/backups/tukuyomi-core
+sudo tar -C / -cpf /var/backups/tukuyomi-core/before-update.tar etc/tukuyomi-core/config.json var/lib/tukuyomi-core/store var/lib/tukuyomi-core/managed var/lib/tukuyomi-core/admin
+```
+
+The log directory (`records.dir`), the certificates and keys, and the work directory (`kernel.tmp_root`) are not copied.
 
 ### Updating from 0.1.0
 
+- Take the copy of "Copy Before an Update" above, and then replace the executables.
 - Just by replacing the executables, you can read the 0.1.0 configuration file, rules store, and managed store as they are (if you had chosen a ModSecurity generation in 0.1.0, `kernel.default_engine` is required, as described below). If you do not write the new setting keys (`kernel.default_engine`, the `engine` of an upstream), the proxy runs with only one engine, as in 0.1.0.
 - If you had chosen a Coraza generation in 0.1.0, you do not need to write `kernel.default_engine`. The `current` written by 0.1.0 is read as the chosen generation of Coraza. `config check` writes `accepted`, and at start only one line `start: rules engine coraza` appears. `current` is not rewritten and no `current.*` is added.
 - If you had chosen a ModSecurity generation in 0.1.0, write `modsecurity` in `kernel.default_engine`.
@@ -2184,35 +2204,26 @@ These are the steps to update from 0.1.0 and the steps to go back to 0.1.0. The 
   - The records shipper rejects unknown setting keys in the configuration file. Before you write `kernel.default_engine` or the `engine` of an upstream, replace the records shipper with the same build. The 0.1.0 proxy also rejects a configuration file that has `kernel.default_engine`, with `configuration has an unknown key` (exit 2).
   - Replace all the executables with those of the same release, and then restart the admin process, the proxy, and the records shipper in this order (the same order as step 8 of "Moving to the Managed Configuration"). If you restart the admin process first, then during the replacement the updated admin process only refuses the generation choice and the rollback for the earlier proxy with 409, and the rules store and the switch history do not change.
 
-### Going Back to 0.1.0
+### Going Back to the Previous Version
 
-These are the steps to put the executables back to 0.1.0. 0.1.0 reads only `current`, and does not know `kernel.default_engine` or the `engine` of an upstream. `rules activate` of the updated version writes `current.<engine>` and removes the `current` that points to a generation of the same engine. So the result of `config check` and start in 0.1.0 changes depending on what you did with the updated executables.
+Restore the copy taken before the update, and start the executables of the previous version. There are no steps that differ from version to version.
 
-| What you did with the updated executables | `config check` and start in 0.1.0 |
-|---|---|
-| Only started (made no choice and wrote no new setting key) | The rules store does not change, so it starts as it is |
-| Chose only a generation of an engine different from that of the generation 0.1.0 had chosen (`current` remains) | It starts. That choice is not visible to 0.1.0 |
-| Chose a generation of the same engine as that of the generation 0.1.0 had chosen (`current` is removed and `current.<engine>` is created) | It writes the line `rules store refused: no generation is chosen` and rejects the configuration (exit 1) |
-| Wrote `kernel.default_engine` in the configuration file | It writes the line `configuration refused: configuration has an unknown key` and rejects the configuration (exit 2) |
+1. Stop the admin process, the proxy, the records shipper, and the certificate renewal timer.
+2. Move the current configuration file and the copied directories aside to other names (keep them; do not delete them).
+3. Restore the copy.
+4. Put back the executables of the previous version, and confirm that `config check` of the previous version writes `accepted`.
+5. Start the admin process, the proxy, and the records shipper in this order, and start the certificate renewal timer.
 
-The steps to go back are as follows. Run steps 2 and 3 with the updated executables, and steps 5 and 7 with the 0.1.0 executables. Steps 1, 4, and 6 do not use an executable.
+For the copy taken in the example of "Copy Before an Update" above, steps 2 and 3 are as follows.
 
-1. Stop the proxy and the admin process.
-2. Check the chosen generation with `rules list`. 0.1.0 can choose only one generation, so decide which generation to run.
-3. With `managed`, select again, with `managed activate <version>`, a managed configuration version in which no upstream has `engine`, because 0.1.0 does not know the `engine` of an upstream. After step 5, `current` and `current.<engine>` can point to different generations, and then `managed activate` of the updated executables rejects the configuration, so do this first.
-4. Remove `kernel.default_engine` from the configuration file. If you had written the `engine` of upstreams, remove it as well.
-5. Run `rules activate <config> <fingerprint>` with the 0.1.0 executable. 0.1.0 writes `current`.
-6. Remove `current.coraza` and `current.modsecurity` (`current.*`). Only `current` remains.
-7. Run `config check` with the 0.1.0 executable, and start.
+```bash
+sudo mv /etc/tukuyomi-core/config.json /etc/tukuyomi-core/config.json.after-update
+sudo mv /var/lib/tukuyomi-core/store /var/lib/tukuyomi-core/store.after-update
+sudo mv /var/lib/tukuyomi-core/managed /var/lib/tukuyomi-core/managed.after-update
+sudo mv /var/lib/tukuyomi-core/admin /var/lib/tukuyomi-core/admin.after-update
+sudo tar -C / -xpf /var/backups/tukuyomi-core/before-update.tar
+```
 
-After every step, either `current` or some `current.*` exists. That is why step 5 comes before step 6.
-
-When you go back to the updated executables and proceed again, it is the same as "Updating from 0.1.0" above. If you had chosen a ModSecurity generation in 0.1.0, `kernel.default_engine` is required. At start, the `current` written by 0.1.0 is read as the chosen generation of the same engine. The `current` marker of `rules list` is on one line, there is one `start: rules engine <engine>` line, and `current.*` does not increase.
-
-If you go back to the updated executables while forgetting to remove `current.*`, the following happens.
-
-- When `current` and `current.<engine>` of the same engine point to different generations, `rules list`, `config check`, and start all reject the configuration with `the current generation records of the engine disagree` (exit 1). `rules list` writes all the generation lines and then writes this sentence to standard error, and the `current` marker is not put on the generation of the engine in disagreement. Choosing again with `rules activate` brings it back.
-- When only an old choice for another engine remains (for example, `current` points to a Coraza generation, `current.modsecurity` remains, and there is no `current.coraza`), the configuration is accepted and the choice is read as a chosen generation. The `current` marker of `rules list` is on two lines, `config check` writes `accepted`, and at start two engines start, `start: rules engine coraza` and `start: rules engine modsecurity`.
-- A disagreement for the same engine only stops the start. An old choice for another engine is read without being refused, and that engine starts. If you do not want to start ModSecurity, remove `current.*` when you go back.
-
-The 0.1.0 admin process cannot read the lines of the switch history written by the updated admin process (the lines that have an `engine` field) and skips them. So the rollback target after going back (`rollback_to` of `GET /api/status`) is decided from the old lines that 0.1.0 wrote (see "Switch History" in the [admin reference](admin-reference.md)).
+- What you changed after the update is lost: the generations you imported or chose, the versions and applies of the managed configuration, the users, API tokens, and sessions you made, and the lines of the audit log in the admin store. The lines of the audit log also went to standard error (the journal).
+- The log directory is not restored. The logs written after the update stay.
+- The certificates of the ACME sites in `acme/` of the managed store go back to those of the time of the copy. The next `acme renew` renews them according to the rest of their validity (see "ACME" above).

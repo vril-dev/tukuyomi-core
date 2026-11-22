@@ -2170,10 +2170,30 @@ TLS は次のとおりです。
 
 ## バージョンの更新
 
-0.1.0 から更新する手順と、0.1.0 に戻す手順です。更新後のバージョンは、アップストリームごとに検査エンジンを選べます（上の「検査エンジンの選択」）。ユニットの書き方は、[ビルドと配置](../build/binary-deployment.ja.md) の「systemd」を参照してください。
+1.0 までは、直前のリリースからの更新だけを支えます。間のリリースを飛ばすときは、リリースを 1 つずつ順に更新します。前のバージョンへは、更新の前に取った写しを戻して切り戻します（下の「前のバージョンへの切り戻し」）。ユニットの書き方は、[ビルドと配置](../build/binary-deployment.ja.md) の「systemd」を参照してください。
+
+### 更新の前の写し
+
+更新の前に、次のものの写しを取ります。
+
+- 設定ファイル
+- ルールストア（`rules.store.dir`）
+- managed ストア（`managed.dir`。managed 設定を使う場合）
+- 管理データの保存先（`admin.store.dir`。管理プロセスを使う場合）
+
+写しを取る間は、管理プロセス、プロキシ、ログ送信プロセスと、証明書の更新のタイマーを止めておきます。所有者と権限は、そのまま保ちます（ルールストアなどは、所有者と権限を検証します）。写しには、管理データの保存先のパスワードのハッシュと API トークン、managed ストアの秘密鍵なども入るので、root だけが読めるディレクトリに置きます。次は、[ビルドと配置](../build/binary-deployment.ja.md) のディレクトリとユニットの例での写し方です。使っていないディレクトリは、引数から外します。
+
+```bash
+sudo systemctl stop tukuyomi-core-admin.service tukuyomi-core.service tukuyomi-core-records-ship.service tukuyomi-core-acme.timer
+sudo install -d -m 0700 /var/backups/tukuyomi-core
+sudo tar -C / -cpf /var/backups/tukuyomi-core/before-update.tar etc/tukuyomi-core/config.json var/lib/tukuyomi-core/store var/lib/tukuyomi-core/managed var/lib/tukuyomi-core/admin
+```
+
+ログのディレクトリ（`records.dir`）、証明書と鍵、作業ディレクトリ（`kernel.tmp_root`）は、写しません。
 
 ### 0.1.0 からの更新
 
+- 上の「更新の前の写し」を取ってから、実行ファイルを入れ替えます。
 - 実行ファイルを入れ替えるだけで、0.1.0 の設定ファイル、ルールストア、managed ストアは、そのまま読めます（0.1.0 で ModSecurity の世代を選択していたときは、下のとおり、`kernel.default_engine` が必要です）。新しい設定キー（`kernel.default_engine`、アップストリームの `engine`）を書かなければ、0.1.0 と同じように、1 つのエンジンだけで稼働します。
 - 0.1.0 で Coraza の世代を選択していたときは、`kernel.default_engine` を書く必要はありません。0.1.0 が書いた `current` は、Coraza の選択中の世代として読まれます。`config check` は `accepted` で、起動すると `start: rules engine coraza` の行が 1 つだけ出ます。`current` は書き換わらず、`current.*` も増えません。
 - 0.1.0 で ModSecurity の世代を選択していたときは、`kernel.default_engine` に `modsecurity` を書きます。
@@ -2184,35 +2204,26 @@ TLS は次のとおりです。
   - ログ送信プロセスは、設定ファイルの未知の設定キーを受け付けません。`kernel.default_engine` やアップストリームの `engine` を書く前に、ログ送信プロセスを同じビルドに入れ替えます。0.1.0 のプロキシも、`kernel.default_engine` のある設定ファイルを、`configuration has an unknown key` で受け付けません（exit 2）。
   - 実行ファイルを同じリリースのものにすべて入れ替えてから、管理プロセス、プロキシ、ログ送信プロセスの順に再起動します（「managed 設定への移行」の手順 8 と同じ順です）。管理プロセスを先に再起動すると、入れ替えの間は、更新後の管理プロセスが以前のプロキシへの世代の選択とロールバックを 409 で拒否するだけで、ルールストアと切り替えの履歴は変わりません。
 
-### 0.1.0 への切り戻し
+### 前のバージョンへの切り戻し
 
-実行ファイルを 0.1.0 に戻す手順です。0.1.0 は `current` だけを読み、`kernel.default_engine` とアップストリームの `engine` を知りません。更新後の `rules activate` は、`current.<engine>` を書いて、同じエンジンの世代を指す `current` を消します。そのため、更新後の実行ファイルで何をしたかによって、0.1.0 の `config check` と起動の結果が変わります。
+更新の前に取った写しを戻し、前のバージョンの実行ファイルで起動します。版ごとに違う手順はありません。
 
-| 更新後の実行ファイルでしたこと | 0.1.0 の `config check` と起動 |
-|---|---|
-| 起動しただけ（選択も、新しい設定キーを書くことも、していません） | ルールストアが変わらないので、そのまま起動します |
-| 0.1.0 が選択していた世代と別のエンジンの世代だけを選択した（`current` は残ります） | 起動します。その選択は、0.1.0 には見えません |
-| 0.1.0 が選択していた世代と同じエンジンの世代を選択した（`current` が消えて、`current.<engine>` ができます） | `rules store refused: no generation is chosen` の行を出して受け付けません（exit 1） |
-| 設定ファイルに `kernel.default_engine` を書いた | `configuration refused: configuration has an unknown key` の行を出して受け付けません（exit 2） |
+1. 管理プロセス、プロキシ、ログ送信プロセスと、証明書の更新のタイマーを止めます。
+2. 今の設定ファイルと、写しを取ったディレクトリを、別の名前に退避します（消さずに残します）。
+3. 写しを戻します。
+4. 実行ファイルを前のバージョンに戻し、前のバージョンの `config check` が `accepted` を出すことを確かめます。
+5. 管理プロセス、プロキシ、ログ送信プロセスの順に起動し、証明書の更新のタイマーを起動します。
 
-戻す手順は次のとおりです。2 と 3 は更新後の実行ファイル、5 と 7 は 0.1.0 の実行ファイルで実行します。1、4、6 は、実行ファイルを使いません。
+上の「更新の前の写し」の例で取った写しの場合、2 と 3 は次のとおりです。
 
-1. プロキシと管理プロセスを止めます。
-2. `rules list` で、選択中の世代を確認します。0.1.0 が選択できる世代は 1 つなので、どの世代で動かすかを決めます。
-3. `managed` のある設定では、`managed activate <version>` で、アップストリームに `engine` を書いていない managed 設定のバージョンを選択し直します。0.1.0 は、アップストリームの `engine` を知らないためです。5 の後は、`current` と `current.<engine>` が別の世代を指すことがあり、更新後の実行ファイルの `managed activate` は受け付けなくなるので、先に行います。
-4. 設定ファイルから、`kernel.default_engine` を外します。アップストリームの `engine` を書いていたときも、外します。
-5. 0.1.0 の実行ファイルで、`rules activate <config> <fingerprint>` を実行します。0.1.0 が `current` を書きます。
-6. `current.coraza` と `current.modsecurity`（`current.*`）を消します。`current` だけが残ります。
-7. 0.1.0 の実行ファイルで `config check` を実行し、起動します。
+```bash
+sudo mv /etc/tukuyomi-core/config.json /etc/tukuyomi-core/config.json.after-update
+sudo mv /var/lib/tukuyomi-core/store /var/lib/tukuyomi-core/store.after-update
+sudo mv /var/lib/tukuyomi-core/managed /var/lib/tukuyomi-core/managed.after-update
+sudo mv /var/lib/tukuyomi-core/admin /var/lib/tukuyomi-core/admin.after-update
+sudo tar -C / -xpf /var/backups/tukuyomi-core/before-update.tar
+```
 
-どの手順の後も、`current` か `current.*` のどれかがあります。6 の前に 5 を行うのは、そのためです。
-
-更新後の実行ファイルに戻して進め直すときは、上の「0.1.0 からの更新」と同じです。0.1.0 で ModSecurity の世代を選択していたときは、`kernel.default_engine` が必要です。起動すると、0.1.0 が書いた `current` は、同じエンジンの選択中の世代として読まれます。`rules list` の `current` の印は 1 行、`start: rules engine <engine>` の行は 1 つで、`current.*` は増えません。
-
-`current.*` を消し忘れたまま、更新後の実行ファイルに戻したときは、次のようになります。
-
-- 同じエンジンの `current` と `current.<engine>` が別の世代を指しているときは、`rules list`、`config check`、起動のどれも、`the current generation records of the engine disagree` で受け付けません（exit 1）。`rules list` は、世代の行をすべて出してから、標準エラーにこの文を出し、`current` の印は、食い違うエンジンの世代に付きません。`rules activate` で選択し直すと、元に戻ります。
-- 別のエンジンの古い選択だけが残っているとき（たとえば、`current` が Coraza の世代を指し、`current.modsecurity` が残っていて、`current.coraza` が無いとき）は、受け付けられ、選択中の世代として読まれます。`rules list` の `current` の印は 2 行になり、`config check` は `accepted` で、起動すると `start: rules engine coraza` と `start: rules engine modsecurity` の 2 つのエンジンが起動します。
-- 同じエンジンの食い違いは、起動を止めるだけです。別のエンジンの古い選択は、断られずに読まれて、そのエンジンが起動します。ModSecurity を起動したくないときは、戻すときに `current.*` を消します。
-
-0.1.0 の管理プロセスは、更新後の管理プロセスが書いた切り替えの履歴の行（`engine` の欄がある行）を読めず、読み飛ばします。そのため、戻した後のロールバック先（`GET /api/status` の `rollback_to`）は、0.1.0 が書いた古い行から決まります（[管理リファレンス](admin-reference.ja.md) の「切り替えの履歴」）。
+- 更新の後に変えたものは、失われます。インポートや選択をした世代、managed 設定のバージョンと反映、作ったユーザー、API トークン、セッション、管理データの保存先の監査ログの行です。監査ログの行は、標準エラー（ジャーナル）にも出ています。
+- ログのディレクトリは戻しません。更新の後のログは残ります。
+- managed ストアの `acme/` にある ACME のサイトの証明書は、写しを取ったときのものに戻ります。次の `acme renew` で、有効期間の残りに応じて更新されます（上の「ACME」）。

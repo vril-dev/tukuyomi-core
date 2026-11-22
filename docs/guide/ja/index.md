@@ -38,7 +38,7 @@ build: "pandoc → EPUB 3"
   （source: docs/operations/operator-reference.ja.md の「ログ」「ログ送信プロセス」）
 - **第8章　ACME による証明書** — 必要なもの、初回の発行、更新
   （source: docs/operations/operator-reference.ja.md の「ACME」「ACME のサイト」）
-- **第9章　運用** — 監視、設定のリロード、停止、バージョンの更新
+- **第9章　運用** — 監視、設定のリロード、停止、バージョンの更新と切り戻し
   （source: docs/operations/operator-reference.ja.md の「シグナル」「停止」「監視」「バージョンの更新」）
 - **付録A　運用リファレンス** — docs/operations/operator-reference.ja.md を、本を作るときに取り込みます
 - **付録B　管理リファレンス** — docs/operations/admin-reference.ja.md を、本を作るときに取り込みます

@@ -1,6 +1,6 @@
 # 第9章　運用
 
-本章では、稼働中のプロキシを運用するときの操作を説明します。監視（`/readyz`、`/metrics`、systemd への通知）、シグナルによる設定のリロード、停止、0.1.0 からの更新が分かります。操作の結果は、ログの行とメトリクスで確認します。
+本章では、稼働中のプロキシを運用するときの操作を説明します。監視（`/readyz`、`/metrics`、systemd への通知）、シグナルによる設定のリロード、停止、バージョンの更新と前のバージョンへの切り戻しが分かります。操作の結果は、ログの行とメトリクスで確認します。
 
 ## 9.1　監視
 
@@ -132,11 +132,23 @@
 
 ## 9.4　バージョンの更新
 
-0.1.0 から更新する手順です。更新後のバージョンは、アップストリームごとに検査エンジンを選べます（第4章）。新しいリリースの実行ファイルの入手と確認は、第3章の 3.3 を参照してください。
+1.0 までは、直前のリリースからの更新だけを支えます。間のリリースを飛ばすときは、リリースを 1 つずつ順に更新します。前のバージョンへは、更新の前に取った写しを戻して切り戻します。新しいリリースの実行ファイルの入手と確認は、第3章の 3.3 を参照してください。
+
+### 更新の前の写し
+
+更新の前に、設定ファイル、ルールストア（`rules.store.dir`）、managed ストア（`managed.dir`）、管理データの保存先（`admin.store.dir`）の写しを取ります。使っていないものは除きます。写しを取る間は、管理プロセス、プロキシ、ログ送信プロセスと、証明書の更新のタイマーを止めておきます。所有者と権限は、そのまま保ちます。写しには、パスワードのハッシュ、API トークン、秘密鍵なども入るので、root だけが読めるディレクトリに置きます。第3章のディレクトリとユニットの例では、次のとおりです。
+
+```bash
+sudo systemctl stop tukuyomi-core-admin.service tukuyomi-core.service tukuyomi-core-records-ship.service tukuyomi-core-acme.timer
+sudo install -d -m 0700 /var/backups/tukuyomi-core
+sudo tar -C / -cpf /var/backups/tukuyomi-core/before-update.tar etc/tukuyomi-core/config.json var/lib/tukuyomi-core/store var/lib/tukuyomi-core/managed var/lib/tukuyomi-core/admin
+```
+
+ログのディレクトリ（`records.dir`）、証明書と鍵、作業ディレクトリ（`kernel.tmp_root`）は、写しません。
 
 ### 0.1.0 からの更新
 
-実行ファイルを入れ替えるだけで、0.1.0 の設定ファイル、ルールストア、managed ストアは、そのまま読めます。新しい設定キー（`kernel.default_engine`、アップストリームの `engine`）を書かなければ、0.1.0 と同じように、1 つのエンジンだけで稼働します。
+0.2.0 は、アップストリームごとに検査エンジンを選べます（第4章）。上の写しを取ってから、実行ファイルを入れ替えます。実行ファイルを入れ替えるだけで、0.1.0 の設定ファイル、ルールストア、managed ストアは、そのまま読めます。新しい設定キー（`kernel.default_engine`、アップストリームの `engine`）を書かなければ、0.1.0 と同じように、1 つのエンジンだけで稼働します。
 
 - 0.1.0 で Coraza の世代を選択していたときは、`kernel.default_engine` を書く必要はありません。0.1.0 が書いた `current` は、Coraza の選択中の世代として読まれます。`config check` は `accepted` で、起動すると `start: rules engine coraza` の行が 1 つだけ出ます。`current` は書き換わらず、`current.*` も増えません。
 - 0.1.0 で ModSecurity の世代を選択していたときは、`kernel.default_engine` に `modsecurity` を書きます。書かないと、`config check` と起動は、`rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` の行を出して受け付けません（exit 1）。ルールストアは変わりません。
@@ -147,9 +159,27 @@
 - ログ送信プロセスは、設定ファイルの未知の設定キーを受け付けません。`kernel.default_engine` やアップストリームの `engine` を書く前に、ログ送信プロセスを同じビルドに入れ替えます。0.1.0 のプロキシも、`kernel.default_engine` のある設定ファイルを、`configuration has an unknown key` で受け付けません（exit 2）。
 - 実行ファイルを同じリリースのものにすべて入れ替えてから、管理プロセス、プロキシ、ログ送信プロセスの順に再起動します。管理プロセスを先に再起動すると、入れ替えの間は、更新後の管理プロセスが以前のプロキシへの世代の選択とロールバックを 409 で拒否するだけで、ルールストアと切り替えの履歴は変わりません。
 
-### 0.1.0 への切り戻し
+### 前のバージョンへの切り戻し
 
-0.1.0 に戻すときは、更新後の実行ファイルで何をしたか（世代の選択、新しい設定キー）によって、手順が変わります。手順と、それぞれの場合の `config check` と起動の結果は、付録A 運用リファレンスの「0.1.0 への切り戻し」を参照してください。
+更新の前に取った写しを戻し、前のバージョンの実行ファイルで起動します。版ごとに違う手順はありません。
+
+1. 管理プロセス、プロキシ、ログ送信プロセスと、証明書の更新のタイマーを止めます。
+2. 今の設定ファイルと、写しを取ったディレクトリを、別の名前に退避します（消さずに残します）。
+3. 写しを戻します。
+4. 実行ファイルを前のバージョンに戻し、前のバージョンの `config check` が `accepted` を出すことを確かめます。
+5. 管理プロセス、プロキシ、ログ送信プロセスの順に起動し、証明書の更新のタイマーを起動します。
+
+上の例で取った写しの場合、2 と 3 は次のとおりです。
+
+```bash
+sudo mv /etc/tukuyomi-core/config.json /etc/tukuyomi-core/config.json.after-update
+sudo mv /var/lib/tukuyomi-core/store /var/lib/tukuyomi-core/store.after-update
+sudo mv /var/lib/tukuyomi-core/managed /var/lib/tukuyomi-core/managed.after-update
+sudo mv /var/lib/tukuyomi-core/admin /var/lib/tukuyomi-core/admin.after-update
+sudo tar -C / -xpf /var/backups/tukuyomi-core/before-update.tar
+```
+
+更新の後に変えたもの（インポートや選択をした世代、managed 設定のバージョンと反映、作ったユーザー、API トークン、セッション、管理データの保存先の監査ログの行）は、失われます。ログのディレクトリは戻さないので、更新の後のログは残ります。ほかの注意は、付録A 運用リファレンスの「前のバージョンへの切り戻し」を参照してください。
 
 ## 9.5　運用上の注意
 
@@ -157,4 +187,4 @@
 - 動作中に変更できない設定キーは、`systemctl restart` で再起動します。管理プロセスとログ送信プロセスが読む設定キーを変えたときも、それらを再起動します。
 - 設定のリロードは、ルールの世代を切り替えません。世代は SIGUSR1 か管理画面で切り替えます。証明書と鍵だけを再読み込みするときは、SIGHUP ではなく SIGUSR2 を送ります。SIGHUP は設定ファイルの全体を読み込むので、書きかけの設定を読み込んでしまうことがあります。
 - 管理プロセス、プロキシ、ログ送信プロセスは、同じビルドにそろえます。
-- 0.1.0 に戻す前に、更新後の実行ファイルで何を選択し、どの設定キーを書いたかを確認します。結果が変わります。
+- 更新の前に、写しを取ります。前のバージョンへは、この写しを戻して切り戻します。
