@@ -68,7 +68,7 @@ Creates the first user (with the role `owner`). It can create the user only when
   ```
 
 - A name is 1 to 32 bytes of lowercase letters, digits, `.`, `_`, and `-`. A password is 12 to 128 bytes of UTF-8.
-- On success, it writes `created owner <name>` to standard output and exits with 0. Other lines go to standard error and start with `admin bootstrap:`.
+- On success, it writes `created owner <name>` to standard output and exits with 0. Other lines go to standard error. Except for the line of the audit log (below), they start with `admin bootstrap:`.
 - It writes an audit log line (`action` is `create`, `auth` is `bootstrap`, with no actor and no client address) before it creates the user. If it cannot write the line, it does not create the user. This line is written to standard error as JSON.
 - It can run when the admin process is not running.
 

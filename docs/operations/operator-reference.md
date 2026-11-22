@@ -122,7 +122,7 @@ The input of `import` is as follows. The paths in the options can also be writte
 - If SIGINT (Ctrl-C) or SIGTERM arrives during the trial, the command stops the trial, cleans up the inspector process and the work directory, and exits without making a generation. After the trial, these two signals do not stop the command.
 - `import` starts an inspector process, so it also runs the checks before start (see "Checks Before Start" in the [build and deployment guide](../build/binary-deployment.md)).
 
-The exit codes are as follows. 0 is success. 1 is any other exit (a rejected rules store or input, a failed trial, a rules store in use, a generation whose manifest cannot be read in `list`, a rules store whose chosen generation cannot be determined, `deactivate` for an engine that the configuration uses or an engine that has no chosen generation, and running as root). 2 is an argument error, a configuration file that was rejected (for `deactivate`, this includes the selected version of `managed`), or an engine that cannot be used (`import` and `activate`). `list` of a rules store that has no chosen generation exits 0.
+The exit codes are as follows. 0 is success. 1 is any other exit (a rejected rules store or input, a failed trial, a rules store in use, a generation whose manifest cannot be read in `list` (the list is still written to the end), a rules store whose chosen generation cannot be determined, `deactivate` for an engine that the configuration uses or an engine that has no chosen generation, and running as root). 2 is an argument error, a configuration file that was rejected (for `deactivate`, this includes the selected version of `managed`), or an engine that cannot be used (`import` and `activate`). `list` of a rules store that has no chosen generation exits 0.
 
 ### `managed`
 
@@ -2041,7 +2041,7 @@ When the records shipper connects to the DB, it looks for the tables and creates
 - It sends the lines of every `type`. For a line that is a JSON object with a `type` it knows, it puts the fields into the columns with the same names (the columns for fields that are missing and for fields of a different type are empty). Other lines are inserted with `type` set to `unknown`. The line itself always remains in `raw`.
 - The column lengths follow the limits that the proxy writes, and long values are cut (`method` 32, `host` 255, `path` 1024, `request_id` 128 bytes). For a line that is not UTF-8, invalid bytes become U+FFFD in `raw` (`line_hash` is the hash of the original bytes).
 - `line_hash` is UNIQUE, so a line that was sent twice becomes one. Lines with the same byte sequence also become one.
-- If there is `retention_days`, once per minute it deletes up to 1000 lines older than that (when 1000 lines could be deleted, it continues to delete). Age is decided by the `ts` of the log (the clock of the proxy).
+- If `retention_days` is not 0, once per minute it deletes up to 1000 lines older than that (when 1000 lines could be deleted, it continues to delete). Age is decided by the `ts` of the log (the clock of the proxy).
 
 ### Logs That Cannot Be Shipped
 
