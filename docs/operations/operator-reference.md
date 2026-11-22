@@ -1753,7 +1753,7 @@ Example (the value of `sha256` is an example. Write the value that `sha256sum` p
 
 ## Logs
 
-Logs are written to standard error, one JSON object per line (to the journal under systemd). If the configuration has `records`, the same lines are also written to files (see "Log Files (`records`)" below). If `records.ship` is also present, another process (the records shipper) sends the lines of the files to PostgreSQL or MySQL (see "Records Shipper" below). You can choose for each route whether to let requests through or to refuse them when logs cannot be kept (see "What Logs Keep (`keep` and the `records` of a Route)" below). The output of the short commands (`config check`, `rules`, `managed`, `acme`, `admin bootstrap`, `admin reset`) remains lines of text for people to read.
+Logs are written to standard error, one JSON object per line (to the journal under systemd). If the configuration has `records`, the same lines are also written to files (except some of the first lines of a start; see "Log Files (`records`)" below). If `records.ship` is also present, another process (the records shipper) sends the lines of the files to PostgreSQL or MySQL (see "Records Shipper" below). You can choose for each route whether to let requests through or to refuse them when logs cannot be kept (see "What Logs Keep (`keep` and the `records` of a Route)" below). The output of the short commands (`config check`, `rules`, `managed`, `acme`, `admin bootstrap`, `admin reset`) remains lines of text for people to read.
 
 Every log line starts with the following two fields. A field without a value is not written (it is not `null`).
 
@@ -1855,7 +1855,7 @@ The `line` sentences are as follows.
 
 ### Log Files (`records`)
 
-When you write `records` in the configuration, the same lines as the logs written to standard error are also written to files in a directory. If it is omitted, logs go only to standard error. The admin process reads these files to search the logs.
+When you write `records` in the configuration, the same lines as the logs written to standard error are also written to files in a directory. If it is omitted, logs go only to standard error. The first lines of a start that come before the log files are opened (such as the `start: configuration accepted` and `start: rules …` lines) go only to standard error. The admin process reads these files to search the logs.
 
 ```text
 {"dir", "file_bytes", "files", "keep"?, "sync_ms"?, "ship"?}
