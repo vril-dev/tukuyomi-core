@@ -17,7 +17,7 @@ Main features:
 - Admin API and admin UI (editing managed configuration and applying it without stopping the proxy, rule set generations, log search, audit log)
 - Log files, and log shipping to PostgreSQL / MySQL
 
-For what is and is not implemented, see "現在の状態" (current status) in the [system overview](docs/detailed-design/00_overview/system-overview.md) (Japanese).
+For what is and is not implemented, see "Current Status" in the [system overview](docs/detailed-design/00_overview/system-overview.md).
 
 > The product as a whole has not had a security review yet.
 
@@ -43,7 +43,7 @@ For placement, the first start, and building from source (Rust 1.94.1 and Go 1.2
 
 ## Documentation
 
-The documentation is in Japanese only.
+The documentation is available in English and Japanese.
 
 - Documentation index: [docs/README.md](docs/README.md)
 - Build and deployment: [docs/build/binary-deployment.md](docs/build/binary-deployment.md)

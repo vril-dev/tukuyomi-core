@@ -1,29 +1,31 @@
-# 管理リファレンス
+[English](admin-reference.md) | [日本語](admin-reference.ja.md)
 
-この文書では、現在の実装の管理プロセス、設定キー `admin`、管理 API、管理画面を、調べて使える形でまとめています。プロキシの設定キーとコマンドは [運用リファレンス](operator-reference.md) を、配置と systemd のユニットの例は [ビルドと配置](../build/binary-deployment.md) を参照してください。
+# Admin Reference
 
-この文書に出てくるパスと名前（`/etc/tukuyomi-core/config.json`、OS ユーザー `tukuyomi`、`admin.example.com`、`192.0.2.0/24` など）は例です。
+This document is a reference for the admin process, the setting key `admin`, the admin API, and the admin screens of the current implementation. For the setting keys and commands of the proxy, see the [operator reference](operator-reference.md). For the deployment and examples of systemd units, see the [build and deployment guide](../build/binary-deployment.md).
 
-## 構成
+The paths and names in this document (`/etc/tukuyomi-core/config.json`, the OS user `tukuyomi`, `admin.example.com`, `192.0.2.0/24`, and so on) are examples.
 
-管理プロセスは、`tukuyomi-proxy` と同じ実行ファイルの `admin` コマンドで動く、プロキシとは別のプロセスです。ブラウザーで開く管理画面と、プログラムが使う管理 API に応答します。
+## Components
 
-| 構成要素 | 内容 |
+The admin process runs as the `admin` command of the same executable as `tukuyomi-proxy`, separately from the proxy. It responds to requests for the admin screens that you open in a browser and for the admin API that programs use.
+
+| Component | Content |
 |---|---|
-| 管理プロセス | `tukuyomi-proxy admin <config>`。TLS を使わないループバックのリスナーで、管理画面と管理 API に応答します |
-| 管理画面 | 実行ファイルに組み込んだ画面（日本語と英語）。管理プロセスが提供します |
-| 管理データの保存先 | 設定の `admin.store.dir`。ユーザー、API トークン、監査ログ、切り替えの履歴、設定の変更履歴を置くディレクトリ |
-| 制御ソケット | 設定の `admin.control`。プロキシが作る Unix ドメインソケット。管理プロセスが、プロキシの状態を問い合わせ、エンジンごとの世代の切り替えと、managed 設定のバージョンでの設定のリロードを依頼するために使います（プロキシ側は [運用リファレンス](operator-reference.md) の「制御ソケット」） |
-| ログファイル | 設定の `records.dir`。プロキシがログの写しを置きます。管理プロセスが読み出します（[運用リファレンス](operator-reference.md) の「ログファイル（`records`）」） |
-| managed ストア | 設定の `managed.dir`（`managed` のある設定だけ）。managed 設定のバージョンと、バージョンが使う証明書などのファイルを置くディレクトリ。管理プロセスがバージョンを保存し、削除します。プロキシは読むだけです（[運用リファレンス](operator-reference.md) の「managed ストアとバージョン」） |
+| Admin process | `tukuyomi-proxy admin <config>`. It responds to requests for the admin screens and the admin API on a loopback listener without TLS |
+| Admin screens | Screens built into the executable (Japanese and English). The admin process serves them |
+| Admin store | `admin.store.dir` in the configuration. The directory that holds the users, API tokens, audit log, switch history, and configuration history |
+| Control socket | `admin.control` in the configuration. A Unix domain socket that the proxy creates. The admin process uses it to ask for the state of the proxy, to request a generation switch for each engine, and to request a configuration reload with a version of the managed configuration (for the proxy side, see "Control Socket" in the [operator reference](operator-reference.md)) |
+| Log files | `records.dir` in the configuration. The proxy puts copies of its logs there. The admin process reads them (see "Log Files (`records`)" in the [operator reference](operator-reference.md)) |
+| Managed store | `managed.dir` in the configuration (only for a configuration that has `managed`). The directory that holds the versions of the managed configuration and the files that the versions use, such as certificates. The admin process saves and removes versions. The proxy only reads them (see "Managed Store and Versions" in the [operator reference](operator-reference.md)) |
 
-- 管理プロセスとプロキシは、同じ設定ファイルを読みます。管理プロセスは、`admin` などの値を起動時に 1 回だけ読み、再読み込みしません。ただし、設定ファイルの値を読み出す `GET /api/config` と、managed 設定の検証と変更では、そのたびに設定ファイルを再読み込みします（下の「managed 設定の操作」）。プロキシは SIGHUP でリロードしますが、`admin` は動作中に変更できない設定キーです（[運用リファレンス](operator-reference.md) の「SIGHUP（設定のリロード）」）。
-  - プロキシが `admin` から使う設定キーは `listen` と `control` で、managed のある設定では `route` も使います。`route` はプロキシだけが使い、管理プロセスは使いません。ほかの設定キーは、同じファイルを両方が受け付けるか両方が受け付けないようにするため、プロキシも範囲を検証するだけです。
-  - `admin` の設定キーを変更したら、管理プロセスを再起動します。プロキシは、`admin` が違う設定のリロードを拒否するので、プロキシも再起動します。`admin.route` を変更したときのプロキシの扱いは、[運用リファレンス](operator-reference.md) の「`admin`」と「SIGHUP（設定のリロード）」を参照してください。
-- 管理プロセスは、プロキシが停止していても動作します。停止している間も、世代とログの読み出し、インポート、ユーザーの管理、managed 設定のバージョンの読み出し・検証・削除は使えます。プロキシに依頼する世代の切り替えとロールバック、managed 設定の反映は、プロキシに接続できなければ拒否します。managed 設定の「保存して反映」の操作では、そのときバージョンも保存しません（下の「世代の操作」と「managed 設定の操作」）。
-- 設定に `admin` が無ければ、管理プロセスは起動せず（exit 2）、プロキシは制御ソケットを作りません。
+- The admin process and the proxy read the same configuration file. The admin process reads values such as `admin` only once, at start, and does not read them again. However, `GET /api/config`, which reads out the values of the configuration file, and the check and the changes of the managed configuration read the configuration file again each time (see "Managed Configuration Operations" below). The proxy reloads on SIGHUP, but `admin` is a setting key that cannot change while running (see "SIGHUP (Configuration Reload)" in the [operator reference](operator-reference.md)).
+  - The setting keys of `admin` that the proxy uses are `listen` and `control`, and, in a configuration that has `managed`, also `route`. Only the proxy uses `route`, not the admin process. For the other setting keys, the proxy also only validates the ranges, so that both processes accept the same file or both reject it.
+  - After you change a setting key of `admin`, restart the admin process. The proxy refuses to reload a configuration whose `admin` differs, so restart the proxy too. For what the proxy does when `admin.route` is changed, see "`admin`" and "SIGHUP (Configuration Reload)" in the [operator reference](operator-reference.md).
+- The admin process works while the proxy is stopped. While the proxy is stopped, you can still read generations and logs, import, manage users, and read, check, and remove versions of the managed configuration. A generation switch and a rollback, which the admin process asks the proxy to do, and applying the managed configuration are refused if the proxy cannot be reached. In that case, the "Save and apply" operation of the managed configuration does not save the version either (see "Generation Operations" and "Managed Configuration Operations" below).
+- If the configuration has no `admin`, the admin process does not start (exit 2), and the proxy does not create the control socket.
 
-## 管理プロセス
+## Admin Process
 
 ### `admin`
 
@@ -31,23 +33,23 @@
 tukuyomi-proxy admin <config>
 ```
 
-- 設定ファイルは絶対パスで渡します（[運用リファレンス](operator-reference.md) の「コマンド」と同じ決まりです）。
-- 起動は次の順に進みます。
-  1. 起動前の検証を行います（root でないこと、SIGCHLD、ファイルディスクリプター。プロキシと同じで、内容は [ビルドと配置](../build/binary-deployment.md) の「起動前の検証」を参照してください）。
-  2. 設定ファイルを読み込みます。
-  3. 管理データの保存先を開き、`process.lock` のロックを取得します。
-  4. 監査ログを開きます。
-  5. リスナーをバインドします。
-- リスナーをバインドすると、`admin: listening` の行を出力し、環境に `NOTIFY_SOCKET` があれば `READY=1` を送ります。
-- 1 つの管理データの保存先で動作する管理プロセスは、1 つだけです。`process.lock` を保持している間、ほかの管理プロセスは同じ保存先で起動できません（exit 1）。2 つのプロセスが、同じ時間枠の認証コードや同じリカバリーコードを、それぞれ 1 回ずつ受け入れてしまうのを防ぐためです。
-- プロキシと同じ OS ユーザーで実行します。ルールストア、管理データの保存先、ログファイルを置くディレクトリ、managed ストア（`managed.dir`）は、どれも所有者がその OS ユーザーで、グループとその他のユーザーの権限が無いディレクトリでなければ使いません。制御ソケットを置くディレクトリは、プロキシがソケットを作るときに同じ検証をします。インポートの事前検証は検査プロセスを起動するので、設定の `kernel`（検査プロセスの実行ファイルと作業ディレクトリ）もプロキシと同じ値を使います。
-- 終了コードは次のとおりです。
+- Pass the configuration file as an absolute path (the same rule as for "Commands" in the [operator reference](operator-reference.md)).
+- Start proceeds in the following order.
+  1. It runs the checks before start (not running as root, SIGCHLD, file descriptors. These are the same as for the proxy; see "Checks Before Start" in the [build and deployment guide](../build/binary-deployment.md)).
+  2. It reads the configuration file.
+  3. It opens the admin store and takes the lock on `process.lock`.
+  4. It opens the audit log.
+  5. It binds the listener.
+- After it binds the listener, it writes an `admin: listening` line and, if `NOTIFY_SOCKET` is in the environment, sends `READY=1`.
+- Only one admin process can run on one admin store. While one admin process holds `process.lock`, no other admin process can start on the same store (exit 1). This prevents two processes from each accepting the same verification code of the same time window, or the same recovery code, once.
+- Run it as the same OS user as the proxy. It uses each of the rules store, the admin store, the directory for the log files, and the managed store (`managed.dir`) only if it is a directory that is owned by that OS user and has no permissions for the group and other users. The directory for the control socket gets the same check when the proxy creates the socket. A trial of an import starts an inspector process, so the admin process also uses the same `kernel` value of the configuration as the proxy (the executable and work directory of the inspector process).
+- The exit codes are as follows.
 
-| 終了コード | 意味 |
+| Exit code | Meaning |
 |---|---|
-| 0 | シグナルで停止しました |
-| 1 | それ以外の終了。root での起動、起動前の検証の失敗、使えない管理データの保存先（別の管理プロセスが使用しているときを含む）、開けない監査ログ、バインドできない `admin.listen` |
-| 2 | 引数のエラー、受け付けられなかった設定ファイル、`admin` の無い設定ファイル |
+| 0 | Stopped by a signal |
+| 1 | Any other exit: started as root, a failed check before start, an admin store that cannot be used (including one that another admin process is using), an audit log that cannot be opened, an `admin.listen` that cannot be bound |
+| 2 | An argument error, a configuration file that was rejected, a configuration file without `admin` |
 
 ### `admin bootstrap`
 
@@ -55,9 +57,9 @@ tukuyomi-proxy admin <config>
 tukuyomi-proxy admin bootstrap <config> <name>
 ```
 
-最初のユーザー（ロールは `owner`）を作成します。管理データの保存先にユーザーが 1 人もいないときだけ作成できます。
+Creates the first user (with the role `owner`). It can create the user only when the admin store has no user.
 
-- パスワードは標準入力の最初の 1 行から読み込みます。引数には渡しません。例:
+- It reads the password from the first line of standard input. Do not pass it as an argument. Example:
 
   ```bash
   read -r -s -p 'password: ' PW; echo
@@ -65,10 +67,10 @@ tukuyomi-proxy admin bootstrap <config> <name>
   unset PW
   ```
 
-- 名前は 1〜32 バイトの小文字の英字・数字・`.`・`_`・`-` で、パスワードは 12〜128 バイトの UTF-8 です。
-- 成功すると、標準出力に `created owner <name>` が出力され、exit 0 で終了します。ほかの行は標準エラーに出力され、`admin bootstrap:` で始まります。
-- 監査ログの行（`action` が `create`、`auth` が `bootstrap`、操作者とクライアントのアドレスは無し）を、ユーザーを作成する前に書きます。書けなければユーザーは作成しません。この行は標準エラーに JSON のまま出力されます。
-- 管理プロセスが動作していなくても実行できます。
+- A name is 1 to 32 bytes of lowercase letters, digits, `.`, `_`, and `-`. A password is 12 to 128 bytes of UTF-8.
+- On success, it writes `created owner <name>` to standard output and exits with 0. Other lines go to standard error and start with `admin bootstrap:`.
+- It writes an audit log line (`action` is `create`, `auth` is `bootstrap`, with no actor and no client address) before it creates the user. If it cannot write the line, it does not create the user. This line is written to standard error as JSON.
+- It can run when the admin process is not running.
 
 ### `admin reset`
 
@@ -76,79 +78,79 @@ tukuyomi-proxy admin bootstrap <config> <name>
 tukuyomi-proxy admin reset <config> <name>
 ```
 
-ロックアウトされたユーザー（たとえば、パスワードと二要素認証を両方失った唯一の owner）のために、パスワードを決め直します。
+Sets the password again for a user who is locked out (for example, the only owner who has lost both the password and two-factor authentication).
 
-- パスワードの読み込み方、名前とパスワードの決まり、標準エラーの行、監査ログの行の書き方は、`admin bootstrap` と同じです。監査ログの行は `action` が `reset`、`auth` が `reset` で、対象がユーザーの名前になります。
-- 成功すると、標準出力に `reset password of <name>` が出力され、exit 0 で終了します。
-- ユーザーに対して、次のことを行います。
-  - パスワードを入力された値にし、次のログインで変更させます。
-  - 二要素認証とリカバリーコードを無効にします。
-  - このユーザーのセッションを終了し、API トークンをすべて無効にします。トークンのファイルを削除できなかったときは、その旨の行を標準エラーに出力しますが、トークンは無効のままで、exit 0 で終了します。
-  - ロックアウトを解除し、失敗回数を 0 から数え直します。
-- 無効にしたユーザーは、有効には戻しません。無効のユーザーを使えるようにするには、owner が `PUT /api/users/<name>` で有効にします。
-- 管理プロセスが動作している間も実行できます。変更は、保存先のロックの中で、読み込んだユーザーが変わっていないときだけ書き込みます。別の書き込みと重なったときは、`the admin store is in use by another process` か `the user was changed since it was read` で拒否されます（exit 1）。その場合は、もう一度実行してください。
+- How the password is read, the rules for the name and the password, the lines on standard error, and how the audit log line is written are the same as for `admin bootstrap`. In the audit log line, `action` is `reset`, `auth` is `reset`, and the target is the name of the user.
+- On success, it writes `reset password of <name>` to standard output and exits with 0.
+- It does the following to the user.
+  - It sets the password to the entered value and makes the user change it at the next login.
+  - It disables two-factor authentication and the recovery codes.
+  - It ends the sessions of this user and invalidates all API tokens. If it cannot delete a token file, it writes a line about it to standard error, but the token stays invalid, and it exits with 0.
+  - It releases the lockout and counts failures again from 0.
+- A user who is disabled is not enabled again. To make a disabled user usable, an owner enables the user with `PUT /api/users/<name>`.
+- It can also run while the admin process is running. The change is written inside the lock of the store, and only if the user that was read has not changed. If it overlaps with another write, it is refused with `the admin store is in use by another process` or `the user was changed since it was read` (exit 1). In that case, run it again.
 
-`bootstrap` と `reset` の終了コードと標準エラーの主な行は次のとおりです。
+The exit codes and the main standard error lines of `bootstrap` and `reset` are as follows.
 
-| 終了コード | 場合 | 標準エラーの行（`admin bootstrap:` か `admin reset:` の後） |
+| Exit code | Case | Standard error line (after `admin bootstrap:` or `admin reset:`) |
 |---|---|---|
-| 0 | 成功 | （標準出力に上の行） |
-| 1 | root での実行、起動前の検証の失敗 | `host check refused: ...` |
-| 1 | パスワードを読み込めない | `the password is not 12 to 128 bytes`、`the password line is too long`、`the password is not UTF-8` |
-| 1 | 使えない管理データの保存先、書き込めない監査ログ | `admin store refused: ...`、`audit log refused: ...`、`the audit log cannot be written` |
-| 1 | ユーザーがすでにいる（`bootstrap`）、ユーザーがいない（`reset`） | `the store has a user already`、`the user is not in the store` |
-| 2 | 設定が受け付けられなかった、`admin` が無い | `configuration refused: ...` |
-| 2 | 名前のエラー | `the name is not 1 to 32 bytes of a-z, 0-9, '.', '_' and '-'` |
-| 2 | 引数のエラー | （`admin:` で始まる行に、使い方の行が続きます） |
+| 0 | Success | (the line above, on standard output) |
+| 1 | Run as root, a failed check before start | `host check refused: ...` |
+| 1 | The password cannot be read | `the password is not 12 to 128 bytes`, `the password line is too long`, `the password is not UTF-8` |
+| 1 | An admin store that cannot be used, an audit log that cannot be written | `admin store refused: ...`, `audit log refused: ...`, `the audit log cannot be written` |
+| 1 | The user already exists (`bootstrap`), the user does not exist (`reset`) | `the store has a user already`, `the user is not in the store` |
+| 2 | The configuration was rejected, there is no `admin` | `configuration refused: ...` |
+| 2 | A name error | `the name is not 1 to 32 bytes of a-z, 0-9, '.', '_' and '-'` |
+| 2 | An argument error | (a line that starts with `admin:`, followed by a usage line) |
 
-### リスナー
+### Listener
 
-管理プロセスは、`admin.listen` のループバックアドレスで、HTTP/1.1 に応答します。TLS は使いません（外部から使うときは、プロキシの TLS のリスナーを通します。下の「外部からの利用」）。
+The admin process responds to HTTP/1.1 requests on the loopback address of `admin.listen`. It does not use TLS (to use it from outside, go through a TLS listener of the proxy; see "Access from Outside" below).
 
-| 項目 | 値 |
+| Field | Value |
 |---|---|
-| 同時接続数 | 32。超えた接続は、受け付けてすぐに閉じます |
-| 1 つの接続 | リクエストを 1 つ受け付けて応答し、閉じます（`Connection: close`）。次のリクエストは待ちません |
-| ヘッダー部 | 8 KiB まで、ヘッダーフィールドは 64 個まで。10 秒以内に読み終えます |
-| ボディ | 64 KiB まで。30 秒以内に読み終えます |
-| インポート、`POST /api/managed/check`、`POST /api/managed/apply` のボディ | 12 MiB まで。その API を使えるユーザー（operator 以上で、セッションかトークンが有効で、状態による制限を受けていない）にだけ読み込みます。それ以外では読み込まずに、検証の 400・401・403・429・503 で拒否します（クッキーとトークンの両方がある場合は 400、トークンの回数を使い切ったクライアントは 429、保存先を読めないときは 503） |
-| 応答を作る時間 | 30 秒。インポート、世代の選択、ロールバックは、下の「時間のかかる応答」の時間 |
-| 接続の存続時間 | ヘッダー部とボディと応答の時間の合計まで |
+| Concurrent connections | 32. A connection over the limit is accepted and closed at once |
+| One connection | It accepts one request, responds to it, and closes (`Connection: close`). It does not wait for the next request |
+| Header section | Up to 8 KiB and up to 64 header fields. It must be read within 10 seconds |
+| Body | Up to 64 KiB. It must be read within 30 seconds |
+| Body of an import, `POST /api/managed/check` and `POST /api/managed/apply` | Up to 12 MiB. It is read only for a user who can use that API (an operator or above, with a valid session or token, and not restricted by the state). Otherwise it is not read, and the request is refused with the 400, 401, 403, 429, or 503 of the checks (400 if both a cookie and a token are present, 429 for a client that has used up its token attempts, 503 if the store cannot be read) |
+| Time to build a response | 30 seconds. For an import, choosing a generation and a rollback, the time given in "Slow responses" below |
+| Lifetime of a connection | Up to the total of the times for the header section, the body, and the response |
 
-- `Content-Length` が上限を超えるリクエストは、認証情報を検証する前に、ボディを読み込まずに 413 で応答します。ヘッダー部のエラーや上限超過は、HTTP ライブラリが自身の応答を返すか、何も返しません。
-- ボディを読み込む API は、`Content-Type` が `application/json` でなければ 415 になります。JSON の形式が違うボディや、その API が認識しないキーを含むボディは 400 になります。
-- `HEAD` は `GET` として扱います。表に無いパスは 404、表にあるパスの別のメソッドは 405（`Allow` を付けます）になります。
+- A request whose `Content-Length` is over the limit gets 413 before the credentials are checked, without reading the body. For a header section that has an error or is over the limit, the HTTP library either returns its own response or returns nothing.
+- An API that reads a body returns 415 if `Content-Type` is not `application/json`. A body whose JSON has the wrong form, or that has a key that the API does not recognize, gets 400.
+- `HEAD` is handled as `GET`. A path that is not in the table gets 404, and another method on a path that is in the table gets 405 (with `Allow`).
 
-時間のかかる応答: インポート（事前検証を含む）、世代の選択、ロールバックは、時間がかかります。応答を作る時間は、次の長い方に 7 秒を加えた時間です（`proxy` の時間の設定キーを使います）。時間切れになったリクエストは 503 `unavailable` になります。
+Slow responses: An import (including the trial), choosing a generation, and a rollback take time. The time to build the response is the longer of the following two times plus 7 seconds (it uses the time setting keys of `proxy`). A request that times out gets 503 `unavailable`.
 
-- インポート: `ready_wait_ms + 3 × inspect_wait_ms + stop_inspect_ms`
-- 選択とロールバック: `ready_wait_ms + stop_inspect_ms + 14 秒`
+- Import: `ready_wait_ms + 3 × inspect_wait_ms + stop_inspect_ms`
+- Choosing a generation and rollback: `ready_wait_ms + stop_inspect_ms + 14 seconds`
 
-運用リファレンスの例の値（`ready_wait_ms` 30000、`inspect_wait_ms` 55000、`stop_inspect_ms` 10000）では、上限は約 212 秒です。問題なく終わるインポートは、これよりずっと短い時間で済みます。
+With the values in the example of the operator reference (`ready_wait_ms` 30000, `inspect_wait_ms` 55000, `stop_inspect_ms` 10000), the limit is about 212 seconds. An import that completes without trouble takes far less time than this.
 
-### 停止と systemd
+### Stopping and systemd
 
-- SIGTERM、SIGINT、SIGHUP で停止します。`admin: stop: <signal>` の行を出力し、`NOTIFY_SOCKET` があれば `STOPPING=1` を送ります。
-  1. 動作中のインポートの事前検証を、失敗として終了させます（検査プロセスと作業ディレクトリを片付けます）。
-  2. リスナーを閉じます。
-  3. 処理中のリクエストを最長 10 秒待ち、残った接続は打ち切ります。
-  4. exit 0 で終了します。
-- `NOTIFY_SOCKET` の決まりはプロキシと同じです（[運用リファレンス](operator-reference.md) の「systemd への通知」）。扱うシグナルはこの 3 つだけで、SIGUSR1 と SIGUSR2 は扱いません（送るとデフォルトの動作でプロセスが終了します）。
-- セッション、ユーザーごとの失敗回数とロックアウトの状態、設定中の二要素認証のセットアップキー、managed 設定の反映の処理はメモリだけにあるので、再起動すると全員がログインし直すことになり、反映の処理も残りません。API トークン、ユーザー、監査ログ、切り替えの履歴、設定の変更履歴は保存先に残ります。
+- It stops on SIGTERM, SIGINT, and SIGHUP. It writes an `admin: stop: <signal>` line and, if `NOTIFY_SOCKET` is set, sends `STOPPING=1`.
+  1. It ends the trial of a running import as a failure (it cleans up the inspector process and the work directory).
+  2. It closes the listener.
+  3. It waits up to 10 seconds for requests in progress, and cuts off the connections that remain.
+  4. It exits with 0.
+- The rules for `NOTIFY_SOCKET` are the same as for the proxy (see "Notifications to systemd" in the [operator reference](operator-reference.md)). It handles only these three signals, not SIGUSR1 or SIGUSR2 (if you send one of them, the process ends with the default action).
+- Sessions, the failure count and lockout state of each user, the secret of two-factor authentication that is being set up, and the apply job of the managed configuration are only in memory. So after a restart everyone must log in again, and the apply job is not kept. API tokens, users, the audit log, the switch history, and the configuration history stay in the store.
 
-systemd のユニットは、プロキシのユニット（[ビルドと配置](../build/binary-deployment.md) の「systemd」）に合わせて作成します。管理プロセスの違いは次のとおりです。
+Write the systemd unit to match the unit of the proxy (see "systemd" in the [build and deployment guide](../build/binary-deployment.md)). The differences for the admin process are as follows.
 
-- `ExecStart` は `tukuyomi-proxy admin <config>` にし、`User` と `Group` はプロキシと同じにします。
-- `Type=notify` にします。リスナーをバインドした後に `READY=1` を送ります。
-- `KillMode=mixed` にします。デフォルトの `control-group` では、インポートの事前検証の検査プロセスにも SIGTERM が届き、管理プロセスが検査プロセスを順に停止できません（理由はプロキシと同じです）。
-- `TimeoutStopSec` は、停止時に待つ 10 秒より長くします。インポートの事前検証が実行中の場合に備えて、その検査プロセスを停止する時間（`proxy.stop_inspect_ms` と `kernel.kill_grace_ms`）も足しておきます。
-- `admin.listen` のポートが 1024 以上なら、`AmbientCapabilities` は不要です。`ReadWritePaths` には、ルールストア、管理データの保存先、`kernel.tmp_root`、制御ソケットを置くディレクトリ、managed ストア（`managed.dir` があるとき）を含めます。
-- `LogRateLimitIntervalSec=0` にします。監査ログの行は標準エラー（ジャーナル）にも出力されるので、journald のレート制限で失われないようにします。
-- プロキシのユニットと順序を付ける必要はありません。
+- Set `ExecStart` to `tukuyomi-proxy admin <config>`, and use the same `User` and `Group` as the proxy.
+- Set `Type=notify`. The admin process sends `READY=1` after it binds the listener.
+- Set `KillMode=mixed`. With the default `control-group`, SIGTERM also reaches the inspector process of the trial of an import, and the admin process cannot stop the inspector process in order (the reason is the same as for the proxy).
+- Make `TimeoutStopSec` longer than the 10 seconds that the admin process waits at stop. To allow for a trial of an import that is running, also add the time to stop its inspector process (`proxy.stop_inspect_ms` and `kernel.kill_grace_ms`).
+- If the port of `admin.listen` is 1024 or higher, `AmbientCapabilities` is not needed. `ReadWritePaths` includes the rules store, the admin store, `kernel.tmp_root`, the directory for the control socket, and the managed store (when there is `managed.dir`).
+- Set `LogRateLimitIntervalSec=0`. Audit log lines are also written to standard error (the journal), so this keeps them from being lost to the rate limit of journald.
+- The unit does not need an ordering with the unit of the proxy.
 
-ログは、プロキシと同じく標準エラーに 1 行 1 件の JSON で出力されます（[運用リファレンス](operator-reference.md) の「ログ」）。`admin:` で始まる文の `line` と、監査ログの行の `audit` を出力します。`audit` はプロキシのログファイル（`records.dir`）には入りません。
+As with the proxy, logs go to standard error as one JSON object per line (see "Logs" in the [operator reference](operator-reference.md)). The admin process writes `line` entries for the sentences that start with `admin:` and `audit` entries for the audit log lines. `audit` entries do not go into the log files of the proxy (`records.dir`).
 
-## 設定キー `admin`
+## Setting Key `admin`
 
 ```json
 "admin": {
@@ -165,77 +167,77 @@ systemd のユニットは、プロキシのユニット（[ビルドと配置](
 "records": {"dir": "/var/lib/tukuyomi-core/records", "file_bytes": 16777216, "files": 8}
 ```
 
-`admin` と `records` は、設定ファイルの最上位のオブジェクト（`proxy`、`forward`、`kernel` などと並びます）です。どちらも省略できます。`admin` を書くときは、`crs_dir` と `route` 以外のすべての設定キーを書きます。`route` は、`managed` のある設定では必ず書き、`managed` の無い設定では書けません。未知の設定キー、重複、型の違いを受け付けない決まりは、[運用リファレンス](operator-reference.md) の「設定ファイル」と同じです。
+`admin` and `records` are objects at the top level of the configuration file (alongside `proxy`, `forward`, `kernel`, and so on). Both can be omitted. When you write `admin`, write all setting keys except `crs_dir` and `route`. `route` is required in a configuration that has `managed`, and cannot be written in one that has no `managed`. The rules that reject unknown setting keys, duplicates, and type mismatches are the same as for "Configuration File" in the [operator reference](operator-reference.md).
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `listen` | ループバックの IP（`127.0.0.0/8` か `::1`）とポート（0 は不可） | 管理プロセスのリスナーのアドレス。`::ffff:127.0.0.1` の形はループバックと見なしません |
-| `control` | 絶対パス、107 バイトまで | 制御ソケットのファイル |
-| `store` | `{"kind": "file", "dir"}` | 管理データの保存先。`kind` は現在 `file` だけです。`dir` は絶対パスで 3840 バイトまで |
-| `origin` | `https://` とホスト（任意で `:port`） | 管理画面を開く URL のオリジン。ルートの `host` と同じ形（小文字の名前）で、ワイルドカード、パス、クエリ、末尾の `/` は書けません。`POST` などの変更リクエストの `Origin` と比較します |
-| `trusted_proxies` | 0〜256 個のネットワーク | 管理プロセスのクライアントのアドレスを、`X-Forwarded-For` から決めるときに信頼する相手。ホスト部が 0 の `address/prefix` の形で書きます。読み方はプロキシと同じです（[運用リファレンス](operator-reference.md) の「クライアントのアドレス」） |
-| `mfa` | `"optional"`、`"required"` | 二要素認証を求めるか。`required` は、二要素認証を設定していないユーザーに、設定だけをさせます（下の「ログインと二要素認証」） |
-| `session_idle_ms` | 1 分〜24 時間 | セッションが使われないまま続く時間 |
-| `session_total_ms` | `session_idle_ms` 〜 7 日 | セッションが続く時間の上限 |
-| `crs_dir` | 絶対パス、3840 バイトまで。省略できます | インポートで使える CRS のディレクトリ。`scripts/fetch-crs.sh` で取得したもの（[ビルドと配置](../build/binary-deployment.md) の「CRS の取得」）。省略すると、インポートで CRS を使えません |
-| `route` | `managed` のある設定だけ。そのときは必須 | 管理画面のルート（ホスト、証明書、`access`）。プロキシだけが使います。形式と決まりは [運用リファレンス](operator-reference.md) の「`admin`」を、使い方は下の「managed 設定を使う場合の管理画面のルート」を参照してください |
+| `listen` | A loopback IP (`127.0.0.0/8` or `::1`) and a port (0 is not allowed) | The address of the listener of the admin process. The `::ffff:127.0.0.1` form is not treated as loopback |
+| `control` | An absolute path, up to 107 bytes | The control socket file |
+| `store` | `{"kind": "file", "dir"}` | The admin store. `kind` is only `file` at present. `dir` is an absolute path of up to 3840 bytes |
+| `origin` | `https://` and a host (optionally `:port`) | The origin of the URL that opens the admin screens. It has the same form as the `host` of a route (a lowercase name), and cannot have a wildcard, a path, a query, or a trailing `/`. It is compared with the `Origin` of changing requests such as `POST` |
+| `trusted_proxies` | 0 to 256 networks | The peers that are trusted when the client address of the admin process is decided from `X-Forwarded-For`. Write them in the form `address/prefix` with the host part 0. They are read the same way as for the proxy (see "Client Address" in the [operator reference](operator-reference.md)) |
+| `mfa` | `"optional"`, `"required"` | Whether two-factor authentication is required. `required` lets a user who has not set up two-factor authentication do only the setup (see "Login and Two-Factor Authentication" below) |
+| `session_idle_ms` | 1 minute to 24 hours | How long a session lasts without being used |
+| `session_total_ms` | `session_idle_ms` to 7 days | The upper limit of how long a session lasts |
+| `crs_dir` | An absolute path, up to 3840 bytes. It can be omitted | The CRS directory that imports can use. It is the one fetched with `scripts/fetch-crs.sh` (see "Fetching the CRS" in [build and deployment guide](../build/binary-deployment.md)). If omitted, imports cannot use the CRS |
+| `route` | Only in a configuration that has `managed`. Then it is required | The route of the admin screens (host, certificate, `access`). Only the proxy uses it. For its form and rules, see "`admin`" in the [operator reference](operator-reference.md); for how to use it, see "Admin Route with the Managed Configuration" below |
 
-- `listen` は、リスナー（`proxy.listeners`）と `status.listen` のどれとも重ならないようにします。重なりの決まりはリスナーどうしと同じで、同じアドレスとポート、または片方が `0.0.0.0` や `::` でポートが同じものです。
-- アップストリームのサーバーのアドレスには、`admin.listen` を書けます（リスナーと `status.listen` は書けません）。プロキシのルートを通して外部から使うためです（下の「外部からの利用」）。
-- ディレクトリは互いに離します。ルールストア（`rules.store.dir`）、`records.dir`（あるとき）、`admin.store.dir`、`admin.control` を置くディレクトリ、`managed.dir`（あるとき）、`acme.challenge_dir`（あるとき）は、どれも同じディレクトリにすることも、互いの中に置くこともできません。`admin.control` そのものも、ルールストア、`records.dir`、`admin.store.dir` の中に置くことはできません。
-- `admin.route.host` を変更すると、ブラウザーで開く URL も変わるので、`admin.origin` も新しいホストに合わせ（下の「外部からの利用」）、管理プロセスを再起動します。管理プロセスは、`admin.origin` を起動時にだけ読みます。プロキシ側の扱いは、[運用リファレンス](operator-reference.md) の「`admin`」を参照してください。
-- `admin.store.dir` と、`admin.control` を置くディレクトリは、先に作っておきます。所有者がプロキシの OS ユーザーで、グループとその他のユーザーの権限が無い（0700）、シンボリックリンクでないディレクトリにします。管理プロセスは、その中に `users/`、`tokens/`、`audit/` を作ります。
-- `config check` は、`admin` と `records` の設定キーと値の関係を検証します。管理データの保存先、制御ソケット、ログファイルを開けるかどうかは検証しません。
+- `listen` must not overlap any listener (`proxy.listeners`) or `status.listen`. The rules for overlap are the same as among listeners: the same address and port, or the same port where one of them is `0.0.0.0` or `::`.
+- The address of a server of an upstream can be `admin.listen` (it cannot be that of a listener or of `status.listen`). This is so that the admin process can be used from outside through a route of the proxy (see "Access from Outside" below).
+- Keep the directories apart. The rules store (`rules.store.dir`), `records.dir` (when present), `admin.store.dir`, the directory that holds `admin.control`, `managed.dir` (when present), and `acme.challenge_dir` (when present) cannot be the same directory or inside one another. `admin.control` itself also cannot be inside the rules store, `records.dir`, or `admin.store.dir`.
+- If you change `admin.route.host`, the URL that you open in the browser changes too, so change `admin.origin` to the new host as well (see "Access from Outside" below) and restart the admin process. The admin process reads `admin.origin` only at start. For what the proxy does, see "`admin`" in the [operator reference](operator-reference.md).
+- Create `admin.store.dir` and the directory that holds `admin.control` beforehand. Each must be a directory that is owned by the OS user of the proxy, has no permissions for the group and other users (0700), and is not a symbolic link. The admin process creates `users/`, `tokens/`, and `audit/` in the admin store.
+- `config check` validates the setting keys of `admin` and `records` and the relations between their values. It does not check whether the admin store, the control socket, and the log files can be opened.
 
-管理データの保存先の内容（ファイルは 0600、ディレクトリは 0700）:
+The contents of the admin store (files are 0600, directories are 0700):
 
-| パス | 内容 |
+| Path | Content |
 |---|---|
-| `users/<name>.json` | ユーザー。パスワードのハッシュ、二要素認証のセットアップキー、リカバリーコードのハッシュを含みます。最大 1000 人 |
-| `tokens/<id>.json` | API トークン。トークンの秘密の SHA-256 だけを持ちます。所有者ごとに 50 個まで |
-| `audit/` | 監査ログ（`audit.log` と、ローテーションした古いファイル） |
-| `activations.log` | 切り替えの履歴 |
-| `managed.log` | 設定の変更履歴（下の「設定の変更履歴」） |
-| `lock`、`process.lock` | 書き込みのロックと、管理プロセスのロック |
+| `users/<name>.json` | A user. It holds the password hash, the secret of two-factor authentication, and the hashes of the recovery codes. Up to 1000 users |
+| `tokens/<id>.json` | An API token. It holds only the SHA-256 of the secret of the token. Up to 50 per owner |
+| `audit/` | The audit log (`audit.log` and the older files that were rotated) |
+| `activations.log` | The switch history |
+| `managed.log` | The configuration history (see "Configuration History" below) |
+| `lock`, `process.lock` | The lock for writing and the lock of the admin process |
 
-### 制御ソケット
+### Control Socket
 
-プロキシは、設定に `admin` があると、起動時に `admin.control` の制御ソケットを作ります。作り方、使えるユーザー、依頼と応答の形式は、[運用リファレンス](operator-reference.md) の「制御ソケット」を参照してください。管理プロセス側の扱いは次のとおりです。
+When the configuration has `admin`, the proxy creates the control socket `admin.control` at start. For how it is created, who can use it, and the forms of requests and responses, see "Control Socket" in the [operator reference](operator-reference.md). The admin process handles it as follows.
 
-- 状態の問い合わせ: 接続は 2 秒、応答は 2 秒待ちます。プロキシが接続を受け付けて何も応答せずに閉じる（同時接続数の上限に達している）ときは、250 ms 後に 1 回だけ問い合わせ直し、それでも同じなら「プロキシが処理中」とします（`GET /api/status` では、`reachable` が `true` で `proxy` が `null` になります）。
-- 状態の問い合わせと世代の切り替えの依頼では、ソケットが無い、接続を受け付けるプロセスが無い、応答が決まった形式でない、時間内に応答が無い、のどれも「プロキシに接続できない」になります。
-- 世代の切り替えの依頼は、エンジンごとです。依頼には、切り替えるエンジン（`engine`）と、そのエンジンでルールストアが選択中の世代（`expect`）を書きます。管理プロセスは、状態の `engines`（プロキシで稼働しているエンジンごとの世代、モード、段階）を返さないプロキシ（エンジンごとの選択に対応していない以前のバージョン）には、依頼しません（下の「選択とロールバック」）。
-- 世代の切り替えの依頼は、`ready_wait_ms + 7 秒` まで待ちます。プロキシ自身が応答を待つ時間は `ready_wait_ms + 5 秒` で、管理プロセスの待ち時間は 2 秒長くなっています。
-- プロキシが切り替えの依頼に `busy` と応答したとき、または依頼を読まずに閉じたときは、管理プロセスが 250 ms ごとに状態を問い合わせます。
-  - プロキシが、依頼したエンジンで、依頼した世代を使い始めれば `switched` とします。使い始めたかどうかは、状態の `engines` にある、そのエンジンの世代で見ます。
-  - 切り替えの途中でない状態が、依頼した世代でないまま 2 回続けば `failed` とします。
-  - `stop_inspect_ms + 7 秒` が過ぎた場合も `failed` とします。
-  - 途中で接続できなくなれば `unconfirmed` とします。
-- managed 設定のバージョンでのリロードの依頼（`reload`）は、アップストリームのサーバーの名前解決にかかる可能性のある時間（プロキシが状態で返す `forward.resolve_timeout_ms`。返さない古いプロキシでは、管理プロセスが読み込んだ設定ファイルの値）に 7 秒を加えた時間まで待ちます。プロキシ自身が待つ時間より 2 秒長くなっています。
-- プロキシが証明書（`tls`）で拒否したときは、1 秒後に 1 回だけ依頼し直します。証明書の更新（`acme renew`）がファイルを書き換えている瞬間に読み込んだ証明書は、その瞬間だけ拒否されるためです。
-- `reload` の依頼では、ソケットが無い、接続を受け付けるプロセスが無い、応答が決まった形式でない、時間内に応答が無い、何も応答せずに閉じられた、プロキシが `busy`（`reload under way`）と応答した、のどれも、結果が分からないものとして扱います。依頼が届いて、リロードが続いていることがあるためです。管理プロセスは、待った時間と同じ時間だけ、250 ms ごとにプロキシの状態を問い合わせ、リロード中でなくなるのを待ちます。
-  - プロキシが依頼したバージョンを使っていて、設定を切り替えたリロードの数（`config_reloads` の `replaced`）が依頼の前より増えていれば、反映済みとします。
-  - そうでなければ `failed` とします。
-  - 途中で接続できなくなったとき、時間の終わりにまだリロード中か、まだ問い合わせに応答できないときは、`unconfirmed` とします。
+- Asking for the state: it waits 2 seconds to connect and 2 seconds for the response. If the proxy accepts the connection and closes it without responding (it has reached the limit of concurrent connections), it asks again once after 250 ms, and if the result is the same, it treats the proxy as "Proxy busy" (in `GET /api/status`, `reachable` is `true` and `proxy` is `null`).
+- For a request for the state and a request for a generation switch, all of these mean "the proxy cannot be reached": there is no socket, no process accepts the connection, the response is not in the defined form, or no response comes in time.
+- A request for a generation switch is made for each engine. The request names the engine to switch (`engine`) and the generation that the rules store has chosen for that engine (`expect`). The admin process does not make the request to a proxy that does not return `engines` in its state (the generation, mode, and phase of each engine that runs in the proxy; such a proxy is an earlier version that does not support the choice per engine) (see "Choosing and Rolling Back" below).
+- A request for a generation switch waits up to `ready_wait_ms + 7 seconds`. The time that the proxy itself waits for the response is `ready_wait_ms + 5 seconds`, so the wait of the admin process is 2 seconds longer.
+- When the proxy responds to a switch request with `busy`, or closes the connection without reading the request, the admin process asks for the state every 250 ms.
+  - If the proxy starts to use the requested generation for the requested engine, the result is `switched`. Whether it started to use it is read from the generation of that engine in `engines` of the state.
+  - If, twice in a row, the state is not in the middle of a switch and does not show the requested generation, the result is `failed`.
+  - The result is also `failed` when `stop_inspect_ms + 7 seconds` have passed.
+  - If the proxy cannot be reached on the way, the result is `unconfirmed`.
+- A request for a reload with a version of the managed configuration (`reload`) waits up to the time that resolving the names of the servers of the upstreams may take, plus 7 seconds. That time is `forward.resolve_timeout_ms` that the proxy returns in its state; for an old proxy that does not return it, it is the value in the configuration file that the admin process has read. This is 2 seconds longer than the time that the proxy itself waits.
+- If the proxy refuses with a certificate (`tls`), the admin process makes the request again once after 1 second. This is because a certificate that was read at the moment when the certificate renewal (`acme renew`) was rewriting the files is refused only for that moment.
+- For a `reload` request, all of these are treated as a result that is not known: there is no socket, no process accepts the connection, the response is not in the defined form, no response comes in time, the connection was closed without a response, or the proxy responded with `busy` (`reload under way`). This is because the request may have arrived and the reload may be continuing. The admin process asks for the state of the proxy every 250 ms for as long as it waited, and waits until the proxy is no longer reloading.
+  - If the proxy is using the requested version and the number of reloads that switched the configuration (`replaced` of `config_reloads`) is larger than before the request, the result is applied.
+  - Otherwise the result is `failed`.
+  - If the proxy cannot be reached on the way, if it is still reloading at the end of the time, or if it still cannot respond to a query, the result is `unconfirmed`.
 
-結果の扱いは、下の「世代の操作」と「managed 設定の操作」を参照してください。反映の順序と、反映が途中で停止したときの扱いは、[運用リファレンス](operator-reference.md) の「反映」を参照してください。
+For how the results are handled, see "Generation Operations" and "Managed Configuration Operations" below. For the order of applying and what happens when an apply stops halfway, see "Applying" in the [operator reference](operator-reference.md).
 
-### ログファイル
+### Log File
 
-`GET /api/records` は、プロキシが書き込むログファイル（`records.dir`）を読み込みます。ファイルの名前、サイズ、ローテーションは、[運用リファレンス](operator-reference.md) の「ログファイル（`records`）」を参照してください。
+`GET /api/records` reads the log files that the proxy writes (`records.dir`). For the file names, sizes, and rotation, see "Log Files (`records`)" in the [operator reference](operator-reference.md).
 
-- 設定に `records` が無いと、この API は 404 になります。
-- 管理プロセスは、プロキシと同じ OS ユーザーとしてファイルを読み込みます。ディレクトリの所有者が違う、グループかその他のユーザーの権限がある、ディレクトリでない（シンボリックリンクは使えません）のどれかの場合は、読み込みません（503）。
-- ログファイルにはクライアントのアドレスとパスが入ります。管理 API では viewer 以上が読めるので、viewer のロールを渡すユーザーを検討したうえで決めてください。
+- If the configuration has no `records`, this API gives 404.
+- The admin process reads the files as the same OS user as the proxy. It does not read them (503) if the owner of the directory is different, if the group or other users have permissions, or if it is not a directory (a symbolic link cannot be used).
+- The log files hold client addresses and paths. The admin API lets a viewer or above read them, so decide carefully which users you give the role viewer.
 
-## 外部からの利用
+## Access from Outside
 
-管理プロセスは TLS を使わないので、プロキシの TLS のリスナーを通して使います。クッキーは `Secure` 付きで出力されるので、管理画面は https でしか使えません。通し方は、設定ファイルに `managed` があるかどうかで違います。
+The admin process does not use TLS, so use it through a TLS listener of the proxy. Cookies are sent with `Secure`, so the admin screens can be used only over https. How you route to it depends on whether the configuration file has `managed`.
 
-- `managed` の無い設定: 管理用の Host のルートを `forward.routes` に書きます（下の例）。
-- `managed` のある設定: 管理画面のルートを `admin.route` に書きます（[運用リファレンス](operator-reference.md) の「全体の構成」と「`admin`」、下の「managed 設定を使う場合の管理画面のルート」）。
+- A configuration without `managed`: write a route for an admin host in `forward.routes` (see the example below).
+- A configuration with `managed`: write the route of the admin screens in `admin.route` (see "Overall Structure" and "`admin`" in the [operator reference](operator-reference.md), and "Admin Route with the Managed Configuration" below).
 
-`managed` の無い設定の例:
+An example for a configuration without `managed`:
 
 ```json
 "forward": {
@@ -250,25 +252,25 @@ systemd のユニットは、プロキシのユニット（[ビルドと配置](
 }
 ```
 
-（`forward` のほかの設定キーは省略しています。`admin.listen` が `127.0.0.1:9100` の例です。）
+(The other setting keys of `forward` are omitted. This is an example where `admin.listen` is `127.0.0.1:9100`.)
 
-- 証明書: `admin.example.com` を `hosts` に持つ証明書を、TLS のリスナーに置きます。持たない名前のハンドシェイクは失敗します。
-- アップストリーム: サーバーのアドレスに `admin.listen` を書きます。
-- `engine`: 管理プロセスへ転送するアップストリームにも、ほかのアップストリームと同じく `engine` を書けます。書かなければ、デフォルトのエンジンで検査します。書き方は [運用リファレンス](operator-reference.md) の「`forward`」を、エンジンの選択は同じ文書の「検査エンジンの選択」を参照してください。インポートの検査除外のルート（下の「インポートのルートを検査除外にする」）は、このアップストリームのエンジンの世代に入れます。
-- `access`: `allow_cidrs` で、管理画面を使うユーザーのアドレスだけを許可します。クライアントのアドレスの決め方と、`access` を使うときの注意は、[運用リファレンス](operator-reference.md) の「クライアントのアドレス」と「`access` を使うときの注意」を参照してください。どれかのルートが `access` を持つと、どのルートの `host` にもポートを書けません。
-- 全体の設定（全体のアクセス制御とレート制限）とホストごとの設定は、ルートを選択する前に、この Host のリクエストにも適用されます（[運用リファレンス](operator-reference.md) の「アクセス制御とレート制限」）。管理画面を使うユーザーの数と速さに合わせて決めます。
-- 平文のリスナーに、この Host を通さないでください。ルートはリスナーを問わずに選択されるので、`redirect` でない平文のリスナーがあると、パスワードが暗号化されずに流れる可能性があります。平文のリスナーは `redirect` にします。
+- Certificate: put a certificate that has `admin.example.com` in its `hosts` on a TLS listener. A handshake for a name that it does not have fails.
+- Upstream: write `admin.listen` as the address of the server.
+- `engine`: an upstream that forwards to the admin process can also have `engine`, like the other upstreams. If you do not write it, requests are inspected by the default engine. For how to write it, see "`forward`" in the [operator reference](operator-reference.md), and for choosing an engine, see "Choosing the Inspection Engine" in the same document. A bypass route for an import (see "Bypassing Inspection for the Import Route" below) goes into the generations for the upstream engine of this upstream.
+- `access`: with `allow_cidrs`, allow only the addresses of the users of the admin screens. For how the client address is decided and for what to be careful about when you use `access`, see "Client Address" and "Notes on using `access`" in the [operator reference](operator-reference.md). If any route has `access`, no route can have a port in its `host`.
+- The global settings (the global access control and rate limits) and the host policies also apply to requests for this host, before a route is chosen (see "Access Control and Rate Limits" in the [operator reference](operator-reference.md)). Decide them to fit the number and speed of the users of the admin screens.
+- Do not route this host through a plaintext listener. A route is chosen regardless of the listener, so if there is a plaintext listener that is not `redirect`, the password may flow unencrypted. Make plaintext listeners `redirect`.
 
-次の 2 つは、どちらの設定でも書きます。
+Write the following two in either configuration.
 
-- `admin.trusted_proxies`: プロキシが管理プロセスに接続する元のアドレス（同じホストなら `127.0.0.1/32`）を書きます。書かないと、すべてのクライアントがプロキシのアドレスになり、ログインの試行回数の制限（クライアントごと）が全員で共有され、監査ログの `client` がどれもプロキシのアドレスになります。
-- `admin.origin`: ブラウザーで開く URL のオリジンと一字一句同じにします（ポートが 443 のときは書きません）。違うと、ログインを含む変更が 403 になります。
+- `admin.trusted_proxies`: write the address that the proxy connects to the admin process from (`127.0.0.1/32` if it is the same host). If you do not, every client has the address of the proxy, so the limit on login attempts (per client) is shared by everyone, and `client` in the audit log is the address of the proxy for every line.
+- `admin.origin`: make it exactly the same as the origin of the URL that you open in the browser (do not write the port when it is 443). If it differs, changes, including login, get 403.
 
-### managed 設定を使う場合の管理画面のルート
+### Admin Route with the Managed Configuration
 
-`managed` のある設定では、管理画面のルートを設定ファイルの `admin.route` に書き、プロキシがこのルートを自分で作成します。設定キーの形式、証明書と `access`、全体の設定とホストごとの設定が適用されないこと、managed 設定のバージョンに書けないホストについては、[運用リファレンス](operator-reference.md) の「`admin`」を、リクエストを受信してからの処理については、同じ文書の「リクエストの検証の順序」を参照してください。ボディの上限は、下の「ボディのサイズ」を参照してください。
+In a configuration that has `managed`, write the route of the admin screens in `admin.route` of the configuration file, and the proxy creates this route itself. For the form of the setting key, the certificate and `access`, the fact that the global settings and the host policies do not apply, and the hosts that cannot be written in a version of the managed configuration, see "`admin`" in the [operator reference](operator-reference.md); for the processing from the time a request is received, see "Order of Request Checks" in the same document. For the body limit, see "Body Size" below.
 
-管理画面のルートのリクエストは、デフォルトのエンジン（設定ファイルの `kernel.default_engine`。書かなければ Coraza）の稼働中の世代で検査されます。管理画面で managed 設定を編集するには、`POST /api/managed/check`（検証）と `POST /api/managed/apply`（「保存して反映」の操作）を検査除外のルートにします。この 2 つのリクエストのボディは、証明書チェーンと秘密鍵の PEM や多くのルートを含む、最大 12 MiB の JSON です。検査の対象にすると、ルールがブロックすることがあります。ルールのインポートのパス（下の「インポートのルートを検査除外にする」）と一緒に、1 つの `--routes` のファイルに書けます。
+Requests to the admin route are inspected with the running generation of the default engine (`kernel.default_engine` of the configuration file; Coraza if it is not written). To edit the managed configuration in the admin screens, make `POST /api/managed/check` (check) and `POST /api/managed/apply` (the "Save and apply" operation) bypass routes. The bodies of these two requests are JSON of up to 12 MiB, with PEM certificate chains and private keys and many routes. If they are inspected, a rule may block them. You can write them in one `--routes` file together with the path of the rule import (see "Bypassing Inspection for the Import Route" below).
 
 ```json
 [
@@ -278,13 +280,13 @@ systemd のユニットは、プロキシのユニット（[ビルドと配置](
 ]
 ```
 
-- `path` は `/` で終わらないので、そのパスだけに一致します。ほかの `/api/managed` のパスは、検査されます。
-- 検査除外のルートは世代の一部です。デフォルトのエンジンのどの世代にも同じルートを入れ続けてください。入れ忘れた世代を選択すると、その世代からは `check` と `apply` のボディが検査されます。デフォルトのエンジンを替えるときは、新しいデフォルトのエンジンの世代にも同じルートを入れて選択してから替えます（手順は [運用リファレンス](operator-reference.md) の「検査エンジンの選択」を参照してください）。
-- 検査除外のルートが無い世代で、ルールが `check` か `apply` のリクエストを 403 でブロックすると、管理画面は「プロキシか WAF がリクエストを拒否しました。PEM のファイルや多くのルートを含むリクエストボディは、WAF にブロックされることがあります。/api/managed/check と /api/managed/apply を検査の対象から除外する設定を確認してください。」と表示します。
+- `path` does not end with `/`, so it matches only that path. The other `/api/managed` paths are inspected.
+- A bypass route is part of a generation. Keep putting the same routes into every generation of the default engine. If you choose a generation in which they were forgotten, the bodies of `check` and `apply` are inspected from that generation on. When you change the default engine, put the same routes into a generation of the new default engine and choose it, and then change the default engine (for the steps, see "Choosing the Inspection Engine" in the [operator reference](operator-reference.md)).
+- If a rule blocks a request to `check` or `apply` with 403 in a generation that has no bypass routes, the admin screens show "The proxy or the WAF refused the request. A body with PEM files or many routes can be blocked by the WAF. Check that /api/managed/check and /api/managed/apply are left out of the inspection."
 
-### インポートのルートを検査除外にする
+### Bypassing Inspection for the Import Route
 
-`POST /api/generations`（インポート）のボディは、ルールのファイルを含む大きな JSON です。これを検査の対象にすると、ルールの検査がインポートをブロックすることがあります。このパスは、世代の検査除外のルート（[運用リファレンス](operator-reference.md) の「検査除外のルート」）にします。
+The body of `POST /api/generations` (import) is a large JSON that holds rule files. If it is inspected, the inspection of the rules may block the import. Make this path a bypass route of generations (see "Bypass Routes" in the [operator reference](operator-reference.md)).
 
 ```json
 [
@@ -292,27 +294,27 @@ systemd のユニットは、プロキシのユニット（[ビルドと配置](
 ]
 ```
 
-- `path` は `/` で終わらないので、このパスだけに一致します。`/api/generations/<fingerprint>`（世代の読み出しと削除）は、検査されます。
-- 検査除外のルートは世代の一部です。管理画面のリクエストを検査するエンジンのどの世代にも、同じルートを入れ続けてください。検査するのは、`managed` のある設定ではデフォルトのエンジン、`managed` の無い設定では、管理プロセスへ転送するアップストリームのエンジン（上の「外部からの利用」）です。入れ忘れた世代を選択すると、その世代からはインポートが検査されます。検査するエンジンが替わるとき（デフォルトのエンジンを替えるときなど）は、新しいエンジンの世代に同じルートを移してから替えます（[運用リファレンス](operator-reference.md) の「検査エンジンの選択」）。
-- このルートが効くのは、入れた世代が使われてからです。最初にこのルートを入れる世代は、コマンドでインポートします（`rules import ... --routes <file>`）。管理画面のインポートでも、ホストとパスを表の行に書いて入れられます（送るボディは同じ形の JSON です）。
+- `path` does not end with `/`, so it matches only this path. `/api/generations/<fingerprint>` (reading and removing a generation) is inspected.
+- A bypass route is part of a generation. Keep putting the same route into every generation of the engine that inspects the requests of the admin screens. The engine that inspects is the default engine in a configuration that has `managed`, and the engine of the upstream that forwards to the admin process in a configuration without `managed` (see "Access from Outside" above). If you choose a generation in which it was forgotten, imports are inspected from that generation on. When the engine that inspects changes (for example, when you change the default engine), move the same route into a generation of the new engine and then change the engine (see "Choosing the Inspection Engine" in the [operator reference](operator-reference.md)).
+- This route takes effect only after the generation that holds it is in use. For the generation that first holds this route, import with the command (`rules import ... --routes <file>`). In an import from the admin screens, you can also add it by writing the host and the path in a row of the table (the body that is sent is JSON of the same form).
 
-### 管理画面の Host での CRS の調整
+### CRS Tuning for the Admin Host
 
-管理画面の Host を CRS で検査すると、CRS のデフォルトの設定は、管理画面の次のリクエストをブロックします。どちらも、管理画面の Host にだけ効く調整で通します。調整の後も、ほかの Host の検査は変わりません。
+If the admin host is inspected with the CRS, the default settings of the CRS block the following requests of the admin screens. Both are let through with tuning that affects only the admin host. After the tuning, the inspection of other hosts does not change.
 
-- PUT と DELETE: CRS がデフォルトで許可するメソッドは `GET`・`HEAD`・`POST`・`OPTIONS` だけで、ほかのメソッドはルール 911100 でブロックされます。管理 API は、パスワードの変更、ロールと有効・無効の変更、二要素認証の無効化、API トークンと世代の削除に PUT と DELETE を使います。調整が無いと、新しいユーザーは最初のパスワードの変更ができず、ログインを終えられません。
-- パスワードの欄: CRS は JSON のボディの値も検査します。記号の並びによっては、正しいパスワードが SQL インジェクションと判定され、ログインやパスワードの変更がブロックされます（ルール 942100 など）。
+- PUT and DELETE: the CRS allows only `GET`, `HEAD`, `POST`, and `OPTIONS` by default, and blocks other methods with rule 911100. The admin API uses PUT and DELETE to change passwords, to change roles and the enabled or disabled state, to disable two-factor authentication, and to remove API tokens and generations. Without the tuning, a new user cannot make the first password change and cannot finish logging in.
+- Password fields: the CRS also inspects the values of a JSON body. Depending on the sequence of symbols, a correct password may be judged to be SQL injection, and login or a password change is blocked (rule 942100 and others).
 
-2 つの調整は、管理画面の Host を検査するエンジンの世代に入れます。検査するのは、`managed` のある設定ではデフォルトのエンジン、`managed` の無い設定では、管理プロセスへ転送するアップストリームのエンジンです（上の「外部からの利用」）。デフォルトのエンジンを ModSecurity にして、この節の 2 つの調整を入れた世代でも、ログイン、ユーザーと API トークンの作成、`GET /api/status`、ルールのインポート、管理画面（概要、アップストリーム、インポート）の表示が通ることを確認しています。PUT と DELETE は、ModSecurity では確認していません。この節の最後の項目のとおり、世代を選択する前に試してください。
+The two tunings go into the generation of the engine that inspects the admin host. The engine that inspects is the default engine in a configuration that has `managed`, and the engine of the upstream that forwards to the admin process in a configuration without `managed` (see "Access from Outside" above). With ModSecurity as the default engine and a generation that has the two tunings of this section, it has been confirmed that login, creating users and API tokens, `GET /api/status`, importing rules, and displaying the admin screens (Overview, Upstreams, Rule import) pass. PUT and DELETE have not been confirmed with ModSecurity. As the last item of this section says, try them before you choose the generation.
 
-メソッドの調整は、CRS のディレクトリの `crs-setup.conf` の終わりに追加してから、世代をインポートします。運用者のルールのファイルは CRS のルールの後に読み込まれる（[運用リファレンス](operator-reference.md) の「`rules`」）ので、そこに書いても、メソッドのルールより後になって効きません。管理画面のインポートで CRS を使うときは、`admin.crs_dir` の `crs-setup.conf` に追加します。
+For the method tuning, add it at the end of `crs-setup.conf` in the CRS directory, and then import the generation. The rule files of the operator are loaded after the CRS rules (see "`rules`" in the [operator reference](operator-reference.md)), so if you write it there, it comes after the method rule and has no effect. When you use the CRS in an import from the admin screens, add it to `crs-setup.conf` in `admin.crs_dir`.
 
 ```text
 SecRule REQUEST_HEADERS:Host "@rx ^admin\.example\.com(?::[0-9]{1,5})?$" \
     "id:1000100,phase:1,pass,nolog,t:none,t:lowercase,setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT DELETE'"
 ```
 
-パスワードの欄の調整は、運用者のルールのファイルに書き、インポートで `--rules`（管理画面では「ルールファイル」）に渡します。フェーズ 1 のルールなので、CRS の後に読み込まれても、ボディを検査する CRS のルールより先に効きます。
+Write the tuning of the password fields in a rule file of the operator, and pass it to the import with `--rules` (in the admin screens, "Rule files"). It is a phase 1 rule, so even if it is loaded after the CRS, it takes effect before the CRS rules that inspect the body.
 
 ```text
 SecRule REQUEST_HEADERS:Host "@rx ^admin\.example\.com(?::[0-9]{1,5})?$" \
@@ -322,156 +324,156 @@ SecRule REQUEST_HEADERS:Host "@rx ^admin\.example\.com(?::[0-9]{1,5})?$" \
     ctl:ruleRemoveTargetByTag=OWASP_CRS;ARGS:json.new"
 ```
 
-- `admin\.example\.com` は、`admin.origin` のホストに置き換えます。`.` は `\.` と書きます。
-- 検査の対象から外すのはパスワードの 3 つの欄（`password`、`current`、`new`）だけです。名前の欄、トークンの名前、クエリなどは、調整の後も検査されます。攻撃に似た名前はブロックされるので、別の名前にしてください。
-- ルール ID は、ほかのルールと重ならない値にします（検査プロセスが使う ID は、[運用リファレンス](operator-reference.md) の「検査プロセスが追加する設定とルール」を参照してください）。
-- 調整を入れた世代は、管理画面の Host の PUT と DELETE、記号を含むパスワードでのログインを試してから選択します。ブロックされたリクエストは、画面に表示されるリクエスト ID でログを検索すると、`rules` でルール ID が分かります。
+- Replace `admin\.example\.com` with the host of `admin.origin`. Write `.` as `\.`.
+- Only the three password fields (`password`, `current`, and `new`) are excluded from the inspection. The name field, the name of a token, the query, and so on are still inspected after the tuning. A name that looks like an attack is blocked, so use another name.
+- Use a rule ID that does not overlap other rules (for the IDs that the inspector process uses, see "Settings and Rules Added by the Inspector" in the [operator reference](operator-reference.md)).
+- Before you choose a generation that has the tuning, try PUT and DELETE to the admin host and a login with a password that has symbols. For a request that was blocked, search the logs with the request ID that the screen shows, and `rules` gives the rule ID.
 
-### ボディのサイズ
+### Body Size
 
-- ルールのインポート（`POST /api/generations`）と、managed 設定の `POST /api/managed/check`・`POST /api/managed/apply` のリクエストボディは、最大 12 MiB になります。`proxy.max_body` を 12 MiB（12582912）以上にしてください。ルートの `max_body` は `proxy.max_body` を下げることしかできないので、ほかのルートを制限したい場合は、そちらのルートに小さい `max_body` を書きます。管理画面のルート（`admin.route`）には `max_body` が無いので、`proxy.max_body` が上限になります。
-- 検査除外のルートの長いボディは、バッファリングせずに流すので、12 MiB のボディが `max_buffered_bytes` を使い切ることはありません（[運用リファレンス](operator-reference.md) の「リクエストボディの上限と検査する長さ」）。
-- 管理画面は、検証のリクエストボディが 12 MiB を超えるか、ファイルが 192 件を超えるときは、送信せずにその旨を表示します。設定ファイルの `proxy.max_body`（`GET /api/config` で読み出します）より大きいだけのときは、送信したうえで、検証の結果と一緒に「送信するリクエストボディが、設定ファイルの proxy.max_body より大きくなります。プロキシを経由して接続しているときは拒否されます。」と表示します。プロキシがボディの上限で拒否した 413 には、「リクエストボディがプロキシの上限（proxy.max_body）を超えました。」と表示します。
+- The request body of a rule import (`POST /api/generations`) and of `POST /api/managed/check` and `POST /api/managed/apply` of the managed configuration is up to 12 MiB. Set `proxy.max_body` to 12 MiB (12582912) or more. The `max_body` of a route can only lower `proxy.max_body`, so to limit other routes, write a smaller `max_body` on those routes. The admin route (`admin.route`) has no `max_body`, so `proxy.max_body` is its limit.
+- A long body of a bypass route is streamed without buffering, so a 12 MiB body does not use up `max_buffered_bytes` (see "Request Body Limits and Inspected Length" in the [operator reference](operator-reference.md)).
+- If the request body of a check is over 12 MiB, or there are more than 192 files, the admin screens do not send it and show a message to that effect. If the body is only larger than `proxy.max_body` of the configuration file (read with `GET /api/config`), the screens send it and show "The body to send is larger than proxy.max_body of the configuration file. It is refused when you connect through the proxy." together with the result of the check. For a 413 that the proxy gave because of the body limit, the screens show "The body is over the limit of the proxy (proxy.max_body)."
 
-### 時間のかかる応答とタイムアウト
+### Slow Responses and Timeouts
 
-- インポート、世代の選択、ロールバックは、数十秒以上かかることがあります（時間の上限は「リスナー」の「時間のかかる応答」）。プロキシの時間の設定キーはルートごとに変更できません。応答のヘッダー部を待つ時間は、`upstream_header_ms`、`response_idle_ms`、`request_total_ms` のうち先に尽きたもので切れます（[運用リファレンス](operator-reference.md) の「`proxy`: 時間」と「値どうしの関係」）。ボディを流すリクエスト（検査除外のルートのインポートなど）では、応答のヘッダー部が届くまで `response_idle_ms` は効きません。
-- 切れると、プロキシはクライアントに 502（`request_total_ms` では 503）を返します。管理プロセスは処理を続け、インポート、選択、ロールバックは最後まで進みます。プロキシの切断では止まりません。
-- 管理画面は、ボディに `result` を持たない 502 と 504 を「結果不明」として扱い、画面ごとに、状態と履歴、または世代の一覧を再読み込みして表示します。`result` を持つ応答（`failed` の 502、`unreachable` と `unconfirmed` の 503 を含む）は、その値で読み取ります。`result` を持たない 503 は変更が拒否されたものと読み取るので、`request_total_ms` は、ボディを受信する時間と検査の時間に `upstream_header_ms` を加えた時間より十分に長くしておいてください。API を直接使う場合も、同じ応答のときは `GET /api/status` と `GET /api/history`（インポートなら `GET /api/generations`）で確認します。
-- 時間の設定キーは、インポートと切り替えに必要な時間を測ってから決めてください。`upstream_header_ms` を長くすると、ほかの Host のアップストリームが遅いときも長く待つことになります。
+- An import, choosing a generation, and a rollback can take tens of seconds or more (for the time limit, see "Slow responses" under "Listener"). The time setting keys of the proxy cannot be changed for each route. The wait for the header section of the response ends at whichever of `upstream_header_ms`, `response_idle_ms`, and `request_total_ms` runs out first (see "`proxy`: Times" and "Relations Between Values" in the [operator reference](operator-reference.md)). For a request that streams its body (for example, an import on a bypass route), `response_idle_ms` has no effect until the header section of the response arrives.
+- When the wait runs out, the proxy returns 502 to the client (503 for `request_total_ms`). The admin process continues, and the import, choosing, and rollback run to the end. They are not stopped by the proxy cutting the connection.
+- The admin screens treat a 502 or 504 whose body has no `result` as "Result unknown", and, for each screen, read again and show the state and the history, or the list of generations. A response that has `result` (including a 502 with `failed`, and a 503 with `unreachable` or `unconfirmed`) is read by that value. A 503 that has no `result` is read as a change that was refused, so make `request_total_ms` sufficiently longer than the time to receive the body plus the time of the inspection plus `upstream_header_ms`. When you use the API directly, for the same responses, check with `GET /api/status` and `GET /api/history` (for an import, `GET /api/generations`).
+- Decide the time setting keys after you measure the time that imports and switches need. If you make `upstream_header_ms` longer, the proxy also waits longer when the upstream of another host is slow.
 
-## ユーザーとロール
+## Users and Roles
 
-ユーザーは、名前、ロール、パスワードを持ちます。名前は 1〜32 バイトの小文字の英字・数字・`.`・`_`・`-`、パスワードは 12〜128 バイトの UTF-8 です（日本語の文字は 1 文字が 3 バイトです）。パスワードは、PBKDF2-HMAC-SHA256（600000 回、ソルト 16 バイト）のハッシュで保存します。
+A user has a name, a role, and a password. A name is 1 to 32 bytes of lowercase letters, digits, `.`, `_`, and `-`. A password is 12 to 128 bytes of UTF-8 (a Japanese character is 3 bytes). The password is stored as a PBKDF2-HMAC-SHA256 hash (600000 iterations, 16-byte salt).
 
-| ロール | できること |
+| Role | What it can do |
 |---|---|
-| `viewer` | 状態、世代の一覧と内容、切り替えの履歴、ログを読めます。managed 設定の状態、バージョンの一覧、反映の処理、設定の変更履歴を読めます。自分のパスワード、二要素認証、API トークンを扱えます |
-| `operator` | viewer のすべて。加えて、監査ログを読めます。ルールのインポート、世代の選択、ロールバック、削除ができます。managed 設定のバージョンの内容と証明書の情報、設定ファイルの値を読め、検証、保存して反映、名前で反映、ロールバック、削除ができます |
-| `owner` | operator のすべて。加えて、ユーザーを作成し、ロールと有効・無効を変更し、ほかのユーザーのパスワードと二要素認証を初期化し、全員の API トークンを閲覧して削除できます |
+| `viewer` | Can read the state, the list and contents of generations, the switch history, and the logs. Can read the state of the managed configuration, the list of versions, the apply jobs, and the configuration history. Can manage their own password, two-factor authentication, and API tokens |
+| `operator` | Everything a viewer can do. In addition, can read the audit log. Can import rules, choose generations, roll back, and remove generations. Can read the contents of the versions of the managed configuration, the certificate information, and the values of the configuration file, and can check, save and apply, apply by name, roll back, and remove |
+| `owner` | Everything an operator can do. In addition, can create users, change roles and the enabled or disabled state, reset the passwords and two-factor authentication of other users, and view and remove the API tokens of everyone |
 
-- 最初の owner は `admin bootstrap` で作成します。以降のユーザーは、owner が `POST /api/users` で作成します。作成できるのは 1000 人までです。1000 人に達すると、作成は 409 `the store has too many users` で拒否されます。ユーザーは削除できないので、上限には無効にしたユーザーも数えます。
-- ユーザーを削除する API はありません。使わなくなったユーザーは無効にします。無効にしたユーザーは、ログインできず、セッションと API トークンが使えなくなります。有効にし直しても、削除された API トークンは戻りません。
-- owner が作成したユーザーと、owner が `POST /api/users/<name>/password` でパスワードを決めたユーザーは、次のログインで、自分のパスワードに変更するまで、ほかの API を使えません。
-- owner の自分自身に対する操作と、owner がいなくなる操作は拒否します。
-  - 自分のロールを下げる、自分を無効にする: 403
-  - 自分のパスワードと二要素認証の初期化: 403（アカウントの API で変更します）
-  - 有効な owner が 1 人もいなくなる変更: 409
-- ユーザーの管理は、管理プロセスの中で 1 つずつ順に進みます。2 人の owner が同時に互いを下げて、owner がいなくなることはありません。
-- ロールと状態の変更（ロールを変更する、無効にする、有効にする、パスワードを決める、二要素認証を無効にする）は、そのユーザーのセッションを終了します。ロールを下げること、無効にすること、パスワードを決めることは、API トークンも無効にします。
-- ロールも有効・無効も変わらない `PUT /api/users/<name>` は、何も変更せずに 200 でそのユーザーを返します。セッションは終了せず、監査ログにも書きません。
+- Create the first owner with `admin bootstrap`. Later users are created by an owner with `POST /api/users`. Up to 1000 users can be created. When the number reaches 1000, creating a user is refused with 409 `the store has too many users`. Users cannot be removed, so disabled users also count toward the limit.
+- There is no API to remove a user. Disable a user that is no longer used. A disabled user cannot log in, and their sessions and API tokens stop working. Even if you enable the user again, the API tokens that were deleted do not come back.
+- A user that an owner created, and a user whose password an owner set with `POST /api/users/<name>/password`, cannot use other APIs at the next login until they change the password to their own.
+- An owner's operations on themselves, and operations that would leave no owner, are refused.
+  - Lowering your own role, disabling yourself: 403
+  - Resetting your own password and two-factor authentication: 403 (change them with the account API)
+  - A change that would leave no enabled owner: 409
+- User management proceeds one operation at a time, in order, inside the admin process. It cannot happen that two owners lower each other at the same time and leave no owner.
+- A change of role or state (changing the role, disabling, enabling, setting the password, disabling two-factor authentication) ends the sessions of that user. Lowering the role, disabling, and setting the password also invalidate the API tokens.
+- A `PUT /api/users/<name>` that changes neither the role nor the enabled or disabled state changes nothing and returns that user with 200. It does not end sessions, and it is not written to the audit log.
 
-## ログインと二要素認証
+## Login and Two-Factor Authentication
 
-ログインは `POST /api/login`（`{"name", "password"}`）で始まります。応答の `mfa` が次の段階を示します。
+Login starts with `POST /api/login` (`{"name", "password"}`). `mfa` in the response shows the next step.
 
-| `mfa` | 意味 | 次の操作 |
+| `mfa` | Meaning | Next action |
 |---|---|---|
-| `off` | セッションが使えます | API を使います。`must_change` が `true` なら、パスワードを変更します |
-| `verify` | 二要素認証の認証コードが必要です | `POST /api/login/mfa` |
-| `setup` | `admin.mfa` が `required` で、二要素認証が未設定です | 二要素認証を設定します |
+| `off` | The session can be used | Use the API. If `must_change` is `true`, change the password |
+| `verify` | A verification code of two-factor authentication is needed | `POST /api/login/mfa` |
+| `setup` | `admin.mfa` is `required` and two-factor authentication is not set up | Set up two-factor authentication |
 
-セッションは、状態によって使える API が決まります。状態に合わない API は、403 と次の決まった文で拒否します。
+Which APIs a session can use depends on its state. An API that does not fit the state is refused with 403 and the following fixed sentence.
 
-| 状態 | 場合 | 使える API | 拒否するときの `error` |
+| State | Case | Usable APIs | `error` when refused |
 |---|---|---|---|
-| 認証コード待ち | パスワードが合い、二要素認証を設定しているユーザー。5 分で終了します | `POST /api/login/mfa`、`POST /api/logout` | `second factor required` |
-| パスワード変更待ち | owner が作成したユーザー、または owner か `admin reset` でパスワードを決められたユーザー | `PUT /api/account/password`、`GET /api/session`、`POST /api/logout` | `password change required` |
-| 二要素認証の設定待ち | `admin.mfa` が `required` で、二要素認証が未設定のユーザー | `POST /api/account/mfa/setup`、`POST /api/account/mfa/confirm`、`GET /api/session`、`POST /api/logout` | `second factor setup required` |
-| 通常 | 上のどれでもない場合 | ロールが許可するすべての API | |
+| Waiting for a verification code | The password was right and the user has set up two-factor authentication. It ends in 5 minutes | `POST /api/login/mfa`, `POST /api/logout` | `second factor required` |
+| Waiting for a password change | A user created by an owner, or a user whose password was set by an owner or by `admin reset` | `PUT /api/account/password`, `GET /api/session`, `POST /api/logout` | `password change required` |
+| Waiting for two-factor setup | A user for whom `admin.mfa` is `required` and two-factor authentication is not set up | `POST /api/account/mfa/setup`, `POST /api/account/mfa/confirm`, `GET /api/session`, `POST /api/logout` | `second factor setup required` |
+| Normal | None of the above | All APIs that the role allows | |
 
-- パスワード変更待ちと二要素認証の設定待ちが重なるときは、両方の API を使えます。
-- `GET /api/session` は、状態（`state`: `active`、`must_change`、`mfa_setup`）、残りの時間、残りのリカバリーコードの数を返します。認証コード待ちのセッションは 403 になります。
+- When waiting for a password change and waiting for two-factor setup overlap, the APIs of both can be used.
+- `GET /api/session` returns the state (`state`: `active`, `must_change`, `mfa_setup`), the remaining time, and the number of remaining recovery codes. For a session that is waiting for a verification code, it gives 403.
 
-二要素認証（MFA）:
+Two-factor authentication (MFA):
 
-- 時刻に基づくワンタイムパスワード（RFC 6238）で、HMAC-SHA1、6 桁、30 秒ごとの時間枠で作成します。現在の枠の前後 1 つの枠の認証コードも受け入れます。使った枠は保持していて、その枠と、それより前の枠の認証コードは拒否します。
-- 設定:
-  1. `POST /api/account/mfa/setup`（`{"password"}`）は、セットアップキー（20 バイトの乱数）を base32 の文字列（`secret`）と `otpauth://` のアドレス（`uri`）で返します。セットアップキーはセッションのメモリに 10 分だけ置きます。
-  2. `POST /api/account/mfa/confirm`（`{"code"}`）は、認証アプリの認証コードを検証し、二要素認証を有効にして、リカバリーコードを返します。このユーザーのほかのセッションは終了し、新しいセッションと CSRF トークンが返されます。
-- 設定の開始と確定を拒否する場合: すでに二要素認証を設定しているユーザーは、どちらも 409 `mfa is set already` で拒否されます。確定は、設定を始めていない、または 10 分を過ぎたときも、409 `mfa setup was not started or has run out` で拒否されます。認証コードが合わないときは 403 `the code is wrong` になります。
-- リカバリーコードは 10 個で、1 個は 16 文字（大文字の `A`〜`Z` と `2`〜`7`）、1 回だけ使えます。設定のとき 1 回だけ返し、保存先には SHA-256 だけを置きます。使い切る前に作り直すには、二要素認証を無効にして設定し直します。`admin.mfa` が `required` のときは、自分では無効にできません。owner に `DELETE /api/users/<name>/mfa` で無効にしてもらいます（owner 自身の分は、ほかの owner に無効にしてもらうか、`admin reset` を使います）。
-- ログインでの認証コードの確認では、`POST /api/login/mfa` に `{"code"}`（6 桁）か `{"recovery"}`（リカバリーコード。大文字で送ります）の一方を送ります。合うと、認証コード待ちのセッションが終了し、新しいセッション（新しい ID と CSRF トークン）が返されます。
-- 無効にする: `DELETE /api/account/mfa`（`{"password", "code"}`。`code` は認証コードかリカバリーコード）。`admin.mfa` が `required` のときは 403 `mfa is required` で拒否されます。owner は、ほかのユーザーの二要素認証を `DELETE /api/users/<name>/mfa` で無効にできます。
-- `required` のとき、二要素認証を設定していないユーザーの API トークンは使えません。
-- 二要素認証のセットアップキーは、ユーザーのファイルに、そのまま置きます（認証コードを計算するのにセットアップキーそのものが必要なためです）。保存先のディレクトリを 0700 にして保護します。
+- It is a time-based one-time password (RFC 6238), made with HMAC-SHA1 with 6 digits, in time windows of 30 seconds. It also accepts the code of the window before and the window after the current one. It keeps the window that was used, and rejects the code of that window and of the windows before it.
+- Setup:
+  1. `POST /api/account/mfa/setup` (`{"password"}`) returns the secret (20 random bytes) as a base32 string (`secret`) and as an `otpauth://` address (`uri`). The secret is kept in the memory of the session for only 10 minutes.
+  2. `POST /api/account/mfa/confirm` (`{"code"}`) verifies the code of the authenticator app, enables two-factor authentication, and returns the recovery codes. The other sessions of this user end, and a new session and a CSRF token are returned.
+- Refusing the start and the confirmation of the setup: a user who has already set up two-factor authentication is refused for both with 409 `mfa is set already`. The confirmation is also refused with 409 `mfa setup was not started or has run out` if the setup was not started or 10 minutes have passed. If the code is wrong, it gives 403 `the code is wrong`.
+- There are 10 recovery codes. A code is 16 characters (uppercase `A` to `Z` and `2` to `7`) and can be used once. They are returned only once, at setup, and only their SHA-256 is kept in the store. To make new ones before you use them up, disable two-factor authentication and set it up again. When `admin.mfa` is `required`, you cannot disable it yourself. Ask an owner to disable it with `DELETE /api/users/<name>/mfa` (for an owner's own, ask another owner to disable it, or use `admin reset`).
+- To verify a code at login, send either `{"code"}` (6 digits) or `{"recovery"}` (a recovery code, sent in uppercase) to `POST /api/login/mfa`. If it is right, the session that was waiting for the code ends, and a new session (a new ID and a new CSRF token) is returned.
+- Disabling: `DELETE /api/account/mfa` (`{"password", "code"}`; `code` is a verification code or a recovery code). When `admin.mfa` is `required`, it is refused with 403 `mfa is required`. An owner can disable the two-factor authentication of other users with `DELETE /api/users/<name>/mfa`.
+- With `required`, the API tokens of a user who has not set up two-factor authentication cannot be used.
+- The secret of two-factor authentication is kept as it is in the file of the user (because the secret itself is needed to calculate the verification code). Protect it by making the directory of the store 0700.
 
-## ロックアウトと試行回数の制限
+## Lockout and Attempt Limits
 
-| 対象 | 決まり |
+| Target | Rule |
 |---|---|
-| ユーザーごと | 続けて 5 回失敗すると、15 分間ロックアウトします。ロックアウト中の試行も失敗に数え、15 分を数え直します。成功すると失敗回数をリセットします |
-| クライアントごと | 1 分間に 30 回まで試行できます。超えた試行は、ハッシュを計算する前に 429 `too many tries` で拒否し、ユーザーの失敗には数えません |
+| Per user | After 5 failures in a row, the user is locked out for 15 minutes. An attempt during the lockout also counts as a failure and restarts the 15 minutes. A success resets the failure count |
+| Per client | Up to 30 attempts per minute. An attempt over the limit is refused with 429 `too many tries` before any hash is calculated, and does not count as a failure of the user |
 
-- ユーザーごとの失敗に数えるのは、ログインでパスワードが合わなかった場合、ログインの認証コード（`POST /api/login/mfa`）が合わなかった場合、二要素認証の無効化の認証コードが合わなかった場合、パスワードを検証する API（パスワードの変更、二要素認証の設定と無効化、トークンの作成）でパスワードが合わなかった場合です。無効のユーザーやロックアウト中のユーザーのログインも、そのユーザーの失敗に数えます。二要素認証を設定しているユーザーは、パスワードが合っても失敗回数をリセットしません。認証コードが合ったときにリセットします。パスワードを知っている人が、ログインのたびに失敗回数をリセットして認証コードを試し続けられないようにするためです。二要素認証の設定の確定（`POST /api/account/mfa/confirm`）で認証コードが合わなかった場合は、ユーザーの失敗にもクライアントの回数にも数えず、監査ログにも書きません。応答は 403 `the code is wrong` です。
-- クライアントごとの回数に数えるのは、ログイン、ログインの認証コード、パスワードを検証する API（上と同じ）、合わない API トークンです。正しい API トークンのリクエストと、二要素認証の設定の確定は数えません。ログインは、成功した試行も数えます。回数を使い切ったクライアントの API トークンのリクエストは、トークンが正しくても、トークンを検証する前に 429 `too many tries` で拒否します。
-- 最大 4096 のクライアントを追跡します。1 分以内に試行したクライアントで満杯のときは、ほかのクライアントを受け付けません。
-- ログインは、存在しない名前、無効なユーザー、ロックアウト中のユーザー、パスワードの不一致のどれでも、同じ応答（401 `invalid credentials`）にします。存在しない名前やロックアウト中でもハッシュを 1 回計算するので、かかる時間でも見分けられません。ログインの認証コードの不一致も、同じ 401 `invalid credentials` で応答します。ほかの API でのエラーは 403 で、パスワードは `the password is wrong`（パスワードの変更は `the current password is wrong`）、認証コードは `the code is wrong` です。
-- 理由は監査ログにだけ書きます（`unknown user`、`disabled`、`locked`、`wrong password`、`wrong code`）。存在しない名前は書きません。名前の欄に入力されたパスワードがログに出ないようにするためです。
-- ユーザーごとの失敗回数とロックアウトの状態、クライアントごとの試行回数は、管理プロセスのメモリにだけあります。再起動すると消えます。
-- ユーザーが変更されると（`admin reset`、owner の操作、パスワードの変更、二要素認証の設定と無効化）、ロックアウトは解除され、次の失敗から数え直します。
+- These count as a failure of the user: a wrong password at login, a wrong verification code at login (`POST /api/login/mfa`), a wrong verification code for disabling two-factor authentication, and a wrong password in an API that verifies the password (changing the password, setting up and disabling two-factor authentication, creating a token). A login of a disabled user or of a locked-out user also counts as a failure of that user. For a user who has set up two-factor authentication, a right password does not reset the failure count. It is reset when the verification code is right. This keeps someone who knows the password from resetting the failure count at every login and trying verification codes without end. A wrong code at the confirmation of the two-factor setup (`POST /api/account/mfa/confirm`) is not counted as a failure of the user or as an attempt of the client, and is not written to the audit log. The response is 403 `the code is wrong`.
+- These count toward the attempt count of the client: a login, a verification code at login, an API that verifies the password (the same as above), and an API token that does not match. A request with a correct API token and the confirmation of the two-factor setup are not counted. A login is counted even if it succeeds. A request with an API token from a client that has used up its count is refused with 429 `too many tries` before the token is verified, even if the token is right.
+- It tracks up to 4096 clients. When the table is full of clients that tried within the last minute, it does not accept other clients.
+- A login gives the same response (401 `invalid credentials`) for a name that does not exist, a disabled user, a locked-out user, and a wrong password. It calculates the hash once even for a name that does not exist or a user who is locked out, so the time it takes does not tell them apart either. A wrong verification code at login also gets the same 401 `invalid credentials`. In other APIs the error is 403: for the password, `the password is wrong` (`the current password is wrong` for a password change), and for the verification code, `the code is wrong`.
+- The reason is written only to the audit log (`unknown user`, `disabled`, `locked`, `wrong password`, `wrong code`). A name that does not exist is not written. This keeps a password that was typed into the name field out of the log.
+- The failure count and lockout state of each user and the attempt count of each client are only in the memory of the admin process. They disappear when it restarts.
+- When a user is changed (`admin reset`, an owner's operation, a password change, or setting up or disabling two-factor authentication), the lockout is released and counting starts again from the next failure.
 
-## セッション
+## Sessions
 
-- ログインが通ると、セッションを作成し、クッキー `tukuyomi_admin` を返します。クッキーの値は、32 バイトの乱数を base64url にした 43 文字です。
+- When a login succeeds, a session is created and the cookie `tukuyomi_admin` is returned. The value of the cookie is 43 characters: 32 random bytes in base64url.
 
   ```text
   Set-Cookie: tukuyomi_admin=<43-characters>; Secure; HttpOnly; SameSite=Strict; Path=/
   ```
 
-  有効期限は付けません（ブラウザーを閉じると消えます）。ログアウトでは `Max-Age=0` のクッキーを返して削除します。
-- 管理プロセスは、セッションを ID の SHA-256 で保持し、ID そのものは持ちません。監査ログの `session` には、その SHA-256 の先頭 8 桁だけを書きます。
-- セッションごとに、CSRF トークン（別の 32 バイトの乱数、43 文字）を持ちます。ログインの応答と `GET /api/session` で返します。
-- セッションが終了する場合:
-  - `admin.session_idle_ms` の間、使われなかった場合（リクエストごとに数え直します）
-  - 作成してから `admin.session_total_ms` が過ぎた場合
-  - ログアウトした場合
-  - そのユーザーのパスワード、ロール、有効・無効、二要素認証が変更された場合（`admin reset` と、別の管理プロセスの操作を含みます）。パスワードと二要素認証を自分で変更したときは、そのリクエストに新しいセッションを返し、ほかのセッションを終了します
-  - ユーザーが無効になった場合
-  - 管理プロセスを再起動した場合
-- 1 人のユーザーが持てるセッションは、認証コード待ちと通常のそれぞれで 16 個までです。17 個目を作成すると、いちばん古いものを終了し、監査ログに `logout`（`reason` は `too many sessions`）を書きます。認証コード待ちを繰り返しても、通常のセッションは終了しません。全体では 1024 個まで持ち、満杯になると新しいセッションを作成できません（ログインは 503）。
-- 1 つのリクエストは、セッションのクッキーか API トークンのどちらかを持ちます。両方あると 400 になります。`Authorization` ヘッダーが Bearer でなくても、セッションのクッキーと並ぶと 400 になるので、管理画面の前に Basic 認証などの HTTP 認証をかけると、ログイン後のリクエストは 400 になります。クッキーが 2 回含まれるリクエストは、セッションを持たないものとして 401 にします。
+  No expiry is set (the cookie disappears when the browser is closed). At logout, a cookie with `Max-Age=0` is returned to delete it.
+- The admin process keeps a session by the SHA-256 of its ID, and does not hold the ID itself. `session` in the audit log gets only the first 8 digits of that SHA-256.
+- Each session has a CSRF token (another 32 random bytes, 43 characters). It is returned in the response to login and by `GET /api/session`.
+- A session ends in these cases:
+  - It was not used for `admin.session_idle_ms` (counted again at every request)
+  - `admin.session_total_ms` has passed since it was created
+  - The user logged out
+  - The password, role, enabled or disabled state, or two-factor authentication of the user was changed (including `admin reset` and an operation of another admin process). When users change their own password or two-factor authentication, a new session is returned for that request and the other sessions end
+  - The user was disabled
+  - The admin process was restarted
+- A user can have up to 16 sessions that are waiting for a verification code, and up to 16 normal sessions. When a 17th is created, the oldest one ends and `logout` (with `reason` `too many sessions`) is written to the audit log. Repeating the wait for a verification code does not end normal sessions. The admin process keeps up to 1024 sessions in all, and when it is full, a new session cannot be created (login gets 503).
+- A request has either the cookie of a session or an API token. If it has both, it gets 400. Even when the `Authorization` header is not Bearer, it gets 400 if it comes with the session cookie, so if you put HTTP authentication such as Basic authentication in front of the admin screens, requests after login get 400. A request that has the cookie twice is treated as having no session and gets 401.
 
-## CSRF と Origin
+## CSRF and Origin
 
-`GET` と `HEAD` 以外のリクエスト（変更）には、次の 2 つの検証があります。
+A request other than `GET` and `HEAD` (a change) has these two checks.
 
-- `Origin`: ヘッダーがあれば、`admin.origin` と一字一句同じで、1 つだけであること。違うと 403 `forbidden` になります。`Origin` ヘッダーが無いリクエスト（プログラムからのリクエスト）は通ります。ログインのリクエストにも適用します。
-- `X-CSRF-Token`: セッションのリクエストでは、そのセッションの CSRF トークンと同じ値を、1 つだけ付けること（一定の時間で比較します）。違うか無いと 403 `forbidden` になります。API トークンのリクエストには不要です（クッキーを使わないためです）。
+- `Origin`: if the header is present, it must be exactly the same as `admin.origin`, and there must be only one. If not, it gets 403 `forbidden`. A request without an `Origin` header (a request from a program) passes. It also applies to the login request.
+- `X-CSRF-Token`: for a session request, it must have exactly one value that is the same as the CSRF token of that session (compared in constant time). If it differs or is missing, it gets 403 `forbidden`. It is not needed for a request with an API token (because it does not use a cookie).
 
-検証の順序は、「応答の形式」の「管理 API の検証の順序」を参照してください。
+For the order of the checks, see "Order of Admin API Checks" under "Response Format".
 
-- 管理画面は、CSRF トークンをメモリにだけ置き、変更のリクエストごとに付けます。ページを開き直すと `GET /api/session` で受け取り直します。認証コード待ちのセッションは `GET /api/session` が 403 になり CSRF トークンを受け取れないので、ページを開き直すとログインからやり直しになります。
-- `Origin` の不一致と CSRF の不一致で拒否したリクエストは、ユーザーが分かっているときに監査ログに書きます（`reason` は `origin`、`csrf`）。
+- The admin screens keep the CSRF token only in memory and attach it to each changing request. When you reopen the page, they receive the token again with `GET /api/session`. For a session that is waiting for a verification code, `GET /api/session` gives 403 and no CSRF token can be received, so if you reopen the page, you start again from login.
+- A request that was refused because of an `Origin` mismatch or a CSRF mismatch is written to the audit log when the user is known (`reason` is `origin` or `csrf`).
 
-## API トークン
+## API Tokens
 
-プログラムが管理 API を使うためのトークンです。
+Tokens for programs to use the admin API.
 
-- 形式は `tkc_<16-hex-digits>_<43-characters>` です。前の部分がトークンの ID で、後ろが秘密（32 バイトの乱数の base64url）です。作成したときに 1 回だけ全体を返します。管理データの保存先には秘密の SHA-256 だけを置きます。
-- `Authorization: Bearer <token>` で送ります。セッションのクッキーとは一緒に送れません（400）。
-- 作成: `POST /api/account/tokens`（`{"name", "role", "days", "password"}`）。セッションのユーザーが自分のために作成します。現在のパスワードが必要です。
-  - `name`: 1〜64 バイトの印字可能な ASCII
-  - `role`: 自分のロール以下。それより上のロールは 403 `the role is above the role of the user` で拒否します。
-  - `days`: 1〜365。作成した時刻からこの日数で有効期限が切れます。
-  - 1 人が持てるのは 50 個までです（超えると 409 `the user has too many tokens`）。50 個の数には、期限が切れたトークンも含まれます。期限が切れたトークンは自動では削除されないので、`DELETE /api/account/tokens/<id>` で削除します。
-  - 応答は、トークンの情報（`id`、`owner`、`name`、`role`、`created`、`expires`、`expired`、`last_used`。時刻はミリ秒のエポック）に、`token`（全体の文字列）を加えたものです。
-- 使える API: 状態、世代、インポート、選択、ロールバック、削除、履歴、ログ、監査ログ、managed 設定と設定ファイルの値（下の「API のパスの一覧」で「トークン」が ○ のもの）。アカウントの API と、ユーザーの管理の API には使えません（403）。owner のトークンで、ほかのユーザーのパスワードや二要素認証を初期化して、そのユーザーとしてログインできてしまうのを防ぐためです。
-- リクエストのロールはトークンのロールです（所有者のロール以下）。CSRF トークンは不要です。変更のリクエストの `Origin` は、あれば `admin.origin` と同じであること。
-- 使うたびに、次を検証します。
-  - 形式が正しく、保存先にその ID があり、秘密の SHA-256 が合うこと
-  - 所有者がいて、無効でなく、ロールがトークンのロール以上であること
-  - トークンが、所有者の「この時刻より前に作ったトークンは無効」の時刻より後に作成されていること
-  - 有効期限が過ぎていないこと
-  - `admin.mfa` が `required` なら、所有者が二要素認証を設定していること
-- 無効になる場合（ファイルを削除できなくても、上の検証で通らなくなります）:
-  - 有効期限が来た場合、または削除した場合（`DELETE /api/account/tokens/<id>`、owner は `DELETE /api/tokens/<id>`）
-  - 所有者が無効になった場合
-  - 所有者のロールが下がった場合（所有者のすべてのトークンが無効になります）
-  - 所有者のパスワードが変更された場合（自分で変更したとき、owner が決めたとき、`admin reset`）
-- 合わないトークンは、クライアントごとの試行回数（上の「ロックアウトと試行回数の制限」）に数えます。監査ログには書きません。誰でも送れるリクエストで、監査ログを埋め尽くされないようにするためです。
-- 最後に使った時刻（`last_used`）は、10 分に 1 回までしか書き込みません。書き込めなくてもリクエストは通ります。
-- 使い方の例（`$TOKEN` にトークンを入れます）:
+- The form is `tkc_<16-hex-digits>_<43-characters>`. The first part is the ID of the token, and the last part is the secret (32 random bytes in base64url). The whole token is returned only once, when it is created. Only the SHA-256 of the secret is kept in the admin store.
+- Send it as `Authorization: Bearer <token>`. It cannot be sent together with the cookie of a session (400).
+- Creating: `POST /api/account/tokens` (`{"name", "role", "days", "password"}`). A user with a session creates it for themselves. The current password is needed.
+  - `name`: 1 to 64 printable ASCII bytes
+  - `role`: the user's own role or lower. A higher role is refused with 403 `the role is above the role of the user`.
+  - `days`: 1 to 365. The token expires after this number of days from the time it was created.
+  - One user can have up to 50 tokens (more is refused with 409 `the user has too many tokens`). The 50 includes expired tokens. Expired tokens are not deleted automatically, so delete them with `DELETE /api/account/tokens/<id>`.
+  - The response is the information of the token (`id`, `owner`, `name`, `role`, `created`, `expires`, `expired`, `last_used`; the times are epoch milliseconds) with `token` (the whole string) added.
+- APIs it can use: status, generations, import, choosing, rollback, removal, history, logs, the audit log, the managed configuration, and the values of the configuration file (those with "yes" in the "Token" column of "API Paths" below). It cannot be used for the account APIs and the APIs for managing users (403). This keeps a token of an owner from resetting the password or the two-factor authentication of another user and logging in as that user.
+- The role of the request is the role of the token (the role of the owner or lower). A CSRF token is not needed. The `Origin` of a changing request, if there is one, must be the same as `admin.origin`.
+- Every time it is used, these are checked:
+  - The form is correct, the store has that ID, and the SHA-256 of the secret matches
+  - The owner exists, is not disabled, and has a role that is the role of the token or higher
+  - The token was created after the owner's "tokens made before this time are invalid" time
+  - The expiry has not passed
+  - If `admin.mfa` is `required`, the owner has set up two-factor authentication
+- It becomes invalid in these cases (even if the file cannot be deleted, it no longer passes the checks above):
+  - The expiry came, or it was removed (`DELETE /api/account/tokens/<id>`; for an owner, `DELETE /api/tokens/<id>`)
+  - The owner was disabled
+  - The role of the owner was lowered (all tokens of the owner become invalid)
+  - The password of the owner was changed (by the owner, set by an owner, or `admin reset`)
+- A token that does not match counts toward the attempt count of the client (see "Lockout and Attempt Limits" above). It is not written to the audit log. This keeps anyone who can send requests from filling the audit log.
+- The last-used time (`last_used`) is written at most once every 10 minutes. If it cannot be written, the request still passes.
+- An example of use (put the token in `$TOKEN`):
 
   ```bash
   curl -sS -H "Authorization: Bearer $TOKEN" https://admin.example.com/api/status
@@ -480,476 +482,476 @@ SecRule REQUEST_HEADERS:Host "@rx ^admin\.example\.com(?::[0-9]{1,5})?$" \
     https://admin.example.com/api/activate
   ```
 
-## 監査ログ
+## Audit Log
 
-管理プロセスは、ログイン、変更、拒否したリクエストを、監査ログの行として残します。
+The admin process keeps logins, changes, and refused requests as lines of the audit log.
 
-| 項目 | 内容 |
+| Field | Content |
 |---|---|
-| `ts`、`type` | ログと同じです。`type` は `audit` です |
-| `id` | リクエスト ID（`X-Request-ID`）。コマンド（`admin bootstrap`、`admin reset`）の行にはありません |
-| `actor` | 検証したユーザーの名前。検証できなかったときはありません。リクエストヘッダーからは取得しません |
-| `session` | セッション ID の SHA-256 の先頭 8 桁。ID そのものは書きません |
-| `auth` | セッション以外の場合の認証方法。`token:<id>`、`bootstrap`、`reset` |
-| `client` | クライアントのアドレス。コマンドの行にはありません |
-| `action` | 操作（下の表） |
-| `target` | 操作の対象（ユーザーの名前、API トークンの ID、世代のフィンガープリント、managed 設定のバージョンの名前）。存在しない名前のログインにはありません |
-| `result` | `ok`、`denied`（拒否）、`failed`（実行を試みたが失敗） |
-| `reason` | 決まった語（`wrong password`、`locked`、`expect`、`store` など） |
-| `before`、`after` | 変更の前と後。ロール、有効・無効、世代のフィンガープリント、managed 設定のバージョンの名前 |
+| `ts`, `type` | The same as in the logs. `type` is `audit` |
+| `id` | The request ID (`X-Request-ID`). Not present in the lines of commands (`admin bootstrap`, `admin reset`) |
+| `actor` | The name of the verified user. Not present if the user could not be verified. It is not taken from the request headers |
+| `session` | The first 8 digits of the SHA-256 of the session ID. The ID itself is not written |
+| `auth` | The authentication method when it is not a session: `token:<id>`, `bootstrap`, `reset` |
+| `client` | The client address. Not present in the lines of commands |
+| `action` | The operation (the table below) |
+| `target` | The target of the operation (the name of a user, the ID of an API token, the fingerprint of a generation, the name of a version of the managed configuration). Not present for a login with a name that does not exist |
+| `result` | `ok`, `denied` (refused), `failed` (the operation was tried and failed) |
+| `reason` | A fixed word (`wrong password`, `locked`, `expect`, `store`, and so on) |
+| `before`, `after` | Before and after a change: the role, the enabled or disabled state, the fingerprint of a generation, the name of a version of the managed configuration |
 
-パスワード、API トークン、認証コード、リカバリーコード、二要素認証のセットアップキー、クッキーは書きません。
+Passwords, API tokens, verification codes, recovery codes, secrets of two-factor authentication, and cookies are not written.
 
-| `action` | 場合 |
+| `action` | Case |
 |---|---|
-| `login` | ログインの成功（`ok`）と失敗（`denied`。`reason` は `unknown user`、`wrong password`、`locked`、`disabled`）。セッションを作成できないとき（`failed`、`no session`）。二要素認証を設定したユーザーのパスワードが合ったときの `reason` は `second factor pending` です |
-| `mfa` | 認証コードの成功と失敗（`wrong code`、`locked`）。リカバリーコードの成功は `reason` が `recovery code` です |
-| `lock` | ユーザーのロックアウト（`reason` は `too many failures`） |
-| `logout` | ログアウト。セッションが多すぎて終了させたときは `reason` が `too many sessions` です |
-| `password`、`mfa_setup`、`mfa_confirm`、`mfa_disable` | 自分のパスワード、二要素認証の設定の開始・確定・無効化。パスワードや認証コードのエラーは `denied`（`wrong password`、`wrong code`、`locked`）になります。ただし、`mfa_confirm` の認証コードのエラーは行を書きません |
-| `token_create`、`token_revoke` | API トークンの作成（`after` がロール）と削除 |
-| `user_create`、`role`、`disable`、`enable`、`user_password`、`user_mfa` | owner が行うユーザーの管理 |
-| `import`、`activate`、`rollback`、`remove` | 世代の操作（下の「世代の操作」） |
-| `managed-import` | `POST /api/managed/apply`（「保存して反映」の操作）で、バージョンを保存する前（下の「managed 設定の操作」の「保存して反映」） |
-| `managed-apply`、`managed-activate`、`managed-rollback` | managed 設定の「保存して反映」「名前で反映」「ロールバック」の操作（下の「managed 設定の操作」） |
-| `managed-remove` | managed 設定のバージョンの削除 |
-| `create`、`reset` | コマンド `admin bootstrap`、`admin reset` |
-| API ごとの `action` | 拒否した API の名前で、`denied` の行を書きます（下の注）。名前は、上の世代の操作と managed 設定の `action` のほかに、`status`、`generations`、`generation`（世代 1 つの読み出し）、`history`、`records`、`audit`、`session`、`users`、`user_update`（`PUT /api/users/<name>`）、`tokens`、`managed`（`GET /api/managed`）、`managed-versions`、`managed-version`（バージョン 1 つの読み出し）、`managed-job`、`managed-history`、`managed-check`、`managed-certificates`、`config`（`GET /api/config`）です |
+| `login` | A successful login (`ok`) and a failed one (`denied`; `reason` is `unknown user`, `wrong password`, `locked`, `disabled`). When a session cannot be created (`failed`, `no session`). When the password of a user who has set up two-factor authentication is right, `reason` is `second factor pending` |
+| `mfa` | Success and failure of a verification code (`wrong code`, `locked`). A success with a recovery code has `reason` `recovery code` |
+| `lock` | A lockout of a user (`reason` is `too many failures`) |
+| `logout` | A logout. When a session was ended because there were too many, `reason` is `too many sessions` |
+| `password`, `mfa_setup`, `mfa_confirm`, `mfa_disable` | A user's own password; starting and confirming the two-factor setup; disabling two-factor authentication. An error of the password or the verification code is `denied` (`wrong password`, `wrong code`, `locked`). However, no line is written for an error of the verification code of `mfa_confirm` |
+| `token_create`, `token_revoke` | Creating (`after` is the role) and removing an API token |
+| `user_create`, `role`, `disable`, `enable`, `user_password`, `user_mfa` | User management by an owner |
+| `import`, `activate`, `rollback`, `remove` | Generation operations (see "Generation Operations" below) |
+| `managed-import` | In `POST /api/managed/apply` (the "Save and apply" operation), before the version is saved (see "Save and Apply" under "Managed Configuration Operations" below) |
+| `managed-apply`, `managed-activate`, `managed-rollback` | The "Save and apply", "Apply by name", and "Roll back" operations of the managed configuration (see "Managed Configuration Operations" below) |
+| `managed-remove` | Removing a version of the managed configuration |
+| `create`, `reset` | The commands `admin bootstrap` and `admin reset` |
+| `action` of each API | The name of an API that was refused; a `denied` line is written (see the note below). Besides the `action` values of the generation operations and the managed configuration above, the names are `status`, `generations`, `generation` (reading one generation), `history`, `records`, `audit`, `session`, `users`, `user_update` (`PUT /api/users/<name>`), `tokens`, `managed` (`GET /api/managed`), `managed-versions`, `managed-version` (reading one version), `managed-job`, `managed-history`, `managed-check`, `managed-certificates`, and `config` (`GET /api/config`) |
 
-- API ごとの検証で拒否したリクエストは、ユーザーが分かっていれば `denied` の行を書きます。`reason` は `origin`、`csrf`、`token`（API トークンが使えない API）、`role`、`state`、`second factor pending`、`password change`、`second factor setup` です。
-- ユーザーが分からない段階で拒否したリクエストは書きません。セッションも API トークンも無い、合わない API トークン、クライアントの回数を超えたログイン、`Origin` が違うログイン、パスが無いなどです。誰でも送れるリクエストで、古い行を押し出されないようにするためです。
-- 世代の操作の行は、`target` に対象の世代のフィンガープリントを書きます。`activate` と `rollback` の `ok` の行は、`before` に選択中だった世代、`after` に依頼した世代も書きます。`ok` の行は変更の前に書くので、成功を示す行ではありません。終わり方は、後に続く `failed` の行と、切り替えの履歴で確認します。`failed` の `reason` は、`expect`、`store`、`refused`、`failed`、`unconfirmed`、`history`（履歴の行を書き込めなかった）で、インポートは `store` と `trial` です。変更の前に拒否したときは `denied` で、`reason` は `expect`、`engine`、`version`（エンジンごとの状態を返さないプロキシ）、`busy`、`unreachable` です。削除は、選択中の世代が `chosen`、ロールバック先が `rollback target` です。
-- managed 設定の行は、`target` に対象のバージョンの名前を書きます。`managed-apply`、`managed-activate`、`managed-rollback` の `ok` の行は、反映の処理がプロキシに依頼する前に書き、`before` に変更前、`after` に変更後のバージョンを書きます。成功を示す行ではないので、終わり方は、後に続く行と設定の変更履歴で確認します。
-  - 変更の前に拒否したときは `denied` で、`reason` は `managed`、`configuration`、`expect`、`unreachable`、`busy`、`unmanaged`、`engine`（`managed-activate` と `managed-rollback` で、バージョンのアップストリームのエンジンにルールストアで選択中の世代が無い）と、反映の処理の結果を表す語（`current changed`、`no version`、`store`）です。
-  - 変更の前の行を書いた後に失敗したときは `failed` で、`reason` は反映の処理の結果を表す語（`refused`、`busy`、`error`、`failed`、`unconfirmed`、`not recorded`）と `history`（設定の変更履歴の行を書き込めなかった）です。反映の処理を始められなかったときも `failed` で、`reason` は `time`、`stopping`、`thread` です。
-  - `managed-import` の失敗の `reason` は `store`、`version`、`configuration` です。削除は、拒否が `managed`、`configuration`、`chosen`（選択中のバージョン）、`rollback target`（ロールバック先）、失敗が `store` です。
-  - 検証と、読み出しだけの API は、変更ではないので、入口で拒否したとき以外は行を書きません。
+- A request that is refused by a check of an API gets a `denied` line if the user is known. `reason` is `origin`, `csrf`, `token` (an API that cannot use an API token), `role`, `state`, `second factor pending`, `password change`, or `second factor setup`.
+- A request that is refused at a stage where the user is not known is not written. Examples are a request with neither a session nor an API token, an API token that does not match, a login over the count of the client, a login with a wrong `Origin`, and a path that does not exist. This keeps anyone who can send requests from pushing out the old lines.
+- A line of a generation operation has the fingerprint of the target generation in `target`. An `ok` line of `activate` and `rollback` also has the generation that was chosen before in `before` and the generation that was requested in `after`. An `ok` line is written before the change, so it is not a line that shows success. Check how the operation ended with the `failed` line that follows it and with the switch history. The `reason` of `failed` is `expect`, `store`, `refused`, `failed`, `unconfirmed`, or `history` (the line of the history could not be written), and for an import, `store` and `trial`. When the operation was refused before the change, it is `denied` and `reason` is `expect`, `engine`, `version` (a proxy that does not return the state of each engine), `busy`, or `unreachable`. For a removal, a generation that is chosen is `chosen`, and a rollback target is `rollback target`.
+- A line of the managed configuration has the name of the target version in `target`. An `ok` line of `managed-apply`, `managed-activate`, and `managed-rollback` is written before the apply job asks the proxy, with the version before the change in `before` and the version after it in `after`. It is not a line that shows success, so check how the operation ended with the lines that follow and with the configuration history.
+  - When the operation was refused before the change, it is `denied`, and `reason` is `managed`, `configuration`, `expect`, `unreachable`, `busy`, `unmanaged`, `engine` (in `managed-activate` and `managed-rollback`, when the rules store has no chosen generation for an upstream engine of the version), or a word for the result of the apply job (`current changed`, `no version`, `store`).
+  - When the operation failed after the line before the change was written, it is `failed`, and `reason` is a word for the result of the apply job (`refused`, `busy`, `error`, `failed`, `unconfirmed`, `not recorded`) or `history` (the line of the configuration history could not be written). When the apply job could not be started, it is also `failed`, and `reason` is `time`, `stopping`, or `thread`.
+  - The `reason` of a failure of `managed-import` is `store`, `version`, or `configuration`. For a removal, a refusal is `managed`, `configuration`, `chosen` (the selected version), or `rollback target` (the rollback target), and a failure is `store`.
+  - A check and an API that only reads are not changes, so they write no line except when they are refused at the entrance.
 
-書き込みの方法:
+How it is written:
 
-- 変更は、監査ログの行を先に書いてから行います。行を書けない（ディスクが満杯の場合など）ときは、変更せずに 503 `unavailable` で拒否します。行はディスクに同期してから、標準エラーにも出力します。
-- 例外はログアウトです。権限を取り消す操作なので、行を書けなくてもセッションを終了します。
-- 変更が失敗したときは、後から `failed` の行を書きます（書けなくても応答は変えません）。
-- 保存先は `admin.store.dir` の `audit/audit.log` で、1 行 1 件の JSON です。1 つのファイルが 16 MiB を超えると次のファイルに移り、8 ファイル（`audit.log`、`audit.1.log` から `audit.7.log`）を残します。同じ行を標準エラー（ジャーナル）にも出力します。
-- `GET /api/audit`（operator 以上、API トークン可）は、最新の 200 行を新しい順に `{"entries": [...]}` で返します。ファイルの終わりから読み、足りなければ古いファイルを読みます。1 つのファイルは終わりの 1 MiB までを読み、ファイルがそれより大きいときは、古いファイルを読まずにそこで終了します。読めない行は飛ばします。
+- A change is made after the audit log line is written first. If the line cannot be written (for example, the disk is full), the change is not made and the request is refused with 503 `unavailable`. The line is synced to disk and then also written to standard error.
+- The exception is logout. It is an operation that revokes authority, so the session ends even if the line cannot be written.
+- When a change fails, a `failed` line is written afterwards (the response does not change even if it cannot be written).
+- It is stored in `audit/audit.log` under `admin.store.dir`, as one JSON object per line. When one file goes over 16 MiB, it moves to the next file, and 8 files are kept (`audit.log` and `audit.1.log` to `audit.7.log`). The same lines are also written to standard error (the journal).
+- `GET /api/audit` (operator or above, API tokens allowed) returns the newest 200 lines, newest first, as `{"entries": [...]}`. It reads from the end of the file, and reads the older files if it needs more. It reads only up to the last 1 MiB of one file, and if the file is larger than that, it stops there without reading the older files. Lines that cannot be read are skipped.
 
-## 世代の操作
+## Generation Operations
 
-世代の一覧と内容は viewer が読めます。インポート、選択、ロールバック、削除は operator 以上が行えます。
+A viewer can read the list and contents of generations. An operator or above can import, choose, roll back, and remove.
 
-### 一覧と内容
+### Listing and Contents
 
-- `GET /api/status`: 次を返します。
-  - `current`: デフォルトのエンジンについて、ルールストアで選択中の世代のフィンガープリント（無ければ `null`）
-  - `reachable`: プロキシに接続できるか。同時接続数の上限のために応答できないプロキシは、接続できるものとして扱います
-  - `proxy`: プロキシの状態（`generation`、`mode`、`engine`、`phase`、`switching`、`engines`、`reloading`、`ready`）と数（`uptime_ms`、`requests`、`blocked`、`policy_refused`、`upstream_failures`、`config`、`managed`、`resolve_timeout_ms`、`config_reloads`）。プロキシの応答のままで、読めなければ `null`。`generation`、`mode`、`engine`、`phase` は、デフォルトのエンジンについて、プロキシが応答した値です。`engines` は、プロキシで稼働しているエンジンごとの `{"engine", "generation", "mode", "phase"}` の配列（エンジンの名前順）で、`ready` は `/readyz` が準備済みと答える状態かどうかです。`engines`、`reloading` と数は以前のバージョンのプロキシが送らないので、送られなかったものはそれぞれ `null` になります（応答は拒否しません）。`reloading` は、設定のリロードの途中かどうかです。数の内容は次のとおりで、詳しくは [運用リファレンス](operator-reference.md) の「制御ソケット」を参照してください
-    - `uptime_ms`: プロキシが起動してからのミリ秒
-    - `requests`: リクエストの数（ログの 7 つの `class` のすべて）
-    - `blocked`: ルールがブロックしたリクエストの数
-    - `policy_refused`: 全体の `access` と `rate_limit`、ホストごとの設定が拒否したリクエストの数
-    - `upstream_failures`: 稼働中の設定の、アップストリームのサーバーの失敗回数。設定のリロードで設定が切り替わると、0 から数え直します
-    - `config`: 稼働中の設定ファイルの SHA-256（64 桁の小文字の 16 進数）
-    - `managed`: 稼働中の managed 設定のバージョンの名前（64 桁の小文字の 16 進数）。`managed` の無い設定では `null`
-    - `resolve_timeout_ms`: 稼働中の設定の `forward.resolve_timeout_ms`
-    - `config_reloads`: SIGHUP と制御ソケットの `reload` による設定のリロードの数。`{"replaced", "refused"}`（切り替えた数と拒否した数）
-  - `rollback_to`: 今、デフォルトのエンジンのロールバックを依頼したら選択される世代（無ければ `null`）
-  - `default_engine`: 管理プロセスが起動したときの `kernel.default_engine`（`coraza` か `modsecurity`。書かなければ `coraza`）。管理プロセスとプロキシの一方だけを再起動したときは、`proxy` の `engine` と違うことがあります
-  - `engines`: エンジンごとの `{"engine", "current", "rollback_to"}` の配列（`coraza`、`modsecurity` の順）。それぞれ、ルールストアでそのエンジンに選択中の世代と、そのエンジンのロールバック先です。上の `current` と `rollback_to` は、この配列の `default_engine` のエンジンの値です
-  - `crs`: `{"available", "files"}`。`admin.crs_dir` があるかどうかと、インポートで除外できる CRS の `.conf` の名前
-- `GET /api/generations`: `{"reachable", "generations"}`。新しい順に、各世代の `fingerprint`、`made`（作成した時刻。エポックからの秒数）、`mode`（`block`、`detect`、マニフェストが読めなければ `unknown`）、`engine`（`coraza`、`modsecurity`、マニフェストが読めなければ `unknown`）、`routes`（検査除外のルートの数）、`current`（どれかのエンジンで、ルールストアで選択中か）、`serving`（どれかのエンジンで、プロキシで稼働中か）を返します。
-- `GET /api/generations/<fingerprint>`: 上に加えて、`load`（読み込む順）、`files`（`path`、`size`、`sha256`）を返します。`routes` は、ここでは数ではなくルートの配列（`host`、`path`、`action`）です。ルートが `host` を持たないときは、`host` は付きません。ルールストアに無い世代は 404 になります。
+- `GET /api/status`: returns the following.
+  - `current`: the fingerprint of the generation that the rules store has chosen for the default engine (`null` if there is none)
+  - `reachable`: whether the proxy can be reached. A proxy that cannot respond because of the limit of concurrent connections is treated as reachable
+  - `proxy`: the state of the proxy (`generation`, `mode`, `engine`, `phase`, `switching`, `engines`, `reloading`, `ready`) and numbers (`uptime_ms`, `requests`, `blocked`, `policy_refused`, `upstream_failures`, `config`, `managed`, `resolve_timeout_ms`, `config_reloads`). It is the response of the proxy as it is, and `null` if it cannot be read. `generation`, `mode`, `engine`, and `phase` are the values that the proxy gave for the default engine. `engines` is an array of `{"engine", "generation", "mode", "phase"}` for each engine that runs in the proxy (in the order of the engine names), and `ready` is whether the state is one for which `/readyz` responds that the proxy is ready. A proxy of an earlier version does not send `engines`, `reloading`, or the numbers, so whatever was not sent is `null` (the response is not refused). `reloading` is whether a configuration reload is in progress. The contents of the numbers are as follows; for details, see "Control Socket" in the [operator reference](operator-reference.md)
+    - `uptime_ms`: milliseconds since the proxy started
+    - `requests`: the number of requests (all 7 `class` values of the log)
+    - `blocked`: the number of requests that rules blocked
+    - `policy_refused`: the number of requests that the global `access` and `rate_limit`, and the host policies, refused
+    - `upstream_failures`: the failure count of the servers of the upstreams of the running configuration. When the configuration is switched by a configuration reload, it is counted again from 0
+    - `config`: the SHA-256 of the running configuration file (64 lowercase hexadecimal digits)
+    - `managed`: the name of the version of the managed configuration that is running (64 lowercase hexadecimal digits). `null` for a configuration without `managed`
+    - `resolve_timeout_ms`: `forward.resolve_timeout_ms` of the running configuration
+    - `config_reloads`: the number of configuration reloads by SIGHUP and by `reload` of the control socket. `{"replaced", "refused"}` (the number switched and the number refused)
+  - `rollback_to`: the generation that would be chosen if a rollback of the default engine were requested now (`null` if there is none)
+  - `default_engine`: `kernel.default_engine` when the admin process started (`coraza` or `modsecurity`; `coraza` if it is not written). If only one of the admin process and the proxy was restarted, it may differ from `engine` of `proxy`
+  - `engines`: an array of `{"engine", "current", "rollback_to"}` for each engine (in the order `coraza`, `modsecurity`). These are the generation that the rules store has chosen for that engine and the rollback target of that engine. `current` and `rollback_to` above are the values of the engine of `default_engine` in this array
+  - `crs`: `{"available", "files"}`. Whether `admin.crs_dir` exists, and the names of the `.conf` files of the CRS that an import can leave out
+- `GET /api/generations`: `{"reachable", "generations"}`. For each generation, newest first, it returns `fingerprint`, `made` (the time it was made, in seconds since the epoch), `mode` (`block`, `detect`, or `unknown` if the manifest cannot be read), `engine` (`coraza`, `modsecurity`, or `unknown` if the manifest cannot be read), `routes` (the number of bypass routes), `current` (whether the rules store has chosen it for any engine), and `serving` (whether it is running in the proxy for any engine).
+- `GET /api/generations/<fingerprint>`: in addition to the above, it returns `load` (the order of loading) and `files` (`path`, `size`, `sha256`). `routes` here is an array of routes (`host`, `path`, `action`), not a number. If a route has no `host`, `host` is not present. A generation that is not in the rules store gives 404.
 
-「選択中」の世代と「稼働中」の世代は別で、エンジンごとに 1 つずつあります。ルールストアで選択中でも、プロキシが切り替えに失敗しているとき、またはそのエンジンが稼働していないときは、その世代は稼働していません。管理画面は、切り替えの途中ではないのに、どれかのエンジンで 2 つが違うとき、または選択中の世代があるのにそのエンジンが稼働していないときに、警告を表示します。
+The "Chosen" generation and the "Serving" generation are different, and there is one of each for each engine. Even if a generation is chosen in the rules store, it is not running if the proxy failed to switch to it, or if that engine is not running. The admin screens show a warning when the two differ for any engine while no switch is in progress, or when a generation is chosen but that engine is not running.
 
-### インポート
+### Import
 
-`POST /api/generations`（operator 以上、API トークン可）は、`rules import` と同じ順序で、世代を作成します。ファイルを集め、ルールストアに仮に置き、検査プロセスで事前検証し、事前検証に通れば世代にします。世代は選択しません。
+`POST /api/generations` (operator or above, API tokens allowed) creates a generation in the same order as `rules import`. It collects the files, puts them in the rules store temporarily, runs a trial with an inspector process, and, if the trial passes, makes them a generation. It does not choose the generation.
 
-ボディは JSON のオブジェクトで、キーはすべて省略できます。
+The body is a JSON object, and all keys can be omitted.
 
-| キー | 内容 |
+| Key | Content |
 |---|---|
-| `rules` | ルールのファイル。`{"name", "data"}` の配列で、書いた順に読み込みます。`name` はディレクトリを除いた名前（`--rules` と同じ決まり）、`data` は標準の base64（パディング付き） |
-| `data` | データのファイル。形式は `rules` と同じです（`--data` に対応します） |
-| `crs` | `true` で `admin.crs_dir` の CRS を使います。リクエストではパスを指定できません。`admin.crs_dir` が無いと 400 になります |
-| `crs_off` | 読み込まない CRS の `.conf` の名前の配列（`--crs-off` に対応します） |
-| `routes` | 検査除外のルートの配列（`--routes` のファイルと同じ形式） |
-| `engine` | 検査エンジンの名前（`--engine` に対応します）。`coraza` か `modsecurity`（小文字）。省略すると、管理プロセスのデフォルトのエンジン（`GET /api/status` の `default_engine` と同じ値）です |
-| `detect_only` | `true` で検知のみの世代にします |
-| `accept_block` | `true` で、事前検証のリクエストがブロックされても失敗にしません |
+| `rules` | The rule files. An array of `{"name", "data"}`, loaded in the order written. `name` is a name without a directory (the same rule as `--rules`), and `data` is standard base64 (with padding) |
+| `data` | The data files. The form is the same as `rules` (it corresponds to `--data`) |
+| `crs` | `true` uses the CRS of `admin.crs_dir`. A request cannot give a path. If there is no `admin.crs_dir`, it gives 400 |
+| `crs_off` | An array of the names of the `.conf` files of the CRS that are not loaded (it corresponds to `--crs-off`) |
+| `routes` | An array of bypass routes (the same form as a `--routes` file) |
+| `engine` | The name of the inspection engine (it corresponds to `--engine`). `coraza` or `modsecurity` (lowercase). If omitted, it is the default engine of the admin process (the same value as `default_engine` of `GET /api/status`) |
+| `detect_only` | `true` makes a detect-only generation |
+| `accept_block` | `true` does not make it a failure even if a request of the trial is blocked |
 
-- 上限と名前の決まりは `rules import` と同じです（[運用リファレンス](operator-reference.md) の「`rules`」）。ファイルは 128 個、1 つ 2 MiB、全体 8 MiB までです。2 MiB を超えるファイルは、デコードする前に拒否します。
-- `engine` がエンジンの名前でないときと、そのエンジンが使えないときは、ファイルを集める前に 400 で拒否します。何も仮に置かず、事前検証も実行しません。文は次のどちらかです。
+- The limits and the rules for names are the same as for `rules import` (see "`rules`" in the [operator reference](operator-reference.md)). Up to 128 files, 2 MiB per file, and 8 MiB in all. A file over 2 MiB is refused before it is decoded.
+- If `engine` is not the name of an engine, or if that engine cannot be used, it is refused with 400 before the files are collected. Nothing is put in the rules store temporarily, and no trial is run. The sentence is one of these:
   - `engine is not the name of an engine (coraza or modsecurity)`
-  - `kernel.engines has no inspector for the engine of the generation`（設定に、そのエンジンの検査プロセスが無い）
-- 事前検証は `rules import` と同じで、管理プロセスが検査プロセスを 1 つ起動し、決まった 3 つのリクエスト（`GET /`、フォームの `POST /`、JSON の `POST /`）を検査します。検査プロセスは、`engine` のエンジンのもの（`coraza` は `kernel.inspector`、`modsecurity` は `kernel.engines`）です。`kernel` の値と、`proxy` の `ready_wait_ms`・`inspect_wait_ms`・`stop_inspect_ms`・`drive_slice_ms` を使います。
-- インポート、選択、ロールバック、削除は、管理プロセスの中で 1 つずつ順に進みます。ほかの変更が進んでいるときは、待たずに 409 `a change of the rules is under way` になります。コマンドや別のプロセスがルールストアのロックを保持しているときは、409 `the rules store is in use by another command` になります。
+  - `kernel.engines has no inspector for the engine of the generation` (the configuration has no inspector process for that engine)
+- The trial is the same as for `rules import`: the admin process starts one inspector process and inspects three fixed requests (`GET /`, a form `POST /`, and a JSON `POST /`). The inspector process is the one for the engine in `engine` (`kernel.inspector` for `coraza`, `kernel.engines` for `modsecurity`). It uses the values of `kernel`, and `ready_wait_ms`, `inspect_wait_ms`, `stop_inspect_ms`, and `drive_slice_ms` of `proxy`.
+- Import, choosing, rollback, and removal proceed one at a time, in order, inside the admin process. If another change is in progress, it does not wait and gets 409 `a change of the rules is under way`. If a command or another process holds the lock of the rules store, it gets 409 `the rules store is in use by another command`.
 
-応答:
+The response:
 
-| ステータスコード | 場合 | ボディ |
+| Status code | Case | Body |
 |---|---|---|
-| 200 | 世代を作成できたとき | `{"fingerprint", "result", "trial"}`。`result` は `created`、`existing`（同じ世代が既にあった）、`repaired`（壊れていた同じフィンガープリントの世代を作り直した） |
-| 400 | 入力が拒否されたとき（使えないエンジンも含みます） | `{"error"}`。入力のファイルの名前があれば `subject` に付きます（0x20〜0x7e の外のバイトは `\xNN`、128 バイトまで） |
-| 409 | ルールストアで拒否されたとき、ほかの変更が進んでいるとき | `{"error"}` |
-| 422 | 事前検証が失敗したとき。世代は作成しません | `{"error": "the trial failed", "trial": {..}}` |
-| 500 | 事前検証を実行できないとき | `{"error"}` |
-| 503 | 監査ログの行を書けないとき | `{"error": "unavailable"}` |
+| 200 | A generation was created | `{"fingerprint", "result", "trial"}`. `result` is `created`, `existing` (the same generation was already there) or `repaired` (a damaged generation with the same fingerprint was made again) |
+| 400 | The input was refused (including an engine that cannot be used) | `{"error"}`. If there is the name of an input file, it is added to `subject` (bytes outside 0x20 to 0x7e are written as `\xNN`, up to 128 bytes) |
+| 409 | Refused by the rules store, or another change is in progress | `{"error"}` |
+| 422 | The trial failed. No generation is created | `{"error": "the trial failed", "trial": {..}}` |
+| 500 | The trial could not be run | `{"error"}` |
+| 503 | The audit log line could not be written | `{"error": "unavailable"}` |
 
-`trial` は、通ったとき `{"passed": true, "accepted": [..]}`、失敗したとき `{"passed": false, "failure": <message>}` で、検査プロセスの出力があれば、`passed` の値に関わらず `detail`（512 バイトまで）が付きます。事前検証のリクエストがすべて通っても、検査プロセスか作業ディレクトリが片付かなかったときは、`passed` が `false`、`failure` が `the inspector did not stop cleanly; a process or a directory may be left behind` になり、422 で世代は作成しません。このときは、ホストにプロセスやディレクトリが残っていないか確認してください。`accepted` は、事前検証で受け入れたブロック（`{"kind": "block", "probe", "rule", "phase", "status"}`）と検知（`{"kind": "detected", "probe", "rule", "status"}`）です。`probe` は事前検証のリクエストの名前（`GET /`、`POST / with a urlencoded body`、`POST / with a JSON body`）です。
+`trial` is `{"passed": true, "accepted": [..]}` when it passed and `{"passed": false, "failure": <message>}` when it failed. If there is output from the inspector process, `detail` (up to 512 bytes) is added, whatever the value of `passed`. Even if all requests of the trial passed, if the inspector process or the work directory was not cleaned up, `passed` is `false` and `failure` is `the inspector did not stop cleanly; a process or a directory may be left behind`, and the response is 422 and no generation is created. In that case, check that no process or directory is left on the host. `accepted` is the blocks (`{"kind": "block", "probe", "rule", "phase", "status"}`) and detections (`{"kind": "detected", "probe", "rule", "status"}`) that the trial accepted. `probe` is the name of the request of the trial (`GET /`, `POST / with a urlencoded body`, `POST / with a JSON body`).
 
-### 選択とロールバック
+### Choosing and Rolling Back
 
-`POST /api/activate`（`{"generation", "expect"}`）と `POST /api/rollback`（`{"engine", "expect"}`。`engine` は省略できます）は、ルールストアの選択中の世代を変更し、プロキシを切り替えさせます。operator 以上で、API トークン可です。切り替えは、1 つのエンジンについて行います。`activate` では世代のエンジン、`rollback` では `engine` のエンジン（省略すると、管理プロセスのデフォルトのエンジン）です。選択中の世代とロールバック先は、エンジンごとにあります（[運用リファレンス](operator-reference.md) の「エンジンごとの選択中の世代」）。
+`POST /api/activate` (`{"generation", "expect"}`) and `POST /api/rollback` (`{"engine", "expect"}`; `engine` can be omitted) change the generation that the rules store has chosen and make the proxy switch. They need an operator or above, and API tokens can be used. A switch is made for one engine. For `activate` it is the engine of the generation, and for `rollback` it is the engine in `engine` (the default engine of the admin process if omitted). The chosen generation and the rollback target exist for each engine (see "Chosen Generation per Engine" in the [operator reference](operator-reference.md)).
 
-- フィンガープリントは 64 桁の小文字の 16 進数です。違うと 400 `a generation is not 64 lowercase hexadecimal digits` になります。
-- `rollback` の `engine` が、小文字の `coraza` か `modsecurity` でないときは、400 `engine is not the name of an engine (coraza or modsecurity)` になります。
-- `expect` は、そのエンジンについて画面で見た「選択中の世代」です。画面を見た後に別のユーザーやコマンドが選択し直していれば、古い画面で選択し直して上書きするのを防ぐため、409 で拒否します。
-  - `activate` の `expect` は、`generation` の世代のエンジンについて選択中の世代です。そのエンジンに選択中の世代が無いときは `null` を書きます。`null` を書いたのに選択中の世代があれば、409 で拒否します。
-  - `activate` では `expect` のキーを必ず書きます。省略すると 400 です。`rollback` の `expect` は、64 桁の文字列です。
-- そのエンジンに選択中の世代が無いときは、`expect` を `null` にして選択できます。画面も、選択中の世代が無いエンジンの世代に、選択の操作を表示します。デフォルトのエンジンの最初の世代は、プロキシが起動するために必要なので、コマンド（`rules activate`）で選択します（[運用リファレンス](operator-reference.md) の「検査エンジンの選択」）。
-- `generation` に現在選択中の世代を指定すると、ルールストアの選択中の世代は変わらず、プロキシだけを切り替えさせます（管理画面の「プロキシに反映する」）。プロキシでそのエンジンが稼働していないときは、そのエンジンを起動します（管理画面の「エンジンを起動する」）。まだ選択していない世代を指定したときも、プロキシで稼働していないエンジンは、その世代で起動します。`rollback` も、プロキシでそのエンジンが稼働していなければ、ロールバック先の世代でそのエンジンを起動します。
+- A fingerprint is 64 lowercase hexadecimal digits. If not, it gives 400 `a generation is not 64 lowercase hexadecimal digits`.
+- If `engine` of `rollback` is not lowercase `coraza` or `modsecurity`, it gives 400 `engine is not the name of an engine (coraza or modsecurity)`.
+- `expect` is the "Chosen generation" that you saw on the screen for that engine. If someone else or a command has chosen again since you saw the screen, it is refused with 409, to keep you from overwriting by choosing again on an old screen.
+  - `expect` of `activate` is the generation that is chosen for the engine of the generation in `generation`. If no generation is chosen for that engine, write `null`. If you write `null` while a generation is chosen, it is refused with 409.
+  - Always write the key `expect` for `activate`. If you omit it, it gives 400. `expect` of `rollback` is a 64-character string.
+- If no generation is chosen for that engine, you can choose one with `expect` set to `null`. The screen also shows the choose operation for a generation of an engine that has no chosen generation. The first generation of the default engine is needed for the proxy to start, so choose it with the command (`rules activate`) (see "Choosing the Inspection Engine" in the [operator reference](operator-reference.md)).
+- If you give `generation` the generation that is chosen now, the chosen generation of the rules store does not change, and only the proxy is made to switch (in the admin screens, "Apply to the proxy"). If that engine is not running in the proxy, that engine is started (in the admin screens, "Start the engine"). Even if you give a generation that is not chosen yet, an engine that is not running in the proxy is started with that generation. `rollback` also starts that engine with the rollback target if that engine is not running in the proxy.
 
-進み方:
+Steps:
 
-1. 世代がルールストアにあること（`activate`。無ければ 404 `no such generation`）。ロールバックは、ロールバック先を決めます（下）。
-2. ルールストアで、そのエンジンに選択中の世代が `expect` と同じであること（選択中の世代が無いときは、`expect` が `null` であること）。違えば 409（変更なし。履歴には書きません。監査ログに `denied`、`reason` は `expect`）。
-3. 切り替え先の世代のエンジンが使えること。使えなければ、`{"error": <message>}` の 409（変更なし。履歴には書きません。監査ログに `denied`、`reason` は `engine`）。文は、上の「インポート」の 400 の `kernel.engines has no inspector for the engine of the generation` と同じです。マニフェストが読めない世代は、ここでは拒否せず、ルールストアで世代を選択する段階で拒否されます。
-4. プロキシの状態を問い合わせます。
-   - 接続できない: 503 `the proxy cannot be reached`。ルールストアは変更せず、履歴に `unreachable` を書きます（監査ログにも `denied`、`reason` は `unreachable`）。
-   - 接続を受け付けて何も応答せずに閉じる（同時接続数の上限）: 503 `the proxy is busy`。ルールストアは変更せず、履歴には書きません（監査ログに `denied`、`reason` は `busy`）。
-   - 状態に `engines` が無い（エンジンごとの選択に対応していない以前のバージョンのプロキシ）: 409 `the proxy does not report its engines`。ルールストアは変更せず、履歴には書きません（監査ログに `denied`、`reason` は `version`）。管理プロセスとプロキシは、同じビルドにそろえてください（[運用リファレンス](operator-reference.md) の「バージョンの更新」）。
-5. 監査ログの行を書きます（書けなければ 503 `unavailable` で、変更しません）。
-6. ルールストアで世代を選択します。選択はロックの中で行い、`expect` をもう一度検証します。別のプロセスがこの間に選択していれば、上書きせずに 409 とします。
-7. プロキシに切り替えを依頼し、終わりを待ちます（上の「制御ソケット」）。
-8. 履歴に 1 行書き、応答します。
+1. The generation is in the rules store (`activate`; if not, 404 `no such generation`). For a rollback, the rollback target is decided (below).
+2. In the rules store, the generation that is chosen for that engine is the same as `expect` (if no generation is chosen, `expect` is `null`). If not, 409 (no change. Nothing is written to the history. The audit log gets `denied` with `reason` `expect`).
+3. The engine of the generation to switch to can be used. If not, 409 with `{"error": <message>}` (no change. Nothing is written to the history. The audit log gets `denied` with `reason` `engine`). The sentence is the same as `kernel.engines has no inspector for the engine of the generation` of the 400 of "Import" above. A generation whose manifest cannot be read is not refused here, but is refused at the stage where the rules store chooses the generation.
+4. The state of the proxy is asked.
+   - It cannot be reached: 503 `the proxy cannot be reached`. The rules store is not changed, and `unreachable` is written to the history (the audit log also gets `denied` with `reason` `unreachable`).
+   - It accepts the connection and closes without responding (the limit of concurrent connections): 503 `the proxy is busy`. The rules store is not changed, and nothing is written to the history (the audit log gets `denied` with `reason` `busy`).
+   - The state has no `engines` (a proxy of an earlier version that does not support the choice per engine): 409 `the proxy does not report its engines`. The rules store is not changed, and nothing is written to the history (the audit log gets `denied` with `reason` `version`). Use the same build for the admin process and the proxy (see "Version Updates" in the [operator reference](operator-reference.md)).
+5. An audit log line is written (if it cannot be written, 503 `unavailable`, and nothing is changed).
+6. The rules store chooses the generation. The choice is made inside the lock, and `expect` is verified once more. If another process chose in the meantime, it is not overwritten and the result is 409.
+7. The proxy is asked to switch, and the admin process waits for the end (see "Control Socket" above).
+8. One line is written to the history and the response is returned.
 
-応答（ボディは `{"result", "engine", "from", "generation", "chosen"}`。失敗では `error` も付きます）:
+The response (the body is `{"result", "engine", "from", "generation", "chosen"}`; a failure also has `error`):
 
-| `result` | ステータスコード | 意味 | `chosen` |
+| `result` | Status code | Meaning | `chosen` |
 |---|---|---|---|
-| `switched` | 200 | プロキシは現在その世代を使っています | `true` |
-| `unchanged` | 200 | プロキシはすでにその世代を使っていました | `true` |
-| `refused` | 409 | プロキシが拒否しました（`the proxy refused the switch`）。プロキシが `expect` の不一致を検出したときも含みます | `true` |
-| `failed` | 502 | プロキシは切り替えませんでした（`the proxy did not switch`）。時間内に切り替わらなかったときも含みます | `true` |
-| `unreachable` | 503 | プロキシに接続できません。ルールストアは変更していません | `false` |
-| `unconfirmed` | 503 | ルールストアは変更しましたが、プロキシが結果を応答しませんでした（`the proxy did not say how the switch ended`） | `true` |
+| `switched` | 200 | The proxy now uses that generation | `true` |
+| `unchanged` | 200 | The proxy was already using that generation | `true` |
+| `refused` | 409 | The proxy refused (`the proxy refused the switch`). This includes the case where the proxy found that `expect` did not match | `true` |
+| `failed` | 502 | The proxy did not switch (`the proxy did not switch`). This includes the case where it did not switch in time | `true` |
+| `unreachable` | 503 | The proxy cannot be reached. The rules store was not changed | `false` |
+| `unconfirmed` | 503 | The rules store was changed, but the proxy did not say the result (`the proxy did not say how the switch ended`) | `true` |
 
-- `chosen` は、ルールストアで現在その世代が選択中かどうかを示します。
-- 切り替えが `refused`、`failed`、`unconfirmed` に終わっても、ルールストアは元に戻しません。`refused` と `failed` では、プロキシは前の世代を使い続けます。`unconfirmed` では、プロキシがどちらの世代を使っているか分からないので、`GET /api/status` の `proxy.engines` にある、そのエンジンの `generation` で確認します。プロキシを再起動すると、エンジンごとに、ルールストアで選択中の世代で始まります。その世代を使わない場合は、前の世代を選択し直します。
-- 履歴に行を書けなかったときは、応答に `"history": "not written"` が付きます。
-- `result` と `chosen` を持つのは、上の表の 6 つの場合だけです。ほかの失敗のボディは `{"error": <message>}` だけです。`expect` が合わない 409（`the chosen generation is not the one that was expected`）、`the proxy is busy` の 503、ロールバック先が決まらない 409、世代のエンジンが使えない 409、エンジンごとの状態を返さないプロキシへの 409、ルールストア自体で選択が拒否された 409 がそれに当たります。この中で履歴に行（`refused`）を書くのは、ルールストア自体で選択が拒否されたときだけです。
+- `chosen` shows whether that generation is now chosen in the rules store.
+- Even if the switch ends in `refused`, `failed`, or `unconfirmed`, the rules store is not put back. With `refused` and `failed`, the proxy keeps using the previous generation. With `unconfirmed`, it is not known which generation the proxy is using, so check `generation` of that engine in `proxy.engines` of `GET /api/status`. When the proxy is restarted, each engine starts with the generation that the rules store has chosen. If you do not want to use that generation, choose the previous generation again.
+- If a line could not be written to the history, `"history": "not written"` is added to the response.
+- Only the six cases in the table above have `result` and `chosen`. The body of the other failures is only `{"error": <message>}`. These are: the 409 where `expect` does not match (`the chosen generation is not the one that was expected`), the 503 `the proxy is busy`, the 409 where the rollback target cannot be decided, the 409 where the engine of the generation cannot be used, the 409 for a proxy that does not return the state of each engine, and the 409 where the choice was refused by the rules store itself. Among these, a line (`refused`) is written to the history only when the choice was refused by the rules store itself.
 
-ロールバック先:
+The rollback target:
 
-- 履歴の中で、そのエンジンの行のうち、結果が `switched` で、`from` と `to` が違う、最も新しい行の `from` です。`engine` の無い行（以前のバージョンの管理プロセスが書いた行）は、`from` と `to` の世代のエンジンがどちらもそのエンジンのときだけ、そのエンジンの行として使います（世代のエンジンを読めないときは使いません）。
-- ただし、その行の `to` が、ルールストアでそのエンジンに現在選択中の世代のときだけです。切り替えが失敗した後や、コマンドで世代を選択した後は、履歴の終わりが選択中の世代と合わないので、ロールバックできません（409 `the history does not end at the chosen generation`）。`switched` の行が無いときは 409 `there is no switch to go back from` になります。
-- ロールバック先の世代がルールストアに無ければ 409 `the generation to go back to is not in the store` になります。
-- ロールバックも履歴に `rollback` として入ります。続けてもう一度ロールバックすると、元の世代に戻ります。
+- It is the `from` of the newest line in the history that is a line of that engine, whose result is `switched`, and whose `from` and `to` differ. A line without `engine` (a line that an admin process of an earlier version wrote) is used as a line of that engine only when the engines of the generations of `from` and `to` are both that engine (it is not used if the engine of a generation cannot be read).
+- However, this applies only when the `to` of that line is the generation that the rules store has chosen now for that engine. After a switch failed, or after a generation was chosen with a command, the end of the history does not match the chosen generation, so a rollback is not possible (409 `the history does not end at the chosen generation`). If there is no `switched` line, it gives 409 `there is no switch to go back from`.
+- If the generation to go back to is not in the rules store, it gives 409 `the generation to go back to is not in the store`.
+- A rollback is also entered in the history, as `rollback`. If you roll back again right after, it goes back to the original generation.
 
-### 削除
+### Removal
 
-`DELETE /api/generations/<fingerprint>`（operator 以上、API トークン可）は、世代をルールストアから削除します。元に戻せません。次の世代は削除せず、409 で拒否します。
+`DELETE /api/generations/<fingerprint>` (operator or above, API tokens allowed) removes a generation from the rules store. It cannot be undone. The following generations are not removed, and are refused with 409.
 
-| 世代 | `error` |
+| Generation | `error` |
 |---|---|
-| ルールストアで選択中の世代（どのエンジンでも） | `the generation is the one the rules store chooses` |
-| ロールバック先の世代（どのエンジンでも） | `the generation is the target of a rollback` |
-| プロキシで稼働中の世代（どのエンジンでも） | `the generation is used by a running proxy` |
+| The generation that the rules store has chosen (for any engine) | `the generation is the one the rules store chooses` |
+| A generation that is a rollback target (for any engine) | `the generation is the target of a rollback` |
+| A generation that is running in the proxy (for any engine) | `the generation is used by a running proxy` |
 
-ルールストアに無い世代は 404 です。ほかの変更が進んでいるときは、409 `a change of the rules is under way`（この管理プロセスの中）か `the rules store is in use by another command`（コマンドや別のプロセスがルールストアのロックを保持している）で拒否します。削除の検証の後にコマンドが世代を選択したときは、409 `the generation is the current one` になります。成功すると `{"removed": <fingerprint>}` を返します。
+A generation that is not in the rules store gives 404. If another change is in progress, it is refused with 409 `a change of the rules is under way` (inside this admin process) or `the rules store is in use by another command` (a command or another process holds the lock of the rules store). If a command chose a generation after the check for the removal, it gives 409 `the generation is the current one`. On success, it returns `{"removed": <fingerprint>}`.
 
-## managed 設定の操作
+## Managed Configuration Operations
 
-managed 設定は、サイトと証明書、アップストリーム、ルート、デフォルトのアップストリーム、全体のアクセス制御とレート制限、ホストごとの設定を、設定ファイルとは別の managed ストアにバージョンとして置き、管理画面と管理 API から変更する設定です。managed 設定を使うかどうか、managed ストアとバージョンの形式、コマンド、反映の順序については、[運用リファレンス](operator-reference.md) の「managed 設定」を参照してください。ここでは、管理 API の操作を説明します。
+The managed configuration is a configuration in which the sites and certificates, the upstreams, the routes, the default upstream, the global access control and rate limits, and the host policies are kept as versions in a managed store separate from the configuration file, and are changed from the admin screens and the admin API. For whether to use the managed configuration, the form of the managed store and versions, the commands, and the order of applying, see "Managed Configuration" in the [operator reference](operator-reference.md). This section describes the operations of the admin API.
 
-- 状態、バージョンの一覧、反映の処理、設定の変更履歴は viewer が読めます。バージョンの内容、証明書の情報、設定ファイルの値、検証、保存して反映、名前で反映、ロールバック、削除は operator 以上が行えます。どれも API トークンで使えます。
-- バージョンの内容と設定ファイルの値を operator 以上に限るのは、ルートの書き換え（`rewrite`）に、アップストリームの認証の値などの秘密を書けるためです。
-- この API が使えるのは、管理プロセスが起動したときに、設定ファイルに `managed` があった場合だけです。無かった場合は、`GET /api/managed` は `{"managed": false}` を返し、`GET /api/config` はあるときと同じように使え、ほかは 409 `the configuration has no managed object` で拒否します。
-- managed ストアは、管理プロセスの起動時に `managed.dir` が指していたディレクトリで、リクエストのたびに開きます。開けないときは、500 と managed ストアの文で応答します。検証と変更では設定ファイルを再読み込みし、`managed.dir` が起動時と違えば 409 `the managed object of the configuration names another directory than at the start` で拒否します。`managed` の有無や `managed.dir` を変更したら、管理プロセスを再起動します。
+- A viewer can read the state, the list of versions, the apply jobs, and the configuration history. An operator or above can read the contents of a version, the certificate information, and the values of the configuration file, and can check, save and apply, apply by name, roll back, and remove. All of them can be used with API tokens.
+- The contents of a version and the values of the configuration file are limited to an operator or above because a rewrite of a route (`rewrite`) can hold a secret such as an authentication value for the upstream.
+- These APIs can be used only if the configuration file had `managed` when the admin process started. If it did not, `GET /api/managed` returns `{"managed": false}`, `GET /api/config` can be used as when there is one, and the others are refused with 409 `the configuration has no managed object`.
+- The managed store is the directory that `managed.dir` pointed to when the admin process started, and it is opened at every request. If it cannot be opened, the response is 500 with a sentence of the managed store. A check and a change read the configuration file again, and if `managed.dir` differs from that at start, they are refused with 409 `the managed object of the configuration names another directory than at the start`. If you change whether `managed` is present or change `managed.dir`, restart the admin process.
 
-### 状態と一覧
+### State and Listing
 
-- `GET /api/managed`: 次を返します。
+- `GET /api/managed`: returns the following.
   - `managed`: `true`
-  - `current`: managed ストアの選択中のバージョン（無ければ `null`）
-  - `serving`: プロキシが制御ソケットで応答した、稼働中のバージョン（状態を読めないとき、プロキシが `managed` の無い設定で動いているときは `null`）
-  - `reachable`: プロキシに接続できるか。同時接続数の上限のために問い合わせに応答できないプロキシは、接続できるものとして扱います
-  - `reloading`: プロキシが設定をリロード中か（分からなければ `null`）
-  - `rollback_to`: 今ロールバックを依頼したら反映するバージョン（無ければ `null`。下の「名前を指定した反映とロールバック」）
-  - `job`: 最後の反映の処理（無ければ `null`。下の「反映の処理」）
+  - `current`: the version that the managed store has selected (`null` if there is none)
+  - `serving`: the version that is running, as the proxy responded on the control socket (`null` if the state cannot be read, or if the proxy is running with a configuration without `managed`)
+  - `reachable`: whether the proxy can be reached. A proxy that cannot respond to a query because of the limit of concurrent connections is treated as reachable
+  - `reloading`: whether the proxy is reloading the configuration (`null` if not known)
+  - `rollback_to`: the version that would be applied if a rollback were requested now (`null` if there is none; see "Applying and Rolling Back by Name" below)
+  - `job`: the last apply job (`null` if there is none; see "Apply Jobs" below)
 
-  設定の変更履歴を読めないときは 503 になります。
-- `GET /api/managed/versions`: `{"reachable", "versions"}`。新しい順に、各バージョンの `name`（バージョンの名前。SHA-256 の 64 桁の小文字の 16 進数）、`made`（バージョンのファイルの更新時刻。エポックからの秒数）、`current`（選択中か）、`serving`（稼働中か）を返します。
-- `GET /api/managed/versions/<version>`（operator 以上）: 上の 4 つに加えて、`version`（managed ストアにあるとおりのバージョンの JSON）を返します。バージョンは、ファイルを SHA-256 だけで指定し、どの応答もファイルの内容を持ちません。managed ストアに無いバージョンは 404、内容が名前と合わないバージョンは 500 になります。
+  If the configuration history cannot be read, it gives 503.
+- `GET /api/managed/versions`: `{"reachable", "versions"}`. For each version, newest first, it returns `name` (the name of the version; the 64 lowercase hexadecimal digits of its SHA-256), `made` (the modification time of the file of the version, in seconds since the epoch), `current` (whether it is selected), and `serving` (whether it is running).
+- `GET /api/managed/versions/<version>` (operator or above): in addition to the above four, it returns `version` (the JSON of the version as it is in the managed store). A version specifies files only by SHA-256, and no response holds the contents of a file. A version that is not in the managed store gives 404, and a version whose contents do not match its name gives 500.
 
-「選択中」のバージョンと「稼働中」のバージョンは別です。反映が途中で停止したときや、コマンドでバージョンを選択したときは、2 つが違うことがあります。どちらかのバージョンをもう一度反映すると、2 つはそろいます。管理画面は、2 つが違うときに通知と、そろえる 2 つの操作を表示します（下の「管理画面」）。
+The "Selected" version and the "Running" version are different. When an apply stopped halfway, or when a version was selected with a command, the two may differ. If you apply either version again, the two become the same. When they differ, the admin screens show a notice and two operations to make them the same (see "Admin Screens" below).
 
-### 証明書の情報
+### Certificate Information
 
-`GET /api/managed/certificates/<version>`（operator 以上）は、バージョンのサイトごとに、managed ストアにある証明書の状態を、バージョンでの順序で返します。応答は `{"name", "sites"}` で、サイトごとに次のキーを持ちます。
+`GET /api/managed/certificates/<version>` (operator or above) returns the state of the certificates in the managed store for each site of the version, in the order of the version. The response is `{"name", "sites"}`, and each site has the following keys.
 
-| キー | 内容 |
+| Key | Content |
 |---|---|
-| `name` | サイトの名前 |
-| `kind` | `files`（証明書チェーンと秘密鍵のファイル）、`acme`。どちらの形式でもなければ `null` |
-| `chain`、`key` | `files` のサイトの、証明書チェーンと秘密鍵のファイルの名前（SHA-256）。内容は返しません |
-| `hosts` | `acme` のサイトのホスト。読める形式のときだけ |
-| `state` | 下の表 |
-| `not_after`、`expired` | 証明書チェーンの最初の証明書が持つ有効期限（エポックからの秒数）と、サーバーの時計で期限切れかどうか。有効期限を読み取れたときだけ |
-| `names`、`more` | 証明書に含まれるホスト名（DNS 名、100 個まで）と、ほかの名前の数。名前も読み取れたときだけ。`[]` は、証明書に DNS 名が無いことを示します |
+| `name` | The name of the site |
+| `kind` | `files` (files of a certificate chain and a private key), `acme`. `null` if it is in neither form |
+| `chain`, `key` | For a `files` site, the names (SHA-256) of the files of the certificate chain and the private key. The contents are not returned |
+| `hosts` | The hosts of an `acme` site. Only when it is in a readable form |
+| `state` | The table below |
+| `not_after`, `expired` | The expiry of the first certificate of the certificate chain (in seconds since the epoch), and whether it has expired by the clock of the server. Only when the expiry could be read |
+| `names`, `more` | The host names in the certificate (DNS names, up to 100) and the number of other names. Only when the names could be read too. `[]` shows that the certificate has no DNS name |
 
-`state` は、次のうち最初に一致するものです。
+`state` is the first of the following that matches.
 
-| `state` | 意味 |
+| `state` | Meaning |
 |---|---|
-| `unreadable` | 証明書チェーンか秘密鍵のファイルを読めません（シンボリックリンク、1 MiB 以下の通常のファイルでない、`files` のサイトで内容が名前と合わない、など）。どちらの形式でもない証明書も、これになります |
-| `missing` | `files` のサイトで、証明書チェーンか秘密鍵のファイルが managed ストアに無いとき |
-| `waiting` | `acme` のサイトで、まだ発行されていないとき（`acme renew` が書く証明書チェーンか秘密鍵が無い） |
-| `unparsed` | 証明書チェーンの最初の証明書から、名前か有効期限を読み取れないとき |
-| `present` | `files` のサイトで、証明書チェーンを読め、秘密鍵のファイルがあるとき |
-| `issued` | `acme` のサイトで、証明書チェーンを読め、秘密鍵のファイルがあるとき |
+| `unreadable` | The file of the certificate chain or the private key cannot be read (a symbolic link, not a regular file of 1 MiB or less, a `files` site whose contents do not match the name, and so on). A certificate that is in neither form is also this |
+| `missing` | For a `files` site, the file of the certificate chain or the private key is not in the managed store |
+| `waiting` | For an `acme` site, it has not been issued yet (the certificate chain or private key that `acme renew` writes is missing) |
+| `unparsed` | The names or the expiry cannot be read from the first certificate of the certificate chain |
+| `present` | For a `files` site, the certificate chain can be read and the file of the private key exists |
+| `issued` | For an `acme` site, the certificate chain can be read and the file of the private key exists |
 
-- 応答は、ディスクにある証明書の状態であり、プロキシがメモリに持つ証明書の状態ではありません。`acme renew` の後は、プロキシが証明書を再読み込みする（SIGUSR2）まで、2 つは違います。バージョンは、稼働中のものでなくてもかまいません。
-- `present` と `issued` は、ファイルがあり、証明書チェーンを読めることだけを示します。秘密鍵の内容、証明書チェーンと秘密鍵が対応しているか、証明書がサイトのホストを含むかは検証しません。どのサイトも `present` のバージョンを、プロキシが拒否することはあります。
-- プロキシは証明書の有効期限を確認せず、期限切れの証明書もそのまま使います。`check` と `apply` の検証でも、有効期限を確認しません。
-- この API は、変更の実行権もロックも取得せず、プロキシに問い合わせず、監査ログに書きません。
+- The response is the state of the certificates on the disk, not the state of the certificates in the memory of the proxy. After `acme renew`, the two differ until the proxy reads the certificates again (SIGUSR2). The version does not have to be the running one.
+- `present` and `issued` show only that the files exist and that the certificate chain can be read. It is not verified what the private key contains, whether the certificate chain and the private key are a pair, or whether the certificate includes the hosts of the site. The proxy may still refuse a version in which every site is `present`.
+- The proxy does not check the expiry of a certificate, and uses an expired certificate as it is. The validation by `check` and `apply` does not check the expiry either.
+- This API does not take the right to run a change or a lock, does not ask the proxy, and does not write to the audit log.
 
-### 設定ファイルの値
+### Configuration File Values
 
-`GET /api/config`（operator 以上）は、設定ファイルの現在の値を返します。設定ファイルに `managed` があっても無くても使えます。
+`GET /api/config` (operator or above) returns the current values of the configuration file. It can be used whether the configuration file has `managed` or not.
 
-- 設定ファイルをリクエストのたびに再読み込みし、設定ファイルの検証をすべて通ったときだけ応答します。読めないときと受け付けられないときは、409 と決まった文で応答します。
-- 応答は `{"sha256", "managed", ...}` です。`sha256` はファイルの SHA-256（プロキシが読み込むと `/api/status` の `proxy.config` に出る値）、`managed` は設定ファイルに `managed` があるか、残りは設定ファイルの設定キーを、設定ファイルと同じ名前と形式で並べたものです。
-- 決まった一覧にある設定キーだけを出力します。パスの値（証明書、秘密鍵、CA のファイル、ディレクトリ、検査プロセス、ソケット、データベースのファイル）は、書かれていれば `true`、無ければ `null` で返し、パスの文字列は返しません。
-- operator 以上に限るのは、ルートの書き換えに秘密を書けること、サーバーとリスナーのアドレスが含まれることのためです。
+- It reads the configuration file again at every request, and responds only when the file passed all the validation of the configuration file. If it cannot be read or is rejected, it responds with 409 and a fixed sentence.
+- The response is `{"sha256", "managed", ...}`. `sha256` is the SHA-256 of the file (the value that appears in `proxy.config` of `/api/status` once the proxy has read it), `managed` is whether the configuration file has `managed`, and the rest are the setting keys of the configuration file, in the same names and form as in the configuration file.
+- It outputs only the setting keys in a fixed list. Values that are paths (certificates, private keys, CA files, directories, inspector processes, sockets, database files) are returned as `true` if they are written and `null` if not, and the path strings are not returned.
+- It is limited to an operator or above because a rewrite of a route can hold a secret, and because the addresses of servers and listeners are included.
 
-### 検証
+### Check
 
-`POST /api/managed/check`（operator 以上）は、バージョンを `POST /api/managed/apply` と同じように検証し、何も保存しません。画面が、保存する前に、エラーをその欄に表示するための API です。
+`POST /api/managed/check` (operator or above) validates a version in the same way as `POST /api/managed/apply` and saves nothing. It is an API for the screen to show errors in their fields before saving.
 
-- ボディは `{"version", "files", "expect"}` で、`POST /api/managed/apply` と同じ形式です（下の「保存して反映」）。`expect` は省略でき、あっても形式を検証しません。
-- 進み方（最初に拒否した段階で応答します）:
-  1. 検証の実行枠。ほかのリクエストが保持していれば 503 `a check of a managed version is under way`。管理プロセスが起動したときに `managed` が無かった場合は、すぐに 409。
-  2. ボディ、ファイル、バージョンの形式。拒否は 400（文と場所）。
-  3. 設定ファイルを再読み込みします。`managed` が無いとき、`managed.dir` が起動時と違うとき、受け付けられないときは 409。
-  4. managed ストアを開きます。開けなければ 500。
-  5. バージョンとファイルを、設定ファイルと、リクエストのファイルと managed ストアのファイルで検証します。拒否は 400（文と場所）。バージョンのアップストリームのエンジンに、ルールストアで選択中の世代が無いときも 400 です（文は `no generation is chosen for the engine of an upstream`、`at` は、最初に当たったアップストリームの `upstreams.<name>.engine`）。ルールストアを読めなければ 500。
-- 応答は 200 `{"version", "detect"}` です。`version` は、保存した場合のバージョンの名前です。`detect` は、検知のみのモードの世代を選択中のエンジンで検査するアップストリームの `[{"upstream", "engine"}, ..]`（アップストリームの並びの順。無ければ `[]`）です。そのアップストリームでは、ルールに一致したリクエストもブロックされません。
-- 変更の実行権を取得せず、プロキシに問い合わせず、managed ストアに何も置かず、監査ログにも書きません。選択中のバージョンが無い managed ストア（コマンドで最初のバージョンを作成する前）でも検証できます。
-- 検証の実行枠: `check` と `apply` のバージョンの検証は、管理プロセスの中で同時に 1 つだけ実行します。12 MiB のボディと managed ストアのファイルをもう一度読み込むので、メモリを多く使うためです。
+- The body is `{"version", "files", "expect"}`, in the same form as for `POST /api/managed/apply` (see "Save and Apply" below). `expect` can be omitted, and its form is not validated even if it is present.
+- Steps (the response comes from the first stage that refuses):
+  1. The slot for validation. If another request holds it, 503 `a check of a managed version is under way`. If `managed` was absent when the admin process started, 409 at once.
+  2. The form of the body, the files and the version. A refusal is 400 (a sentence and a place).
+  3. The configuration file is read again. If there is no `managed`, if `managed.dir` differs from that at start, or if it is rejected, 409.
+  4. The managed store is opened. If it cannot be opened, 500.
+  5. The version and the files are validated against the configuration file, and against the files of the request and the files of the managed store. A refusal is 400 (a sentence and a place). It is also 400 when the rules store has no chosen generation for an upstream engine of the version (the sentence is `no generation is chosen for the engine of an upstream`, and `at` is `upstreams.<name>.engine` of the first upstream that hit it). If the rules store cannot be read, 500.
+- The response is 200 `{"version", "detect"}`. `version` is the name of the version if it were saved. `detect` is `[{"upstream", "engine"}, ..]` of the upstreams that are inspected by an engine whose chosen generation is a detect-only generation (in the order of the upstreams; `[]` if there are none). For those upstreams, even a request that matches a rule is not blocked.
+- It does not take the right to run a change, does not ask the proxy, puts nothing in the managed store, and does not write to the audit log. It can validate even for a managed store that has no selected version (before the first version is created with a command).
+- The slot for validation: the validation of a version by `check` and `apply` runs only one at a time inside the admin process, because it reads the 12 MiB body and the files of the managed store again and uses a lot of memory.
 
-### 保存して反映
+### Save and Apply
 
-`POST /api/managed/apply`（operator 以上）は、バージョンを managed ストアに保存し、稼働中のプロキシに反映します。ボディは JSON のオブジェクトで、3 つのキーがどれも必要です。
+`POST /api/managed/apply` (operator or above) saves a version in the managed store and applies it to the running proxy. The body is a JSON object, and all three keys are needed.
 
-| キー | 内容 |
+| Key | Content |
 |---|---|
-| `expect` | 画面で見た選択中のバージョン（64 桁の小文字の 16 進数） |
-| `version` | 保存するバージョン。managed ストアのバージョンの形式（ファイルを SHA-256 で指定し、パスを持たない）で、書き方は問いません。保存するときは 1 つの決まった書き方にし、その SHA-256 がバージョンの名前になります |
-| `files` | バージョンと一緒に保存するファイル（証明書チェーン、秘密鍵、CA のファイルの PEM の文字列）の配列 |
+| `expect` | The selected version that you saw on the screen (64 lowercase hexadecimal digits) |
+| `version` | The version to save. In the form of a version of the managed store (files are specified by SHA-256 and have no path); how it is written does not matter. When it is saved, it is written in one fixed way, and its SHA-256 is the name of the version |
+| `files` | An array of the files to save with the version (PEM strings of the certificate chain, the private key, and the CA files) |
 
-- `files` は 192 個まで、1 つ 1 MiB までです。同じファイルを 2 回送ることはできず、どのファイルもバージョンが指定するものであること。バージョンが指定していて、リクエストに含まれないファイルは、managed ストアに既にあること。
-- ファイルの内容は、応答、監査ログ、設定の変更履歴に書きません。
+- `files` is up to 192 files, and up to 1 MiB per file. The same file cannot be sent twice, and every file must be one that the version specifies. A file that the version specifies and that the request does not include must already be in the managed store.
+- The contents of the files are not written to the response, the audit log, or the configuration history.
 
-進み方（最初に拒否した段階で応答します）:
+Steps (the response comes from the first stage that refuses):
 
-1. 検証の実行枠。ほかのリクエストが保持していれば 503。監査ログには書きません。
-2. ボディ。JSON の形式が違うとき、ファイルが多すぎるか大きすぎるとき、バージョンの形式が違うとき（設定キーの重複、未知の設定キー、不足している設定キー、型の違い）、`expect` が 64 桁の小文字の 16 進数でないときは 400。監査ログには書きません。
-3. 変更の実行権、設定ファイルの再読み込み、managed ストアと `expect`、プロキシの状態（下の「名前を指定した反映とロールバック」の 1〜4 と同じ）。プロキシがバージョンを受け付けられないときは、何も保存しません。
-4. バージョンを、設定ファイルとファイルで検証します（`managed import` と同じ検証。国のデータベースは読み込まず、プロキシが反映のときに読み込みます）。バージョンのアップストリームのエンジンに、ルールストアで選択中の世代があることも検証します（「検証」の 5 と同じです）。拒否は 400（文と場所）。監査ログには書きません。
-5. 監査ログに `managed-import` の行（対象はバージョンの名前）を書きます。書けなければ 503 で、何も保存しません。
-6. ファイルとバージョンを、managed ストアのロックの中で置きます。コマンドがロックを保持していれば 409 `the managed store is in use by another command`、ほかの managed ストアの拒否も 409。managed ストアのファイルと合わせて読み込んだバージョンが拒否されれば 400（場所なし）、設定ファイルが拒否されれば 409。どれも監査ログに失敗（`store`、`version`、`configuration`）を書きます。
-7. 反映の処理を始めます（下の「名前を指定した反映とロールバック」の 6）。保存したが反映の処理を始められなかったバージョンは、managed ストアに残ります。害はありません。
+1. The slot for validation. If another request holds it, 503. It is not written to the audit log.
+2. The body. 400 if the form of the JSON is wrong, if there are too many files or a file is too large, if the form of the version is wrong (a repeated setting key, an unknown setting key, a missing setting key, a type mismatch), or if `expect` is not 64 lowercase hexadecimal digits. It is not written to the audit log.
+3. The right to run a change, the reload of the configuration file, the managed store and `expect`, and the state of the proxy (the same as 1 to 4 of "Applying and Rolling Back by Name" below). If the proxy cannot accept the version, nothing is saved.
+4. The version is validated against the configuration file and the files (the same validation as `managed import`; the country database is not loaded, and the proxy loads it at the time of the apply). It is also validated that the rules store has a chosen generation for each upstream engine of the version (the same as step 5 of "Check"). A refusal is 400 (a sentence and a place). It is not written to the audit log.
+5. A `managed-import` line (the target is the name of the version) is written to the audit log. If it cannot be written, 503, and nothing is saved.
+6. The files and the version are placed inside the lock of the managed store. If a command holds the lock, 409 `the managed store is in use by another command`; other refusals of the managed store are also 409. If the version that was read together with the files of the managed store is refused, 400 (no place); if the configuration file is refused, 409. In every case, a failure (`store`, `version`, `configuration`) is written to the audit log.
+7. The apply job is started (step 6 of "Applying and Rolling Back by Name" below). A version that was saved but whose apply job could not be started stays in the managed store. It does no harm.
 
-応答は 202 で、`version`（バージョンの名前）、`placed`（保存の結果。`created`、同じバージョンが既にあった `existing`、壊れた写しを置き換えた `recreated`）、`job`（始めた反映の処理）を持ちます。
+The response is 202, and has `version` (the name of the version), `placed` (the result of saving: `created`, `existing` if the same version was already there, or `recreated` if a damaged copy was replaced), and `job` (the apply job that was started).
 
-### 名前を指定した反映とロールバック
+### Applying and Rolling Back by Name
 
-`POST /api/managed/activate`（`{"expect", "version"}`）は managed ストアのバージョンを名前で、`POST /api/managed/rollback`（`{"expect"}`）はロールバック先のバージョンを、稼働中のプロキシに反映します。operator 以上で、API トークンでも使えます。
+`POST /api/managed/activate` (`{"expect", "version"}`) applies a version of the managed store, by name, and `POST /api/managed/rollback` (`{"expect"}`) applies the rollback target version, to the running proxy. They need an operator or above, and API tokens can also be used.
 
-- `expect` と `version` は 64 桁の小文字の 16 進数です。違うと 400 `a version is not 64 lowercase hexadecimal digits` になります。
-- `expect` は、画面で見た選択中のバージョンです。画面を見た後にほかのユーザーかコマンドが選択し直していれば、古い画面から上書きしないよう、409 で拒否します。
-- 選択中のバージョンが無い managed ストアでは、`expect` が合わないので反映できません。最初のバージョンは、コマンド（`managed import` と `managed activate`）で作成して選択します（[運用リファレンス](operator-reference.md) の「managed 設定での初回起動」）。
+- `expect` and `version` are 64 lowercase hexadecimal digits. If not, it gives 400 `a version is not 64 lowercase hexadecimal digits`.
+- `expect` is the selected version that you saw on the screen. If another user or a command has selected again since you saw the screen, it is refused with 409, so that an old screen does not overwrite it.
+- In a managed store that has no selected version, nothing can be applied because `expect` does not match. Create and select the first version with commands (`managed import` and `managed activate`) (see "First Start with the Managed Configuration" in the [operator reference](operator-reference.md)).
 
-進み方（上の「保存して反映」の 3 も同じです。最初に拒否した段階で応答します）:
+Steps (step 3 of "Save and Apply" above is the same. The response comes from the first stage that refuses):
 
-1. 変更の実行権。管理プロセスの中で、変更は反映の処理の終わりまで含めて 1 つずつ順に進みます。ほかの変更（バージョンの削除を含みます）が進んでいれば 409 `a change of the managed configuration is under way`、管理プロセスが停止中なら 503。監査ログには書きません。
-2. 設定ファイルを再読み込みします。`managed` が無いとき（管理プロセスの起動時に無かったときも）、`managed.dir` が起動時と違うとき、受け付けられないときは 409。監査ログに拒否（`managed`、`configuration`）を書きます。
-3. managed ストア。開けないとき、選択中のバージョンを示すファイル（`current`）を読めないときは 500。選択中のバージョンが `expect` でない（無いときも）ときは 409 `the chosen managed version is not the one that was expected`（監査ログに拒否、`expect`）。ロールバックは、ここでロールバック先を決めます。無ければ 409、設定の変更履歴を読めなければ 503（どちらも監査ログには書きません）。
-4. プロキシの状態を、制御ソケットで問い合わせます。
-   - 接続できない: 503 `the proxy cannot be reached`。設定の変更履歴に `unreachable` の行を書きます（監査ログに拒否、`unreachable`）。
-   - 接続を受け付けて何も応答せずに閉じる（同時接続数の上限）: 503 `the proxy is busy`（監査ログに拒否、`busy`）。
-   - 稼働中の設定に `managed` が無い: 409 `the configuration in force has no managed object`（監査ログに拒否、`unmanaged`）。
-5. 名前で反映とロールバックでは、バージョンが managed ストアにあること。無ければ、名前で反映は 404、ロールバックは 409 `the version to go back to is not in the store`。あれば、バージョンのアップストリームのエンジンに、ルールストアで選択中の世代があること。無ければ 409 `no generation is chosen for the engine of an upstream` と `at`（最初に当たったアップストリームの `upstreams.<name>.engine`）で、監査ログに拒否（`engine`）を書きます。ルールストアを読めなければ 500。`POST /api/managed/apply` は、ここでバージョンを保存します（上の「保存して反映」の 4〜6）。
-6. 反映の処理を始めます。応答の時間（30 秒）の残りが 5 秒以下のときと、1 の後に管理プロセスが停止し始めたときは、503（監査ログに失敗、`time`、`stopping`）。スレッドを作成できなければ 503（監査ログに失敗、`thread`）。
+1. The right to run a change. Inside the admin process, changes proceed one at a time, including the end of the apply job. If another change (including removing a version) is in progress, 409 `a change of the managed configuration is under way`; if the admin process is stopping, 503. It is not written to the audit log.
+2. The configuration file is read again. If there is no `managed` (including the case where there was none when the admin process started), if `managed.dir` differs from that at start, or if it is rejected, 409. A refusal (`managed`, `configuration`) is written to the audit log.
+3. The managed store. If it cannot be opened, or if the file that shows the selected version (`current`) cannot be read, 500. If the selected version is not `expect` (including when there is none), 409 `the chosen managed version is not the one that was expected` (a refusal, `expect`, in the audit log). For a rollback, the rollback target is decided here. If there is none, 409, and if the configuration history cannot be read, 503 (neither is written to the audit log).
+4. The state of the proxy is asked on the control socket.
+   - It cannot be reached: 503 `the proxy cannot be reached`. An `unreachable` line is written to the configuration history (a refusal, `unreachable`, in the audit log).
+   - It accepts the connection and closes without responding (the limit of concurrent connections): 503 `the proxy is busy` (a refusal, `busy`, in the audit log).
+   - The running configuration has no `managed`: 409 `the configuration in force has no managed object` (a refusal, `unmanaged`, in the audit log).
+5. For apply by name and rollback, the version must be in the managed store. If not, apply by name gives 404, and rollback gives 409 `the version to go back to is not in the store`. If it is, the rules store must have a chosen generation for each upstream engine of the version. If not, 409 `no generation is chosen for the engine of an upstream` with `at` (`upstreams.<name>.engine` of the first upstream that hit it), and a refusal (`engine`) is written to the audit log. If the rules store cannot be read, 500. `POST /api/managed/apply` saves the version here (4 to 6 of "Save and Apply" above).
+6. The apply job is started. If the time left of the response (30 seconds) is 5 seconds or less, or if the admin process began to stop after 1, 503 (a failure, `time`, `stopping`, in the audit log). If a thread cannot be created, 503 (a failure, `thread`, in the audit log).
 
-応答は 202 で、`version`（反映するバージョン）と `job` を持ちます。
+The response is 202, and has `version` (the version to apply) and `job`.
 
-ロールバック先:
+The rollback target:
 
-- 設定の変更履歴の中で、結果が `applied` で、`from` と `to` が違う、最も新しい行の `from` です。
-- ただし、その行の `to` が、現在選択中のバージョンのときだけです。反映が `applied` に終わらなかった後や、コマンドでバージョンを選択した後は、履歴の終わりが選択中のバージョンと合わないので、ロールバックできません（409 `the history does not end at the chosen version`）。`applied` の行が無いときは 409 `there is no change to go back from` になります。
-- ロールバックも履歴に `rollback` として入ります。続けてもう一度ロールバックすると、元のバージョンに戻ります。
+- It is the `from` of the newest line in the configuration history whose result is `applied` and whose `from` and `to` differ.
+- However, this applies only when the `to` of that line is the version that is selected now. After an apply that did not end in `applied`, or after a version was selected with a command, the end of the history does not match the selected version, so a rollback is not possible (409 `the history does not end at the chosen version`). If there is no `applied` line, it gives 409 `there is no change to go back from`.
+- A rollback is also entered in the history, as `rollback`. If you roll back again right after, it goes back to the original version.
 
-### 反映の処理
+### Apply Jobs
 
-変更（「保存して反映」「名前で反映」「ロールバック」）は、上の段階を通るとすぐに 202 で応答し、反映は管理プロセス内の反映の処理（`job`）として続きます。反映は、1 つの応答を待てる時間より長くかかることがあるためです。終わりは `GET /api/managed/job`（viewer 以上。`{"job"}`、無ければ `null`）か、`GET /api/managed` の `job` で読み取ります。
+A change ("Save and apply", "Apply by name", "Roll back") gets the response 202 as soon as it has passed the stages above, and the apply continues as an apply job (`job`) inside the admin process. This is because an apply may take longer than the time that one response can wait. You can read how it ended with `GET /api/managed/job` (viewer or above; `{"job"}`, or `null` if there is none) or with `job` of `GET /api/managed`.
 
-- 管理プロセスが保持する反映の処理は最後の 1 つだけで、メモリにだけあります。管理プロセスを再起動すると失われます。動作中の反映の処理は、管理プロセスと一緒に終了し、managed ストアのロックもプロセスと一緒に解放されます。
-- 反映の処理はキャンセルできません。依頼したユーザーのロールが変わっても止まりません。
-- 反映の処理は、終わるまで変更の実行権を保持します。その間、ほかの変更とバージョンの削除は 409 になります。
-- 反映の順序（managed ストアのロック、プロキシへのリロードの依頼、選択中のバージョンを進める順序）と、途中で停止したときの扱いは、[運用リファレンス](operator-reference.md) の「反映」を参照してください。管理プロセスが制御ソケットで待つ時間は、上の「制御ソケット」を参照してください。
+- The admin process keeps only the last apply job, and it is only in memory. It is lost when the admin process restarts. An apply job that is running ends together with the admin process, and the lock of the managed store is released together with the process.
+- An apply job cannot be cancelled. It does not stop even if the role of the user who requested it changes.
+- An apply job holds the right to run a change until it ends. During that time, other changes and the removal of versions get 409.
+- For the order of applying (the lock of the managed store, the request to the proxy to reload, and the order in which the selected version is advanced) and what happens when it stops halfway, see "Applying" in the [operator reference](operator-reference.md). For the time that the admin process waits on the control socket, see "Control Socket" above.
 
-| キー | 内容 |
+| Key | Content |
 |---|---|
-| `kind` | `apply`（保存して反映）、`activate`（名前で反映）、`rollback` |
-| `actor` | 依頼したユーザーの名前 |
-| `from`、`to` | 変更前（`expect`）と変更後のバージョン |
-| `started`、`ended` | 始めた時刻と終わった時刻（エポックからの秒数）。動作中は、`ended` は `null` です |
-| `state` | `running`（反映中）か `ended` |
-| `result` | 終わり方（下の表）。動作中は `null` です |
-| `reason` | 決まった語。拒否したプロキシの部分（`configuration`、`version`、`store`、`upstream`、`tls`、`fixed`、`listener`、`thread`）、`busy` の理由（`store in use`、`proxy busy`、`reload under way`、`starting`、`too many orders`、`stopping`）、`error` の理由、`not recorded` の理由（`current changed`、`store`） |
-| `detail` | 拒否したプロキシの文か、managed ストアの文 |
-| `config_before`、`config_after` | 反映の前と後に使われていた設定ファイルの SHA-256。分かるときだけ |
-| `history` | 設定の変更履歴に行が書き込まれたか。行を書かない終わり方では `null` |
+| `kind` | `apply` (Save and apply), `activate` (apply by name), `rollback` |
+| `actor` | The name of the user who requested it |
+| `from`, `to` | The version before the change (`expect`) and the version after it |
+| `started`, `ended` | The time it started and the time it ended (in seconds since the epoch). While it is running, `ended` is `null` |
+| `state` | `running` (applying) or `ended` |
+| `result` | How it ended (the table below). While it is running, `null` |
+| `reason` | A fixed word. The part where the proxy refused (`configuration`, `version`, `store`, `upstream`, `tls`, `fixed`, `listener`, `thread`), the reasons for `busy` (`store in use`, `proxy busy`, `reload under way`, `starting`, `too many orders`, `stopping`), the reasons for `error`, and the reasons for `not recorded` (`current changed`, `store`) |
+| `detail` | The sentence of the proxy that refused, or the sentence of the managed store |
+| `config_before`, `config_after` | The SHA-256 of the configuration file that was in use before and after the apply. Only when known |
+| `history` | Whether a line was written to the configuration history. `null` for an ending that writes no line |
 
-| `result` | 意味 | 監査ログ | 設定の変更履歴 |
+| `result` | Meaning | Audit log | Configuration history |
 |---|---|---|---|
-| `applied` | プロキシが変更後のバージョンで稼働し、managed ストアで変更後のバージョンが選択されました | 変更の前に書いた `ok` の行 | 行を書きます |
-| `refused` | プロキシが拒否しました。何も変更されていません | 失敗 | 行を書きます |
-| `busy` | managed ストアかプロキシが使用中でした。何も変更されていません | 変更の前の行より前なら拒否、後なら失敗 | 後なら行を書きます |
-| `current changed` | 選択中のバージョンが `expect` ではなくなっていました | 拒否 | 書きません |
-| `no version` | バージョンが managed ストアにありません | 拒否 | 書きません |
-| `unmanaged` | 稼働中のプロキシの設定に `managed` がありません | 拒否 | 書きません |
-| `store` | managed ストアのロックを取得できない、選択中のバージョンを示すファイル（`current`）が無いか読めない、など | 拒否 | 書きません |
-| `audit` | 変更前の監査ログの行を書けませんでした。何も変更されていません | − | 書きません |
-| `error` | プロキシが依頼を受け付けませんでした（`unknown op` は、制御ソケットの `reload` に対応していない古いプロキシ） | 失敗 | 行を書きます |
-| `unreachable` | プロキシに接続できませんでした | 拒否 | 行を書きます |
-| `failed` | プロキシは変更後のバージョンに切り替わりませんでした | 失敗 | 行を書きます |
-| `unconfirmed` | 結果を確認できませんでした | 失敗 | 行を書きます |
-| `not recorded` | プロキシは変更後のバージョンに切り替わりましたが、managed ストアで選択されませんでした（`current changed`: 選択中のバージョンが手作業で変更された、`store`: 選択中のバージョンを示すファイル（`current`）を書けない） | 失敗 | 行を書きます |
+| `applied` | The proxy runs the version after the change, and the managed store has selected the version after the change | The `ok` line written before the change | A line is written |
+| `refused` | The proxy refused. Nothing was changed | A failure | A line is written |
+| `busy` | The managed store or the proxy was in use. Nothing was changed | A refusal if it happened before the line before the change was written, a failure if after | A line is written if after |
+| `current changed` | The selected version was no longer `expect` | A refusal | Not written |
+| `no version` | The version is not in the managed store | A refusal | Not written |
+| `unmanaged` | The configuration of the running proxy has no `managed` | A refusal | Not written |
+| `store` | The lock of the managed store could not be taken, or the file that shows the selected version (`current`) is missing or cannot be read, and so on | A refusal | Not written |
+| `audit` | The audit log line before the change could not be written. Nothing was changed | − | Not written |
+| `error` | The proxy did not accept the request (`unknown op` means an old proxy that does not support `reload` of the control socket) | A failure | A line is written |
+| `unreachable` | The proxy could not be reached | A refusal | A line is written |
+| `failed` | The proxy did not switch to the version after the change | A failure | A line is written |
+| `unconfirmed` | The result could not be confirmed | A failure | A line is written |
+| `not recorded` | The proxy switched to the version after the change, but the managed store did not select it (`current changed`: the selected version was changed by hand; `store`: the file that shows the selected version (`current`) cannot be written) | A failure | A line is written |
 
-- `refused` の `reason` が `fixed` になるのは、稼働中は変更できない設定キーが違うとき（`detail` は `<key> cannot change while running`）と、バージョンのアップストリームのエンジンがプロキシで稼働していないとき（起動中を含みます。`detail` は `the engine of an upstream is not ready (upstream <name>)`）です。稼働していないエンジンは、先に起動してから（「ルールの世代」の画面の「エンジンを起動する」か SIGUSR1。[運用リファレンス](operator-reference.md) の「エンジンごとの選択中の世代」）、もう一度反映します。
-- 監査ログの `ok` の行は、変更の前に書きます（`from` と `to` を `before` と `after` に書きます。設定ファイルの SHA-256 は、監査ログではなく設定の変更履歴に書きます）。成功を示す行ではないので、終わり方は、後に続く行と設定の変更履歴で確認します。
-- 設定の変更履歴に行を書き込めなかったときは、監査ログに失敗（`history`）を書きます。
-- 反映の処理が途中で異常終了したときは `unconfirmed` になり、管理プロセスがログに 1 行を書きます。
-- `unconfirmed` と `not recorded` の後は、選択中のバージョンと稼働中のバージョンが違うことがあります。`GET /api/managed` の `current` と `serving` で確認し、違っていれば、どちらかのバージョンをもう一度反映します。
+- `reason` of `refused` is `fixed` when a setting key that cannot change while running differs (`detail` is `<key> cannot change while running`), and when an upstream engine of the version is not running in the proxy (including when it is starting; `detail` is `the engine of an upstream is not ready (upstream <name>)`). Start an engine that is not running first (with "Start the engine" on the "Rule generations" screen, or with SIGUSR1; see "Chosen Generation per Engine" in the [operator reference](operator-reference.md)), and then apply again.
+- The `ok` line of the audit log is written before the change (`from` and `to` are written to `before` and `after`. The SHA-256 of the configuration file is written to the configuration history, not to the audit log). It is not a line that shows success, so check how the operation ended with the lines that follow and with the configuration history.
+- If a line could not be written to the configuration history, a failure (`history`) is written to the audit log.
+- If an apply job ended abnormally on the way, it becomes `unconfirmed`, and the admin process writes one line to its log.
+- After `unconfirmed` and `not recorded`, the selected version and the running version may differ. Check with `current` and `serving` of `GET /api/managed`, and if they differ, apply either version again.
 
-### バージョンの削除
+### Removing Versions
 
-`DELETE /api/managed/versions/<version>`（operator 以上、API トークン可、ボディなし）は、バージョンを managed ストアから削除します。元に戻せません。どのバージョンも指定しなくなったファイルと ACME の証明書も、一緒に片付けます（片付けで削除されるものは [運用リファレンス](operator-reference.md) の「バージョンの削除」）。
+`DELETE /api/managed/versions/<version>` (operator or above, API tokens allowed, no body) removes a version from the managed store. It cannot be undone. It also cleans up the files and ACME certificates that no version specifies any more (for what the cleanup removes, see "Removing Versions" in the [operator reference](operator-reference.md)).
 
-進み方（最初に拒否した段階で応答します）:
+Steps (the response comes from the first stage that refuses):
 
-1. 名前が 64 桁の小文字の 16 進数でなければ 404。
-2. 変更の実行権（反映の処理も保持します）。ほかの変更が進んでいれば 409、管理プロセスが停止中なら 503。監査ログには書きません。
-3. 設定ファイルを再読み込みします。`managed` が無いとき、`managed.dir` が起動時と違うとき、受け付けられないときは 409（監査ログに拒否、`managed`、`configuration`）。
-4. managed ストアを開けなければ 500。
-5. managed ストアの一覧に無いバージョンは 404。
-6. 選択中のバージョンは削除しません（409、監査ログに拒否、`chosen`）。
-7. ロールバック先のバージョンは削除しません（409、監査ログに拒否、`rollback target`）。設定の変更履歴を読めなければ 503。
-8. 監査ログに `managed-remove` の行（対象はバージョンの名前）を書きます。書けなければ 503 で、削除しません。
-9. managed ストアから削除します。拒否は、409 と managed ストアの文（監査ログに失敗、`store`）。
+1. If the name is not 64 lowercase hexadecimal digits, 404.
+2. The right to run a change (an apply job also holds it). If another change is in progress, 409, and if the admin process is stopping, 503. It is not written to the audit log.
+3. The configuration file is read again. If there is no `managed`, if `managed.dir` differs from that at start, or if it is rejected, 409 (a refusal, `managed`, `configuration`, in the audit log).
+4. If the managed store cannot be opened, 500.
+5. A version that is not in the list of the managed store gives 404.
+6. The selected version is not removed (409, a refusal, `chosen`, in the audit log).
+7. The rollback target version is not removed (409, a refusal, `rollback target`, in the audit log). If the configuration history cannot be read, 503.
+8. A `managed-remove` line (the target is the name of the version) is written to the audit log. If it cannot be written, 503, and nothing is removed.
+9. It is removed from the managed store. A refusal is 409 with a sentence of the managed store (a failure, `store`, in the audit log).
 
-| バージョン | `error` |
+| Version | `error` |
 |---|---|
-| 選択中のバージョン | `the version is the one the managed store chooses` |
-| ロールバック先のバージョン | `the version is the target of a rollback` |
-| 使用中のバージョン（どれが使用中かは [運用リファレンス](operator-reference.md) の「バージョンの削除」） | `the managed version is in use` |
+| The selected version | `the version is the one the managed store chooses` |
+| The rollback target version | `the version is the target of a rollback` |
+| A version in use (for which versions are in use, see "Removing Versions" in the [operator reference](operator-reference.md)) | `the managed version is in use` |
 
-- 成功すると 200 `{"removed", "cleaned"}` を返します。`removed` は削除したバージョンの名前、`cleaned` は片付けを終えたかどうかの真偽値です。`cleaned` が `false` の場合は、片付けを終えられなかったこと（ほかのバージョンを読めなかった、など）を示します。削除は取り消さず、次の削除のときにもう一度片付けます。
-- プロキシには問い合わせません。使用中のバージョンは、managed ストアで拒否されます。
-- 削除は、ほかのバージョンを 1 つずつ読み込むので、バージョンが多いほど時間がかかります。応答が間に合わないと 503 になりますが、削除はそのまま完了することがあります。
-- 設定の変更履歴には行を書きません。削除したバージョンを指定している行は残ります。
+- On success, it returns 200 `{"removed", "cleaned"}`. `removed` is the name of the removed version, and `cleaned` is a boolean for whether the cleanup finished. If `cleaned` is `false`, the cleanup could not finish (for example, another version could not be read). The removal is not undone, and the cleanup is tried again at the next removal.
+- It does not ask the proxy. A version in use is refused by the managed store.
+- A removal reads the other versions one by one, so it takes longer when there are more versions. If the response is not in time, it gives 503, but the removal may still complete.
+- It writes no line to the configuration history. Lines that specify the removed version remain.
 
-## 切り替えの履歴
+## Switch History
 
-`GET /api/history`（viewer 以上、API トークン可）は、世代の選択とロールバックの履歴を、新しい順に 200 行まで `{"entries": [...]}` で返します。
+`GET /api/history` (viewer or above, API tokens allowed) returns the history of choosing generations and of rollbacks, newest first, up to 200 lines, as `{"entries": [...]}`.
 
-| 項目 | 内容 |
+| Field | Content |
 |---|---|
-| `ts` | 時刻（UTC の RFC 3339 で ms まで） |
-| `actor` | 切り替えを依頼したユーザーの名前 |
-| `from` | 依頼の前に、`to` の世代が属するエンジンで、ルールストアが選択中だった世代（無かったときは `to` と同じ） |
-| `to` | 依頼した世代（ロールバックではロールバック先） |
-| `kind` | `activate`、`rollback` |
-| `result` | 結果の語（下の注） |
-| `engine` | `to` の世代のエンジン（`coraza` か `modsecurity`）。以前のバージョンの管理プロセスが書いた行は `null` |
+| `ts` | The time (UTC, RFC 3339, to the millisecond) |
+| `actor` | The name of the user who requested the switch |
+| `from` | The generation that the rules store had chosen before the request, for the engine that the generation in `to` belongs to (the same as `to` if there was none) |
+| `to` | The generation that was requested (the rollback target for a rollback) |
+| `kind` | `activate`, `rollback` |
+| `result` | A word for the result (see the note below) |
+| `engine` | The engine of the generation in `to` (`coraza` or `modsecurity`). `null` for a line that an admin process of an earlier version wrote |
 
-`result` は、「選択とロールバック」の応答の `result`（`switched`、`unchanged`、`refused`、`failed`、`unreachable`、`unconfirmed`）と同じ 6 つで、意味も同じです。
+`result` is the same six values as `result` in the response of "Choosing and Rolling Back" (`switched`, `unchanged`, `refused`, `failed`, `unreachable`, `unconfirmed`), with the same meanings.
 
-- 履歴は `admin.store.dir` の `activations.log` に、エンジンを分けずに 1 つのファイルとして追記します。1 行を書き終えて同期してから応答します。ローテーションせず、削除もされません。読み戻すのは終わりの 1 MiB（約 4000 行）までで、それより古い行はロールバック先の判断にも使われません。
-- 管理画面と管理 API で依頼した切り替えだけが入ります。コマンド（`rules activate`）と SIGUSR1 による選択と切り替えは入りません。
-- 履歴に書くのは、プロキシに接続できなかったときと、監査ログの行を書いた後の結果（ルールストアで選択が拒否されたときと、プロキシの応答）だけです。入力のエラー、世代が無い、ロールバック先が決まらない、ほかの変更が進んでいる、`expect` が古い、プロキシが同時接続数の上限のために状態の問い合わせに応答しなかった、監査ログの行を書けなかった、のときは書きません。
+- The history is appended to `activations.log` in `admin.store.dir`, as one file for all engines. A line is synced after it is written, and then the response is returned. It is not rotated, and it is not deleted. Only the last 1 MiB (about 4000 lines) is read back, and lines older than that are not used for deciding the rollback target either.
+- Only switches requested through the admin screens and the admin API are entered. A choice and a switch by the command (`rules activate`) and by SIGUSR1 are not entered.
+- A line is written to the history only when the proxy could not be reached, and for the results after the audit log line was written (when the rules store refused the choice, and the response of the proxy). It is not written for an input error, a generation that does not exist, a rollback target that cannot be decided, another change in progress, an old `expect`, a proxy that did not respond to the query for the state because of the limit of concurrent connections, or an audit log line that could not be written.
 
-## 設定の変更履歴
+## Configuration History
 
-`GET /api/managed/history`（viewer 以上、API トークン可）は、managed 設定の変更（「保存して反映」「名前で反映」「ロールバック」）の履歴を、新しい順に 200 行まで `{"entries": [...]}` で返します。
+`GET /api/managed/history` (viewer or above, API tokens allowed) returns the history of the changes of the managed configuration ("Save and apply", "Apply by name", "Roll back"), newest first, up to 200 lines, as `{"entries": [...]}`.
 
-| 項目 | 内容 |
+| Field | Content |
 |---|---|
-| `ts` | 時刻（UTC の RFC 3339 で ms まで） |
-| `actor` | 変更を依頼したユーザーの名前 |
-| `kind` | `apply`、`activate`、`rollback` |
-| `from` | 依頼のときに managed ストアで選択中だったバージョン |
-| `to` | 依頼したバージョン（ロールバックではロールバック先） |
-| `result` | 結果の語（下の注） |
-| `reason` | 決まった語。無ければ `null` |
-| `config_before`、`config_after` | 反映の前と後に使われていた設定ファイルの SHA-256。無ければ `null` |
+| `ts` | The time (UTC, RFC 3339, to the millisecond) |
+| `actor` | The name of the user who requested the change |
+| `kind` | `apply`, `activate`, `rollback` |
+| `from` | The version that the managed store had selected at the time of the request |
+| `to` | The version that was requested (the rollback target for a rollback) |
+| `result` | A word for the result (see the note below) |
+| `reason` | A fixed word. `null` if there is none |
+| `config_before`, `config_after` | The SHA-256 of the configuration file in use before and after the apply. `null` if not known |
 
-`result` は、`applied`、`refused`、`busy`、`error`、`failed`、`unconfirmed`、`not recorded`、`unreachable` の 8 つで、意味は「managed 設定の操作」の「反映の処理」の表と同じです。`reason` も、反映の処理の `reason` と同じ語です。
+`result` is one of these eight: `applied`, `refused`, `busy`, `error`, `failed`, `unconfirmed`, `not recorded`, `unreachable`. The meanings are the same as in the table of "Apply Jobs" under "Managed Configuration Operations". `reason` also uses the same words as `reason` of the apply job.
 
-- 履歴は `admin.store.dir` の `managed.log` に、1 行 1 件の JSON で追記します。1 行を書き終えて同期します。ローテーションせず、削除もされません。読み戻すのは終わりの 1 MiB までで、それより古い行はロールバック先の判断にも使われません。決まった形式に合わない行は除きます。
-- 管理画面と管理 API で依頼した変更だけが入ります。コマンド（`managed activate`）による選択と、SIGHUP による反映は入りません。
-- 行を書くのは、プロキシに接続できなかったとき（`unreachable`）と、変更前の監査ログの行を書いた後の終わり方だけです（「反映の処理」の表）。入力のエラー、ほかの変更が進んでいる、`expect` が古い、ロールバック先が決まらない、プロキシが同時接続数の上限のために問い合わせに応答しなかった、監査ログの行を書けなかった、のときは書きません。
-- プロキシと managed ストアの文は、履歴には書きません。反映の処理の `detail` にだけあります。
-- 行を書けなかったときは、反映の処理の `history` が `false` になり、監査ログに失敗（`history`）を書きます。
-- 管理プロセスが起動したときに `managed` が無かった場合は 409、履歴を読めない場合は 503 になります。
+- The history is appended to `managed.log` in `admin.store.dir`, as one JSON object per line. A line is synced after it is written. It is not rotated, and it is not deleted. Only the last 1 MiB is read back, and lines older than that are not used for deciding the rollback target either. Lines that do not match the fixed form are left out.
+- Only changes requested through the admin screens and the admin API are entered. A choice by the command (`managed activate`) and an apply by SIGHUP are not entered.
+- A line is written only when the proxy could not be reached (`unreachable`) and for the endings after the audit log line before the change was written (the table of "Apply Jobs"). It is not written for an input error, another change in progress, an old `expect`, a rollback target that cannot be decided, a proxy that did not respond to the query because of the limit of concurrent connections, or an audit log line that could not be written.
+- The sentences of the proxy and the managed store are not written to the history. They are only in `detail` of the apply job.
+- If a line could not be written, `history` of the apply job is `false` and a failure (`history`) is written to the audit log.
+- If `managed` was absent when the admin process started, it gives 409, and if the history cannot be read, 503.
 
-## ログの読み出し
+## Reading Logs
 
-`GET /api/records`（viewer 以上、API トークン可）は、`records.dir` のファイルを新しい行から読み、条件に合う行を返します。行は書かれたままの JSON のオブジェクトで、リクエストから来た文字（`path` など）は `%XX` の形のままです（[運用リファレンス](operator-reference.md) の「ログ」）。キーの順序は変わることがあります。
+`GET /api/records` (viewer or above, API tokens allowed) reads the files of `records.dir` from the newest line and returns the lines that match the conditions. A line is the JSON object as it was written, and characters that came from a request (such as `path`) stay in the `%XX` form (see "Logs" in the [operator reference](operator-reference.md)). The order of the keys may change.
 
-条件（クエリ）は次のとおりです。どれも 1 回までで、値は `%XX` で書けます（デコードの後に 128 バイトまで）。
+The conditions (the query) are as follows. Each can be given once, and a value can be written with `%XX` (up to 128 bytes after decoding).
 
-| 条件 | 形式 |
+| Condition | Form |
 |---|---|
-| `from`、`to` | 開始と終了の時刻。UTC の RFC 3339 で、`Z` で終わります。秒の小数は 9 桁まで（ミリ秒に切り捨てます）か、なし |
-| `type` | `request`、`connection`、`tunnel`、`line`、`audit`、`dropped` |
-| `class` | リクエストのログの結果（1〜32 文字の小文字・数字・`_`・`-`） |
-| `status` | ステータスコード（1〜3 桁の数字） |
-| `rule` | ルール ID。判定したルールか、ほかに一致したルールの中にあるもの |
-| `id` | リクエスト ID |
-| `client` | IP アドレス |
-| `generation` | 世代のフィンガープリント。先頭 16 桁か 64 桁（ログには先頭 16 桁だけがあります） |
-| `engine` | リクエストを検査したエンジン。`coraza` か `modsecurity`（小文字だけ）。`engine` を持たないログ（検査除外のルートを通ったリクエストなど）は、この条件に合いません |
-| `file`、`offset`、`inode` | 続きの位置。3 つがそろって初めて使えます |
+| `from`, `to` | The start and end times. RFC 3339 in UTC, ending in `Z`. Up to 9 digits of fraction of a second (cut down to milliseconds), or none |
+| `type` | `request`, `connection`, `tunnel`, `line`, `audit`, `dropped` |
+| `class` | The result of a request log (1 to 32 characters of lowercase letters, digits, `_`, and `-`) |
+| `status` | A status code (1 to 3 digits) |
+| `rule` | A rule ID. One that is in the rule that decided, or in the other rules that matched |
+| `id` | The request ID |
+| `client` | An IP address |
+| `generation` | The fingerprint of a generation. The first 16 digits or all 64 (the log has only the first 16 digits) |
+| `engine` | The engine that inspected the request. `coraza` or `modsecurity` (lowercase only). A log without `engine` (such as a request that went through a bypass route) does not match this condition |
+| `file`, `offset`, `inode` | The position to continue from. It can be used only when all three are given |
 
-- `audit` のログは、管理プロセスの標準エラーと監査ログの保存先に出力されるもので、プロキシのログファイルには入りません。`type=audit` で検索しても、このファイルからは見つかりません。監査ログは `GET /api/audit` で読みます。
-- 1 回に返すのは 500 行まで、読み込むのは 256 MiB までです。どちらかに達して、まだログが残っているときは、応答の `next` に続きの位置が入ります。読み込む量の上限で、条件に合う行を見つける前に読み込みが止まると、`records` が空でも `next` が入ります。`next` が `null` になるまで続けて読みます。
-- 応答は `{"records": [..], "next": null か {"file", "offset", "inode"}}` です。`inode` は文字列で返します。続きを読むには、同じ条件に `next` の 3 つの値を加えます。
-- 続きの位置は、ファイルの番号と、その中の位置、ファイルの inode で決まります。ログファイルのローテーションで番号が変わっても、inode でファイルを探します。ファイルがローテーションで削除された、または位置が行の終わりでなくなったときは、409 `the continuation names no place in the record files any more` になります。その場合は、最初から読み直します。
-- 新しい行から順に読み、`from` より古い行に出会うと、そこで読み込みを終了します。書き込みの途中で改行が無い最後の行、`ts` を持たない行、長すぎる行は、返しません。
-- 失敗:
-  - 設定に `records` が無い: 404 `records are not configured`
-  - 条件のエラー（未知の条件、同じ条件が 2 回、値の形式のエラー、続きの位置の 3 つがそろわない）: 400。文は決まった英語の 1 文
-  - ログファイルのディレクトリが、所有者・権限の検証に通らない: 503。文は検証の文
-  - ファイルを読めない: 503 `unavailable`
+- A log of `audit` is the one that is written to the standard error of the admin process and to the store of the audit log, and it does not go into the log files of the proxy. Even if you search with `type=audit`, it cannot be found in these files. Read the audit log with `GET /api/audit`.
+- It returns up to 500 lines at a time, and reads up to 256 MiB. When it reaches either one and logs still remain, `next` in the response holds the position to continue from. When the read limit stops the reading before a line that matches the conditions is found, `next` is present even if `records` is empty. Keep reading until `next` is `null`.
+- The response is `{"records": [..], "next": null or {"file", "offset", "inode"}}`. `inode` is returned as a string. To continue, add the three values of `next` to the same conditions.
+- The position to continue from is decided by the number of the file, the position in it, and the inode of the file. Even if the numbers change by the rotation of the log files, the file is found by its inode. If the file was deleted by rotation, or the position is no longer at the end of a line, it gives 409 `the continuation names no place in the record files any more`. In that case, read again from the start.
+- It reads from the newest line, and when it meets a line older than `from`, it ends the reading there. It does not return the last line that has no newline because it is being written, a line without `ts`, or a line that is too long.
+- Failures:
+  - The configuration has no `records`: 404 `records are not configured`
+  - An error in the conditions (an unknown condition, the same condition twice, an error in the form of a value, the three values of the position to continue from are not all given): 400. The sentence is one fixed English sentence
+  - The directory of the log files does not pass the check of the owner and permissions: 503. The sentence is the sentence of the check
+  - The file cannot be read: 503 `unavailable`
 
-## 管理画面
+## Admin Screens
 
-管理画面は、管理プロセスが提供します。ブラウザーで `https://admin.example.com/`（`admin.origin`）を開きます。
+The admin screens are served by the admin process. Open `https://admin.example.com/` (`admin.origin`) in a browser.
 
-- ファイルは `proxy/admin-ui/` にあり、実行ファイルに組み込みます。管理プロセスと管理画面は、いつも同じバージョンです。ホストのファイルは読み込みません。
-- 提供するパスは、`GET /`（ページ）と `GET /ui/<ui-version>/<name>`（スタイルシート、アイコン、34 個のスクリプトの、合わせて 36 個）だけです。スクリプトの名前は、`proxy/admin-ui/js/` からのパスです（`js/app.js` は `/ui/<ui-version>/app.js`、`js/waf/waf.js` は `/ui/<ui-version>/waf/waf.js`）。セッションは不要です（ファイルに秘密は含まれません）。
-- パスの `<ui-version>` は、36 個のファイルの名前と内容から作成する、16 桁の小文字の 16 進数です（ファイルごとに名前と SHA-256 を並べた一覧の、SHA-256 の先頭 16 桁）。ページかファイルの最初のリクエストが来たときに 1 回だけ作成し、ページの中の `/ui/` を `/ui/<ui-version>/` に置き換えて提供します。ファイルの内容が変わらなければ、`<ui-version>` も変わりません。
-- `<ui-version>` の無い `/ui/<name>`、違う `<ui-version>` のパス、36 個に無い名前は、どれも API の表に回って 404 になります。ページと、`<ui-version>` の下のファイルに `GET` と `HEAD` 以外のメソッドを送ると、405（`Allow: GET, HEAD`）になります。
-- ページとファイルの応答のヘッダー:
+- The files are in `proxy/admin-ui/`, and are built into the executable. The admin process and the admin screens are always the same version. The admin process does not read any files of the host.
+- The only paths that it serves are `GET /` (the page) and `GET /ui/<ui-version>/<name>` (a style sheet, an icon, and 34 scripts, 36 files in all). The name of a script is its path from `proxy/admin-ui/js/` (`js/app.js` is `/ui/<ui-version>/app.js`, and `js/waf/waf.js` is `/ui/<ui-version>/waf/waf.js`). No session is needed (the files contain no secret).
+- `<ui-version>` in the path is 16 lowercase hexadecimal digits made from the names and contents of the 36 files (the first 16 digits of the SHA-256 of a list that has the name and the SHA-256 of each file). It is made once, when the first request for the page or a file comes, and the page is served with `/ui/` in it replaced by `/ui/<ui-version>/`. If the contents of the files do not change, `<ui-version>` does not change either.
+- `/ui/<name>` without `<ui-version>`, a path with a different `<ui-version>`, and a name that is not one of the 36 all fall through to the table of the API and get 404. A method other than `GET` and `HEAD` for the page and for the files under `<ui-version>` gets 405 (`Allow: GET, HEAD`).
+- The headers of the responses for the page and the files:
 
-| ヘッダー | 値 |
+| Header | Value |
 |---|---|
-| `Cache-Control` | ページは `no-store`。`<ui-version>` の下のファイルは `public, max-age=31536000, immutable` |
+| `Cache-Control` | The page is `no-store`. The files under `<ui-version>` are `public, max-age=31536000, immutable` |
 | `X-Content-Type-Options` | `nosniff` |
 | `Content-Security-Policy` | `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'` |
 | `Referrer-Policy` | `same-origin` |
@@ -957,186 +959,186 @@ managed 設定は、サイトと証明書、アップストリーム、ルート
 | `Cross-Origin-Resource-Policy` | `same-origin` |
 | `Permissions-Policy` | `accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()` |
 
-- ページは毎回読み込まれ、そのときの `<ui-version>` のパスでファイルを指定します。`<ui-version>` の下のファイルは内容が変わらないので、ブラウザーは 1 年までキャッシュを使います。画面のファイルが変わった実行ファイルで管理プロセスを再起動すると、`<ui-version>` が変わり、ブラウザーはそのときだけ新しいパスのファイルを読み込みます。
-- 画面のスクリプトは、文字列からマークアップを作成できません（Trusted Types）。画面は、自分のスクリプトとスタイルとアイコンを読み込み、自分の API を呼び出す以外のことはできません。
-- API の応答の `Referrer-Policy` は `no-referrer`、画面のファイルの応答は `same-origin` です。
+- The page is loaded every time, and refers to the files with the path of the `<ui-version>` at that time. The files under `<ui-version>` never change, so the browser uses its cache for up to a year. When you restart the admin process with an executable in which the files of the screens changed, `<ui-version>` changes, and the browser loads the files with the new path only then.
+- The scripts of the screens cannot make markup from a string (Trusted Types). The screens can do nothing except load their own scripts, styles, and icons, and call their own API.
+- `Referrer-Policy` of API responses is `no-referrer`, and that of the files of the screens is `same-origin`.
 
-言語と保存:
+Language and storage:
 
-- 言語は日本語と英語です。選択した言語が保存されていればそれを、無ければブラウザーの言語（`ja` で始まれば日本語、`en` で始まれば英語）を、どちらでもなければ英語を使います。画面上部の帯で切り替えられます。
-- テーマ（自動、ライト、ダーク）と、時刻の表示方法（ローカルか UTC）も、画面上部の帯で選べます。ブラウザーのストレージ（`localStorage`）に保存するのは、この言語とテーマと時刻の表示方法の 3 つだけです。パスワード、認証コード、リカバリーコード、API トークン、CSRF トークン、二要素認証のセットアップキー、managed 設定の下書き（下の「下書き」）は、どれも画面のメモリにだけ置きます。一度しか返さないもの（リカバリーコード、API トークン、設定中のセットアップキー）も、画面を離れると破棄します。ただし、二要素認証の設定を確定した応答が画面を離れた後に届いたときは、そのリカバリーコードを、次の画面に表示するまで保持します。ログアウトしたときやセッションが終了したときは、どれも破棄します。URL と履歴にも入れません。
-- 言語、テーマ、時刻の表示方法を切り替えても、画面は再描画せず、文字だけを置き換えます。入力した文字、選択したファイル、絞り込みは、そのまま残ります。
-- 二要素認証の QR コードは、画面の中で描画します（外部には何も送信しません）。
+- The languages are Japanese and English. The screens use the saved language if there is one, otherwise the browser language (Japanese if it starts with `ja`, English if it starts with `en`), and English if it is neither. You can switch the language in the bar at the top of the screen.
+- The theme (Auto, Light, Dark) and how times are shown (Local or UTC) can also be chosen in the bar at the top of the screen. The only things that the screens save in the browser storage (`localStorage`) are these three: the language, the theme, and how times are shown. The password, verification code, recovery codes, API token, CSRF token, secret of two-factor authentication, and draft of the managed configuration (see "Drafts" below) are all kept only in the memory of the screen. Those that are returned only once (the recovery codes, an API token, a secret that is being set up) are also discarded when you leave the screen. However, when the response that confirmed the two-factor setup arrives after you left the screen, its recovery codes are kept until they are shown on the next screen. At logout and when the session ends, all of these are discarded. They are not put in the URL or the history either.
+- When you switch the language, the theme, or how times are shown, the screen is not drawn again, and only the text is replaced. The text you entered, the files you selected, and the filters stay as they are.
+- The QR code of two-factor authentication is drawn inside the screen (nothing is sent outside).
 
-使える画面はロールで決まります。メニューは、画面を 7 つのまとまり（下の表の「メニュー」の列）ごとに並べ、ロールが使える画面だけを表示します。
+Which screens you can use depends on the role. The menu arranges the screens in 7 groups (the "Menu" column of the table below), and shows only the screens that the role can use.
 
-| メニュー | 画面 | ロール | 内容 |
+| Menu | Screen | Role | Content |
 |---|---|---|---|
-| （名前なし） | 概要 | viewer 以上 | プロキシの数（「リクエスト」「ブロック」「ポリシーで拒否」「アップストリームのエラー」「設定のリロード」の 5 つ。「リクエスト」の下に起動からの時間を添えます。内容は上の「一覧と内容」の `GET /api/status`）、プロキシの状態（全部のエンジンの準備ができているか、世代の切り替え中か）、エンジンごとの世代の状態、現在の設定ファイルの SHA-256 を表示します。エンジンごとの面には、エンジンの名前（デフォルトのエンジンには札「デフォルト」）、検査カーネルの段階、選択中の世代、稼働中の世代、モード、ロールバック先と、2 つの世代がどうなっているかの文を表示します。選択中の世代があるのにプロキシで稼働していないエンジンには、札「未起動」と、ルールの世代の画面でエンジンを起動する旨の文（「このエンジンには選択中の世代がありますが、プロキシで稼働していません。ルールの世代の画面で、エンジンを起動してください。」）を表示します。選択中の世代も稼働中の世代も無く、デフォルトのエンジンでもないエンジンは、表示しません。切り替えの途中ではないのに、どれかのエンジンで 2 つの世代が違うとき、または選択中の世代があるのにそのエンジンが稼働していないときは、画面上部の帯に警告を表示します。途中のときは、概要の画面にその旨だけを表示します。managed 設定を使っているときは、「managed 設定」の枠に、選択中のバージョンと稼働中のバージョン、2 つの「一致」「不一致」（反映の処理の間は「反映中」）を表示し、「設定のバージョンを開く」で設定のバージョンの画面へ移れます |
-| WAF | ルールの世代 | viewer 以上 | 世代の一覧と詳細（ファイル、読み込む順、検査除外のルート）を表示します。operator 以上は、世代のエンジンごとに、選択、プロキシの切り替え、エンジンの起動、削除ができます。選択は「この世代に切り替える」、選択中の世代にプロキシが追い付いていないときの切り替えは「プロキシに反映する」、選択中の世代があるエンジンがプロキシで稼働していないときの起動は「エンジンを起動する」です。マニフェストが読めずエンジンが分からない世代には、選択と起動のボタンを表示しません。どのエンジンの選択中の世代、稼働中の世代、ロールバック先も削除できません |
-| WAF | ルールのインポート | operator 以上 | ブラウザーでファイルを選択し、検査エンジン（Coraza か ModSecurity。初期値はデフォルトのエンジン。分からないときは Coraza）、CRS の使用と使わないファイル、検査除外のルート、検知のみを指定してインポートします。検査除外のルートは、ホスト（省略できます）とパスを 1 行に 1 つずつ書きます。説明には、「管理画面のルートは、デフォルトのエンジンで検査されます。インポートのリクエストが検査でブロックされるときは、デフォルトのエンジンの世代に、検査除外のルートを入れてください。」と表示します。アクションはいつも `bypass` で、送信するボディの `routes` は、`--routes` のファイルと同じ形式の JSON です。ホストだけの行はエラーとして表示し、何も書かない行は送信しません。上限をブラウザーでも数えます。事前検証でブロックされたら、確認を経て「ブロックを受け入れてインポートする」ができます。新しい世代は選択されません |
-| WAF | 切り替え履歴 | viewer 以上 | 切り替えの履歴（新しい順に 200 件まで。画面にもそのように書かれています。列「エンジン」は、`engine` の無い古い行では「—」）と、エンジンごとのロールバック先を表示します。operator 以上は、ロールバック先があるエンジンごとに、「前の世代にロールバックする」ができます |
-| ログ | アクセスログ | viewer 以上 | 条件を指定してログを検索します。条件「エンジン」（指定しない、Coraza、ModSecurity）で、検査したエンジンを絞り込めます。リクエストから来た文字は、`%XX` の形のまま表示します。リクエスト ID を持つログは、行の内容（メソッドとホストとパスなど）を押すと詳細を開きます。リクエスト ID は、内容の `title` 属性と、詳細の「すべての欄」と「JSON」に出ます。リクエスト ID を持たないログ（接続や、プロキシの文の行など）は、行の「詳細」で開きます。開くと、先に要点（結果の `class`・`status`・`reason`、ルール、`score`、時刻、クライアント、メソッドとホストとパス、世代、エンジン）を表示し、その下に、折りたたんだ「すべての欄」と「JSON」を置きます。「すべての欄」で「URL デコードした文字も表示する」を選択すると、デコードした文字も表示します |
-| ログ | 監査ログ | operator 以上 | 最新の 200 件（新しい順。画面にもそのように書かれています）を表示します。リクエスト ID がプロキシと管理プロセスの付与する形式のときは、その ID からアクセスログを開けます |
-| プロキシ | サイト | operator 以上 | managed 設定の下書きの、サイトの一覧と編集（名前、ホスト、証明書。証明書は、証明書チェーンと秘密鍵のファイルか ACME）。一覧と編集の面に、managed ストアにある証明書の有効期限、状態、証明書に含まれるホスト名を表示します（上の「証明書の情報」） |
-| プロキシ | アップストリーム | operator 以上 | 下書きの、デフォルトのアップストリームと、アップストリームの一覧と編集（エンジン、サーバー、TLS と CA のファイル）。エンジンは、「デフォルトのエンジン（Coraza）」（かっこの中は、デフォルトのエンジンの名前）、「Coraza」、「ModSecurity」から選びます。選択肢の説明は、[運用リファレンス](operator-reference.md) の「ModSecurity の世代」を指します。一覧の列「エンジン」には、検査するエンジンを表示します（デフォルトのエンジンに従うアップストリームには「（デフォルトのエンジン）」を添えます）。保存の前に、選んだエンジンに選択中の世代が無いとき、プロキシで稼働していないとき、起動中のとき、ModSecurity の検査プロセスが設定ファイルの `kernel.engines` に無いときは、その旨の注意を表示します |
-| プロキシ | ルート | operator 以上 | 下書きの、ルートの一覧と編集（ホスト、パス、アップストリーム。折りたたんだ部分に、アクセス制御、ストリーミング応答、書き換え）。1024 本まで読み込みます |
-| ポリシー | アクセス制御とレート制限 | operator 以上 | 下書きの、全体のアクセス制御とレート制限と、ホストごとの設定の一覧と編集（下の「ホストごとの設定の画面」） |
-| 設定 | 設定のバージョン | viewer 以上 | 選択中のバージョンと稼働中のバージョン、プロキシの状態、反映の状況、バージョンの一覧を表示します（下の「managed 設定の画面」）。operator 以上は、バージョンの内容（JSON と証明書）を表示し、名前で反映、削除、下書きの作成ができます。選択中のバージョン、稼働中のバージョン、ロールバック先は削除できません |
-| 設定 | 設定の変更履歴 | viewer 以上 | 設定の変更履歴（新しい順に 200 件まで。画面にもそのように書かれています）とロールバック先を表示します。設定ファイルが反映の前と後で違う行には「変更あり」を表示します。operator 以上は、「前のバージョンにロールバックする」ができます |
-| 設定 | 設定ファイル | operator 以上 | 設定ファイルの現在の値（上の「設定ファイルの値」）を表示します。ここでは変更できません。パスは表示せず、書かれていれば true、書かれていなければ「—」と表示します。稼働中のプロキシとの比較（「一致」か「不一致（リロード待ち）」）を表示します |
-| 管理 | アカウント | viewer 以上 | パスワードの変更、二要素認証の設定と無効化、API トークンの作成と削除 |
-| 管理 | ユーザー | owner | ユーザーの一覧、作成、ロールの変更、無効・有効、パスワードと二要素認証の初期化、全員の API トークンの一覧と削除 |
+| (no name) | Overview | viewer or above | It shows the numbers of the proxy (five: "Requests", "Blocked", "Refused by policy", "Upstream failures", and "Config reloads", with the time since the start added under "Requests"; for the contents, see `GET /api/status` under "Listing and Contents" above), the state of the proxy (whether all engines are ready, and whether a generation switch is in progress), the state of the generations for each engine, and the SHA-256 of the current configuration file. The panel of each engine shows the name of the engine (the badge "Default" for the default engine), the phase of the inspection kernel, the chosen generation, the running generation, the mode, the rollback target, and a sentence about what the two generations are doing. For an engine that has a chosen generation but is not running in the proxy, it shows the badge "Not running" and a sentence that says to start the engine on the Rule generations screen ("A generation is chosen for this engine, but the proxy does not run it. Start the engine on the Rule generations screen."). An engine that has neither a chosen generation nor a running generation, and is not the default engine, is not shown. When no switch is in progress but the two generations differ for any engine, or when a generation is chosen but that engine is not running, a warning is shown in the bar at the top of the screen. While a switch is in progress, only a message to that effect is shown on the Overview screen. When the managed configuration is used, the "Managed configuration" panel shows the selected version and the running version, and "Matching" or "Different" for the two ("Applying" while an apply job is running), and "Open versions" moves to the Configuration versions screen |
+| WAF | Rule generations | viewer or above | It shows the list of generations and the detail (files, load order, bypass routes). An operator or above can choose, switch the proxy, start the engine, and remove, for each engine of the generation. Choosing is "Switch to this generation"; switching when the proxy has not caught up with the chosen generation is "Apply to the proxy"; starting an engine that has a chosen generation but is not running in the proxy is "Start the engine". For a generation whose manifest cannot be read, so that its engine is not known, the buttons for choosing and starting are not shown. The chosen generation, the running generation, and the rollback target of any engine cannot be removed |
+| WAF | Rule import | operator or above | Select files in the browser and import them, specifying the inspection engine (Coraza or ModSecurity; the initial value is the default engine, and Coraza if it is not known), whether to use the CRS and which files not to use, the bypass routes, and detect only. Write the bypass routes one per line, as a host (optional) and a path. The description says "The route of the admin page is inspected by the default engine. When the request of an import is blocked by the inspection, put a route that is not inspected into a generation of the default engine." The action is always `bypass`, and `routes` in the body that is sent is JSON of the same form as a `--routes` file. A line with only a host is shown as an error, and a line with nothing in it is not sent. The browser also counts the limits. If the trial is blocked, you can use "Accept the block and import" after a confirmation. The new generation is not chosen |
+| WAF | Switch history | viewer or above | It shows the history of switches (newest first, up to 200; the screen says so too; the "Engine" column shows "—" for old lines that have no `engine`) and the rollback target of each engine. An operator or above can roll back ("Roll back") for each engine that has a rollback target |
+| Logs | Access log | viewer or above | It searches the logs with conditions. The condition "Engine" (Any, Coraza, ModSecurity) narrows the logs by the engine that inspected. Text that came from a request is shown in the `%XX` form as it is. A log that has a request ID opens its detail when you press the content of the row (the method, host, and path, and so on). The request ID appears in the `title` attribute of the content, and in "All fields" and "JSON" of the detail. A log without a request ID (such as a connection or a sentence line of the proxy) is opened with "Open" on the row. When opened, it first shows the main points (the `class`, `status`, and `reason` of the result, the rule, `score`, the time, the client, the method, host, and path, the generation, and the engine), and below them a folded "All fields" and "JSON". In "All fields", if you select "Also show the text with %XX read", the decoded text is also shown |
+| Logs | Audit log | operator or above | It shows the newest 200 lines (newest first; the screen says so too). When the request ID is in the form that the proxy and the admin process give, you can open the access log from that ID |
+| Proxy | Sites | operator or above | The list and editing of the sites of the draft of the managed configuration (name, hosts, certificate; the certificate is the files of a certificate chain and a private key, or ACME). The list and the editing panel show the expiry, the state, and the host names in the certificate that are in the managed store (see "Certificate Information" above) |
+| Proxy | Upstreams | operator or above | The default upstream of the draft, and the list and editing of the upstreams (engine, servers, TLS, and CA file). The engine is chosen from "Default engine (Coraza)" (the parentheses hold the name of the default engine), "Coraza" and "ModSecurity". The explanation of the choices points to "ModSecurity Generations" in the [operator reference](operator-reference.md). The "Engine" column of the list shows the engine that inspects ("(default engine)" is added for an upstream that follows the default engine). Before saving, a notice is shown when the chosen engine has no chosen generation, is not running in the proxy, is starting, or when the inspector process of ModSecurity is not in `kernel.engines` of the configuration file |
+| Proxy | Routes | operator or above | The list and editing of the routes of the draft (host, path, upstream; in the folded part, access control, streaming responses, and rewrite). It loads up to 1024 routes |
+| Policy | Access control and rate limits | operator or above | The list and editing of the global access control and rate limits of the draft, and of the host policies (see "Host policy screen" below) |
+| Configuration | Configuration versions | viewer or above | It shows the selected version and the running version, the state of the proxy, the state of the apply, and the list of versions (see "Managed configuration screens" below). An operator or above can show the contents of a version (JSON and certificates), apply by name, remove, and make a draft. The selected version, the running version, and the rollback target cannot be removed |
+| Configuration | Configuration history | viewer or above | It shows the configuration history (newest first, up to 200; the screen says so too) and the rollback target. A line where the configuration file differs before and after the apply shows "Changed". An operator or above can roll back ("Roll back to the previous version") |
+| Configuration | Configuration file | operator or above | It shows the current values of the configuration file (see "Configuration File Values" above). It cannot be changed here. It does not show paths; it shows true if a path is written, and "—" if not. It shows a comparison with the running proxy ("The same" or "Different (waiting to be read)") |
+| Admin | Account | viewer or above | Changing the password, setting up and disabling two-factor authentication, and creating and removing API tokens |
+| Admin | Users | owner | The list of users, creating, changing the role, disabling and enabling, resetting passwords and two-factor authentication, and the list and removal of the API tokens of everyone |
 
-- 概要の数がプロキシから得られないときは、数の代わりに「—」と短い語を表示し、0 とは区別します。理由は、プロキシの面に 1 回だけ表示します。理由は、プロキシに接続できない（`reachable` が `false`）、プロキシが処理中（`proxy` が `null`）、そのプロキシが数を返さない（以前のバージョンのプロキシで、値が `null`）のどれかです。設定ファイルの SHA-256 も同じです。
-- エンジンごとの表示には、次の注意を表示します。
-  - 管理プロセスとプロキシで、デフォルトのエンジンが違うとき（片方だけを再起動したとき）は、デフォルトの札を出さず、概要、ルールのインポート、アップストリームの画面に「管理プロセスとプロキシで、デフォルトのエンジンが違います。両方を再起動してそろえてください。」と表示します。
-  - 以前のバージョンのプロキシ（`engines` を返さないもの）には、概要、ルールの世代、切り替え履歴の画面に「このプロキシはエンジンごとの状態を返しません。管理プロセスとプロキシを同じビルドにそろえてください。」と表示し、世代の選択、プロキシへの反映、エンジンの起動、ロールバックのボタンは表示しません（[運用リファレンス](operator-reference.md) の「バージョンの更新」）。
-- 世代の選択、ロールバック、削除は、先に確認を表示します。確認には、「現在」と「切り替え後」（ロールバックでは「ロールバック後」、削除では「削除後」）の世代を、フィンガープリント（先頭 12 桁）、モード、エンジン、検査除外のルート数の表で並べ、変わる値を太字にします。選択の「現在」は選択中の世代、「切り替え後」は選択する世代で、プロキシが選択中の世代と違う世代を使っているときは、その世代も表示します。ロールバックの「ロールバック後」はロールバック先で、削除の「削除後」はどれも「なし」です。分からない値は「—」になります。プロキシで稼働していないエンジンの確認（そのエンジンに選択中の世代が無いときの最初の選択、選択中の世代での起動、ロールバックを含みます）には、そのエンジンを起動する旨も表示し、「このエンジンは、プロキシを再起動した後も起動します。稼働中に失敗すると、プロキシ全体が停止します。使わなくなったら、rules deactivate コマンドで選択を解除してください。」を添えます（[運用リファレンス](operator-reference.md) の「エンジンごとの選択中の世代」）。インポートは確認なしで送信し、事前検証のブロックを受け入れてインポートし直すときだけ確認を表示します。実行中は、ほかの変更を始められません。
-- 結果が分からないとき（ボディに `result` が無い 502 と 504、接続が切れた）は、世代の選択とロールバックでは行き先のエンジンの状態と履歴を、インポートでは世代の一覧の新しい方から 3 つを、削除では世代の一覧を再読み込みして表示します。managed 設定の変更で、変更が始まったか分からないときは、「結果不明」として状態を再読み込みして表示します。
-- 画面は、時間をおいて自分から再読み込みすることはありません。例外は managed 設定の反映の処理で、画面は、反映の処理が終わるまで、前の応答の 1 秒後に `GET /api/managed/job` を読んで状態を確認し続けます。読めない応答が 3 回続くか、反映の処理にかかる可能性のある時間を過ぎると、確認をやめ、その旨を表示します。確認の間はリクエストのたびにセッションが使われたことになるので、セッションは `admin.session_idle_ms` では終了しません（`admin.session_total_ms` では終了します）。プロキシを通して使っているときは、ログの残し方が `security` でなければ、確認の 1 回ごとに、プロキシのログに 1 行が入ります。画面から変更したときは、それに関わる表示を再読み込みします。最新にするには「再読み込み」を使います（インポートの画面にはありません）。
-- 一覧の表は、並べ替えられる列の名前を押すと、その列で並べ替えます（押すたびに昇順と降順が切り替わり、値の無い行は後ろに来ます）。表の上の欄に語を入力すると、セルに見えている文字がその語をすべて含む行に絞り込みます（語は空白で区切り、大文字と小文字は区別しません。操作のボタンの列は対象にしません）。行は 50 行ずつのページに分け、「前へ」と「次へ」で進みます。並べ替えと絞り込みは、画面が読み込んだ行の中だけで行います。世代に含まれる検査除外のルートの表など、絞り込みの欄が無い小さな表もあります。
-- アクセスログは、`GET /api/records` の 1 回の応答（500 行まで）を、50 行ずつのページで表示します。応答に続き（`next`）があれば、最後のページの「次へ」で続きの古いログを読み込みます。最初のページの「前へ」で、前に読み込んだ新しい方に戻ります。続きの位置は URL に入らないので、URL を開き直すと最初から読み込みます。
-- 画面の場所は、URL の `#` の後に入ります。`#/<screen>`（`overview`、`generations`、`import`、`history`、`records`、`audit`、`sites`、`upstreams`、`routes`、`policy`、`managed`、`managed-history`、`config`、`account`、`users`）のほか、世代の詳細は `#/generations/<fingerprint>`、バージョンの内容は `#/managed/<version>`、ログの 1 件は `#/records/<id>`、ログの検索は `#/records?<key>=<value>`（条件の名前は `GET /api/records` と同じで、続きの位置を除きます）です。移動するたびにブラウザーの履歴に入るので、ブラウザーの戻る操作と進む操作で行き来できます。URL を開き直しても、同じ画面になります。
-- URL の中の値は、使う前に形式を検証します。形式の違う値、画面が認識しない条件、余分な部分は、使わずに URL から取り除き、「アドレスの正しくない部分を取り除きました。」と表示します。未知の画面と、ロールが使えない画面は、概要を開きます。ログの 1 件は、読み込んだ行に無ければ、そのリクエスト ID の条件で読み出し、見つからなければその旨を表示します。
-- 時刻は 1 つの表示方法で表示します。初期状態ではローカルの時刻（`2026-11-04 16:33:56（JST）` の形。括弧の中は、ブラウザーが返すタイムゾーンの短い名前で、`JST` や `GMT+8` などになります）で、画面上部の帯の「時刻」で UTC（`（UTC）`）に切り替えられます。表では、タイムゾーンの名前を列の名前に 1 回だけ書き（`時刻（JST）` など）、セルには書きません。夏時間などで列の名前と違うタイムゾーンの時刻だけ、セルにもタイムゾーンを書きます。もう一方の表示方法は、その時刻の `title` 属性（ポインターを重ねると表示される文字）に表示されます。ログの検索の `from` と `to` は、この切り替えに関わらず、UTC の RFC 3339（`Z` で終わる）で書きます。
-- ログインの後、パスワード変更待ちと二要素認証の設定待ちのときは、その画面だけを表示します。
-- 画面は、ブラウザーの `fetch` で管理 API を呼び出します。API の応答の文（`error`）は、画面が言語ごとの文に置き換えます。
-- 応答に `error` の文が無い失敗（手前に置いたプロキシがルールでブロックしたリクエストの 403、プロキシが管理プロセスに接続できなかった 502 など）では、画面は失敗の文の後に、応答の `X-Request-ID` のリクエスト ID を表示します。その ID で「アクセスログ」の画面を検索すると、ブロックしたルールなどが分かります（上の「管理画面の Host での CRS の調整」）。ID は、プロキシと管理プロセスが付与する形式のときだけ表示します。
+- When the numbers of the Overview cannot be obtained from the proxy, the screen shows "—" and a short word in place of the numbers, so that they are distinguished from 0. The reason is shown only once, in the panel of the proxy. The reason is one of these: the proxy cannot be reached (`reachable` is `false`), the proxy is busy (`proxy` is `null`), or that proxy does not return the numbers (a proxy of an earlier version, where the value is `null`). The SHA-256 of the configuration file is treated the same way.
+- The display for each engine shows these notices.
+  - When the default engine differs between the admin process and the proxy (when only one of them was restarted), the "Default" badge is not shown, and "The admin process and the proxy have different default engines. Restart both to make them the same." is shown on the Overview, Rule import, and Upstreams screens.
+  - For a proxy of an earlier version (one that does not return `engines`), "This proxy does not report the state of its engines. Use the same build for the admin process and the proxy." is shown on the Overview, Rule generations, and Switch history screens, and the buttons for choosing a generation, applying to the proxy, starting an engine, and rolling back are not shown (see "Version Updates" in the [operator reference](operator-reference.md)).
+- Choosing, rolling back, and removing a generation show a confirmation first. The confirmation puts the generation "Now" and the generation "After the switch" ("After the rollback" for a rollback, "After the delete" for a removal) side by side in a table of the fingerprint (first 12 digits), the mode, the engine, and the number of bypass routes, and shows the values that change in bold. For choosing, "Now" is the chosen generation and "After the switch" is the generation to choose, and if the proxy is using a generation different from the chosen one, that generation is also shown. For a rollback, "After the rollback" is the rollback target, and for a removal, "After the delete" is "Gone" for every item. A value that is not known is "—". The confirmation for an engine that is not running in the proxy (including the first choice when the engine has no chosen generation, starting with the chosen generation, and a rollback) also says that the engine will be started, and adds "This engine will start again after the proxy is restarted. If it fails while it runs, the whole proxy stops. When you no longer use it, remove its choice with the rules deactivate command." (see "Chosen Generation per Engine" in the [operator reference](operator-reference.md)). An import is sent without a confirmation, and a confirmation is shown only when you accept the block of the trial and import again. While one is running, no other change can be started.
+- When the result is not known (a 502 or 504 whose body has no `result`, or a dropped connection), a choice and a rollback read again and show the state and the history of the engine that the switch was for; an import reads again and shows the newest three of the list of generations; a removal reads again and shows the list of generations. When a change of the managed configuration was sent and it is not known whether the change started, the screen reads the state again and shows it as "Result unknown".
+- The screens never read again by themselves after a time. The exception is the apply job of the managed configuration: until the apply job ends, the screen reads `GET /api/managed/job` 1 second after the previous response to check the state. If it cannot read a response 3 times in a row, or when the time that an apply job may take has passed, it stops checking and shows a message to that effect. While it checks, every request counts as a use of the session, so the session does not end by `admin.session_idle_ms` (it does end by `admin.session_total_ms`). When you use the screens through the proxy, and what the logs keep is not `security`, each check adds one line to the log of the proxy. When you change something from a screen, the related displays are read again. To get the latest data, use "Reload" (the Rule import screen does not have it).
+- In the table of a list, pressing the name of a column that can be sorted sorts by that column (each press switches between ascending and descending, and rows with no value come last). If you type words in the field above the table, it narrows to the rows whose visible text in the cells has all the words (words are separated by spaces, and case is not distinguished; the column of operation buttons is not searched). Rows are divided into pages of 50, and you move with "Previous" and "Next". Sorting and narrowing are done only among the rows that the screen has loaded. Some small tables, such as the table of bypass routes in a generation, have no field for narrowing.
+- The Access log shows one response of `GET /api/records` (up to 500 lines) in pages of 50 lines. If the response has a continuation (`next`), "Next" on the last page loads the older logs that follow. "Previous" on the first page goes back to the newer ones that were loaded before. The position to continue from is not put in the URL, so if you open the URL again, it loads from the start.
+- The screen is identified by the part of the URL after `#`. It is `#/<screen>` (`overview`, `generations`, `import`, `history`, `records`, `audit`, `sites`, `upstreams`, `routes`, `policy`, `managed`, `managed-history`, `config`, `account`, `users`); in addition, the detail of a generation is `#/generations/<fingerprint>`, the contents of a version are `#/managed/<version>`, one log is `#/records/<id>`, and the search of the logs is `#/records?<key>=<value>` (the names of the conditions are the same as for `GET /api/records`, except the position to continue from). Every move enters the history of the browser, so you can go back and forward with the back and forward operations of the browser. If you open the URL again, you get the same screen.
+- The values in the URL are validated for their form before they are used. A value in the wrong form, a condition that the screen does not recognize, and extra parts are not used and are removed from the URL, and "Removed what was not valid in the address." is shown. An unknown screen, and a screen that the role cannot use, open the Overview. For one log, if it is not in the rows that were loaded, the screen reads it with the condition of that request ID, and if it is not found, it shows a message to that effect.
+- Times are shown in one way. By default they are local times (in the form `2026-11-04 16:33:56 (JST)`; the parentheses hold the short name of the time zone that the browser returns, such as `JST` or `GMT+8`), and "Time" in the bar at the top of the screen switches them to UTC (`(UTC)`). In a table, the name of the time zone is written once in the name of the column (`Time (JST)` and so on), not in the cells. Only a time in a time zone different from the one in the column name (because of summer time, for example) also has the time zone in its cell. The other way of showing a time appears in the `title` attribute of that time (the text shown when you hold the pointer over it). `from` and `to` of the search of the logs are always written in RFC 3339 in UTC (ending in `Z`), whichever is selected.
+- After login, while the session is waiting for a password change or for two-factor setup, only that screen is shown.
+- The screens call the admin API with `fetch` of the browser. The screens replace the sentence of an API response (`error`) with a sentence in each language.
+- For a failure with no `error` sentence in the response (a 403 for a request that a proxy in front blocked by a rule, a 502 where the proxy could not connect to the admin process, and so on), the screen shows the request ID of `X-Request-ID` of the response after the sentence about the failure. If you search the "Access log" screen with that ID, you can find the rule that blocked the request and so on (see "CRS Tuning for the Admin Host" above). The ID is shown only when it is in the form that the proxy and the admin process give.
 
-managed 設定の画面:
+Managed configuration screens:
 
-- 管理プロセスが managed 設定なしで起動しているときは、設定のバージョンの画面と編集の画面に、managed 設定でできることと、使い始めるまでの手順の要点を表示します。手順は [運用リファレンス](operator-reference.md) の「managed 設定への移行」に従います。
-- 設定のバージョンの画面は、選択中のバージョン、稼働中のバージョン、プロキシの状態（「接続可」「接続不可」「プロキシが処理中」「managed 設定は未使用」「リロード中」）を表示します。2 つのバージョンが違うときは、その通知と、operator 以上には「選択中のバージョンをもう一度反映する」と「稼働中のバージョンを選択し直す」の 2 つの操作を表示します。前者はプロキシを選択中のバージョンに切り替え、後者は稼働中のバージョンを名前で反映して選択中のバージョンにします。
-- 設定ファイルが、稼働中のプロキシが読み込んだ内容と違うとき（`GET /api/config` の `sha256` が `/api/status` の `proxy.config` と違う）は、その旨を表示します。この画面から反映すると、設定ファイルの変更も一緒に反映されます。設定ファイルにエラーがあると、反映は拒否されます。
-- 名前で反映（「このバージョンを反映する」）、ロールバック、2 つのバージョンをそろえる操作、削除（「このバージョンを削除する」）は、先に確認を表示します。確認には、「現在」と「反映後」（削除では「削除後」）のバージョンを、サイト数、アップストリーム数、エンジンごとのアップストリーム数（「Coraza のアップストリーム数」「ModSecurity のアップストリーム数」。デフォルトのエンジンが分からないときは、「エンジンを指定したアップストリーム数」の 1 行）、ルート数、デフォルトのアップストリーム、全体のアクセス制御、全体のレート制限、ホストごとの設定数の表で並べ、反映では「各サーバーのダウン判定と、アップストリームの失敗回数はリセットされます。」も表示します。名前で反映、ロールバック、2 つのバージョンをそろえる操作では、検知のみのモードの世代が稼働しているエンジンについて、反映後のバージョンにそのエンジンのアップストリームがあれば、「反映後」の値に札「現在 検知のみ」を添えます。
-- 変更を送信すると、反映の処理が終わるまで「反映中」と表示し、終わると、結果（「反映済み」「拒否」「使用中」など）と、起きたこと、次にすることを表示します。プロキシが、反映を `fixed` で拒否したときは、「稼働中は変更できない設定キーが変更されているか、アップストリームのエンジンがプロキシで稼働していません。」と、次にすること（「エンジンが稼働していないときは、ルールの世代の画面でそのエンジンを起動してから、もう一度反映してください。それ以外は、変更できない設定キーを元に戻すか、プロキシを再起動してください。」）を表示します。名前で反映とロールバックの 409 の `at` が `upstreams.<name>.engine` のときは、拒否の文の前に、「アップストリーム app:」のようにアップストリームの名前を添えます。
-- バージョンの内容（`#/managed/<version>`）は operator 以上だけが開けます。内容は秘密を含む可能性があるので、開いている間だけ画面のメモリに置きます。選択中でないバージョンでは、「このバージョンから下書きを作成する」で、そのバージョンから下書きを作成できます。
+- When the admin process was started without the managed configuration, the Configuration versions screen and the editing screens show what the managed configuration can do and the main points of the steps until you start using it. The steps follow "Moving to the Managed Configuration" in the [operator reference](operator-reference.md).
+- The Configuration versions screen shows the selected version, the running version, and the state of the proxy ("Reachable", "Not reachable", "Proxy busy", "Not using the managed configuration", "Reading its configuration again"). When the two versions differ, it shows a notice about it, and, to an operator or above, two operations: "Apply the selected version again" and "Select the running version". The former switches the proxy to the selected version, and the latter applies the running version by name and makes it the selected version.
+- When the configuration file differs from what the running proxy has read (`sha256` of `GET /api/config` differs from `proxy.config` of `/api/status`), the screen says so. If you apply from this screen, the changes of the configuration file are also applied. If the configuration file has an error, the apply is refused.
+- Apply by name ("Apply this version"), rollback, the operation that makes the two versions the same, and removal ("Remove this version") show a confirmation first. The confirmation puts the version "Now" and the version "After applying" ("After removing" for a removal) side by side in a table of the number of sites, the number of upstreams, the number of upstreams for each engine ("Coraza upstreams" and "ModSecurity upstreams"; when the default engine is not known, one row "Upstreams that name an engine"), the number of routes, the default upstream, the global access control, the global rate limit, and the number of host policies, and for an apply it also shows "The marks of servers that have failed and the failure counts of the upstreams start again." For apply by name, rollback, and the operation that makes the two versions the same, for an engine whose generation is running as a detect-only generation, if the version after the apply has an upstream of that engine, the badge "Detect only now" is added to the value of "After applying".
+- When you send a change, "Applying" is shown until the apply job ends, and when it ends, the result ("Applied", "Refused", "Busy", and so on), what happened, and what to do next are shown. When the proxy refused the apply with `fixed`, it shows "A key that cannot change while the proxy runs is different, or the engine of an upstream is not running in the proxy." and the next step ("If the engine is not running, start it on the Rule generations screen, then apply again. Otherwise put that key of the configuration file back, or restart the proxy."). When `at` of a 409 of apply by name or rollback is `upstreams.<name>.engine`, the name of the upstream is added before the sentence of the refusal, as in "Upstream app:".
+- The contents of a version (`#/managed/<version>`) can be opened only by an operator or above. The contents may include secrets, so they are kept in the memory of the screen only while they are open. For a version that is not the selected one, "Make a draft from this version" makes a draft from that version.
 
-下書き:
+Drafts:
 
-- サイト、アップストリーム、ルート、アクセス制御とレート制限の 4 つの画面は、managed 設定の 1 つの下書きを編集します。下書きは、選択中のバージョンから作成します（バージョンの内容の画面から、ほかのバージョンからも作成できます）。ここでの変更は、「保存して反映する」を押すまで有効になりません。
-- 下書きは、このページのメモリにだけあります。ブラウザーのストレージ、URL、履歴には入れません。ログアウトしたとき、操作がないままセッションが切れたとき、タブを閉じたときに失われます。変更のある下書きを残してページを離れようとすると、ブラウザーが確認を表示します。
-- 下書きに入力している間は、30 秒に 1 回まで `GET /api/session` を送信し、セッションを延長します（入力はセッションを使ったことになります）。
-- 画面上部の帯に、元のバージョンと「変更あり」か「変更なし」を表示します。「変更あり」は、下書きから作成するバージョンが元のバージョンと違うときだけです。入力して元に戻した下書きは「変更なし」になります。入力の形式にエラーのある下書きは「変更あり」になります。
-- 帯の「検証する」は `POST /api/managed/check` を送信し、拒否されたらエラーをその欄に表示します（下の「応答の形式」の `at`）。「保存して反映する」は、検証、確認、`POST /api/managed/apply` の順に進みます。「変更なし」の下書きは保存できません（検証は「元のバージョンと同じで、変更はありません。」と表示します）。
-- 「保存して反映する」の確認には、保存する変更（アップストリーム、デフォルトのアップストリーム、アクセス制御、レート制限、ホストごとの設定、サイト、ルートの追加・削除・変更）を名前で並べ、値は表示しません（書き換えに秘密を書けるためです）。アップストリームのエンジンが替わるとき（2 つのバージョンの両方にあるアップストリームだけ）は「アップストリームのエンジン」、エンジンの指定の付け外しだけで検査するエンジンが同じときは「アップストリームのエンジンの指定」として並べます。検知のみのモードの世代を選択中のエンジンで検査するアップストリームがあるときは、「{n} 件のアップストリーム（{names}）は、検知のみの世代のエンジンで検査されます。ルールに一致したリクエストも遮断されません。」を表示します（`{n}` は数、`{names}` は名前。名前は 20 件までで、残りは「ほか 3 件」のように件数を表示します）。ACME の証明書が新しく必要なサイトがあるときは（`{n}` はその数）、「{n} 件のサイトで新しい証明書が必要です。acme renew で発行されるまで（タイマーに任せると最大 1 日あまり）、そのサイトのホストには TLS で接続できません。」を表示します。
-- 下書きの元のバージョンがもう選択中でないとき（ほかのユーザーかコマンドが先に変更した）は、そのままでは保存できません。
-- 証明書チェーン、秘密鍵、CA の PEM のファイルは、ブラウザーで読み込み、UTF-8 のテキストで 1 MiB 以下かを検証し、送信するテキストの SHA-256 で指定します。ファイルの内容は表示しません。SHA-256 をブラウザーの暗号機能で計算するので、安全な接続（https か localhost）でだけ選択できます。読み込んだバイト列は使い終わるとすぐに 0 で埋めますが、テキストはブラウザーの中で 0 で埋められず、どこからも参照されなくなるまでメモリに残ります。
+- The four screens Sites, Upstreams, Routes, and Access control and rate limits edit one draft of the managed configuration. The draft is made from the selected version (it can also be made from another version on the screen for the contents of a version). A change made here has no effect until you press "Save and apply".
+- The draft is only in the memory of this page. It is not put in the browser storage, the URL, or the history. It is lost when you log out, when the session ends without any operation, and when you close the tab. If you try to leave the page with a draft that has changes, the browser shows a confirmation.
+- While you type into the draft, `GET /api/session` is sent at most once every 30 seconds to extend the session (typing counts as using the session).
+- The bar at the top of the screen shows the base version and "Changed" or "No changes". "Changed" appears only when the version that would be made from the draft differs from the base version. A draft that you typed into and then put back is "No changes". A draft that has an error in the form of its input is "Changed".
+- "Check" in the bar sends `POST /api/managed/check` and, if it is refused, shows the error in its field (see `at` of "Response Format" below). "Save and apply" goes through the check, a confirmation, and `POST /api/managed/apply`, in this order. A draft with "No changes" cannot be saved (the check says "This is the same as the base version: nothing has changed.").
+- The confirmation of "Save and apply" lists the changes to save (adding, removing, and changing upstreams, the default upstream, access control, rate limits, host policies, sites, and routes) by name, and does not show the values (because a rewrite can hold a secret). When an upstream engine changes (only for upstreams that are in both versions), it is listed as "Upstream engine", and when only the setting of the engine was added or removed and the engine that inspects is the same, as "Upstream engine setting". When there are upstreams that are inspected by an engine whose chosen generation is a detect-only generation, it shows "{n} upstream(s) ({names}) are inspected by an engine whose generation only detects. A request that matches a rule is not blocked." (`{n}` is the number and `{names}` are the names. Up to 20 names are shown, and the rest are shown as a count such as "3 more"). When there is a site that needs a new ACME certificate (`{n}` is that number), it shows "{n} site(s) need a new certificate. Until acme renew issues it (a little over a day at most when left to the timer), the hosts of the site cannot be reached over TLS."
+- When the base version of the draft is no longer the selected one (another user or a command changed it first), it cannot be saved as it is.
+- The PEM files of the certificate chain, private key, and CA are read in the browser, validated as UTF-8 text of 1 MiB or less, and specified by the SHA-256 of the text that is sent. The contents of a file are not shown. The SHA-256 is calculated with the cryptography functions of the browser, so a file can be selected only over a secure connection (https or localhost). The bytes that were read are filled with 0 as soon as they have been used, but the text is not filled with 0 inside the browser, and stays in memory until nothing refers to it.
 
-ホストごとの設定の画面:
+Host policy screen:
 
-- アクセス制御とレート制限の画面は、上から、「全体の設定とホストごとの設定は、管理画面のルートには適用されません。」の注意、全体のアクセス制御とレート制限の枠、ホストごとの設定の一覧と「ホストごとの設定を追加する」、開いたホストごとの設定を編集する面を並べます。
-- ホストごとの設定の設定キー、ホストの比較の決まり、重ね方については、[運用リファレンス](operator-reference.md) の「ホストごとの設定（`host_policies`）」を参照してください。
-- 編集の面では、名前と、ホスト（1 行に 1 つ）を書き、アクセス制御とレート制限のそれぞれで、次の 3 つから選びます。切り替えても、入力は下書きに残ります。
-  - 「引き継ぐ」: 全体の設定を、このホストにも適用します。レート制限は、全体と同じカウンターで数えます。
-  - 「このホストの設定」: 全体の設定の代わりに、この面の値を適用します。全体のアクセス制御は引き継がれません。レート制限は、このホスト用のカウンターで数えます。
-  - 「使わない」: このホストには適用しません。アクセス制御では、全体の拒否もこのホストには適用されません。
-- 全体のアクセス制御かレート制限を変更する下書きでは、全体の枠と「保存して反映する」の確認に、「全体のアクセス制御を引き継がない {n} 件のホストごとの設定（{names}）には、この変更は効きません。」（`{n}` は数、`{names}` は名前。レート制限も同じ形）を表示します。「このホストの設定」と「使わない」のホストには、全体の変更（緊急の拒否を含む）が効かないためです。
-- 一覧には、「ホストごとの設定は、Host ヘッダーがそのホストであるリクエストにだけ適用されます。別のホストのリクエストが、デフォルトのアップストリーム、ホストのないルート、*. で始まるホストのルートを通って同じアップストリームに届くときは、全体の設定だけが適用されます。ホストごとにルートを書き、デフォルトのアップストリームを「なし」にすることをお勧めします。」と表示します。
-- `geo` の無い設定ファイルで国の指定を書くと、検証の `at` が、そのホストごとの設定のアクセス制御を示します。管理画面のルートと同じホストを書くと、検証の `at` が、その行を示します。
+- From the top, the Access control and rate limits screen has the notice "The global settings and the per-host settings do not apply to the route to this admin screen.", the panel of the global access control and rate limits, the list of host policies with "Add a per-host setting", and the panel for editing the host policy that is open.
+- For the setting keys of a host policy, the rules for comparing hosts, and how they are layered, see "Host Policies (`host_policies`)" in the [operator reference](operator-reference.md).
+- In the editing panel, write a name and the hosts (one per line), and choose one of these three for each of access control and rate limits. Your input stays in the draft when you switch.
+  - "Inherit": the global settings also apply to this host. The rate limit is counted with the same counter as the global one.
+  - "Settings for this host": the values in this panel apply in place of the global settings. The global access control is not inherited. The rate limit is counted with a counter for this host.
+  - "Not used": it does not apply to this host. For access control, even a global refusal does not apply to this host.
+- In a draft that changes the global access control or the global rate limit, the panel of the global settings and the confirmation of "Save and apply" show "This change does not reach the {n} per-host setting(s) that do not inherit the global access control ({names})." (`{n}` is the number and `{names}` are the names. The same form for rate limits). This is because global changes (including an urgent denial) do not take effect for hosts with "Settings for this host" or "Not used".
+- The list shows "A per-host setting applies only to requests whose Host header is one of its hosts. When a request for another host reaches the same upstream through the default upstream, a route with no host or a route whose host starts with *., only the global settings apply to it. Write a route for each host, and set the default upstream to None."
+- If you write a country list in a configuration file that has no `geo`, `at` of the check shows the access control of that host policy. If you write the same host as the admin route, `at` of the check shows that row.
 
-## API のパスの一覧
+## API Paths
 
-「トークン」の列は、API トークンで使えるかどうかです。「状態」の列は、使えるセッションの状態です（通常は、状態による制限が無いこと。状態は上の「ログインと二要素認証」を参照してください）。
+The "Token" column shows whether an API token can be used. The "State" column shows the session states in which the API can be used ("Normal" means that there is no restriction by the state; for the states, see "Login and Two-Factor Authentication" above).
 
-| メソッド | パス | 最小のロール | トークン | 状態 | 内容 |
+| Method | Path | Minimum role | Token | State | Content |
 |---|---|---|---|---|---|
-| POST | `/api/login` | （不要） | × | | ログイン。`{"name", "password"}` |
-| POST | `/api/login/mfa` | viewer | × | 認証コード待ち | 二要素認証の確認。`{"code"}` か `{"recovery"}` |
-| POST | `/api/logout` | viewer | × | どの状態でも | ログアウト |
-| GET | `/api/session` | viewer | × | 認証コード待ち以外 | セッションの情報 |
-| PUT | `/api/account/password` | viewer | × | 通常、パスワード変更待ち | パスワードの変更。`{"current", "new"}` |
-| POST | `/api/account/mfa/setup` | viewer | × | 通常、二要素認証の設定待ち | 二要素認証の設定の開始。`{"password"}` |
-| POST | `/api/account/mfa/confirm` | viewer | × | 通常、二要素認証の設定待ち | 設定の確定。`{"code"}` |
-| DELETE | `/api/account/mfa` | viewer | × | 通常、二要素認証の設定待ち | 二要素認証を無効にします。`{"password", "code"}` |
-| GET | `/api/account/tokens` | viewer | × | 通常 | 自分の API トークンの一覧 |
-| POST | `/api/account/tokens` | viewer | × | 通常 | API トークンの作成 |
-| DELETE | `/api/account/tokens/<id>` | viewer | × | 通常 | 自分の API トークンの削除。ほかのユーザーの API トークンは 404 |
-| GET | `/api/status` | viewer | ○ | 通常 | プロキシと世代の状態 |
-| GET | `/api/generations` | viewer | ○ | 通常 | 世代の一覧 |
-| GET | `/api/generations/<fingerprint>` | viewer | ○ | 通常 | 世代の詳細 |
-| POST | `/api/generations` | operator | ○ | 通常 | インポート |
-| DELETE | `/api/generations/<fingerprint>` | operator | ○ | 通常 | 世代の削除 |
-| POST | `/api/activate` | operator | ○ | 通常 | 世代の選択とプロキシの切り替え |
-| POST | `/api/rollback` | operator | ○ | 通常 | 前の世代へのロールバック。`{"engine", "expect"}`（`engine` は省略できます） |
-| GET | `/api/history` | viewer | ○ | 通常 | 切り替えの履歴 |
-| GET | `/api/managed` | viewer | ○ | 通常 | managed 設定の状態 |
-| GET | `/api/managed/versions` | viewer | ○ | 通常 | managed 設定のバージョンの一覧 |
-| GET | `/api/managed/versions/<version>` | operator | ○ | 通常 | バージョンの内容 |
-| DELETE | `/api/managed/versions/<version>` | operator | ○ | 通常 | バージョンの削除 |
-| GET | `/api/managed/certificates/<version>` | operator | ○ | 通常 | バージョンに含まれるサイトの証明書の情報 |
-| POST | `/api/managed/check` | operator | ○ | 通常 | バージョンの検証。`{"version", "files", "expect"}`（`expect` は省略できます） |
-| POST | `/api/managed/apply` | operator | ○ | 通常 | バージョンを保存して反映します。`{"expect", "version", "files"}` |
-| POST | `/api/managed/activate` | operator | ○ | 通常 | 名前で反映。`{"expect", "version"}` |
-| POST | `/api/managed/rollback` | operator | ○ | 通常 | 前のバージョンへのロールバック。`{"expect"}` |
-| GET | `/api/managed/job` | viewer | ○ | 通常 | 最後の反映の処理 |
-| GET | `/api/managed/history` | viewer | ○ | 通常 | 設定の変更履歴 |
-| GET | `/api/config` | operator | ○ | 通常 | 設定ファイルの値 |
-| GET | `/api/records` | viewer | ○ | 通常 | ログの読み出し |
-| GET | `/api/audit` | operator | ○ | 通常 | 監査ログの最新 200 行 |
-| GET | `/api/users` | owner | × | 通常 | ユーザーの一覧 |
-| POST | `/api/users` | owner | × | 通常 | ユーザーの作成。`{"name", "role", "password"}` |
-| PUT | `/api/users/<name>` | owner | × | 通常 | ロールか有効・無効の変更。`{"role"}` か `{"disabled"}` のどちらか 1 つ |
-| POST | `/api/users/<name>/password` | owner | × | 通常 | ほかのユーザーのパスワードを決めます。`{"password"}` |
-| DELETE | `/api/users/<name>/mfa` | owner | × | 通常 | ほかのユーザーの二要素認証を無効にします |
-| GET | `/api/tokens` | owner | × | 通常 | 全員の API トークンの一覧 |
-| DELETE | `/api/tokens/<id>` | owner | × | 通常 | 全員の API トークンの削除 |
+| POST | `/api/login` | (none) | no | | Login. `{"name", "password"}` |
+| POST | `/api/login/mfa` | viewer | no | Waiting for a verification code | Verification of the two-factor code. `{"code"}` or `{"recovery"}` |
+| POST | `/api/logout` | viewer | no | Any state | Logout |
+| GET | `/api/session` | viewer | no | Not waiting for a verification code | Session information |
+| PUT | `/api/account/password` | viewer | no | Normal, waiting for a password change | Change the password. `{"current", "new"}` |
+| POST | `/api/account/mfa/setup` | viewer | no | Normal, waiting for two-factor setup | Start the two-factor setup. `{"password"}` |
+| POST | `/api/account/mfa/confirm` | viewer | no | Normal, waiting for two-factor setup | Confirm the setup. `{"code"}` |
+| DELETE | `/api/account/mfa` | viewer | no | Normal, waiting for two-factor setup | Disable two-factor authentication. `{"password", "code"}` |
+| GET | `/api/account/tokens` | viewer | no | Normal | List of your own API tokens |
+| POST | `/api/account/tokens` | viewer | no | Normal | Create an API token |
+| DELETE | `/api/account/tokens/<id>` | viewer | no | Normal | Remove your own API token. An API token of another user gives 404 |
+| GET | `/api/status` | viewer | yes | Normal | State of the proxy and the generations |
+| GET | `/api/generations` | viewer | yes | Normal | List of generations |
+| GET | `/api/generations/<fingerprint>` | viewer | yes | Normal | Detail of a generation |
+| POST | `/api/generations` | operator | yes | Normal | Import |
+| DELETE | `/api/generations/<fingerprint>` | operator | yes | Normal | Remove a generation |
+| POST | `/api/activate` | operator | yes | Normal | Choose a generation and switch the proxy |
+| POST | `/api/rollback` | operator | yes | Normal | Roll back to the previous generation. `{"engine", "expect"}` (`engine` can be omitted) |
+| GET | `/api/history` | viewer | yes | Normal | Switch history |
+| GET | `/api/managed` | viewer | yes | Normal | State of the managed configuration |
+| GET | `/api/managed/versions` | viewer | yes | Normal | List of versions of the managed configuration |
+| GET | `/api/managed/versions/<version>` | operator | yes | Normal | Contents of a version |
+| DELETE | `/api/managed/versions/<version>` | operator | yes | Normal | Remove a version |
+| GET | `/api/managed/certificates/<version>` | operator | yes | Normal | Certificate information of the sites in a version |
+| POST | `/api/managed/check` | operator | yes | Normal | Check a version. `{"version", "files", "expect"}` (`expect` can be omitted) |
+| POST | `/api/managed/apply` | operator | yes | Normal | Save a version and apply it. `{"expect", "version", "files"}` |
+| POST | `/api/managed/activate` | operator | yes | Normal | Apply by name. `{"expect", "version"}` |
+| POST | `/api/managed/rollback` | operator | yes | Normal | Roll back to the previous version. `{"expect"}` |
+| GET | `/api/managed/job` | viewer | yes | Normal | The last apply job |
+| GET | `/api/managed/history` | viewer | yes | Normal | Configuration history |
+| GET | `/api/config` | operator | yes | Normal | Values of the configuration file |
+| GET | `/api/records` | viewer | yes | Normal | Reading logs |
+| GET | `/api/audit` | operator | yes | Normal | The newest 200 lines of the audit log |
+| GET | `/api/users` | owner | no | Normal | List of users |
+| POST | `/api/users` | owner | no | Normal | Create a user. `{"name", "role", "password"}` |
+| PUT | `/api/users/<name>` | owner | no | Normal | Change the role or the enabled or disabled state. Either `{"role"}` or `{"disabled"}`, only one of them |
+| POST | `/api/users/<name>/password` | owner | no | Normal | Set the password of another user. `{"password"}` |
+| DELETE | `/api/users/<name>/mfa` | owner | no | Normal | Disable the two-factor authentication of another user |
+| GET | `/api/tokens` | owner | no | Normal | List of the API tokens of everyone |
+| DELETE | `/api/tokens/<id>` | owner | no | Normal | Remove an API token of anyone |
 
-- 「通常」の API は、パスワード変更待ちと二要素認証の設定待ちのセッションでは使えません。
-- 主な応答のボディ（時刻は、ユーザーと API トークンではミリ秒のエポック、世代の `made`、managed 設定のバージョンの `made`、反映の処理の `started` と `ended`、証明書の `not_after` では秒のエポック、履歴と監査ログの `ts` では RFC 3339）:
-  - `POST /api/login`、`POST /api/login/mfa`: `{"name", "role", "csrf", "mfa", "must_change"}` とクッキー
-  - `GET /api/session`: `{"name", "role", "csrf", "mfa", "recovery_left", "must_change", "state", "idle_expires_in_ms", "total_expires_in_ms"}`。`mfa` は二要素認証を設定しているかどうか
-  - `PUT /api/account/password`、`DELETE /api/account/mfa`: `{"csrf"}` と新しいクッキー。ほかのセッションは終了します。パスワードの変更では API トークンがすべて削除されます
-  - `POST /api/account/mfa/setup`: `{"secret", "uri"}`。`POST /api/account/mfa/confirm`: `{"csrf", "recovery"}` と新しいクッキー
-  - `GET /api/users`: `{"users": [..]}`（`name`、`role`、`disabled`、`mfa`、`must_change`、`created`、`changed`）。`POST /api/users` と `PUT /api/users/<name>` は、そのユーザーを返します
-  - `GET /api/account/tokens`、`GET /api/tokens`: `{"tokens": [..]}`（新しい順。秘密は含みません）
-  - `POST /api/managed/check`: 200 `{"version", "detect"}`。`POST /api/managed/apply`: 202 `{"version", "placed", "job"}`。`POST /api/managed/activate`、`POST /api/managed/rollback`: 202 `{"version", "job"}`。`DELETE /api/managed/versions/<version>`: 200 `{"removed", "cleaned"}`（上の「managed 設定の操作」）
+- An API marked "Normal" cannot be used by a session that is waiting for a password change or waiting for two-factor setup.
+- The main response bodies (times are epoch milliseconds for users and API tokens; epoch seconds for `made` of a generation, `made` of a version of the managed configuration, `started` and `ended` of an apply job, and `not_after` of a certificate; and RFC 3339 for `ts` of the histories and the audit log):
+  - `POST /api/login`, `POST /api/login/mfa`: `{"name", "role", "csrf", "mfa", "must_change"}` and a cookie
+  - `GET /api/session`: `{"name", "role", "csrf", "mfa", "recovery_left", "must_change", "state", "idle_expires_in_ms", "total_expires_in_ms"}`. `mfa` is whether two-factor authentication is set up
+  - `PUT /api/account/password`, `DELETE /api/account/mfa`: `{"csrf"}` and a new cookie. The other sessions end. A password change removes all API tokens
+  - `POST /api/account/mfa/setup`: `{"secret", "uri"}`. `POST /api/account/mfa/confirm`: `{"csrf", "recovery"}` and a new cookie
+  - `GET /api/users`: `{"users": [..]}` (`name`, `role`, `disabled`, `mfa`, `must_change`, `created`, `changed`). `POST /api/users` and `PUT /api/users/<name>` return that user
+  - `GET /api/account/tokens`, `GET /api/tokens`: `{"tokens": [..]}` (newest first; the secret is not included)
+  - `POST /api/managed/check`: 200 `{"version", "detect"}`. `POST /api/managed/apply`: 202 `{"version", "placed", "job"}`. `POST /api/managed/activate`, `POST /api/managed/rollback`: 202 `{"version", "job"}`. `DELETE /api/managed/versions/<version>`: 200 `{"removed", "cleaned"}` (see "Managed Configuration Operations" above)
 
-## 応答の形式
+## Response Format
 
-### 応答
+### Responses
 
-- 応答はどれも JSON で、次のヘッダーを持ちます（管理画面のファイルは別です。上の「管理画面」）: `Content-Type: application/json`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`、`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`、`Referrer-Policy: no-referrer`、`X-Request-ID`（リクエスト ID）。
-- リクエスト ID は、`admin.trusted_proxies` に入る相手からのリクエストが持つ `X-Request-ID` が、プロキシの付与する形式（16 桁の小文字の 16 進数、`-`、1〜16 桁の数字）のときは、その値です。そうでなければ、管理プロセスが同じ形式の ID を作成します。プロキシを通したリクエストは、プロキシのログの `id` と監査ログの `id` が同じになります。
-- 失敗の応答は `{"error": "<sentence>"}` です。文は、エラーの種類ごとに決まった英語の 1 文で、リクエストの値は含みません（入力のファイルの名前だけは、インポートの 400 の `subject` に別の項目で付きます）。インポートの 422 は `trial` も、世代の選択とロールバックの失敗は上の表の項目も持ちます。管理画面は、この文を言語ごとの文に置き換えます。
-- `POST /api/managed/check` と `POST /api/managed/apply` の 400 は、`{"error", "at"}` です。`at` は、ボディの中で、拒否した値の場所です。場所が無いときは `null` になります。アップストリームのエンジンに選択中の世代が無いために `POST /api/managed/activate` と `POST /api/managed/rollback` が拒否する 409 も、`{"error", "at"}` です。
-  - 場所は、リクエストボディ内の設定キーのパスで書きます。`files` はファイルが多すぎるとき、`files[k]` は大きすぎる・2 回ある・バージョンが指定していないファイルです。バージョンの中の場所は、`sites[1].hosts[0]`、`upstreams.app.servers[2].address`、`upstreams.app.engine`、`sites[0].certificate.key`、`host_policies[1].rate_limit.keys` の形になります。
-  - 配列の番号は 0 から数えます。
-  - JSON の形式が違うボディと、64 桁の小文字の 16 進数でない `expect` は、場所がありません（`null`）。下の「管理 API の検証の順序」で拒否した 400 には、`at` のキーがありません。
-  - 文は、場所を含まない決まった文です。設定ファイルの拒否（409）も、文だけで場所を持ちません。
-- 反映の処理の `detail`（プロキシが拒否した文）は、場所を `at` で持たず、文の中に書きます。そのとき、リスナーとアップストリームのサーバーは 1 から数え（`listener 1 cannot be bound`、`(upstream app, server 1)` など）、サイトは名前で書きます（`site app`）。検証の `at` とは数え方が違います。
+- Every response is JSON and has these headers (the files of the admin screens are different; see "Admin Screens" above): `Content-Type: application/json`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, `X-Request-ID` (the request ID).
+- The request ID is the `X-Request-ID` of the request when the request comes from a peer in `admin.trusted_proxies` and that value is in the form that the proxy gives (16 lowercase hexadecimal digits, `-`, and 1 to 16 digits). Otherwise the admin process makes an ID of the same form. For a request that went through the proxy, `id` in the log of the proxy and `id` in the audit log are the same.
+- A failure response is `{"error": "<sentence>"}`. The sentence is one fixed English sentence for each kind of error, and does not contain a value of the request (only the name of an input file is added, as a separate item, as `subject` of the 400 of an import). The 422 of an import also has `trial`, and the failures of choosing a generation and of rollback also have the items of the table above. The admin screens replace this sentence with a sentence in each language.
+- The 400 of `POST /api/managed/check` and `POST /api/managed/apply` is `{"error", "at"}`. `at` is the location, in the body, of the value that was refused. If there is no location, it is `null`. The 409 that `POST /api/managed/activate` and `POST /api/managed/rollback` give because no generation is chosen for an upstream engine is also `{"error", "at"}`.
+  - A location is written as the path of the setting keys in the request body. `files` is for when there are too many files, and `files[k]` is for a file that is too large, that appears twice, or that the version does not specify. A location in the version takes forms such as `sites[1].hosts[0]`, `upstreams.app.servers[2].address`, `upstreams.app.engine`, `sites[0].certificate.key`, and `host_policies[1].rate_limit.keys`.
+  - Array indexes count from 0.
+  - A body whose JSON has the wrong form, and an `expect` that is not 64 lowercase hexadecimal digits, have no location (`null`). A 400 that is refused in "Order of Admin API Checks" below has no `at` key.
+  - The sentence is a fixed sentence that does not contain a location. A refusal of the configuration file (409) also has only a sentence and no location.
+- `detail` of the apply job (the sentence of the proxy that refused) does not have the location in `at`, and writes it inside the sentence. In it, listeners and upstream servers count from 1 (`listener 1 cannot be bound`, `(upstream app, server 1)`, and so on), and a site is written by its name (`site app`). The way of counting differs from `at` of the check.
 
-### ステータスコード
+### Status Codes
 
-| ステータスコード | 場合 | 主な `error` |
+| Status code | Case | Main `error` |
 |---|---|---|
-| 400 | ボディが JSON のオブジェクトでない、その API が認識しないキーがある、クッキーと API トークンの両方がある、入力のエラー | `bad request`、API ごとの文。`/api/managed/check` と `/api/managed/apply` では `at` も付きます |
-| 401 | セッションも API トークンも無い、終了した、ユーザーが変更された、無効の API トークン。ログインのエラー | `unauthorized`、`invalid credentials` |
-| 403 | `Origin`・CSRF・ロール・状態・API トークンが使えない API による拒否。パスワードや認証コードのエラー。ほかの拒否 | `forbidden`、`second factor required`、`password change required`、`second factor setup required`、`the password is wrong`、`the current password is wrong`、`the code is wrong`、`mfa is required` |
-| 404 | 表に無いパス、存在しない世代・managed 設定のバージョン・ユーザー・API トークン、`records` が無い設定 | `not found`、`no such generation`、`records are not configured` |
-| 405 | パスにそのメソッドが無いとき。`Allow` を付けます（`GET` があれば `HEAD` も含めます） | `method not allowed` |
-| 408 | ボディが 30 秒以内に届かない | `request timeout` |
-| 409 | 別の変更と重なった、状態に合わない、数の上限、世代のエンジンが使えない、エンジンごとの状態を返さないプロキシ、アップストリームのエンジンに選択中の世代が無い、managed 設定が無い、設定ファイルが受け付けられない | `conflict`、`the name is taken`、`the store has too many users`、`the user has too many tokens`、`the last enabled owner stays`、`the user was changed since it was read`、世代の操作の文（`the chosen generation is not the one that was expected`、`the proxy does not report its engines` など）、`the configuration has no managed object`、`a change of the managed configuration is under way`、managed 設定の操作の文（`no generation is chosen for the engine of an upstream` など） |
-| 413 | ボディが上限を超える | `payload too large` |
-| 415 | ボディを読み込む API に、`application/json` でない `Content-Type` | `unsupported media type` |
-| 422 | インポートの事前検証の失敗 | `the trial failed` |
-| 429 | クライアントの回数の超過 | `too many tries` |
-| 500 | 管理プロセスの中の不整合、ルールストアか managed ストアを読めない | `internal error`、ルールストアと managed ストアの文 |
-| 502 | プロキシが切り替えなかった | `the proxy did not switch` |
-| 503 | 保存先や監査ログの行を読み書きできない、時間切れ、プロキシに接続できない、managed 設定の検証が重なった | `unavailable`、`the proxy cannot be reached`、`the proxy is busy`、`the proxy did not say how the switch ended`、`a check of a managed version is under way` |
+| 400 | The body is not a JSON object, it has a key that the API does not recognize, there are both a cookie and an API token, an input error | `bad request`, a sentence for each API. `/api/managed/check` and `/api/managed/apply` also have `at` |
+| 401 | There is neither a session nor an API token, the session has ended, the user was changed, an invalid API token. A login error | `unauthorized`, `invalid credentials` |
+| 403 | Refused by `Origin`, CSRF, the role, the state, or an API that cannot use an API token. An error of the password or the verification code. Other refusals | `forbidden`, `second factor required`, `password change required`, `second factor setup required`, `the password is wrong`, `the current password is wrong`, `the code is wrong`, `mfa is required` |
+| 404 | A path that is not in the table, a generation, a version of the managed configuration, a user or an API token that does not exist, a configuration without `records` | `not found`, `no such generation`, `records are not configured` |
+| 405 | The path does not have that method. `Allow` is added (it includes `HEAD` if there is `GET`) | `method not allowed` |
+| 408 | The body does not arrive within 30 seconds | `request timeout` |
+| 409 | It overlaps another change, it does not fit the state, a limit on a number, the engine of the generation cannot be used, a proxy that does not return the state of each engine, no generation is chosen for an upstream engine, there is no managed configuration, the configuration file is rejected | `conflict`, `the name is taken`, `the store has too many users`, `the user has too many tokens`, `the last enabled owner stays`, `the user was changed since it was read`, a sentence of a generation operation (`the chosen generation is not the one that was expected`, `the proxy does not report its engines`, and so on), `the configuration has no managed object`, `a change of the managed configuration is under way`, a sentence of a managed configuration operation (`no generation is chosen for the engine of an upstream`, and so on) |
+| 413 | The body is over the limit | `payload too large` |
+| 415 | An API that reads a body gets a `Content-Type` that is not `application/json` | `unsupported media type` |
+| 422 | The trial of an import failed | `the trial failed` |
+| 429 | The count of the client is exceeded | `too many tries` |
+| 500 | An inconsistency inside the admin process. The rules store or the managed store cannot be read | `internal error`, the sentences of the rules store and the managed store |
+| 502 | The proxy did not switch | `the proxy did not switch` |
+| 503 | The store or an audit log line cannot be read or written, a timeout, the proxy cannot be reached, checks of the managed configuration overlap | `unavailable`, `the proxy cannot be reached`, `the proxy is busy`, `the proxy did not say how the switch ended`, `a check of a managed version is under way` |
 
-managed 設定の変更（「保存して反映」「名前で反映」「ロールバック」）は、受け付けると 202 で応答します。終わり方は、反映の処理（上の「managed 設定の操作」）で読み取ります。
+A change of the managed configuration ("Save and apply", "Apply by name", "Roll back") gets the response 202 when it is accepted. Read how it ended from the apply job (see "Managed Configuration Operations" above).
 
-### 管理 API の検証の順序
+### Order of Admin API Checks
 
-最初に通らなかった検証で応答します。
+The first check that is not passed gives the response.
 
-1. パス（表に無ければ 404）とメソッド（無ければ 405）
-2. 最小のロールを持つ API は、認証情報（セッションのクッキーか `Authorization: Bearer`）。両方あれば 400、どちらも無い、または合わなければ 401、API トークンの回数を使い切ったクライアントは 429
-3. 変更では `Origin`（403）と、セッションなら `X-CSRF-Token`（403）
-4. API トークンが使えない API に API トークン（403）
-5. セッションの状態（403。決まった文）
-6. ロール（403）
+1. The path (404 if it is not in the table) and the method (405 if it does not have it)
+2. For an API that has a minimum role, the credentials (the cookie of a session or `Authorization: Bearer`). If both are present, 400; if neither is present or it does not match, 401; for a client that has used up its API token count, 429
+3. For a change, `Origin` (403) and, for a session, `X-CSRF-Token` (403)
+4. An API token for an API that cannot use an API token (403)
+5. The state of the session (403; a fixed sentence)
+6. The role (403)
 
-3 から 6 で拒否したリクエストは、ユーザーが分かっているので、監査ログに書きます。その後、その API がボディを読み込むなら、`Content-Type`（415）と JSON の形式（400）を検証します。
+A request that was refused at 3 to 6 is written to the audit log, because the user is known. After that, if the API reads a body, it validates `Content-Type` (415) and the form of the JSON (400).

@@ -1,273 +1,275 @@
-# ビルドと配置
+[English](binary-deployment.md) | [日本語](binary-deployment.ja.md)
 
-この文書では、現在の実装を 1 台の Linux ホストで動かす手順を説明します。設定キーの意味と範囲、コマンド、シグナル、ログ、監視は [運用リファレンス](../operations/operator-reference.md) を、管理プロセスの設定と API は [管理リファレンス](../operations/admin-reference.md) を参照してください。
+# Build and Deployment
 
-この文書に出てくるパス（`/opt/tukuyomi-core`、`/etc/tukuyomi-core`、`/var/lib/tukuyomi-core`）と OS ユーザーの名前（`tukuyomi`）は例です。設定に書くパスは、どれも絶対パスで書きます（`.`・`..`・空の要素・末尾の `/` を含むパスは受け付けません）。
+This document explains how to run the current implementation on a single Linux host. For the meaning and range of the setting keys, commands, signals, logs, and monitoring, see the [operator reference](../operations/operator-reference.md); for the settings and API of the admin process, see the [admin reference](../operations/admin-reference.md).
 
-## 構成要素
+The paths in this document (`/opt/tukuyomi-core`, `/etc/tukuyomi-core`, `/var/lib/tukuyomi-core`) and the OS user name (`tukuyomi`) are examples. Write every path in the configuration as an absolute path (a path that contains `.`, `..`, an empty element, or a trailing `/` is rejected).
 
-| 構成要素 | 内容 |
+## Components
+
+| Component | Content |
 |---|---|
-| `tukuyomi-proxy`（Rust、`proxy/`） | HTTP／HTTPS のリクエストを受信して転送します。検査カーネル（`kernel/`、Rust のライブラリ）を組み込み、検査プロセスの起動・停止・再起動を受け持ちます。同じ実行ファイルが、ルールストアのコマンド（`rules`）、証明書のコマンド（`acme renew`）、設定の検証（`config check`）、管理プロセス（`admin`）も持ちます |
-| `tukuyomi-inspector`（Go、`inspector/`） | Coraza でリクエストを検査します。プロキシが子プロセスとして起動し、引き継いだ Unix ドメインソケットのペアで通信します。待ち受けるポートは持ちません。設定の `kernel.inspector` に指定します |
-| `tukuyomi-inspector-modsecurity`（Rust と C++、`inspector-modsecurity/`） | ModSecurity v3（libmodsecurity 3.0.17）でリクエストを検査します。ModSecurity の世代（`rules import --engine modsecurity`）を使う場合と、デフォルトのエンジンかアップストリームのエンジンに `modsecurity` を指定する場合だけ必要で、使わないホストでは省けます。プロキシが子プロセスとして起動し、引き継いだ Unix ドメインソケットのペアで通信します。待ち受けるポートは持ちません。設定の `kernel.engines.modsecurity.inspector` に指定します |
-| `tukuyomi-records-ship`（Rust、`records-ship/`） | ログ送信プロセスです。プロキシのログファイルの行を、PostgreSQL か MySQL のテーブルへ送ります。ログを DB へ送る場合だけ必要で、送らないホストでは省けます。プロキシとは別のユニットで動き、同じ設定ファイルを読みます。待ち受けるポートは持ちません |
-| 管理プロセス | 同じ実行ファイルの `tukuyomi-proxy admin <config>` です。プロキシとは別のユニットで動かします。ループバックアドレスで待ち受け、管理 API と管理画面（実行ファイルに組み込み済み）を提供します。ルールの世代を操作し、制御ソケットを通じてプロキシに切り替えを依頼します |
-| 設定ファイル | 1 つの JSON ファイルです。値にデフォルトはありません。省けると決まっている設定キー（`acme`、`records`、`access`、`rate_limit`、`geo`、`admin` など）のほかは、すべて書きます。プロキシと管理プロセスが同じファイルを読みます |
-| ルールストア | ルールセットの世代を置くディレクトリです（設定の `rules.store.dir`）。`rules import` が世代を作り、`rules activate` が使う世代をエンジン（Coraza か ModSecurity）ごとに選択します。管理プロセスも同じ操作をします |
-| 検査プロセスの作業ディレクトリ | 起動ごとの一時ディレクトリを作る親ディレクトリです（設定の `kernel.tmp_root`） |
-| 証明書と鍵 | TLS のリスナーで使います。`acme renew` で発行・更新するか、運用者が置きます |
-| ログのディレクトリ | 標準エラーに出すログの写しを置くディレクトリです（設定の `records.dir`）。プロキシが書き、管理プロセスとログ送信プロセスが読みます。ログ送信プロセスは、送信済みの位置（`ship.state`）もここに書きます |
-| 接続文字列のファイル | ログ送信プロセスが DB に接続するための文字列（パスワードを含む）を書いたファイルです（設定の `records.ship.db_dsn_file`）。ログ送信プロセスだけが読みます |
-| 管理データの保存先 | 管理プロセスが、ユーザー、API トークン、監査ログ、切り替えの履歴を置くディレクトリです（設定の `admin.store.dir`） |
-| 制御ソケット | プロキシが管理プロセスからの依頼を受ける Unix ドメインソケットです（設定の `admin.control`） |
-| 国のデータベース | アクセス制御（`access`）の国の指定に使う、MaxMind DB 形式のファイルです（設定の `geo.country_db`）。運用者が用意します |
+| `tukuyomi-proxy` (Rust, `proxy/`) | Receives HTTP/HTTPS requests and forwards them. It embeds the inspection kernel (`kernel/`, a Rust library) and starts, stops, and restarts the inspector processes. The same executable also provides the rules store commands (`rules`), the certificate command (`acme renew`), the configuration check (`config check`), and the admin process (`admin`) |
+| `tukuyomi-inspector` (Go, `inspector/`) | Inspects requests with Coraza. The proxy starts it as a child process, and the two communicate over an inherited pair of Unix domain sockets. It has no listening port. Specify it with `kernel.inspector` in the configuration |
+| `tukuyomi-inspector-modsecurity` (Rust and C++, `inspector-modsecurity/`) | Inspects requests with ModSecurity v3 (libmodsecurity 3.0.17). It is needed only when you use a ModSecurity generation (`rules import --engine modsecurity`) or when you set `modsecurity` as the default engine or an upstream engine, and hosts that do not use it can omit it. The proxy starts it as a child process, and the two communicate over an inherited pair of Unix domain sockets. It has no listening port. Specify it with `kernel.engines.modsecurity.inspector` in the configuration |
+| `tukuyomi-records-ship` (Rust, `records-ship/`) | The records shipper. It ships the lines of the proxy's log files to a PostgreSQL or MySQL table. It is needed only when you ship logs to a DB, and hosts that do not ship logs can omit it. It runs in a unit separate from the proxy and reads the same configuration file. It has no listening port |
+| Admin process | `tukuyomi-proxy admin <config>`, the same executable. Run it in a unit separate from the proxy. It listens on a loopback address and provides the admin API and the admin screens (already embedded in the executable). It operates on rule generations and asks the proxy to switch them through the control socket |
+| Configuration file | A single JSON file. Values have no defaults. Write every setting key except those that are defined as omittable (`acme`, `records`, `access`, `rate_limit`, `geo`, `admin`, and others). The proxy and the admin process read the same file |
+| Rules store | The directory that holds the generations of rule sets (`rules.store.dir` in the configuration). `rules import` creates generations, and `rules activate` chooses the generation to use for each engine (Coraza or ModSecurity). The admin process performs the same operations |
+| Inspector work directory | The parent directory in which a temporary directory is created at each start (`kernel.tmp_root` in the configuration) |
+| Certificates and keys | Used by the TLS listeners. Either issue and renew them with `acme renew` or have the operator place them |
+| Log directory | The directory that holds copies of the logs written to standard error (`records.dir` in the configuration). The proxy writes to it, and the admin process and the records shipper read it. The records shipper also writes the shipped position (`ship.state`) here |
+| Connection string file | A file that holds the string (including the password) that the records shipper uses to connect to the DB (`records.ship.db_dsn_file` in the configuration). Only the records shipper reads it |
+| Admin store | The directory in which the admin process keeps users, API tokens, the audit log, and the switch history (`admin.store.dir` in the configuration) |
+| Control socket | The Unix domain socket on which the proxy receives requests from the admin process (`admin.control` in the configuration) |
+| Country database | A file in MaxMind DB format, used for the country lists of access control (`access`) (`geo.country_db` in the configuration). The operator provides it |
 
-検査プロセス、管理プロセス、ログ送信プロセスは、プロキシと同じ OS ユーザーで動きます。
+The inspector processes, the admin process, and the records shipper run as the same OS user as the proxy.
 
-## 必要な環境
+## Requirements
 
-- Linux。動作を確認しているのは x86_64 だけです。
-- Landlock が有効な Linux。
-  - 検査プロセスは、ルールを読んだ後に Landlock で自身の権限を制限します（下の「検査プロセスの権限の制限」）。
-  - Landlock が無い Linux では、検査プロセスは起動しません（exit 14）。プロキシも起動せず（ログは `stop: the kernel failed: Exit(14)`）、`rules import` の事前検証も、管理プロセスのインポートの事前検証も失敗します。制限をかけずに動かす設定はありません。
-  - Landlock を含む Linux 5.13 以上で、LSM の一覧に `landlock` が含まれている必要があります（`/sys/kernel/security/lsm` で確認できます）。どのディストリビューションが Landlock をデフォルトで有効にしているかは確認していません。
-  - Linux のバージョンによって、制限できる範囲が違います。どの ABI バージョンで制限したかは、外からは分かりません。
-    - TCP のバインドと接続まで制限するには、Linux 6.7 以上（Landlock の ABI 4 以上）が必要です。それより前のバージョンでは、ファイルだけを制限して動きます。
-    - Linux 6.2 より前（ABI 1・2）では、ファイルの切り詰めを禁止できません。Linux 6.10 より前（ABI 4 まで）では、デバイスの ioctl を禁止できません。
-- ModSecurity の検査プロセスを動かすホストに必要な共有ライブラリは、libstdc++、libgcc_s、libc、libm だけです。libmodsecurity、YAJL、PCRE2 は実行ファイルに静的リンクしてあるので、インストールは不要です。
-- 常時動くプロキシと検査プロセスは、プロキシ 1 つと、起動したエンジンごとの検査プロセス 1 つです（管理プロセスとログ送信プロセスは、これとは別のプロセスです）。
-  - Coraza だけなら検査プロセスは 1 つ、Coraza と ModSecurity の両方を起動すると 2 つです。
-  - エンジンの世代を切り替えている間は、そのエンジンの検査プロセスが一時的に 1 つ増えます。切り替えは、プロキシ全体で同時に 1 つまでです。
-  - 管理プロセスは、インポートの事前検証のたびに、検査プロセスを 1 つ起動します（コマンドの `rules import` も同じです）。
-  - メモリの目安は、[運用リファレンス](../operations/operator-reference.md) の「検査エンジンの選択」を参照してください。
-- ビルドに必要なもの:
-  - Rust 1.94.1 以上（`proxy/Cargo.toml` の `rust-version`）
-  - C コンパイラ（TLS に使う aws-lc-rs が C のコードをビルドします）
-  - Go 1.27.2（`inspector/go.mod`）。検査プロセスは、ビルドに使った Go のバージョンを検査カーネルに通知します。検査カーネルは、`go1.27.2` でビルドしたものだけを受け付けます。
-- ModSecurity の検査プロセスをビルドする場合だけ、さらに次のものが必要です。
-  - `rustc` 1.94.1 ちょうど（`rustc -vV` の `release:` の行が `1.94.1`）。プロキシと違い、別のバージョンでビルドした検査プロセスは検査カーネルが受け付けません（下の「ModSecurity の検査プロセス」）。
-  - C と C++ のコンパイラ、make
-  - libyajl-dev と libpcre2-dev（静的ライブラリの `libyajl_s.a` と `libpcre2-8.a`）
-  - bash、curl、sha256sum、tar（libmodsecurity の取得に使います。アーカイブを `BUILD_MODSECURITY_ARCHIVE_FILE` で渡す場合、curl は不要です）
-- CRS の取得に必要なもの: bash、curl、sha256sum、tar
-- ログを DB へ送る場合だけ必要なもの:
-  - PostgreSQL か MySQL のサーバー。動作を確認しているのは PostgreSQL 16・18 と MySQL 8.0 です。
-  - ログのディレクトリのファイルシステムが、ファイルの作成時刻（`statx` の btime）を返すこと。動作を確認しているのは ext4 だけです。
+- Linux. Operation has been confirmed on x86_64 only.
+- Linux with Landlock enabled.
+  - An inspector process restricts its own privileges with Landlock after it reads the rules (see "Restricting the Inspector Processes" below).
+  - On a Linux without Landlock, the inspector process does not start (exit 14). The proxy does not start either (the log shows `stop: the kernel failed: Exit(14)`), and the trial of `rules import` and the trial of an import by the admin process both fail. There is no setting that runs without the restriction.
+  - You need Linux 5.13 or later, which includes Landlock, and `landlock` must be in the LSM list (you can check it in `/sys/kernel/security/lsm`). Which distributions enable Landlock by default has not been checked.
+  - The range that can be restricted depends on the Linux version. You cannot tell from the outside which ABI version was used for the restriction.
+    - Restricting TCP bind and connect requires Linux 6.7 or later (Landlock ABI 4 or later). On earlier versions, the process runs with a file-only restriction.
+    - On Linux earlier than 6.2 (ABI 1 and 2), truncating files cannot be prohibited. On Linux earlier than 6.10 (up to ABI 4), device ioctls cannot be prohibited.
+- The only shared libraries needed on a host that runs the ModSecurity inspector process are libstdc++, libgcc_s, libc, and libm. libmodsecurity, YAJL, and PCRE2 are statically linked into the executable, so you do not need to install them.
+- At any time, one proxy and one inspector process for each started engine are running (the admin process and the records shipper are separate processes).
+  - With Coraza only, there is one inspector process; if both Coraza and ModSecurity are started, there are two.
+  - While the generation of an engine is being switched, the inspector processes of that engine temporarily increase by one. Only one switch can run at a time across the whole proxy.
+  - For each import trial, the admin process starts one inspector process (the `rules import` command does the same).
+  - For a guide to memory use, see "Choosing the Inspection Engine" in the [operator reference](../operations/operator-reference.md).
+- What the build needs:
+  - Rust 1.94.1 or later (`rust-version` in `proxy/Cargo.toml`)
+  - A C compiler (aws-lc-rs, which is used for TLS, builds C code)
+  - Go 1.27.2 (`inspector/go.mod`). The inspector process reports the Go version used for the build to the inspection kernel. The inspection kernel accepts only an inspector built with `go1.27.2`.
+- Only when you build the ModSecurity inspector process, you also need the following:
+  - `rustc` exactly 1.94.1 (the `release:` line of `rustc -vV` is `1.94.1`). Unlike the proxy, the inspection kernel rejects an inspector process built with a different version (see "ModSecurity Inspector" below).
+  - C and C++ compilers, and make
+  - libyajl-dev and libpcre2-dev (the static libraries `libyajl_s.a` and `libpcre2-8.a`)
+  - bash, curl, sha256sum, and tar (used to fetch libmodsecurity; curl is not needed if you pass the archive with `BUILD_MODSECURITY_ARCHIVE_FILE`)
+- What fetching the CRS needs: bash, curl, sha256sum, and tar
+- Needed only when you ship logs to a DB:
+  - A PostgreSQL or MySQL server. Operation has been confirmed with PostgreSQL 16 and 18 and MySQL 8.0.
+  - The file system of the log directory must return the file creation time (btime of `statx`). Operation has been confirmed on ext4 only.
 
-## リリースの tarball
+## Release Tarball
 
-0.1.0 から、GitHub のリリースで、Linux x86_64 用の実行ファイルの tarball を配布しています。ソースからビルドしない場合は、これを使います。
+Since 0.1.0, GitHub releases have distributed a tarball of executables for Linux x86_64. Use it if you do not build from source.
 
-| ファイル | 内容 |
+| File | Content |
 |---|---|
-| `tukuyomi-core_v0.2.0_linux_amd64.tar.gz` | ディレクトリ `tukuyomi-core_v0.2.0_linux_amd64/` の中に、4 つの実行ファイル（上の「構成要素」）、`README.md`、`README.ja.md`、`LICENSE`、`NOTICE`、`THIRD-PARTY-LICENSES`、`docs/`、`scripts/fetch-crs.sh` |
-| `tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256` | tarball の SHA-256 |
-| `tukuyomi-core_v0.2.0_SHA256SUMS` | 上と同じ行 |
+| `tukuyomi-core_v0.2.0_linux_amd64.tar.gz` | In the directory `tukuyomi-core_v0.2.0_linux_amd64/`: the four executables (see "Components" above), `README.md`, `README.ja.md`, `LICENSE`, `NOTICE`, `THIRD-PARTY-LICENSES`, `docs/`, and `scripts/fetch-crs.sh` |
+| `tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256` | The SHA-256 of the tarball |
+| `tukuyomi-core_v0.2.0_SHA256SUMS` | The same line as the file above |
 
-- ダウンロードしたら、展開する前に SHA-256 を確認します。
+- After downloading, check the SHA-256 before extracting.
 
   ```bash
   sha256sum -c tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256
   tar -xzf tukuyomi-core_v0.2.0_linux_amd64.tar.gz
   ```
 
-- 実行ファイルは、Ubuntu 26.04.1 LTS（glibc 2.43、gcc 15.2.0）で、`rustc` 1.94.1 と Go 1.27.2 を使ってビルドしました。動作を確認したのは、ビルドしたホストだけです。
-- 動かすホストには glibc 2.39 以上が必要です（`tukuyomi-proxy` が `GLIBC_2.39` のシンボルを使います）。ModSecurity の検査プロセスには、さらに libstdc++ の `GLIBCXX_3.4.29` と `CXXABI_1.3.15` のシンボルが必要です。これより古い Linux では動かないので、ソースからビルドしてください（下の「ソースからのビルド」）。
-- 検査プロセス（`tukuyomi-inspector`）は静的リンクしてあります。TLS のライブラリ（aws-lc）も、実行ファイルに静的リンクしてあります。
-- 実行ファイルは、たとえば `/opt/tukuyomi-core/bin/` に置きます。その後の手順は、ソースからビルドした場合と同じです（下の「OS ユーザーとディレクトリ」と「初回起動の手順」）。
+- The executables were built on Ubuntu 26.04.1 LTS (glibc 2.43, gcc 15.2.0) with `rustc` 1.94.1 and Go 1.27.2. Operation has been confirmed only on the host where they were built.
+- The host that runs them needs glibc 2.39 or later (`tukuyomi-proxy` uses `GLIBC_2.39` symbols). The ModSecurity inspector process also needs the libstdc++ symbols `GLIBCXX_3.4.29` and `CXXABI_1.3.15`. They do not run on an older Linux, so build from source (see "Building from Source" below).
+- The inspector process (`tukuyomi-inspector`) is statically linked. The TLS library (aws-lc) is also statically linked into the executable.
+- Place the executables in, for example, `/opt/tukuyomi-core/bin/`. The following steps are the same as for a build from source (see "OS User and Directories" and "First Start" below).
 
-## ソースからのビルド
+## Building from Source
 
-プロキシは `proxy/` でビルドします。検査カーネルも一緒にビルドされます。
+Build the proxy in `proxy/`. The inspection kernel is built together with it.
 
 ```bash
 cd proxy && cargo build --release --locked
 ```
 
-実行ファイルは `proxy/target/release/tukuyomi-proxy` にできます。管理画面のファイル（`proxy/admin-ui/`）は、このビルドで実行ファイルに組み込まれます。画面のための別のビルドや配布は必要ありません。
+The executable is produced at `proxy/target/release/tukuyomi-proxy`. This build embeds the files of the admin screens (`proxy/admin-ui/`) in the executable. No separate build or distribution is needed for the screens.
 
-検査プロセスは、`inspector/` で cgo を使わずにビルドします。
+Build the inspector process in `inspector/` without cgo.
 
 ```bash
 cd inspector && CGO_ENABLED=0 go build -mod=readonly -o tukuyomi-inspector .
 ```
 
-`CGO_ENABLED=0` は必ず指定してください。
+Always specify `CGO_ENABLED=0`.
 
-- 検査プロセスは、Landlock などの設定をすべてのスレッドにかけるために、Go の `syscall.AllThreadsSyscall` を使います。cgo を使った実行ファイルではこの呼び出しが `ENOTSUP` を返すため、検査プロセスは起動しません（exit 14）。
-- 起動しない理由（`the inspector is built with cgo and cannot restrict every thread`）は、検査プロセスの標準出力・標準エラーには出ません。`rules import` の `the inspector said:` の行と、SIGUSR1 の切り替えが失敗したときの `reload: the inspector said:` の行にだけ出ます。プロキシの起動では、`stop: the kernel failed: Exit(14)` の行だけが出ます。
+- To apply Landlock and other restrictions to all threads, the inspector process uses Go's `syscall.AllThreadsSyscall`. In an executable that uses cgo, this call returns `ENOTSUP`, so the inspector process does not start (exit 14).
+- The reason it does not start (`the inspector is built with cgo and cannot restrict every thread`) does not appear in the standard output or standard error of the inspector process. It appears only in the `the inspector said:` line of `rules import` and in the `reload: the inspector said:` line when a SIGUSR1 switch fails. When the proxy starts, only the line `stop: the kernel failed: Exit(14)` appears.
 
-### ModSecurity の検査プロセス
+### ModSecurity Inspector
 
-ModSecurity の世代を使う場合だけビルドします。Coraza の世代だけを使うホストには不要です。先に libmodsecurity（ModSecurity v3.0.17）を新しいディレクトリ（prefix）に静的ライブラリとしてビルドし、その prefix を指定して検査プロセスをビルドします。
+Build it only when you use ModSecurity generations. Hosts that use only Coraza generations do not need it. First build libmodsecurity (ModSecurity v3.0.17) as a static library in a new directory (the prefix), then build the inspector process with that prefix specified.
 
 ```bash
 scripts/build-modsecurity.sh <new-dir>
 cd inspector-modsecurity && TUKUYOMI_MODSECURITY_PREFIX=<new-dir> cargo build --release --locked
 ```
 
-実行ファイルは `inspector-modsecurity/target/release/tukuyomi-inspector-modsecurity` にできます。
+The executable is produced at `inspector-modsecurity/target/release/tukuyomi-inspector-modsecurity`.
 
-`scripts/build-modsecurity.sh` の動作は次のとおりです。
+`scripts/build-modsecurity.sh` behaves as follows:
 
-- 取得するバージョン（3.0.17）と、配布アーカイブ（`modsecurity-v3.0.17.tar.gz`）の sha256（`f283b33d5c21130fd3a15c84a93a1abe12bd1949edaf44288b12af571b671a50`）は、スクリプトの中に固定してあります。引数では変えられません。
-- アーカイブは https でだけ取得し、固定した sha256 と一致してから中身を読みます。GitHub に接続できないホストでは、固定したアーカイブの写しを `BUILD_MODSECURITY_ARCHIVE_FILE` で渡せます。その場合も、sha256 などの検証は同じです。
-- 新しいディレクトリは、まだ存在しない絶対パスで、英数字と `.`・`_`・`+`・`-` だけで書きます。`.` で始まる名前は使えません。相対パスで書いた場合は、カレントディレクトリからのパスとして扱います。
-- 新しいディレクトリの親ディレクトリは、既に存在し、実行する OS ユーザーが書き込めることが必要です。スクリプトはその隣に一時ディレクトリを作り、最後に 1 回のリネームで新しいディレクトリを置きます。
-- 既にあるディレクトリには触れません。途中で失敗したときは、何も残りません。
-- 数分かかります。
-- configure は、このスクリプトに固定したフラグで実行します。curl、Lua、MaxMind、GeoIP、libxml2、LMDB、ssdeep は使わず、YAJL と PCRE2 だけを使います。configure の結果がそうならなければ、エラーで終わります。外部からルールを取り込む、スクリプトを実行する、データベースを参照する、XML を解析する、といった機能をルールに使わせないための保護の一部なので、変えないでください。
-- prefix には、`include/`、`lib/libmodsecurity.a`、`include-src/`（libmodsecurity の内部のヘッダー）、`archive.sha256`（固定したアーカイブの sha256 を書いた 1 行）ができます。
+- The version to fetch (3.0.17) and the sha256 of the distribution archive (`modsecurity-v3.0.17.tar.gz`) (`f283b33d5c21130fd3a15c84a93a1abe12bd1949edaf44288b12af571b671a50`) are fixed inside the script. You cannot change them with arguments.
+- The archive is fetched over https only, and its contents are read only after it matches the fixed sha256. On a host that cannot connect to GitHub, you can pass a copy of the fixed archive with `BUILD_MODSECURITY_ARCHIVE_FILE`. The sha256 and other checks are the same in that case.
+- The new directory must be an absolute path that does not exist yet, written with only letters, digits, `.`, `_`, `+`, and `-`. A name that starts with `.` cannot be used. A relative path is treated as a path from the current directory.
+- The parent directory of the new directory must already exist and be writable by the OS user that runs the script. The script creates a temporary directory next to it and places the new directory with a single rename at the end.
+- It does not touch an existing directory. If it fails midway, nothing is left behind.
+- It takes a few minutes.
+- configure runs with flags that are fixed in this script. It does not use curl, Lua, MaxMind, GeoIP, libxml2, LMDB, or ssdeep, and uses only YAJL and PCRE2. If the result of configure is not so, the script exits with an error. This is part of the protection that keeps rules from using features such as importing rules from outside, running scripts, referencing databases, and parsing XML, so do not change it.
+- The prefix gets `include/`, `lib/libmodsecurity.a`, `include-src/` (the internal headers of libmodsecurity), and `archive.sha256` (one line with the sha256 of the fixed archive).
 
-次の場合、検査プロセスのビルドはエラーで終わります。
+In the following cases, building the inspector process ends with an error:
 
-- `TUKUYOMI_MODSECURITY_PREFIX` が無い、または絶対パスでない
-- prefix に `include/modsecurity/modsecurity.h`、`include-src/src/variables/variable.h`、`lib/libmodsecurity.a` のどれかが無い
-- prefix の `archive.sha256` が読めない、または小文字の 16 進数 64 桁の 1 行でない
-- C++ コンパイラが `libpcre2-8.a`（libpcre2-dev）か `libyajl_s.a`（libyajl-dev）を見つけられない
+- `TUKUYOMI_MODSECURITY_PREFIX` is missing or is not an absolute path
+- The prefix lacks any of `include/modsecurity/modsecurity.h`, `include-src/src/variables/variable.h`, and `lib/libmodsecurity.a`
+- `archive.sha256` in the prefix cannot be read, or is not one line of 64 lowercase hexadecimal digits
+- The C++ compiler cannot find `libpcre2-8.a` (libpcre2-dev) or `libyajl_s.a` (libyajl-dev)
 
-検査プロセスは、ビルドに使ったコンパイラのバージョン、libmodsecurity のバージョン、アーカイブの sha256 を、起動時の最初のメッセージ（HELLO）で検査カーネルに通知します。ModSecurity の検査プロセスについて、検査カーネルは次の 3 つがすべて一致するものだけを受け付けます。
+The inspector process reports the version of the compiler used for the build, the libmodsecurity version, and the archive sha256 to the inspection kernel in the first message at start (HELLO). For a ModSecurity inspector process, the inspection kernel accepts only one in which all three of the following match:
 
-| 項目 | 受け付ける値 |
+| Field | Accepted value |
 |---|---|
-| ビルドに使ったコンパイラ | `rustc 1.94.1` |
-| libmodsecurity のバージョン | `v3.0.17` |
-| アーカイブの sha256 | 上の `f283b33d…b671a50` |
+| The compiler used for the build | `rustc 1.94.1` |
+| The libmodsecurity version | `v3.0.17` |
+| The archive sha256 | `f283b33d…b671a50` above |
 
-一致しない場合、検査カーネルは `hello toolchain differs`、`hello engine version differs`、`hello engine source differs` のどれかを出して受け付けず、検査プロセスを再起動しません。プロキシの起動では `stop: the kernel failed: Hello("<message>")` の行が、`rules import` では `rules import: the trial failed: the inspector could not be started (Hello("<message>"))` の行が出ます。
+If they do not match, the inspection kernel writes one of `hello toolchain differs`, `hello engine version differs`, and `hello engine source differs`, rejects the inspector process, and does not restart it. At proxy start the line `stop: the kernel failed: Hello("<message>")` appears, and with `rules import` the line `rules import: the trial failed: the inspector could not be started (Hello("<message>"))` appears.
 
-### ログ送信プロセス
+### Records Shipper
 
-ログを DB へ送る場合だけビルドします。`records-ship/` でビルドします。プロキシのライブラリも一緒にビルドされます。
+Build it only when you ship logs to a DB. Build it in `records-ship/`. The proxy library is built together with it.
 
 ```bash
 cd records-ship && cargo build --release --locked
 ```
 
-実行ファイルは `records-ship/target/release/tukuyomi-records-ship` にできます。必要なものはプロキシと同じです（Rust 1.94.1 以上と C コンパイラ）。
+The executable is produced at `records-ship/target/release/tukuyomi-records-ship`. The requirements are the same as for the proxy (Rust 1.94.1 or later and a C compiler).
 
-### CRS の取得
+### Fetching the CRS
 
-CRS（OWASP Core Rule Set）は同梱していません。`scripts/fetch-crs.sh` で取得します。サービスの OS ユーザーで実行してください。CRS は Apache License 2.0 で配布されています。スクリプトはルールのファイルだけを取り出し、アーカイブの `LICENSE` は取り出しません。
+The CRS (OWASP Core Rule Set) is not bundled. Fetch it with `scripts/fetch-crs.sh`. Run it as the OS user of the service. The CRS is distributed under the Apache License 2.0. The script extracts only the rule files and does not extract the `LICENSE` of the archive.
 
 ```bash
 sudo -u tukuyomi scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
 ```
 
-- 取得するバージョン（4.23.0）と、配布アーカイブの sha256 は、スクリプトの中に固定してあります。引数では変えられません。
-- アーカイブは https でだけ取得し、固定した sha256 と一致してから中身を読みます。GitHub に接続できないホストでは、固定したアーカイブの写しを `FETCH_CRS_ARCHIVE_FILE` で渡せます。その場合も、sha256 などの検証は同じです。
-- 新しいディレクトリには、次の 4 つだけが入ります。
-  - `crs-setup.conf`（`crs-setup.conf.example` の写し）
+- The version to fetch (4.23.0) and the sha256 of the distribution archive are fixed inside the script. You cannot change them with arguments.
+- The archive is fetched over https only, and its contents are read only after it matches the fixed sha256. On a host that cannot connect to GitHub, you can pass a copy of the fixed archive with `FETCH_CRS_ARCHIVE_FILE`. The sha256 and other checks are the same in that case.
+- The new directory contains only the following four:
+  - `crs-setup.conf` (a copy of `crs-setup.conf.example`)
   - `crs-setup.conf.example`
   - `rules/*.conf`
   - `rules/*.data`
-- スクリプトは `umask 077` で動きます。できたディレクトリとファイルは、実行した OS ユーザーだけが読めます。root で実行すると、サービスの OS ユーザーの `rules import` が読めません。
-- 新しいディレクトリの親ディレクトリは、既に存在し、実行する OS ユーザーが書き込めることが必要です。スクリプトはその隣に一時ディレクトリを作ります。
-- 既にあるディレクトリには触れません。途中で失敗したときは、何も残りません。
-- 運用者は、インポートの前に `crs-setup.conf` を編集できます。たとえば、受け付けるボディの型を追加できます（[運用リファレンス](../operations/operator-reference.md) の「ルールセットと世代」）。
+- The script runs with `umask 077`. The directory and files it creates can be read only by the OS user that ran it. If you run it as root, `rules import` run by the OS user of the service cannot read them.
+- The parent directory of the new directory must already exist and be writable by the OS user that runs the script. The script creates a temporary directory next to it.
+- It does not touch an existing directory. If it fails midway, nothing is left behind.
+- The operator can edit `crs-setup.conf` before the import. For example, you can add the body types that are accepted (see "Rule Sets and Generations" in the [operator reference](../operations/operator-reference.md)).
 
-## OS ユーザーとディレクトリ
+## OS User and Directories
 
-プロキシは root では動きません。起動もすべてのコマンドも、プロセスの 4 つのユーザー ID（real、effective、saved、file system）のどれかが 0 なら、`host check refused` の行を出して拒否します（exit 1）。
+The proxy does not run as root. If any of the four user IDs of the process (real, effective, saved, file system) is 0, the proxy at start and every command write a `host check refused` line and refuse (exit 1).
 
-- 専用の OS ユーザーを作り、サービスもコマンドもその OS ユーザーで実行してください。たとえば `sudo -u tukuyomi tukuyomi-proxy ...` とします。
-- root で `acme renew` を実行すると、作った鍵を別の OS ユーザーのプロキシが読めないので、これも拒否します。
-- 管理プロセス（`admin`）と、その短いコマンド（`admin bootstrap`・`admin reset`）も、同じ OS ユーザーで実行します。ルールストア、ログのディレクトリ、制御ソケット、managed ストアは、その OS ユーザーだけが使える（0700）ためです。別の OS ユーザーで動かすと、どれも使えません。
-- ログ送信プロセスも、同じ OS ユーザーで動かします。ログのディレクトリを読み、そこに `ship.state` を書くためです。ログ送信プロセスも root では動きません。
+- Create a dedicated OS user and run both the service and the commands as that OS user. For example, use `sudo -u tukuyomi tukuyomi-proxy ...`.
+- `acme renew` run as root is also refused, because the proxy running as another OS user cannot read the keys it creates.
+- Run the admin process (`admin`) and its short commands (`admin bootstrap` and `admin reset`) as the same OS user. This is because the rules store, the log directory, the control socket, and the managed store can be used only by that OS user (0700). None of them can be used if you run as a different OS user.
+- Run the records shipper as the same OS user too, because it reads the log directory and writes `ship.state` there. The records shipper does not run as root either.
 
-ディレクトリとファイルの例を次に示します。
+Examples of directories and files:
 
-| 例 | 設定キー | 所有者と権限 |
+| Example | Setting key | Owner and permissions |
 |---|---|---|
-| `/opt/tukuyomi-core/bin/tukuyomi-proxy`、`/opt/tukuyomi-core/bin/tukuyomi-inspector` | `kernel.inspector`（Coraza の検査プロセスの方） | root。サービスの OS ユーザーが書き換えられない場所に置きます |
-| `/opt/tukuyomi-core/bin/tukuyomi-inspector-modsecurity` | `kernel.engines.modsecurity.inspector`（ModSecurity の検査プロセスの方。省けます） | root。サービスの OS ユーザーが書き換えられない場所に置きます |
-| `/opt/tukuyomi-core/bin/tukuyomi-records-ship` | （ログ送信プロセスのユニット。省けます） | root。サービスの OS ユーザーが書き換えられない場所に置きます |
-| `/etc/tukuyomi-core/config.json` | （起動の引数） | root。サービスの OS ユーザーが読めることが必要です。サイズは 256 KiB まで |
-| `/var/lib/tukuyomi-core/store` | `rules.store.dir` | サービスの OS ユーザー。権限は 0700 |
-| `/var/lib/tukuyomi-core/tmp` | `kernel.tmp_root` | サービスの OS ユーザー。権限は 0700。setgid は付けません |
-| `/var/lib/tukuyomi-core/managed` | `managed.dir`（managed 設定を使う場合） | サービスの OS ユーザー。権限は 0700。中の `versions/`・`files/`・`acme/` などは、コマンド、管理プロセス、`acme renew` が作ります |
-| `/var/lib/tukuyomi-core/tls/` | リスナーと管理画面のルート（`admin.route`）が使う証明書の `cert_file`・`key_file` | サービスの OS ユーザー（`acme renew` が書きます）。managed 設定の ACME のサイトの証明書は、managed ストアの `acme/` にあります |
-| `/var/lib/tukuyomi-core/acme/account.key` | `acme.account_key_file` | `acme renew` が初回の実行時に作ります（0600） |
-| `/var/lib/tukuyomi-core/challenges` | `acme.challenge_dir` | サービスの OS ユーザー。チャレンジ専用のディレクトリにします |
-| `/var/lib/tukuyomi-core/records` | `records.dir` | サービスの OS ユーザー。権限は 0700。中の `records.log` などはプロキシが、`ship.state` はログ送信プロセスが、0600 で作ります |
-| `/etc/tukuyomi-core/records-db.dsn` | `records.ship.db_dsn_file`（ログ送信プロセスを使う場合） | 所有者はサービスの OS ユーザーで、権限は 0600。設定ファイルと違い、root を所有者にしません（ログ送信プロセスが所有者と権限を検証します） |
-| `/var/lib/tukuyomi-core/admin` | `admin.store.dir`（管理データの保存先） | サービスの OS ユーザー。権限は 0700。中の `users/`・`tokens/`・`audit/` などは管理プロセスが作ります |
-| `/var/lib/tukuyomi-core/control` | `admin.control` を置くディレクトリ（例のソケットは `/var/lib/tukuyomi-core/control/proxy.sock`） | サービスの OS ユーザー。権限は 0700。ソケットはプロキシが 0600 で作ります。ソケットのパスは 107 バイトまで |
-| `/var/lib/tukuyomi-core/crs-4.23.0` | `admin.crs_dir`（管理 API で CRS をインポートする場合） | 「CRS の取得」で作ったディレクトリ。サービスの OS ユーザーが読めることが必要です |
-| `/etc/tukuyomi-core/country.mmdb` | `geo.country_db` | root。サービスの OS ユーザーが読めて、書き換えられない形にします（0644）。プロキシは所有者と権限を検証しません |
+| `/opt/tukuyomi-core/bin/tukuyomi-proxy`, `/opt/tukuyomi-core/bin/tukuyomi-inspector` | `kernel.inspector` (for the Coraza inspector process) | root. Place them where the OS user of the service cannot modify them |
+| `/opt/tukuyomi-core/bin/tukuyomi-inspector-modsecurity` | `kernel.engines.modsecurity.inspector` (for the ModSecurity inspector process; can be omitted) | root. Place it where the OS user of the service cannot modify it |
+| `/opt/tukuyomi-core/bin/tukuyomi-records-ship` | (the records shipper unit; can be omitted) | root. Place it where the OS user of the service cannot modify it |
+| `/etc/tukuyomi-core/config.json` | (the start argument) | root. The OS user of the service must be able to read it. The size is up to 256 KiB |
+| `/var/lib/tukuyomi-core/store` | `rules.store.dir` | The OS user of the service. Permissions 0700 |
+| `/var/lib/tukuyomi-core/tmp` | `kernel.tmp_root` | The OS user of the service. Permissions 0700. Do not set setgid |
+| `/var/lib/tukuyomi-core/managed` | `managed.dir` (when you use the managed configuration) | The OS user of the service. Permissions 0700. The commands, the admin process, and `acme renew` create `versions/`, `files/`, `acme/`, and the others inside |
+| `/var/lib/tukuyomi-core/tls/` | `cert_file` and `key_file` of the certificates used by the listeners and by the admin route (`admin.route`) | The OS user of the service (`acme renew` writes them). The certificates of the ACME sites of the managed configuration are in `acme/` of the managed store |
+| `/var/lib/tukuyomi-core/acme/account.key` | `acme.account_key_file` | `acme renew` creates it on the first run (0600) |
+| `/var/lib/tukuyomi-core/challenges` | `acme.challenge_dir` | The OS user of the service. Use a directory dedicated to challenges |
+| `/var/lib/tukuyomi-core/records` | `records.dir` | The OS user of the service. Permissions 0700. The proxy creates `records.log` and the other files inside, and the records shipper creates `ship.state`, all with 0600 |
+| `/etc/tukuyomi-core/records-db.dsn` | `records.ship.db_dsn_file` (when you use the records shipper) | The owner is the OS user of the service, and the permissions are 0600. Unlike the configuration file, the owner is not root (the records shipper checks the owner and permissions) |
+| `/var/lib/tukuyomi-core/admin` | `admin.store.dir` (the admin store) | The OS user of the service. Permissions 0700. The admin process creates `users/`, `tokens/`, `audit/`, and the others inside |
+| `/var/lib/tukuyomi-core/control` | The directory in which `admin.control` is placed (the example socket is `/var/lib/tukuyomi-core/control/proxy.sock`) | The OS user of the service. Permissions 0700. The proxy creates the socket with 0600. The socket path is up to 107 bytes |
+| `/var/lib/tukuyomi-core/crs-4.23.0` | `admin.crs_dir` (when you import the CRS through the admin API) | The directory created in "Fetching the CRS". The OS user of the service must be able to read it |
+| `/etc/tukuyomi-core/country.mmdb` | `geo.country_db` | root. Make it readable by the OS user of the service and not modifiable by it (0644). The proxy does not check the owner and permissions |
 
-- 設定の `kernel.inspector` は、ModSecurity の世代だけを使うホストでも書きます（省けない設定キーです）。`kernel.engines` は、ModSecurity の世代を使う場合だけ書きます。書かないと、ModSecurity の世代はインポートも選択もできず、起動時にも受け付けません（[運用リファレンス](../operations/operator-reference.md) の「`kernel`」）。`kernel.default_engine` を `modsecurity` にするときも、`kernel.inspector` は書きます（`kernel.engines` も必要です）。
-- 上の表のディレクトリは、先に作っておいてください。プロキシもコマンドも、これらのディレクトリは作りません。ルールストアの中のもの（`generations/`、`staging/`、`using/` など）はコマンドとプロキシが、managed ストアの中のものはコマンド、管理プロセス、`acme renew` が、管理データの保存先の中身は管理プロセスが、ログファイルと制御ソケットはプロキシが作ります。
-- ルールストア、ログのディレクトリ、管理データの保存先、制御ソケットを置くディレクトリ、managed ストア、`challenge_dir` は、別々のディレクトリにします。同じディレクトリにすることも、互いの中に置くこともできません（設定を受け付けません）。上の表の例は、どれも `/var/lib/tukuyomi-core` の下の別々のディレクトリです。重なりは書いたままのパスで比べるので、シンボリックリンクは使わないでください。
-- 下の「systemd」の例のユニットは、`ReadWritePaths=/var/lib/tukuyomi-core` で、この下のディレクトリに書き込めるようにしています。managed ストアもこの下に置けば、ユニットを変更する必要はありません。別の場所に置く場合は、`ReadWritePaths` に追加してください。
-- ルールストア、作業ディレクトリ、ログのディレクトリ、管理データの保存先、制御ソケットを置くディレクトリ、managed ストアについては、シンボリックリンクでないディレクトリであること、所有者がプロセスの OS ユーザーであること、グループとその他のユーザーの権限が無いことを検証します。検証するタイミングはそれぞれ違います。
-  - ルールストアは、プロキシの起動、`config check`、`rules` のコマンドで検証します。管理プロセスがルールストアを開くときも検証します。条件を満たさなければ、exit 1 で拒否します。
-  - managed ストアは、開くたびに検証します（プロキシの起動と設定のリロード、`config check`、`managed` のコマンド、`acme renew`、管理プロセス）。条件を満たさなければ受け付けません（プロキシの起動と `config check` は exit 1）。
-  - 作業ディレクトリは、検査プロセスを起動するたびに検証します（プロキシの起動、検査プロセスの再起動、SIGUSR1 の切り替え、`rules import` の事前検証）。条件を満たさなければ、検査プロセスを起動しません。プロキシの起動では exit 1 で終わり、SIGUSR1 の切り替えでは今の世代が動き続け、再起動ではプロキシが停止します。
-  - ログのディレクトリは、プロキシの起動時に検証します。条件を満たさなければ、プロキシは起動しません（exit 1）。ログファイルを開き直す前と、ローテーションする前にも検証します。
-  - 制御ソケットを置くディレクトリは、プロキシの起動時に検証します。条件を満たさなければ、プロキシは起動しません（exit 1）。
-  - 管理データの保存先は、管理プロセスの起動と、`admin bootstrap`・`admin reset` で検証します。条件を満たさなければ、exit 1 で拒否します。
-  - `config check` と `acme renew` は、作業ディレクトリを検証しません。`config check` は、ログのディレクトリ、制御ソケットを置くディレクトリ、管理データの保存先も検証しません。
-- 上のディレクトリの親ディレクトリは検証しません。ほかの OS ユーザーが中に名前を作ったり、置き換えたりできないようにするのは、運用者の責任です。
-- 作業ディレクトリに setgid が付いていると、中に作るディレクトリがその属性を受け継いで権限の検証に失敗し、検査プロセスを起動できません。
-- `acme renew` は、証明書・鍵・チャレンジのファイルを、それぞれのディレクトリ（ACME のサイトでは managed ストアの `acme/` の中）に一時ファイルとして書いてから置き換えます。サービスの OS ユーザーが、これらのディレクトリに書き込めることが必要です。
-- 設定ファイルを読めない OS ユーザーでコマンドを実行すると、設定を読む段階で受け付けません。ルールストアや managed ストアの所有者と違う OS ユーザーで実行すると、それぞれを開く段階で受け付けません。
+- Write `kernel.inspector` in the configuration even on a host that uses ModSecurity generations only (it is a setting key that cannot be omitted). Write `kernel.engines` only when you use ModSecurity generations. Without it, a ModSecurity generation can be neither imported nor chosen, and the proxy rejects it at start as well (see "`kernel`" in the [operator reference](../operations/operator-reference.md)). When you set `kernel.default_engine` to `modsecurity`, you still write `kernel.inspector` (and `kernel.engines` is also needed).
+- Create the directories in the table above beforehand. Neither the proxy nor the commands create them. The commands and the proxy create what is inside the rules store (`generations/`, `staging/`, `using/`, and so on); the commands, the admin process, and `acme renew` create what is inside the managed store; the admin process creates what is inside the admin store; and the proxy creates the log files and the control socket.
+- Use separate directories for the rules store, the log directory, the admin store, the directory for the control socket, the managed store, and `challenge_dir`. They cannot be the same directory or be placed inside one another (the configuration is rejected). In the example in the table above, they are all separate directories under `/var/lib/tukuyomi-core`. Overlap is judged by comparing the paths as written, so do not use symbolic links.
+- The unit in the "systemd" example below makes the directories under it writable with `ReadWritePaths=/var/lib/tukuyomi-core`. If you also place the managed store under it, you do not need to change the unit. If you place it elsewhere, add it to `ReadWritePaths`.
+- For the rules store, the work directory, the log directory, the admin store, the directory for the control socket, and the managed store, the following are checked: it is a directory and not a symbolic link, it is owned by the OS user of the process, and it has no permissions for the group and other users. The timing of the checks differs for each directory.
+  - The rules store is checked at proxy start, in `config check` and in the `rules` commands. It is also checked when the admin process opens it. If the conditions are not met, the operation is refused with exit 1.
+  - The managed store is checked every time it is opened (proxy start and configuration reload, `config check`, the `managed` commands, `acme renew`, and the admin process). If the conditions are not met, it is rejected (proxy start and `config check` end with exit 1).
+  - The work directory is checked every time an inspector process is started (proxy start, restart of an inspector process, a SIGUSR1 switch, and the trial of `rules import`). If the conditions are not met, the inspector process does not start. At proxy start the proxy ends with exit 1, a SIGUSR1 switch keeps the current generation running, and on a restart the proxy stops.
+  - The log directory is checked at proxy start. If the conditions are not met, the proxy does not start (exit 1). It is also checked before the log file is reopened and before rotation.
+  - The directory for the control socket is checked at proxy start. If the conditions are not met, the proxy does not start (exit 1).
+  - The admin store is checked at admin process start and in `admin bootstrap` and `admin reset`. If the conditions are not met, they refuse with exit 1.
+  - `config check` and `acme renew` do not check the work directory. `config check` does not check the log directory, the directory for the control socket, or the admin store either.
+- The parent directories of the directories above are not checked. It is the operator's responsibility to prevent other OS users from creating or replacing names inside them.
+- If setgid is set on the work directory, the directories created inside it inherit that attribute and fail the permission check, so the inspector process cannot start.
+- `acme renew` writes the certificate, key, and challenge files as temporary files in their respective directories (for an ACME site, inside `acme/` of the managed store) and then replaces the targets. The OS user of the service must be able to write to these directories.
+- If you run a command as an OS user that cannot read the configuration file, the configuration is rejected at the stage of reading it. If you run it as an OS user different from the owner of the rules store or the managed store, it is rejected at the stage of opening each of them.
 
-### 国のデータベース
+### Country Database
 
-国の指定（全体の `access`、`host_policies` の `access`、ルートの `access` の `deny_countries`・`allow_countries`）を使う場合だけ必要です。
+Needed only when you use country lists (`deny_countries` and `allow_countries` of the global `access`, of the `access` of `host_policies`, and of the `access` of a route).
 
-- データベースはプロキシに同梱しておらず、プロキシが取得することもありません。MaxMind DB 形式（バージョン 2）のファイルを運用者が用意します。使用許諾は、提供元の条件に従って運用者が守ってください。
-- 置く場所と権限: 所有者を root にし、サービスの OS ユーザーが読めて書き換えられないファイル（0644）にします。例は `/etc/tukuyomi-core/country.mmdb` です。プロキシは所有者と権限を検証せず、中身を `geo.sha256` で検証します。シンボリックリンクにはしないでください（受け付けません）。サイズは 256 MiB までです。
-- 設定の全体を読むコマンド（プロキシの起動とリロード、`config check`、`acme renew`、`managed import`・`managed activate`）は、どれもサービスの OS ユーザーでこのファイルの全体を読みます。このファイルを読めない OS ユーザーで実行したコマンドは、設定を読む段階で受け付けません。`rules` と `admin` のコマンド、管理プロセス、ログ送信プロセスは、このファイルを読みません。
-- 国の指定があると、プロキシは、検証したファイルの全体をメモリに保持します。読むコマンドは、読むたびに全体を検証するので、大きいファイルでは時間とメモリを使います。
-- ファイルの SHA-256 を求めて、設定の `geo.sha256` に書きます。値が一致しないと、どのコマンドも設定を受け付けません。
+- The database is not bundled with the proxy, and the proxy does not fetch it. The operator provides a file in MaxMind DB format (version 2). The operator must follow the license terms of the provider.
+- Location and permissions: make the owner root, and make the file readable by the OS user of the service and not modifiable by it (0644). An example is `/etc/tukuyomi-core/country.mmdb`. The proxy does not check the owner and permissions, and verifies the contents with `geo.sha256`. Do not make it a symbolic link (it is rejected). The size is up to 256 MiB.
+- Every command that reads the whole configuration (proxy start and reload, `config check`, `acme renew`, `managed import`, and `managed activate`) reads the whole of this file as the OS user of the service. A command run as an OS user that cannot read this file is rejected at the stage of reading the configuration. The `rules` and `admin` commands, the admin process, and the records shipper do not read this file.
+- When country lists exist, the proxy keeps the whole verified file in memory. A command that reads it verifies the whole file each time, so a large file costs time and memory.
+- Compute the SHA-256 of the file and write it in `geo.sha256` in the configuration. Every command rejects the configuration if the values do not match.
 
   ```bash
   sha256sum /etc/tukuyomi-core/country.mmdb
   ```
 
-- データベースを入れ替えるときは、新しいファイルを別の名前で置き、設定の `geo.country_db` と `geo.sha256` を 1 回の置き換えで書き換えます。`config check` で検証してから、プロキシにリロードさせます（`systemctl reload`）。プロキシは、起動時とリロードのたびにデータベースを読みます。管理プロセスは、データベースを読みません。
-- 設定キーと、国の判定の方法（プライベートアドレスや、IPv4 だけのデータベースでの IPv6 アドレスは `UNKNOWN`）は、[運用リファレンス](../operations/operator-reference.md) の「アクセス制御とレート制限」を参照してください。
+- To replace the database, place the new file under a different name, and rewrite `geo.country_db` and `geo.sha256` in the configuration in a single replacement. Check it with `config check`, and then have the proxy reload (`systemctl reload`). The proxy reads the database at start and at every reload. The admin process does not read the database.
+- For the setting keys and how the country is determined (a private address, or an IPv6 address with an IPv4-only database, is `UNKNOWN`), see "Access Control and Rate Limits" in the [operator reference](../operations/operator-reference.md).
 
-## 初回起動の手順
+## First Start
 
-設定ファイルに `managed` を書く（managed 設定を使う）場合は、[運用リファレンス](../operations/operator-reference.md) の「managed 設定での初回起動」の手順で進めてください。managed 設定を使うかどうかの判断は、同じ文書の「managed 設定を使うかどうか」を参照してください。その手順では、下の 2〜4 と 7 をそのまま使います。
+If you write `managed` in the configuration file (you use the managed configuration), follow the procedure in "First Start with the Managed Configuration" in the [operator reference](../operations/operator-reference.md). For deciding whether to use the managed configuration, see "Whether to Use the Managed Configuration" in the same document. That procedure uses steps 2 to 4 and 7 below as they are.
 
-1. 設定ファイルを書きます。設定キーの一覧と例は、[運用リファレンス](../operations/operator-reference.md) を参照してください。上の表のディレクトリを先に作ります。国の指定を使う場合は、国のデータベースも置き、`sha256` を書きます（上の「国のデータベース」）。
-2. CRS を取得します（上の「CRS の取得」）。
-3. ルールセットをインポートします。
+1. Write the configuration file. For the list of setting keys and an example, see the [operator reference](../operations/operator-reference.md). Create the directories in the table above first. If you use country lists, also place the country database and write its `sha256` (see "Country Database" above).
+2. Fetch the CRS (see "Fetching the CRS" above).
+3. Import the rule set.
 
    ```bash
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy rules import /etc/tukuyomi-core/config.json --crs /var/lib/tukuyomi-core/crs-4.23.0 --detect-only
    ```
 
-   - インポートでは、検査プロセスを 1 つ起動し、決まったリクエストを 3 つ検査します（事前検証）。事前検証に通ったときだけ世代になり、標準出力に `<fingerprint> created` が出ます。同じ内容の世代が既にあれば、`already exists` が出ます。
-   - `--detect-only` を付けると、検知のみの世代になります。ルールに一致したリクエストも通し、ログに残します。最初はこの形で動かし、誤検知を確認してから遮断の世代に切り替えることをおすすめします。
-   - 遮断の世代では、事前検証のリクエストが 1 つでもブロックされると、事前検証に失敗し、世代になりません。`crs-setup.conf` の設定を厳しくした場合などは、ログを見て修正するか、`--accept-block` を付けてください。
-   - ModSecurity で検査する世代にするには、`--engine modsecurity` を付けます。設定の `kernel.engines` に検査プロセスを指定する必要があります。事前検証は、そのエンジンの検査プロセスで実行されます。
-4. 世代を選択します。
+   - The import starts one inspector process and inspects three fixed requests (the trial). Only if the trial passes does it become a generation, and `<fingerprint> created` is written to standard output. If a generation with the same content already exists, `already exists` is written.
+   - With `--detect-only`, the generation is in detect-only mode. Requests that match rules are also passed through and are recorded in the log. It is recommended to run in this mode first, check for false positives, and then switch to a generation in block mode.
+   - With a generation in block mode, if even one of the trial requests is blocked, the trial fails and no generation is created. If you made the settings in `crs-setup.conf` stricter, for example, read the log and fix them, or add `--accept-block`.
+   - To make a generation that is inspected by ModSecurity, add `--engine modsecurity`. You must specify the inspector process in `kernel.engines` in the configuration. The trial runs with the inspector process of that engine.
+4. Choose the generation.
 
    ```bash
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy rules activate /etc/tukuyomi-core/config.json <fingerprint>
    ```
 
-   - 世代は、エンジンごとに選択します。最初に選択するのは、デフォルトのエンジン（設定の `kernel.default_engine`。書かなければ `coraza`）の世代です。デフォルトのエンジンに選択中の世代が無いと、プロキシは起動しません。
-   - ModSecurity だけで始めるときは、設定の `kernel.default_engine` を `modsecurity` にして、ModSecurity の世代を選択します。`kernel.default_engine` を書かずに ModSecurity の世代だけを選択すると、`config check` と起動は `rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` で拒否されます（exit 1）。
-   - エンジンごとの選択の詳細は、[運用リファレンス](../operations/operator-reference.md) の「エンジンごとの選択中の世代」を参照してください。
-5. 設定を検証します。
+   - A generation is chosen for each engine. The first one to choose is the generation of the default engine (`kernel.default_engine` in the configuration; `coraza` if it is not written). If the default engine has no chosen generation, the proxy does not start.
+   - To start with ModSecurity only, set `kernel.default_engine` in the configuration to `modsecurity` and choose a ModSecurity generation. If you choose only a ModSecurity generation without writing `kernel.default_engine`, `config check` and the proxy at start refuse with `rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` (exit 1).
+   - For the details of choosing per engine, see "Chosen Generation per Engine" in the [operator reference](../operations/operator-reference.md).
+5. Check the configuration.
 
    ```bash
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy config check /etc/tukuyomi-core/config.json
    ```
 
-   - 通れば、標準出力に `accepted` が出て、exit 0 になります。
-   - デフォルトのエンジンの世代を選択する前に実行すると、`rules store refused: no generation is chosen` で拒否されます（exit 1）。アップストリームのエンジンに選択中の世代が無いときも、同じ文で拒否されます。設定そのもののエラーは exit 2 で分かるので、手順 1 の後にも実行できます。
-   - アップストリームのサーバー名と、TLS の証明書と鍵のファイルも検証します。受け付けられなかった場合も同じ exit 1 で、行の先頭（`upstream refused`、`tls refused`）で区別できます。
-   - 検査プロセスは起動しないので、作業ディレクトリ、検査プロセスの実行ファイル、Landlock は検証しません。
-6. サービスを起動します（下の「systemd」）。
-7. 管理プロセスを使う場合は、そのユニットも起動し（下の「管理プロセスのユニット」）、最初のユーザーを作ります。
+   - If it passes, `accepted` is written to standard output and it ends with exit 0.
+   - If you run it before choosing a generation for the default engine, it is refused with `rules store refused: no generation is chosen` (exit 1). It is refused with the same message when an upstream engine has no chosen generation. An error in the configuration itself shows as exit 2, so you can also run it after step 1.
+   - It also checks the upstream server names and the TLS certificate and key files. A rejection there also ends with exit 1, and you can tell the cases apart by the beginning of the line (`upstream refused`, `tls refused`).
+   - It does not start an inspector process, so it does not check the work directory, the inspector executable, or Landlock.
+6. Start the service (see "systemd" below).
+7. If you use the admin process, also start its unit (see "Admin Process Unit" below) and create the first user.
 
    ```bash
    read -r -s -p 'password: ' PW; echo
@@ -275,15 +277,15 @@ sudo -u tukuyomi scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
    unset PW
    ```
 
-   - パスワードは、標準入力の最初の 1 行から読みます（12〜128 バイト）。引数には渡しません。名前は、`a-z`・`0-9`・`.`・`_`・`-` で 1〜32 バイトです。
-   - 作るユーザーのロールは `owner` です。成功すると `created owner <name>` が出ます。管理データの保存先にユーザーが 1 人でもいれば、拒否されます（exit 1）。
-   - 管理プロセスの起動の前でも後でも実行できます。パスワードを忘れたユーザーには `admin reset` を使います。
-   - 管理 API、ロール、画面については、[管理リファレンス](../operations/admin-reference.md) を参照してください。
-8. ログを DB へ送る場合は、DB のユーザーと DB を用意し、接続文字列のファイルを、所有者をサービスの OS ユーザーにして 0600 で置きます。設定に `records.ship` を書いて、ログ送信プロセスのユニットを起動します（下の「ログ送信プロセスのユニット」）。テーブルは、ログ送信プロセスが最初に接続したときに作ります。テーブルの権限と接続文字列の形式は、[運用リファレンス](../operations/operator-reference.md) の「ログ送信プロセス」を参照してください。
+   - The password is read from the first line of standard input (12 to 128 bytes). Do not pass it as an argument. The name is 1 to 32 bytes of `a-z`, `0-9`, `.`, `_`, and `-`.
+   - The role of the user it creates is `owner`. On success, `created owner <name>` is written. If the admin store already has even one user, it is refused (exit 1).
+   - You can run it before or after the admin process starts. For a user who has forgotten the password, use `admin reset`.
+   - For the admin API, roles and screens, see the [admin reference](../operations/admin-reference.md).
+8. If you ship logs to a DB, prepare the DB user and the DB, and place the connection string file with the OS user of the service as its owner and with 0600. Write `records.ship` in the configuration and start the records shipper unit (see "Records Shipper Unit" below). The records shipper creates the table when it first connects. For the table permissions and the format of the connection string, see "Records Shipper" in the [operator reference](../operations/operator-reference.md).
 
 ## systemd
 
-サービスのユニットの例を示します。
+Here is an example of the service unit.
 
 ```ini
 [Unit]
@@ -317,49 +319,49 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 ```
 
-- `KillMode=mixed` にします。
-  - デフォルトの `control-group` では、停止の SIGTERM が検査プロセスにも届きます。
-  - 検査プロセスは SIGTERM を処理しないので、その場で終了します。そのため、プロキシが検査プロセスを順に停止すること（残りの検査を終え、終了の通知を受けること）ができません。
-  - `mixed` では、SIGTERM はプロキシにだけ届きます。プロキシは、自分で検査プロセスを停止してから終了します。
-- `Type=notify` にします。プロキシは、起動する全部のエンジンの検査カーネルの準備ができてすべてのリスナーをバインドした後に `READY=1` を、停止の始めに `STOPPING=1` を systemd へ送ります。`systemctl start` と、このユニットの後に `After=` で並べたユニットは、そこまで待ちます。`Type=simple` では、実行した時点で起動したと見なされます。
-  - 通知を送るのはプロキシのメインプロセスだけです。`NotifyAccess` はデフォルト（`main`）のままで問題ありません。
-  - `TimeoutStartSec` は、アップストリームの名前解決の時間（`resolve_timeout_ms`）と、検査カーネルの準備を待つ時間（`ready_wait_ms`）を足した時間より長くします。`READY=1` が届かないと、systemd はこの時間の後にプロキシを停止します。
-- `TimeoutStopSec` は、`stop_wait_ms` と `kill_grace_ms` と、ログの書き出しの 200 ms を足した時間より長くします。短いと、systemd が先に SIGKILL を送ります。停止の流れは、[運用リファレンス](../operations/operator-reference.md) の「停止」を参照してください。
-- `LogRateLimitIntervalSec=0` を指定します。journald のデフォルトのレート制限では、リクエストが集中したときにリクエストのログがジャーナルに入らずに失われます。
-- ログはジャーナルに入ります。設定に `records` があれば、同じログがファイルにも書かれます（上の「OS ユーザーとディレクトリ」）。保存期間と容量は、journald の設定（`/etc/systemd/journald.conf` の `SystemMaxUse`、`MaxRetentionSec` など）で決めます。ログにはクライアントのアドレスとパスが入るので、ジャーナルを読めるグループ（Ubuntu では `adm`・`systemd-journal`）に入れる OS ユーザーは最小限にしてください。ログの形式は、[運用リファレンス](../operations/operator-reference.md) の「ログ」を参照してください。
-- 監視用のリスナー（設定の `status`）を置くと、同じホストの監視プログラムから `/healthz`・`/readyz`・`/metrics` にアクセスできます。ロードバランサーの準備状態の確認には `/readyz` を使います。
-- シグナルは、プロキシのメインプロセスにだけ送ります（`ExecReload` の `$MAINPID`、または `systemctl kill --kill-whom=main`）。
-  - `--kill-whom=main` を付けない `systemctl kill` は、検査プロセスにもシグナルを送ります。
-  - 検査プロセスは、SIGUSR1・SIGUSR2 は無視しますが、SIGTERM・SIGINT・SIGHUP が届くと終了します。
-- `systemctl reload` は、2 つの `ExecReload` を順に実行します。`config check` が通ったときだけ SIGHUP を送り、プロキシは設定ファイルをリロードして、停止せずに新しい設定に切り替えます（[運用リファレンス](../operations/operator-reference.md) の「SIGHUP（設定のリロード）」）。
-  - `config check` が受け付けない設定では、SIGHUP は送られず、`systemctl reload` が失敗を返します。
-  - `config check` が通ると、`systemctl reload` は SIGHUP を送った時点で成功を返し、リロードの完了を待ちません。動作中のプロキシだけが拒否する理由（動作中に変更できない設定キーの違い、アップストリームのエンジンが稼働していないこと、新しいリスナーのバインド）では、`systemctl reload` は成功を返します。結果は、ログの `reload: configuration replaced <SHA-256>`（`managed` のある設定では、後に ` managed <version>` が続きます）と `reload: configuration refused: <reason>` の行と、`/metrics` の `tukuyomi_config_reloads_total` で確認します。
-  - 選択中の世代を `config check` が受け付けない間は、`systemctl reload` も拒否されます（リロードそのものは世代に触れません）。
-- 設定を変更する手順: ファイルを書き換え（別の名前に書いてから、1 回の置き換えで差し替えます）、`systemctl reload tukuyomi-core.service` を実行し、ログの行で結果を確認します。動作中に変更できない設定キーを変えたときは、`systemctl restart` で再起動します。管理プロセスとログ送信プロセスは設定をリロードしないので、それらが読む設定キーを変えたら再起動します。
-- 入れ替えの順序: SIGHUP を受けると停止していた以前のバージョンから入れ替えるときは、新しい実行ファイルを入れて再起動してから、ユニットの `ExecReload` を変更して `systemctl daemon-reload` を実行します（両方を変更してから再起動してもかまいません）。前のバージョンのまま新しいユニットで `systemctl reload` を実行すると、前のバージョンは SIGHUP で停止します。exit 0 で停止するので、`Restart=on-failure` でも再起動しません。
-- エンジンごとの選択に対応していない以前のバージョンから入れ替えるときは、管理プロセス、プロキシ、ログ送信プロセスを同じビルドにそろえます。手順と入れ替えの順序は、[運用リファレンス](../operations/operator-reference.md) の「バージョンの更新」を参照してください。
-- 証明書と鍵だけを再読み込みさせる（SIGUSR2）ときは、次のように送ります。
+- Use `KillMode=mixed`.
+  - With the default `control-group`, the SIGTERM sent to stop also reaches the inspector processes.
+  - An inspector process does not handle SIGTERM and exits on the spot. The proxy therefore cannot stop the inspector processes in order (finishing the remaining inspections and receiving the termination notice).
+  - With `mixed`, SIGTERM reaches only the proxy. The proxy stops the inspector processes itself and then exits.
+- Use `Type=notify`. The proxy sends `READY=1` to systemd after the inspection kernels of all the engines to be started are ready and all the listeners are bound, and sends `STOPPING=1` at the beginning of the stop. `systemctl start`, and units ordered after this unit with `After=`, wait until then. With `Type=simple`, the service is considered started as soon as it is executed.
+  - Only the main process of the proxy sends the notifications. You can leave `NotifyAccess` at its default (`main`).
+  - Make `TimeoutStartSec` longer than the sum of the upstream name resolution time (`resolve_timeout_ms`) and the time to wait for the inspection kernel to be ready (`ready_wait_ms`). If `READY=1` does not arrive, systemd stops the proxy after this time.
+- Make `TimeoutStopSec` longer than the sum of `stop_wait_ms`, `kill_grace_ms`, and the 200 ms for writing out the logs. If it is shorter, systemd sends SIGKILL first. For the stop sequence, see "Stopping" in the [operator reference](../operations/operator-reference.md).
+- Specify `LogRateLimitIntervalSec=0`. With the default rate limit of journald, request logs are lost without entering the journal when many requests arrive at once.
+- Logs go to the journal. If the configuration has `records`, the same logs are also written to files (see "OS User and Directories" above). The retention period and size are set in the journald configuration (`SystemMaxUse`, `MaxRetentionSec`, and so on in `/etc/systemd/journald.conf`). The logs contain client addresses and paths, so keep the number of OS users in the groups that can read the journal (`adm` and `systemd-journal` on Ubuntu) to a minimum. For the log format, see "Logs" in the [operator reference](../operations/operator-reference.md).
+- If you add a listener for monitoring (`status` in the configuration), a monitoring program on the same host can access `/healthz`, `/readyz`, and `/metrics`. Use `/readyz` for a load balancer's readiness check.
+- Send signals only to the main process of the proxy (`$MAINPID` in `ExecReload`, or `systemctl kill --kill-whom=main`).
+  - `systemctl kill` without `--kill-whom=main` also sends the signal to the inspector processes.
+  - An inspector process ignores SIGUSR1 and SIGUSR2, but exits when SIGTERM, SIGINT, or SIGHUP arrives.
+- `systemctl reload` runs the two `ExecReload` lines in order. It sends SIGHUP only if `config check` passes, and the proxy reloads the configuration file and switches to the new configuration without stopping (see "SIGHUP (Configuration Reload)" in the [operator reference](../operations/operator-reference.md)).
+  - With a configuration that `config check` rejects, SIGHUP is not sent and `systemctl reload` returns a failure.
+  - When `config check` passes, `systemctl reload` returns success at the moment it sends SIGHUP and does not wait for the reload to complete. When only the running proxy refuses the configuration (a difference in a setting key that cannot change while running, an upstream engine that is not running, or binding a new listener), `systemctl reload` still returns success. Check the result in the log lines `reload: configuration replaced <SHA-256>` (with a configuration that has `managed`, ` managed <version>` follows) and `reload: configuration refused: <reason>`, and in `tukuyomi_config_reloads_total` of `/metrics`.
+  - While `config check` rejects the chosen generation, `systemctl reload` is also refused (the reload itself does not touch generations).
+- To change the configuration: rewrite the file (write it under another name and swap it in with a single replacement), run `systemctl reload tukuyomi-core.service`, and check the result in the log lines. If you changed a setting key that cannot change while running, restart with `systemctl restart`. The admin process and the records shipper do not reload the configuration, so restart them when you change a setting key that they read.
+- Order of replacement: when you replace an earlier version that stopped when it received SIGHUP, install the new executable and restart first, and then change `ExecReload` in the unit and run `systemctl daemon-reload` (you may also change both and then restart). If you run `systemctl reload` with the new unit while still on the earlier version, the earlier version stops on SIGHUP. It stops with exit 0, so `Restart=on-failure` does not restart it.
+- When you replace an earlier version that does not support choosing per engine, bring the admin process, the proxy, and the records shipper to the same build. For the procedure and the order of replacement, see "Version Updates" in the [operator reference](../operations/operator-reference.md).
+- To make it reload only the certificates and keys (SIGUSR2), send it as follows:
 
   ```bash
   systemctl kill -s SIGUSR2 --kill-whom=main tukuyomi-core.service
   ```
 
-- ルールセットの世代の切り替え（SIGUSR1）は、次のように送ります。
+- To switch the generation of the rule set (SIGUSR1), send it as follows:
 
   ```bash
   systemctl kill -s SIGUSR1 --kill-whom=main tukuyomi-core.service
   ```
 
-  SIGUSR1 は、エンジンごとの選択中の世代へ、エンジンを 1 つずつ順に切り替えます。選択中の世代があるのに稼働していないエンジンは、起動します（[運用リファレンス](../operations/operator-reference.md) の「SIGUSR1（世代の切り替え）」）。
+  SIGUSR1 switches to the chosen generation of each engine, one engine at a time in order. An engine that has a chosen generation but is not running is started (see "SIGUSR1 (Generation Switch)" in the [operator reference](../operations/operator-reference.md)).
 
-- ログのディレクトリ、制御ソケットを置くディレクトリ、管理データの保存先、managed ストアは、`ReadWritePaths` の中に置きます（上の例では `/var/lib/tukuyomi-core` の下）。別の場所に置く場合は、`ReadWritePaths` に追加してください。
-- ポート 80・443 で待ち受けるには `CAP_NET_BIND_SERVICE` が必要です。ambient ケーパビリティは検査プロセスにも引き継がれますが、検査プロセスは起動時にすべてのケーパビリティを破棄します。
-- `LimitNOFILE` は、受け付ける接続（`max_conns`）とアップストリームへの接続の数を足した値より大きくします。接続ごとにファイルディスクリプターを使います。
-- 設定のエラーなどで起動が拒否されると、`Restart=on-failure` により `RestartSec` ごとに再起動します。設定を変更する前に、`config check` で検証してください。
+- Place the log directory, the directory for the control socket, the admin store, and the managed store inside `ReadWritePaths` (under `/var/lib/tukuyomi-core` in the example above). If you place them elsewhere, add them to `ReadWritePaths`.
+- Listening on ports 80 and 443 requires `CAP_NET_BIND_SERVICE`. The ambient capability is inherited by the inspector processes too, but an inspector process discards all capabilities at start.
+- Make `LimitNOFILE` larger than the sum of the accepted connections (`max_conns`) and the connections to upstreams. Each connection uses a file descriptor.
+- When the start is refused because of a configuration error or the like, `Restart=on-failure` restarts it every `RestartSec`. Check the configuration with `config check` before you change it.
 
-### 管理プロセスのユニット
+### Admin Process Unit
 
-管理プロセスは、プロキシとは別のユニットで動かします。実行ファイル、設定ファイル、OS ユーザーはプロキシと同じです。ユニットの例を示します。
+Run the admin process in a unit separate from the proxy. The executable, the configuration file, and the OS user are the same as the proxy's. Here is an example of the unit.
 
 ```ini
 # tukuyomi-core-admin.service
@@ -387,20 +389,20 @@ ReadWritePaths=/var/lib/tukuyomi-core
 WantedBy=multi-user.target
 ```
 
-- `Type=notify` にします。管理プロセスは、リスナーをバインドした後に `READY=1` を、停止の始めに `STOPPING=1` を送ります。
-- `KillMode=mixed` にします。管理プロセスは、ルールのインポートの事前検証で検査プロセスを起動します。停止の SIGTERM がメインプロセスにだけ届けば、管理プロセスが実行中の事前検証を終えて、検査プロセスと作業ディレクトリを片付けます。
-- 管理プロセスは、停止のシグナル（SIGTERM、SIGINT、SIGHUP）を受けると、リスナーを閉じ、処理中のリクエストを最大 10 秒待ちます。`TimeoutStopSec` は、この 10 秒より長くします。インポートの事前検証が実行中の場合に備えて、その検査プロセスを停止する時間（`proxy.stop_inspect_ms` と `kernel.kill_grace_ms`）も足しておきます。
-- `LogRateLimitIntervalSec=0` を指定します。監査ログは標準エラー（ジャーナル）にも出るので、journald のレート制限で失われないようにします。
-- 検査プロセスの実行ファイル（`kernel.inspector`。ModSecurity の世代では `kernel.engines` の方）と作業ディレクトリ（`kernel.tmp_root`）は、プロキシと同じものを使います。インポートの事前検証で起動する検査プロセスも、プロキシの場合と同じく Landlock で自身の権限を制限します。
-- 管理プロセスは、`admin.listen` のループバックアドレスで、平文の HTTP で待ち受けます。1024 以上のポートなら、`AmbientCapabilities` は不要です。
-- 管理プロセスは、設定ファイルを起動時に 1 回だけ読みます（プロキシと違い、SIGHUP でリロードしません）。設定を変更したら、`config check` で検証してから、`systemctl restart` で再起動します。`ExecReload` は置きません（管理プロセスにとって SIGHUP は停止のシグナルです）。
-- プロキシが動いていなくても、管理プロセスは起動します。その間は、世代の切り替えも managed 設定の反映も依頼できません。
-- 外部から使う場合は、プロキシの TLS リスナーのルートから `admin.listen` のアドレスへ転送します。`admin.listen` はアップストリームのサーバーに指定できます。`managed` のある設定では、ルートではなく `admin.route` で転送し、`admin.listen` をアップストリームのサーバーには指定できません（[運用リファレンス](../operations/operator-reference.md) の「`admin`」）。ルートの書き方は [管理リファレンス](../operations/admin-reference.md) の「外部からの利用」を、画面と API の使い方は同じ文書を参照してください。
-- ログはジャーナルに入ります。監査ログは、管理データの保存先の `audit/` にも書かれます。
+- Use `Type=notify`. The admin process sends `READY=1` after it binds the listener and `STOPPING=1` at the beginning of the stop.
+- Use `KillMode=mixed`. The admin process starts inspector processes for the trial of a rule import. If the SIGTERM sent to stop reaches only the main process, the admin process finishes the trial that is running and cleans up the inspector process and the work directory.
+- When the admin process receives a stop signal (SIGTERM, SIGINT, or SIGHUP), it closes the listener and waits up to 10 seconds for requests in progress. Make `TimeoutStopSec` longer than these 10 seconds. To allow for an import trial that is running, also add the time to stop its inspector process (`proxy.stop_inspect_ms` and `kernel.kill_grace_ms`).
+- Specify `LogRateLimitIntervalSec=0`. The audit log is also written to standard error (the journal), so this keeps it from being lost to the rate limit of journald.
+- For the inspector executable (`kernel.inspector`; `kernel.engines` for ModSecurity generations) and the work directory (`kernel.tmp_root`), use the same ones as the proxy. The inspector process started for an import trial also restricts its own privileges with Landlock, as in the proxy's case.
+- The admin process listens on the loopback address `admin.listen` with plain HTTP. With a port of 1024 or higher, `AmbientCapabilities` is not needed.
+- The admin process reads the configuration file only once, at start (unlike the proxy, it does not reload on SIGHUP). After you change the configuration, check it with `config check` and then restart with `systemctl restart`. Do not set `ExecReload` (for the admin process, SIGHUP is a stop signal).
+- The admin process starts even if the proxy is not running. In the meantime it cannot ask for a generation switch or for applying the managed configuration.
+- To use it from outside, forward from a route of the proxy's TLS listener to the address in `admin.listen`. `admin.listen` can be specified as an upstream server. With a configuration that has `managed`, forward with `admin.route` instead of a route, and `admin.listen` cannot be specified as an upstream server (see "`admin`" in the [operator reference](../operations/operator-reference.md)). For how to write the route, see "Access from Outside" in the [admin reference](../operations/admin-reference.md); for how to use the screens and the API, see the same document.
+- Logs go to the journal. The audit log is also written to `audit/` in the admin store.
 
-### ログ送信プロセスのユニット
+### Records Shipper Unit
 
-ログを DB へ送る場合は、ログ送信プロセスをプロキシとは別のユニットで動かします。設定ファイルと OS ユーザーはプロキシと同じです。ユニットの例を示します。
+If you ship logs to a DB, run the records shipper in a unit separate from the proxy. The configuration file and the OS user are the same as the proxy's. Here is an example of the unit.
 
 ```ini
 # tukuyomi-core-records-ship.service
@@ -427,19 +429,19 @@ ReadWritePaths=/var/lib/tukuyomi-core
 WantedBy=multi-user.target
 ```
 
-- `Type=notify` にします。ログ送信プロセスは、起動時の検証を終えた後に `READY=1` を、停止の始めに `STOPPING=1` を送ります。DB には `READY=1` の後に接続します。接続できない DB は待ってから再試行するので、DB のユニットの後に並べる必要はありません。
-- `TimeoutStopSec` は長めにします。停止のシグナルは DB の呼び出しが終わるまで処理されないため、停止までに長いと 1〜2 分かかります。それより短くて SIGKILL になっても、行と位置は同じトランザクションで DB に入るので、次の起動では続きから送ります。
-- ログのディレクトリ（`ship.state` を書きます）は、`ReadWritePaths` の中に置きます。
-- DB がログインを拒否すると、ログ送信プロセスは exit 1 で終了し、`Restart=on-failure` により `RestartSec` ごとに再起動します。接続文字列を直すまで、これを繰り返します。
-- DB サーバーの証明書を独自の認証局で発行したときは、その証明書のファイルを `Environment=SSL_CERT_FILE=<path>` で渡します。
-- 設定ファイルと接続文字列のファイルは、起動時に 1 回だけ読みます（プロキシと違い、SIGHUP でリロードしません）。変更したら、`systemctl restart` で再起動します。`ExecReload` は置きません（ログ送信プロセスにとって SIGHUP は停止のシグナルです）。
-- ログ送信プロセスはプロキシと同じ設定ファイルを読み、未知の設定キーを含む設定ファイルは受け付けません。設定に新しい設定キー（`managed`、`host_policies`、`kernel.default_engine`、アップストリームの `engine` など）を書く前に、ログ送信プロセスの実行ファイルをプロキシと同じビルドに入れ替えてください。前のビルドのままだと、ログ送信プロセスは次の起動で設定を受け付けず、起動しません（[運用リファレンス](../operations/operator-reference.md) の「ログ送信プロセスの起動」）。
-- プロキシが動いていなくても、ログ送信プロセスは起動し、ファイルにあるログを送ります。プロキシは、ログ送信プロセスが動いていないこと（`ship.state` が 90 秒より古いこと）を、`required` のルートのリクエストを拒否することで示します。
-- ログ送信プロセスのログはジャーナルに入ります。
+- Use `Type=notify`. The records shipper sends `READY=1` after it finishes its checks at start and `STOPPING=1` at the beginning of the stop. It connects to the DB after `READY=1`. It waits and retries when it cannot connect to the DB, so you do not need to order it after the DB unit.
+- Make `TimeoutStopSec` long. The stop signal is not handled until the DB call finishes, so a stop can take 1 to 2 minutes at the longest. Even if the timeout is shorter and the process ends with SIGKILL, the lines and the position enter the DB in the same transaction, so the next start continues from where it left off.
+- Place the log directory (where `ship.state` is written) inside `ReadWritePaths`.
+- If the DB refuses the login, the records shipper ends with exit 1, and `Restart=on-failure` restarts it every `RestartSec`. It repeats this until you fix the connection string.
+- If the certificate of the DB server was issued by your own certificate authority, pass the certificate file with `Environment=SSL_CERT_FILE=<path>`.
+- The records shipper reads the configuration file and the connection string file only once, at start (unlike the proxy, it does not reload on SIGHUP). After you change them, restart with `systemctl restart`. Do not set `ExecReload` (for the records shipper, SIGHUP is a stop signal).
+- The records shipper reads the same configuration file as the proxy, and rejects a configuration file that contains an unknown setting key. Before you write a new setting key (`managed`, `host_policies`, `kernel.default_engine`, the upstream `engine`, and so on) in the configuration, replace the records shipper executable with the same build as the proxy. If it stays on the previous build, the records shipper rejects the configuration at the next start and does not start (see "Starting the Records Shipper" in the [operator reference](../operations/operator-reference.md)).
+- The records shipper starts even if the proxy is not running, and ships the logs that are in the files. The proxy shows that the records shipper is not running (`ship.state` is older than 90 seconds) by refusing requests to `required` routes.
+- The logs of the records shipper go to the journal.
 
-### 証明書の更新のタイマー
+### Certificate Renewal Timer
 
-`acme renew` を毎日実行する例を示します。
+Here is an example that runs `acme renew` every day.
 
 ```ini
 # tukuyomi-core-acme.service
@@ -474,45 +476,45 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-- コマンドの後に送る SIGUSR2 で、プロキシが新しい証明書を読み込みます。動作中のプロキシは、コマンドが証明書を書いたことを検知しません。
-  - `systemctl reload` を使わないのは、SIGHUP では設定ファイルの全体を読み込むためです。タイマーが実行されたときに編集途中の設定を読み込まないように、証明書と鍵だけを読み込む SIGUSR2 を送ります。
-- `ExecStopPost` は、コマンドが失敗しても実行されます。証明書が 1 つでも `failed` になるとコマンドは exit 1 で終わりますが、SIGUSR2 は送られるので、ほかの更新できた証明書は使われ始めます。`failed` の証明書のファイルは前のまま残り、SIGUSR2 は読み込んだ証明書がすべて検証に通るときだけ入れ替えるので、失敗したときに送っても問題ありません。
-- `ExecStopPost` の先頭の `+` は、`systemctl kill` を root で実行するための指定です。コマンドそのものは、サービスの OS ユーザーで実行されます。
-- `ExecStartPost=+` で SIGUSR2 を送っているユニットは、その行を上の `ExecStopPost=+` の行に変更し、`systemctl daemon-reload` を実行してください。`ExecStartPost` はコマンドが exit 0 で終わったときだけ実行されるので、1 つの `failed` で、ほかの更新できた証明書も、次に SIGUSR2 か SIGHUP を送るまで使われません。
-- 同じ設定で `acme renew` を 2 つ同時に実行しないでください。同時実行を防ぐ仕組みはありません。systemd のタイマーは重なりませんが、cron などで実行する場合は重ならないようにしてください。
-- managed 設定で、ACME のサイトのホストの組み合わせを変更したバージョンを反映したときは、タイマーを待たずに `systemctl start tukuyomi-core-acme.service` でこのサービスを実行します（[運用リファレンス](../operations/operator-reference.md) の「ACME のサイト」）。
-- 初回の発行の手順は、[運用リファレンス](../operations/operator-reference.md) の「ACME」を参照してください。
+- The SIGUSR2 sent after the command makes the proxy load the new certificates. A running proxy does not detect that the command wrote certificates.
+  - `systemctl reload` is not used because SIGHUP loads the whole configuration file. So that the timer does not load a configuration that is being edited when it runs, SIGUSR2, which loads only the certificates and keys, is sent.
+- `ExecStopPost` runs even if the command fails. If even one certificate becomes `failed`, the command ends with exit 1, but SIGUSR2 is still sent, so the other certificates that were renewed start to be used. The file of a `failed` certificate stays as it was, and SIGUSR2 replaces certificates only when all the certificates it loaded pass the check, so there is no problem in sending it on a failure.
+- The `+` at the beginning of `ExecStopPost` is a specification to run `systemctl kill` as root. The command itself runs as the OS user of the service.
+- If you have a unit that sends SIGUSR2 with `ExecStartPost=+`, change that line to the `ExecStopPost=+` line above and run `systemctl daemon-reload`. `ExecStartPost` runs only when the command ends with exit 0, so with a single `failed`, the other certificates that were renewed are not used until the next time SIGUSR2 or SIGHUP is sent.
+- Do not run two `acme renew` with the same configuration at the same time. There is no mechanism to prevent concurrent runs. systemd timers do not overlap, but if you run it from cron or the like, make sure the runs do not overlap.
+- When you apply a version of the managed configuration in which the combination of hosts of an ACME site was changed, run this service with `systemctl start tukuyomi-core-acme.service` without waiting for the timer (see "ACME Sites" in the [operator reference](../operations/operator-reference.md)).
+- For the procedure of the first issue, see "ACME" in the [operator reference](../operations/operator-reference.md).
 
-## 検査プロセスの権限の制限
+## Restricting the Inspector Processes
 
-検査プロセスは、起動時に次の順で自身の権限を制限します。どの制限も、プロセスのすべてのスレッドに、元に戻せない形でかけます。
+At start, an inspector process restricts its own privileges in the following order. Every restriction is applied to all threads of the process in a form that cannot be undone.
 
-1. ルールセットの世代を読みます。読めなければ exit 11 で終了します。別のエンジンの世代のマニフェストもこの検査プロセスは読めないので、同じく exit 11 で終了します。
-   - Coraza の検査プロセスは、この後はファイルを読みません。
-   - ModSecurity の検査プロセスは、検証したファイルを、起動ごとの一時ディレクトリの中に写します（写せなければ exit 14）。制限をかけた後は、ルールをこの写しから組み立て、この写しだけを読みます。
-2. Landlock のルールセットを組み立てます。
-   - 起動ごとの一時ディレクトリ（作業ディレクトリの中に作ります）の外のファイルに触れられなくします。作業ディレクトリの中のほかのディレクトリにも触れられません。
-   - 一時ディレクトリの中で許可するのは、ファイルの作成・書き込み・読み込み・切り詰め・削除だけです。ディレクトリの作成と一覧、一時ディレクトリの外へのリネーム、プログラムの実行はできません。
-   - Linux 6.7 以上（ABI 4 以上）では、TCP のバインドと接続も禁止します。
-3. ケーパビリティを破棄します（ambient を空にし、effective・permitted・inheritable を 0 にします）。
-4. `no_new_privs` を設定します。
-5. 最後に Landlock を有効にします。この時点から、2 の制限が効きます。
+1. It reads the generation of the rule set. If it cannot read it, it ends with exit 11. It cannot read the manifest of a generation of another engine either, so it likewise ends with exit 11.
+   - The Coraza inspector process does not read files after this.
+   - The ModSecurity inspector process copies the verified files into the temporary directory created for each start (if it cannot copy them, exit 14). After the restriction is applied, it builds the rules from this copy and reads only this copy.
+2. It builds the Landlock rule set.
+   - It makes the files outside the temporary directory created for each start (created inside the work directory) inaccessible. Other directories inside the work directory are also inaccessible.
+   - What is allowed inside the temporary directory is only creating, writing, reading, truncating, and deleting files. Creating and listing directories, renaming to outside the temporary directory, and running programs are not possible.
+   - On Linux 6.7 or later (ABI 4 or later), TCP bind and connect are also prohibited.
+3. It discards the capabilities (empties the ambient set and sets effective, permitted, and inheritable to 0).
+4. It sets `no_new_privs`.
+5. Finally, it enables Landlock. From this point, the restrictions of step 2 take effect.
 
-2 から 5 のどれかが失敗すると、検査プロセスは起動しません（exit 14）。この後、ルールをその世代のエンジン（Coraza か ModSecurity）で検証して組み立て、リクエストの受け付けを始めます。ルールの検証や組み立てに失敗したときは、exit 11 で終了します。ModSecurity の検査プロセスは、ライブラリの準備ができないなどの環境の問題では、exit 14 で終了します。
+If any of steps 2 to 5 fails, the inspector process does not start (exit 14). After this, it checks and builds the rules with the engine of that generation (Coraza or ModSecurity) and starts accepting requests. If checking or building the rules fails, it ends with exit 11. The ModSecurity inspector process ends with exit 14 on an environment problem such as the library not being ready.
 
-制限できないものもあります。
+Some things cannot be restricted.
 
-- Landlock は、UDP、Unix ドメインソケット、MPTCP のソケット（`IPPROTO_MPTCP` で作るもの）を制限しません。そのため検査プロセスは、これらを使って外部へ送信することや、1024 以上のポートで待ち受けることが、まだできます。
-- MPTCP を使わないホストでは、`net.mptcp.enabled=0` にすると MPTCP のソケットを作れなくなります。
-- 1024 未満のポートは、ケーパビリティを破棄するので使えません（Linux の `net.ipv4.ip_unprivileged_port_start` がデフォルトの 1024 の場合）。
+- Landlock does not restrict UDP, Unix domain sockets, or MPTCP sockets (those created with `IPPROTO_MPTCP`). The inspector process can therefore still use them to send data to the outside and to listen on ports 1024 and above.
+- On a host that does not use MPTCP, setting `net.mptcp.enabled=0` makes it impossible to create MPTCP sockets.
+- Ports below 1024 cannot be used because the capabilities are discarded (when Linux's `net.ipv4.ip_unprivileged_port_start` is the default 1024).
 
-プロキシ側には、この制限をかけません。プロキシは設定・ルールストア・証明書と鍵を読み、リスナーとアップストリームへの接続を持ちます。管理プロセスも、自身にはこの制限をかけません。インポートの事前検証で起動する検査プロセスだけが、上の制限をかけます。
+The proxy side is not subject to this restriction. The proxy reads the configuration, the rules store, and the certificates and keys, and holds the listeners and the connections to upstreams. The admin process also does not apply this restriction to itself. Only the inspector process started for an import trial applies the restriction above.
 
-## 起動前の検証
+## Checks Before Start
 
-プロキシの起動、`rules import`（事前検証で検査プロセスを起動します）、管理プロセスのコマンド（`admin <config>`、`admin bootstrap`、`admin reset`）は、`/proc` を読んで次の条件も検証します。条件を満たさなければ拒否します。`config check` とほかのコマンドは、root でないことだけを検証します。
+Proxy start, `rules import` (which starts an inspector process for the trial) and the commands of the admin process (`admin <config>`, `admin bootstrap`, and `admin reset`) also check the following conditions by reading `/proc`. If the conditions are not met, they refuse. `config check` and the other commands check only that the process is not root.
 
-- SIGCHLD を無視していないこと。検査カーネルは、子プロセスの終了を自分で待ちます。
-- 2 より大きいファイルディスクリプターが、すべて close-on-exec であること。検査プロセスに不要なディスクリプターを渡さないためです。
+- SIGCHLD is not ignored. The inspection kernel waits for the exit of its child processes itself.
+- All file descriptors greater than 2 are close-on-exec. This keeps unnecessary descriptors from being passed to the inspector processes.
 
-systemd から起動する場合は、どちらの条件も満たされます。
+Both conditions are met when you start from systemd.

@@ -17,7 +17,7 @@ Coraza／ModSecurity 搭載の WAF リバースプロキシ
 - 管理 API と管理画面（managed 設定の編集と、プロキシを止めない反映、ルールセットの世代の操作、ログの検索、監査ログ）
 - ログファイルへの出力と、PostgreSQL／MySQL へのログ送信
 
-実装済みの機能と未実装の機能は、[システム概要](docs/detailed-design/00_overview/system-overview.md) の「現在の状態」を参照してください。
+実装済みの機能と未実装の機能は、[システム概要](docs/detailed-design/00_overview/system-overview.ja.md) の「現在の状態」を参照してください。
 
 > 製品全体のセキュリティ評価は、まだ行っていません。
 
@@ -39,17 +39,17 @@ tar -xzf tukuyomi-core_v0.2.0_linux_amd64.tar.gz
 
 CRS は同梱していません。`scripts/fetch-crs.sh` で取得してください。
 
-配置、初回の起動、ソースからのビルド（Rust 1.94.1 と Go 1.27.2 が必要です）の手順は、[docs/build/binary-deployment.md](docs/build/binary-deployment.md) を参照してください。
+配置、初回の起動、ソースからのビルド（Rust 1.94.1 と Go 1.27.2 が必要です）の手順は、[docs/build/binary-deployment.ja.md](docs/build/binary-deployment.ja.md) を参照してください。
 
 ## ドキュメント
 
-ドキュメントは日本語のみです。
+ドキュメントは英語と日本語で用意しています。
 
-- ドキュメントの索引: [docs/README.md](docs/README.md)
-- ビルドと配置: [docs/build/binary-deployment.md](docs/build/binary-deployment.md)
-- 運用リファレンス: [docs/operations/operator-reference.md](docs/operations/operator-reference.md)
-- 管理リファレンス: [docs/operations/admin-reference.md](docs/operations/admin-reference.md)
-- システム概要: [docs/detailed-design/00_overview/system-overview.md](docs/detailed-design/00_overview/system-overview.md)
+- ドキュメントの索引: [docs/README.ja.md](docs/README.ja.md)
+- ビルドと配置: [docs/build/binary-deployment.ja.md](docs/build/binary-deployment.ja.md)
+- 運用リファレンス: [docs/operations/operator-reference.ja.md](docs/operations/operator-reference.ja.md)
+- 管理リファレンス: [docs/operations/admin-reference.ja.md](docs/operations/admin-reference.ja.md)
+- システム概要: [docs/detailed-design/00_overview/system-overview.ja.md](docs/detailed-design/00_overview/system-overview.ja.md)
 
 ## ライセンス
 

@@ -1,174 +1,176 @@
-# 設計方針・制約
+[English](design-principles.md) | [日本語](design-principles.ja.md)
 
-> **状態: 初期草案**
+# Design Principles and Constraints
+
+> **Status: initial draft**
 >
-> 5 つの設計原則を前提とします。原則の適用方法、検査モード、移植・バージョン管理・コード構成の方針は検討中です。実装済みの範囲は、[システム概要](system-overview.md) の「現在の状態」を参照してください。
+> The five design principles are assumed. How to apply the principles, the inspection modes, and the policies on porting, version management, and code structure are under study. For the implemented scope, see "Current Status" in the [system overview](system-overview.md).
 
-## この文書の範囲
+## Scope of This Document
 
-この文書では、設計原則とその適用の候補、検査モードと技術的な障害の区別、fail-closed の適用範囲、ログと管理機能の扱い、移植と前例の扱い、依存・ルール・設定のバージョンの方針、コードの構成の方針を示します。
+This document shows the design principles and the candidates for applying them, the distinction between inspection modes and technical failures, where fail-closed applies, the handling of logs and management functions, the handling of porting and precedents, the policy on the versions of dependencies, rules, and configuration, and the policy on code structure.
 
-構成の候補と設計上の義務は [アーキテクチャ概要](architecture.md) を、前提と用語は [システム概要](system-overview.md) を参照してください。
+For the candidate structure and the design obligations, see the [architecture overview](architecture.md). For the assumptions and terms, see the [system overview](system-overview.md).
 
-## 設計原則
+## Design Principles
 
-迷ったときは、「敵対的な監査に耐えるか」で判断します。
+When in doubt, decide by asking: "Would this survive an adversarial audit?"
 
-### 1. 権限分離
+### 1. Privilege Separation
 
-単一の責務の単位に分け、障害を横へ広げません。各要素の権限を最小にします。
+Divide the system into units with a single responsibility, and do not let faults spread sideways. Keep the privileges of each element to the minimum.
 
-適用（候補）:
+Application (candidate):
 
-- 検査、HTTP の受信と転送、管理を別の責務として扱います。
-- プロセスを分けるだけでは、権限分離になりません。実行する OS ユーザー、アクセスできるファイル、外部との通信、資源の上限、起動と再起動の責任を組で決めます（AR-03、AR-04）。
-- ルールの機能のうち、外部への問い合わせ（DNS など）、外部コマンドの実行、ファイルへの書き込みは、検査側に必要な権限を広げます。残す機能と、必要な権限・OS の制限を組にして決めます。使える機能の許可リストは候補ですが、採否が決まるまで機能は削りません（DP-07、OV-01）。
+- Treat inspection, HTTP receiving and forwarding, and administration as separate responsibilities.
+- Separating processes alone does not give privilege separation. Decide as a set the OS user to run as, the files it can access, external communication, the limits on resources, and the responsibility for start and restart (AR-03, AR-04).
+- Among the functions of rules, queries to the outside (DNS and so on), running external commands, and writing to files widen the privileges needed on the inspection side. Decide the functions to keep together with the privileges and OS restrictions they need. An allowlist of usable functions is a candidate, but functions are not removed until the decision to adopt or not is made (DP-07, OV-01).
 
-### 2. 入力を信用しない
+### 2. Distrust All Input
 
-外部からのデータはすべて攻撃の経路とみなします。境界で、型・長さ・範囲を明示的に検証します。
+Treat all external data as an attack path. Validate type, length, and range explicitly at the boundary.
 
-適用（候補）:
+Application (candidate):
 
-- クライアントのリクエスト、アップストリームの応答、設定、ルール、管理の入口への入力、プロセス間のメッセージ（両方向）を入力として扱います。
-- 検査プロセスから返る判定とログ用の情報も、Rust のプロキシで検証します。
-- クライアントが送った識別子（リクエスト ID など）を、内部のトランザクションの識別子に使いません。
-- クライアントの IP アドレスを示すヘッダーは、信頼すると設定した相手からのものだけを採用する案です（DP-08）。
+- Treat as input client requests, upstream responses, settings, rules, input to the entrance for administration, and messages between processes (in both directions).
+- Decisions and information for logs returned from the inspector process are also validated in the Rust proxy.
+- Identifiers sent by the client (such as a request ID) are not used as the identifier of an internal transaction.
+- The proposal is to adopt a header that shows the client's IP address only when it comes from a peer configured as trusted (DP-08).
 
-### 3. 最小主義
+### 3. Minimalism
 
-コードが少ないほど、不具合は減ります。依存はすべて、恒久的な負債になります。
+The less code, the fewer bugs. Every dependency is a permanent liability.
 
-適用（候補）:
+Application (candidate):
 
-- 依存を加えるときは、理由と、加えない場合の案を記録します。
-- 別プロセス案では、検査プロセスを Coraza のルールの構築と検査に限り、ほかの機能を持たせません。
-- 必要性が確認されていない機能や抽象化は、先に作りません。
-- 最小主義は、確認を減らすことではありません。コードを減らしても、境界と異常系の確認は減らしません。
+- When adding a dependency, record the reason and the alternative of not adding it.
+- In the separate-process proposal, limit the inspector process to building and inspecting Coraza rules, and give it no other functions.
+- Do not build in advance features or abstractions whose necessity has not been confirmed.
+- Minimalism does not mean less checking. Even if code is reduced, the checks of boundaries and failure cases are not reduced.
 
-### 4. 資源の決定性
+### 4. Deterministic Resources
 
-確保と解放を明示します。オーバーフローと境界を考慮し、プラットフォームの挙動に頼りません。
+Make acquisition and release explicit. Consider overflow and boundaries, and do not rely on platform behavior.
 
-適用（候補）:
+Application (candidate):
 
-- ボディ、伸長（サイズと、伸長に使う CPU・メモリ・ディスク・時間）、引数、同時実行、待ち行列、ディスクへの退避、時間に、明示的な上限を置きます。値は未決定です（AR-09、AR-14）。
-- WAF インスタンスの上限（検査エンジンへ渡すボディや引数など）と、Rust のプロキシが受信・転送するときの上限は、分けて決めます。On、DetectionOnly、Off、明示的なバイパスのどれを採っても、Rust のプロキシが受信・転送するときには、資源と時間の境界を持たせる案です（AR-09）。
-- 上限を超えたときは、黙って切り捨てず、拒否するか、明示した部分検査として扱います。部分検査は、検査を必要とする通信には適用できません（AR-09）。どちらにするかは、通信の種類ごとに決めます（DP-03）。
-- トランザクション、一時ファイル、接続、同時実行の枠は、正常と異常のすべての場合で、解放の責任者を決めます（AR-10、AR-15）。
-- 検査エンジンのデフォルト値に頼らず、使う値を設定で明示します。
+- Put explicit limits on bodies, decompression (the size, and the CPU, memory, disk, and time used for decompression), arguments, concurrency, queues, spilling to disk, and time. The values are undecided (AR-09, AR-14).
+- Decide separately the limits of the WAF instance (the body and arguments passed to the inspection engine) and the limits when the Rust proxy receives and forwards. Whichever of On, DetectionOnly, Off, and explicit bypass is adopted, the proposal is that the Rust proxy has boundaries on resources and time when it receives and forwards (AR-09).
+- When a limit is exceeded, do not truncate silently; refuse, or treat it as explicit partial inspection. Partial inspection cannot be applied to traffic that requires inspection (AR-09). Which of the two applies is decided for each kind of traffic (DP-03).
+- For transactions, temporary files, connections, and concurrency slots, decide who is responsible for release in all normal and abnormal cases (AR-10, AR-15).
+- Do not rely on the default values of the inspection engine; state the values to use explicitly in the settings.
 
-### 5. 構造的なセキュリティ
+### 5. Structural Security
 
-セキュリティは、後付けの修正ではなく、構造で作ります。症状ではなく、脆弱性の種類をなくします。
+Build security into the structure, not as a later fix. Eliminate the kind of vulnerability, not the symptom.
 
-適用（候補）:
+Application (candidate):
 
-- 検査を必要とする通信（DP-02）の検査不能を、明示的なバイパスや Off など、意図した無検査と同じものとして扱いません。転送するか拒否するかは、モードと障害の種類ごとに決めます（DP-03）。
-- 「判定がない」ことを「許可」と区別します。検査しなかった理由（明示的なバイパスか、検査不能か）を分けて記録します。
-- 検査、判定、転送の間で、表現の解釈をそろえます（AR-07）。
-- HTTP のフレーミングの曖昧さを、そのまま受け付けません（AR-06）。
+- Do not treat the uninspectability of traffic that requires inspection (DP-02) as the same as intended non-inspection such as explicit bypass or Off. Whether to forward or refuse is decided for each mode and kind of failure (DP-03).
+- Distinguish "no decision" from "allow". Record separately the reason inspection was not done (explicit bypass or uninspectable).
+- Align the interpretation of the form among inspection, decision, and forwarding (AR-07).
+- Do not accept ambiguity in HTTP framing as it is (AR-06).
 
-## 検査モードと技術的な障害の区別
+## Inspection Modes Versus Technical Failures
 
-検査のモードは、次の 2 つの軸に分けて扱います。
+The inspection mode is handled in terms of the following two axes.
 
-| 軸 | 値 |
+| Axis | Values |
 |---|---|
-| ルールの選択 | デフォルトのルールセット、ルートごとの別のルールセット、明示的なバイパス |
-| 選んだ WAF インスタンスの動作 | On、DetectionOnly、Off |
+| Rule selection | The default rule set, a different rule set for each route, explicit bypass |
+| Behavior of the chosen WAF instance | On, DetectionOnly, Off |
 
-- これらのモードを残すか、どれを残すかは未決定です（DP-01、OV-01）。次の表は、残す場合に決める必要がある論点を示すもので、モードの採用を決めるものではありません。
-- 意図した無検査（明示的なバイパス、Off）や、破壊的なアクションを実行しない検査（DetectionOnly）と、技術的な検査不能は、別のものとして扱います。
-- 技術的な検査不能には、準備完了の前、異常終了、応答しない、通信の異常、タイムアウト、上限超過、構築の失敗などの種類があります。障害の種類とモードの組ごとに、DP-03 で扱いを決めます。
-- Off と明示的なバイパスも同じではありません。Off でも、ログや資源の管理のために WAF インスタンスの側が関わる設計がありえます。
-- ルールのアクションによって、トランザクションごとに WAF インスタンスの動作やボディの扱いを変えられる場合があります。その場合、モードはルールの中からも変わることがあるため、採用するバージョンで確認し、使える機能の範囲（DP-07）とあわせて決めます。
+- Whether to keep these modes, and which to keep, is undecided (DP-01, OV-01). The following table shows the points to decide if they are kept, and does not decide the adoption of any mode.
+- Treat intended non-inspection (explicit bypass, Off), and inspection that does not execute disruptive actions (DetectionOnly), as different from technical uninspectability.
+- Technical uninspectability has kinds such as before ready, abnormal exit, no response, communication anomaly, timeout, limit exceeded, and build failure. The handling for each combination of kind of failure and mode is decided in DP-03.
+- Off and explicit bypass are not the same either. Even with Off, there can be designs in which the WAF instance side is involved for logs and resource management.
+- Depending on rule actions, the behavior of the WAF instance and the handling of the body can sometimes be changed for each transaction. In that case, the mode can also change from within the rules, so check it in the version to be adopted and decide it together with the range of usable functions (DP-07).
 
-| 設定された状態 | 意図した挙動 | 技術的な障害のときの扱い |
+| Configured state | Intended behavior | Handling on a technical failure |
 |---|---|---|
-| ルールセット（デフォルトまたはルートごと）＋ On | ルールの破壊的なアクション（拒否、切断、リダイレクトなど）を実行します | 検査を必要とする通信（DP-02）のうち、指定した WAF インスタンスを使えないものは拒否する案（fail-closed）。別のルールへ切り替えてよい条件は DP-04 |
-| ルールセット＋ DetectionOnly | ルールの評価は行いますが、破壊的なアクションは実行しません。ログが残るかどうかは、ルールと監査ログの設定によります（DP-10） | 検知してもブロックしないことと、技術的な障害は別です。技術的な障害のときに拒否するか、通して記録するか、ログ上でどう区別するかは DP-03。DetectionOnly の通信を検査を必要とする通信に含めるかは DP-02 |
-| ルールセット＋ Off | ルールを評価しません | WAF インスタンスを必要とする範囲（ログ、資源の管理）と、障害のときに転送するかは DP-03。Rust のプロキシが受信・転送するときの上限とタイムアウトは Off でも持つ案（AR-09、AR-14） |
-| 明示的なバイパス（残す場合、DP-01） | 検査プロセスを呼ばない案 | 検査プロセスの障害の影響を受けない案。Rust のプロキシが受信・転送するときの上限とタイムアウトは持つ案（AR-09）。設定の意図、ログの要件、判定に使う表現は DP-05 |
-| 検査の要否やルートを判定できない | — | バイパスとして扱いません。検査を必要とする通信として扱うか、拒否するかは DP-03（AR-07） |
-| ルールセットの構築・選択の失敗 | — | 起動時の構築の失敗、更新の失敗、存在しないルールセットの参照を分けて決めます。デフォルトのルールへ切り替えるか、拒否するかは DP-04。検査を必要とする通信で、より弱い設定（DetectionOnly、Off、明示的なバイパス）へ切り替えることは、原則 5 の候補と両立しません。切り替える場合のログと通知の要件も DP-04 で決めます |
+| Rule set (default or per route) + On | Executes the disruptive actions of rules (deny, drop, redirect, and so on) | For traffic that requires inspection (DP-02), the proposal is to refuse what cannot use the specified WAF instance (fail-closed). The condition under which switching to other rules is allowed is DP-04 |
+| Rule set + DetectionOnly | Evaluates rules but does not execute disruptive actions. Whether logs remain depends on the rules and the audit log settings (DP-10) | Detecting without blocking is different from a technical failure. Whether to refuse on a technical failure, or to pass and record, and how to distinguish this in the logs, is DP-03. Whether to include DetectionOnly traffic in traffic that requires inspection is DP-02 |
+| Rule set + Off | Does not evaluate rules | The range that needs the WAF instance (logs, resource management), and whether to forward on a failure, is DP-03. The proposal is that the limits and timeouts when the Rust proxy receives and forwards are kept even with Off (AR-09, AR-14) |
+| Explicit bypass (if kept, DP-01) | The proposal is not to call the inspector process | The proposal is that it is not affected by failures of the inspector process. The proposal is that the limits and timeouts when the Rust proxy receives and forwards are kept (AR-09). The intent of the setting, the requirements for logs, and the form used for the decision are DP-05 |
+| Whether inspection is needed, or the route, cannot be decided | — | Not treated as bypass. Whether to treat it as traffic that requires inspection, or to refuse it, is DP-03 (AR-07) |
+| Failure to build or select a rule set | — | Decide separately a failure to build at start, a failure to update, and a reference to a rule set that does not exist. Whether to switch to the default rules or to refuse is DP-04. For traffic that requires inspection, switching to a weaker setting (DetectionOnly, Off, explicit bypass) is not compatible with the candidate of principle 5. The requirements for logs and notification when switching are also decided in DP-04 |
 
-## fail-closed の適用範囲
+## Where Fail-Closed Applies
 
-- 候補は、「検査を必要とすると定義した通信の検査不能を、意図した無検査へ変換しない」ことです。すべてのモード、すべての通信に一律に適用するものではありません。
-- 「検査を必要とする通信」の範囲は未決定です。たとえば、DetectionOnly の通信を含めるかどうかは DP-02 で扱います。
-- 拒否するときにクライアントへ返す応答は未決定です（AR-16）。
-- すでに転送したデータは取り戻せません。検査の完了前に送ってよい範囲は、AR-08 で扱います。
-- 部分検査で未検査の残りを転送することは、検査を必要とする通信の fail-closed と両立しません（AR-09）。
-- ルールセットが使えないときに別のルールへ切り替えることは、fail-closed とは別に決めます（DP-04）。
-- アップストリームの障害は、検査不能とは別に扱います（AR-18）。
+- The candidate is to not convert the uninspectability of traffic defined as requiring inspection into intended non-inspection. It is not applied uniformly to all modes and all traffic.
+- The range of "traffic that requires inspection" is undecided. For example, whether to include DetectionOnly traffic is handled in DP-02.
+- The response returned to the client on a refusal is undecided (AR-16).
+- Data that has already been forwarded cannot be taken back. The range that may be sent before inspection completes is handled in AR-08.
+- Partial inspection that forwards the uninspected rest is not compatible with fail-closed for traffic that requires inspection (AR-09).
+- Switching to other rules when a rule set cannot be used is decided separately from fail-closed (DP-04).
+- Upstream failures are handled separately from uninspectability (AR-18).
 
-## ログと管理機能の扱い
+## Logs and Management Functions
 
-ログ（DP-10）:
+Logs (DP-10):
 
-- ログには、攻撃者が送った値や、認証情報・個人情報などの機微なデータが入ることがあります。記録する項目、機微なデータの伏せ方（マスキングなど）、保存と表示での制御文字などの扱い、閲覧の権限、サイズ・保存期間・容量、記録できないときの扱いを決めます。
-- ログ用の情報は、検査プロセスから返るものも含めて入力として扱い、Rust のプロキシの境界で検証します（AR-13）。
-- ログの出力が、情報の漏えいの入口や、ログを閲覧・解析する側へ入力を注入する入口にならないことを、検証の候補にします。
-- 値、保存方式（OV-07）、表示の方法は未決定です。
+- Logs may contain values sent by an attacker and sensitive data such as credentials and personal information. Decide the items to record, how to hide sensitive data (masking and so on), the handling of control characters and so on in storage and display, the permissions to view, the size, retention period, and capacity, and the handling when recording is not possible.
+- Treat the information for logs, including what the inspector process returns, as input and validate it at the boundary of the Rust proxy (AR-13).
+- Make it a candidate for verification that the output of logs does not become an entrance for leaking information or for injecting input into the side that views and analyzes the logs.
+- The values, the storage method (OV-07), and the display method are undecided.
 
-管理機能（採る場合。OV-03、AR-05）:
+Management functions (if adopted; OV-03, AR-05):
 
-- 管理 UI の再利用と改善を検討することは前提です。採る場合は、配置だけでなく、認証、操作ごとの権限の分け方（ルールやバイパスの変更と、ログの閲覧など）、変更の履歴、変更が及ぶ範囲を決めます。
-- 管理の入口への入力も、信用しない入力として扱います（原則 2）。
-- 具体的なロール、認証の方式、画面の詳細は未決定です。
+- Studying reuse and improvement of the admin UI is an assumption. If adopted, decide not only the placement but also authentication, how privileges are divided for each operation (changes to rules and bypass versus viewing logs, and so on), the history of changes, and the scope that changes reach.
+- Treat input to the entrance for administration as untrusted input too (principle 2).
+- Concrete roles, the authentication method, and the details of the screens are undecided.
 
-## 移植と前例の扱い
+## Porting and Precedents
 
-この節の方針は候補です。前例の扱い全体は、DP-06 で決めます。
+The policy in this section is a candidate. The handling of precedents as a whole is decided in DP-06.
 
-- 移植元とするバージョン（OV-02）と、残す機能の基準（OV-01）は未決定です。決まるまで、個々の機能を残す・除く・移すとは決めません。
-- 移植元と同じ結果になることだけを受入条件にすると、移植元の挙動を確認しないまま、仕様として固定することになります。検査範囲は仕様として明文化し、仕様に対して検証する案です。
-- 移植元の挙動のうち確認が必要なものは、「写す」「直す」「採否を決める」に分けて記録する案です。
-- 機能の追加・除外と、既存の検査範囲を正しく実行するための接続処理は、分けて扱います。
+- The version to port from (OV-02) and the criteria for the features to keep (OV-01) are undecided. Until they are decided, no individual feature is decided to be kept, removed, or moved.
+- If matching the behavior of the source of the port is made the only acceptance condition, the behavior of the source is fixed as a specification without checking it. The proposal is to state the inspection scope explicitly as a specification and to verify against the specification.
+- The proposal is to record, among the behaviors of the source of the port that need checking, which to "copy", which to "fix", and which to "decide whether to adopt".
+- Treat adding or removing features separately from connection work that is needed to run the existing inspection scope correctly.
 
-前例の分け方の候補（DP-06）:
+Candidates for how to divide precedents (DP-06):
 
-| 対象 | 参考にする前例（候補） |
+| Subject | Precedent to refer to (candidate) |
 |---|---|
-| 製品のルート、設定、ログ、運用 | tukuyomi の実装と設計。残す範囲は OV-01 で決めます |
-| Coraza への入力、フェーズ、判定、寿命 | 採用するバージョンの Coraza の公式 API と、公式の接続の実装。ただし、公式の例のモードや部分検査の設定を、そのまま製品の仕様にはしません |
-| Rust の所有権、エラー、並行実行 | tukuyomi-core で別に決めます |
+| Product routes, configuration, logs, and operation | The implementation and design of tukuyomi. The scope to keep is decided in OV-01 |
+| Input to Coraza, phases, decisions, and lifetime | The official Coraza API of the version to be adopted, and the official connection implementations. However, the modes and partial inspection settings of the official examples are not made the product specification as they are |
+| Rust ownership, errors, and concurrency | Decided separately in tukuyomi-core |
 
-前例どうしで挙動が違う場合は、根拠と採否を設計の記録に残してから、実装に移ります。
+When precedents disagree in behavior, move to implementation after recording the grounds and the decision to adopt or not in a design record.
 
-## 依存・ルール・設定のバージョン
+## Versions of Dependencies, Rules and Configuration
 
-- 採用する時点で、保守されていて既知の修正を含むバージョンであることを確認し、バージョンを固定します。この文書では、特定のバージョンを推奨しません。
-- 検査エンジンのバージョンを上げるだけでは足りないことがあります。上限への到達や解析エラーを拒否する設定とルールを、エンジンのバージョンと組で確認します（AR-09）。
-- libcoraza 案では、接続ライブラリのバージョンと、その中に含まれる Coraza のバージョンの両方を確認します。
-- 別プロセス案では、Rust のプロキシと検査プロセスという 2 つの実行ファイルについて、バージョンの組み合わせと通信の契約が合うことを確認します。合わない組み合わせを検知して受け付けないか、適合する組み合わせとして配布するかなどは未決定です（AR-13、OV-06）。
-- ルールセットのバージョンと、検査エンジンの設定も、同じように固定して確認します。
-- 接続方式を比べるときは、Go API を直接使う側の Coraza のバージョンと、libcoraza に含まれる Coraza のバージョンを記録して比較の条件に含め、できればそろえます。そろわない場合は、バージョンを含む構成どうしの比較であり、接続方式だけの差とは結論しません。
-- バージョンを更新するたびに、同じ確認を繰り返します。確認の手順は未決定です（DP-09）。
+- At the time of adoption, confirm that the version is maintained and includes known fixes, and pin the version. This document does not recommend a specific version.
+- Raising the version of the inspection engine is sometimes not enough. Check the settings and rules that refuse reaching a limit or a parsing error together with the version of the engine (AR-09).
+- In the libcoraza proposal, check both the version of the connection library and the version of Coraza included in it.
+- In the separate-process proposal, check that the combination of versions of the two executables, the Rust proxy and the inspector process, matches the communication contract. Whether to detect a combination that does not match and reject it, or to distribute only combinations known to match, is undecided (AR-13, OV-06).
+- Pin and check the version of the rule set and the settings of the inspection engine in the same way.
+- When comparing connection methods, record the Coraza version on the side that uses the Go API directly and the Coraza version included in libcoraza, include them in the conditions of the comparison, and align them if possible. If they cannot be aligned, it is a comparison between configurations that include the versions, and it is not concluded that the difference is only in the connection method.
+- Repeat the same checks each time a version is updated. The procedure for checking is undecided (DP-09).
 
-## コードの構成
+## Code Structure
 
-- コードは責務・型・所有者で整理します。ファイルを過度に分けません。
-- 具体的なモジュールとファイルの構成は、実装の時点で必要に応じて決めます。この文書では定めません。
+- Organize code by responsibility, type, and owner. Do not split files excessively.
+- The concrete structure of modules and files is decided as needed at the time of implementation. It is not defined in this document.
 
-## 未決事項
+## Open Points
 
-| ID | 事項 | 現在の扱い | 関連 |
+| ID | Item | Current handling | Related |
 |---|---|---|---|
-| DP-01 | 検査モード（ルールの選択、WAF インスタンスの動作、明示的なバイパス）をどこまで残すか | 未決定 | OV-01、DP-07 |
-| DP-02 | 検査を必要とする通信の定義（DetectionOnly の通信を含めるかなど） | 未決定 | DP-03 |
-| DP-03 | 障害の種類とモードの組ごとの、技術的な障害のときの扱い（検査の要否を判定できない場合を含みます） | 未決定。On で検査を必要とする通信は拒否する案 | AR-07、AR-09、AR-16 |
-| DP-04 | ルールセットの構築・選択に失敗したときの切り替え（フォールバック）、切り替え先の制限、ログと通知 | 未決定 | AR-11、AR-12 |
-| DP-05 | 明示的なバイパスの判定に使う表現と、ログの要件 | 未決定 | AR-07、DP-10 |
-| DP-06 | 移植するときの前例の分け方 | 3 つの対象に分ける案が候補 | OV-02 |
-| DP-07 | ルールで使える機能と、必要な権限の組 | 未決定。使える機能の許可リストは候補 | AR-04、OV-01、DP-01 |
-| DP-08 | クライアントの IP アドレスなどを示すヘッダーの信頼の設定 | 未決定 | AR-10、OV-01 |
-| DP-09 | 依存・ルール・設定のバージョンを確認して固定する手順（2 つの実行ファイルの組み合わせと、比較に使う Coraza のバージョンの記録を含みます） | 採用時に確認する方針。手順は未決定 | AR-01、AR-13、OV-06 |
-| DP-10 | ログと監査ログの要件。どのプロセスが書くか、記録する項目、機微なデータの扱い、保存・表示での制御文字などの扱い、閲覧の権限、サイズ・保存期間・容量、記録できないときに転送を続けるかを含みます | 未決定 | AR-05、AR-10、AR-13、AR-18、OV-03、OV-07 |
+| DP-01 | How far to keep the inspection modes (rule selection, behavior of the WAF instance, explicit bypass) | Undecided | OV-01, DP-07 |
+| DP-02 | The definition of traffic that requires inspection (whether to include DetectionOnly traffic, and so on) | Undecided | DP-03 |
+| DP-03 | The handling on a technical failure for each combination of kind of failure and mode (including when whether inspection is needed cannot be decided) | Undecided. The proposal is to refuse traffic that requires inspection with On | AR-07, AR-09, AR-16 |
+| DP-04 | Switching (fallback) when building or selecting a rule set fails, the limits on the switch destination, and logs and notification | Undecided | AR-11, AR-12 |
+| DP-05 | The form used to decide explicit bypass, and the requirements for logs | Undecided | AR-07, DP-10 |
+| DP-06 | How to divide precedents when porting | The proposal to divide into three subjects is a candidate | OV-02 |
+| DP-07 | The functions usable in rules, and the privileges they need, as a set | Undecided. An allowlist of usable functions is a candidate | AR-04, OV-01, DP-01 |
+| DP-08 | Trust settings for headers that show the client's IP address and so on | Undecided | AR-10, OV-01 |
+| DP-09 | The procedure to check and pin the versions of dependencies, rules, and configuration (including the combination of the two executables and recording the Coraza version used in the comparison) | A policy of checking at adoption. The procedure is undecided | AR-01, AR-13, OV-06 |
+| DP-10 | Requirements for logs and audit logs. This includes which process writes them, the items to record, the handling of sensitive data, the handling of control characters and so on in storage and display, the permissions to view, the size, retention period, and capacity, and whether to continue forwarding when recording is not possible | Undecided | AR-05, AR-10, AR-13, AR-18, OV-03, OV-07 |
 
-## 関連文書
+## Related Documents
 
-- [システム概要](system-overview.md)
-- [アーキテクチャ概要](architecture.md)
-- [ドキュメントの索引](../../README.md)
+- [System Overview](system-overview.md)
+- [Architecture Overview](architecture.md)
+- [Documentation Index](../../README.md)
