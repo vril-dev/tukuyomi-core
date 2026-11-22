@@ -1,0 +1,123 @@
+/* The look of the tukuyomi-core operations guide (EPUB 3). A deep red accent (#9b1c1c) on a plain page, with a soft red
+   (#fbefef) for table heads and code and a light red (#e3b8b8) for frames. Readers set their own fonts and sizes, so only
+   the colours, the spacing and the frames are fixed here. The colours are written as values, because some EPUB readers
+   do not read CSS custom properties. */
+
+body {
+  line-height: 1.7;
+  font-family: serif;
+  color: #222222;
+}
+
+h1, h2, h3, h4 {
+  font-family: sans-serif;
+  line-height: 1.4;
+  color: #9b1c1c;
+  page-break-after: avoid;
+}
+
+h1 {
+  margin-top: 0;
+  padding-bottom: 0.3em;
+  font-size: 1.6em;
+  border-bottom: 3px solid #9b1c1c;
+}
+
+h2 {
+  margin-top: 2em;
+  padding-left: 0.5em;
+  font-size: 1.3em;
+  border-left: 5px solid #9b1c1c;
+}
+
+h3 {
+  margin-top: 1.5em;
+  font-size: 1.1em;
+}
+
+h4 {
+  font-size: 1em;
+}
+
+p, li {
+  text-align: start;
+}
+
+a {
+  color: #9b1c1c;
+}
+
+strong {
+  color: #9b1c1c;
+}
+
+code {
+  font-family: monospace;
+  font-size: 0.9em;
+  /* break-word, not anywhere: a table column keeps the width of its longest word instead of one letter. */
+  overflow-wrap: break-word;
+}
+
+pre {
+  font-family: monospace;
+  font-size: 0.8em;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 0.6em 0.8em;
+  background: #fbefef;
+  border: 1px solid #e3b8b8;
+  border-left: 4px solid #9b1c1c;
+  page-break-inside: avoid;
+}
+
+pre code {
+  font-size: 1em;
+}
+
+table {
+  border-collapse: collapse;
+  margin: 1em 0;
+  font-size: 0.9em;
+}
+
+th, td {
+  border: 1px solid #e3b8b8;
+  padding: 0.3em 0.5em;
+  vertical-align: top;
+}
+
+th {
+  font-family: sans-serif;
+  background: #fbefef;
+  color: #9b1c1c;
+}
+
+blockquote {
+  margin-left: 1em;
+  padding-left: 0.8em;
+  border-left: 3px solid #e3b8b8;
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid #e3b8b8;
+}
+
+/* The title page that pandoc makes from the metadata. */
+section.titlepage, #title-block-header,
+section.titlepage p, section.titlepage div {
+  text-align: center;
+}
+
+.title {
+  color: #9b1c1c;
+  font-family: sans-serif;
+  font-size: 2.2em;
+  border: 0;
+}
+
+.subtitle {
+  font-family: sans-serif;
+  color: #222222;
+}
