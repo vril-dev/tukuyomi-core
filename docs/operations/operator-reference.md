@@ -2170,18 +2170,18 @@ If the environment has `NOTIFY_SOCKET`, the proxy sends `READY=1` to that socket
 
 ## Version Updates
 
-Until 1.0, only updates from the previous release are supported. To skip releases in between, update one release at a time, in order. To go back to the previous version, restore the copy taken before the update (see "Going Back to the Previous Version" below). For how to write the unit, see "systemd" in the [build and deployment guide](../build/binary-deployment.md).
+Until 1.0, only updates from the previous release are supported. To skip releases in between, update one release at a time, in order. To go back to the previous version, restore the backup taken before the update (see "Going Back to the Previous Version" below). For how to write the unit, see "systemd" in the [build and deployment guide](../build/binary-deployment.md).
 
-### Copy Before an Update
+### Backup Before an Update
 
-Before an update, take a copy of the following:
+Before an update, take a backup of the following:
 
 - The configuration file
 - The rules store (`rules.store.dir`)
 - The managed store (`managed.dir`, when you use the managed configuration)
 - The admin store (`admin.store.dir`, when you use the admin process)
 
-While you take the copy, keep the admin process, the proxy, the records shipper, and the certificate renewal timer stopped. Keep the owners and permissions as they are (the rules store and the others are checked for their owner and permissions). The copy also holds the password hashes and API tokens of the admin store, the private keys of the managed store, and so on, so put it in a directory that only root can read. The following copies the example directories and units of the [build and deployment guide](../build/binary-deployment.md). Leave out of the arguments any directory that you do not use.
+While you take the backup, keep the admin process, the proxy, the records shipper, and the certificate renewal timer stopped. Keep the owners and permissions as they are (the rules store and the others are checked for their owner and permissions). The backup also holds the password hashes and API tokens of the admin store, the private keys of the managed store, and so on, so put it in a directory that only root can read. The following backs up the example directories and units of the [build and deployment guide](../build/binary-deployment.md). Leave out of the arguments any directory that you do not use.
 
 ```bash
 sudo systemctl stop tukuyomi-core-admin.service tukuyomi-core.service tukuyomi-core-records-ship.service tukuyomi-core-acme.timer
@@ -2189,11 +2189,11 @@ sudo install -d -m 0700 /var/backups/tukuyomi-core
 sudo tar -C / -cpf /var/backups/tukuyomi-core/before-update.tar etc/tukuyomi-core/config.json var/lib/tukuyomi-core/store var/lib/tukuyomi-core/managed var/lib/tukuyomi-core/admin
 ```
 
-The log directory (`records.dir`), the certificates and keys, and the work directory (`kernel.tmp_root`) are not copied.
+The log directory (`records.dir`), the certificates and keys, and the work directory (`kernel.tmp_root`) are not backed up.
 
 ### Updating from 0.1.0
 
-- Take the copy of "Copy Before an Update" above, and then replace the executables.
+- Take the backup of "Backup Before an Update" above, and then replace the executables.
 - Just by replacing the executables, you can read the 0.1.0 configuration file, rules store, and managed store as they are (if you had chosen a ModSecurity generation in 0.1.0, `kernel.default_engine` is required, as described below). If you do not write the new setting keys (`kernel.default_engine`, the `engine` of an upstream), the proxy runs with only one engine, as in 0.1.0.
 - If you had chosen a Coraza generation in 0.1.0, you do not need to write `kernel.default_engine`. The `current` written by 0.1.0 is read as the chosen generation of Coraza. `config check` writes `accepted`, and at start only one line `start: rules engine coraza` appears. `current` is not rewritten and no `current.*` is added.
 - If you had chosen a ModSecurity generation in 0.1.0, write `modsecurity` in `kernel.default_engine`.
@@ -2206,15 +2206,15 @@ The log directory (`records.dir`), the certificates and keys, and the work direc
 
 ### Going Back to the Previous Version
 
-Restore the copy taken before the update, and start the executables of the previous version. There are no steps that differ from version to version.
+Restore the backup taken before the update, and start the executables of the previous version. There are no steps that differ from version to version.
 
 1. Stop the admin process, the proxy, the records shipper, and the certificate renewal timer.
 2. Move the current configuration file and the copied directories aside to other names (keep them; do not delete them).
-3. Restore the copy.
+3. Restore the backup.
 4. Put back the executables of the previous version, and confirm that `config check` of the previous version writes `accepted`.
 5. Start the admin process, the proxy, and the records shipper in this order, and start the certificate renewal timer.
 
-For the copy taken in the example of "Copy Before an Update" above, steps 2 and 3 are as follows.
+For the backup taken in the example of "Backup Before an Update" above, steps 2 and 3 are as follows.
 
 ```bash
 sudo mv /etc/tukuyomi-core/config.json /etc/tukuyomi-core/config.json.after-update
@@ -2226,4 +2226,4 @@ sudo tar -C / -xpf /var/backups/tukuyomi-core/before-update.tar
 
 - What you changed after the update is lost: the generations you imported or chose, the versions and applies of the managed configuration, the users, API tokens, and sessions you made, and the lines of the audit log in the admin store. The lines of the audit log also went to standard error (the journal).
 - The log directory is not restored. The logs written after the update stay.
-- The certificates of the ACME sites in `acme/` of the managed store go back to those of the time of the copy. The next `acme renew` renews them according to the rest of their validity (see "ACME" above).
+- The certificates of the ACME sites in `acme/` of the managed store go back to those of the time of the backup. The next `acme renew` renews them according to the rest of their validity (see "ACME" above).

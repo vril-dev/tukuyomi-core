@@ -6,7 +6,10 @@ Coraza／ModSecurity 搭載の WAF リバースプロキシ
 
 ## 概要
 
-`tukuyomi-core` は、WAF（Web Application Firewall）を組み込んだ HTTP／HTTPS のリバースプロキシです。受信したリクエストを Coraza または ModSecurity v3 で検査して、アップストリームへ転送します。検査には OWASP Core Rule Set（CRS）などのルールセットを使います。[tukuyomi](https://github.com/vril-dev/tukuyomi) から派生した製品で、WAF の機能に特化することを目指しています。
+`tukuyomi-core` は、WAF（Web Application Firewall）を組み込んだ HTTP／HTTPS のリバースプロキシです。
+受信したリクエストを Coraza または ModSecurity v3 で検査して、アップストリームへ転送します。
+検査には OWASP Core Rule Set（CRS）などのルールセットを使います。
+[tukuyomi](https://github.com/vril-dev/tukuyomi) から派生した製品で、WAF の機能に特化することを目指しています。
 
 主な機能は次のとおりです。
 
@@ -30,16 +33,18 @@ Coraza／ModSecurity 搭載の WAF リバースプロキシ
 - Linux 5.13 以上で、Landlock が有効になっていること
 - glibc 2.39 以上（リリースのバイナリを使う場合。ModSecurity の検査プロセスには libstdc++ も必要です）
 
-[GitHub のリリース](https://github.com/vril-dev/tukuyomi-core/releases) から、tarball とチェックサムのファイルをダウンロードします。チェックサムを確認してから、展開してください。
+[GitHub のリリース](https://github.com/vril-dev/tukuyomi-core/releases) から、tarball とチェックサムのファイルをダウンロードします。
+チェックサムを確認してから、展開してください。
 
 ```bash
 sha256sum -c tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256
 tar -xzf tukuyomi-core_v0.2.0_linux_amd64.tar.gz
 ```
 
-CRS は同梱していません。`scripts/fetch-crs.sh` でダウンロードしてください。
+CRS は同梱していないので、`scripts/fetch-crs.sh` でダウンロードしてください。
 
-配置、初回の起動、ソースからのビルドの手順は、[docs/build/binary-deployment.ja.md](docs/build/binary-deployment.ja.md) にあります。ソースからビルドするには、Rust 1.94.1 と Go 1.27.2 が必要です。
+配置、初回の起動、ソースからのビルドの手順は、[docs/build/binary-deployment.ja.md](docs/build/binary-deployment.ja.md) にあります。
+ソースからビルドするには、Rust 1.94.1 と Go 1.27.2 が必要です。
 
 ## ドキュメント
 
@@ -53,6 +58,7 @@ CRS は同梱していません。`scripts/fetch-crs.sh` でダウンロード�
 
 ## ライセンス
 
-tukuyomi-core は BSD 2-Clause License で公開しています。詳しくは [LICENSE](LICENSE) を参照してください。
+tukuyomi-core は BSD 2-Clause License で公開しています。
+詳しくは [LICENSE](LICENSE) を参照してください。
 
-実行ファイルには、サードパーティのソフトウェアが含まれています。それらのライセンスと著作権表示は、[NOTICE](NOTICE) と [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES) にあります。
+実行ファイルにはサードパーティのソフトウェアが含まれており、そのライセンスと著作権表示は [NOTICE](NOTICE) と [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES) にあります。

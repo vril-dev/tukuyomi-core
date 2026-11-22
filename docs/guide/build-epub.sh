@@ -10,7 +10,8 @@
 # docs/operations/operator-reference(.ja).md and admin-reference(.ja).md when the book is built, so the reference
 # exists in one place only. Links between the two references go to the appendix in the book. A link to another
 # document of the repository becomes its name followed by its path in the repository, as the chapters write it, so
-# that the book has no link to a file that a release tag may not have.
+# that the book has no link to a file that a release tag may not have. The Japanese sources put each sentence on
+# its own line; cjk-line-breaks.lua drops those line breaks so that no space appears in the Japanese text.
 
 set -euo pipefail
 
@@ -20,6 +21,7 @@ REPO_ROOT="$(cd "$DOCS_ROOT/.." && pwd)"
 DIST="$SCRIPT_DIR/dist"
 TMP_BASE="$SCRIPT_DIR/.tmp/build-epub"
 CSS="$SCRIPT_DIR/book.css"
+FILTER="$SCRIPT_DIR/cjk-line-breaks.lua"
 
 DOC_VERSION="${VERSION:-}"
 if [[ -z "$DOC_VERSION" ]]; then
@@ -160,6 +162,7 @@ PY
     --toc-depth=2 \
     --split-level=1 \
     --css="$CSS" \
+    --lua-filter="$FILTER" \
     --metadata "title=${title}" \
     --metadata "subtitle=${subtitle}" \
     --metadata "lang=${lang}" \
