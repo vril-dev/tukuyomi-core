@@ -10,11 +10,11 @@
 |---|---|
 | `tukuyomi-proxy`（Rust、`proxy/`） | HTTP／HTTPS のリクエストを受信して転送します。検査カーネル（`kernel/`、Rust のライブラリ）を組み込み、検査プロセスの起動・停止・再起動を受け持ちます。同じ実行ファイルが、ルールストアのコマンド（`rules`）、証明書のコマンド（`acme renew`）、設定の検証（`config check`）、管理プロセス（`admin`）も持ちます |
 | `tukuyomi-inspector`（Go、`inspector/`） | Coraza でリクエストを検査します。プロキシが子プロセスとして起動し、引き継いだ Unix ドメインソケットのペアで通信します。待ち受けるポートは持ちません。設定の `kernel.inspector` に指定します |
-| `tukuyomi-inspector-modsecurity`（Rust と C++、`inspector-modsecurity/`） | ModSecurity v3（libmodsecurity 3.0.17）でリクエストを検査します。ModSecurity の世代（`rules import --engine modsecurity`）を使う場合だけ必要で、使わないホストでは省けます。プロキシが子プロセスとして起動し、引き継いだ Unix ドメインソケットのペアで通信します。待ち受けるポートは持ちません。設定の `kernel.engines.modsecurity.inspector` に指定します |
+| `tukuyomi-inspector-modsecurity`（Rust と C++、`inspector-modsecurity/`） | ModSecurity v3（libmodsecurity 3.0.17）でリクエストを検査します。ModSecurity の世代（`rules import --engine modsecurity`）を使う場合と、デフォルトのエンジンかアップストリームのエンジンに `modsecurity` を指定する場合だけ必要で、使わないホストでは省けます。プロキシが子プロセスとして起動し、引き継いだ Unix ドメインソケットのペアで通信します。待ち受けるポートは持ちません。設定の `kernel.engines.modsecurity.inspector` に指定します |
 | `tukuyomi-records-ship`（Rust、`records-ship/`） | ログ送信プロセスです。プロキシのログファイルの行を、PostgreSQL か MySQL のテーブルへ送ります。ログを DB へ送る場合だけ必要で、送らないホストでは省けます。プロキシとは別のユニットで動き、同じ設定ファイルを読みます。待ち受けるポートは持ちません |
 | 管理プロセス | 同じ実行ファイルの `tukuyomi-proxy admin <config>` です。プロキシとは別のユニットで動かします。ループバックアドレスで待ち受け、管理 API と管理画面（実行ファイルに組み込み済み）を提供します。ルールの世代を操作し、制御ソケットを通じてプロキシに切り替えを依頼します |
 | 設定ファイル | 1 つの JSON ファイルです。値にデフォルトはありません。省けると決まっている設定キー（`acme`、`records`、`access`、`rate_limit`、`geo`、`admin` など）のほかは、すべて書きます。プロキシと管理プロセスが同じファイルを読みます |
-| ルールストア | ルールセットの世代を置くディレクトリです（設定の `rules.store.dir`）。`rules import` が世代を作り、`rules activate` が使う世代を選択します。管理プロセスも同じ操作をします |
+| ルールストア | ルールセットの世代を置くディレクトリです（設定の `rules.store.dir`）。`rules import` が世代を作り、`rules activate` が使う世代をエンジン（Coraza か ModSecurity）ごとに選択します。管理プロセスも同じ操作をします |
 | 検査プロセスの作業ディレクトリ | 起動ごとの一時ディレクトリを作る親ディレクトリです（設定の `kernel.tmp_root`） |
 | 証明書と鍵 | TLS のリスナーで使います。`acme renew` で発行・更新するか、運用者が置きます |
 | ログのディレクトリ | 標準エラーに出すログの写しを置くディレクトリです（設定の `records.dir`）。プロキシが書き、管理プロセスとログ送信プロセスが読みます。ログ送信プロセスは、送信済みの位置（`ship.state`）もここに書きます |
@@ -36,6 +36,11 @@
     - TCP のバインドと接続まで制限するには、Linux 6.7 以上（Landlock の ABI 4 以上）が必要です。それより前のバージョンでは、ファイルだけを制限して動きます。
     - Linux 6.2 より前（ABI 1・2）では、ファイルの切り詰めを禁止できません。Linux 6.10 より前（ABI 4 まで）では、デバイスの ioctl を禁止できません。
 - ModSecurity の検査プロセスを動かすホストに必要な共有ライブラリは、libstdc++、libgcc_s、libc、libm だけです。libmodsecurity、YAJL、PCRE2 は実行ファイルに静的リンクしてあるので、インストールは不要です。
+- 常時動くプロキシと検査プロセスは、プロキシ 1 つと、起動したエンジンごとの検査プロセス 1 つです（管理プロセスとログ送信プロセスは、これとは別のプロセスです）。
+  - Coraza だけなら検査プロセスは 1 つ、Coraza と ModSecurity の両方を起動すると 2 つです。
+  - エンジンの世代を切り替えている間は、そのエンジンの検査プロセスが一時的に 1 つ増えます。切り替えは、プロキシ全体で同時に 1 つまでです。
+  - 管理プロセスは、インポートの事前検証のたびに、検査プロセスを 1 つ起動します（コマンドの `rules import` も同じです）。
+  - メモリの目安は、[運用リファレンス](../operations/operator-reference.md) の「検査エンジンの選択」を参照してください。
 - ビルドに必要なもの:
   - Rust 1.94.1 以上（`proxy/Cargo.toml` の `rust-version`）
   - C コンパイラ（TLS に使う aws-lc-rs が C のコードをビルドします）
@@ -192,7 +197,7 @@ sudo -u tukuyomi scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
 | `/var/lib/tukuyomi-core/crs-4.23.0` | `admin.crs_dir`（管理 API で CRS をインポートする場合） | 「CRS の取得」で作ったディレクトリ。サービスの OS ユーザーが読めることが必要です |
 | `/etc/tukuyomi-core/country.mmdb` | `geo.country_db` | root。サービスの OS ユーザーが読めて、書き換えられない形にします（0644）。プロキシは所有者と権限を検証しません |
 
-- 設定の `kernel.inspector` は、ModSecurity の世代だけを使うホストでも書きます（省けない設定キーです）。`kernel.engines` は、ModSecurity の世代を使う場合だけ書きます。書かないと、ModSecurity の世代はインポートも選択もできず、起動時にも受け付けません（[運用リファレンス](../operations/operator-reference.md) の「`kernel`」）。
+- 設定の `kernel.inspector` は、ModSecurity の世代だけを使うホストでも書きます（省けない設定キーです）。`kernel.engines` は、ModSecurity の世代を使う場合だけ書きます。書かないと、ModSecurity の世代はインポートも選択もできず、起動時にも受け付けません（[運用リファレンス](../operations/operator-reference.md) の「`kernel`」）。`kernel.default_engine` を `modsecurity` にするときも、`kernel.inspector` は書きます（`kernel.engines` も必要です）。
 - 上の表のディレクトリは、先に作っておいてください。プロキシもコマンドも、これらのディレクトリは作りません。ルールストアの中のもの（`generations/`、`staging/`、`using/` など）はコマンドとプロキシが、managed ストアの中のものはコマンド、管理プロセス、`acme renew` が、管理データの保存先の中身は管理プロセスが、ログファイルと制御ソケットはプロキシが作ります。
 - ルールストア、ログのディレクトリ、管理データの保存先、制御ソケットを置くディレクトリ、managed ストア、`challenge_dir` は、別々のディレクトリにします。同じディレクトリにすることも、互いの中に置くこともできません（設定を受け付けません）。上の表の例は、どれも `/var/lib/tukuyomi-core` の下の別々のディレクトリです。重なりは書いたままのパスで比べるので、シンボリックリンクは使わないでください。
 - 下の「systemd」の例のユニットは、`ReadWritePaths=/var/lib/tukuyomi-core` で、この下のディレクトリに書き込めるようにしています。managed ストアもこの下に置けば、ユニットを変更する必要はありません。別の場所に置く場合は、`ReadWritePaths` に追加してください。
@@ -248,6 +253,9 @@ sudo -u tukuyomi scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy rules activate /etc/tukuyomi-core/config.json <fingerprint>
    ```
 
+   - 世代は、エンジンごとに選択します。最初に選択するのは、デフォルトのエンジン（設定の `kernel.default_engine`。書かなければ `coraza`）の世代です。デフォルトのエンジンに選択中の世代が無いと、プロキシは起動しません。
+   - ModSecurity だけで始めるときは、設定の `kernel.default_engine` を `modsecurity` にして、ModSecurity の世代を選択します。`kernel.default_engine` を書かずに ModSecurity の世代だけを選択すると、`config check` と起動は `rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` で拒否されます（exit 1）。
+   - エンジンごとの選択の詳細は、[運用リファレンス](../operations/operator-reference.md) の「エンジンごとの選択中の世代」を参照してください。
 5. 設定を検証します。
 
    ```bash
@@ -255,7 +263,7 @@ sudo -u tukuyomi scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
    ```
 
    - 通れば、標準出力に `accepted` が出て、exit 0 になります。
-   - 世代を選択する前に実行すると、`rules store refused: no generation is chosen` で拒否されます（exit 1）。設定そのもののエラーは exit 2 で分かるので、手順 1 の後にも実行できます。
+   - デフォルトのエンジンの世代を選択する前に実行すると、`rules store refused: no generation is chosen` で拒否されます（exit 1）。アップストリームのエンジンに選択中の世代が無いときも、同じ文で拒否されます。設定そのもののエラーは exit 2 で分かるので、手順 1 の後にも実行できます。
    - アップストリームのサーバー名と、TLS の証明書と鍵のファイルも検証します。受け付けられなかった場合も同じ exit 1 で、行の先頭（`upstream refused`、`tls refused`）で区別できます。
    - 検査プロセスは起動しないので、作業ディレクトリ、検査プロセスの実行ファイル、Landlock は検証しません。
 6. サービスを起動します（下の「systemd」）。
@@ -313,7 +321,7 @@ WantedBy=multi-user.target
   - デフォルトの `control-group` では、停止の SIGTERM が検査プロセスにも届きます。
   - 検査プロセスは SIGTERM を処理しないので、その場で終了します。そのため、プロキシが検査プロセスを順に停止すること（残りの検査を終え、終了の通知を受けること）ができません。
   - `mixed` では、SIGTERM はプロキシにだけ届きます。プロキシは、自分で検査プロセスを停止してから終了します。
-- `Type=notify` にします。プロキシは、検査カーネルの準備ができてすべてのリスナーをバインドした後に `READY=1` を、停止の始めに `STOPPING=1` を systemd へ送ります。`systemctl start` と、このユニットの後に `After=` で並べたユニットは、そこまで待ちます。`Type=simple` では、実行した時点で起動したと見なされます。
+- `Type=notify` にします。プロキシは、起動する全部のエンジンの検査カーネルの準備ができてすべてのリスナーをバインドした後に `READY=1` を、停止の始めに `STOPPING=1` を systemd へ送ります。`systemctl start` と、このユニットの後に `After=` で並べたユニットは、そこまで待ちます。`Type=simple` では、実行した時点で起動したと見なされます。
   - 通知を送るのはプロキシのメインプロセスだけです。`NotifyAccess` はデフォルト（`main`）のままで問題ありません。
   - `TimeoutStartSec` は、アップストリームの名前解決の時間（`resolve_timeout_ms`）と、検査カーネルの準備を待つ時間（`ready_wait_ms`）を足した時間より長くします。`READY=1` が届かないと、systemd はこの時間の後にプロキシを停止します。
 - `TimeoutStopSec` は、`stop_wait_ms` と `kill_grace_ms` と、ログの書き出しの 200 ms を足した時間より長くします。短いと、systemd が先に SIGKILL を送ります。停止の流れは、[運用リファレンス](../operations/operator-reference.md) の「停止」を参照してください。
@@ -325,10 +333,11 @@ WantedBy=multi-user.target
   - 検査プロセスは、SIGUSR1・SIGUSR2 は無視しますが、SIGTERM・SIGINT・SIGHUP が届くと終了します。
 - `systemctl reload` は、2 つの `ExecReload` を順に実行します。`config check` が通ったときだけ SIGHUP を送り、プロキシは設定ファイルをリロードして、停止せずに新しい設定に切り替えます（[運用リファレンス](../operations/operator-reference.md) の「SIGHUP（設定のリロード）」）。
   - `config check` が受け付けない設定では、SIGHUP は送られず、`systemctl reload` が失敗を返します。
-  - `config check` が通ると、`systemctl reload` は SIGHUP を送った時点で成功を返し、リロードの完了を待ちません。動作中のプロキシだけが拒否する理由（動作中に変更できない設定キーの違い、新しいリスナーのバインド）では、`systemctl reload` は成功を返します。結果は、ログの `reload: configuration replaced <SHA-256>`（`managed` のある設定では、後に ` managed <version>` が続きます）と `reload: configuration refused: <reason>` の行と、`/metrics` の `tukuyomi_config_reloads_total` で確認します。
+  - `config check` が通ると、`systemctl reload` は SIGHUP を送った時点で成功を返し、リロードの完了を待ちません。動作中のプロキシだけが拒否する理由（動作中に変更できない設定キーの違い、アップストリームのエンジンが稼働していないこと、新しいリスナーのバインド）では、`systemctl reload` は成功を返します。結果は、ログの `reload: configuration replaced <SHA-256>`（`managed` のある設定では、後に ` managed <version>` が続きます）と `reload: configuration refused: <reason>` の行と、`/metrics` の `tukuyomi_config_reloads_total` で確認します。
   - 選択中の世代を `config check` が受け付けない間は、`systemctl reload` も拒否されます（リロードそのものは世代に触れません）。
 - 設定を変更する手順: ファイルを書き換え（別の名前に書いてから、1 回の置き換えで差し替えます）、`systemctl reload tukuyomi-core.service` を実行し、ログの行で結果を確認します。動作中に変更できない設定キーを変えたときは、`systemctl restart` で再起動します。管理プロセスとログ送信プロセスは設定をリロードしないので、それらが読む設定キーを変えたら再起動します。
 - 入れ替えの順序: SIGHUP を受けると停止していた以前のバージョンから入れ替えるときは、新しい実行ファイルを入れて再起動してから、ユニットの `ExecReload` を変更して `systemctl daemon-reload` を実行します（両方を変更してから再起動してもかまいません）。前のバージョンのまま新しいユニットで `systemctl reload` を実行すると、前のバージョンは SIGHUP で停止します。exit 0 で停止するので、`Restart=on-failure` でも再起動しません。
+- エンジンごとの選択に対応していない以前のバージョンから入れ替えるときは、管理プロセス、プロキシ、ログ送信プロセスを同じビルドにそろえます。手順と入れ替えの順序は、[運用リファレンス](../operations/operator-reference.md) の「バージョンの更新」を参照してください。
 - 証明書と鍵だけを再読み込みさせる（SIGUSR2）ときは、次のように送ります。
 
   ```bash
@@ -340,6 +349,8 @@ WantedBy=multi-user.target
   ```bash
   systemctl kill -s SIGUSR1 --kill-whom=main tukuyomi-core.service
   ```
+
+  SIGUSR1 は、エンジンごとの選択中の世代へ、エンジンを 1 つずつ順に切り替えます。選択中の世代があるのに稼働していないエンジンは、起動します（[運用リファレンス](../operations/operator-reference.md) の「SIGUSR1（世代の切り替え）」）。
 
 - ログのディレクトリ、制御ソケットを置くディレクトリ、管理データの保存先、managed ストアは、`ReadWritePaths` の中に置きます（上の例では `/var/lib/tukuyomi-core` の下）。別の場所に置く場合は、`ReadWritePaths` に追加してください。
 - ポート 80・443 で待ち受けるには `CAP_NET_BIND_SERVICE` が必要です。ambient ケーパビリティは検査プロセスにも引き継がれますが、検査プロセスは起動時にすべてのケーパビリティを破棄します。
@@ -422,7 +433,7 @@ WantedBy=multi-user.target
 - DB がログインを拒否すると、ログ送信プロセスは exit 1 で終了し、`Restart=on-failure` により `RestartSec` ごとに再起動します。接続文字列を直すまで、これを繰り返します。
 - DB サーバーの証明書を独自の認証局で発行したときは、その証明書のファイルを `Environment=SSL_CERT_FILE=<path>` で渡します。
 - 設定ファイルと接続文字列のファイルは、起動時に 1 回だけ読みます（プロキシと違い、SIGHUP でリロードしません）。変更したら、`systemctl restart` で再起動します。`ExecReload` は置きません（ログ送信プロセスにとって SIGHUP は停止のシグナルです）。
-- ログ送信プロセスはプロキシと同じ設定ファイルを読み、未知の設定キーを含む設定ファイルは受け付けません。設定に新しい設定キー（`managed`、`host_policies` など）を書く前に、ログ送信プロセスの実行ファイルをプロキシと同じビルドに入れ替えてください。前のビルドのままだと、ログ送信プロセスは次の起動で設定を受け付けず、起動しません（[運用リファレンス](../operations/operator-reference.md) の「ログ送信プロセスの起動」）。
+- ログ送信プロセスはプロキシと同じ設定ファイルを読み、未知の設定キーを含む設定ファイルは受け付けません。設定に新しい設定キー（`managed`、`host_policies`、`kernel.default_engine`、アップストリームの `engine` など）を書く前に、ログ送信プロセスの実行ファイルをプロキシと同じビルドに入れ替えてください。前のビルドのままだと、ログ送信プロセスは次の起動で設定を受け付けず、起動しません（[運用リファレンス](../operations/operator-reference.md) の「ログ送信プロセスの起動」）。
 - プロキシが動いていなくても、ログ送信プロセスは起動し、ファイルにあるログを送ります。プロキシは、ログ送信プロセスが動いていないこと（`ship.state` が 90 秒より古いこと）を、`required` のルートのリクエストを拒否することで示します。
 - ログ送信プロセスのログはジャーナルに入ります。
 
