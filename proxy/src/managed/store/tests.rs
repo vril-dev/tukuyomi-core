@@ -2,15 +2,21 @@
 //! file that names it (`Fixture`).
 
 use super::*;
+use crate::rules::bundle::{Bundle, BundlePath, Mode};
+use crate::rules::file_store::FileStore;
+use crate::rules::routes::Routes;
+use crate::rules::store::RuleStore;
 use serde_json::{Value, json};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::atomic::{AtomicU32, Ordering};
+use tukuyomi_kernel::Engine;
 
 /// The main file of the fixture without its `managed`: one plain listener, `forward` with its time only.
 const MAIN: &str = r#"{"proxy":{"listeners":[{"address":"127.0.0.1:8080"}],"max_conns":1024,"max_head_bytes":8192,"max_body":1048576,"inspect_body":1048576,"max_body_wire":2097152,"max_buffered_bytes":8388608,"upstream_max_headers":100,"upstream_max_head_bytes":16384,"upstream_head_wire":65536,"drive_slice_ms":50,"ready_wait_ms":10000,"head_read_ms":10000,"body_read_ms":30000,"inspect_wait_ms":30000,"upstream_connect_ms":5000,"upstream_header_ms":30000,"request_total_ms":60000,"response_idle_ms":60000,"conn_total_ms":120000,"stop_inspect_ms":5000,"stop_wait_ms":10000,"keepalive_timeout_ms":75000,"keepalive_requests":1000,"keepalive_time_ms":60000,"lingering_time_ms":30000,"lingering_timeout_ms":5000,"lingering_bytes":262144,"trusted_proxies":[],"upstream_keepalive":32,"upstream_keepalive_timeout_ms":60000,"upstream_keepalive_requests":1000},"forward":{"resolve_timeout_ms":30000},"kernel":{"inspector":"/opt/tukuyomi/inspector","tmp_root":"/var/lib/tukuyomi/tmp","gomaxprocs":2,"gomemlimit":1073741824,"slots":4,"wait_queue":16,"records":20,"discard_limit":4,"tick_ms":100,"hello_wait_ms":5000,"frame_io_ms":1000,"verdict_wait_ms":2000,"wait_deadline_ms":3000,"closed_wait_ms":2000,"stop_after_ms":2000,"drain_wait_ms":1000,"exit_wait_ms":1000,"kill_grace_ms":1000,"restarts":3,"restart_window_ms":60000},"rules":{"store":{"kind":"file","dir":"/var/lib/tukuyomi/rules"}}}"#;
 
 /// A directory of a test (`TMPDIR`), removed with everything in it when dropped, which holds a managed store
-/// (`store/`, 0700) and the main file that names it (`config.json`).
+/// (`store/`, 0700), the main file that names it (`config.json`), and a rules store (`rules/`, 0700) that has a
+/// generation chosen for Coraza.
 pub(crate) struct Fixture {
     root: PathBuf,
 }
@@ -47,6 +53,38 @@ impl Fixture {
         self.root.join("store")
     }
 
+    /// The directory of the rules store, made with a generation chosen for Coraza when it is not there.
+    pub(crate) fn rules(&self) -> PathBuf {
+        let dir = self.root.join("rules");
+        if !dir.exists() {
+            DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            Fixture::choose_in(&dir, Engine::Coraza);
+        }
+        dir
+    }
+
+    /// Makes a generation for `engine` in the rules store of the fixture and chooses it.
+    pub(crate) fn choose_rules(&self, engine: Engine) {
+        Fixture::choose_in(&self.rules(), engine);
+    }
+
+    fn choose_in(dir: &Path, engine: Engine) {
+        let path = |text: &str| BundlePath::parse(text).unwrap();
+        let bundle = Bundle::new(
+            engine,
+            Mode::Block,
+            vec![(path("rules/local.conf"), b"SecRuleEngine On\n".to_vec())],
+            vec![path("rules/local.conf")],
+            Routes::default(),
+        )
+        .unwrap();
+        let mut rules = FileStore::open(dir).unwrap();
+        rules.stage(&bundle).unwrap();
+        rules.commit().unwrap();
+        rules.activate(bundle.fingerprint()).unwrap();
+    }
+
     pub(crate) fn store(&self) -> Store {
         match Store::open(&self.dir()) {
             Ok(store) => store,
@@ -76,6 +114,7 @@ impl Fixture {
     pub(crate) fn main_file(&self, edit: impl FnOnce(&mut Value)) -> PathBuf {
         let mut main: Value = serde_json::from_str(MAIN).unwrap();
         main["managed"] = json!({ "dir": self.dir() });
+        main["rules"]["store"]["dir"] = json!(self.rules());
         edit(&mut main);
         let path = self.root.join("config.json");
         fs::write(&path, main.to_string()).unwrap();

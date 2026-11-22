@@ -186,7 +186,13 @@ fn the_control_socket_has_mode_0600_and_switches_only_to_the_generation_that_is_
     assert_eq!(meta.permissions().mode() & 0o777, 0o600);
 
     let first = generation();
-    let running = |generation: &str| json!({"generation": generation, "mode": "block", "engine": "coraza", "phase": "ready", "switching": false, "ready": true});
+    let running = |generation: &str| {
+        json!({
+            "generation": generation, "mode": "block", "engine": "coraza", "phase": "ready", "switching": false,
+            "ready": true,
+            "engines": [{"engine": "coraza", "generation": generation, "mode": "block", "phase": "ready"}],
+        })
+    };
     assert_eq!(state(status(&root)), running(&first));
     assert_eq!(exchange(proxy.port, &get("/reload-probe")).status(), 200);
 
@@ -303,7 +309,11 @@ fn a_second_proxy_on_the_same_configuration_does_not_take_the_socket_of_a_runnin
     );
     assert_eq!(
         state(status(&root)),
-        json!({"generation": generation(), "mode": "block", "engine": "coraza", "phase": "ready", "switching": false, "ready": true})
+        json!({
+            "generation": generation(), "mode": "block", "engine": "coraza", "phase": "ready", "switching": false,
+            "ready": true,
+            "engines": [{"engine": "coraza", "generation": generation(), "mode": "block", "phase": "ready"}],
+        })
     );
     finish(proxy, 0);
 }

@@ -5,8 +5,8 @@ import { test } from 'node:test';
 import { ApiError } from '../js/api.js';
 import { actionsOf, screens as generationScreens } from '../js/waf/generations.js';
 import { setLanguage, w } from '../js/i18n.js';
-import { ENGINES, Ended, LIMITS, checkFiles, checkRouteList, importBody, routesOfRows, toBase64, trialBlocked } from '../js/waf/import.js';
-import { instantOf, canChange, clock, engineName, generationState, hashOf, shortOf, switchOutcome, timeCellText, timeLabel, timeText } from '../js/parts.js';
+import { Ended, LIMITS, checkFiles, checkRouteList, importBody, routesOfRows, toBase64, trialBlocked } from '../js/waf/import.js';
+import { ENGINE_IDS, instantOf, canChange, clock, defaultEngine, engineName, engineStates, generationState, hashOf, oldProxy, shortOf, switchOutcome, timeCellText, timeLabel, timeText } from '../js/parts.js';
 import { parseRoute } from '../js/app.js';
 import { PAGE_SIZE, filterRows, nextDirection, pageOf, sortRows } from '../js/table.js';
 import { countOf, uptimeText } from '../js/waf/waf.js';
@@ -14,6 +14,20 @@ import { Pager, buildQuery, decodeText, screens as recordScreens, summaryOf } fr
 
 const file = (name, size) => ({ name, size });
 const codes = (check) => check.problems.map((problem) => problem.code);
+
+const id = (digit) => digit.repeat(64);
+
+/**
+ * An answer of `GET /api/status` of this version. `chosen` and `rollback` are what the rules store says, by engine;
+ * `running` is the generation that the proxy serves for each engine that it runs (`null`: a proxy that does not report
+ * its engines); `proxy` is `null` for a proxy that cannot be reached, or what it says besides.
+ */
+function statusOf({ chosen = {}, rollback = {}, running = {}, proxy = {}, name = 'coraza' }) {
+  const engines = ENGINE_IDS.map((engine) => ({ engine, current: chosen[engine] ?? null, rollback_to: rollback[engine] ?? null }));
+  const ran = running === null ? null : Object.entries(running).map(([engine, generation]) => ({ engine, generation, mode: 'block', phase: 'ready' }));
+  const base = { generation: id('0'), mode: 'block', engine: name, phase: 'ready', switching: false, ready: true, engines: ran };
+  return { current: chosen[name] ?? null, reachable: proxy !== null, rollback_to: rollback[name] ?? null, default_engine: name, engines, proxy: proxy === null || typeof proxy === 'string' ? proxy : { ...base, ...proxy }, crs: { available: false, files: [] } };
+}
 
 test('the files of an import are counted against the limits, at the limit and one past it', () => {
   const many = (n) => Array.from({ length: n }, (_, at) => file(`r${at}.conf`, 1));
@@ -137,38 +151,81 @@ test('how an import ended waits for the screen that is shown, is told once, and 
   assert.equal(holder.take(), null);
 });
 
-test('a user who may only look is offered no action, and an operator only those the store allows', () => {
-  const state = { hasChosen: true, rollbackTo: 'c'.repeat(64), servingKnown: true };
-  const other = { fingerprint: 'a'.repeat(64), current: false, serving: false };
-  const chosen = { fingerprint: 'b'.repeat(64), current: true, serving: true };
-  const target = { fingerprint: 'c'.repeat(64), current: false, serving: false };
+test('a user who may only look is offered no action, and an operator only those the store allows for the engine of the generation', () => {
+  const [a, b, c, d, m, n] = ['a', 'b', 'c', 'd', 'e', 'f'].map(id);
+  const gen = (fingerprint, engine, flags = {}) => ({ fingerprint, engine, current: false, serving: false, ...flags });
+  const both = { chosen: { coraza: b, modsecurity: m }, rollback: { coraza: c, modsecurity: n }, running: { coraza: b, modsecurity: m } };
+  const state = (status) => ({ engines: engineStates(status), legacy: oldProxy(status) });
+  const ready = state(statusOf(both));
   for (const role of ['viewer', 'nobody', undefined]) {
-    assert.deepEqual(actionsOf(role, other, state), { choose: null, remove: false, kept: null }, String(role));
+    assert.deepEqual(actionsOf(role, gen(a, 'coraza'), ready), { choose: null, remove: false, kept: null }, String(role));
   }
   for (const role of ['operator', 'owner']) {
-    assert.deepEqual(actionsOf(role, other, state), { choose: 'choose', remove: true, kept: null });
-    assert.deepEqual(actionsOf(role, chosen, state), { choose: null, remove: false, kept: 'chosen' });
-    assert.deepEqual(actionsOf(role, target, state), { choose: 'choose', remove: false, kept: 'rollback' });
+    assert.deepEqual(actionsOf(role, gen(a, 'coraza'), ready), { choose: 'choose', remove: true, kept: null });
+    assert.deepEqual(actionsOf(role, gen(b, 'coraza', { current: true, serving: true }), ready), { choose: null, remove: false, kept: 'chosen' });
   }
-  // Chosen but not served: the proxy is told to switch to it. Served but not chosen: kept as well.
-  assert.equal(actionsOf('operator', { ...chosen, serving: false }, state).choose, 'apply');
-  // A proxy that did not say what it serves (busy, or out of reach) gives no ground to tell it to switch.
-  assert.equal(actionsOf('operator', { ...chosen, serving: false }, { ...state, servingKnown: false }).choose, null);
-  assert.equal(actionsOf('operator', other, { ...state, servingKnown: false }).choose, 'choose');
-  assert.equal(actionsOf('operator', { ...other, serving: true }, state).kept, 'serving');
-  // Without a chosen generation no request to choose can say what it expects.
-  assert.equal(actionsOf('operator', other, { hasChosen: false, rollbackTo: null, servingKnown: true }).choose, null);
+  // The target of a rollback of either engine is kept, and a generation of the other engine may still be chosen.
+  assert.deepEqual(actionsOf('operator', gen(c, 'coraza'), ready), { choose: 'choose', remove: false, kept: 'rollback' });
+  assert.deepEqual(actionsOf('operator', gen(n, 'modsecurity'), ready), { choose: 'choose', remove: false, kept: 'rollback' });
+  assert.equal(actionsOf('operator', gen(a, 'coraza', { serving: true }), ready).kept, 'serving');
+  // Chosen but another one serves: the proxy is told to switch. Chosen and the engine does not run: it is started.
+  assert.equal(actionsOf('operator', gen(b, 'coraza', { current: true }), state(statusOf({ ...both, running: { coraza: a, modsecurity: m } }))).choose, 'apply');
+  assert.equal(actionsOf('operator', gen(m, 'modsecurity', { current: true }), state(statusOf({ ...both, running: { coraza: b } }))).choose, 'start');
+  // A switch that is under way (the engine is being started) leaves the button to start it, not to apply.
+  assert.equal(actionsOf('operator', gen(m, 'modsecurity', { current: true }), state(statusOf({ ...both, running: { coraza: b }, proxy: { switching: true } }))).choose, 'start');
+  assert.equal(actionsOf('operator', gen(b, 'coraza', { current: true }), state(statusOf({ ...both, running: { coraza: a, modsecurity: m }, proxy: { switching: true } }))).choose, 'apply');
+  // An engine that has none chosen can be given one; each engine is asked for what it has, not what the other has.
+  assert.equal(actionsOf('operator', gen(d, 'modsecurity'), state(statusOf({ chosen: { coraza: b }, running: { coraza: b } }))).choose, 'choose');
+  // A generation whose engine is not one of ours (its manifest could not be read) is not chosen or started.
+  assert.equal(actionsOf('operator', gen(a, 'unknown'), ready).choose, null);
+  // A proxy that cannot be reached or is busy gives no ground to tell it to switch; one of an older version cannot be told.
+  const away = state(statusOf({ ...both, proxy: null }));
+  assert.equal(actionsOf('operator', gen(a, 'coraza'), away).choose, 'choose');
+  assert.equal(actionsOf('operator', gen(b, 'coraza', { current: true }), away).choose, null);
+  const old = state(statusOf({ ...both, running: null }));
+  assert.deepEqual(actionsOf('operator', gen(a, 'coraza'), old), { choose: null, remove: true, kept: null });
   assert.equal(canChange('owner') && canChange('operator') && !canChange('viewer'), true);
 });
 
-test('a proxy that is busy or out of reach is neither the same nor different: its generation is unknown', () => {
-  const id = (digit) => digit.repeat(64);
-  assert.equal(generationState({ current: id('a'), proxy: null }), 'unknown');
-  assert.equal(generationState({ current: id('a'), proxy: 'busy' }), 'unknown');
+test('each engine is in one state, from what the store chooses for it and what the proxy runs, and the bar tells a difference of any', () => {
+  const [a, b] = [id('a'), id('b')];
+  const states = (status) => Object.fromEntries(engineStates(status).map((one) => [one.engine, one.state]));
+  assert.deepEqual(states(statusOf({ chosen: { coraza: a }, running: { coraza: a } })), { coraza: 'same', modsecurity: 'idle' });
+  assert.deepEqual(states(statusOf({ chosen: { coraza: a, modsecurity: b }, running: { coraza: a, modsecurity: a } })), { coraza: 'same', modsecurity: 'differ' });
+  // The switch of the proxy is one flag for all engines: an engine that is not what it is to be is under way, the others stay.
+  assert.deepEqual(states(statusOf({ chosen: { coraza: a, modsecurity: b }, running: { coraza: a, modsecurity: a }, proxy: { switching: true } })), { coraza: 'same', modsecurity: 'switching' });
+  // Chosen and not run is `unstarted`, and the start that is under way is not told as a difference. Run and not chosen is `unchosen`.
+  assert.deepEqual(states(statusOf({ chosen: { coraza: a, modsecurity: b }, running: { coraza: a } })), { coraza: 'same', modsecurity: 'unstarted' });
+  assert.equal(states(statusOf({ chosen: { coraza: a, modsecurity: b }, running: { coraza: a }, proxy: { switching: true } })).modsecurity, 'switching');
+  assert.deepEqual(states(statusOf({ chosen: {}, running: { coraza: a } })), { coraza: 'unchosen', modsecurity: 'idle' });
+  // What the proxy did not say is unknown for every engine, the default one too (an older proxy runs one engine, whose name is not the default).
+  for (const odd of [{ proxy: null }, { running: null }, { proxy: 'busy' }]) {
+    assert.deepEqual(states(statusOf({ chosen: { coraza: a }, ...odd })), { coraza: 'unknown', modsecurity: 'unknown' }, JSON.stringify(odd));
+  }
+  const one = engineStates(statusOf({ chosen: { modsecurity: b }, rollback: { modsecurity: a }, running: { modsecurity: b }, name: 'modsecurity' }));
+  assert.deepEqual(one[1], { engine: 'modsecurity', current: b, rollbackTo: a, serving: b, mode: 'block', phase: 'ready', running: true, isDefault: true, state: 'same' });
+  assert.deepEqual([one[0].running, engineStates(statusOf({ proxy: null }))[0].running], [false, null]);
+  assert.equal(one[0].isDefault, false);
+  // The bar: a difference or an engine that is chosen and not run; an engine that runs with none chosen is no difference.
+  assert.equal(generationState(statusOf({ chosen: { coraza: a }, running: { coraza: a } })), 'same');
+  assert.equal(generationState(statusOf({ chosen: { coraza: a, modsecurity: b }, running: { coraza: a, modsecurity: a } })), 'differ');
+  assert.equal(generationState(statusOf({ chosen: { coraza: a, modsecurity: b }, running: { coraza: a } })), 'differ');
+  assert.equal(generationState(statusOf({ chosen: { coraza: a }, running: { coraza: b }, proxy: { switching: true } })), 'switching');
+  assert.equal(generationState(statusOf({ chosen: {}, running: { coraza: a } })), 'same');
+  assert.equal(generationState(statusOf({ chosen: { coraza: a }, proxy: null })), 'unknown');
+  assert.equal(generationState(statusOf({ chosen: { coraza: a }, running: null })), 'unknown');
   assert.equal(generationState(undefined), 'unknown');
-  assert.equal(generationState({ current: id('a'), proxy: { generation: id('a'), switching: false } }), 'same');
-  assert.equal(generationState({ current: id('a'), proxy: { generation: id('b'), switching: true } }), 'switching');
-  assert.equal(generationState({ current: id('a'), proxy: { generation: id('b'), switching: false } }), 'differ');
+});
+
+test('the default engine is the one that the admin process names, and none is named when the proxy runs another', () => {
+  const named = (name, proxy = {}, running = {}) => defaultEngine(statusOf({ name, running, proxy }));
+  assert.deepEqual(named('modsecurity'), { name: 'modsecurity', differs: false });
+  assert.deepEqual(named('coraza', { engine: 'modsecurity' }), { name: null, differs: true });
+  // A proxy of an older version names the engine that it runs, which is no default; a proxy that is out of reach names none.
+  assert.deepEqual(named('coraza', { engine: 'modsecurity' }, null), { name: 'coraza', differs: false });
+  assert.deepEqual(named('coraza', null), { name: 'coraza', differs: false });
+  assert.deepEqual(defaultEngine({ default_engine: 'Coraza' }), { name: null, differs: false });
+  assert.deepEqual(defaultEngine(undefined), { name: null, differs: false });
 });
 
 test('the end of a switch is told by the proxy’s own word, whatever the status that carried it', () => {
@@ -186,6 +243,9 @@ test('the end of a switch is told by the proxy’s own word, whatever the status
   assert.equal(unconfirmed.chosen, true);
   assert.equal(unconfirmed.unwritten, true);
   assert.equal(unconfirmed.ids.to, ids.generation);
+  // The engine is the one that the proxy names in its answer, else the one that the request was for.
+  assert.equal(switchOutcome({ body: { result: 'switched', engine: 'modsecurity', ...ids, chosen: true }, error: null }, 'coraza').engine, 'modsecurity');
+  assert.equal(switchOutcome(fail('unknown', 504, '', null), 'coraza').engine, 'coraza');
 
   // Without a word of the proxy's, the kind of the error says how to go on.
   assert.equal(word(fail('unavailable', 503, 'the proxy is busy', { error: 'the proxy is busy' })), 'busy');
@@ -211,6 +271,10 @@ test('a search is a query of the filters that are filled in, in the form the API
   assert.deepEqual(buildQuery({ generation: 'a'.repeat(64) }).problems, []);
   assert.deepEqual(buildQuery({ generation: 'a'.repeat(63) }).problems, ['generation']);
   assert.equal(buildQuery({ id: 'abc-1' }, { file: 2, offset: 4096, inode: '123' }).query, 'id=abc-1&file=2&offset=4096&inode=123');
+  // The engine is one of the two names as the API takes them, in lower case.
+  assert.deepEqual(buildQuery({ engine: 'modsecurity' }), { query: 'engine=modsecurity', problems: [] });
+  assert.deepEqual(buildQuery({ engine: 'Coraza' }), { query: '', problems: ['engine'] });
+  assert.deepEqual(buildQuery({ engine: 'modsec' }).problems, ['engine']);
 });
 
 test('the pages of a search can be gone through forward and back, and a new search starts over', () => {
@@ -282,10 +346,10 @@ test('every key that a script asks for is named in the call itself, so that the 
 });
 
 test('the import form offers Coraza, the default, and ModSecurity, each by its name in both languages', () => {
-  assert.deepEqual(ENGINES, ['coraza', 'modsecurity']);
+  assert.deepEqual(ENGINE_IDS, ['coraza', 'modsecurity']);
   for (const language of ['en', 'ja']) {
     setLanguage(language);
-    assert.deepEqual(ENGINES.map(engineName), ['Coraza', 'ModSecurity']);
+    assert.deepEqual(ENGINE_IDS.map(engineName), ['Coraza', 'ModSecurity']);
   }
   setLanguage('en');
 });
@@ -377,6 +441,10 @@ test('a value in the address is used only in the form its screen takes, and what
   // A screen that is not ours is none; the page then shows its first screen.
   for (const hash of ['', '#', '#/', '#/nothing', '#/__proto__', '#/constructor/x']) assert.equal(parseRoute(hash, known).screen, null, hash);
   // The address of what was found is the one that was read, and it reads back the same.
+  const engine = parseRoute('#/records?engine=modsecurity&status=403', known);
+  assert.deepEqual(engine.query, { engine: 'modsecurity', status: '403' });
+  const wrong = parseRoute('#/records?engine=Coraza', known);
+  assert.deepEqual([wrong.query, wrong.invalid], [{}, ['engine']]);
   const again = parseRoute(hashOf('records', { id: 'abc-1', query: { generation: fp.slice(0, 16), client: 'a b' } }), known);
   assert.deepEqual(again.query, { generation: fp.slice(0, 16) });
   assert.deepEqual(again.invalid, ['client']);

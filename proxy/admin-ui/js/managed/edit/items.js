@@ -116,7 +116,7 @@ export function newServer() {
 /** What a group holds as text, to tell whether it has changed since the draft was made. */
 export function snapshot(group) {
   const servers = group.servers.map((server) => [server.address, server.weight, server.max_fails, server.fail_timeout_ms, server.backup]);
-  return JSON.stringify([group.name, group.tls, group.ca, group.server_name, servers]);
+  return JSON.stringify([group.name, group.tls, group.ca, group.server_name, group.engine, servers]);
 }
 
 export function groupOf(name, raw) {
@@ -129,6 +129,8 @@ export function groupOf(name, raw) {
     tls: Object.hasOwn(raw, 'tls'),
     ca: typeof tls.ca === 'string' ? tls.ca : '',
     server_name: typeof tls.server_name === 'string' ? tls.server_name : '',
+    // The empty text is no engine of its own: the default engine.
+    engine: typeof raw.engine === 'string' ? raw.engine : '',
     raw,
   };
   group.origin = snapshot(group);
@@ -136,7 +138,7 @@ export function groupOf(name, raw) {
 }
 
 export function newGroup() {
-  return { cid: nextCid(), fresh: true, name: '', servers: [newServer()], tls: false, ca: '', server_name: '', raw: {} };
+  return { cid: nextCid(), fresh: true, name: '', servers: [newServer()], tls: false, ca: '', server_name: '', engine: '', raw: {} };
 }
 
 export function builtServer(group, server, faults) {

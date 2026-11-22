@@ -3,9 +3,10 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { mock, test } from 'node:test';
 
 import { ApiError } from '../js/api.js';
-import { dictionaries } from '../js/i18n.js';
+import { dictionaries, lazy } from '../js/i18n.js';
 import { BUSY, REFUSED, RESULTS, Watch, isJob, watchLimit } from '../js/managed/job.js';
 import { cardState, differs, versionActions } from '../js/managed/managed.js';
+import { Screen } from '../js/managed/screen.js';
 import { mayRollBack } from '../js/managed/history.js';
 
 const FP = 'a'.repeat(64);
@@ -19,6 +20,20 @@ test('every result, every word of a refusal and every word of busy has its words
   const busy = ['store in use', 'proxy busy', 'reload under way', 'starting', 'too many orders', 'stopping'];
   assert.deepEqual(Object.keys(BUSY).sort(), [...busy].sort());
   assert.equal(Object.hasOwn(dictionaries.en, 'managed.result.unknown'), true);
+});
+
+test('a refusal of a change says which upstream when it names the engine of one, and the reason of a reload that cannot run an engine says both causes', () => {
+  const refusal = (error) => String(Screen.prototype.refusal.call({ ctx: { describe: (failure) => lazy(() => failure.sentence) } }, error));
+  const sentence = 'no generation is chosen for the engine of an upstream';
+  assert.equal(refusal(new ApiError('conflict', 409, sentence, { error: sentence, at: 'upstreams.app.engine' })), `Upstream app: ${sentence}`);
+  // Another place, a place that is no engine, and another kind of answer are told by the sentence alone.
+  assert.equal(refusal(new ApiError('conflict', 409, sentence, { error: sentence, at: 'upstreams.app.servers[0].address' })), sentence);
+  assert.equal(refusal(new ApiError('conflict', 409, sentence, { error: sentence })), sentence);
+  assert.equal(refusal(new ApiError('refused', 400, sentence, { error: sentence, at: 'upstreams.app.engine' })), sentence);
+  for (const code of ['en', 'ja']) {
+    assert.match(dictionaries[code]['managed.refused.fixed'], code === 'en' ? /engine/ : /エンジン/);
+    assert.match(dictionaries[code]['managed.refused.fixed_next'], code === 'en' ? /Rule generations/ : /ルールの世代/);
+  }
 });
 
 test('a job is read only in its form, and how long it may run follows the time of the lookup of the names', () => {

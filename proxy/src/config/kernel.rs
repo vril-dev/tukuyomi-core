@@ -5,7 +5,9 @@
 //! left out. When it is there it has the one key `modsecurity`, whose value has the one key `inspector`: an absolute
 //! clean path, by the rule that `kernel.inspector` follows. The file is not looked at here; the start of the
 //! inspector does that. A generation of an engine can be used only if the configuration has an inspector for the
-//! engine (`KernelSettings::check_engine`).
+//! engine (`KernelSettings::check_engine`). `kernel.default_engine` may be left out, and is then `coraza`: it is the
+//! engine that inspects the requests to an upstream group that names no `engine` (see `forward`), and that of the
+//! way to the admin process. It is `coraza` or `modsecurity`, and the configuration has an inspector for it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,6 +24,8 @@ pub(super) struct RawKernel {
     inspector: String,
     #[serde(default, deserialize_with = "super::present")]
     engines: Option<Object<RawEngines>>,
+    #[serde(default, deserialize_with = "super::present")]
+    default_engine: Option<String>,
     tmp_root: String,
     gomaxprocs: u16,
     gomemlimit: u64,
@@ -81,6 +85,12 @@ pub(super) fn check(raw: Option<Object<RawEngines>>) -> Result<Engines, ConfigEr
 /// directory of the rules store.
 pub(super) fn settings(k: RawKernel, rules: &Path) -> Result<KernelSettings, ConfigError> {
     let engines = check(k.engines)?;
+    let default = match k.default_engine.as_deref() {
+        None => Engine::Coraza,
+        Some(name) => Engine::parse(name).ok_or(ConfigError(
+            "kernel.default_engine is not coraza or modsecurity",
+        ))?,
+    };
     let config = tukuyomi_kernel::Config {
         engine: Engine::Coraza,
         inspector: PathBuf::from(k.inspector),
@@ -109,7 +119,11 @@ pub(super) fn settings(k: RawKernel, rules: &Path) -> Result<KernelSettings, Con
         restart_window: Duration::from_millis(k.restart_window_ms),
     };
     config.check().map_err(|e| ConfigError(e.0))?;
-    Ok(KernelSettings(config, engines))
+    let settings = KernelSettings(config, engines, default);
+    settings
+        .check_engine(default)
+        .map_err(|_| ConfigError("kernel.engines has no inspector for kernel.default_engine"))?;
+    Ok(settings)
 }
 
 /// The least time the HTTP side must allow for an inspection: the kernel's wait for the first frame, two
@@ -211,12 +225,17 @@ pub(super) fn relations(proxy: &ProxyConfig, settings: &KernelSettings) -> Resul
     Ok(())
 }
 
-/// The kernel values of the file, checked. The rules directory and fingerprint come from the rules store at
-/// start-up, and the engine and its inspector from the generation.
+/// The kernel values of the file, checked, and the engine that `default_engine` names. The rules directory and
+/// fingerprint come from the rules store at start-up, and the engine and its inspector from the generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelSettings(pub(super) tukuyomi_kernel::Config, Engines);
+pub struct KernelSettings(pub(super) tukuyomi_kernel::Config, Engines, Engine);
 
 impl KernelSettings {
+    /// The engine for what names none: `kernel.default_engine`, or Coraza when the file leaves it out.
+    pub fn default_engine(&self) -> Engine {
+        self.2
+    }
+
     /// The kernel configuration for one generation, whose rules are inspected by `engine`, checked again.
     pub fn for_generation(
         &self,

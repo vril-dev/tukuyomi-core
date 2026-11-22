@@ -23,6 +23,8 @@ const CHANGES_SHOWN = 20;
 
 const AREAS = {
   upstream: () => w('edit.area.upstream'),
+  engine: () => w('edit.area.engine'),
+  engine_key: () => w('edit.area.engine_key'),
   default: () => w('edit.area.default'),
   access: () => w('edit.area.access'),
   rate_limit: () => w('edit.area.rate_limit'),
@@ -88,14 +90,13 @@ export function checkFinding(draft, asked, { answer, error }, describe) {
   if (draft.revision !== asked.revision) return { kind: 'stale' };
   if (error !== null) return { kind: 'refused', fault: refusalFault(error, asked.map, describe) };
   if (!isFingerprint(answer.version)) return { kind: 'refused', fault: barFault(w('error.generic')) };
-  return answer.version === draft.base ? { kind: 'same' } : { kind: 'passed', to: answer.version };
+  // The groups that a generation of detection only inspects, by name, for a confirmation to say.
+  const detect = Array.isArray(answer.detect) ? answer.detect.map((group) => String(group?.upstream)) : [];
+  return answer.version === draft.base ? { kind: 'same' } : { kind: 'passed', to: answer.version, detect };
 }
 
-/**
- * The notice that a change of the global `kind` (`access` or `rate_limit`) does not reach the host policies `names`
- * (see `notReached`), with the first names and how many more there are; null when there are none.
- */
-export function unreachedNotice(kind, names) {
+/** A warning that `make(n, listed)` words, for the `names` that it is about: the first of them, and how many more there are; null when there are none. */
+function namesNotice(make, names) {
   if (names.length === 0) return null;
   const shown = names.slice(0, CHANGES_SHOWN);
   const more = names.length - shown.length;
@@ -103,7 +104,23 @@ export function unreachedNotice(kind, names) {
     const named = shown.map((name) => (name === '' ? t('edit.group.unnamed') : name)).join(', ');
     return more > 0 ? `${named} ${t('edit.site.cert_more', { n: more })}` : named;
   });
-  return notice('warn', UNREACHED[kind](names.length, listed));
+  return notice('warn', make(names.length, listed));
+}
+
+/**
+ * The notice that a change of the global `kind` (`access` or `rate_limit`) does not reach the host policies `names`
+ * (see `notReached`), with the first names and how many more there are; null when there are none.
+ */
+export function unreachedNotice(kind, names) {
+  return namesNotice(UNREACHED[kind], names);
+}
+
+/**
+ * The notice that the groups `names` are inspected by an engine whose generation only detects, from the `detect` of a
+ * check (a version has all of its groups there, the ones that the change leaves as they were too); null when there are none.
+ */
+export function detectNotice(names) {
+  return namesNotice((n, listed) => w('edit.detect', { n, names: listed }), names);
 }
 
 /** The lines of what a change does (see `changesBetween`): the first ones, and how many more there are. */
@@ -406,7 +423,7 @@ export class EditScreen extends Screen {
       return null;
     }
     draft.putSaid([{ tone: 'ok', words: w('edit.checked.passed', { id: shortOf(finding.to) }) }, ...overProxy]);
-    return { body, map: asked.map, version: built.version, to: finding.to, revision: asked.revision };
+    return { body, map: asked.map, version: built.version, to: finding.to, revision: asked.revision, detect: finding.detect };
   }
 
   // ---- the saving ----
@@ -414,19 +431,21 @@ export class EditScreen extends Screen {
   /** Asks whether to save what the check `checked` found, with what changes from the base. */
   askSave(draft, checked) {
     const toIssue = sitesToIssue(draft.baseVersion, checked.version);
+    const name = this.defaultName();
     return confirmChange(this.layer, {
       title: w('edit.confirm.title'),
       lines: [
         el('p', {}, w('edit.confirm.what')),
-        changesView(changesBetween(draft.baseVersion, checked.version)),
+        changesView(changesBetween(draft.baseVersion, checked.version, name)),
         this.fileWaits() ? notice('warn', w('managed.file_waits')) : null,
         toIssue > 0 ? notice('warn', w('edit.confirm.to_issue', { n: toIssue })) : null,
         unreachedNotice('access', notReached(draft.baseVersion, checked.version, 'access')),
         unreachedNotice('rate_limit', notReached(draft.baseVersion, checked.version, 'rate_limit')),
+        detectNotice(checked.detect),
         draft.choseChain() ? notice('info', w('edit.confirm.expiry')) : null,
         el('p', { class: 'tc-muted tc-small' }, w('managed.confirm.groups_reset')),
       ],
-      diff: diffView([w('managed.confirm.now'), w('managed.confirm.after')], diffRows(draft.base, checked.to, countsOf(draft.baseVersion), countsOf(checked.version))),
+      diff: diffView([w('managed.confirm.now'), w('managed.confirm.after')], diffRows(draft.base, checked.to, countsOf(draft.baseVersion, name), countsOf(checked.version, name))),
       confirm: w('edit.save'),
     });
   }
@@ -505,7 +524,7 @@ export class EditScreen extends Screen {
     if (!this.alive || heldDraft() !== draft || !isFingerprint(current) || version === null) return;
     const yes = await confirmChange(this.layer, {
       title: w('edit.moved.rebase'),
-      lines: [el('p', {}, w('edit.rebase.what')), changesView(changesBetween(draft.baseVersion, version)), el('p', {}, w('edit.rebase.warn'))],
+      lines: [el('p', {}, w('edit.rebase.what')), changesView(changesBetween(draft.baseVersion, version, this.defaultName())), el('p', {}, w('edit.rebase.warn'))],
       confirm: w('edit.moved.rebase'),
     });
     if (!yes || !this.alive || heldDraft() !== draft) return;

@@ -19,7 +19,7 @@ Main features:
 
 For what is and is not implemented, see "現在の状態" (current status) in the [system overview](docs/detailed-design/00_overview/system-overview.md) (Japanese).
 
-> 0.1.0 is the first release. The product as a whole has not had a security review yet.
+> The product as a whole has not had a security review yet.
 
 ## Installation
 
@@ -33,8 +33,8 @@ Requirements:
 Download the tarball and its checksum file from the [GitHub releases](https://github.com/vril-dev/tukuyomi-core/releases), verify the checksum, and extract the tarball.
 
 ```bash
-sha256sum -c tukuyomi-core_v0.1.0_linux_amd64.tar.gz.sha256
-tar -xzf tukuyomi-core_v0.1.0_linux_amd64.tar.gz
+sha256sum -c tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256
+tar -xzf tukuyomi-core_v0.2.0_linux_amd64.tar.gz
 ```
 
 The CRS is not bundled. Fetch it with `scripts/fetch-crs.sh`.

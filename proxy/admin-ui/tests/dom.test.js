@@ -4,11 +4,13 @@ import { test } from 'node:test';
 import { ApiError } from '../js/api.js';
 import { bindAttribute, el, mount, retranslate, safeUrl, setText } from '../js/dom.js';
 import { lazy, setLanguage, w } from '../js/i18n.js';
+import { ENGINE_IDS, outcomeView } from '../js/parts.js';
 import { draftFromVersion, forgetDraft, heldDraft } from '../js/managed/edit/draft.js';
 import { screens as generationScreens } from '../js/waf/generations.js';
 import { screens as wafScreens } from '../js/waf/waf.js';
 import { screens as importScreens } from '../js/waf/import.js';
 import { jobResult } from '../js/managed/job.js';
+import { detectNotice } from '../js/managed/edit/bar.js';
 import { removalView, screens as managedScreens } from '../js/managed/managed.js';
 import { countsOf, defaultGroupView, diffRows } from '../js/managed/screen.js';
 import { valueTree } from '../js/managed/history.js';
@@ -58,6 +60,11 @@ class Node {
   remove() {
     this.parent?.children.splice(this.parent.children.indexOf(this), 1);
     this.parent = null;
+  }
+
+  contains(other) {
+    for (let node = other; node !== null && node !== undefined; node = node.parent) if (node === this) return true;
+    return false;
   }
 }
 
@@ -138,6 +145,17 @@ class Element extends Node {
 
   focus() {
     globalThis.document.activeElement = this;
+  }
+
+  // A dialog opened by `confirmChange` or `openDialog`: it closes with the value of the button that closed it.
+  showModal() {
+    this.open = true;
+  }
+
+  close(value = '') {
+    this.returnValue = value;
+    this.open = false;
+    this.dispatch('close');
   }
 
   matches(selector) {
@@ -265,11 +283,23 @@ const wait = () => new Promise((resolve) => setTimeout(resolve, 0));
 const FP = 'a'.repeat(64);
 const OTHER = 'b'.repeat(64);
 
+/**
+ * An answer of `GET /api/status` of this version. `chosen` and `rollback` are what the rules store says, by engine;
+ * `running` is the generation that the proxy serves for each engine that it runs (`null`: a proxy that does not report
+ * its engines); `proxy` is `null` for a proxy that cannot be reached, or what it says besides.
+ */
+function statusOf({ chosen = {}, rollback = {}, running = {}, proxy = {}, name = 'coraza' }) {
+  const engines = ENGINE_IDS.map((engine) => ({ engine, current: chosen[engine] ?? null, rollback_to: rollback[engine] ?? null }));
+  const ran = running === null ? null : Object.entries(running).map(([engine, generation]) => ({ engine, generation, mode: 'block', phase: 'ready' }));
+  const base = { generation: FP, mode: 'block', engine: name, phase: 'ready', switching: false, ready: true, engines: ran };
+  return { current: chosen[name] ?? null, reachable: proxy !== null, rollback_to: rollback[name] ?? null, default_engine: name, engines, proxy: proxy === null ? null : { ...base, ...proxy }, crs: { available: false, files: [] } };
+}
+
 test('the overview shows the numbers of the proxy, and a dash where the proxy gave none, with the reason said once', () => {
   setLanguage('en');
   const mountOverview = wafScreens[0].mount;
-  const shown = (proxy, reachable = true) => {
-    const data = { current: FP, reachable, proxy, rollback_to: null, crs: { available: false, files: [] } };
+  const shown = (proxy) => {
+    const data = statusOf({ chosen: { coraza: FP }, running: { coraza: FP }, proxy });
     const root = document.createElement('main');
     document.body.append(root);
     const api = { call: async () => ({ managed: false }) };
@@ -284,7 +314,7 @@ test('the overview shows the numbers of the proxy, and a dash where the proxy ga
   const old = shown({ phase: 'ready', mode: 'block', engine: 'coraza', switching: false, generation: FP, requests: null, blocked: 0 });
   assert.equal(times(old, 'This proxy does not give the numbers of the overview that show —.'), 1);
   assert.equal(old.includes('—'), true);
-  const away = shown(null, false);
+  const away = shown(null);
   assert.equal(times(away, 'The proxy cannot be reached.'), 1);
   assert.equal(times(away, 'Not read'), 6);
 });
@@ -297,7 +327,7 @@ test('the list of generations is a table, and the address of one generation open
     async call(method, path) {
       calls.push(path);
       if (path === '/api/generations') return { reachable: true, generations: [item(FP, true), item(OTHER, false)] };
-      if (path === '/api/status') return { current: FP, reachable: true, proxy: { generation: FP, switching: false }, rollback_to: OTHER };
+      if (path === '/api/status') return statusOf({ chosen: { coraza: FP }, rollback: { coraza: OTHER }, running: { coraza: FP } });
       return { ...item(path.slice(-64), false), load: ['a.conf'], files: [{ path: 'a.conf', size: 10, sha256: 'c'.repeat(64) }], routes: [{ path: '/x', action: 'bypass' }] };
     },
   };
@@ -321,6 +351,199 @@ test('the list of generations is a table, and the address of one generation open
   screen.stop();
 });
 
+const [C1, C2, M1, M2] = ['c', 'd', 'e', 'f'].map((digit) => digit.repeat(64));
+
+/** A fake API for the screens of the generations and the history: the changes that are sent are kept in `sent`, and answered as the proxy does when it switches. */
+function generationsApi(status, generations, sent) {
+  return {
+    async call(method, path, body) {
+      if (method === 'POST') {
+        sent.push([path, body]);
+        const target = body.generation ?? body.engine;
+        return { result: 'switched', engine: body.engine ?? generations.find((item) => item.fingerprint === body.generation).engine, from: body.expect ?? target, generation: target, chosen: true };
+      }
+      if (path === '/api/generations') return { reachable: true, generations };
+      if (path === '/api/status') return status;
+      if (path === '/api/history') return { entries: [] };
+      throw new Error(path);
+    },
+  };
+}
+
+const generation = (fingerprint, engine, flags = {}) => ({ fingerprint, made: 1_795_000_000, mode: 'block', engine, routes: 0, current: false, serving: false, ...flags });
+
+/** Mounts a screen of the generations (0) or of the history (1) over `status`, with `generations` listed; gives the screen, its root and what is sent. */
+async function openGenerations(index, status, generations) {
+  setLanguage('en');
+  const sent = [];
+  const ctx = { user: { name: 'ann', role: 'operator' }, api: generationsApi(status, generations, sent), describe: String, refreshStatus() {}, navigate() {} };
+  const root = document.createElement('main');
+  document.body.append(root);
+  const screen = generationScreens[index].mount(ctx, root, { id: null, query: {} });
+  await wait();
+  const buttons = (label, within = root) => within.querySelectorAll('button').filter((item) => item.textContent === label);
+  /** What the confirmation says, and then the confirmation answered with the button `label`. */
+  const confirm = async (label) => {
+    const dialog = root.querySelector('dialog');
+    const said = dialog.textContent;
+    press(buttons(label, dialog)[0]);
+    await wait();
+    await wait();
+    return said;
+  };
+  return { screen, root, sent, buttons, confirm };
+}
+
+test('a generation is chosen with the generation that is chosen for its engine, and with none for an engine that has none', async () => {
+  // The list is the newest first: the generation of Coraza that is chosen comes before the ones of ModSecurity.
+  const list = [generation(C1, 'coraza', { current: true, serving: true }), generation(M1, 'modsecurity', { current: true, serving: true }), generation(M2, 'modsecurity')];
+  const both = statusOf({ chosen: { coraza: C1, modsecurity: M1 }, running: { coraza: C1, modsecurity: M1 } });
+  const { screen, root, sent, buttons, confirm } = await openGenerations(0, both, list);
+  const row = (fingerprint) => root.querySelector(`[data-row="${fingerprint}"]`);
+  press(buttons('Switch to this generation', row(M2))[0]);
+  await wait();
+  assert.equal((await confirm('Switch')).includes('The rules store will choose the generation below'), true);
+  assert.deepEqual(sent, [['/api/activate', { generation: M2, expect: M1 }]]);
+  screen.stop();
+
+  // No generation is chosen for ModSecurity: the request says so with a null, which is in the JSON, and the engine is started.
+  const alone = await openGenerations(0, statusOf({ chosen: { coraza: C1 }, running: { coraza: C1 } }), [list[0], generation(M2, 'modsecurity')]);
+  press(alone.buttons('Switch to this generation', alone.root.querySelector(`[data-row="${M2}"]`))[0]);
+  await wait();
+  const said = await alone.confirm('Start');
+  for (const text of ['Start the engine?', 'No generation is chosen for ModSecurity yet', 'the whole proxy stops']) assert.equal(said.includes(text), true, text);
+  assert.deepEqual(alone.sent, [['/api/activate', { generation: M2, expect: null }]]);
+  assert.equal(JSON.stringify(alone.sent[0][1]).includes('"expect":null'), true);
+  assert.equal(alone.root.textContent.includes('The ModSecurity engine of the proxy now serves generation'), true);
+  alone.screen.stop();
+
+  // Chosen and not run: the engine is started with the generation that is chosen, and the list says it does not run.
+  const started = await openGenerations(0, statusOf({ chosen: { coraza: C1, modsecurity: M1 }, running: { coraza: C1 } }), [list[0], list[1]]);
+  const chosenRow = started.root.querySelector(`[data-row="${M1}"]`);
+  assert.equal(chosenRow.textContent.includes('Not running'), true);
+  press(started.buttons('Start the engine', chosenRow)[0]);
+  await wait();
+  assert.equal((await started.confirm('Start')).includes('ModSecurity is not running in the proxy'), true);
+  assert.deepEqual(started.sent, [['/api/activate', { generation: M1, expect: M1 }]]);
+  started.screen.stop();
+});
+
+test('a refusal says what the proxy kept for the engine only as far as it was known before, and tells to choose the earlier generation again only when there is one', () => {
+  setLanguage('en');
+  const refused = (running, again) => outcomeView({ word: 'refused', ids: { from: again ? FP : OTHER, to: FP }, engine: 'modsecurity', running, chosen: true, unwritten: false, error: null }, String).textContent;
+  const kept = refused(true, false);
+  assert.equal(kept.includes('keeps serving its earlier generation for ModSecurity') && kept.includes('choose generation'), true);
+  // An engine that did not run is still not run, and with the same generation before and after there is none to choose again.
+  const fresh = refused(false, true);
+  assert.equal(fresh.includes('refused to start ModSecurity') && fresh.includes('Check the state on the Overview screen.') && !fresh.includes('choose generation'), true);
+  // What was not known before is not said.
+  const unsure = refused(null, false);
+  assert.equal(unsure.includes('refused to switch ModSecurity') && !unsure.includes('earlier generation') && !unsure.includes('does not run'), true);
+  assert.equal(refused(true, true).includes('Check the state on the Overview screen.'), true);
+});
+
+test('a proxy that cannot be reached is not said to leave the engine not running: what is asked for is a switch, and no start is told', async () => {
+  const list = [generation(C2, 'coraza', { current: true }), generation(C1, 'coraza')];
+  const away = statusOf({ chosen: { coraza: C2 }, rollback: { coraza: C1 }, proxy: null });
+  const told = async (index, press_) => {
+    const { screen, root, sent, buttons, confirm } = await openGenerations(index, away, list);
+    press(press_(root, buttons));
+    await wait();
+    const said = await confirm('Cancel');
+    assert.deepEqual(sent, []);
+    screen.stop();
+    return said;
+  };
+  const choose = await told(0, (root, buttons) => buttons('Switch to this generation', root.querySelector(`[data-row="${C1}"]`))[0]);
+  assert.equal(choose.includes('Switch to this generation?'), true);
+  const back = await told(1, (root, buttons) => buttons('Roll back')[0]);
+  assert.equal(back.includes('Roll back Coraza to the previous generation?'), true);
+  for (const said of [choose, back]) for (const text of ['not running', 'will start', 'the whole proxy stops']) assert.equal(said.includes(text), false, text);
+});
+
+test('a rollback is of one engine: its button names the engine and what is chosen for it, and an engine with nothing to go back to has none', async () => {
+  const list = [generation(C2, 'coraza', { current: true, serving: true }), generation(C1, 'coraza'), generation(M2, 'modsecurity', { current: true, serving: true }), generation(M1, 'modsecurity')];
+  const state = statusOf({ chosen: { coraza: C2, modsecurity: M2 }, rollback: { coraza: C1, modsecurity: M1 }, running: { coraza: C2, modsecurity: M2 } });
+  const { screen, sent, buttons, confirm } = await openGenerations(1, state, list);
+  assert.equal(buttons('Roll back').length, 2);
+  // The first is the default engine, and it still names it.
+  press(buttons('Roll back')[0]);
+  await wait();
+  assert.equal((await confirm('Roll back')).includes('Roll back Coraza to the previous generation?'), true);
+  press(buttons('Roll back')[1]);
+  await wait();
+  await confirm('Roll back');
+  assert.deepEqual(sent, [['/api/rollback', { engine: 'coraza', expect: C2 }], ['/api/rollback', { engine: 'modsecurity', expect: M2 }]]);
+  screen.stop();
+
+  // ModSecurity has nothing to go back to, so only Coraza has a button.
+  const one = await openGenerations(1, statusOf({ chosen: { coraza: C2, modsecurity: M2 }, rollback: { coraza: C1 }, running: { coraza: C2, modsecurity: M2 } }), list);
+  assert.equal(one.buttons('Roll back').length, 1);
+  one.screen.stop();
+});
+
+test('a proxy that does not report its engines is offered no change, and the screens say why', async () => {
+  const list = [generation(C2, 'coraza', { current: true }), generation(C1, 'coraza')];
+  const old = statusOf({ chosen: { coraza: C2 }, rollback: { coraza: C1 }, running: null });
+  for (const index of [0, 1]) {
+    const { screen, root, buttons } = await openGenerations(index, old, list);
+    for (const label of ['Switch to this generation', 'Apply to the proxy', 'Start the engine', 'Roll back']) assert.equal(buttons(label).length, 0, label);
+    assert.equal(root.textContent.includes('This proxy does not report the state of its engines.'), true);
+    screen.stop();
+  }
+});
+
+test('the overview shows each engine that has something chosen or that runs, the default one marked, and says when the two processes have another default', async () => {
+  setLanguage('en');
+  const shown = (status) => {
+    const root = document.createElement('main');
+    document.body.append(root);
+    const api = { call: async () => ({ managed: false }) };
+    wafScreens[0].mount({ status: () => ({ data: status, error: null, at: new Date(0), busy: false }), onStatus: () => () => {}, refreshStatus() {}, describe: String, api }, root);
+    return root;
+  };
+  const marks = (root) => root.querySelectorAll('span').filter((item) => item.textContent === 'Default').length;
+  // Nothing is chosen or run for ModSecurity: only Coraza, the default engine, is there.
+  const one = shown(statusOf({ chosen: { coraza: FP }, running: { coraza: FP } }));
+  assert.equal(one.textContent.includes('ModSecurity'), false);
+  assert.equal(marks(one), 1);
+  // The proxy does not report its engines: it is told once for the panel, and for each engine that what the proxy serves is not known.
+  const old = shown(statusOf({ chosen: { coraza: FP }, running: null }));
+  for (const text of ['This proxy does not report the state of its engines.', 'The generation that the proxy serves for this engine could not be read.']) assert.equal(old.textContent.includes(text), true, text);
+  // ModSecurity has a generation chosen and the proxy does not run it: it is there, and the way to start it is said.
+  const two = shown(statusOf({ chosen: { coraza: FP, modsecurity: OTHER }, running: { coraza: FP } }));
+  assert.equal(two.textContent.includes('ModSecurity'), true);
+  assert.equal(two.textContent.includes('A generation is chosen for this engine, but the proxy does not run it.'), true);
+  // The proxy runs another default engine than the admin process names: neither is marked, and it is said.
+  const apart = shown(statusOf({ chosen: { coraza: FP }, running: { coraza: FP }, proxy: { engine: 'modsecurity' } }));
+  assert.equal(marks(apart), 0);
+  assert.equal(apart.textContent.includes('The admin process and the proxy have different default engines.'), true);
+  // An engine that runs with no generation chosen is told, and the bar is not told of a difference.
+  const bare = shown(statusOf({ chosen: {}, running: { coraza: FP } }));
+  assert.equal(bare.textContent.includes('No generation is chosen. If the proxy is restarted, this engine will not start.'), true);
+});
+
+test('the engine of an import starts as the default engine that the status names', async () => {
+  setLanguage('en');
+  const ctx = { user: { name: 'ann', role: 'operator' }, api: { call: async () => statusOf({ name: 'modsecurity', chosen: { modsecurity: FP }, running: { modsecurity: FP } }) }, describe: String, refreshStatus() {} };
+  const root = document.createElement('main');
+  document.body.append(root);
+  const screen = importScreens[0].mount(ctx, root, { id: null, query: {} });
+  await wait();
+  assert.equal(root.querySelectorAll('select').find((item) => item.getAttribute('name') === 'engine').value, 'modsecurity');
+  assert.equal(root.textContent.includes('different default engines'), false);
+  screen.stop();
+  // The two processes have another default engine: none is the default one (the engine of the proxy is not taken for it), and that is said.
+  const apart = { ...ctx, api: { call: async () => statusOf({ name: 'coraza', chosen: { coraza: FP }, running: { coraza: FP }, proxy: { engine: 'modsecurity' } }) } };
+  const other = document.createElement('main');
+  document.body.append(other);
+  const second = importScreens[0].mount(apart, other, { id: null, query: {} });
+  await wait();
+  assert.notEqual(other.querySelectorAll('select').find((item) => item.getAttribute('name') === 'engine').value, 'modsecurity');
+  assert.equal(other.textContent.includes('The admin process and the proxy have different default engines.'), true);
+  second.stop();
+});
+
 test('the page opens the shell for the role of the user, follows the address, and takes a new language without drawing again', async () => {
   const answer = (body) => ({ status: 200, headers: { get: (name) => (name === 'content-type' ? 'application/json' : null) }, json: async () => body });
   const asked = [];
@@ -329,7 +552,7 @@ test('the page opens the shell for the role of the user, follows the address, an
     asked.push(path);
     if (path === '/api/session') return answer({ name: 'ann', role, state: 'active', csrf: 'tok', mfa: false });
     if (path === '/api/managed') return answer({ managed: false });
-    if (path === '/api/status') return answer({ current: FP, reachable: true, proxy: { generation: FP, mode: 'block', engine: 'coraza', phase: 'ready', switching: false }, rollback_to: null, crs: { available: false, files: [] } });
+    if (path === '/api/status') return answer(statusOf({ chosen: { coraza: FP }, running: { coraza: FP } }));
     return answer({ reachable: true, generations: [], entries: [], records: [], next: null });
   };
   const hash = { handlers: [] };
@@ -681,8 +904,11 @@ test('the screen of the upstream groups makes a draft from the selected version,
   assert.equal(forgetDraft(), true);
 });
 
-/** A screen of the draft on the fake page, with an API that gives `version`, and answers a check with the 400 for `at` (and `sentence`). */
-async function editScreen(id, version, refusal) {
+/**
+ * A screen of the draft on the fake page, with an API that gives `version`, and answers a check with the 400 for `at` (and
+ * `sentence`). `status` is the answer of `GET /api/status` and `config` what `GET /api/config` adds to its answer.
+ */
+async function editScreen(id, version, refusal, { status = { proxy: { config: 'c'.repeat(64) } }, config = {}, answer = null } = {}) {
   setLanguage('en');
   globalThis.addEventListener = () => {};
   globalThis.removeEventListener = () => {};
@@ -691,13 +917,14 @@ async function editScreen(id, version, refusal) {
     async call(method, path, body) {
       if (method === 'POST') {
         sent.push(path, body);
+        if (answer !== null) return answer;
         const { at, sentence } = refusal();
         throw new ApiError('refused', 400, sentence, { error: sentence, at });
       }
       if (path === '/api/managed') return { managed: true, current: FP, serving: FP, reachable: true, reloading: false, rollback_to: null, job: null };
       if (path === `/api/managed/versions/${FP}`) return { name: FP, made: 1, current: true, serving: true, version };
-      if (path === '/api/status') return { proxy: { config: 'c'.repeat(64) } };
-      return { sha256: 'c'.repeat(64), forward: {}, proxy: { max_body: 1_000_000 } };
+      if (path === '/api/status') return status;
+      return { sha256: 'c'.repeat(64), forward: {}, proxy: { max_body: 1_000_000 }, ...config };
     },
   };
   const ctx = { user: { name: 'ann', role: 'operator' }, api, describe: (error) => lazy(() => error.sentence), refreshStatus() {}, navigate() {} };
@@ -955,4 +1182,179 @@ test('no default upstream is told as such in a confirmation and in the content o
   assert.equal(String(defaultGroupView('')), 'Not set');
   assert.equal(defaultGroupView('app'), 'app');
   assert.equal(defaultGroupView(null), '—');
+});
+
+test('the screen of the upstream groups chooses the engine of a group, says what is known of the engine before a saving, and tells a refusal at the choice', async () => {
+  const version = { sites: [], upstreams: groupOfOne, routes: [], default_upstream: '' };
+  const status = statusOf({ chosen: { coraza: FP }, running: { coraza: FP } });
+  const { root, screen, sent, pressed, control, errorOf } = await editScreen('upstreams', version, () => ({ at: 'upstreams.app.engine', sentence: 'kernel.engines has no inspector for the engine of an upstream' }), { status });
+  // The list says the engine that inspects the group, and that it is the default one.
+  const line = root.querySelector('[data-row]').textContent;
+  assert.equal(line.includes('Coraza') && line.includes('(default engine)'), true);
+  pressed('Edit');
+  const engine = control('Engine');
+  assert.deepEqual(engine.querySelectorAll('option').map((option) => option.textContent), ['Default engine (Coraza)', 'Coraza', 'ModSecurity']);
+  // The choice is written to the draft; what the status and the file say of the engine is told where the choice is, before a saving.
+  engine.value = 'modsecurity';
+  engine.dispatch('change');
+  assert.equal(heldDraft().groups[0].engine, 'modsecurity');
+  assert.equal(heldDraft().changed, true);
+  for (const text of ['No generation is chosen for ModSecurity.', 'The configuration file has no inspector for ModSecurity']) assert.equal(root.textContent.includes(text), true, text);
+  pressed('Close');
+  pressed('Check');
+  await wait();
+  await wait();
+  assert.equal(sent[1].version.upstreams.app.engine, 'modsecurity');
+  // The refusal opens the group at its choice, and the choice is where the focus goes; changing the choice takes it away.
+  const refused = control('Engine');
+  assert.equal(refused.getAttribute('aria-invalid'), 'true');
+  assert.equal(errorOf(refused), 'kernel.engines has no inspector for the engine of an upstream');
+  assert.equal(document.activeElement, refused);
+  refused.value = '';
+  refused.dispatch('change');
+  assert.equal(refused.getAttribute('aria-invalid'), null);
+  assert.equal(Object.hasOwn(heldDraft().build().version.upstreams.app, 'engine'), false);
+  assert.equal(root.textContent.includes('No generation is chosen for ModSecurity.'), false);
+  // The choice is back to what the version had, so there is no change.
+  assert.equal(heldDraft().changed, false);
+  screen.stop();
+  forgetDraft();
+  // The default engine that the admin process names is not the one that the proxy runs: the choice does not name it, and the two are asked to be started again.
+  const apart = await editScreen('upstreams', version, () => ({ at: null, sentence: 'x' }), { status: statusOf({ chosen: { coraza: FP }, running: { coraza: FP }, proxy: { engine: 'modsecurity' } }) });
+  apart.pressed('Edit');
+  assert.equal(apart.control('Engine').querySelectorAll('option')[0].textContent, 'Default engine');
+  assert.equal(apart.root.textContent.includes('The admin process and the proxy have different default engines.'), true);
+  apart.screen.stop();
+  forgetDraft();
+  // An engine that is not one of ours is kept in the choice, so that the choice does not read as the default one.
+  const odd = await editScreen('upstreams', { ...version, upstreams: { app: { ...groupOfOne.app, engine: 'Coraza' } } }, () => ({ at: null, sentence: 'x' }), { status });
+  odd.pressed('Edit');
+  assert.equal(odd.control('Engine').value, 'Coraza');
+  assert.equal(heldDraft().changed, false);
+  odd.screen.stop();
+  forgetDraft();
+});
+
+test('the confirmation of a saving names the groups whose engine changes, counts the groups by engine, and says which are inspected by a generation that only detects', async () => {
+  const version = { sites: [], upstreams: groupOfOne, routes: [], default_upstream: '' };
+  const status = statusOf({ chosen: { coraza: FP, modsecurity: OTHER }, running: { coraza: FP, modsecurity: OTHER } });
+  // The check passes, and says that the group is inspected by a generation that only detects.
+  const answer = { version: OTHER, detect: [{ upstream: 'app', engine: 'modsecurity' }] };
+  const { root, screen, sent, pressed, control } = await editScreen('upstreams', version, () => null, { status, answer });
+  pressed('Edit');
+  const engine = control('Engine');
+  engine.value = 'modsecurity';
+  engine.dispatch('change');
+  pressed('Close');
+  pressed('Save and apply');
+  await wait();
+  await wait();
+  assert.equal(sent[0], '/api/managed/check');
+  const dialog = root.querySelector('dialog');
+  assert.notEqual(dialog, null);
+  const said = dialog.textContent;
+  for (const text of ['Change Upstream engine app', '1 upstream(s) (app) are inspected by an engine whose generation only detects.', 'ModSecurity upstreams', 'Coraza upstreams']) assert.equal(said.includes(text), true, text);
+  // The user does not confirm: nothing is sent but the check.
+  press(dialog.querySelectorAll('button').find((item) => item.textContent === 'Cancel'));
+  await wait();
+  assert.equal(sent.length, 2);
+  screen.stop();
+  forgetDraft();
+});
+
+test('a version that is applied by its name is counted by engine in the confirmation with the engines that only detect, and a refusal that names an upstream says which', async () => {
+  setLanguage('en');
+  const spare = 'c'.repeat(64);
+  const version = { sites: [], upstreams: { app: { servers: [], engine: 'modsecurity' }, api: { servers: [] } }, routes: [], default_upstream: 'app' };
+  const sentence = 'no generation is chosen for the engine of an upstream';
+  const status = statusOf({ chosen: { coraza: FP, modsecurity: OTHER }, running: { coraza: FP, modsecurity: OTHER } });
+  status.proxy.engines[1].mode = 'detect';
+  const sent = [];
+  const api = {
+    async call(method, path, body) {
+      if (method === 'POST') {
+        sent.push([path, body]);
+        throw new ApiError('conflict', 409, sentence, { error: sentence, at: 'upstreams.app.engine' });
+      }
+      if (path === '/api/managed') return { managed: true, current: FP, serving: FP, reachable: true, reloading: false, rollback_to: null, job: null };
+      if (path === '/api/managed/versions') return { reachable: true, versions: [{ name: FP, made: 1, current: true, serving: true }, { name: spare, made: 1, current: false, serving: false }] };
+      if (path === '/api/status') return status;
+      if (path.startsWith('/api/managed/versions/')) return { name: path.slice(-64), made: 1, version };
+      return { sha256: 'c'.repeat(64), forward: {} };
+    },
+  };
+  const ctx = { user: { name: 'ann', role: 'operator' }, api, describe: (error) => lazy(() => error.sentence), refreshStatus() {}, navigate() {} };
+  const root = document.createElement('main');
+  document.body.append(root);
+  const screen = managedScreens[0].mount(ctx, root, { id: null, query: {} });
+  await wait();
+  await wait();
+  await wait();
+  const apply = (within) => within.querySelectorAll('button').filter((item) => item.textContent === 'Apply this version')[0];
+  press(apply(root.querySelector(`[data-row="${spare}"]`)));
+  await wait();
+  await wait();
+  const dialog = root.querySelector('dialog');
+  // The groups are counted by the engine that inspects them (the default engine for the one that names none), and ModSecurity runs a generation of detection.
+  const said = dialog.textContent;
+  for (const text of ['Coraza upstreams', 'ModSecurity upstreams', 'Detect only now']) assert.equal(said.includes(text), true, text);
+  press(apply(dialog));
+  await wait();
+  await wait();
+  assert.deepEqual(sent, [['/api/managed/activate', { expect: FP, version: spare }]]);
+  assert.equal(root.textContent.includes(`Upstream app: ${sentence}`), true);
+  screen.stop();
+});
+
+test('a group whose engine the proxy does not run is told so before a saving, one that is starting is told to wait, and one that stopped or failed is not running', async () => {
+  const version = { sites: [], upstreams: groupOfOne, routes: [], default_upstream: '' };
+  for (const [phase, text] of [['absent', 'ModSecurity is not running in the proxy.'], ['starting', 'ModSecurity is starting.'], ['stopping', 'ModSecurity is not running in the proxy.'], ['failed', 'ModSecurity is not running in the proxy.'], ['ready', null]]) {
+    const status = statusOf({ chosen: { coraza: FP, modsecurity: OTHER }, running: phase === 'absent' ? { coraza: FP } : { coraza: FP, modsecurity: OTHER } });
+    if (phase !== 'absent') status.proxy.engines[1].phase = phase;
+    const { root, screen, pressed, control } = await editScreen('upstreams', version, () => null, { status });
+    pressed('Edit');
+    const engine = control('Engine');
+    engine.value = 'modsecurity';
+    engine.dispatch('change');
+    const told = ['is not running in the proxy.', 'is starting.'].filter((part) => root.textContent.includes(`ModSecurity ${part}`));
+    assert.deepEqual(told, text === null ? [] : [text.slice('ModSecurity '.length)], phase);
+    screen.stop();
+    forgetDraft();
+  }
+});
+
+test('the numbers of a version are by the engine that inspects its groups, and a line of an engine that only detects says so', () => {
+  setLanguage('en');
+  const group = (engine) => ({ servers: [], ...(engine === undefined ? {} : { engine }) });
+  const version = { upstreams: { a: group(), b: group('coraza'), c: group('modsecurity') } };
+  const pick = (counts) => [counts.coraza, counts.modsecurity, counts.pinned];
+  assert.deepEqual(pick(countsOf(version, 'coraza')), [2, 1, 2]);
+  assert.deepEqual(pick(countsOf(version, 'modsecurity')), [1, 2, 2]);
+  assert.deepEqual(pick(countsOf(version, null)), [null, null, 2]);
+  assert.deepEqual(pick(countsOf({ upstreams: 'x' }, 'coraza')), [null, null, null]);
+  const labels = (lines) => lines.map((line) => String(line.label));
+  const known = diffRows(FP, OTHER, countsOf(version, 'coraza'), countsOf({ upstreams: { a: group('modsecurity'), b: group('coraza') } }, 'coraza'));
+  assert.equal(labels(known).includes('Coraza upstreams') && labels(known).includes('ModSecurity upstreams'), true);
+  assert.equal(labels(known).includes('Upstreams that name an engine'), false);
+  const line = (label, lines) => lines.find((one) => String(one.label) === label);
+  assert.equal(line('Coraza upstreams', known).changed, true);
+  assert.equal(line('ModSecurity upstreams', known).changed, false);
+  // Without the default engine only the groups that name one are counted.
+  const unknown = diffRows(FP, OTHER, countsOf(version, null), countsOf(version, null));
+  assert.equal(labels(unknown).includes('Upstreams that name an engine'), true);
+  assert.equal(labels(unknown).includes('Coraza upstreams'), false);
+  // The proxy runs ModSecurity with a generation that only detects: the line of that engine says so, and the other does not.
+  const detecting = diffRows(FP, OTHER, countsOf(version, 'coraza'), countsOf(version, 'coraza'), { detecting: ['modsecurity'] });
+  assert.equal(Array.isArray(line('ModSecurity upstreams', detecting).after), true);
+  assert.equal(typeof line('Coraza upstreams', detecting).after, 'string');
+});
+
+test('the groups that a generation of detection inspects are named, twenty of them and then how many more', () => {
+  setLanguage('en');
+  const names = (n) => Array.from({ length: n }, (_, at) => `g${at}`);
+  assert.equal(detectNotice([]), null);
+  const twenty = detectNotice(names(20)).textContent;
+  assert.equal(twenty.includes('20 upstream(s)') && twenty.includes('g19') && !twenty.includes('more'), true);
+  const more = detectNotice(names(21)).textContent;
+  assert.equal(more.includes('g19') && !more.includes('g20') && more.includes('and 1 more'), true);
 });

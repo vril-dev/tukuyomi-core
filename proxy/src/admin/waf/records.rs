@@ -6,8 +6,9 @@
 //! The query has these fields, each at most once: `from` and `to` (a time in UTC in RFC 3339 form, with `Z` and a
 //! fraction of up to 9 digits or none, the first and the last time wanted), `type` (the type of the record), `class`,
 //! `status`, `rule` (the id of a rule, as the verdict or among the matched ones), `id` (the number of a request),
-//! `client` (an IP address), `generation` (16 or 64 digits of a generation) and, together or not at all, `file`,
-//! `offset` and `inode`, the continuation that an earlier answer gave. A value is percent-decoded; a field that is not
+//! `client` (an IP address), `generation` (16 or 64 digits of a generation), `engine` (`coraza` or `modsecurity`, the
+//! engine that judged the request) and, together or not at all, `file`, `offset` and `inode`, the continuation that an
+//! earlier answer gave. A value is percent-decoded; a field that is not
 //! known, a value that is not of the form of its field and a field twice are refused.
 //!
 //! One answer has at most `Limits::lines` lines and reads at most `Limits::read` bytes of the files (a chunk is read
@@ -32,6 +33,7 @@ use std::path::Path;
 
 use http::StatusCode;
 use serde_json::{Value, json};
+use tukuyomi_kernel::Engine;
 
 use super::{Waf, conflict};
 use crate::admin::server::Answer;
@@ -101,6 +103,7 @@ struct Filter {
     id: Option<String>,
     client: Option<String>,
     generation: Option<String>,
+    engine: Option<String>,
 }
 
 /// A query: the filter and where to go on.
@@ -283,6 +286,10 @@ impl Query {
                     // A record shows the first 8 bytes of the generation.
                     filter.generation = Some(digits[..16].to_owned());
                 }
+                "engine" => {
+                    // The name, exactly: the lowercase one that a record has.
+                    filter.engine = Some(Engine::parse(&value).ok_or(bad)?.name().to_owned());
+                }
                 "file" => {
                     file = Some(
                         token(&value, 4, |b| b.is_ascii_digit())
@@ -345,6 +352,7 @@ fn judge(line: &[u8], filter: &Filter) -> Judged {
         ("id", &filter.id),
         ("client", &filter.client),
         ("generation", &filter.generation),
+        ("engine", &filter.engine),
     ];
     let rule = |wanted: i64| {
         map.get("rule").and_then(Value::as_i64) == Some(wanted)

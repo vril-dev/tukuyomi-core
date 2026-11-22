@@ -1,8 +1,9 @@
 // The screens of the rule generations: the list with the detail of one generation (which has an address of its own,
-// `#/generations/<fingerprint>`) and the actions that choose and remove a generation, and the history of the switches
-// with the rollback. A change of the rules asks first (a confirmation that shows the generation before and after),
-// holds the buttons while it runs, and tells how it ended: the words of the proxy's answer (see `switchOutcome`), and
-// when no answer came, what the status and the history show now. A screen is `{ id, title, least, mount }`;
+// `#/generations/<fingerprint>`) and the actions that choose, apply, start and remove a generation, and the history of
+// the switches with the rollback. A generation is chosen for each engine, so what a generation may be used for, and what
+// a rollback goes back to, is told engine by engine. A change of the rules asks first (a confirmation that shows the
+// generation before and after), holds the buttons while it runs, and tells how it ended: the words of the proxy's
+// answer (see `switchOutcome`), and when no answer came, what the status and the history show now. A screen is `{ id, title, least, mount }`;
 // `mount(ctx, root, route)` draws into `root` and gives back `{ stop, show }`; `show(route)` is called when the
 // address changes inside the screen. Nothing runs when the module is loaded.
 
@@ -15,15 +16,16 @@ import {
   diffView,
   engineBadge,
   engineName,
+  engineStates,
   findingsView,
   fingerprintText,
   fingerprintView,
-  generationState,
   hashOf,
   isFingerprint,
   kv,
   modeBadge,
   modeName,
+  oldProxy,
   outcomeView,
   pageHead,
   panelWith,
@@ -59,26 +61,53 @@ const STATES = {
   chosen: { tone: 'info', words: () => w('badge.chosen'), text: () => t('badge.chosen') },
   serving: { tone: 'ok', words: () => w('badge.serving'), text: () => t('badge.serving') },
   rollback: { tone: 'muted', words: () => w('badge.rollback'), text: () => t('badge.rollback') },
+  unstarted: { tone: 'warn', words: () => w('badge.unstarted'), text: () => t('badge.unstarted') },
+};
+/** The words of the button that changes the proxy for a generation, by what it does. */
+const CHOOSE = {
+  choose: () => w('gen.choose'),
+  apply: () => w('gen.apply'),
+  start: () => w('gen.start'),
 };
 
 /**
- * What a user may do with a generation, from the role and from `state`: `hasChosen` (the rules store chooses one;
- * without it no request to choose can name what it expects), `rollbackTo` (the generation a rollback would choose)
- * and `servingKnown` (the proxy said which generation it serves; when it did not, nothing shows that the chosen
- * generation is not served). `choose` is `choose`, `apply` (it is chosen but the proxy does not serve it, so the
- * proxy is told to switch to it) or null; `remove` says whether the store may remove it; `kept` says why not (the
- * chosen generation, the one that a proxy serves and the target of a rollback are kept). A viewer may do none of it.
+ * The engines that a screen of the state shows: those with a generation chosen or served, and the default engine; all of
+ * them when there are none (nothing is chosen anywhere and the default engine is not known).
  */
-export function actionsOf(role, generation, { hasChosen, rollbackTo, servingKnown }) {
+export function shownEngines(states) {
+  const shown = states.filter((state) => state.current !== null || state.serving !== null || state.isDefault);
+  return shown.length === 0 ? states : shown;
+}
+
+/** The name of an engine as the head of its part of a screen, with the mark of the default engine. */
+export function engineHeading(state) {
+  return el('h3', {}, lazy(() => engineName(state.engine)), state.isDefault ? [' ', badge('info', w('engine.default'))] : null);
+}
+
+/**
+ * What a user may do with a generation, from the role and from `state`: `engines` (the state of each engine, see
+ * `engineStates`) and `legacy` (the proxy does not report its engines, so it cannot be told to switch). `choose` is
+ * `choose` (the generation is not chosen for its engine: the request names the one that is, or none), `apply` (it is
+ * chosen but the proxy serves another one for the engine, so the proxy is told to switch to it), `start` (it is chosen
+ * and the proxy does not run the engine, whether a switch is under way or not) or null; a generation whose engine is not one of ours (its manifest could not
+ * be read) is offered none of them. `remove` says whether the store may remove it; `kept` says why not (the chosen
+ * generation, the one that a proxy serves, and the target of a rollback of any engine are kept). A viewer may do none
+ * of it.
+ */
+export function actionsOf(role, generation, { engines, legacy }) {
   const none = { choose: null, remove: false, kept: null };
   if (!canChange(role)) return none;
+  const mine = engines.find((one) => one.engine === generation.engine);
   let kept = null;
   if (generation.current === true) kept = 'chosen';
   else if (generation.serving === true) kept = 'serving';
-  else if (generation.fingerprint === rollbackTo) kept = 'rollback';
+  else if (engines.some((one) => one.rollbackTo === generation.fingerprint)) kept = 'rollback';
   let choose = null;
-  if (hasChosen && generation.current !== true) choose = 'choose';
-  if (hasChosen && servingKnown && generation.current === true && generation.serving !== true) choose = 'apply';
+  if (mine !== undefined && !legacy) {
+    if (generation.current !== true) choose = 'choose';
+    else if (mine.running === false) choose = 'start';
+    else if (mine.state === 'differ' || mine.state === 'switching') choose = 'apply';
+  }
   return { choose, remove: kept === null, kept };
 }
 
@@ -99,6 +128,19 @@ export function diffRows(now, after, { gone = false } = {}) {
     after: gone ? w('confirm.gone') : text(after, key, show),
     changed: gone || !same(key),
   }));
+}
+
+/**
+ * What the confirmation of a change to the engine of `state` says it does, by whether a generation is chosen for the
+ * engine and whether the proxy runs it (`running`: true, false, or null when the proxy did not say: nothing is said of a
+ * start then, for a request that cannot ask the proxy is refused and changes nothing). `apply` is for the generation that
+ * is chosen already.
+ */
+function changeWords(state, apply) {
+  const engine = engineName(state.engine);
+  if (state.running === false) return state.current === null ? w('gen.choose.first', { engine }) : w('gen.choose.start', { engine });
+  if (state.current === null) return w('gen.choose.unchosen', { engine });
+  return apply ? w('gen.choose.same') : w('gen.choose.what');
 }
 
 /** The base of the screens of the rules: the layers, the reads, the change that runs and its end. */
@@ -175,21 +217,23 @@ class Screen {
     return outcome.skipped || !this.alive ? null : outcome;
   }
 
-  /** A request to switch: shows how it ended, then reads again, whatever the end was. */
-  async switch(name, call) {
+  /** A request to switch `engine`: shows how it ended, then reads again, whatever the end was. */
+  async switch(name, call, engine) {
+    // Whether the proxy ran the engine before the request (null: it did not say): what a refusal leaves in its place depends on it.
+    const running = engineStates(this.data?.status).find((one) => one.engine === engine)?.running ?? null;
     const done = await this.change(name, call);
     if (done === null) return;
-    const outcome = switchOutcome(done);
+    const outcome = { ...switchOutcome(done, engine), running };
     mount(this.results, outcomeView(outcome, this.ctx.describe));
     if (outcome.word === 'lost') {
-      await this.findings();
+      await this.findings(engine);
       if (!this.alive) return;
     }
     await this.load();
   }
 
-  /** No answer came: reads the status and the history and shows what they say. */
-  async findings() {
+  /** No answer came: reads the status and the history and shows what they say of `engine`. */
+  async findings(engine) {
     let status = null;
     let history = null;
     try {
@@ -199,7 +243,7 @@ class Screen {
     } catch {
       status = null;
     }
-    if (this.alive) this.results.append(findingsView(status, history));
+    if (this.alive) this.results.append(findingsView(status, history, engine));
   }
 
   failure(words) {
@@ -256,17 +300,8 @@ class GenerationsScreen extends Screen {
 
   /** The state that `actionsOf` asks for, from what was read last. */
   state() {
-    const rollbackTo = this.data?.status?.rollback_to;
-    return {
-      hasChosen: this.chosen() !== null,
-      rollbackTo: typeof rollbackTo === 'string' ? rollbackTo : null,
-      servingKnown: generationState(this.data?.status) !== 'unknown',
-    };
-  }
-
-  /** The generation that the rules store chooses, as the list showed it, which a request to choose must expect. */
-  chosen() {
-    return this.items().find((item) => item.current === true)?.fingerprint ?? null;
+    const status = this.data?.status;
+    return { engines: engineStates(status), legacy: oldProxy(status) };
   }
 
   async read() {
@@ -374,10 +409,12 @@ class GenerationsScreen extends Screen {
   // ---- the list ----
 
   stateWords(item) {
+    const engines = engineStates(this.data?.status);
     const names = [];
     if (item.current === true) names.push('chosen');
     if (item.serving === true) names.push('serving');
-    if (item.fingerprint === this.data?.status?.rollback_to) names.push('rollback');
+    if (engines.some((one) => one.rollbackTo === item.fingerprint)) names.push('rollback');
+    if (item.current === true && engines.find((one) => one.engine === item.engine)?.running === false) names.push('unstarted');
     return names;
   }
 
@@ -388,16 +425,15 @@ class GenerationsScreen extends Screen {
 
   drawBody() {
     const items = this.items();
-    const chosen = this.chosen();
     const reachable = this.data?.list?.reachable === true;
     // A proxy that is busy answers the list but does not say what it serves, so no generation is marked as served.
-    const mismatch = this.data !== null && reachable && this.state().servingKnown && chosen !== null && !items.some((item) => item.serving === true);
+    const mismatch = this.data !== null && reachable && this.state().engines.some((one) => one.state === 'differ' || one.state === 'unstarted');
     mount(
       this.notes,
       this.error === null ? null : this.failure(w('gen.failed')),
       this.data === null || reachable ? null : notice('warn', w('gen.unreachable')),
       mismatch ? notice('warn', w('status.differ')) : null,
-      this.data !== null && canChange(this.ctx.user.role) && chosen === null && items.length > 0 ? notice('warn', w('gen.nochosen')) : null,
+      this.data !== null && this.state().legacy ? notice('info', w('gen.legacy')) : null,
     );
     this.table.node.hidden = this.data === null && this.error !== null;
     this.table.update({ rows: items, loading: this.data === null && this.error === null });
@@ -410,7 +446,7 @@ class GenerationsScreen extends Screen {
     const can = actionsOf(this.ctx.user.role, item, this.state());
     const busy = working.name !== null;
     const buttons = [
-      can.choose === null ? null : button(inDetail ? 'primary' : 'small', can.choose === 'apply' ? w('gen.apply') : w('gen.choose'), () => this.choose(item), { disabled: busy }),
+      can.choose === null ? null : button(inDetail ? 'primary' : 'small', CHOOSE[can.choose](), () => this.choose(item, can.choose), { disabled: busy }),
       can.remove ? el('span', { class: 'tc-actions--apart' }, button(inDetail ? 'danger' : 'small danger', w('gen.remove'), () => this.remove(item), { disabled: busy })) : null,
       can.kept === null ? null : el('span', { class: 'tc-muted tc-small' }, KEPT[can.kept]()),
     ];
@@ -421,21 +457,25 @@ class GenerationsScreen extends Screen {
     return this.items().find((item) => item.fingerprint === fingerprint) ?? null;
   }
 
-  async choose(item) {
-    const expect = this.chosen();
-    if (expect === null) return;
-    const proxy = this.data.status?.proxy;
-    const serving = proxy !== null && typeof proxy === 'object' ? proxy.generation : null;
-    const lines = [el('p', {}, expect === item.fingerprint ? w('gen.choose.same') : w('gen.choose.what'))];
-    if (typeof serving === 'string' && serving !== expect) lines.push(el('p', { class: 'tc-muted tc-small' }, w('gen.choose.serving', { serving: shortOf(serving) })));
+  /**
+   * Asks, then sends the request that chooses `item` for its engine (`kind` is what `actionsOf` offered). It expects the
+   * generation that is chosen for that engine, and none (`null`) for an engine that has none.
+   */
+  async choose(item, kind) {
+    const mine = this.state().engines.find((one) => one.engine === item.engine);
+    if (mine === undefined) return;
+    const { current: expect, running } = mine;
+    const lines = [el('p', {}, changeWords(mine, kind === 'apply'))];
+    if (mine.serving !== null && mine.serving !== expect) lines.push(el('p', { class: 'tc-muted tc-small' }, w('gen.choose.serving', { serving: shortOf(mine.serving) })));
+    if (running === false) lines.push(el('p', { class: 'tc-muted tc-small' }, w('gen.start.risk')));
     const yes = await confirmChange(this.layer, {
-      title: w('gen.choose.title'),
+      title: running === false ? w('gen.start.title') : w('gen.choose.title'),
       lines,
       diff: diffView([w('confirm.now'), w('confirm.after_choose')], diffRows(this.itemOf(expect), this.itemOf(item.fingerprint) ?? item)),
-      confirm: w('gen.choose.confirm'),
+      confirm: running === false ? w('gen.start.confirm') : w('gen.choose.confirm'),
     });
     if (!yes || !this.alive) return;
-    await this.switch('activate', () => this.ctx.api.call('POST', '/api/activate', { generation: item.fingerprint, expect }));
+    await this.switch('activate', () => this.ctx.api.call('POST', '/api/activate', { generation: item.fingerprint, expect }), item.engine);
   }
 
   async remove(item) {
@@ -477,6 +517,7 @@ class HistoryScreen extends Screen {
         { key: 'ts', label: timeLabel(w('col.time')), value: (entry) => instantOf(entry.ts), text: (entry) => timeCellText(entry.ts), tight: true, cell: (entry) => timeCell(entry.ts) },
         { key: 'actor', label: w('col.by'), value: (entry) => String(entry.actor) },
         { key: 'kind', label: w('col.kind'), value: (entry) => (Object.hasOwn(KINDS, entry.kind) ? KINDS[entry.kind]() : String(entry.kind)) },
+        { key: 'engine', label: w('col.engine'), value: (entry) => (typeof entry.engine === 'string' ? entry.engine : ''), text: (entry) => (typeof entry.engine === 'string' ? engineName(entry.engine) : '—'), cell: (entry) => (typeof entry.engine === 'string' ? engineBadge(entry.engine) : '—') },
         { key: 'from', label: w('col.from'), value: (entry) => entry.from ?? '', text: (entry) => fingerprintText(entry.from), mono: true, cell: fp('from') },
         { key: 'to', label: w('col.to'), value: (entry) => entry.to ?? '', text: (entry) => fingerprintText(entry.to), mono: true, cell: fp('to') },
         { key: 'result', label: w('col.result'), value: (entry) => String(entry.result), text: (entry) => wordText(entry.result), cell: (entry) => wordBadge(entry.result) },
@@ -508,29 +549,44 @@ class HistoryScreen extends Screen {
   }
 
   targetPanel(status) {
-    const target = status.rollback_to;
-    const may = canChange(this.ctx.user.role) && typeof target === 'string' && typeof status.current === 'string';
+    const legacy = oldProxy(status);
     return panelWith(
       w('status.rollback'),
       [],
-      typeof target === 'string' ? fingerprintView(target) : el('p', { class: 'tc-muted' }, w('status.rollback_none')),
-      typeof target === 'string' ? el('p', { class: 'tc-muted tc-small' }, w('status.rollback_note')) : null,
-      may ? el('div', { class: 'tc-actions' }, button('', w('history.rollback'), () => this.rollback(status), { disabled: working.name !== null })) : null,
+      legacy ? notice('info', w('gen.legacy')) : null,
+      shownEngines(engineStates(status)).map((state) => this.targetLine(state, !legacy)),
     ).node;
   }
 
-  async rollback(status) {
-    const { current, rollback_to: target } = status;
+  /** The part of the panel for one engine: the generation that a rollback of it goes to, and the button when it may. */
+  targetLine(state, proxyKnown) {
+    const target = state.rollbackTo;
+    const may = canChange(this.ctx.user.role) && proxyKnown && typeof target === 'string' && state.current !== null;
+    return el(
+      'div',
+      { class: 'tc-stack' },
+      engineHeading(state),
+      typeof target === 'string' ? fingerprintView(target) : el('p', { class: 'tc-muted' }, w('status.rollback_none')),
+      typeof target === 'string' ? el('p', { class: 'tc-muted tc-small' }, w('status.rollback_note')) : null,
+      may ? el('div', { class: 'tc-actions' }, button('', w('history.rollback'), () => this.rollback(state), { disabled: working.name !== null })) : null,
+    );
+  }
+
+  /** Asks, then rolls back `state.engine`: the request names the engine, and expects the generation chosen for it. */
+  async rollback(state) {
+    const { engine, current, rollbackTo: target } = state;
     const find = (fingerprint) => this.data.generations.find((item) => item.fingerprint === fingerprint) ?? { fingerprint };
+    const stopped = state.running === false;
+    const name = engineName(engine);
     const yes = await confirmChange(this.layer, {
-      title: w('history.rollback.title'),
-      lines: [el('p', {}, w('history.rollback.what'))],
+      title: w('history.rollback.title', { engine: name }),
+      lines: [el('p', {}, w('history.rollback.what')), stopped ? el('p', {}, w('history.rollback.start', { engine: name })) : null, stopped ? el('p', { class: 'tc-muted tc-small' }, w('gen.start.risk')) : null],
       diff: diffView([w('confirm.now'), w('confirm.after_rollback')], diffRows(find(current), find(target))),
       confirm: w('history.rollback'),
       tone: 'danger',
     });
     if (!yes || !this.alive) return;
-    await this.switch('rollback', () => this.ctx.api.call('POST', '/api/rollback', { expect: current }));
+    await this.switch('rollback', () => this.ctx.api.call('POST', '/api/rollback', { engine, expect: current }), engine);
   }
 }
 

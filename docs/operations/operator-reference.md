@@ -21,15 +21,19 @@ tukuyomi-proxy <config>
   2. 設定ファイル（`managed` があれば、managed ストアの選択中のバージョンと、それが指すファイルも。`geo` があれば、国のデータベースの読み込みと検証も）
   3. アップストリームのサーバーの名前解決と、アップストリームの CA のファイル
   4. TLS のリスナーの証明書と鍵
-  5. ルールストアと、選択中の世代
+  5. ルールストアと、エンジンごとの選択中の世代
   6. ログファイル（設定に `records` があるとき）を開く
   7. 監視用のリスナー（設定に `status` があるとき）のバインド
   8. 制御ソケット（設定に `admin` があるとき）のバインド
-  9. 検査カーネルの起動と、検査プロセスの準備
+  9. 検査カーネルの起動と、検査プロセスの準備（起動するエンジンごと）
   10. リスナーのバインド
+- 起動するエンジンは、選択中の世代があり、検査プロセスが設定にあるエンジンのすべてです。デフォルトのエンジンが先で、ほかは名前の順です。
+  - デフォルトのエンジンと、アップストリームのエンジンには、選択中の世代が必要です。無ければ、`start: rules store refused: no generation is chosen` の行を出して停止します（exit 1）。
+  - デフォルトのエンジンに選択中の世代が無く、ほかのエンジンには選択中の世代があるときは、`start: rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` の行を出して停止します（exit 1）。`kernel.default_engine` を書くか、デフォルトのエンジンの世代を選択してください。
+  - どのアップストリームも使わないエンジンも、選択中の世代があれば起動します（下の「検査エンジンの選択」）。
 - ログファイルは、検査プロセスより前に開きます。開けなければ、`start: record file refused: ...` の行を出し、検査プロセスを起動せずに停止します（exit 1）。
 - 監視用のリスナーと制御ソケットは、検査プロセスより前にバインドします。バインドできなければ、検査プロセスを起動せずに停止します（exit 1）。制御ソケットは `start: control socket refused: ...` の行を出します。
-- リスナーは、検査カーネルの準備ができてから、すべてをバインドします。1 つでもバインドできなければ、どれも使わずに停止します。
+- リスナーは、起動するエンジンの検査カーネルがすべて準備できてから、すべてをバインドします。1 つでもバインドできなければ、どれも使わずに停止します。
 - シグナルの処理は 6 の後に有効になります。それより前（名前解決は最長 `resolve_timeout_ms` かかります）に届いたシグナルは、どれもプロキシをそのまま終了させます。
 - ログには、準備ができると `start: the kernel is ready`、リスナーが待ち受けを始めると `start: listening` の行が出ます（`line` のログ。下の「ログ」）。
 - 環境変数 `NOTIFY_SOCKET` があれば、すべてのリスナーをバインドした後に `READY=1` を送ります（下の「systemd への通知」）。
@@ -38,7 +42,7 @@ tukuyomi-proxy <config>
 | 終了コード | 意味 |
 |---|---|
 | 0 | シグナルで停止し、検査カーネルの停止（検査プロセスの終了と作業ディレクトリの削除）まで確認できたとき |
-| 1 | それ以外の終了です。root での起動、起動前の検証の失敗、名前解決できないアップストリームの名前、使えない CA のファイル、受け付けない証明書や鍵、受け付けないルールストアや世代、受け付けない managed ストアやバージョン、開けないログファイル、バインドできない監視用のリスナーや制御ソケットを含みます（このときは何も起動していません） |
+| 1 | それ以外の終了です。root での起動、起動前の検証の失敗、名前解決できないアップストリームの名前、使えない CA のファイル、受け付けない証明書や鍵、受け付けないルールストアや世代、選択中の世代が無いデフォルトのエンジンやアップストリームのエンジン、受け付けない managed ストアやバージョン、開けないログファイル、バインドできない監視用のリスナーや制御ソケットを含みます（このときは何も起動していません） |
 | 2 | 引数のエラー、または設定ファイルを受け付けなかったとき |
 
 ### `config check`
@@ -51,7 +55,10 @@ tukuyomi-proxy config check <config>
   - 通れば、標準出力に `accepted` の 1 行が出て exit 0 になります。
   - ほかの行は標準エラーに出て、`config check:` で始まります。引数のエラーのときだけ `config:` で始まり、使い方の行が続きます。
   - 終了コードは起動と同じです。
-  - 選択中の世代のエンジンが使えるかも検証します。使えなければ、`config check: rules generation refused: <reason>` の行を出して exit 1 になります。このビルドが持つ検査エンジンは `coraza` と `modsecurity` です。`modsecurity` の世代は、設定の `kernel.engines` に検査プロセスがあるときだけ使えます（下の「`kernel`」の `engines`）。
+  - 選択中の世代があるエンジンごとに、検査カーネルの設定を検証します。検査カーネルの設定を作れない世代は、`config check: rules generation refused: <reason>` の行を出して exit 1 になります。このビルドが持つ検査エンジンは `coraza` と `modsecurity` です。`modsecurity` は、設定の `kernel.engines` に検査プロセスがあるときだけ使えます（下の「`kernel`」の `engines`）。
+  - 起動のときと同じ文で、選択中の世代が無いデフォルトのエンジンとアップストリームのエンジンを受け付けません（`config check: rules store refused: no generation is chosen`、`config check: rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine`。どちらも exit 1）。
+  - デフォルトのエンジンかアップストリームのエンジンが `modsecurity` で、設定に `kernel.engines` が無いときは、設定ファイルかバージョンを受け付けません。どのアップストリームも使わないエンジンは、設定に検査プロセスが無ければ、選択中の世代があっても検証せず、起動もしません。
+  - 検知のみの世代を選択しているエンジンへ向くアップストリームごとに、`config check: upstream <name>: engine <engine>, mode detect` の行を出します。
 - `managed` があれば、managed ストアの選択中のバージョン（`current`）を起動のときと同じように読み込んで検証し、`config check: managed version <version>` の行を出します。選択中のバージョンが無ければ、`config check: managed store refused: no managed version is chosen` の行を出して exit 1 になります（下の「managed 設定」）。読んでいる間は、そのバージョンの削除を拒否します。
 - `geo` があれば、国のデータベースも起動のときと同じように読み込んで検証します（「アクセス制御とレート制限」の `geo`）。
 - 検証しないもの:
@@ -62,8 +69,8 @@ tukuyomi-proxy config check <config>
   - ログファイルを開けること（上の 6）
   - リスナーと監視用のリスナーのポート、制御ソケットをバインドできること
   - systemd の設定
-  - 動作中のプロキシが設定のリロードで拒否する理由（動作中に変更できない設定キーの違い、新しいリスナーのバインド。下の「SIGHUP（設定のリロード）」）
-- このコマンドが書くものは 1 つだけです。起動のときと同じく、選択中の世代を使うことを示す目印をルールストアの `using/` に作ります（まだ無いとき）。コマンドが終了すると、目印のロックは解除されます。
+  - 動作中のプロキシが設定のリロードで拒否する理由（動作中に変更できない設定キーの違い、アップストリームのエンジンが稼働していないこと、新しいリスナーのバインド。下の「SIGHUP（設定のリロード）」）
+- このコマンドが書くものは、目印だけです。起動のときと同じく、起動するエンジンごとの選択中の世代を使うことを示す目印を、ルールストアの `using/` に作ります（まだ無いとき）。コマンドが終了すると、目印のロックは解除されます。
 - サービスと同じ OS ユーザーで実行してください。別の OS ユーザーでは、ルールストアと managed ストアの所有者の検証や、鍵のファイルの読み込みで受け付けません。
 
 ### `rules`
@@ -71,6 +78,7 @@ tukuyomi-proxy config check <config>
 ```text
 tukuyomi-proxy rules import <config> [--crs <dir>] [--crs-off <name>]... [--rules <file>]... [--data <file>]... [--routes <file>] [--engine <name>] [--accept-block] [--detect-only]
 tukuyomi-proxy rules activate <config> <fingerprint>
+tukuyomi-proxy rules deactivate <config> <engine>
 tukuyomi-proxy rules remove <config> <fingerprint>
 tukuyomi-proxy rules list <config>
 ```
@@ -80,9 +88,10 @@ tukuyomi-proxy rules list <config>
 | コマンド | すること | 標準出力 |
 |---|---|---|
 | `import` | 入力からルールセットを作ってルールストアに置き、事前検証に通れば世代にします。世代は選択しません | `<fingerprint> created`、`<fingerprint> already exists`、`<fingerprint> recreated, the stored copy was broken` |
-| `activate` | 世代を選択します。後で起動するプロキシと、SIGUSR1 を受けたプロキシがそれを使います。世代のエンジンが使えないときは、選択せずに受け付けません（exit 2） | `<fingerprint> current` |
-| `remove` | 選択中でない世代で、どのプロキシも使っていないものを削除します | `<fingerprint> removed` |
-| `list` | 世代の一覧 | フィンガープリント、作成時刻（エポックからの秒数）、モード（`block`・`detect`、マニフェストが読めなければ `unknown`）、エンジン（`coraza`・`modsecurity`、マニフェストが読めなければ `unknown`）、検査除外のルート（bypass）があれば `routes` と数、選択中の世代に `current` |
+| `activate` | 世代を選択します。選択は、世代のエンジンごとに 1 つです（下の「エンジンごとの選択中の世代」）。後で起動するプロキシと、SIGUSR1 を受けたプロキシがそれを使います。世代のエンジンが使えないときは、選択せずに受け付けません（exit 2） | `<fingerprint> current` |
+| `deactivate` | エンジンの選択中の世代を解除します。次に起動するプロキシは、そのエンジンを起動しません。動作中のプロキシは、起動したエンジンを止めません。デフォルトのエンジンと、アップストリームのエンジンに使われているエンジンは、解除せずに受け付けません（exit 1。下の「エンジンごとの選択中の世代」） | `<fingerprint> deactivated`（解除した世代） |
+| `remove` | どのエンジンでも選択中でない世代で、どのプロキシも使っていないものを削除します | `<fingerprint> removed` |
+| `list` | 世代の一覧 | フィンガープリント、作成時刻（エポックからの秒数）、モード（`block`・`detect`、マニフェストが読めなければ `unknown`）、エンジン（`coraza`・`modsecurity`、マニフェストが読めなければ `unknown`）、検査除外のルート（bypass）があれば `routes` と数、エンジンごとの選択中の世代に `current`（2 つのエンジンの世代が選択中なら、2 行に付きます）。選択中の世代を決められないとき（ファイルを読めない、内容が正しくない、`current` と `current.<engine>` が食い違う）は、世代の行をすべて出した後、標準エラーに `rules list: <reason>` の行を出して exit 1 になります |
 
 `import` の入力は次のとおりです。オプションのパスは、カレントディレクトリからの相対パスでも書けます。
 
@@ -93,7 +102,7 @@ tukuyomi-proxy rules list <config>
 | `--rules <file>` | 運用者のルールのファイル。何度でも書け、CRS の後に書いた順に読み込みます |
 | `--data <file>` | 運用者のルールが読むデータのファイル。ルールセットには入りますが、ルールとしては読み込みません |
 | `--routes <file>` | 検査除外のルート（bypass）のファイル（下の「検査除外のルート」） |
-| `--engine <name>` | 世代の検査エンジンの名前。`coraza` か `modsecurity`（小文字）。省けば `coraza`。これ以外の名前と、設定の `kernel.engines` に検査プロセスが無い `modsecurity` は、何も置かずに受け付けません（exit 2） |
+| `--engine <name>` | 世代の検査エンジンの名前。`coraza` か `modsecurity`（小文字）。省けば、設定の `kernel.default_engine` のエンジン（`kernel.default_engine` を書かなければ `coraza`）。これ以外の名前と、設定の `kernel.engines` に検査プロセスが無い `modsecurity` は、何も置かずに受け付けません（exit 2） |
 | `--accept-block` | 事前検証のリクエストがブロックされても、事前検証を失敗にしません（一致したルールは出力されます） |
 | `--detect-only` | 検知のみの世代にします（下の「検知のみのモード」） |
 
@@ -111,7 +120,7 @@ tukuyomi-proxy rules list <config>
 - 事前検証の間に SIGINT（Ctrl-C）か SIGTERM を受けると、事前検証を停止し、検査プロセスと作業ディレクトリを片付けて、世代を作らずに終了します。事前検証の後は、この 2 つのシグナルでコマンドは停止しません。
 - `import` は検査プロセスを起動するので、起動前の検証（[ビルドと配置](../build/binary-deployment.md) の「起動前の検証」）も実行します。
 
-終了コードは、0 が成功、1 がそれ以外の終了（受け付けないルールストアや入力、失敗した事前検証、使用中のルールストア、`list` でマニフェストが読めない世代や選択中の世代が無いルールストア、root での実行）、2 が引数のエラー、受け付けない設定ファイル、または使えないエンジン（`import` と `activate`）です。
+終了コードは、0 が成功、1 がそれ以外の終了（受け付けないルールストアや入力、失敗した事前検証、使用中のルールストア、`list` でマニフェストが読めない世代や、選択中の世代を決められないルールストア、設定が使っているエンジンと選択中の世代が無いエンジンの `deactivate`、root での実行）、2 が引数のエラー、受け付けない設定ファイル（`deactivate` では、`managed` の選択中のバージョンも含みます）、または使えないエンジン（`import` と `activate`）です。選択中の世代が無いルールストアの `list` は、exit 0 です。
 
 ### `managed`
 
@@ -127,7 +136,7 @@ managed 設定のバージョン（下の「managed 設定」）を扱う短い�
 | コマンド | すること | 標準出力 |
 |---|---|---|
 | `import` | 文書からバージョンを作って managed ストアに置きます。文書が指すファイルを読み、プロキシと同じように検証して、`files/` に置きます。バージョンは選択しません | `<version> created`、`<version> existing`、`<version> recreated, the stored copy was broken` |
-| `activate` | 起動のうちルールストアより前の段階（設定ファイルとバージョン、アップストリームの名前解決と CA のファイル、証明書）を実行し、通ったときだけバージョンを選択します（`current` を変更します） | `<version> current` |
+| `activate` | 起動のうちルールストアより前の段階（設定ファイルとバージョン、アップストリームの名前解決と CA のファイル、証明書）を実行し、バージョンのアップストリームが使うエンジンに、選択中の世代があることをルールストアで確認して、通ったときだけバージョンを選択します（`current` を変更します）。選択中の世代が無いエンジンを使うアップストリームがあれば、`managed activate: rules store refused: no generation is chosen for the engine of an upstream (upstream <name>)` の行を出し、選択せずに拒否します（exit 1）。`import` は、この確認をしません | `<version> current` |
 | `remove` | 選択中でなく、使用中でもないバージョンを削除し、どのバージョンも指さなくなったファイルと ACME のサイトの証明書を片付けます。ロールバックの先かどうかは調べません | `<version> removed` |
 | `list` | バージョンの一覧 | バージョン、ファイルの更新時刻（エポックからの秒数）、選択中のバージョンに `current` |
 
@@ -193,7 +202,7 @@ tukuyomi-proxy admin reset <config> <name>
 |---|---|
 | SIGTERM、SIGINT | 停止します（下の「停止」） |
 | SIGHUP | 設定ファイルをリロードし、停止せずに新しい設定に切り替えます |
-| SIGUSR1 | ルールストアで選択中の世代へ切り替えます |
+| SIGUSR1 | ルールストアでエンジンごとに選択中の世代へ、エンジンを 1 つずつ切り替えます。選択中の世代があり、稼働していないエンジンは、起動します |
 | SIGUSR2 | すべての TLS のリスナーの証明書と鍵のファイルを再読み込みします（`managed` のある設定では、`admin.route` の証明書と、managed ストアのサイトの証明書） |
 
 SIGHUP を受けると停止していた以前のバージョンから入れ替えるときは、新しい実行ファイルを入れてからユニットを変更します（[ビルドと配置](../build/binary-deployment.md) の「systemd」）。以前のバージョンは SIGHUP で停止します。
@@ -204,15 +213,16 @@ SIGHUP を受けると停止していた以前のバージョンから入れ替�
 - 制御ソケットの `reload` の依頼も、同じ手順で設定をリロードします（`current` の代わりに、依頼で指定されたバージョンを読み込みます。下の「制御ソケット」）。リロードは一度に 1 つだけです。
 - すべてが通り、動作中に変更できない設定キー（下）がどれも起動のときと同じなら、新しい設定に一度に切り替えます。最後に `reload: configuration replaced <sha256>` の行を出します（`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`）。どのファイルとバージョンが効いているかは、この値で確認します。
 - どこかで拒否したら、何も変更せず、理由の行を出します（`reload: configuration refused: <reason>`、`reload: upstream refused: <reason>`、`reload: tls refused: <reason>`、`managed` のある設定では `reload: managed store refused: <reason>`・`reload: managed version refused: <reason>` など）。拒否の行には、ファイルの値を出しません。
+- 新しい設定のアップストリームのエンジンが、稼働していないか、準備ができていないときも、何も変更せずに拒否します（`reload: configuration refused: the engine of an upstream is not ready (upstream <name>)`。`<name>` はそのアップストリームの名前です）。リロードは検査プロセスを起動しないので、そのエンジンは、先に SIGUSR1 で起動します（下の「SIGUSR1（世代の切り替え）」と「エンジンごとの選択中の世代」）。制御ソケットの `reload` の依頼では、`reason` が `fixed` の拒否になります。
 - 切り替えても拒否しても、`tukuyomi_config_reloads_total` に数えます（`replaced`、`refused`）。制御ソケットの `reload` で始めたリロードも、同じように数えます。
 - 変更できるもの:
   - `proxy` の設定キー（下の変更できない設定キーを除きます）、リスナー（追加、削除、並べ替え、TLS と証明書、`http2`、`redirect`）
-  - `forward`（アップストリームとルート）。アップストリームのサーバーの名前は、リロードのたびに名前解決をやり直します。`managed` のある設定では、バージョンのサイト、アップストリーム、ルート、デフォルトのアップストリーム
+  - `forward`（アップストリームとルート）。アップストリームのサーバーの名前は、リロードのたびに名前解決をやり直します。アップストリームの `engine` は、変更後のエンジンが稼働していれば、変更できます。`managed` のある設定では、バージョンのサイト、アップストリーム、ルート、デフォルトのアップストリーム
   - アップストリームの `ca_file`、リスナーの証明書と鍵、ACME のチャレンジ
   - 全体の `access`・`rate_limit`、`host_policies`、`geo`（国のデータベースを読み込みます）
   - 管理画面のルートの証明書と `access`
   - `records.keep`
-- 動作中に変更できない設定キー: `proxy.max_conns`、`max_buffered_bytes`、`drive_slice_ms`、`ready_wait_ms`、`stop_inspect_ms`、`stop_wait_ms`、`records`（`keep` を除くすべてと、有無）、`status`、`admin`、`admin.route.host`、`rules.store`、`managed`（有無と `dir`）、`kernel`（すべて）。どれかが起動のときと違う設定は、全体を拒否します（`reload: configuration refused: <key> cannot change while running`）。変更するときは再起動してください。
+- 動作中に変更できない設定キー: `proxy.max_conns`、`max_buffered_bytes`、`drive_slice_ms`、`ready_wait_ms`、`stop_inspect_ms`、`stop_wait_ms`、`records`（`keep` を除くすべてと、有無）、`status`、`admin`、`admin.route.host`、`rules.store`、`managed`（有無と `dir`）、`kernel`（`default_engine` を含むすべて）。どれかが起動のときと違う設定は、全体を拒否します（`reload: configuration refused: <key> cannot change while running`）。変更するときは再起動してください。
   - `records`・`status`・`admin`・`rules.store`・`managed`・`kernel` は、管理プロセスとログ送信プロセスも同じファイルから起動のときに読み込むので、プロキシだけが変更すると値が一致しなくなります。`admin.route.host` は、管理プロセスが起動のときに読み込む `admin.origin` と合わせて使うので、変更できません。
 - 接続:
   - 切り替えた後に受け付けた接続は、新しい設定を使います。開いている接続は、受け付けたときの設定を使い続け、次のように閉じます。リクエストは拒否しません。
@@ -228,7 +238,7 @@ SIGHUP を受けると停止していた以前のバージョンから入れ替�
 - 持ち越すもの:
   - レート制限のテーブルは、テーブルごとに持ち越します（下の「レート制限（`rate_limit`）」と「ホストごとの設定（`host_policies`）」）。全体のテーブルは、新旧の両方に全体の `rate_limit` があり、`keys`・`rate`・`burst` がどれも同じなら続きます（`exempt_cidrs` は新しい値を使います）。どれかが違うか、片方に無ければ、新しいテーブルで 0 から数え、`reload: rate limit table started anew` の行を出します。
   - アップストリームのダウン判定と失敗の数、アップストリームへの待機中の接続、リスナーの TLS のセッションは作り直します。`tukuyomi_upstream_failures_total` は 0 から数え直します。
-  - ルールの世代には触れません。稼働中の世代はそのままで、ルールストアも読み込みません（世代を切り替えるのは SIGUSR1）。
+  - ルールの世代には触れません。稼働中の世代はそのままで、ルールストアも読み込みません（世代を切り替えるのは SIGUSR1）。エンジンも起動せず、新しい設定のアップストリームのエンジンの準備ができていることだけを確認します（上の拒否）。
 - 同じ内容のファイルと同じバージョンでも、上のとおり作り直し、待っている接続を閉じます。
 - リロードの途中に受けた SIGHUP は、`reload: a configuration reload is in progress, ignored` の行を出すだけです。シグナルの処理が有効になってからリスナーをバインドするまでの間と、停止の間に受けた SIGHUP も、行を 1 つ出すだけです。リロードの途中に制御ソケットで受け付けた `reload` の依頼には、`busy`（`reload under way`）で応答します。
 - リロードの途中に受けた SIGUSR2 は、リロードが終わった後（切り替えたときも拒否したときも）に、今の設定の証明書を読み込みます。`reload: SIGUSR2` の行は、そのときに出ます。
@@ -237,16 +247,22 @@ SIGHUP を受けると停止していた以前のバージョンから入れ替�
 
 ### SIGUSR1（世代の切り替え）
 
-- プロキシはルールストアを読み込み、選択中の世代で新しい検査カーネルと検査プロセスを起動します。新しい方の準備ができたら、新しいリクエストをそちらへ振り向けます。
+- プロキシは、エンジンごとにルールストアを読み込み、選択中の世代が稼働中の世代と違うエンジンを切り替えます。デフォルトのエンジンが先で、ほかは名前の順に、1 つずつ切り替えます。1 つの切り替えが終わってから、次のエンジンを始めます。
+  - 切り替えでは、選択中の世代で新しい検査カーネルと検査プロセスを起動します。新しい方の準備ができたら、そのエンジンの新しいリクエストを、そちらへ振り向けます。
   - 古い方は、持っているリクエストを `stop_inspect` まで検査してから停止します。
-  - 新しい方が起動に失敗するか、`ready_wait` 以内に準備できなければ、古い方がそのまま検査を続けます。
-  - 新しい検査プロセスは、その世代のエンジンの実行ファイル（Coraza は `kernel.inspector`、ModSecurity は `kernel.engines`）で起動します。エンジンが変わる切り替えも、プロキシを停止せずにできます。
+  - 新しい方が起動に失敗するか、`ready_wait` 以内に準備できなければ、切り替えは失敗です（`reload: generation <fingerprint> failed to start: <reason>` の行を出します）。古い方がそのまま検査を続けます。
+  - 新しい検査プロセスは、そのエンジンの実行ファイル（Coraza は `kernel.inspector`、ModSecurity は `kernel.engines`）で起動します。
   - 選択中の世代のエンジンが使えないときは、切り替えません。`reload: rules store refused: <reason>` の行を出し、古い方がそのまま検査を続けます。`rules activate` と管理プロセスは、そのような世代を選択しません。
-- 検査除外のルートのテーブルは、新しい世代がリクエストを受け付け始めるときに一緒に入れ替わります。
-- 切り替えの間は検査プロセスが 2 つになり、メモリもおよそ 2 倍になります。CRS 4.23.0 で測定した Coraza の検査プロセスは、1 つ約 52 MB でした（ModSecurity の検査プロセスは測定していません）。
-- シグナルの処理が有効になってからリスナーをバインドするまでの間、切り替えの途中、停止の間に受けた SIGUSR1 は、ログに行を 1 つ出すだけで何もしません。今と同じ世代が選択されているときも、その旨の行を出すだけです。
-- 使っている間、プロキシは世代の目印（ルールストアの `using/<fingerprint>`）に共有ロックを持ちます。そのため `rules remove` は、使用中の世代を削除できません。
-- 管理プロセスは、制御ソケットでも同じ切り替えを依頼できます（下の「制御ソケット」）。切り替えの手順と、`tukuyomi_rules_switches_total` の数え方は SIGUSR1 と同じです。
+- 選択中の世代があり、稼働していないエンジンは、同じ切り替えで起動します。起動に失敗したときは、そのエンジンは稼働していないままです。
+  - 選択中の世代が稼働中の世代と同じエンジンは、`reload: generation <fingerprint> is already running` の行を出して、次のエンジンへ進みます。
+  - 稼働していないエンジンに選択中の世代が無いときは、何もしません（行も出しません）。
+  - 稼働しているエンジンに選択中の世代が無いとき（`rules deactivate` の後など）は、`reload: rules store refused: no generation is chosen` の行を出し、`tukuyomi_rules_switches_total` の `refused` に数えます。そのエンジンは稼働し続けます。
+- 準備の後に検査カーネルが失敗すると、プロキシ全体が停止します。SIGUSR1 で起動したエンジンも、どのアップストリームも使わないエンジンも同じです（下の「`kernel`」と「検査エンジンの選択」）。
+- 検査除外のルートのテーブルは、エンジンごとにあります。新しい世代がリクエストを受け付け始めるときに、そのエンジンのテーブルが一緒に入れ替わります。
+- 切り替えの間は、そのエンジンの検査プロセスが 1 つ増えます。切り替えは、プロキシ全体で同時に 1 つだけなので、増えるのは 1 つまでです。メモリの目安は、下の「検査エンジンの選択」を参照してください。
+- シグナルの処理が有効になってからリスナーをバインドするまでの間、切り替えの途中、停止の間に受けた SIGUSR1 は、ログに行を 1 つ出すだけで何もしません（切り替えの途中は `reload: a switch is in progress, ignored`）。先の SIGUSR1 で、まだ切り替えていないエンジンがあるときは、途中の切り替えが終わってから続けます。
+- 使っている間、プロキシは、エンジンごとに、稼働中の世代の目印（ルールストアの `using/<fingerprint>`）に共有ロックを持ちます。そのため `rules remove` は、使用中の世代を削除できません。
+- 管理プロセスは、制御ソケットでも、エンジンを指定して同じ切り替えを依頼できます（下の「制御ソケット」）。切り替えの手順と、`tukuyomi_rules_switches_total` の数え方は SIGUSR1 と同じです。
 
 ### SIGUSR2（証明書の再読み込み）
 
@@ -272,13 +288,15 @@ SIGHUP を受けると停止していた以前のバージョンから入れ替�
 1. リスナーを閉じ、新しいリクエストを拒否します。制御ソケットも閉じて、そのファイルを削除します（応答を待っていたクライアントは、応答を受け取りません）。次のリクエストを待っている接続は閉じます。`/readyz` は 503 `stopping` になり、`NOTIFY_SOCKET` があれば `STOPPING=1` を送ります。
 2. 検査は `t0 + stop_inspect` までに終えます。
 3. 接続は `t0 + stop_wait` まで待ち、残りは打ち切ります。WebSocket のトンネルは停止では終了せず、このときに打ち切られます。この後に監視用のリスナーを閉じます。
-4. 検査カーネルの終了を `t0 + stop_wait + kill_grace` まで待ちます。
+4. 起動しているエンジンの検査カーネルが、すべて終了するのを `t0 + stop_wait + kill_grace` まで待ちます。
 5. ログを最長 200 ms 書き出して終了します。
 
 最後に `stop: kernel ..., bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` の行が出ます。検査カーネルの終了が確認できなかったときは、代わりに `stop: the driver stopped: ...` か `stop: the driver gave no end` が出ます。
 
+- その前に、起動しているエンジンごとに `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` の行が出ます。
+- `stop: kernel` の行は 1 つです。`bye`・`exit_confirmed`・`dir_removed` などは、起動しているエンジンのうち、名前の順で最初のエンジンについての値です。ほかのエンジンと、切り替えで前に停止した検査カーネルの結果は、`retired_clean` にまとめて出ます。
 - `bye true` は、検査プロセスが終了の通知を送ってから終了したことを示します。
-- 終了コードが 0 になるのは、停止の理由が失敗でなく、停止した検査カーネル（切り替えで前に停止したものも含みます）のすべてで、検査プロセスの終了と作業ディレクトリの削除が確認できたときだけです。
+- 終了コードが 0 になるのは、停止の理由が失敗でなく、停止した検査カーネル（ほかのエンジンのものと、切り替えで前に停止したものも含みます）のすべてで、検査プロセスの終了と作業ディレクトリの削除が確認できたときだけです。
 
 ## 設定ファイル
 
@@ -452,7 +470,7 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 
 | 設定キー | 意味 |
 |---|---|
-| `drive_slice_ms` | 検査のドライバーが 1 回に検査カーネルを動かす時間。新しいリクエストは、動かす回と回の間に受け付けるので、ほかのリクエストがあるときに新しいリクエストが待つ最長の時間になります。推奨値は 1 |
+| `drive_slice_ms` | 検査のドライバーが 1 回に、仕事のあるエンジンの検査カーネルを動かす時間。仕事の無いエンジンの検査カーネルは、最短のステップ（1 ms）で動かします。新しいリクエストは、動かす回と回の間に受け付けるので、ほかのリクエストがあるときに新しいリクエストが待つ最長の時間は、この時間に、仕事のあるエンジンの数を掛けた時間が目安です。推奨値は 1 |
 | `ready_wait_ms` | 検査カーネルの準備を待つ時間（起動、世代の切り替え、`rules import` の事前検証） |
 | `head_read_ms` | リクエストのヘッダー部を読み終える時間。最初のヘッダー部は `accept` から数え（TLS のハンドシェイクを含みます）、後のヘッダー部は最初のバイトから数えます。HTTP/2 のヘッダーブロックは、`HEADERS` フレームの最初のバイトから数えます |
 | `body_read_ms` | ボディの先頭（`inspect_body` まで、またはボディ全体）を、ヘッダー部の終わりから読み終える時間。それより長いボディの残りは、読み込みと読み込みの間がこの時間を超えると切断します |
@@ -543,7 +561,7 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 | 設定キー | 範囲 | 意味 |
 |---|---|---|
 | `resolve_timeout_ms` | 1 ms〜3600 s | 起動のときと、SIGHUP と制御ソケットの `reload` によるリロードで、アップストリームのサーバーの名前解決を終える時間。制御ソケットの `reload` の依頼と、管理プロセスの反映が応答を待つ時間にも効きます（下の「制御ソケット」と「managed 設定」の「反映」） |
-| `upstreams` | 1〜64 個 | アップストリームの名前（1〜64 文字の英字・数字・`-`・`_`）から `{"servers", "tls"?}` への対応 |
+| `upstreams` | 1〜64 個 | アップストリームの名前（1〜64 文字の英字・数字・`-`・`_`）から `{"servers", "tls"?, "engine"?}` への対応 |
 | `routes` | 0〜1024 個 | リクエストの `Host` とパスからアップストリームを選ぶルート |
 | `default_upstream` | アップストリームの名前か空の文字列 | どのルートにも一致しないリクエストのアップストリーム。空なら、そうしたリクエストは 404 |
 
@@ -582,6 +600,13 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 - `ca_file` は、信頼するルート証明書を持つ PEM のファイルです。絶対パスで 3840 バイトまで、ファイルは 1 MiB までで、1〜100 枚を持ちます。起動のときと SIGHUP のリロードで読み込みます（SIGUSR2 では読み込みません）。
 - `server_name` は、小文字の名前で、TLS で使える形であることが必要です。あれば、サーバーをその名前で検証します。無ければ、書いた名前で検証します。IP リテラルで書いたサーバーは、そのアドレスで検証します。
 - アップストリームへは TLS 1.2 と 1.3 で、ALPN は `http/1.1` だけです（アップストリームへ HTTP/2 は使いません）。クライアント証明書は送りません。
+
+アップストリームの `engine` は、そのアップストリームへのリクエストを検査するエンジンの名前です。
+
+- `coraza` か `modsecurity`（小文字）です。省けば、`kernel.default_engine` のエンジンで検査します（`kernel.default_engine` を書かなければ `coraza`）。`null` は書けません。
+- これ以外の名前は、`an upstream engine is not coraza or modsecurity` で受け付けません。設定の `kernel.engines` に検査プロセスが無い `modsecurity` も、`kernel.engines has no inspector for the engine of an upstream` で受け付けません。
+- 同じアドレスのサーバーを持つアップストリームは、どれも同じエンジンにします（下の「値どうしの関係」と「検査エンジンの選択」）。
+- 変更後のエンジンが稼働していれば、設定のリロードで変更できます（上の「SIGHUP（設定のリロード）」）。
 
 ルートは `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?, "records"?}` です。
 
@@ -683,10 +708,13 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 
 検査カーネルと検査プロセスの設定です。時間は、どれも 1 ms〜3600 s の範囲で書きます。
 
+検査カーネルは、起動したエンジンごとに 1 つあります。`slots`・`wait_queue`・`records`・`restarts`・`restart_window_ms` は、エンジンごとの検査カーネルが、それぞれ同じ値で持ちます。たとえば `slots` は、1 つのエンジンが同時に検査するリクエストの数です。
+
 | 設定キー | 範囲 | 意味 |
 |---|---|---|
 | `inspector` | 絶対パス | Coraza の検査プロセスの実行ファイル。省けない設定キーで、ModSecurity の世代だけを使うホストでも書きます |
-| `engines` | 省けます。`{"modsecurity": {"inspector": <absolute-path>}}` の形で、どちらの階層の設定キーも必要です。パスは 4095 バイトまで | ModSecurity の検査プロセスの実行ファイル。`modsecurity` の世代を使うときに起動します。省くと、`modsecurity` の世代は、インポート、選択、起動のどれでも `kernel.engines has no inspector for the engine of the generation` で受け付けません |
+| `engines` | 省けます。`{"modsecurity": {"inspector": <absolute-path>}}` の形で、どちらの階層の設定キーも必要です。パスは 4095 バイトまで | ModSecurity の検査プロセスの実行ファイル。この設定キーがあり、`modsecurity` の世代が選択中のときに起動します（アップストリームが使うかどうかは問いません）。省くと、`modsecurity` の世代は、インポートと選択で `kernel.engines has no inspector for the engine of the generation` で受け付けません。起動では、デフォルトのエンジンでもアップストリームのエンジンでもない `modsecurity` は、選択中の世代があっても起動せず、行も出しません。デフォルトのエンジンかアップストリームのエンジンを `modsecurity` にする設定は、省くと受け付けません（`kernel.engines has no inspector for kernel.default_engine`、`kernel.engines has no inspector for the engine of an upstream`） |
+| `default_engine` | 省けます。`coraza` か `modsecurity`（小文字）。省けば `coraza` | アップストリームの `engine` を省いたときのエンジン、`rules import` の `--engine` を省いたときのエンジン、`managed` のある設定で管理画面のルートを検査するエンジンです（下の「検査エンジンの選択」）。`modsecurity` にするには、`engines` が必要です。これ以外の名前は `kernel.default_engine is not coraza or modsecurity` で受け付けません。`null` は書けません。動作中は変更できません（上の「SIGHUP（設定のリロード）」） |
 | `tmp_root` | 絶対パス、3840 バイトまで | 起動ごとの作業ディレクトリを作る親ディレクトリ。シンボリックリンクでないディレクトリで、所有者がプロキシの OS ユーザー、グループとその他のユーザーの権限が無く、setgid が無いこと |
 | `gomaxprocs` | 1〜65535 | 検査プロセスの `GOMAXPROCS`。ModSecurity の検査プロセスは、1 つのスレッドで動くので使いません（受け取った値を最初のメッセージで返すだけ） |
 | `gomemlimit` | 1〜9223372036854775807（バイト） | 検査プロセスの `GOMEMLIMIT`。ModSecurity の検査プロセスは、使いません（受け取った値を最初のメッセージで返すだけで、メモリの上限にはなりません） |
@@ -708,7 +736,7 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 | `restart_window_ms` | | 再起動の回数を数えるウィンドウ |
 
 - 検査プロセスの再起動には、ウィンドウ内の回数に上限があります。上限に達したらウィンドウの中の再起動の回数が上限を下回るまで再起動せず、その間に待つリクエストは 503 になります。
-- ルールのエラーなど、決まって失敗する理由では再起動しません。リクエストを渡している検査カーネルが停止すると、プロキシも停止します（`stop: the kernel failed`）。
+- ルールのエラーなど、決まって失敗する理由では再起動しません。どのエンジンの検査カーネルでも、停止すると、プロキシも停止します。リクエストを渡していないエンジンの検査カーネルでも同じです（`stop: the kernel failed`）。
 
 ### `rules.store`
 
@@ -773,11 +801,11 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 | `certificate` | `{"cert_file", "key_file", "acme"?}` | 管理画面のルートの証明書。リスナーの証明書（`hosts` が `host` だけのもの）と同じように検証して読み込みます。`acme` を付けると `acme renew` が発行し、ファイルは起動のときに無くてもかまいません（そのときは設定ファイルに `acme` が必要です） |
 | `access` | ルートの `access` と同じ形。`allow_cidrs` は必ず書き、空にできません | 管理画面のルートに適用されるアクセス制御 |
 
-- 全体の設定（全体の `access`・`rate_limit`）もホストごとの設定も、管理画面のルートには適用されません。管理画面のルートに適用されるネットワークの制限は、`access` だけです（下の「リクエストの検証の順序」）。WAF の検査は受けます。
+- 全体の設定（全体の `access`・`rate_limit`）もホストごとの設定も、管理画面のルートには適用されません。管理画面のルートに適用されるネットワークの制限は、`access` だけです（下の「リクエストの検証の順序」）。WAF の検査は、デフォルトのエンジンで受けます（下の「検査エンジンの選択」）。
 - TLS のリスナーは、管理画面のルートの証明書を、バージョンのサイトの証明書と一緒に SNI で選びます。管理画面のホストのリクエストを、ほかの証明書の接続で受信すると 421 で、リダイレクトでない平文のリスナーで受信すると 404 で応答し、転送しません。リダイレクトのリスナーは、https へリダイレクトします。
 - `host` は、バージョンのサイトの `hosts`、ルートの `host`、ホストごとの設定の `hosts` に書けません（`*.` のワイルドカードに含まれる場合はかまいません。管理画面のルートが先に一致します）。
 - 証明書と `access` は設定のリロードで変更できます。`host` は動作中に変更できないので、変更するときはプロキシと管理プロセスを再起動してください。
-- `managed` の無い設定では、`admin.listen` を指すアップストリームとルートで、管理画面へ転送します（[管理リファレンス](admin-reference.md) の「外部からの利用」）。そのルートには、全体の設定とホストごとの設定が適用されます。
+- `managed` の無い設定では、`admin.listen` を指すアップストリームとルートで、管理画面へ転送します（[管理リファレンス](admin-reference.md) の「外部からの利用」）。そのルートには、全体の設定とホストごとの設定が適用されます。検査するエンジンは、そのアップストリームのエンジンです（`engine` を省けば、デフォルトのエンジン）。
 
 #### 制御ソケット
 
@@ -794,10 +822,10 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 
 | 依頼 | 応答 |
 |---|---|
-| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "reloading", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures", "config", "managed", "resolve_timeout_ms", "config_reloads"}`。稼働中の世代のフィンガープリント（64 桁の 16 進数）、その世代のモード（`block`、`detect`）、エンジン（`coraza` か `modsecurity`）、検査カーネルの段階（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、設定のリロード（SIGHUP か `reload` の依頼）の途中か、`/readyz` が `ready` と応答する状態か。続く 9 つは、プロキシの数と値です（下） |
-| `{"op":"switch","expect":"<fingerprint>"}` | ルールストアで選択中の世代が `expect` と同じときだけ、SIGUSR1 と同じ切り替えをします。切り替えが終わってから、`{"result", "reason"?, "generation"}` で応答します。`generation` は、応答するときに稼働中の世代です |
+| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "reloading", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures", "config", "managed", "resolve_timeout_ms", "config_reloads", "engines"}`。デフォルトのエンジンの、稼働中の世代のフィンガープリント（64 桁の 16 進数）、その世代のモード（`block`、`detect`）、エンジン（`coraza` か `modsecurity`）、検査カーネルの段階（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、設定のリロード（SIGHUP か `reload` の依頼）の途中か、`/readyz` が `ready` と応答する状態か。続く 9 つは、プロキシの数と値です（下）。最後の `engines` は、起動しているエンジンごとの状態で、エンジンの名前の順に `[{"engine", "generation", "mode", "phase"}, ..]` の形で並びます |
+| `{"op":"switch","engine"?:"<engine>","expect":"<fingerprint>"}` | `engine`（`coraza` か `modsecurity`。省けばデフォルトのエンジン）のルールストアで選択中の世代が `expect` と同じときだけ、SIGUSR1 と同じ、そのエンジンの切り替えをします（稼働していないエンジンは起動します）。切り替えが終わってから、`{"result", "reason"?, "generation"}` で応答します。`generation` は、応答するときにそのエンジンで稼働中の世代です（稼働していなければ `null`） |
 | `{"op":"reload","managed":"<version>"}` | 設定ファイルと、指定されたバージョンで、SIGHUP と同じ設定のリロードをします。managed ストアの `current` は読み込みません。同じバージョンでもリロードします。リロードが終わってから応答します（下） |
-| ほかの行 | `{"result":"error","reason":..}`。`reason` は `line too long`、`malformed request`、`unknown op`、`bad expect`、`bad managed` |
+| ほかの行 | `{"result":"error","reason":..}`。`reason` は `line too long`、`malformed request`、`unknown op`、`bad expect`、`bad engine`、`bad managed` |
 
 `status` の数と値は、応答を作るときに読み取ります。`uptime_ms`、`config`、`managed`、`resolve_timeout_ms` のほかは、`/metrics` が出力する値と同じです（下の「メトリクス（`/metrics`）」）。
 
@@ -813,15 +841,15 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 | `resolve_timeout_ms` | 稼働中の設定の `forward.resolve_timeout_ms` |
 | `config_reloads` | `{"replaced", "refused"}`。SIGHUP と `reload` の依頼による設定のリロードの数を、切り替えたか拒否したかで分けたもの（`tukuyomi_config_reloads_total`） |
 
-- これらの無い応答は、前のビルドのプロキシが返した応答です。管理プロセスは、無い値を `null` として扱います（[管理リファレンス](admin-reference.md) の「一覧と内容」）。
+- これらの無い応答は、前のビルドのプロキシが返した応答です。管理プロセスは、無い値を `null` として扱います（[管理リファレンス](admin-reference.md) の「一覧と内容」）。`engines` の無い応答も、前のビルドのプロキシが返した応答です。前のビルドのプロキシは、エンジンごとの状態を返しません（[管理リファレンス](admin-reference.md) の「選択とロールバック」）。
 
 `switch` の `result` は次のとおりです。
 
 | `result` | `reason` | とき |
 |---|---|---|
-| `switched` | 無し | 切り替えが終わり、選択中の世代で動いています |
+| `switched` | 無し | 切り替えが終わり、選択中の世代で稼働しています（稼働していなかったエンジンは、起動しています） |
 | `unchanged` | `already serving` | 選択中の世代を、もう使っています |
-| `refused` | `current changed` | ルールストアで選択中の世代が、`expect` と違います。何もしません |
+| `refused` | `current changed` | ルールストアで選択中の世代が、`expect` と違います（そのエンジンに選択中の世代が無いときも）。何もしません |
 | `refused` | `store refused` | ルールストアか設定を受け付けませんでした |
 | `failed` | `driver did not take the order`、`not switched` | 切り替えを始められませんでした、または新しい世代が起動しませんでした |
 | `busy` | `starting`、`switch under way`、`too many orders`、`stopping` | 検査カーネルの準備ができる前、別の切り替えの途中、依頼が多すぎる、停止の間 |
@@ -829,14 +857,14 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 - 切り替えの結果は、SIGUSR1 と同じように `tukuyomi_rules_switches_total` に数えます。数えないのは、`unchanged`、`busy`、`current changed` の応答だけです。`store refused` は `refused` に、`driver did not take the order` と `not switched` は `failed` に数えます。
 - 切り替えの依頼は、`ready_wait_ms` に 5 秒を足した時間まで応答を待ちます。それを過ぎると `busy`（`switch under way`）で応答し、切り替えは続きます。
 - 状態の問い合わせに 2 秒以内に応答できないとき（依頼が多すぎるとき、停止の間を含みます）は、`{"result":"error","reason":"no answer"}` を返します。
-- 切り替えの依頼は、応答するたびに、ログに `control: switch expect <fingerprint>: <result> (<reason>), serving <fingerprint>` の行を 1 つ出します。`busy` の応答も含みます。`busy` で応答した切り替えが後で終了すると、終了したときにもう 1 つ出ます。
+- 切り替えの依頼は、応答するたびに、ログに `control: switch expect <fingerprint>: <result> (<reason>), serving <fingerprint>` の行を 1 つ出します。`busy` の応答も含みます。`busy` で応答した切り替えが後で終了すると、終了したときにもう 1 つ出ます。この行は、エンジンを名指ししません。`serving` は、依頼のエンジンで稼働中の世代で、稼働していなければ `none` です。
 
 `reload` の応答は、どれも、応答するときに稼働中のバージョンを `managed` に持ちます（`managed` の無い設定では `null`）。
 
 | `result` | 形 | とき |
 |---|---|---|
 | `replaced` | `{"result":"replaced","config":"<sha256>","managed":"<version>"}` | 切り替えました。2 つの値は、`reload: configuration replaced <sha256> managed <version>` の行と同じです |
-| `refused` | `{"result":"refused","reason":..,"detail":..,"managed":..}` | 何も変更していません。`reason` は拒否した箇所で、`configuration`（設定ファイルか国のデータベース）、`version`（バージョンの検証）、`store`（managed ストア、バージョンやファイルの名前と内容）、`upstream`（名前解決、アップストリームの CA）、`tls`（リスナーの証明書、サイト、管理画面のルート）、`fixed`（動作中に変更できない設定キー）、`listener`（新しいリスナーをバインドできなかった）、`thread`（リロードのスレッドを始められなかった、スレッドが応答せずに終了した）のどれかです。`detail` は、ログの行の `refused: ` の後ろと同じ文です |
+| `refused` | `{"result":"refused","reason":..,"detail":..,"managed":..}` | 何も変更していません。`reason` は拒否した箇所で、`configuration`（設定ファイルか国のデータベース）、`version`（バージョンの検証）、`store`（managed ストア、バージョンやファイルの名前と内容）、`upstream`（名前解決、アップストリームの CA）、`tls`（リスナーの証明書、サイト、管理画面のルート）、`fixed`（動作中に変更できない設定キー、稼働していないエンジンのアップストリーム）、`listener`（新しいリスナーをバインドできなかった）、`thread`（リロードのスレッドを始められなかった、スレッドが応答せずに終了した）のどれかです。`detail` は、ログの行の `refused: ` の後ろと同じ文です |
 | `refused` | `reason` が `unmanaged`、`detail` が `the configuration in force has no managed object` | 動作中の設定に `managed` がありません。リロードを始めずに拒否します |
 | `busy` | `{"result":"busy","reason":..,"managed":..}` | `starting`（リスナーをバインドする前）、`reload under way`（SIGHUP かほかの `reload` のリロードの途中、またはこの依頼のリロードが待つ時間以内に終了しなかったとき。そのときもリロードは続きます）、`too many orders`、`stopping` |
 
@@ -874,6 +902,8 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 | `wait_queue ≤ max_conns` | 1 つの接続が持つ検査は 1 つ |
 | `kernel.records ≥ slots + wait_queue` | 検査カーネルのレコード |
 | `tick ≤ 1 s`、`tick` はほかの検査カーネルのどの時間以下 | 検査カーネルの 1 ステップ |
+| アップストリームの `engine` と `kernel.default_engine` は、検査プロセスが設定にあるエンジンだけ（`modsecurity` には `kernel.engines` が必要です） | 検査プロセスの無いエンジンでは、検査できません |
+| 同じアドレスのサーバーを持つアップストリームは、どれも同じエンジン | クライアントが `Host` を選ぶだけで、同じサーバーへ届くアップストリームのうち、最も弱いエンジンやモードのものを通れてしまうためです（下の「検査エンジンの選択」） |
 | 国の指定（全体の `access`、`host_policies` の `access`、ルートの `access` の `deny_countries`・`allow_countries`）があれば `geo` もあります | 国を判定するデータベースが必要です |
 | `rules.store.dir`、`records.dir`、`admin.store.dir`、`admin.control` のあるディレクトリは、互いに同じでなく、どれも他の中にありません。`admin.control` 自身は前の 3 つの中にありません | 一方のローテーションや書き換えが、他方の内容を置き換えないため |
 | `managed.dir` は、上の 4 つのディレクトリと同じでなく、どれの中にもなく、どれを含むこともありません | 同上 |
@@ -890,7 +920,7 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 - 推奨値は、`max_body` が 100 MiB、`inspect_body` が 16 KiB です。`inspect_body` は、検査の負荷を測定してから決め直す予定です。
   - 1 vCPU のホストでは、1 MiB 近い JSON の検査に約 7 秒かかりました。
   - 検査の時間が `verdict_wait_ms` を超えると、リクエストは 503 になります。検査プロセスは、503 を返した後も、その検査が終わるまで CPU を使います。
-  - さらに `stop_after_ms` を超えると、検査プロセスは停止され、再起動します。その間はほかのリクエストも 503 になり、再起動の回数（`restarts`）も使います。
+  - さらに `stop_after_ms` を超えると、検査プロセスは停止され、再起動します。その間は、そのエンジンへのほかのリクエストも 503 になり、再起動の回数（`restarts`）も使います。
 - ボディが `inspect_body` で終わる場合は、全体をバッファリングして検査し、検査した形で転送します。
 - 長いボディは、先頭の `inspect_body` バイトだけを検査します。許可されたら、残りをクライアントが送るとおりにアップストリームへ流します（バッファリングしません）。
   - 先頭より後ろは検査しません。
@@ -913,11 +943,12 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 ## ルールセットと世代
 
 - 世代は、`rules import` が作るルールセットの一式で、フィンガープリント（マニフェストの SHA-256）で呼びます。作った後は変えません。
-- 世代は、ルールを検査するエンジンも持ちます（`rules import --engine`。省けば `coraza`）。このビルドが持つエンジンは `coraza`（Coraza）と `modsecurity`（ModSecurity v3）です。同じファイルでも、エンジンが違えばマニフェストが変わり、別の世代（別のフィンガープリント）になります。`modsecurity` の世代は、設定の `kernel.engines` に検査プロセスがあるときだけ、インポート、選択、起動ができます。
+- 世代は、ルールを検査するエンジンも持ちます（`rules import --engine`。省けば、`kernel.default_engine` のエンジン。書かなければ `coraza`）。このビルドが持つエンジンは `coraza`（Coraza）と `modsecurity`（ModSecurity v3）です。同じファイルでも、エンジンが違えばマニフェストが変わり、別の世代（別のフィンガープリント）になります。`modsecurity` の世代は、設定の `kernel.engines` に検査プロセスがあるときだけ、インポート、選択、起動ができます。
 - 「検査プロセスが追加する設定とルール」は、Coraza の世代の決まりです。ModSecurity の世代の決まりは、「ModSecurity の世代」を参照してください。
 - ルールストアの内容:
   - `generations/<fingerprint>/`: 世代
-  - `current`: 選択した世代
+  - `current.<engine>`（`current.coraza`、`current.modsecurity`）: エンジンごとに選択した世代。以前のバージョンが書いた `current` も読みます（下の「エンジンごとの選択中の世代」）
+  - `current.<engine>.new`: 選択の途中で止まったときの残り。次の同じエンジンの選択が片付けます
   - `using/<fingerprint>`: 使用中の目印
   - `staging/`: インポートの途中
   - `lock`: コマンドのロック
@@ -958,7 +989,7 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 
 ### ModSecurity の世代
 
-`rules import --engine modsecurity` で作る世代は、libmodsecurity（ModSecurity v3.0.17）でリクエストを検査します。検査プロセスは別の実行ファイル（`tukuyomi-inspector-modsecurity`）で、設定の `kernel.engines.modsecurity.inspector` に書きます（[ビルドと配置](../build/binary-deployment.md)）。インポートの手順、事前検証、`--detect-only`、検査除外のルート、CRS のインポートは、Coraza の世代と同じです。
+`rules import --engine modsecurity` で作る世代は、libmodsecurity（ModSecurity v3.0.17）でリクエストを検査します。検査プロセスは別の実行ファイル（`tukuyomi-inspector-modsecurity`）で、設定の `kernel.engines.modsecurity.inspector` に書きます（[ビルドと配置](../build/binary-deployment.md)）。インポートの手順、事前検証、`--detect-only`、検査除外のルート、CRS のインポートは、Coraza の世代と同じです。アップストリームごとにエンジンを選ぶ設定では、同じリクエストでも、エンジンによって結果が違うことがあります。違いはこの節の後半にまとめています（エンジンの選び方は、下の「検査エンジンの選択」を参照してください）。
 
 検査プロセスが追加する設定とルール（運用者のルールで変更することはできません）:
 
@@ -1007,6 +1038,138 @@ Coraza の世代と違うところは次のとおりです。同じルールと�
 
 ボディの処理を変更するなどで、検査が終わったと検証できないリクエストが 503 になることは、Coraza の世代と同じです（「検査プロセスが追加する設定とルール」）。
 
+### 検査エンジンの選択
+
+アップストリームごとに、リクエストを検査するエンジンを選べます。エンジンは `coraza` と `modsecurity` です。
+
+- アップストリームの `engine` で選びます。省いたアップストリームは、デフォルトのエンジン（`kernel.default_engine`。書かなければ `coraza`）で検査します。`rules import` の `--engine` を省いたときのエンジンも、デフォルトのエンジンです。形と受け付けない値は、上の「`forward`」と「`kernel`」を参照してください。
+- リクエストは、行き先のアップストリームが使うエンジンで検査します。そのエンジンの検査カーネルだけを使い、別のエンジンへは回しません。その検査カーネルが使えないときは、503 で応答します。
+- エンジンによって、同じリクエストでも検知の結果が違うことがあります（「ModSecurity の世代」を参照してください）。
+- 選択中の世代が検知のみのモードになっているエンジンを使うアップストリームは、ルールに一致したリクエストもブロックしません。起動、リロード、`config check` のときに、そのアップストリームごとに `upstream <name>: engine <engine>, mode detect` の行（`start:`・`reload:`・`config check:` で始まります）を出します。
+
+管理画面のルート:
+
+- `managed` のある設定では、管理画面のルート（`admin.route`）は、デフォルトのエンジンで検査します。
+- インポートのルートを検査除外のルートにした世代を、デフォルトのエンジンの世代として使います（理由と、デフォルトのエンジンを変更するときの扱いは、[管理リファレンス](admin-reference.md) の「インポートのルートを検査除外にする」を参照してください）。
+- `managed` の無い設定で、管理プロセスへ転送するアップストリームは、そのアップストリームのエンジンで検査します（上の「`admin`」）。
+
+同じアドレスのサーバー:
+
+- 同じアドレスのサーバーを持つアップストリームで、エンジンが違う設定は、受け付けません（`two upstreams with a server at the same address have different engines`）。クライアントが `Host` を選ぶだけで、同じサーバーへ届くアップストリームのうち、最も弱いエンジンやモードのものを通れてしまうためです。
+- アドレスは、IP リテラルで書いたサーバーなら、IP アドレスの正規の形（IPv6 の形で書いた IPv4 アドレスは、IPv4 アドレスと同じ）とポートで比べます。名前で書いたサーバーは、名前とポートで比べます。同じ IP アドレスを指す別の名前は、同じアドレスと見分けられません。別の名前で同じサーバーへ届くアップストリームは、運用者が同じエンジンにそろえてください。
+
+起動するエンジン:
+
+- プロキシは、選択中の世代があり、検査プロセスが設定にあるエンジンのすべてを起動します。デフォルトのエンジンが先で、ほかは名前の順です。どのアップストリームも使わないエンジンも、起動します。
+- デフォルトのエンジンと、アップストリームのエンジンには、選択中の世代が必要です。無ければ、起動も `config check` も、`rules store refused: no generation is chosen` で受け付けません。
+- デフォルトのエンジンに選択中の世代が無く、ほかのエンジンには選択中の世代があるときは、`rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` で受け付けません。以前のバージョンで ModSecurity の世代を選択していたホストを更新したときなどに当たります。`kernel.default_engine` を書くか、デフォルトのエンジンの世代を選択します（下の「バージョンの更新」）。
+- 起動したエンジンは、プロキシが停止するまで止まりません。`rules deactivate` を実行しても、同じです。
+
+プロセスの数とメモリの目安:
+
+- 常時稼働するプロセスは、プロキシが 1 つと、起動したエンジンごとの検査プロセスが 1 つずつです。Coraza だけを起動しているときは、検査プロセスは 1 つです。
+- 検査プロセスは、次のときに増えます。
+  - 世代の切り替えの間は、そのエンジンの検査プロセスが 1 つ増えます。切り替えは、プロキシ全体で同時に 1 つだけなので、増えるのは 1 つまでです。そのため、プロキシの子プロセスの検査プロセスは、最大でも、起動したエンジンの数に 1 を足した数です。
+  - 事前検証（`rules import` と管理 API のインポート）は、検査プロセスを 1 つ起動します。
+- 管理プロセスとログ送信プロセスは、これとは別のプロセスです。
+
+メモリの目安は、検査プロセスを 1 つずつ測った値、足し算の目安、2 つのエンジンを起動したときの測定値の 3 つに分けて書きます。単位は MiB です。値は、ホストとリクエストの内容によって変わります。
+
+- 検査プロセスを 1 つずつ測った値です。このバージョンと同じ検査プロセスの実行ファイル、CRS 4.23.0、4 つの論理 CPU と 8 GiB のメモリを持つ Linux ホストで、エンジンを 1 つだけ起動して測りました。
+
+  | プロセス | 起動の直後 | 16 KiB までのリクエストの後 | 1 MiB のボディを流した後 |
+  |---|---|---|---|
+  | Coraza の検査プロセス | 約 57 | 約 69 | 約 110〜112（最大 約 125）。この後も下がりません |
+  | ModSecurity の検査プロセス | 約 43 | 約 43 | 約 43（最大 約 52） |
+
+  1 MiB のボディの列は、`proxy.inspect_body` を 1 MiB にして、1 MiB のボディを流した値です。`inspect_body` が推奨値の 16 KiB のときは、16 KiB までの値が当てはまります。
+- 足し算の目安です。上の値と同じ条件の値を足したもので、測った合計ではありません。プロキシは含みません。
+  - 2 つのエンジンを起動しているときは、通常のリクエストで約 100〜112（Coraza の約 57〜69 と、ModSecurity の約 43 の合計）です。1 MiB のボディを流している間の最大は約 178 です。
+  - 世代の切り替え 1 回と事前検証 1 回が重なったときの最悪は、通常のリクエストで約 240、1 MiB のボディを流している間の最大で約 305 です。約 240 と約 305 は、事前検証を行うプロセスの本体を、プロキシの起動の直後と同じ約 9 と仮定した値を含みます（測っていません）。
+- 2 つのエンジンを起動したときの測定値です。Core Rule Set の世代を 2 つのエンジンに選択し、通常のリクエストと SQL インジェクションのリクエストを各数回流した後の常駐メモリ（VmRSS）は、プロキシが約 10、Coraza の検査プロセスが約 52、ModSecurity の検査プロセスが約 43 でした。1 つずつ測った値とは、測った条件（世代とリクエスト）が違うので、同じ値にはなりません。1 MiB のボディは流していません。世代の切り替えの間は、検査プロセスの数が 2 つから最大 3 つに増えました。
+
+どのアップストリームも使わないエンジン:
+
+- 試しに ModSecurity を起動するときなど、どのアップストリームも使わず、デフォルトのエンジンでもないエンジンでも、検査カーネルが失敗すると、プロキシ全体が停止します。停止のときは、`stop: the kernel failed: <reason>` の行を出して exit 1 になります（上の「`kernel`」）。たとえば `kernel.restarts` が 0 のとき、そのエンジンの検査プロセスを SIGKILL で止めると、`stop: the kernel failed: BudgetExhausted` の行を出して停止します。
+- 試した後は、`rules deactivate` でそのエンジンの選択を解除します。解除すると、次の再起動から、そのエンジンは起動しません。動作中のプロキシは、起動したエンジンを止めないので、止めるには再起動します（下の「エンジンごとの選択中の世代」）。
+
+デフォルトのエンジンを変更する手順:
+
+デフォルトのエンジンを変更すると、`engine` を省いたアップストリームの検査エンジンも変わります。変えたくないアップストリームには、先に、今のエンジンを `engine` に書きます。`kernel` は動作中に変更できないので、`kernel.default_engine` は、プロキシの再起動で変更します。次の例は、`managed` のある設定で、デフォルトのエンジンを `coraza` から `modsecurity` に変更する手順です。コマンドは、サービスと同じ OS ユーザーで実行します。
+
+```text
+tukuyomi-proxy rules import <config> --engine modsecurity --crs <crs-dir> --rules <rules-file> --routes <routes-file>   # 新しいデフォルトのエンジンの世代。まだ選択しない
+tukuyomi-proxy managed import <config> <document>         # 全部のアップストリームに、今のエンジンを engine に書いたバージョン
+tukuyomi-proxy managed activate <config> <version>        # 上で作ったバージョンを選択する
+kill -HUP <proxy-pid>
+   reload: configuration replaced <sha256> managed <version>
+tukuyomi-proxy rules activate <config> <fingerprint>      # 新しいデフォルトのエンジンの世代。SIGUSR1 は送らない
+tukuyomi-proxy rules list <config>                        # current の印が 2 行（Coraza の世代と ModSecurity の世代）
+（設定ファイルの kernel に "default_engine": "modsecurity" を書く）
+tukuyomi-proxy config check <config>                      # accepted
+（プロキシと管理プロセスを再起動する）
+   start: rules engine modsecurity
+   start: rules engine coraza
+```
+
+- 新しいデフォルトのエンジンの世代は、先頭の `rules import` で作ります。管理画面の Host での CRS の調整（[管理リファレンス](admin-reference.md) の「管理画面の Host での CRS の調整」）と、インポートのルートの検査除外のルート（「インポートのルートを検査除外にする」）を、その世代にも入れます。
+- その世代は、`kernel.default_engine` を書く前に選択します。SIGUSR1 を送らない間は、そのエンジンは起動せず、プロキシは稼働を続けます。
+- 世代を選択する前に、`kernel.default_engine` を書いて `config check` を実行すると、`rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine`（exit 1）で受け付けません。起動も、同じ文で受け付けません。
+- 動作中のプロキシへの SIGHUP は、`config check` が `accepted` でも、`reload: configuration refused: kernel cannot change while running` で拒否します。変更するには、再起動します。
+- 再起動の後、`start: rules engine` の行は、デフォルトのエンジンが先に出ます。管理画面のルートのリクエストは新しいデフォルトのエンジンで、`engine` を書いたアップストリームのリクエストは、書いたエンジンで検査します（リクエストのログの `engine`）。
+- 管理プロセスも設定ファイルの `kernel.default_engine` を読むので、プロキシと一緒に再起動します（[管理リファレンス](admin-reference.md) の「管理画面」）。
+
+### エンジンごとの選択中の世代
+
+ルールストアは、エンジンごとに、選択中の世代を 1 つ持ちます。
+
+- ファイルは `current.coraza` と `current.modsecurity` です。内容は、世代のフィンガープリント（64 桁の小文字の 16 進数）と改行で、65 バイトです。
+- `rules activate <config> <fingerprint>` は、その世代のエンジンの `current.<engine>` を書きます。`current.<engine>.new` に書いて同期してから置き換えるので、途中で止まっても、中途半端な内容は読まれません。途中で止まったときに残る `current.<engine>.new` は、どこからも読まれません。次の同じエンジンの `rules activate` が消します。
+- `rules list` は、エンジンごとの選択中の世代に `current` の印を付けます。2 つのエンジンの世代を選択していれば、印は 2 行に付きます。
+
+以前のバージョンが書いた `current`:
+
+- このバージョンは、`current` を書きません。以前のバージョンが書いた `current` は、同じエンジンの選択中の世代として読みます。エンジンに `current.<engine>` が無いとき、`current` が指す世代がそのエンジンの世代なら、その世代が、そのエンジンの選択中の世代です。
+- `rules activate` は、`current.<engine>` を書いた後に、同じエンジンの世代を指す `current` を消します。そのため、このバージョンで選択した後は、以前のバージョンは、そのエンジンの選択中の世代を読めません（下の「バージョンの更新」）。
+- 同じエンジンについて、`current` と `current.<engine>` の両方があり、別の世代を指しているときは、どちらも選ばず、`the current generation records of the engine disagree` で受け付けません。`rules list`、`config check`、起動、SIGUSR1 のどれも同じです。以前のバージョンで選択し直したときなどに、この状態になります。`rules activate` で、そのエンジンの世代を選択し直すと、`current.<engine>` を書いて `current` を消すので、元に戻ります。
+- `current.<engine>` が別のエンジンの世代を指しているときと、ファイルの内容が正しくないときは `the current generation record is broken`、ファイルを読めないときは `the current generation record cannot be read` で受け付けません。
+
+`rules deactivate <config> <engine>`:
+
+- そのエンジンの選択を解除します。`current.<engine>` と、同じエンジンの世代を指す `current` を消し、解除した世代を `<fingerprint> deactivated` の行に出します。次の再起動から、そのエンジンは起動しません。
+- 動作中のプロキシは、起動したエンジンの検査カーネルを止めません。そのエンジンは、プロキシを再起動するまで稼働します。再起動までの SIGUSR1 は、`reload: rules store refused: no generation is chosen` の行を出します（上の「SIGUSR1（世代の切り替え）」）。
+- 設定ファイルと、managed ストアの選択中のバージョンを読み、デフォルトのエンジンか、どれかのアップストリームのエンジンがそのエンジンなら、`rules deactivate: the configuration uses the engine` の行を出して受け付けません（exit 1）。エンジンに選択中の世代が無いときも、`rules deactivate: no generation is chosen` の行を出して受け付けません（exit 1）。
+- `managed` のある設定で、選択中のバージョンを読めないなど、設定を受け付けないときは、`rules deactivate: configuration refused: <reason>` の行を出します（exit 2）。`rules` のコマンドのうち、managed ストアを読むのは、このコマンドだけです。
+
+稼働していないエンジンを使うアップストリームを書く順:
+
+選択中の世代があり、稼働していないエンジン（たとえば、起動のときに ModSecurity の世代を選択していなかったとき）を、アップストリームに書く順です。リロードは検査プロセスを起動せず、稼働していないエンジンのアップストリームを拒否するので、SIGUSR1 でそのエンジンを起動します。次の例は、Coraza だけを起動しているプロキシに、`managed` のある設定で、ModSecurity のアップストリーム `mod` を足します。
+
+```text
+tukuyomi-proxy rules activate <config> <fingerprint-modsecurity>   # ModSecurity の世代を選択する。SIGUSR1 はまだ送らない
+tukuyomi-proxy managed activate <config> <version>                 # アップストリーム mod を書いたバージョン。ModSecurity の世代が選択中なので通る
+kill -HUP <proxy-pid>
+   reload: SIGHUP
+   reload: configuration accepted
+   reload: configuration refused: the engine of an upstream is not ready (upstream mod)
+kill -USR1 <proxy-pid>                                             # ModSecurity が起動する
+   reload: SIGUSR1
+   reload: generation <fingerprint-coraza> is already running
+   reload: starting generation <fingerprint-modsecurity>
+   reload: rules engine modsecurity
+   reload: rules mode block
+   reload: rules routes 0
+   reload: generation <fingerprint-modsecurity> is ready, switched
+kill -HUP <proxy-pid>
+   reload: SIGHUP
+   reload: configuration accepted
+   reload: configuration replaced <sha256> managed <version>
+```
+
+- 最初の SIGHUP は、ModSecurity が稼働していないので拒否します。前の設定のまま稼働し続け、`tukuyomi_config_reloads_total` の `refused` が 1 増えます。
+- 先に SIGUSR1 で ModSecurity を起動してから SIGHUP を送れば、リロードは拒否されません。
+- `managed activate` は、バージョンのアップストリームが使うエンジンに、選択中の世代が無いと、選択せずに拒否します（上の「`managed`」）。そのため、`rules activate` を先に行います。
+
 ### 検査除外のルート
 
 `rules import --routes <file>` のファイルは、次の形の JSON の配列です。
@@ -1022,13 +1185,14 @@ Coraza の世代と違うところは次のとおりです。同じルールと�
   - プロキシが自分で行う検証（ヘッダー部、ボディのサイズの上限）は、その前に行います。ボディの型は検証しません（下の「ボディの型」）。
   - アップストリームは、検査除外のルートではなく、`forward` のルートかデフォルトのアップストリームで選びます。そこで 404・403・421 になるリクエストと、全体の `access` と `rate_limit`、ホストごとの設定で拒否されるリクエスト（403・429）、管理画面のルート（`admin.route`）で拒否されるリクエスト（421・404・403）は、検査除外のルートに一致しても応答は変わりません。
   - 検査のスロットを取らないので、検査が混んでいるときや、検査プロセスが止まっているときも通ります。
+- ルートは、エンジンの世代ごとに効きます。リクエストを検査するエンジン（リクエストのアップストリームのエンジン）の、稼働中の世代のルートだけが、そのリクエストに適用されます。ほかのエンジンの世代にあるルートは、そのリクエストを検査除外にしません。
 - `path` と `host` の形と一致の方法は、`forward` のルートと同じです。ほかに次の決まりがあります。
   - `path` は `/` だけにはできません（すべてのリクエストの検査を外してしまうためです）。2〜255 バイトで書きます。
   - `host` にワイルドカードは書けません。
   - 1 つの世代で 256 個までです。`host` と `path` の同じ組み合わせは書けません。
 - `host` を持つ検査除外のルートは、末尾が `.` の `Host`（`app.example.com.`）には一致せず、検査します。アップストリームがそれを別のホストとして解釈するかもしれないためです。`host` を持たないルートは、末尾が `.` の `Host` にも一致します。
 - パスの読み方が複数あるリクエスト（「`access` を使うときの注意」に挙げた形）は、検査除外のルートに一致せず、検査します。
-- ルートは世代のマニフェストに入り、フィンガープリントの一部になります。動作中のプロキシは、世代の切り替えでルートを切り替えます。
+- ルートは世代のマニフェストに入り、フィンガープリントの一部になります。動作中のプロキシは、そのエンジンの世代の切り替えで、そのエンジンのルートを切り替えます。
 
 ## managed 設定
 
@@ -1047,9 +1211,9 @@ managed 設定は、サイト（ホストと証明書）、アップストリー
 - 設定ファイルに書けなくなる設定キーがあります。`forward` は `resolve_timeout_ms` だけになり、TLS のリスナーの `certificates`、全体の `access`・`rate_limit`、`host_policies` も書けません（書くと設定を受け付けません）。これらはバージョンに書きます。
 - 設定に `admin` があれば、管理画面のルート（`admin.route`）が必須です（上の「`admin`」）。管理画面のルートはプロキシが作り、全体の設定もホストごとの設定も適用されません。管理画面のルートに適用されるネットワークの制限は、`admin.route.access` の `allow_cidrs` だけです。
 - `managed` の有無と `managed.dir` は、動作中に変更できない設定キーです。`managed` を追加するときと外すときは、プロキシと管理プロセスを再起動します（設定のリロードは拒否します）。
-- 管理画面のルートのリクエストも WAF の検査を通ります。管理画面からの検証と保存のリクエストは、証明書と秘密鍵を含むことがあり、遮断の世代でブロックされうるので、その 2 つのパスを検査除外のルートにした世代を使います（[管理リファレンス](admin-reference.md) の「managed 設定を使う場合の管理画面のルート」）。
+- 管理画面のルートのリクエストも、デフォルトのエンジンの WAF の検査を通ります。管理画面からの検証と保存のリクエストは、証明書と秘密鍵を含むことがあり、遮断の世代でブロックされうるので、その 2 つのパスを検査除外のルートにした世代を、デフォルトのエンジンの世代として使います（[管理リファレンス](admin-reference.md) の「managed 設定を使う場合の管理画面のルート」）。デフォルトのエンジンを変更するときは、新しいデフォルトのエンジンの世代にも、同じルートを入れます（上の「検査エンジンの選択」）。
 - ACME で発行するサイトの証明書チェーンと秘密鍵は、設定ファイルのパスではなく、managed ストアの `acme/` に置きます（下の「ACME のサイト」）。
-- ログ送信プロセスを使うなら、プロキシと同じビルドに入れ替えてから、設定ファイルに `managed` を書きます。ログ送信プロセスも設定ファイルを読み、`managed` を知らない前のビルドは、未知の設定キーのある設定ファイルを受け付けずに起動しません（下の「ログ送信プロセスの起動」）。
+- ログ送信プロセスを使うなら、プロキシと同じビルドに入れ替えてから、設定ファイルに `managed` を書きます。ログ送信プロセスも設定ファイルを読み、`managed` を知らない前のビルドは、未知の設定キーのある設定ファイルを受け付けずに起動しません（下の「ログ送信プロセスの起動」）。`kernel.default_engine` と、アップストリームの `engine` も、前のビルドには未知の設定キーです。同じビルドに入れ替えてから書きます（下の「バージョンの更新」）。
 
 設定をファイルだけで管理し、管理画面から変更しないなら、`managed` は必要ありません。
 
@@ -1081,13 +1245,13 @@ managed ストアの内容:
 {"sites": [..], "upstreams": {..}, "routes": [..], "default_upstream": "..", "access"?: {..}, "rate_limit"?: {..}, "host_policies"?: [..]}
 ```
 
-- `upstreams`、`routes`、`default_upstream`、`access`、`rate_limit`、`host_policies` は、`managed` の無い設定ファイルの `forward`（上の「`forward`」）と、下の「アクセス制御とレート制限」と同じ形と決まりで書きます。受け付けないときの文も同じです。違うのは、アップストリームの `tls` が `{"ca", "server_name"?}` で、`ca` が managed ストアの `files/` のファイルの SHA-256 であることだけです。
+- `upstreams`、`routes`、`default_upstream`、`access`、`rate_limit`、`host_policies` は、`managed` の無い設定ファイルの `forward`（上の「`forward`」）と、下の「アクセス制御とレート制限」と同じ形と決まりで書きます。受け付けないときの文も同じです。違うのは、アップストリームの `tls` が `{"ca", "server_name"?}` で、`ca` が managed ストアの `files/` のファイルの SHA-256 であることだけです。アップストリームの `engine` は、`forward` と同じ形で書けます。
 - `sites` はサイトの一覧で、0〜64 個です。サイトは `{"name", "hosts", "certificate"}` と書きます。
   - `name` は、アップストリームの名前と同じ決まり（1〜64 文字の英数字・`-`・`_`）で、サイトどうしで同じ名前は書けません。
   - `hosts` は 1〜64 個で、リスナーの証明書の `hosts` と同じように書きます（名前か、`*.` と名前）。同じホストを 2 つのサイトに書けません。
   - `certificate` は、`{"chain", "key"}`（managed ストアの `files/` の証明書チェーンと秘密鍵の SHA-256）か、`{"acme": {"renew_before_days"}}`（下の「ACME のサイト」）のどちらかです。
 - バージョンにパスは書きません。
-- 設定ファイルと合わせて検証します。管理画面のルートのホスト（`admin.route.host`）は、サイトの `hosts` にも、ルートの `host` にも書けません（`*.` のサイトがそれを含んでもかまいません。管理画面のルートが先に一致します）。アップストリームのサーバーは、`admin.listen` のアドレスにできません（名前を解決したアドレスも同じです）。TLS のリスナーがあれば、サイトか管理画面のルートの証明書が 1 つ以上必要です。
+- 設定ファイルと合わせて検証します。アップストリームの `engine` は、設定ファイルの `kernel`（`engines` と `default_engine`）と合わせて検証します（`engine` を省いたアップストリームは、`kernel.default_engine` のエンジンになります）。管理画面のルートのホスト（`admin.route.host`）は、サイトの `hosts` にも、ルートの `host` にも書けません（`*.` のサイトがそれを含んでもかまいません。管理画面のルートが先に一致します）。アップストリームのサーバーは、`admin.listen` のアドレスにできません（名前を解決したアドレスも同じです）。TLS のリスナーがあれば、サイトか管理画面のルートの証明書が 1 つ以上必要です。
 - TLS のリスナーは、どれも、管理画面のルートとすべてのサイトの証明書から、クライアントが SNI で指定したホストで証明書を選びます。名前が同じ証明書を、`*.` で含む証明書より先に選びます。
 
 `managed import` の文書は、バージョンと同じ形で、ファイルを SHA-256 ではなくパスで書きます。サイトの `certificate` は `{"chain_file", "key_file"}` か `{"acme": {..}}`、アップストリームの `tls` は `{"ca_file", "server_name"?}` です。パスは絶対パスで 3840 バイトまでです。文書は 1 MiB までで、空白などの書き方は自由です。
@@ -1168,7 +1332,7 @@ managed ストアの内容:
    }
    ```
 
-5. ルールセットをインポートし、世代を選択します（[ビルドと配置](../build/binary-deployment.md) の「初回起動の手順」の 2〜4）。`rules` のコマンドは設定ファイルだけを読み、managed ストアを読まないので、`current` がまだ無くても通ります（下の 6・7 の後に実行してもかまいません）。
+5. ルールセットをインポートし、世代を選択します（[ビルドと配置](../build/binary-deployment.md) の「初回起動の手順」の 2〜4）。7 の `managed activate` は、バージョンのアップストリームが使うエンジンに、選択中の世代があることを確認するので、この手順は 7 より前に行います。`rules import` と `rules activate` は設定ファイルだけを読み、managed ストアを読まないので、`current` がまだ無くても通ります（6 の後に実行してもかまいません）。`rules deactivate` は、managed ストアの選択中のバージョンも読みます（上の「エンジンごとの選択中の世代」）。
 6. バージョンをインポートします。
 
    ```bash
@@ -1261,7 +1425,7 @@ managed ストアの内容:
    - プロキシは、動作中の設定の `forward.resolve_timeout_ms` に 5 秒を足した時間まで、リロードの終わりを待って応答します。`resolve_timeout_ms` を長くすると、反映も長くかかり、その間はコマンドも拒否されます。
    - 管理プロセスが応答を待つ時間と、証明書の検証での拒否（`tls`。`acme renew` が証明書を置き換えている瞬間と重なったときなど）の扱いは、[管理リファレンス](admin-reference.md) の「制御ソケット」を参照してください。
 2. コマンドと SIGHUP: `managed activate` が、起動と同じ検証を実行して `current` を変更します。コマンドはプロキシに依頼しないので、動作中のプロキシは、次の SIGHUP（`systemctl reload`）か起動で `current` のバージョンを読みます（上の「SIGHUP（設定のリロード）」）。
-   - SIGHUP が拒否されると（動作中に変更できない設定キーの違い、新しいリスナーのバインドなど）、`current` は、動作中のプロキシが拒否したバージョンのまま残り、次に起動するときは、そのバージョンが使われます。
+   - SIGHUP が拒否されると（動作中に変更できない設定キーの違い、アップストリームのエンジンが稼働していないこと、新しいリスナーのバインドなど）、`current` は、動作中のプロキシが拒否したバージョンのまま残り、次に起動するときは、そのバージョンが使われます。
    - 動作中のプロキシのバージョンを変更するには、管理画面か管理 API を使います。コマンドで変更したときは、すぐに `systemctl reload` を実行し、`reload: configuration replaced <sha256> managed <version>` の行を確認します。
 
 どちらの方法も、次のとおりです。
@@ -1619,7 +1783,7 @@ managed ストアの内容:
 | `reason` | 決まった英語の語句（例: `malformed request head`、`body over the limit`、`inspection queue full`、`upstream connection failed`、`denied by access`、`too many requests`） |
 | `ms` | かかった時間（ミリ秒） |
 | `upstream`、`server` | アップストリームの名前と、最後に接続を試みたサーバーのアドレス（試していなければ `server` はありません） |
-| `mode`、`engine`、`generation` | 判定したルールの世代のモード（`block` か `detect`）と、そのエンジン（`coraza` か `modsecurity`）と、世代のフィンガープリントの先頭 16 桁。検査しなかったリクエストにはありません |
+| `mode`、`engine`、`generation` | 判定したルールの世代のモード（`block` か `detect`）と、そのエンジン（`coraza` か `modsecurity`）と、世代のフィンガープリントの先頭 16 桁。検査しなかったリクエスト（検査除外のルートで通したリクエストを含みます）にはありません |
 | `rule` | ブロックしたルール、または検知のみのモードで一致したルールの ID |
 | `rules` | ほかに一致したルールの ID。評価の順に 16 個まで。ログに記録しないルール（`nolog`）と、検査プロセスが追加するルール（4000001〜4000011）は入りません |
 | `rules_more` | 16 個より多く一致したとき `true` |
@@ -1666,10 +1830,11 @@ managed ストアの内容:
 
 | 文 | 場合 |
 |---|---|
-| `start: ...` | 起動の各段階（`start: managed version <version>`、`start: rules generation <fingerprint>`、`start: rules engine <name>`、`start: rules mode block`（か `detect`）、`start: rules generation refused: <reason>`、`start: tls certificate not issued yet (<place>)`、`start: the kernel is ready`、`start: listening`、`start: record file refused: <reason>`、`start: control socket refused: <reason>` など） |
-| `reload: ...` | SIGHUP・SIGUSR1・SIGUSR2 と、制御ソケットの `reload` の依頼を受けたこと（`reload: SIGHUP`、`reload: control reload <version>` など）。設定のリロードの各段階と結果（`reload: configuration replaced <sha256>`、`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`、`reload: configuration refused: <reason>`、`reload: tls certificate not issued yet (<place>)`、`reload: rate limit table started anew`、`reload: rate limit table of host policy <name> started anew` など。上の「SIGHUP（設定のリロード）」）。切り替え（SIGUSR1 と制御ソケット。始めるときに `reload: rules engine <name>`、拒否したときに `reload: rules store refused: <reason>`）と、証明書の入れ替えの結果 |
+| `start: ...` | 起動の各段階（`start: managed version <version>`、起動するエンジンごとの `start: rules generation <fingerprint>`・`start: rules engine <name>`・`start: rules mode block`（か `detect`）・`start: rules routes <count>`（デフォルトのエンジンが先）、検知のみの世代を選択しているエンジンへ向くアップストリームごとの `start: upstream <name>: engine <engine>, mode detect`、`start: rules store refused: <reason>`、`start: rules generation refused: <reason>`、`start: tls certificate not issued yet (<place>)`、`start: the kernel is ready`、`start: listening`、`start: record file refused: <reason>`、`start: control socket refused: <reason>` など） |
+| `reload: ...` | SIGHUP・SIGUSR1・SIGUSR2 と、制御ソケットの `reload` の依頼を受けたこと（`reload: SIGHUP`、`reload: control reload <version>` など）。設定のリロードの各段階と結果（`reload: configuration replaced <sha256>`、`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`、`reload: configuration refused: <reason>`、`reload: tls certificate not issued yet (<place>)`、`reload: rate limit table started anew`、`reload: rate limit table of host policy <name> started anew`、検知のみの世代を選択しているエンジンへ向くアップストリームごとの `reload: upstream <name>: engine <engine>, mode detect` など。上の「SIGHUP（設定のリロード）」）。切り替え（SIGUSR1 と制御ソケット。エンジンごとに、始めるときに `reload: starting generation <fingerprint>`・`reload: rules engine <name>`・`reload: rules mode block`（か `detect`）・`reload: rules routes <count>`、準備ができたときに `reload: generation <fingerprint> is ready, switched`、前の世代を停止したときに `reload: generation <fingerprint> retired, clean true`（か `false`）、すでに稼働している世代のときに `reload: generation <fingerprint> is already running`、起動に失敗したときに `reload: generation <fingerprint> failed to start: <reason>`、切り替えの途中のときに `reload: a switch is in progress, ignored`、拒否したときに `reload: rules store refused: <reason>`）と、証明書の入れ替えの結果 |
 | `control: switch ...`、`control: reload ...` | 制御ソケットの切り替えとリロードの依頼への応答（`control: reload <version>: <result> (<reason>)` など。上の「制御ソケット」） |
 | `driver: inspector incarnation changed, inc <count>, restarts <count>` | 検査プロセスが再起動した場合 |
+| `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` | 停止の始めに、起動しているエンジンごとに 1 つ出ます（上の「停止」） |
 | `conn <number>: internal fault: <reason>` | プロキシの内部の不整合 |
 | `notify: <notice> not sent ...` | systemd への通知を送れなかった場合 |
 | `stop: ...` | 停止の理由と、最後の停止の結果 |
@@ -1781,7 +1946,7 @@ tukuyomi-records-ship <config>
 ```
 
 - `<config>` はプロキシと同じ設定ファイルで、絶対パスで書きます。プロキシと同じ検証で読み、`records.ship` が必要です。無ければ `records-ship: configuration refused: there is no records.ship object` の行を出して終わります。
-- 読むのは設定ファイルだけで、managed ストアのバージョンと国のデータベースは読みません。未知の設定キーのある設定ファイルは受け付けないので、設定に新しい設定キー（`managed`、`host_policies` など）を書く前に、ログ送信プロセスをプロキシと同じビルドに入れ替えます（[ビルドと配置](../build/binary-deployment.md) の「ログ送信プロセスのユニット」）。
+- 読むのは設定ファイルだけで、managed ストアのバージョンと国のデータベースは読みません。未知の設定キーのある設定ファイルは受け付けないので、設定に新しい設定キー（`managed`、`host_policies`、`kernel.default_engine`、アップストリームの `engine` など）を書く前に、ログ送信プロセスをプロキシと同じビルドに入れ替えます（[ビルドと配置](../build/binary-deployment.md) の「ログ送信プロセスのユニット」）。
 - プロキシと同じ OS ユーザーで動かします。root では動きません（ユーザー ID の 4 つのどれかが 0 なら起動しません）。ログのディレクトリが、この OS ユーザーのシンボリックリンクでないディレクトリで、グループとその他のユーザーの権限が無いことも検証します。`ship.state` をそこに書くためです。
 - ログのディレクトリのファイルシステムは、ファイルの作成時刻（`statx` の btime）を返す必要があります。ログ送信プロセスは、ログファイルを inode と作成時刻の組み合わせで見分けます（ファイルシステムは、削除したファイルの inode の番号をすぐに使い回します）。返さないファイルシステムでは、ログ送信プロセスは起動せず、プロキシは遅れを「分からない」として `required` のリクエストを拒否します。
 - 起動の順は、設定、ログのディレクトリ、接続文字列のファイル（下）、シグナルの受け付け、`NOTIFY_SOCKET` があれば `READY=1` です。DB には 1 回目の処理で接続します。接続できない DB は、動作中に止まったときと同じように、待って再試行します。
@@ -1897,10 +2062,10 @@ TLS は次のとおりです。
 | リクエスト | 応答 |
 |---|---|
 | `GET /healthz` | 200 `ok`。プロキシが応答できることだけを示します |
-| `GET /readyz` | 準備ができていれば 200 `ready`。でなければ 503 と理由の語: `starting`（リスナーをバインドする前）、`inspector down`（検査プロセスが動いていない。再起動の間も含みます）、`stopping`（停止が始まった後） |
+| `GET /readyz` | 準備ができていれば 200 `ready`。でなければ 503 と理由の語: `starting`（リスナーをバインドする前）、`inspector down`（起動しているエンジンの、どれかの検査プロセスが稼働していない。再起動の間も含みます）、`stopping`（停止が始まった後） |
 | `GET /metrics` | 200 と、下の表のメトリクス（Prometheus のテキスト形式、`text/plain; version=0.0.4`） |
 
-- 準備ができているのは、検査プロセスが動いていて、リスナーをすべてバインドし、停止が始まっていないときです。世代の切り替えの間は、古い世代が応答するので準備ができたままです。
+- 準備ができているのは、起動しているすべてのエンジンの検査プロセスが稼働していて、リスナーをすべてバインドし、停止が始まっていないときです。世代の切り替えの間は、古い世代が応答するので準備ができたままです。
 - `HEAD` は、同じステータスコードでボディを返しません。ほかのメソッドは 405、ほかのリクエストターゲット（クエリの付いたものも）は 404、HTTP/1.1 でないリクエストと、4 KiB に収まらないヘッダー部は 400 で応答します。
 - 1 つの接続で 1 つのリクエストに応答し、応答したら閉じます。同時に応答する接続は 8 つまでで、転送の `max_conns` とは別に数えます。それを超えた接続は、受けてすぐ閉じます。ヘッダー部を待つのは 2 秒、応答を書くのは 2 秒までです。
 - 監視のリクエストは、検査も転送もせず、ログにも記録しません。全体の `access` と `rate_limit`、ホストごとの設定も適用されません。
@@ -1923,10 +2088,12 @@ TLS は次のとおりです。
 | `tukuyomi_connection_permit_waits_total` | `counter` | | 接続を受け付けるときに接続の枠を待った回数（`max_conns` に達した回数の目安） |
 | `tukuyomi_tls_handshake_failures_total` | `counter` | | TLS のハンドシェイクの失敗とタイムアウト |
 | `tukuyomi_body_buffer_bytes` | `gauge` | | ボディなどのバッファリングに使っている予算のバイト数（`max_buffered_bytes` のうち使っている分） |
-| `tukuyomi_inspections_waiting` | `gauge` | | 検査のスロットを待っているリクエスト（`wait_queue` のうち使っている分） |
-| `tukuyomi_inspector_up` | `gauge` | | リクエストを受けている検査カーネルの準備ができていれば 1、でなければ 0 |
-| `tukuyomi_inspector_restarts_total` | `counter` | | 検査プロセスの再起動 |
-| `tukuyomi_rules_generation_info` | `gauge` | `generation`（フィンガープリントの先頭 16 桁）、`mode`、`engine` | リクエストを受けている世代。値はいつも 1 |
+| `tukuyomi_inspections_waiting` | `gauge` | | 検査のスロットを待っているリクエスト（エンジンごとの `wait_queue` のうち使っている分の、全エンジンの合計） |
+| `tukuyomi_inspector_up` | `gauge` | | 起動しているエンジンの検査カーネルが、すべて準備できていれば 1、でなければ 0 |
+| `tukuyomi_inspector_restarts_total` | `counter` | | 検査プロセスの再起動（全エンジンの合計） |
+| `tukuyomi_inspector_engine_up` | `gauge` | `engine`（`coraza`、`modsecurity`） | エンジンの検査カーネルの準備ができていれば 1、でなければ 0。起動しているエンジンごとに 1 つ |
+| `tukuyomi_inspector_engine_restarts_total` | `counter` | `engine`（`coraza`、`modsecurity`） | エンジンの検査プロセスの再起動。起動しているエンジンごとに 1 つ |
+| `tukuyomi_rules_generation_info` | `gauge` | `generation`（フィンガープリントの先頭 16 桁）、`mode`、`engine` | リクエストを受けている世代。値はいつも 1。起動しているエンジンごとに 1 つ |
 | `tukuyomi_rules_switches_total` | `counter` | `result`（`switched`、`refused`、`failed`） | SIGUSR1 と制御ソケットによる世代の切り替え |
 | `tukuyomi_certificate_reloads_total` | `counter` | `result`（`replaced`、`refused`） | SIGUSR2 による証明書の再読み込み |
 | `tukuyomi_config_reloads_total` | `counter` | `result`（`replaced`、`refused`） | SIGHUP と制御ソケットの `reload` による設定のリロード。リロードの途中に受けて無視した SIGHUP と、リロードを始めなかった `reload` の依頼（`busy`、`unmanaged`、`error` の応答）は数えません |
@@ -1998,3 +2165,52 @@ TLS は次のとおりです。
 - `cert_file`・`key_file`・`challenge_dir` が置かれたディレクトリと、managed ストアに、サービスの OS ユーザーが書けることが必要です（[ビルドと配置](../build/binary-deployment.md) の「OS ユーザーとディレクトリ」）。
   - 鍵は 0600、証明書は 0644 で書きます（umask の分は引かれます）。
 - ACME のサイトでホストの組み合わせを変更したバージョンに反映したときと、前のバージョンに戻したときは、すぐに `acme renew` を実行します（上の「ACME のサイト」）。
+
+## バージョンの更新
+
+0.1.0 から更新する手順と、0.1.0 に戻す手順です。更新後のバージョンは、アップストリームごとに検査エンジンを選べます（上の「検査エンジンの選択」）。ユニットの書き方は、[ビルドと配置](../build/binary-deployment.md) の「systemd」を参照してください。
+
+### 0.1.0 からの更新
+
+- 実行ファイルを入れ替えるだけで、0.1.0 の設定ファイル、ルールストア、managed ストアは、そのまま読めます（0.1.0 で ModSecurity の世代を選択していたときは、下のとおり、`kernel.default_engine` が必要です）。新しい設定キー（`kernel.default_engine`、アップストリームの `engine`）を書かなければ、0.1.0 と同じように、1 つのエンジンだけで稼働します。
+- 0.1.0 で Coraza の世代を選択していたときは、`kernel.default_engine` を書く必要はありません。0.1.0 が書いた `current` は、Coraza の選択中の世代として読まれます。`config check` は `accepted` で、起動すると `start: rules engine coraza` の行が 1 つだけ出ます。`current` は書き換わらず、`current.*` も増えません。
+- 0.1.0 で ModSecurity の世代を選択していたときは、`kernel.default_engine` に `modsecurity` を書きます。
+  - 書かないと、`config check` と起動は、`rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` の行を出して受け付けません（exit 1）。ルールストアは変わりません。
+  - `modsecurity` を書いた設定ファイルは `config check` を通り、起動すると `start: rules engine modsecurity` の行が 1 つだけ出ます。`current` は書き換わらず、`current.*` も増えません。ModSecurity の検査プロセスは、0.1.0 のときから、設定の `kernel.engines` に必要です。
+- 管理プロセス、プロキシ、ログ送信プロセスは、同じビルドにそろえます。
+  - 以前のバージョンのプロキシには、更新後の管理プロセスは世代の選択とロールバックを行いません（409）。詳しくは、[管理リファレンス](admin-reference.md) の「選択とロールバック」と「管理画面」を参照してください。
+  - ログ送信プロセスは、設定ファイルの未知の設定キーを受け付けません。`kernel.default_engine` やアップストリームの `engine` を書く前に、ログ送信プロセスを同じビルドに入れ替えます。0.1.0 のプロキシも、`kernel.default_engine` のある設定ファイルを、`configuration has an unknown key` で受け付けません（exit 2）。
+  - 実行ファイルを同じリリースのものにすべて入れ替えてから、管理プロセス、プロキシ、ログ送信プロセスの順に再起動します（「managed 設定への移行」の手順 8 と同じ順です）。管理プロセスを先に再起動すると、入れ替えの間は、更新後の管理プロセスが以前のプロキシへの世代の選択とロールバックを 409 で拒否するだけで、ルールストアと切り替えの履歴は変わりません。
+
+### 0.1.0 への切り戻し
+
+実行ファイルを 0.1.0 に戻す手順です。0.1.0 は `current` だけを読み、`kernel.default_engine` とアップストリームの `engine` を知りません。更新後の `rules activate` は、`current.<engine>` を書いて、同じエンジンの世代を指す `current` を消します。そのため、更新後の実行ファイルで何をしたかによって、0.1.0 の `config check` と起動の結果が変わります。
+
+| 更新後の実行ファイルでしたこと | 0.1.0 の `config check` と起動 |
+|---|---|
+| 起動しただけ（選択も、新しい設定キーを書くことも、していません） | ルールストアが変わらないので、そのまま起動します |
+| 0.1.0 が選択していた世代と別のエンジンの世代だけを選択した（`current` は残ります） | 起動します。その選択は、0.1.0 には見えません |
+| 0.1.0 が選択していた世代と同じエンジンの世代を選択した（`current` が消えて、`current.<engine>` ができます） | `rules store refused: no generation is chosen` の行を出して受け付けません（exit 1） |
+| 設定ファイルに `kernel.default_engine` を書いた | `configuration refused: configuration has an unknown key` の行を出して受け付けません（exit 2） |
+
+戻す手順は次のとおりです。2 と 3 は更新後の実行ファイル、5 と 7 は 0.1.0 の実行ファイルで実行します。1、4、6 は、実行ファイルを使いません。
+
+1. プロキシと管理プロセスを止めます。
+2. `rules list` で、選択中の世代を確認します。0.1.0 が選択できる世代は 1 つなので、どの世代で動かすかを決めます。
+3. `managed` のある設定では、`managed activate <version>` で、アップストリームに `engine` を書いていない managed 設定のバージョンを選択し直します。0.1.0 は、アップストリームの `engine` を知らないためです。5 の後は、`current` と `current.<engine>` が別の世代を指すことがあり、更新後の実行ファイルの `managed activate` は受け付けなくなるので、先に行います。
+4. 設定ファイルから、`kernel.default_engine` を外します。アップストリームの `engine` を書いていたときも、外します。
+5. 0.1.0 の実行ファイルで、`rules activate <config> <fingerprint>` を実行します。0.1.0 が `current` を書きます。
+6. `current.coraza` と `current.modsecurity`（`current.*`）を消します。`current` だけが残ります。
+7. 0.1.0 の実行ファイルで `config check` を実行し、起動します。
+
+どの手順の後も、`current` か `current.*` のどれかがあります。6 の前に 5 を行うのは、そのためです。
+
+更新後の実行ファイルに戻して進め直すときは、上の「0.1.0 からの更新」と同じです。0.1.0 で ModSecurity の世代を選択していたときは、`kernel.default_engine` が必要です。起動すると、0.1.0 が書いた `current` は、同じエンジンの選択中の世代として読まれます。`rules list` の `current` の印は 1 行、`start: rules engine <engine>` の行は 1 つで、`current.*` は増えません。
+
+`current.*` を消し忘れたまま、更新後の実行ファイルに戻したときは、次のようになります。
+
+- 同じエンジンの `current` と `current.<engine>` が別の世代を指しているときは、`rules list`、`config check`、起動のどれも、`the current generation records of the engine disagree` で受け付けません（exit 1）。`rules list` は、世代の行をすべて出してから、標準エラーにこの文を出し、`current` の印は、食い違うエンジンの世代に付きません。`rules activate` で選択し直すと、元に戻ります。
+- 別のエンジンの古い選択だけが残っているとき（たとえば、`current` が Coraza の世代を指し、`current.modsecurity` が残っていて、`current.coraza` が無いとき）は、受け付けられ、選択中の世代として読まれます。`rules list` の `current` の印は 2 行になり、`config check` は `accepted` で、起動すると `start: rules engine coraza` と `start: rules engine modsecurity` の 2 つのエンジンが起動します。
+- 同じエンジンの食い違いは、起動を止めるだけです。別のエンジンの古い選択は、断られずに読まれて、そのエンジンが起動します。ModSecurity を起動したくないときは、戻すときに `current.*` を消します。
+
+0.1.0 の管理プロセスは、更新後の管理プロセスが書いた切り替えの履歴の行（`engine` の欄がある行）を読めず、読み飛ばします。そのため、戻した後のロールバック先（`GET /api/status` の `rollback_to`）は、0.1.0 が書いた古い行から決まります（[管理リファレンス](admin-reference.md) の「切り替えの履歴」）。

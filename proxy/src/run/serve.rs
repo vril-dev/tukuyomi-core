@@ -10,7 +10,9 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::Instant;
 
 use super::notify::Notify;
-use super::reload::{Fixed, Reloader, control_order, control_while_starting, reload};
+use super::reload::{
+    Fixed, Reloader, continue_reload, control_order, control_while_starting, reload,
+};
 use super::signals::{Event, Signals, Waits};
 use super::status::{self, Readiness, View};
 use super::stop::{Cause, stop};
@@ -23,12 +25,11 @@ use crate::inbound::conn::{Ctx, Setup, Shared, SharedSetup};
 use crate::inbound::session::{self, RequestIds};
 use crate::inbound::transport::accept::{Acceptor, Arrival};
 use crate::inbound::transport::tls::Tls;
-use crate::inspect::driver::{self, Driver, Ingress, Limits, Msg};
+use crate::inspect::driver::{self, Driver, Ingress, Limits, Msg, Start};
+use crate::inspect::engines::Gates;
 use crate::log::Log;
 use crate::log::counters::{Counters, SwitchResult};
 use crate::managed::Hold;
-use crate::rules::bundle::{Fingerprint, Mode};
-use crate::rules::routes::{Routes, SharedRoutes};
 use crate::rules::switch::Switcher;
 
 /// The runtime part: handlers, driver, the wait for ready, serving, and the stop. The holds of the switcher and of the
@@ -41,10 +42,7 @@ pub(super) async fn run(
     forward: ForwardConfig,
     tls: Tls,
     challenge: Option<Challenge>,
-    kernel: tukuyomi_kernel::Config,
-    generation: Fingerprint,
-    mode: Mode,
-    routes: Routes,
+    starts: Vec<Start>,
     mut switcher: Switcher,
     ids: RequestIds,
     status: Option<StatusConfig>,
@@ -89,24 +87,24 @@ pub(super) async fn run(
         },
         None => None,
     };
-    let wait_queue = kernel.wait_queue;
-    let kill_grace = kernel.kill_grace;
+    // The kernel values that every engine has alike (the configuration gives one set of them); `starts` is not empty.
+    let (wait_queue, kill_grace) = match starts.first() {
+        Some(start) => (start.kernel.wait_queue, start.kernel.kill_grace),
+        None => {
+            log.line("start: cannot start the driver: no engine to start");
+            return EXIT_FAILED;
+        }
+    };
     let limits = Limits {
         slice: proxy.drive_slice,
         ready_wait: proxy.ready_wait,
         stop_inspect: proxy.stop_inspect,
     };
-    // The connections read the routes of the generation that serves, and the driver replaces them when another
-    // generation takes over.
-    let routes = SharedRoutes::new(routes);
-    let driver = match driver::start(
-        kernel,
-        generation,
-        mode,
-        routes.clone(),
-        limits,
-        log.clone(),
-    ) {
+    // The connections read the routes of the generation that serves each engine and take the inspection permits of
+    // the engine of their upstream group; the driver replaces the routes when another generation takes over.
+    let gates = Gates::new(wait_queue);
+    let default_engine = switcher.default_engine();
+    let driver = match driver::start(starts, gates.clone(), limits, log.clone()) {
         Ok(driver) => driver,
         Err(text) => {
             log.line(&format!("start: cannot start the driver: {text}"));
@@ -125,8 +123,7 @@ pub(super) async fn run(
     // connection takes the setup that is current when it starts.
     let shared = Arc::new(Shared {
         budget: Arc::new(Semaphore::new(proxy.max_buffered_bytes)),
-        inspect: Arc::new(Semaphore::new(wait_queue)),
-        routes: routes.clone(),
+        gates,
         log: log.clone(),
         ingress: Arc::new(Ingress::new(ingress.clone())),
         ids,
@@ -145,13 +142,14 @@ pub(super) async fn run(
             .with_managed(managed),
         ),
     });
-    let mut reloader = Reloader::new(path, fixed, hold);
+    let mut reloader = Reloader::new(path, fixed, hold, state.clone());
     let readiness = Arc::new(Readiness::new());
     if let Some(bound) = control_socket {
         let switch_wait = proxy.ready_wait.saturating_add(control::SWITCH_MARGIN);
         waits.control = Some(control::serve(
             bound,
             state.clone(),
+            default_engine,
             readiness.clone(),
             switch_wait,
             shared.setup.clone(),
@@ -256,7 +254,7 @@ async fn until_stop(
             Event::Control(order) => {
                 control_order(order, waits, switcher, reloader, ingress, shared);
             }
-            Event::Switched(switched) => {
+            Event::Switched { engine, switched } => {
                 shared.counters.add_switch(if switched {
                     SwitchResult::Switched
                 } else {
@@ -264,8 +262,10 @@ async fn until_stop(
                 });
                 switcher.finish(switched);
                 if let Some(control) = waits.control.as_mut() {
-                    control.switch_ended(switched, switcher.running(), log);
+                    control.switch_ended(engine, switched, switcher.running(engine), log);
                 }
+                // The next engine of a SIGUSR1 that is waiting for this switch to end is switched now.
+                continue_reload(waits, switcher, ingress, &shared.counters, log);
             }
             event => {
                 if let Some(cause) = Cause::of(event) {

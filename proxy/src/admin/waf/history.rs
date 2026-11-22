@@ -6,22 +6,26 @@
 //! history older than that is not seen.
 //!
 //! A line has `ts` (the time, as a record has it), `actor` (the name of the user who asked), `from` (the generation
-//! that the rules store chose before, 64 digits), `to` (the generation that was asked for), `kind` (`activate` or
-//! `rollback`) and `result`: `switched` (the proxy serves `to` now), `unchanged` (it served `to` already), `refused`
-//! (the rules store or the proxy refused), `failed` (the proxy did not switch in time, or at all), `unreachable` (the
-//! proxy could not be asked, and the rules store was not changed) or `unconfirmed` (the rules store was changed, and
-//! the answer of the proxy could not be read).
+//! that the rules store chose before for the engine of `to`, 64 digits; `to` itself when it chose none), `to` (the
+//! generation that was asked for), `engine` (the engine of `to`; a line that an older version wrote has none), `kind`
+//! (`activate` or `rollback`) and `result`: `switched` (the proxy serves `to` now), `unchanged` (it served `to`
+//! already), `refused` (the rules store or the proxy refused), `failed` (the proxy did not switch in time, or at all),
+//! `unreachable` (the proxy could not be asked, and the rules store was not changed) or `unconfirmed` (the rules store
+//! was changed, and the answer of the proxy could not be read).
 //!
-//! The target of a rollback is `from` of the newest line whose result is `switched` and whose `from` is not `to` (a
-//! switch from a generation to itself says nothing about the generation before it), but only if the `to` of that line
-//! is the generation that the rules store chooses now. After a switch that failed, or a choice that a command made,
-//! the history does not end at the chosen generation and there is no target.
+//! The target of a rollback of an engine is `from` of the newest line of that engine whose result is `switched` and
+//! whose `from` is not `to` (a switch from a generation to itself says nothing about the generation before it), but
+//! only if the `to` of that line is the generation that the rules store chooses now for the engine. A line is of the
+//! engine it names; a line that names none is of an engine if the generations of both its `from` and its `to` are of
+//! that engine (an older version switched the one engine of the proxy, whatever it was). After a switch that failed, or
+//! a choice that a command made, the history does not end at the chosen generation and there is no target.
 
 use std::time::SystemTime;
 
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tukuyomi_kernel::Engine;
 
 use super::{Caller, Waf};
 use crate::admin::audit::Outcome;
@@ -103,6 +107,8 @@ pub struct Activation {
     pub to: Fingerprint,
     pub kind: Kind,
     pub result: Ended,
+    /// The engine of `to`; none in a line of an older version.
+    pub engine: Option<Engine>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -114,6 +120,8 @@ struct Stored {
     to: String,
     kind: String,
     result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engine: Option<String>,
 }
 
 impl Activation {
@@ -132,6 +140,27 @@ impl Activation {
             to,
             kind,
             result,
+            engine: None,
+        }
+    }
+
+    /// The activation, for the engine `engine`.
+    pub fn of(self, engine: Engine) -> Activation {
+        Activation {
+            engine: Some(engine),
+            ..self
+        }
+    }
+
+    /// Whether the line is of `engine`; `engine_of` gives the engine of a generation, if it can be told.
+    pub fn is_of(
+        &self,
+        engine: Engine,
+        engine_of: &impl Fn(Fingerprint) -> Option<Engine>,
+    ) -> bool {
+        match self.engine {
+            Some(named) => named == engine,
+            None => engine_of(self.from) == Some(engine) && engine_of(self.to) == Some(engine),
         }
     }
 
@@ -144,6 +173,7 @@ impl Activation {
             to: self.to.hex(),
             kind: self.kind.word().to_owned(),
             result: self.result.word().to_owned(),
+            engine: self.engine.map(|engine| engine.name().to_owned()),
         })
         .ok()?;
         (line.len() < RECORD_MAX).then_some(line)
@@ -160,6 +190,10 @@ impl Activation {
             to: Fingerprint::from_hex(stored.to.as_bytes())?,
             kind: Kind::parse(&stored.kind)?,
             result: Ended::parse(&stored.result)?,
+            engine: match stored.engine {
+                Some(name) => Some(Engine::parse(&name)?),
+                None => None,
+            },
             ts: stored.ts,
             actor: stored.actor,
         })
@@ -174,18 +208,23 @@ impl Activation {
             "to": self.to.hex(),
             "kind": self.kind.word(),
             "result": self.result.word(),
+            "engine": self.engine.map(Engine::name),
         })
     }
 }
 
-/// The generation a rollback goes to when the rules store chooses `chosen`, given the history with the newest line
-/// first; else the fixed sentence of the refusal.
+/// The generation a rollback of `engine` goes to when the rules store chooses `chosen` for it, given the history with
+/// the newest line first; else the fixed sentence of the refusal. `engine_of` gives the engine of a generation, if it
+/// can be told, for the lines of an older version.
 pub fn rollback_target(
     newest_first: &[Activation],
     chosen: Fingerprint,
+    engine: Engine,
+    engine_of: impl Fn(Fingerprint) -> Option<Engine>,
 ) -> Result<Fingerprint, &'static str> {
     let line = newest_first
         .iter()
+        .filter(|line| line.is_of(engine, &engine_of))
         .find(|line| line.result == Ended::Switched && line.from != line.to)
         .ok_or("there is no switch to go back from")?;
     if line.to != chosen {
@@ -207,10 +246,12 @@ impl Waf {
         &self,
         caller: &Caller<'_>,
         kind: Kind,
+        engine: Engine,
         ids: (Fingerprint, Fingerprint),
         ended: Ended,
     ) -> bool {
-        let line = Activation::new(SystemTime::now(), &caller.who.name, ids, kind, ended);
+        let line =
+            Activation::new(SystemTime::now(), &caller.who.name, ids, kind, ended).of(engine);
         let written = self.store.record_activation(&line).is_ok();
         if !written {
             self.note(

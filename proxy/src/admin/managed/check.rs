@@ -11,9 +11,14 @@
 //!    409, and so is one that is refused, with its sentence.
 //! 4. The managed store: one that cannot be opened is 500.
 //! 5. The version with the main file and the files of the request and of the store, as for the saving (see
-//!    `managed::import`): a refusal is 400 with its sentence and its place.
+//!    `managed::import`): a refusal is 400 with its sentence and its place. A group whose engine has no generation
+//!    chosen in the rules store is refused so, about the key `engine` of the group; a rules store that cannot be
+//!    read is 500.
 //!
-//! The answer is 200 with `version`, the name that the version would have in the store. The check does not take the
+//! The answer is 200 with `version`, the name that the version would have in the store, and `detect`, the groups whose
+//! engine runs a generation that only detects (`[{"upstream", "engine"}, ..]`, in the order of the groups, empty for
+//! none): a request that a rule matches goes to such a group, which the version would put in force all the same. The
+//! check does not take the
 //! right to change, does not ask the proxy, puts nothing in the store, and writes nothing to the audit log, for it
 //! changes nothing; the store may choose no version yet.
 
@@ -25,8 +30,8 @@ use serde_json::json;
 use super::import::{Files, body_of, invalid};
 use super::routes::{Managed, conflict, failed, unmanaged};
 use crate::admin::server::{Answer, Req};
-use crate::managed::import;
-use crate::managed::{Store, sent};
+use crate::managed::import::{self, Refused};
+use crate::managed::{ManagedError, Store, sent};
 use crate::rules::bundle::{hex, sha256};
 
 /// The body of the request.
@@ -74,8 +79,18 @@ impl Managed {
         };
         let name = hex(&sha256(&version));
         match import::from_request(&built, &store, version, files) {
-            Ok(_) => Answer::json(StatusCode::OK, json!({ "version": name })),
-            Err(objection) => invalid(&objection),
+            Ok(import) => {
+                let detect: Vec<_> = import
+                    .detecting()
+                    .iter()
+                    .map(
+                        |(upstream, engine)| json!({"upstream": upstream, "engine": engine.name()}),
+                    )
+                    .collect();
+                Answer::json(StatusCode::OK, json!({ "version": name, "detect": detect }))
+            }
+            Err(Refused::Input(objection)) => invalid(&objection),
+            Err(Refused::Rules(e)) => failed(ManagedError(e.0)),
         }
     }
 }

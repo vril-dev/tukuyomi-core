@@ -1,4 +1,4 @@
-use super::core::{Mode, Switching};
+use super::core::Mode;
 use super::*;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem;
@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::TryRecvError;
 
-use tokio::sync::Semaphore;
 use tokio::sync::oneshot::error::TryRecvError as SlotError;
+use tokio::sync::{Semaphore, mpsc};
 use tukuyomi_kernel::{Config, Phase, Reason};
 
+use crate::inspect::engines::{Said, Signals, Switching};
 use crate::inspect::slot::{Pending, deliver, restart_line, submit};
 use crate::log::{Format, start_logger};
 use crate::rules::routes::Route;
+use crate::rules::routes::SharedRoutes;
 
 const MS: Duration = Duration::from_millis(1);
 const SEC: Duration = Duration::from_secs(1);
@@ -94,6 +96,11 @@ impl World {
     /// A ticket for a GET of `uri` whose body is `n` bytes. It takes one inspection permit and, for the
     /// kernel's copy and for the body, `n` bytes of budget each.
     fn ticket(&self, uri: &'static [u8], n: usize) -> Made {
+        self.ticket_for(Engine::Coraza, uri, n)
+    }
+
+    /// The same, for a request that is to be inspected by `engine`.
+    fn ticket_for(&self, engine: Engine, uri: &'static [u8], n: usize) -> Made {
         let n = u32::try_from(n).unwrap();
         let take = |bytes| self.budget.clone().try_acquire_many_owned(bytes).unwrap();
         let body = Arc::new(BodyHold::new(Bytes::from(vec![b'x'; n as usize]), take(n)));
@@ -113,7 +120,12 @@ impl World {
             proto: b"HTTP/1.1",
         };
         Made {
-            ticket: Ticket { req, reply, hold },
+            ticket: Ticket {
+                engine,
+                req,
+                reply,
+                hold,
+            },
             answer,
             body,
         }
@@ -295,42 +307,102 @@ struct Rig {
     tx: Option<SyncSender<Msg>>,
     world: World,
     /// What the core publishes after a round.
-    state: watch::Receiver<State>,
+    state: watch::Receiver<States>,
+    /// The routes of the gate of Coraza, as the connections read them.
+    routes: SharedRoutes,
+    /// What the core tells the main thread: the start is ready, and a kernel that served has failed.
+    ready: oneshot::Receiver<Result<(), Failure>>,
+    failed: mpsc::Receiver<Failure>,
 }
 
 impl Rig {
-    /// An intake takes `wait_queue + 1` messages; the channel has room for `room`.
+    /// An intake takes `2 * wait_queue + 1` messages (the engines have a waiting queue each); the channel has room for
+    /// `room`. The engine Coraza has a kernel, and ModSecurity has none.
     fn new(wait_queue: usize, room: usize) -> Rig {
+        Rig::with(wait_queue, room, &[Engine::Coraza])
+    }
+
+    /// A core with a kernel for each of `engines`, the generation 1 for each.
+    fn with(wait_queue: usize, room: usize, engines: &[Engine]) -> Rig {
         let (tx, rx) = sync_channel(room);
-        let (state_tx, state) = watch::channel(State {
-            phase: Phase::Starting,
-            restarts: 0,
-            generation: generation(1),
-            engine: Engine::Coraza,
-            mode: bundle::Mode::Block,
-        });
+        let routes = SharedRoutes::new(Routes::default());
+        let mut states = States::none();
+        let lanes: Vec<_> = crate::rules::store::ENGINES
+            .into_iter()
+            .map(|engine| {
+                let slot = engines.contains(&engine).then(|| {
+                    states.set(
+                        engine,
+                        Some(State {
+                            phase: Phase::Starting,
+                            restarts: 0,
+                            generation: generation(1),
+                            engine,
+                            mode: bundle::Mode::Block,
+                        }),
+                    );
+                    Slot::new(generation(1), engine, bundle::Mode::Block, Fake::new())
+                });
+                let table = if engine == Engine::Coraza {
+                    routes.clone()
+                } else {
+                    SharedRoutes::new(Routes::default())
+                };
+                Lane::new(engine, table, slot)
+            })
+            .collect();
+        let (state_tx, state) = watch::channel(states);
+        let (ready_tx, ready) = oneshot::channel();
+        let (failed_tx, failed) = mpsc::channel(2);
         let core = Core::new(
-            Slot::new(
-                generation(1),
-                Engine::Coraza,
-                bundle::Mode::Block,
-                Fake::new(),
-            ),
-            SharedRoutes::new(Routes::default()),
+            lanes,
             rx,
-            Signals::Told { _failed: None },
+            Told::new(ready_tx, engines.len(), failed_tx),
             start_logger(Format::Json).unwrap(),
             limits(20 * MS),
             30 * MS,
-            wait_queue + 1,
-            state_tx,
+            2 * wait_queue + 1,
+            Publisher::new(state_tx),
         );
         Rig {
             core,
             tx: Some(tx),
             world: World::new(),
             state,
+            routes,
+            ready,
+            failed,
         }
+    }
+
+    /// The kernel of the engine Coraza, which serves.
+    fn active(&mut self) -> &mut Slot<Fake> {
+        self.core.lanes[0]
+            .active
+            .as_mut()
+            .expect("Coraza has a kernel")
+    }
+
+    /// The kernel of `engine`.
+    fn kernel_of(&mut self, engine: Engine) -> &mut Slot<Fake> {
+        self.core.lanes[index(engine)]
+            .active
+            .as_mut()
+            .expect("the engine has a kernel")
+    }
+
+    /// The lane of Coraza.
+    fn lane(&self) -> &Lane<Fake> {
+        &self.core.lanes[0]
+    }
+
+    /// The state of the kernel of Coraza that was published last.
+    fn seen(&self) -> State {
+        *self
+            .state
+            .borrow()
+            .of(Engine::Coraza)
+            .expect("Coraza is started")
     }
 
     fn send(&self, msg: Msg) {
@@ -371,36 +443,44 @@ fn a_ticket_closed_before_submit_is_dropped_and_gives_back_what_it_held() {
     assert_eq!(r.world.free(), (INSPECT - 2, BUDGET - 14 - 18));
     r.core.intake(None).unwrap();
     let uris: Vec<_> = r
-        .core
-        .active
+        .active()
         .kernel
         .seen
         .iter()
         .map(|s| s.uri.clone())
         .collect();
     assert_eq!(uris, vec![b"/live".to_vec()]);
-    assert_eq!(r.core.active.pending.len(), 1);
+    assert_eq!(r.active().pending.len(), 1);
     // the one that was never submitted gave back all it held at once; the submitted one holds its own
     assert_eq!(r.world.free(), (INSPECT - 1, BUDGET - 14));
 }
 
 #[test]
-fn one_intake_takes_at_most_wait_queue_plus_one_messages() {
-    // wait_queue 4: five messages; the channel here holds far more than a real one
+fn one_intake_takes_at_most_one_more_than_the_waiting_queues_of_all_the_engines_hold() {
+    // wait_queue 4 for each of the two engines: nine messages; the channel here holds far more than a real one
     let mut r = Rig::new(4, 64);
     for _ in 0..12 {
         r.send_closed();
     }
     r.core.intake(None).unwrap();
-    assert_eq!(r.left(), 7);
+    assert_eq!(r.left(), 3);
 
-    // exactly five are taken whole
+    // exactly nine are taken whole
     let mut r = Rig::new(4, 64);
-    for _ in 0..5 {
+    for _ in 0..9 {
         r.send_closed();
     }
     r.core.intake(None).unwrap();
     assert_eq!(r.left(), 0);
+}
+
+#[test]
+fn the_way_to_the_driver_has_room_for_the_waiting_queue_of_every_engine_the_stop_and_a_switch() {
+    // The engines are two, each with `wait_queue` permits: a ticket for each permit, one stop and one switch.
+    assert_eq!(intake_sizes(16), (33, 34));
+    assert_eq!(intake_sizes(0), (1, 2));
+    // A count that overflows is not one that passes the check of the kernel; the sizes stay small.
+    assert_eq!(intake_sizes(usize::MAX), (1, 2));
 }
 
 #[test]
@@ -470,7 +550,7 @@ fn cancel_is_called_once_for_each_abandoned_ticket() {
     r.send(Msg::Ticket(b.ticket));
     r.core.round().unwrap();
     assert_eq!(
-        r.core.active.kernel.calls,
+        r.active().kernel.calls,
         vec![Call::Submit(0), Call::Submit(1), Call::Poll]
     );
 
@@ -480,7 +560,7 @@ fn cancel_is_called_once_for_each_abandoned_ticket() {
         r.core.round().unwrap();
     }
     assert_eq!(
-        r.core.active.kernel.calls,
+        r.active().kernel.calls,
         vec![
             Call::Submit(0),
             Call::Submit(1),
@@ -495,8 +575,7 @@ fn cancel_is_called_once_for_each_abandoned_ticket() {
     // and the body and the copy of each take 3 bytes
     assert_eq!(r.world.free(), (INSPECT - 2, BUDGET - 12));
 
-    r.core
-        .active
+    r.active()
         .kernel
         .polls
         .push_back(vec![(0, Verdict::Uninspectable(Reason::Cancelled))]);
@@ -505,13 +584,13 @@ fn cancel_is_called_once_for_each_abandoned_ticket() {
     assert_eq!(r.world.free(), (INSPECT - 1, BUDGET - 3 - 6));
     drop(a.body);
     assert_eq!(r.world.free(), (INSPECT - 1, BUDGET - 6));
-    assert_eq!(r.core.active.pending.len(), 1);
+    assert_eq!(r.active().pending.len(), 1);
 }
 
 #[test]
 fn a_result_goes_to_the_ticket_it_belongs_to() {
     let mut r = Rig::new(4, 8);
-    r.core.active.kernel.ids = VecDeque::from([5, 2]);
+    r.active().kernel.ids = VecDeque::from([5, 2]);
     let mut a = r.world.ticket(b"/a", 0);
     let mut b = r.world.ticket(b"/b", 0);
     r.send(Msg::Ticket(a.ticket));
@@ -521,15 +600,14 @@ fn a_result_goes_to_the_ticket_it_belongs_to() {
         rule_id: 9201,
         status: 403,
     };
-    r.core
-        .active
+    r.active()
         .kernel
         .polls
         .push_back(vec![(2, blocked), (5, Verdict::Allow)]);
     r.core.round().unwrap();
     assert_eq!(outcome(&mut a.answer), Outcome::Verdict(Verdict::Allow));
     assert_eq!(outcome(&mut b.answer), Outcome::Verdict(blocked));
-    assert!(r.core.active.pending.is_empty());
+    assert!(r.active().pending.is_empty());
 }
 
 const DETECTED: Verdict = Verdict::Detected {
@@ -546,36 +624,35 @@ fn a_detection_from_a_generation_that_blocks_is_not_inspectable_and_one_that_det
     r.send(Msg::Ticket(a.ticket));
     r.send(Msg::Ticket(b.ticket));
     r.core.intake(None).unwrap();
-    r.core
-        .active
+    r.active()
         .kernel
         .polls
         .push_back(vec![(0, DETECTED), (1, Verdict::Allow)]);
-    r.core.active.step(Instant::now()).unwrap();
+    r.active().step(Instant::now()).unwrap();
     let not_inspectable = Verdict::Uninspectable(Reason::Protocol);
     assert_eq!(outcome(&mut a.answer), Outcome::Verdict(not_inspectable));
     assert_eq!(outcome(&mut b.answer), Outcome::Verdict(Verdict::Allow));
-    let line = r.core.active.note_turned().expect("the line is made");
+    let line = r.active().note_turned().expect("the line is made");
     assert!(line.contains(&generation(1).hex()), "{line}");
-    assert_eq!(r.core.active.note_turned(), None);
+    assert_eq!(r.active().note_turned(), None);
 
     // The generation detects: the detection goes on as it is, and no line is made.
     let mut r = Rig::new(4, 8);
-    r.core.active.mode = bundle::Mode::Detect;
+    r.active().mode = bundle::Mode::Detect;
     let mut a = r.world.ticket(b"/a", 0);
     r.send(Msg::Ticket(a.ticket));
     r.core.intake(None).unwrap();
-    r.core.active.kernel.polls.push_back(vec![(0, DETECTED)]);
-    r.core.active.step(Instant::now()).unwrap();
+    r.active().kernel.polls.push_back(vec![(0, DETECTED)]);
+    r.active().step(Instant::now()).unwrap();
     assert_eq!(outcome(&mut a.answer), Outcome::Verdict(DETECTED));
-    assert_eq!(r.core.active.note_turned(), None);
+    assert_eq!(r.active().note_turned(), None);
 
     // What `shutdown` decides is checked the same way.
     let mut r = Rig::new(4, 8);
     let mut a = r.world.ticket(b"/a", 0);
     r.send(Msg::Ticket(a.ticket));
     r.core.round().unwrap();
-    r.core.active.kernel.at_shutdown = vec![(0, DETECTED)];
+    r.active().kernel.at_shutdown = vec![(0, DETECTED)];
     r.send(Msg::Stop {
         inspect_by: Instant::now(),
     });
@@ -698,14 +775,14 @@ fn a_verdict_is_delivered_with_the_rules_that_matched_the_request() {
 #[test]
 fn a_duplicate_id_is_fatal() {
     let mut r = Rig::new(4, 8);
-    r.core.active.kernel.ids = VecDeque::from([3, 3]);
+    r.active().kernel.ids = VecDeque::from([3, 3]);
     let a = r.world.ticket(b"/a", 0);
     let b = r.world.ticket(b"/b", 0);
     r.send(Msg::Ticket(a.ticket));
     r.send(Msg::Ticket(b.ticket));
     assert_eq!(r.core.intake(None), Err("duplicate request id"));
     // the first ticket is still the one in the table
-    assert_eq!(r.core.active.pending.len(), 1);
+    assert_eq!(r.active().pending.len(), 1);
 }
 
 // ---- routes ----
@@ -722,15 +799,15 @@ fn routes(paths: &[&str]) -> Routes {
 #[test]
 fn the_shared_routes_follow_the_generation_that_serves() {
     let mut r = Rig::new(4, 8);
-    r.core.routes.replace(routes(&["/old/"]));
+    r.routes.replace(routes(&["/old/"]));
     let mut told = r.send_switch_with(2, routes(&["/new/"]));
     r.core.round().unwrap();
     // While the new kernel starts, the table is the one of the kernel that serves.
-    assert_eq!(*r.core.routes.current(), routes(&["/old/"]));
+    assert_eq!(*r.routes.current(), routes(&["/old/"]));
     r.other().phase = Phase::Ready;
     r.core.round().unwrap();
-    assert_eq!(r.core.active.generation, generation(2));
-    assert_eq!(*r.core.routes.current(), routes(&["/new/"]));
+    assert_eq!(r.active().generation, generation(2));
+    assert_eq!(*r.routes.current(), routes(&["/new/"]));
     assert_eq!(settle(&mut r, &mut told), Switched::Yes);
 
     // A new kernel that fails to start, or is late, leaves the table as it is.
@@ -738,12 +815,12 @@ fn the_shared_routes_follow_the_generation_that_serves() {
     r.core.round().unwrap();
     r.other().phase = Phase::Failed(Failure::Exit(11));
     assert_eq!(settle(&mut r, &mut told), Switched::No);
-    assert_eq!(*r.core.routes.current(), routes(&["/new/"]));
+    assert_eq!(*r.routes.current(), routes(&["/new/"]));
     r.core.limits.ready_wait = Duration::ZERO;
     let mut told = r.send_switch_with(4, routes(&["/fourth/"]));
     assert_eq!(settle(&mut r, &mut told), Switched::No);
-    assert_eq!(*r.core.routes.current(), routes(&["/new/"]));
-    assert_eq!(r.core.active.generation, generation(2));
+    assert_eq!(*r.routes.current(), routes(&["/new/"]));
+    assert_eq!(r.active().generation, generation(2));
 }
 
 // ---- the wait rule ----
@@ -773,25 +850,11 @@ fn the_restart_line_is_given_for_a_new_incarnation_and_not_for_the_same_one() {
 
 // ---- the signals ----
 
-fn signals() -> (
-    Signals,
-    oneshot::Receiver<Result<(), Failure>>,
-    oneshot::Receiver<Failure>,
-) {
-    let (ready_tx, ready) = oneshot::channel();
-    let (failed_tx, failed) = oneshot::channel();
-    let signals = Signals::Waiting {
-        ready: ready_tx,
-        failed: failed_tx,
-    };
-    (signals, ready, failed)
-}
-
 #[test]
-fn ready_is_said_once_and_a_failure_after_it_goes_to_failed_once() {
+fn ready_is_said_once_and_a_failure_after_it_is_said_once() {
     let why = Failure::Exit(3);
-    let (mut s, mut ready, mut failed) = signals();
-    for phase in [
+    let mut s = Signals::Waiting;
+    let said: Vec<_> = [
         Phase::Starting,
         Phase::Starting,
         Phase::Ready,
@@ -799,19 +862,71 @@ fn ready_is_said_once_and_a_failure_after_it_goes_to_failed_once() {
         Phase::Stopping,
         Phase::Starting,
         Phase::Ready,
-    ] {
-        s.note(phase);
-    }
-    assert_eq!(ready.try_recv(), Ok(Ok(())));
-    assert!(matches!(ready.try_recv(), Err(SlotError::Closed)));
-    // `failed` is open and has nothing to say: closed would read as a lost driver
-    assert!(matches!(failed.try_recv(), Err(SlotError::Empty)));
+    ]
+    .into_iter()
+    .filter_map(|phase| s.note(phase))
+    .collect();
+    assert_eq!(said, [Said::Ready]);
+    let said: Vec<_> = [
+        Phase::Failed(why),
+        Phase::Failed(why),
+        Phase::Failed(Failure::ReapUnknown),
+    ]
+    .into_iter()
+    .filter_map(|phase| s.note(phase))
+    .collect();
+    assert_eq!(said, [Said::Lost(why)]);
+    // A kernel that fails before it is ready is told as that, once.
+    let mut s = Signals::Waiting;
+    assert_eq!(s.note(Phase::Failed(why)), Some(Said::Failed(why)));
+    assert_eq!(s.note(Phase::Failed(why)), None);
+    assert_eq!(s.note(Phase::Ready), None);
+}
 
-    s.note(Phase::Failed(why));
-    s.note(Phase::Failed(why));
-    s.note(Phase::Failed(Failure::ReapUnknown));
-    assert_eq!(failed.try_recv(), Ok(why));
-    assert!(matches!(failed.try_recv(), Err(SlotError::Closed)));
+#[test]
+fn the_start_is_ready_when_every_kernel_that_was_started_is_and_a_failure_before_it_ends_it() {
+    let mut r = Rig::with(4, 8, &[Engine::Coraza, Engine::ModSecurity]);
+    r.kernel_of(Engine::Coraza).kernel.phase = Phase::Ready;
+    r.core.round().unwrap();
+    // One kernel is ready and the other is not: the start is not ready, and `/readyz` has the state to say so.
+    assert!(matches!(r.ready.try_recv(), Err(SlotError::Empty)));
+    assert!(!r.state.borrow().all_ready());
+    r.kernel_of(Engine::ModSecurity).kernel.phase = Phase::Ready;
+    r.core.round().unwrap();
+    assert_eq!(r.ready.try_recv(), Ok(Ok(())));
+    assert!(r.state.borrow().all_ready());
+    assert!(matches!(
+        r.failed.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    // A kernel that fails before it is ready ends the wait with its failure.
+    let mut r = Rig::with(4, 8, &[Engine::Coraza, Engine::ModSecurity]);
+    r.kernel_of(Engine::Coraza).kernel.phase = Phase::Ready;
+    r.kernel_of(Engine::ModSecurity).kernel.phase = Phase::Failed(Failure::Exit(11));
+    r.core.round().unwrap();
+    assert_eq!(r.ready.try_recv(), Ok(Err(Failure::Exit(11))));
+}
+
+#[test]
+fn the_failure_of_a_kernel_that_serves_is_said_whichever_engine_it_is() {
+    for failing in [Engine::Coraza, Engine::ModSecurity] {
+        let mut r = Rig::with(4, 8, &[Engine::Coraza, Engine::ModSecurity]);
+        for engine in [Engine::Coraza, Engine::ModSecurity] {
+            r.kernel_of(engine).kernel.phase = Phase::Ready;
+        }
+        r.core.round().unwrap();
+        assert_eq!(r.ready.try_recv(), Ok(Ok(())));
+        // The engine that nothing uses is the one that is not named by a group: its failure stops the proxy too.
+        r.kernel_of(failing).kernel.phase = Phase::Failed(Failure::Exit(3));
+        r.core.round().unwrap();
+        assert_eq!(r.failed.try_recv(), Ok(Failure::Exit(3)), "{failing:?}");
+        r.core.round().unwrap();
+        assert!(matches!(
+            r.failed.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
 }
 
 // ---- stop and shutdown ----
@@ -830,7 +945,7 @@ fn after_a_stop_tickets_are_still_submitted_and_shutdown_waits_for_the_ingress_t
     assert!(r.core.round().unwrap().is_none());
     assert_eq!(r.core.mode, Mode::Stopping { inspect_by: by });
     assert_eq!(
-        r.core.active.kernel.seen.len(),
+        r.active().kernel.seen.len(),
         2,
         "the ticket after Stop is submitted"
     );
@@ -849,16 +964,15 @@ fn after_a_stop_tickets_are_still_submitted_and_shutdown_waits_for_the_ingress_t
     );
 
     // both results come out, but a sender is left: no shutdown yet
-    r.core
-        .active
+    r.active()
         .kernel
         .polls
         .push_back(vec![(0, Verdict::Allow), (1, Verdict::Allow)]);
     for _ in 0..3 {
         assert!(r.core.round().unwrap().is_none());
     }
-    assert!(r.core.active.pending.is_empty());
-    assert_eq!(r.core.active.kernel.shutdowns(), vec![]);
+    assert!(r.active().pending.is_empty());
+    assert_eq!(r.active().kernel.shutdowns(), vec![]);
     assert_eq!(outcome(&mut a.answer), Outcome::Verdict(Verdict::Allow));
     assert_eq!(outcome(&mut b.answer), Outcome::Verdict(Verdict::Allow));
 
@@ -866,7 +980,7 @@ fn after_a_stop_tickets_are_still_submitted_and_shutdown_waits_for_the_ingress_t
     r.close();
     let done = r.core.round().unwrap().expect("shutdown is due");
     assert_eq!(done.phase, Phase::Stopped);
-    assert_eq!(r.core.active.kernel.shutdowns(), vec![earlier]);
+    assert_eq!(r.active().kernel.shutdowns(), vec![earlier]);
     assert_eq!(r.core.mode, Mode::Down);
 }
 
@@ -878,7 +992,7 @@ fn at_the_stop_deadline_shutdown_is_called_and_a_late_ticket_is_unavailable() {
     r.core.round().unwrap();
 
     let unavailable = Verdict::Uninspectable(Reason::Unavailable);
-    r.core.active.kernel.at_shutdown = vec![(0, unavailable)];
+    r.active().kernel.at_shutdown = vec![(0, unavailable)];
     let by = Instant::now();
     r.send(Msg::Stop { inspect_by: by });
     let done = r.core.round().unwrap().expect("the deadline is reached");
@@ -894,10 +1008,10 @@ fn at_the_stop_deadline_shutdown_is_called_and_a_late_ticket_is_unavailable() {
     r.core.quiesce().unwrap();
     // No kernel judged it.
     assert_eq!(answer(&mut late.answer), Answer::from(Outcome::Unavailable));
-    assert_eq!(r.core.active.kernel.seen.len(), 1);
-    assert_eq!(r.core.active.kernel.shutdowns(), vec![by]);
+    assert_eq!(r.active().kernel.seen.len(), 1);
+    assert_eq!(r.active().kernel.shutdowns(), vec![by]);
     assert!(matches!(
-        r.core.active.kernel.calls.last(),
+        r.active().kernel.calls.last(),
         Some(Call::Shutdown(_))
     ));
     assert_eq!(r.world.free().0, INSPECT);
@@ -957,17 +1071,23 @@ fn a_kernel_that_cannot_start_says_so_once_through_ready_and_still_answers() {
         stop_inspect: 10 * SEC,
     };
     let mut d = start(
-        config(root),
-        generation(1),
-        bundle::Mode::Block,
-        SharedRoutes::new(Routes::default()),
+        vec![Start {
+            generation: generation(1),
+            mode: bundle::Mode::Block,
+            routes: Routes::default(),
+            kernel: config(root),
+        }],
+        Gates::new(INSPECT),
         limits,
         start_logger(Format::Json).unwrap(),
     )
     .unwrap();
     let told = answer(&mut d.ready);
     assert!(matches!(told, Err(Failure::TmpDir(_))), "{told:?}");
-    assert!(matches!(d.failed.try_recv(), Err(SlotError::Empty)));
+    assert!(matches!(
+        d.failed.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 
     // the kernel decides a ticket at once as unavailable
     let world = World::new();
@@ -1024,7 +1144,10 @@ impl Rig {
 
     /// The kernel that does not get new tickets.
     fn other(&mut self) -> &mut Fake {
-        &mut self.core.other().expect("a switch is under way").kernel
+        &mut self.core.lanes[0]
+            .other()
+            .expect("a switch is under way")
+            .kernel
     }
 }
 
@@ -1050,7 +1173,7 @@ fn uris(kernel: &Fake) -> Vec<Vec<u8>> {
 #[test]
 fn a_ready_generation_gets_the_new_tickets_and_the_old_one_finishes_and_is_stopped() {
     let mut r = Rig::new(4, 8);
-    let old_shut = r.core.active.kernel.shut.clone();
+    let old_shut = r.active().kernel.shut.clone();
     let mut a = r.world.ticket(b"/a", 0);
     r.send(Msg::Ticket(a.ticket));
     r.core.round().unwrap();
@@ -1061,31 +1184,28 @@ fn a_ready_generation_gets_the_new_tickets_and_the_old_one_finishes_and_is_stopp
     let mut b = r.world.ticket(b"/b", 0);
     r.send(Msg::Ticket(b.ticket));
     r.core.round().unwrap();
-    assert_eq!(
-        uris(&r.core.active.kernel),
-        [b"/a".to_vec(), b"/b".to_vec()]
-    );
+    assert_eq!(uris(&r.active().kernel), [b"/a".to_vec(), b"/b".to_vec()]);
     assert!(r.other().seen.is_empty());
-    assert_eq!(r.core.active.generation, generation(1));
+    assert_eq!(r.active().generation, generation(1));
 
     // The new kernel is ready and takes the new tickets. Its first id is the id of `a`, which the old kernel holds.
     r.other().phase = Phase::Ready;
     r.other().ids = VecDeque::from([0]);
     r.core.round().unwrap();
-    assert_eq!(r.core.active.generation, generation(2));
+    assert_eq!(r.active().generation, generation(2));
     let blocked = Verdict::Block {
         phase: 1,
         rule_id: 9204,
         status: 403,
     };
-    r.core.active.kernel.polls.push_back(vec![(0, blocked)]);
+    r.active().kernel.polls.push_back(vec![(0, blocked)]);
     r.other()
         .polls
         .push_back(vec![(0, Verdict::Allow), (1, Verdict::Allow)]);
     let mut c = r.world.ticket(b"/c", 0);
     r.send(Msg::Ticket(c.ticket));
     r.core.round().unwrap();
-    assert_eq!(uris(&r.core.active.kernel), [b"/c".to_vec()]);
+    assert_eq!(uris(&r.active().kernel), [b"/c".to_vec()]);
     // Every result went to the request of its own kernel, although two requests have the id 0, and names the
     // generation of that kernel.
     let judged = |slot: &mut oneshot::Receiver<Answer>| {
@@ -1103,15 +1223,15 @@ fn a_ready_generation_gets_the_new_tickets_and_the_old_one_finishes_and_is_stopp
     // The old kernel holds nothing now: it is stopped, and the main thread is told when it is gone.
     assert_eq!(settle(&mut r, &mut told), Switched::Yes);
     assert_eq!(old_shut.lock().unwrap().len(), 1);
-    assert!(r.core.retired_clean);
-    assert!(matches!(r.core.switching, Switching::Idle));
+    assert!(r.lane().retired_clean);
+    assert!(matches!(r.lane().switching, Switching::Idle));
 }
 
 #[test]
 fn an_old_kernel_that_is_out_of_time_is_stopped_at_once_with_its_requests_decided() {
     let mut r = Rig::new(4, 8);
     r.core.limits.stop_inspect = Duration::ZERO;
-    let old_shut = r.core.active.kernel.shut.clone();
+    let old_shut = r.active().kernel.shut.clone();
     let mut a = r.world.ticket(b"/a", 0);
     r.send(Msg::Ticket(a.ticket));
     r.core.round().unwrap();
@@ -1134,21 +1254,19 @@ fn a_ready_generation_is_not_taken_while_the_serving_kernel_has_failed() {
     let _told = r.send_switch_with(2, routes(&["/new/"]));
     r.core.round().unwrap();
     r.other().phase = Phase::Ready;
-    r.core.active.kernel.phase = Phase::Failed(Failure::Exit(3));
+    r.active().kernel.phase = Phase::Failed(Failure::Exit(3));
     r.core.round().unwrap();
-    assert_eq!(r.core.active.generation, generation(1));
-    assert!(matches!(r.core.switching, Switching::Starting { .. }));
-    assert!(r.core.routes.current().is_empty());
+    assert_eq!(r.active().generation, generation(1));
+    assert!(matches!(r.lane().switching, Switching::Starting { .. }));
+    assert!(r.routes.current().is_empty());
 }
 
 #[test]
 fn a_generation_that_fails_or_is_late_is_stopped_and_the_old_one_serves_on() {
     let mut r = Rig::new(4, 8);
-    let (told_by, mut ready, mut failed) = signals();
-    r.core.signals = told_by;
-    r.core.active.kernel.phase = Phase::Ready;
+    r.active().kernel.phase = Phase::Ready;
     r.core.round().unwrap();
-    assert_eq!(ready.try_recv(), Ok(Ok(())));
+    assert_eq!(r.ready.try_recv(), Ok(Ok(())));
 
     // A new kernel that fails to start. Its failure is not the failure of the kernel that serves.
     let mut told = r.send_switch(2);
@@ -1158,23 +1276,22 @@ fn a_generation_that_fails_or_is_late_is_stopped_and_the_old_one_serves_on() {
     r.other().detail = Some(b"tkv0-inspector: start: rules\n".to_vec());
     assert_eq!(settle(&mut r, &mut told), Switched::No);
     assert_eq!(new_shut.lock().unwrap().len(), 1);
-    assert!(matches!(failed.try_recv(), Err(SlotError::Empty)));
+    assert!(matches!(
+        r.failed.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 
     // A new kernel that is not ready in time.
     r.core.limits.ready_wait = Duration::ZERO;
     let mut told = r.send_switch(3);
     assert_eq!(settle(&mut r, &mut told), Switched::No);
-    assert!(r.core.retired_clean);
+    assert!(r.lane().retired_clean);
 
     // The old kernel served on all the time.
-    assert_eq!(r.core.active.generation, generation(1));
+    assert_eq!(r.active().generation, generation(1));
     let mut a = r.world.ticket(b"/a", 0);
     r.send(Msg::Ticket(a.ticket));
-    r.core
-        .active
-        .kernel
-        .polls
-        .push_back(vec![(0, Verdict::Allow)]);
+    r.active().kernel.polls.push_back(vec![(0, Verdict::Allow)]);
     r.core.round().unwrap();
     assert_eq!(outcome(&mut a.answer), Outcome::Verdict(Verdict::Allow));
 }
@@ -1203,7 +1320,7 @@ fn a_stop_during_a_switch_stops_the_new_kernel_at_once_and_lets_the_old_one_fini
 
     // While the old kernel finishes its requests: the stop waits for them until its deadline.
     let mut r = Rig::new(4, 8);
-    let old_shut = r.core.active.kernel.shut.clone();
+    let old_shut = r.active().kernel.shut.clone();
     let mut a = r.world.ticket(b"/a", 0);
     r.send(Msg::Ticket(a.ticket));
     r.core.round().unwrap();
@@ -1211,7 +1328,7 @@ fn a_stop_during_a_switch_stops_the_new_kernel_at_once_and_lets_the_old_one_fini
     r.core.round().unwrap();
     r.other().phase = Phase::Ready;
     r.core.round().unwrap();
-    assert_eq!(r.core.active.generation, generation(2));
+    assert_eq!(r.active().generation, generation(2));
     let unavailable = Verdict::Uninspectable(Reason::Unavailable);
     r.other().at_shutdown = vec![(0, unavailable)];
     r.send(Msg::Stop {
@@ -1232,7 +1349,7 @@ fn a_stop_during_a_switch_stops_the_new_kernel_at_once_and_lets_the_old_one_fini
     assert_eq!(*old_shut.lock().unwrap(), [by]);
     assert_eq!(outcome(&mut a.answer), Outcome::Verdict(unavailable));
     assert_eq!(told.try_recv(), Ok(Switched::Yes));
-    assert!(r.core.retired_clean);
+    assert!(r.lane().retired_clean);
 }
 
 // ---- the state ----
@@ -1240,9 +1357,9 @@ fn a_stop_during_a_switch_stops_the_new_kernel_at_once_and_lets_the_old_one_fini
 #[test]
 fn the_state_follows_the_kernel_that_serves_and_its_restarts_add_up_over_a_switch() {
     let mut r = Rig::new(4, 8);
-    let seen = |r: &Rig| *r.state.borrow();
+    let seen = |r: &Rig| r.seen();
     assert_eq!(seen(&r).phase, Phase::Starting);
-    r.core.active.kernel.phase = Phase::Ready;
+    r.active().kernel.phase = Phase::Ready;
     r.core.round().unwrap();
     let ready = State {
         phase: Phase::Ready,
@@ -1254,8 +1371,8 @@ fn the_state_follows_the_kernel_that_serves_and_its_restarts_add_up_over_a_switc
     assert_eq!(seen(&r), ready);
 
     // The restart window of the inspector: the phase leaves Ready, and the restarts made so far rise.
-    r.core.active.kernel.phase = Phase::Starting;
-    r.core.active.kernel.restarts = 1;
+    r.active().kernel.phase = Phase::Starting;
+    r.active().kernel.restarts = 1;
     r.core.round().unwrap();
     assert_eq!(
         seen(&r),
@@ -1265,7 +1382,7 @@ fn the_state_follows_the_kernel_that_serves_and_its_restarts_add_up_over_a_switc
             ..ready
         }
     );
-    r.core.active.kernel.phase = Phase::Ready;
+    r.active().kernel.phase = Phase::Ready;
     r.core.round().unwrap();
     assert_eq!(
         seen(&r),
@@ -1289,21 +1406,66 @@ fn the_state_follows_the_kernel_that_serves_and_its_restarts_add_up_over_a_switc
             ..ready
         }
     );
-    r.core.active.kernel.restarts = 1;
+    r.active().kernel.restarts = 1;
     r.core.round().unwrap();
     assert_eq!(seen(&r).restarts, 2);
 }
 
 #[test]
-fn the_engine_of_the_generation_that_serves_is_the_one_of_the_kernel_configuration_of_its_switch() {
+fn a_switch_for_an_engine_that_has_no_kernel_starts_it_and_the_state_has_both_engines() {
     let mut r = Rig::new(4, 8);
-    r.core.active.kernel.phase = Phase::Ready;
+    r.active().kernel.phase = Phase::Ready;
     r.core.round().unwrap();
-    assert_eq!(r.state.borrow().engine, Engine::Coraza);
+    assert_eq!(r.state.borrow().of(Engine::ModSecurity), None);
     let (reply, mut told) = oneshot::channel();
     r.send(Msg::Switch(Switch {
         generation: generation(2),
         mode: bundle::Mode::Detect,
+        routes: routes(&["/other/"]),
+        kernel: Config {
+            engine: Engine::ModSecurity,
+            ..config(Path::new("/driver-test/switch-root"))
+        },
+        reply,
+    }));
+    r.core.round().unwrap();
+    // The new kernel starts: Coraza serves as it did, the table of ModSecurity is not the new one yet, and nothing is
+    // told.
+    assert!(matches!(told.try_recv(), Err(SlotError::Empty)));
+    let table = r.core.lanes[index(Engine::ModSecurity)].routes.clone();
+    assert!(table.current().is_empty());
+    r.core.lanes[index(Engine::ModSecurity)]
+        .other()
+        .expect("the kernel starts")
+        .kernel
+        .phase = Phase::Ready;
+    r.core.round().unwrap();
+    // The engine has nothing to finish: the answer is given at once, and its state and its routes are its own.
+    assert_eq!(told.try_recv(), Ok(Switched::Yes));
+    let states = *r.state.borrow();
+    let seen = states.of(Engine::ModSecurity).copied().unwrap();
+    assert_eq!(
+        (seen.generation, seen.engine, seen.mode),
+        (generation(2), Engine::ModSecurity, bundle::Mode::Detect)
+    );
+    assert_eq!(states.of(Engine::Coraza).unwrap().generation, generation(1));
+    assert_eq!(*table.current(), routes(&["/other/"]));
+    assert!(r.routes.current().is_empty());
+    // From now on its failure is the failure of a kernel that serves.
+    r.kernel_of(Engine::ModSecurity).kernel.phase = Phase::Failed(Failure::Exit(3));
+    r.core.round().unwrap();
+    assert_eq!(r.failed.try_recv(), Ok(Failure::Exit(3)));
+}
+
+#[test]
+fn a_kernel_of_a_new_engine_that_fails_before_it_is_ready_is_the_failure_of_its_switch() {
+    let mut r = Rig::new(4, 8);
+    r.active().kernel.phase = Phase::Ready;
+    r.core.round().unwrap();
+    let (reply, mut told) = oneshot::channel();
+    r.send(Msg::Switch(Switch {
+        generation: generation(2),
+        mode: bundle::Mode::Block,
         routes: Routes::default(),
         kernel: Config {
             engine: Engine::ModSecurity,
@@ -1312,12 +1474,149 @@ fn the_engine_of_the_generation_that_serves_is_the_one_of_the_kernel_configurati
         reply,
     }));
     r.core.round().unwrap();
-    r.other().phase = Phase::Ready;
+    r.core.lanes[index(Engine::ModSecurity)]
+        .other()
+        .expect("the kernel starts")
+        .kernel
+        .phase = Phase::Failed(Failure::Exit(11));
+    assert_eq!(settle(&mut r, &mut told), Switched::No);
+    // The proxy is not stopped for it, the engine has no kernel, and its tickets are not served.
+    assert!(matches!(
+        r.failed.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(r.state.borrow().of(Engine::ModSecurity), None);
+}
+
+// ---- the engine of a ticket ----
+
+#[test]
+fn a_ticket_goes_to_the_kernel_of_its_engine_and_to_no_other() {
+    let mut r = Rig::with(4, 16, &[Engine::Coraza, Engine::ModSecurity]);
+    for engine in [Engine::Coraza, Engine::ModSecurity] {
+        r.kernel_of(engine).kernel.phase = Phase::Ready;
+    }
+    let mut a = r.world.ticket_for(Engine::Coraza, b"/a", 0);
+    let mut b = r.world.ticket_for(Engine::ModSecurity, b"/b", 0);
+    r.send(Msg::Ticket(a.ticket));
+    r.send(Msg::Ticket(b.ticket));
+    // The two kernels give different verdicts for the first request they get: Coraza allows, ModSecurity blocks.
+    let blocked = Verdict::Block {
+        phase: 1,
+        rule_id: 949_110,
+        status: 403,
+    };
+    r.kernel_of(Engine::Coraza)
+        .kernel
+        .polls
+        .push_back(vec![(0, Verdict::Allow)]);
+    r.kernel_of(Engine::ModSecurity)
+        .kernel
+        .polls
+        .push_back(vec![(0, blocked)]);
     r.core.round().unwrap();
-    assert_eq!(settle(&mut r, &mut told), Switched::Yes);
-    let seen = *r.state.borrow();
+    assert_eq!(uris(&r.kernel_of(Engine::Coraza).kernel), [b"/a".to_vec()]);
     assert_eq!(
-        (seen.generation, seen.engine, seen.mode),
-        (generation(2), Engine::ModSecurity, bundle::Mode::Detect)
+        uris(&r.kernel_of(Engine::ModSecurity).kernel),
+        [b"/b".to_vec()]
     );
+    // Each answer names the engine that gave it.
+    let by = |slot: &mut oneshot::Receiver<Answer>| {
+        let Answer { outcome, by } = answer(slot);
+        (outcome, by.map(|judge| judge.engine))
+    };
+    assert_eq!(
+        by(&mut a.answer),
+        (Outcome::Verdict(Verdict::Allow), Some(Engine::Coraza))
+    );
+    assert_eq!(
+        by(&mut b.answer),
+        (Outcome::Verdict(blocked), Some(Engine::ModSecurity))
+    );
+}
+
+#[test]
+fn a_ticket_for_an_engine_without_a_kernel_is_unavailable_and_goes_to_no_other_engine() {
+    let mut r = Rig::new(4, 8);
+    r.active().kernel.phase = Phase::Ready;
+    let mut a = r.world.ticket_for(Engine::ModSecurity, b"/a", 0);
+    let mut b = r.world.ticket(b"/b", 0);
+    r.send(Msg::Ticket(a.ticket));
+    r.send(Msg::Ticket(b.ticket));
+    r.active().kernel.polls.push_back(vec![(0, Verdict::Allow)]);
+    r.core.round().unwrap();
+    assert_eq!(outcome(&mut a.answer), Outcome::Unavailable);
+    assert_eq!(uris(&r.active().kernel), [b"/b".to_vec()]);
+    assert_eq!(outcome(&mut b.answer), Outcome::Verdict(Verdict::Allow));
+    // What the ticket held is back at once.
+    drop(a.body);
+    drop(b.body);
+    assert_eq!(r.world.free(), (INSPECT, BUDGET));
+}
+
+#[test]
+fn the_tables_of_routes_are_the_engines_own_and_a_failed_switch_of_one_leaves_the_other() {
+    let mut r = Rig::with(4, 8, &[Engine::Coraza, Engine::ModSecurity]);
+    for engine in [Engine::Coraza, Engine::ModSecurity] {
+        r.kernel_of(engine).kernel.phase = Phase::Ready;
+    }
+    r.routes.replace(routes(&["/coraza/"]));
+    let other = r.core.lanes[index(Engine::ModSecurity)].routes.clone();
+    other.replace(routes(&["/modsecurity/"]));
+    // A switch of ModSecurity that becomes ready replaces its table and not the table of Coraza.
+    let (reply, mut told) = oneshot::channel();
+    r.send(Msg::Switch(Switch {
+        generation: generation(2),
+        mode: bundle::Mode::Block,
+        routes: routes(&["/second/"]),
+        kernel: Config {
+            engine: Engine::ModSecurity,
+            ..config(Path::new("/driver-test/switch-root"))
+        },
+        reply,
+    }));
+    r.core.round().unwrap();
+    r.core.lanes[index(Engine::ModSecurity)]
+        .other()
+        .expect("the kernel starts")
+        .kernel
+        .phase = Phase::Ready;
+    r.core.round().unwrap();
+    assert_eq!(*other.current(), routes(&["/second/"]));
+    assert_eq!(*r.routes.current(), routes(&["/coraza/"]));
+    assert_eq!(settle(&mut r, &mut told), Switched::Yes);
+}
+
+#[test]
+fn a_stop_stops_the_kernels_of_all_the_engines_by_the_deadline() {
+    let mut r = Rig::with(4, 8, &[Engine::Coraza, Engine::ModSecurity]);
+    let shuts: Vec<_> = [Engine::Coraza, Engine::ModSecurity]
+        .into_iter()
+        .map(|engine| {
+            r.kernel_of(engine).kernel.phase = Phase::Ready;
+            r.kernel_of(engine).kernel.shut.clone()
+        })
+        .collect();
+    let mut a = r.world.ticket_for(Engine::ModSecurity, b"/a", 0);
+    r.send(Msg::Ticket(a.ticket));
+    r.core.round().unwrap();
+    let unavailable = Verdict::Uninspectable(Reason::Unavailable);
+    r.kernel_of(Engine::ModSecurity).kernel.at_shutdown = vec![(0, unavailable)];
+    let by = Instant::now();
+    r.send(Msg::Stop { inspect_by: by });
+    let done = loop {
+        if let Some(done) = r.core.round().unwrap() {
+            break done;
+        }
+    };
+    assert_eq!(done.phase, Phase::Stopped);
+    // Every kernel was stopped, once, with the deadline, one of them here and the other on a thread of its own.
+    eventually("both kernels were stopped", || {
+        shuts.iter().all(|shut| shut.lock().unwrap().len() == 1)
+    });
+    for shut in &shuts {
+        assert_eq!(*shut.lock().unwrap(), [by]);
+    }
+    assert_eq!(outcome(&mut a.answer), Outcome::Verdict(unavailable));
+    assert!(r.core.lanes.iter().all(|lane| lane.retired_clean));
 }

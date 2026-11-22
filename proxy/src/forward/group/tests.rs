@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use tukuyomi_kernel::Engine;
+
 use super::*;
 use crate::forward::origin::tests::config;
 
@@ -185,6 +187,7 @@ fn the_way_to_the_admin_process_is_taken_by_the_name_of_its_host_alone() {
         host: "admin.example".to_owned(),
         access: Access::default(),
         server: "127.0.0.1:9180".parse().unwrap(),
+        engine: Engine::Coraza,
     });
     let upstreams = Upstreams::new(&forward, &config());
     let way = |host: &[u8]| {

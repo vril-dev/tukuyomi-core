@@ -68,7 +68,8 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
             phase: "ready",
             switching: false,
             ready: true,
-            // A proxy that does not send the figures.
+            // A proxy that does not send the figures, nor its engines.
+            engines: None,
             reloading: None,
             uptime_ms: None,
             requests: None,
@@ -82,6 +83,7 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
         }
     );
     for key in [
+        "engines",
         "config",
         "reloading",
         "resolve_timeout_ms",
@@ -104,6 +106,7 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
             "switching": false,
             "reloading": true,
             "ready": true,
+            "engines": null,
             "uptime_ms": 1234,
             "requests": 50,
             "blocked": 3,
@@ -128,12 +131,110 @@ fn a_status_and_the_answers_to_a_switch_are_read_from_the_lines_of_the_proxy() {
             fp(2).hex()
         );
         let (path, thread) = serve(dir.path(), Some(line), Duration::ZERO);
-        assert_eq!(control(&path).switch(fp(2)), Some(reply), "{word}");
+        assert_eq!(
+            control(&path).switch(Engine::ModSecurity, fp(2)),
+            Some(reply),
+            "{word}"
+        );
         assert_eq!(
             thread.join().unwrap(),
-            format!("{{\"op\":\"switch\",\"expect\":\"{}\"}}\n", fp(2).hex())
+            format!(
+                "{{\"op\":\"switch\",\"engine\":\"modsecurity\",\"expect\":\"{}\"}}\n",
+                fp(2).hex()
+            )
         );
         fs::remove_file(&path).unwrap();
+    }
+}
+
+/// The line of a proxy that sends its engines as well: Coraza serves the generation 1 and ModSecurity serves the
+/// generation 6, in detect mode, still starting.
+fn engines_line() -> String {
+    status_line("block").replace(
+        "\"ready\":true",
+        &format!(
+            "\"ready\":true,\"engines\":[{{\"engine\":\"coraza\",\"generation\":\"{}\",\"mode\":\"block\",\"phase\":\"ready\"}},{{\"engine\":\"modsecurity\",\"generation\":\"{}\",\"mode\":\"detect\",\"phase\":\"starting\"}}]",
+            fp(1).hex(),
+            fp(6).hex()
+        ),
+    )
+}
+
+#[test]
+fn the_engines_of_a_status_are_read_by_engine_and_a_line_with_a_wrong_entry_is_not_the_proxys() {
+    let dir = scratch();
+    let (path, thread) = serve(dir.path(), Some(engines_line()), Duration::ZERO);
+    let status = control(&path).status().state().unwrap();
+    thread.join().unwrap();
+    fs::remove_file(&path).unwrap();
+    let engines = status.engines.expect("the proxy sends its engines");
+    assert_eq!(
+        engines.of(Engine::Coraza),
+        Some(&EngineStatus {
+            generation: fp(1),
+            mode: "block",
+            phase: "ready"
+        })
+    );
+    assert_eq!(
+        engines.of(Engine::ModSecurity),
+        Some(&EngineStatus {
+            generation: fp(6),
+            mode: "detect",
+            phase: "starting"
+        })
+    );
+    assert_eq!(
+        status.json()["engines"],
+        json!([
+            {"engine": "coraza", "generation": fp(1).hex(), "mode": "block", "phase": "ready"},
+            {"engine": "modsecurity", "generation": fp(6).hex(), "mode": "detect", "phase": "starting"},
+        ])
+    );
+    // An engine that the proxy does not run is not there; an empty list is a proxy that runs none, which is not
+    // the same as one that does not say.
+    let one = engines_line().replace(
+        &format!(",{{\"engine\":\"modsecurity\",\"generation\":\"{}\",\"mode\":\"detect\",\"phase\":\"starting\"}}", fp(6).hex()),
+        "",
+    );
+    let (path, thread) = serve(dir.path(), Some(one), Duration::ZERO);
+    let status = control(&path).status().state().unwrap();
+    thread.join().unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(status.engines.unwrap().of(Engine::ModSecurity).is_none());
+    // A name that is not an engine, an engine twice, a short generation and an unknown word are not the proxy's.
+    for bad in [
+        engines_line().replace("\"modsecurity\"", "\"Coraza\""),
+        engines_line().replace("\"modsecurity\"", "\"coraza\""),
+        engines_line().replace(&fp(6).hex(), "abc"),
+        engines_line().replace("\"starting\"", "\"loud\""),
+        engines_line().replace("\"detect\"", "\"loud\""),
+        engines_line().replace("\"phase\":\"starting\"", "\"phase\":\"starting\",\"x\":1"),
+    ] {
+        let (path, thread) = serve(dir.path(), Some(bad.clone()), Duration::ZERO);
+        assert_eq!(control(&path).status(), Seen::Unreachable, "{bad:?}");
+        thread.join().unwrap();
+        fs::remove_file(&path).unwrap();
+    }
+}
+
+#[test]
+fn the_answer_to_a_switch_has_a_generation_or_null_for_an_engine_that_does_not_run() {
+    let dir = scratch();
+    for (generation, taken) in [
+        (format!(",\"generation\":\"{}\"", fp(2).hex()), true),
+        (",\"generation\":null".to_owned(), true),
+        (",\"generation\":\"abc\"".to_owned(), false),
+        (",\"generation\":5".to_owned(), false),
+        // The key is there in every answer, `null` for an engine that does not run.
+        (String::new(), false),
+    ] {
+        let line = format!("{{\"result\":\"refused\"{generation}}}\n");
+        let (path, thread) = serve(dir.path(), Some(line), Duration::ZERO);
+        let reply = control(&path).switch(Engine::ModSecurity, fp(2));
+        thread.join().unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(reply, taken.then_some(Reply::Refused), "{generation}");
     }
 }
 
@@ -195,7 +296,7 @@ fn no_socket_no_answer_and_an_answer_that_is_not_the_proxys_are_all_unreachable(
         Some(good.replace("switched", "done")),
         Duration::ZERO,
     );
-    assert_eq!(control(&path).switch(fp(1)), None);
+    assert_eq!(control(&path).switch(Engine::Coraza, fp(1)), None);
     thread.join().unwrap();
     fs::remove_file(&path).unwrap();
     // A proxy that takes the question and says nothing is given up after the time of the question.
@@ -253,7 +354,10 @@ fn a_proxy_that_takes_the_connection_and_closes_it_has_no_place_and_is_not_unrea
     fs::remove_file(&path).unwrap();
     // An order that is closed on was not taken, which is what the proxy says of an order it cannot take now.
     let (path, thread) = closing(dir.path(), 1, None);
-    assert_eq!(control(&path).switch(fp(2)), Some(Reply::Busy));
+    assert_eq!(
+        control(&path).switch(Engine::Coraza, fp(2)),
+        Some(Reply::Busy)
+    );
     thread.join().unwrap();
 }
 
@@ -285,7 +389,7 @@ fn a_socket_whose_queue_is_full_is_given_up_within_the_time_of_a_question() {
     );
     let began = Instant::now();
     assert_eq!(control(&path).status(), Seen::Unreachable);
-    assert_eq!(control(&path).switch(fp(1)), None);
+    assert_eq!(control(&path).switch(Engine::Coraza, fp(1)), None);
     assert!(began.elapsed() < 2 * ASK_WAIT);
 }
 

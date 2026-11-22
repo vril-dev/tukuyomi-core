@@ -1,6 +1,6 @@
-// The screens of the WAF. This file has the overview: the numbers of the proxy since it started, its state, the rule
-// generation that the rules store chooses and the one that the proxy serves (with a warning when they differ), the
-// generation that a rollback would choose, the settings file that is in force, and the card of the managed
+// The screens of the WAF. This file has the overview: the numbers of the proxy since it started, its state, for each
+// engine the rule generation that the rules store chooses and the one that the proxy serves (with a warning when they
+// differ), the generation that a rollback would choose, the settings file that is in force, and the card of the managed
 // configuration (made in `../managed/managed.js`). The other screens are in `generations.js` (the generations, the
 // history and the rollback), `import.js` and `records.js` (the records and the
 // audit log); `app.js` puts them in the order of the menu. A screen is `{ id, title, least, mount }`; `mount(ctx, root)`
@@ -8,11 +8,11 @@
 // module is loaded.
 
 import { badge, button, el, mount, notice } from '../dom.js';
-import { screens as generationScreens } from './generations.js';
+import { engineHeading, screens as generationScreens, shownEngines } from './generations.js';
 import { formatNumber, lazy, t, w } from '../i18n.js';
 import { screens as importScreens } from './import.js';
 import { managedCard } from '../managed/managed.js';
-import { engineBadge, fingerprintView, generationState, hashOf, isFingerprint, kv, modeName, pageHead, panel, row, setBusy, stat, timeView } from '../parts.js';
+import { defaultEngine, engineStates, fingerprintView, generationState, hashOf, isFingerprint, kv, modeBadge, oldProxy, pageHead, panel, row, setBusy, stat, timeView } from '../parts.js';
 import { screens as recordScreens } from './records.js';
 
 export { generationState };
@@ -25,6 +25,12 @@ const PHASES = {
   stopped: ['bad', () => w('phase.stopped')],
   failed: ['bad', () => w('phase.failed')],
 };
+
+/** The badge of a phase of an engine of the proxy; a word that is not known is shown as the API gave it. */
+function phaseBadge(phase) {
+  const [tone, words] = Object.hasOwn(PHASES, phase) ? PHASES[phase] : ['muted', () => String(phase)];
+  return badge(tone, words());
+}
 
 const SECOND = 1000;
 
@@ -94,20 +100,21 @@ function overviewStats(data) {
   );
 }
 
+/** The badge for whether the proxy is ready: all the engines that it runs are, which is what `/readyz` says. */
+function readyBadge(proxy) {
+  if (proxy.ready === true) return badge('ok', w('phase.ready'));
+  return proxy.ready === false ? badge('warn', w('status.not_ready')) : null;
+}
+
 function proxyPanel(data) {
   const proxy = data.proxy;
   if (proxy === null || typeof proxy !== 'object') {
     return panel(w('status.proxy'), [], data.reachable === false ? notice('bad', w('status.unreachable')) : notice('warn', w('status.busy')));
   }
-  const [tone, words] = Object.hasOwn(PHASES, proxy.phase) ? PHASES[proxy.phase] : ['muted', () => String(proxy.phase)];
   return panel(
     w('status.proxy'),
-    [badge(tone, words())],
-    kv(
-      row(w('status.mode'), badge('muted', lazy(() => modeName(proxy.mode)))),
-      row(w('status.engine'), engineBadge(proxy.engine)),
-      row(w('status.switching'), proxy.switching ? badge('warn', w('status.switching_on')) : w('status.switching_off')),
-    ),
+    [readyBadge(proxy)],
+    kv(row(w('status.switching'), proxy.switching ? badge('warn', w('status.switching_on')) : w('status.switching_off'))),
     figuresLeftOut(data) ? notice('info', w('overview.reason_old')) : null,
   );
 }
@@ -117,23 +124,39 @@ function generationLine(value) {
   return el('span', { class: 'tc-actions' }, fingerprintView(value), el('a', { class: 'tc-link', href: hashOf('generations', { id: value }) }, w('overview.open')));
 }
 
-function generationsPanel(data) {
-  const state = generationState(data);
-  let verdict = null;
-  if (state === 'same') verdict = notice('ok', w('status.same'));
-  if (state === 'differ') verdict = notice('warn', w('status.differ'));
-  if (state === 'switching') verdict = notice('info', w('status.differ_switching'));
-  const target = data.rollback_to;
-  return panel(
-    w('status.generations'),
-    [],
+// For each state of an engine (see `engineStates`) the words that say what it comes to; none for a state that has none.
+const VERDICTS = {
+  same: () => notice('ok', w('status.same')),
+  differ: () => notice('warn', w('status.differ')),
+  switching: () => notice('info', w('status.differ_switching')),
+  unstarted: () => notice('warn', w('status.unstarted')),
+  unchosen: () => notice('info', w('status.unchosen')),
+  unknown: () => notice('info', w('status.unknown_engine')),
+};
+
+/** The part of the panel of the generations for one engine: what is chosen for it, what the proxy serves, the way back, and what that comes to. */
+function engineSection(state) {
+  const target = state.rollbackTo;
+  return [
+    el('div', { class: 'tc-actions' }, engineHeading(state), state.phase === null ? null : phaseBadge(state.phase), state.running === false && state.current !== null ? badge('warn', w('badge.unstarted')) : null),
     kv(
-      row(w('status.chosen'), data.current === null || data.current === undefined ? w('status.none') : generationLine(data.current)),
-      row(w('status.serving'), generationLine(data.proxy?.generation ?? null)),
+      row(w('status.chosen'), state.current === null ? w('status.none') : generationLine(state.current)),
+      row(w('status.serving'), state.serving !== null ? generationLine(state.serving) : state.state === 'unknown' ? w('status.unknown') : w('status.none')),
+      row(w('status.mode'), state.mode === null ? w('status.none') : modeBadge(state.mode)),
       row(w('status.rollback'), typeof target === 'string' ? generationLine(target) : w('status.rollback_none')),
     ),
     typeof target === 'string' ? el('p', { class: 'tc-muted tc-small' }, w('status.rollback_note')) : null,
-    verdict,
+    Object.hasOwn(VERDICTS, state.state) ? VERDICTS[state.state]() : null,
+  ];
+}
+
+function generationsPanel(data) {
+  return panel(
+    w('status.generations'),
+    [],
+    defaultEngine(data).differs ? notice('warn', w('engine.defaults_differ')) : null,
+    oldProxy(data) ? notice('info', w('gen.legacy')) : null,
+    shownEngines(engineStates(data)).map(engineSection),
   );
 }
 

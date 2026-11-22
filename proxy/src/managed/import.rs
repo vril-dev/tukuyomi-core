@@ -10,7 +10,10 @@
 //! the rest of a line, which `managed import` writes after its name; a site or a group is named in it by the name that
 //! the check of the version passed, which is letters, digits, `-` and `_` only. A refusal of `from_request` is the
 //! sentence and the place it is about (see `version::Objection`): a file of the request by its number (`files[2]`),
-//! or the key of the version that names the file (`sites[0].certificate.key`, `upstreams.app.tls.ca`).
+//! or the key of the version that names the file (`sites[0].certificate.key`, `upstreams.app.tls.ca`). A request is
+//! refused as well when the rules store has no generation chosen for the engine of a group, as the proxy would refuse
+//! the version: about the key `engine` of the first such group (`upstreams.app.engine`). A rules store that cannot be
+//! read is another kind of refusal (`Refused`).
 //!
 //! `from_document` reads each file of the document once, as the proxy reads a certificate file (a regular file of at
 //! most 1 MiB; a link is followed), and makes the version that names them by their SHA-256. `from_request` takes at
@@ -37,11 +40,14 @@ use zeroize::Zeroizing;
 use super::load::{self, Choice, LoadError};
 use super::store::{MAX_BYTES, ManagedError, Placed, Store};
 use super::version::{self, Objection, SiteOf};
-use crate::config::{At, Built, Routing};
+use tukuyomi_kernel::Engine;
+
+use crate::config::{Address, At, Built, GroupConfig, Routing};
 use crate::forward::tls::{self, Authorities, Settings};
 use crate::inbound::transport::tls::{Fault, certified, check, read_file};
 use crate::log::escaped;
-use crate::rules::bundle::sha256;
+use crate::rules::bundle::{Mode, sha256};
+use crate::rules::store::{self, StoreError, UNCHOSEN, unchosen};
 
 /// The most files of a request: the chains and the keys of 64 sites and the files of the authorities of 64 groups.
 pub const MAX_FILES: usize = 192;
@@ -56,6 +62,16 @@ const KEY: &str = "certificate.key";
 pub struct Import {
     version: Vec<u8>,
     files: Vec<Zeroizing<Vec<u8>>>,
+    /// The groups of a version of a request whose engine runs a generation that only detects (see `detecting`).
+    detecting: Vec<(String, Engine)>,
+}
+
+impl Import {
+    /// The groups, with their engine, that the requests are not blocked at: the generation chosen for the engine only
+    /// detects. A request that matches a rule goes to such a group all the same.
+    pub fn detecting(&self) -> &[(String, Engine)] {
+        &self.detecting
+    }
 }
 
 /// How `place` reads the version with the main file before it puts it in the store.
@@ -75,6 +91,21 @@ pub enum Placing {
     Store(ManagedError),
     /// The reading of the main file with the version.
     Load(LoadError),
+}
+
+/// Why `from_request` refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The version or a file of the request: the sentence and the place it is about.
+    Input(Objection),
+    /// The rules store cannot be read, which is a fault of the process and not of the request.
+    Rules(StoreError),
+}
+
+impl From<Objection> for Refused {
+    fn from(objection: Objection) -> Refused {
+        Refused::Input(objection)
+    }
 }
 
 /// The content of a file that `sound` checks: brought already (by the request, or read from the path of the
@@ -131,6 +162,7 @@ pub fn from_document(built: &Built, text: &[u8]) -> Result<Import, String> {
     Ok(Import {
         version,
         files: files.into_values().collect(),
+        detecting: Vec::new(),
     })
 }
 
@@ -167,21 +199,22 @@ pub fn from_request(
     store: &Store,
     version: Vec<u8>,
     files: Vec<Zeroizing<Vec<u8>>>,
-) -> Result<Import, Objection> {
+) -> Result<Import, Refused> {
     if files.len() > MAX_FILES {
-        return Err(Objection::files(MANY_FILES, None));
+        return Err(Objection::files(MANY_FILES, None).into());
     }
     let large = files
         .iter()
         .position(|bytes| !u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_BYTES));
     if let Some(at) = large {
-        return Err(Objection::files(LARGE_FILE, Some(at)));
+        return Err(Objection::files(LARGE_FILE, Some(at)).into());
     }
     let Routing::Managed { resolve_timeout } = built.routing else {
-        return Err(Objection::whole("the configuration has no managed object"));
+        return Err(Objection::whole("the configuration has no managed object").into());
     };
     let geo = built.policy.geo.clone();
     let checked = version::check_sent(&version, &built.main, resolve_timeout, geo)?;
+    let detecting = engines_chosen(built, &checked.forward.groups)?;
     let names: Vec<[u8; 32]> = files.iter().map(|bytes| sha256(bytes)).collect();
     let mut given = BTreeMap::new();
     for (at, (name, bytes)) in names.iter().zip(&files).enumerate() {
@@ -189,7 +222,8 @@ pub fn from_request(
             return Err(Objection::files(
                 "two files of the request have the same content",
                 Some(at),
-            ));
+            )
+            .into());
         }
     }
     // The groups with authorities, by their number among the groups.
@@ -217,7 +251,8 @@ pub fn from_request(
         return Err(Objection::files(
             "a file of the request is not named by the version",
             Some(at),
-        ));
+        )
+        .into());
     }
     let content = |name: &[u8; 32]| match given.get(name).copied() {
         Some(bytes) => Ok(Content::Brought(bytes)),
@@ -236,7 +271,60 @@ pub fn from_request(
             .collect();
         Objection::of(why, Some(at), &groups)
     })?;
-    Ok(Import { version, files })
+    Ok(Import {
+        version,
+        files,
+        detecting,
+    })
+}
+
+/// Checks that the rules store that `built` names has a generation chosen for the engine of every one of `groups`,
+/// which the proxy requires of a version: the refusal is about the key `engine` of the first group that has none.
+/// What is given is the groups, with their engine, whose chosen generation only detects.
+fn engines_chosen(
+    built: &Built,
+    groups: &[GroupConfig<Address, Settings>],
+) -> Result<Vec<(String, Engine)>, Refused> {
+    let rules = store::open(&built.main.store).map_err(Refused::Rules)?;
+    let engines = groups.iter().map(|group| group.engine);
+    if let Some(at) = unchosen(rules.as_ref(), engines).map_err(Refused::Rules)? {
+        let names: Vec<String> = groups.iter().map(|group| group.name.clone()).collect();
+        let at = At::Group(at, Some("engine"));
+        return Err(Objection::of(UNCHOSEN, Some(at), &names).into());
+    }
+    let mut detecting = Vec::new();
+    for group in groups {
+        // Every engine has its generation: the check above found them.
+        let Some(chosen) = rules.current(group.engine).map_err(Refused::Rules)? else {
+            continue;
+        };
+        if rules.mode(chosen).map_err(Refused::Rules)? == Mode::Detect {
+            detecting.push((group.name.clone(), group.engine));
+        }
+    }
+    Ok(detecting)
+}
+
+/// Checks the stored version `bytes` against the main file `built` as the proxy would when it takes the version, and
+/// that the rules store has a generation chosen for the engine of each of its groups, for a version that is put in
+/// force by its name. A version that the check with the main file refuses is not looked at here: the proxy refuses it,
+/// with its own sentence, when it is told to take it.
+pub fn stored_engines_chosen(built: &Built, bytes: &[u8]) -> Result<(), Refused> {
+    let Routing::Managed { resolve_timeout } = built.routing else {
+        return Ok(());
+    };
+    let checked = version::parse(bytes).and_then(|raw| {
+        raw.check(
+            &built.main,
+            resolve_timeout,
+            built.policy.geo.clone(),
+            version::stored_tls,
+        )
+    });
+    match checked {
+        Ok(checked) => engines_chosen(built, &checked.forward.groups).map(drop),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Checks the files of `sites` and the files of the authorities of the groups of `authorities` as the proxy checks

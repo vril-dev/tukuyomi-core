@@ -3,20 +3,36 @@ use std::collections::HashSet;
 use tukuyomi_kernel::{Engine, Reason};
 
 use super::*;
+use crate::inspect::driver::State;
 use crate::log::counters::{Policy, ReloadResult, RuleHit};
 use crate::log::ship::Unshipped;
 use crate::rules::bundle::{Fingerprint, Mode};
 
+/// The state of the kernel of `engine`, which runs the generation of 64 times the digit `digit`.
+fn state_of(engine: Engine, digit: u8, mode: Mode, restarts: u32, phase: Phase) -> State {
+    State {
+        phase,
+        restarts,
+        generation: Fingerprint::from_hex(&[digit; 64]).unwrap(),
+        engine,
+        mode,
+    }
+}
+
+/// Both engines run and are ready: Coraza detects and has restarted 3 times, ModSecurity blocks and has restarted 2.
+fn both() -> States {
+    let mut states = States::none();
+    let coraza = state_of(Engine::Coraza, b'a', Mode::Detect, 3, Phase::Ready);
+    let modsecurity = state_of(Engine::ModSecurity, b'b', Mode::Block, 2, Phase::Ready);
+    states.set(Engine::Coraza, Some(coraza));
+    states.set(Engine::ModSecurity, Some(modsecurity));
+    states
+}
+
 fn scrape<'a>(counters: &'a Counters, groups: Vec<(&'a str, u64)>) -> Scrape<'a> {
     Scrape {
         counters,
-        state: State {
-            phase: Phase::Ready,
-            restarts: 3,
-            generation: Fingerprint::from_hex(&[b'a'; 64]).unwrap(),
-            engine: Engine::Coraza,
-            mode: Mode::Detect,
-        },
+        states: both(),
         connections_open: 2,
         permit_waits: 5,
         body_buffer_bytes: 4096,
@@ -81,8 +97,8 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
             samples += 1;
         }
     }
-    assert_eq!(families.len(), 27);
-    assert!(samples >= 27, "{samples}");
+    assert_eq!(families.len(), 29);
+    assert!(samples >= 29, "{samples}");
 
     for line in [
         "tukuyomi_requests_total{class=\"forwarded\"} 1",
@@ -102,8 +118,13 @@ fn every_family_has_its_help_and_type_once_and_its_samples_follow_them() {
         "tukuyomi_body_buffer_bytes 4096",
         "tukuyomi_inspections_waiting 1",
         "tukuyomi_inspector_up 1",
-        "tukuyomi_inspector_restarts_total 3",
+        "tukuyomi_inspector_restarts_total 5",
+        "tukuyomi_inspector_engine_up{engine=\"coraza\"} 1",
+        "tukuyomi_inspector_engine_up{engine=\"modsecurity\"} 1",
+        "tukuyomi_inspector_engine_restarts_total{engine=\"coraza\"} 3",
+        "tukuyomi_inspector_engine_restarts_total{engine=\"modsecurity\"} 2",
         "tukuyomi_rules_generation_info{generation=\"aaaaaaaaaaaaaaaa\",mode=\"detect\",engine=\"coraza\"} 1",
+        "tukuyomi_rules_generation_info{generation=\"bbbbbbbbbbbbbbbb\",mode=\"block\",engine=\"modsecurity\"} 1",
         "tukuyomi_upstream_failures_total{group=\"api\"} 2",
         "tukuyomi_records_dropped_total 7",
         "tukuyomi_record_write_errors_total 8",
@@ -137,9 +158,40 @@ fn the_health_of_the_records_is_1_or_0_and_the_unshipped_bytes_are_there_only_wi
 }
 
 #[test]
-fn the_inspector_is_up_only_in_the_phase_ready() {
+fn the_inspector_is_up_only_when_the_kernel_of_every_engine_that_runs_is_in_the_phase_ready() {
     let counters = Counters::start();
     let mut seen = scrape(&counters, Vec::new());
-    seen.state.phase = Phase::Starting;
-    assert!(render(&seen).contains("\ntukuyomi_inspector_up 0\n"));
+    let text = render(&seen);
+    assert!(text.contains("\ntukuyomi_inspector_up 1\n"));
+    // One engine that is not ready: the total is 0 and so is the sample of that engine, and the other engine's is 1.
+    let mut states = both();
+    states.set(
+        Engine::ModSecurity,
+        Some(state_of(
+            Engine::ModSecurity,
+            b'b',
+            Mode::Block,
+            2,
+            Phase::Starting,
+        )),
+    );
+    seen.states = states;
+    let text = render(&seen);
+    for line in [
+        "tukuyomi_inspector_up 0",
+        "tukuyomi_inspector_engine_up{engine=\"coraza\"} 1",
+        "tukuyomi_inspector_engine_up{engine=\"modsecurity\"} 0",
+    ] {
+        assert!(text.lines().any(|have| have == line), "{line} in {text}");
+    }
+    // An engine that does not run has no sample at all, and the one that runs is judged alone.
+    let mut states = States::none();
+    states.set(
+        Engine::Coraza,
+        Some(state_of(Engine::Coraza, b'a', Mode::Block, 0, Phase::Ready)),
+    );
+    seen.states = states;
+    let text = render(&seen);
+    assert!(text.contains("\ntukuyomi_inspector_up 1\n"));
+    assert!(!text.contains("engine=\"modsecurity\""));
 }

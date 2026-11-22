@@ -16,20 +16,19 @@ use crate::inbound::challenge::Challenge;
 use crate::inbound::session::RequestIds;
 use crate::inbound::transport::tls::Tls;
 use crate::inspect::driver::Ingress;
+use crate::inspect::engines::Gates;
 use crate::log::Log;
 use crate::log::counters::Counters;
 use crate::policy::country::Geo;
 use crate::policy::{Scope, Scopes};
-use crate::rules::routes::SharedRoutes;
 
 /// What every connection shares for as long as the process runs: the byte budget of held bodies and of the kernel's
-/// copies, the inspection permits (as many as the kernel's waiting queue), the routes of the generation that serves,
-/// the way to the driver, the numbers of the requests, the counters that `/metrics` shows, the logger, and the setup
-/// that the connections that start now take.
+/// copies, the gate of each engine (the inspection permits, as many as the kernel's waiting queue, and the routes of
+/// the generation that serves), the way to the driver, the numbers of the requests, the counters that `/metrics`
+/// shows, the logger, and the setup that the connections that start now take.
 pub struct Shared {
     pub budget: Arc<Semaphore>,
-    pub inspect: Arc<Semaphore>,
-    pub routes: SharedRoutes,
+    pub gates: Gates,
     pub log: Log,
     pub ingress: Arc<Ingress>,
     pub ids: RequestIds,

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustls::pki_types::ServerName;
+use tukuyomi_kernel::Engine;
 
 use super::*;
 use crate::forward::tls::Authorities;
@@ -41,6 +42,7 @@ fn settings(groups: &[(&str, Vec<Address>)], wait_ms: u64) -> ForwardSettings {
                 name: group.to_string(),
                 servers: servers.iter().cloned().map(terms).collect(),
                 tls: None,
+                engine: Engine::Coraza,
             })
             .collect(),
         routes: Table::default(),

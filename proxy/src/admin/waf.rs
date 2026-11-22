@@ -5,29 +5,35 @@
 //! with a token may use all of these routes; the audit log shows the token (`auth`) where it shows the session.
 //!
 //! The parts, one file each: `control` (the control socket of the proxy), `history` (what is kept of each switch),
-//! `import` (the body of an import and the trial), `records` (reading the record files) and `status` (the status
-//! route).
+//! `import` (the body of an import and the trial), `records` (reading the record files), `status` (the status
+//! route), `generations` (the list of the generations, one generation and the removal) and `activate` (the switch to
+//! a generation and the way back).
 //!
 //! The routes (a viewer may use the status, the generations, the history and the records, an operator the import, the
 //! switch, the rollback and the removal as well; a body is JSON of at most 64 KiB, the one of the import 12 MiB; the
 //! answers are JSON, and `error` is a fixed sentence):
-//! - `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "crs"}`: the generation the rules store
-//!   chooses, the state of the proxy from its control socket (`proxy` is `null` when the state could not be read, and
-//!   `reachable` is false when the proxy cannot be reached; a proxy that has no place for the question is reachable;
-//!   `proxy` has the `mode` and the `engine` of the generation it serves, and its figures: the time since it started,
-//!   its counts and the SHA-256 of its configuration file, each `null` when an older proxy does not send it), the
-//!   generation a rollback would go to now (`null` for none), and the CRS of the configuration (see `status`).
+//! - `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "default_engine", "engines", "crs"}`: the
+//!   generation the rules store chooses for the default engine, the state of the proxy from its control socket (`proxy`
+//!   is `null` when the state could not be read, and `reachable` is false when the proxy cannot be reached; a proxy
+//!   that has no place for the question is reachable; `proxy` has the `mode` and the `engine` of the generation that
+//!   serves the default engine, `engines`, the `generation`, `mode`, `engine` and `phase` of each engine it runs, and
+//!   its figures: the time since it started, its counts and the SHA-256 of its configuration file, each `null` when an
+//!   older proxy does not send it), the generation a rollback of the default engine would go to now (`null` for none),
+//!   the name of the default engine (`default_engine`), for each engine the generation the rules store chooses for it
+//!   and the one a rollback of it would go to (`engines`), and the CRS of the configuration (see `status`).
 //! - `GET /api/generations`: `{"reachable", "generations"}`, the newest first, each with its `fingerprint`, `made`
-//!   (seconds since the epoch), `mode`, `engine`, number of `routes`, and whether it is `current` and `serving`.
+//!   (seconds since the epoch), `mode`, `engine`, number of `routes`, and whether it is `current` (chosen for its
+//!   engine) and `serving`.
 //! - `GET /api/generations/<fingerprint>`: that, and the `load` order, the `files` (path, size, SHA-256) and the
 //!   `routes` of its manifest. 404 for a generation the store does not have.
 //! - `POST /api/generations`: the import (see `import`): the same steps as `rules import`: the files are collected
 //!   from the body, staged, tried with an inspector, and made a generation only if the trial passes. 200 with the
 //!   `fingerprint`, `result` (`created`, `existing` or `repaired`) and the `trial`; 400 for input that is refused; 422
 //!   when the trial fails; 409 when the rules store refuses or is in use. The generation is not chosen.
-//! - `POST /api/activate` with `{"generation", "expect"}` and `POST /api/rollback` with `{"expect"}`: see below.
-//! - `DELETE /api/generations/<fingerprint>`: 409 for the generation the store chooses, the target of a rollback,
-//!   and one that a proxy uses (the store refuses it); else it is removed.
+//! - `POST /api/activate` with `{"generation", "expect"}` and `POST /api/rollback` with `{"engine", "expect"}` (the
+//!   engine to roll back, which is the default engine when `engine` is left out): see below.
+//! - `DELETE /api/generations/<fingerprint>`: 409 for the generation the store chooses for its engine, the target of a
+//!   rollback of its engine, and one that a proxy uses (the store refuses it); else it is removed.
 //! - `GET /api/history`: the newest 200 requests to switch (see `history`).
 //! - `GET /api/records`: the lines of the record files (see `records`), 404 when the configuration has no `records`.
 //!
@@ -41,13 +47,16 @@
 //! files, the query), and the name of an input only when the request gave it; the directory of the CRS is told by its
 //! last name.
 //!
-//! A switch (activate, rollback): the generation the rules store chooses must be `expect`, the one the client saw
-//! (else 409; the store checks it again when it chooses, under its lock, so that a generation another process chose
-//! in between is not overwritten: also 409), the engine of the generation to switch to must be usable here (else 409
+//! A switch (activate, rollback) is for the engine of the generation to switch to: the generation the rules store
+//! chooses for that engine must be `expect`, the one the client saw, or `null` when the client saw none chosen (else
+//! 409; the store checks it again when it chooses, under its lock, so that a generation another process chose in
+//! between is not overwritten: also 409), the engine of the generation to switch to must be usable here (else 409
 //! with the sentence of the check, audited as denied with the reason `engine`; the store is not touched, so it never
 //! chooses a generation that the proxy would refuse; a manifest that cannot be read is left to the store, which
-//! refuses it when it chooses), and the proxy must be reachable (else 503, nothing is changed,
-//! the history has an `unreachable` line; a proxy that has no place for the question is 503 too, with no line). Then
+//! refuses it when it chooses), the proxy must report its engines (a proxy of an older version does not: 409 with a
+//! fixed sentence, audited as denied with the reason `version`, and the rules store is not touched), and the proxy
+//! must be reachable (else 503, nothing is changed, the history has an `unreachable` line; a proxy that has no place
+//! for the question is 503 too, with no line). Then
 //! the generation is chosen (`activate_if_current` of the store, which verifies it), and the proxy is ordered to
 //! switch to it by its control socket. If the proxy says the switch is under way (`busy`) its state is looked at
 //! every 250 ms until it serves the generation, or has been idle twice without it, or the time the old inspector may
@@ -57,9 +66,9 @@
 //! `chosen` in the answer says whether the rules store chooses the generation now: it does not when nothing was
 //! changed (the proxy could not be reached first), and it does when the switch then was refused, failed or
 //! unconfirmed: the store is not put back. A history line that cannot be written is told by `history` in the answer.
-//! A rollback goes to the target of the history: the generation before the last switch, if that switch ended at the
-//! generation the rules store chooses now; there is none, or the history ends at another generation, or the target is
-//! not in the store any more: 409.
+//! A rollback goes to the target of the history for its engine: the generation before the last switch of that engine,
+//! if that switch ended at the generation the rules store chooses now for the engine; there is none, or the history
+//! ends at another generation, or the target is not in the store any more: 409.
 //!
 //! The longest time the import, the switch and the rollback may need is `Waf::longest`; the server gives the answer
 //! that time, and every other route its usual 30 s.
@@ -70,31 +79,30 @@ pub mod import;
 pub mod records;
 pub mod status;
 
+mod activate;
+mod generations;
+
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use http::{Method, StatusCode};
-use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::json;
+use tukuyomi_kernel::Engine;
 
-use self::control::{Control, Reply, Seen};
-use self::history::{Ended, Kind, rollback_target};
+use self::control::Control;
 use self::import::{Inspector, Trial};
 use super::audit::{AuditLog, Event, Outcome};
 use super::auth::{Cx, Who};
-use super::password::hex;
-use super::server::{Answer, Gate, Handler, Req, Route, json_body};
+use super::server::{Answer, Gate, Handler, Req, Route};
 use super::store::AdminStore;
 use super::users::Role;
 use crate::config::{AdminConfig, MainFile, ProxyConfig, Records, StoreConfig};
 use crate::log::escaped;
-use crate::rules::bundle::Fingerprint;
 use crate::rules::collect::CollectError;
-use crate::rules::store::{self, NOT_EXPECTED, RuleStore, StoreError};
+use crate::rules::store::{self, RuleStore, StoreError};
 
 /// The most bytes of the body of an import: JSON with the files in base64.
 const IMPORT_BODY_MAX: usize = 12 << 20;
@@ -105,10 +113,6 @@ const IMPORT_LEAST: Role = Role::Operator;
 const GENERATION: &str = "/api/generations/";
 /// A margin on the time that something is waited for.
 const SLACK: Duration = Duration::from_secs(7);
-/// The time between two looks at the proxy while a switch is under way.
-const POLL: Duration = Duration::from_millis(250);
-/// The looks in a row at a proxy that is idle and does not serve the generation, after which the switch is lost.
-const IDLE_LOOKS: u32 = 2;
 /// The most bytes of the name of an input that an answer shows.
 const SUBJECT_MAX: usize = 128;
 
@@ -203,11 +207,6 @@ pub(super) fn slow(method: &Method, path: &str) -> bool {
     *method == Method::POST && matches!(path, IMPORT | "/api/activate" | "/api/rollback")
 }
 
-/// The generation that `path`, a path below `/api/generations/`, names.
-fn fingerprint_of(path: &str) -> Option<Fingerprint> {
-    Fingerprint::from_hex(path.strip_prefix(GENERATION)?.as_bytes())
-}
-
 /// How long the routes wait, from the `proxy` object of the configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct Waits {
@@ -241,6 +240,9 @@ pub struct Config<'a> {
     pub crs_dir: Option<&'a Path>,
     pub records: Option<&'a Records>,
     pub waits: Waits,
+    /// The engine that inspects what names none (`kernel.default_engine`): the one whose chosen generation `status`
+    /// shows.
+    pub default_engine: Engine,
 }
 
 /// Who asked, for the audit log.
@@ -287,64 +289,6 @@ fn invalid(e: CollectError) -> Answer {
     Answer::json(StatusCode::BAD_REQUEST, body)
 }
 
-fn digits(text: &str) -> Result<Fingerprint, Answer> {
-    Fingerprint::from_hex(text.as_bytes()).ok_or_else(|| {
-        Answer::error(
-            StatusCode::BAD_REQUEST,
-            "a generation is not 64 lowercase hexadecimal digits",
-        )
-    })
-}
-
-/// The answer to a request to switch. `ids` are the generation before and the one asked for; `chosen`: the rules
-/// store chooses the latter now; `written`: the history has the line.
-fn reply(ended: Ended, ids: (Fingerprint, Fingerprint), chosen: bool, written: bool) -> Answer {
-    let (status, error) = match ended {
-        Ended::Switched | Ended::Unchanged => (StatusCode::OK, None),
-        Ended::Refused => (StatusCode::CONFLICT, Some("the proxy refused the switch")),
-        Ended::Failed => (StatusCode::BAD_GATEWAY, Some("the proxy did not switch")),
-        Ended::Unreachable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some("the proxy cannot be reached"),
-        ),
-        Ended::Unconfirmed => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some("the proxy did not say how the switch ended"),
-        ),
-    };
-    let mut body = json!({
-        "result": ended.word(),
-        "from": ids.0.hex(),
-        "generation": ids.1.hex(),
-        "chosen": chosen,
-    });
-    if let Some(error) = error {
-        body["error"] = error.into();
-    }
-    unwritten(Answer::json(status, body), written)
-}
-
-/// The answer, with `history` saying so when the history does not have the line of the request.
-fn unwritten(mut answer: Answer, written: bool) -> Answer {
-    if !written {
-        answer.body["history"] = "not written".into();
-    }
-    answer
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActivateBody {
-    generation: String,
-    expect: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RollbackBody {
-    expect: String,
-}
-
 /// The routes of the rules.
 pub struct Waf {
     rules: StoreConfig,
@@ -352,6 +296,7 @@ pub struct Waf {
     crs_dir: Option<PathBuf>,
     records: Option<Records>,
     waits: Waits,
+    default_engine: Engine,
     store: Arc<dyn AdminStore>,
     audit: Arc<AuditLog>,
     trial: Box<dyn Trial>,
@@ -375,6 +320,7 @@ impl Waf {
             crs_dir: config.crs_dir.map(Path::to_path_buf),
             records: config.records.cloned(),
             waits: config.waits,
+            default_engine: config.default_engine,
             store,
             audit,
             trial,
@@ -402,6 +348,7 @@ impl Waf {
             crs_dir: admin.crs_dir.as_deref(),
             records: loaded.records.as_ref(),
             waits,
+            default_engine: loaded.kernel.default_engine(),
         };
         let trial = Box::new(Inspector::new(loaded.kernel.clone(), waits));
         Waf::new(config, store, audit, trial)
@@ -463,324 +410,6 @@ impl Waf {
         let _ = self
             .audit
             .write(&caller.event(action, outcome).target(target).reason(reason));
-    }
-
-    fn generations(&self) -> Answer {
-        let store = match self.rules() {
-            Ok(store) => store,
-            Err(answer) => return answer,
-        };
-        let (list, current) = match (store.list(), store.current()) {
-            (Ok(list), Ok(current)) => (list, current),
-            (Err(e), _) | (_, Err(e)) => return failed(e),
-        };
-        let proxy = self.control.status();
-        let serving = proxy.state().map(|status| status.generation);
-        let items: Vec<Value> = list
-            .iter()
-            .rev()
-            .map(|g| {
-                let (mode, engine, routes) = store
-                    .manifest(g.fingerprint)
-                    .map_or(("unknown", "unknown", 0), |m| {
-                        (m.mode().name(), m.engine().name(), m.routes().len())
-                    });
-                json!({
-                    "fingerprint": g.fingerprint.hex(),
-                    "made": g.made,
-                    "mode": mode,
-                    "engine": engine,
-                    "routes": routes,
-                    "current": current == Some(g.fingerprint),
-                    "serving": serving == Some(g.fingerprint),
-                })
-            })
-            .collect();
-        Answer::json(
-            StatusCode::OK,
-            json!({"reachable": proxy.reachable(), "generations": items}),
-        )
-    }
-
-    fn generation(&self, path: &str) -> Answer {
-        let Some(fingerprint) = fingerprint_of(path) else {
-            return not_found();
-        };
-        let store = match self.rules() {
-            Ok(store) => store,
-            Err(answer) => return answer,
-        };
-        let (list, current) = match (store.list(), store.current()) {
-            (Ok(list), Ok(current)) => (list, current),
-            (Err(e), _) | (_, Err(e)) => return failed(e),
-        };
-        let Some(entry) = list.iter().find(|g| g.fingerprint == fingerprint) else {
-            return not_found();
-        };
-        let manifest = match store.manifest(fingerprint) {
-            Ok(manifest) => manifest,
-            Err(e) => return failed(e),
-        };
-        let serving = self
-            .control
-            .status()
-            .state()
-            .map(|status| status.generation);
-        let files: Vec<Value> = manifest
-            .files()
-            .iter()
-            .map(|f| json!({"path": f.path.as_str(), "size": f.size, "sha256": hex(&f.sha256)}))
-            .collect();
-        let load: Vec<&str> = manifest.load().iter().map(|path| path.as_str()).collect();
-        let routes: Vec<Value> = manifest
-            .routes()
-            .iter()
-            .map(|rule| {
-                let mut route = Map::new();
-                if let Some(host) = rule.host() {
-                    route.insert("host".to_owned(), host.into());
-                }
-                route.insert("path".to_owned(), rule.path().unwrap_or_default().into());
-                route.insert("action".to_owned(), "bypass".into());
-                Value::Object(route)
-            })
-            .collect();
-        Answer::json(
-            StatusCode::OK,
-            json!({
-                "fingerprint": fingerprint.hex(),
-                "made": entry.made,
-                "mode": manifest.mode().name(),
-                "engine": manifest.engine().name(),
-                "current": current == Some(fingerprint),
-                "serving": serving == Some(fingerprint),
-                "load": load,
-                "files": files,
-                "routes": routes,
-            }),
-        )
-    }
-
-    fn activate(&self, req: &Req, caller: &Caller<'_>) -> Answer {
-        let body: ActivateBody = match json_body(req) {
-            Ok(body) => body,
-            Err(answer) => return answer,
-        };
-        match (digits(&body.generation), digits(&body.expect)) {
-            (Ok(to), Ok(expect)) => self.switch_to(caller, Kind::Activate, Some(to), expect),
-            (Err(answer), _) | (_, Err(answer)) => answer,
-        }
-    }
-
-    fn rollback(&self, req: &Req, caller: &Caller<'_>) -> Answer {
-        let body: RollbackBody = match json_body(req) {
-            Ok(body) => body,
-            Err(answer) => return answer,
-        };
-        match digits(&body.expect) {
-            Ok(expect) => self.switch_to(caller, Kind::Rollback, None, expect),
-            Err(answer) => answer,
-        }
-    }
-
-    /// The generation a request to switch is for, which the store must have: `asked`, or for a rollback the target
-    /// of the history when the store chooses `chosen`.
-    fn target(
-        &self,
-        store: &dyn RuleStore,
-        kind: Kind,
-        asked: Option<Fingerprint>,
-        chosen: Fingerprint,
-    ) -> Result<Fingerprint, Answer> {
-        let to = match asked {
-            Some(to) => to,
-            None => rollback_target(&self.lines()?, chosen).map_err(conflict)?,
-        };
-        if store
-            .list()
-            .map_err(failed)?
-            .iter()
-            .any(|g| g.fingerprint == to)
-        {
-            return Ok(to);
-        }
-        Err(match kind {
-            Kind::Activate => Answer::error(StatusCode::NOT_FOUND, "no such generation"),
-            Kind::Rollback => conflict("the generation to go back to is not in the store"),
-        })
-    }
-
-    /// A request to switch to `asked` (for a rollback: to the target of the history) when the rules store chooses
-    /// `expect`. See the module documentation for the steps.
-    fn switch_to(
-        &self,
-        caller: &Caller<'_>,
-        kind: Kind,
-        asked: Option<Fingerprint>,
-        expect: Fingerprint,
-    ) -> Answer {
-        let action = kind.word();
-        let _changing = match self.changing() {
-            Ok(guard) => guard,
-            Err(answer) => return answer,
-        };
-        let mut store = match self.rules() {
-            Ok(store) => store,
-            Err(answer) => return answer,
-        };
-        let to = match self.target(store.as_ref(), kind, asked, expect) {
-            Ok(to) => to,
-            Err(answer) => return answer,
-        };
-        let to_hex = to.hex();
-        // Nothing is changed unless the rules store chooses what the client saw and the proxy can be asked. The
-        // generation before is the one the store gave, which is `expect`.
-        let from = match store.current() {
-            Ok(Some(current)) if current == expect => current,
-            Ok(_) => {
-                self.note(caller, action, Outcome::Denied, "expect", &to_hex);
-                return refused(NOT_EXPECTED);
-            }
-            Err(e) => return failed(e),
-        };
-        let (ids, from_hex) = ((from, to), from.hex());
-        // Before the proxy is asked and before the store chooses: a generation whose engine cannot be used here
-        // would be refused by the proxy, and left as the chosen one it would end the next start. A manifest that
-        // cannot be read is not answered here: the store refuses it when it chooses, and that answer stands.
-        if let Ok(engine) = store.engine(to)
-            && let Err(text) = self.trial.usable(engine)
-        {
-            self.note(caller, action, Outcome::Denied, "engine", &to_hex);
-            return conflict(text);
-        }
-        match self.control.status() {
-            Seen::State(_) => {}
-            Seen::Busy => {
-                self.note(caller, action, Outcome::Denied, "busy", &to_hex);
-                return Answer::error(StatusCode::SERVICE_UNAVAILABLE, "the proxy is busy");
-            }
-            Seen::Unreachable => {
-                self.note(caller, action, Outcome::Denied, "unreachable", &to_hex);
-                let written = self.record(caller, kind, ids, Ended::Unreachable);
-                return reply(Ended::Unreachable, ids, false, written);
-            }
-        }
-        let event = caller
-            .event(action, Outcome::Ok)
-            .target(&to_hex)
-            .change(&from_hex, &to_hex);
-        if self.audit.write(&event).is_err() {
-            return Answer::unavailable();
-        }
-        if let Err(e) = store.activate_if_current(from, to) {
-            // A generation that another process chose since the check above stays, and nothing is written to the
-            // history, as for a wrong `expect`.
-            if e == NOT_EXPECTED {
-                self.note(caller, action, Outcome::Failed, "expect", &to_hex);
-                return refused(e);
-            }
-            self.note(caller, action, Outcome::Failed, "store", &to_hex);
-            let written = self.record(caller, kind, ids, Ended::Refused);
-            return unwritten(refused(e), written);
-        }
-        let ended = self.switch(to);
-        if !matches!(ended, Ended::Switched | Ended::Unchanged) {
-            self.note(caller, action, Outcome::Failed, ended.word(), &to_hex);
-        }
-        let written = self.record(caller, kind, ids, ended);
-        reply(ended, ids, true, written)
-    }
-
-    /// Orders the proxy to switch to `to`, and waits for the end of the switch.
-    fn switch(&self, to: Fingerprint) -> Ended {
-        match self.control.switch(to) {
-            None => Ended::Unconfirmed,
-            Some(Reply::Switched) => Ended::Switched,
-            Some(Reply::Unchanged) => Ended::Unchanged,
-            Some(Reply::Refused) => Ended::Refused,
-            Some(Reply::Failed) => Ended::Failed,
-            Some(Reply::Busy) => self.await_switch(to),
-        }
-    }
-
-    /// The proxy did not finish the switch within the time it waits (or did not take the order): looks at its state
-    /// until it serves `to`. A proxy that has no place for a look is looked at again; one that cannot be reached
-    /// leaves the end of the switch unconfirmed.
-    fn await_switch(&self, to: Fingerprint) -> Ended {
-        let now = Instant::now();
-        let by = now
-            .checked_add(self.waits.stop.saturating_add(SLACK))
-            .unwrap_or(now);
-        let mut idle = 0;
-        loop {
-            sleep(POLL);
-            match self.control.status() {
-                Seen::Unreachable => return Ended::Unconfirmed,
-                Seen::Busy => idle = 0,
-                Seen::State(status) if status.generation == to => return Ended::Switched,
-                Seen::State(status) if status.switching => idle = 0,
-                Seen::State(_) => {
-                    idle += 1;
-                    if idle >= IDLE_LOOKS {
-                        return Ended::Failed;
-                    }
-                }
-            }
-            if Instant::now() >= by {
-                return Ended::Failed;
-            }
-        }
-    }
-
-    fn remove(&self, path: &str, caller: &Caller<'_>) -> Answer {
-        let Some(generation) = fingerprint_of(path) else {
-            return not_found();
-        };
-        let hex = generation.hex();
-        let _changing = match self.changing() {
-            Ok(guard) => guard,
-            Err(answer) => return answer,
-        };
-        let mut store = match self.rules() {
-            Ok(store) => store,
-            Err(answer) => return answer,
-        };
-        match store.list() {
-            Ok(list) if list.iter().any(|g| g.fingerprint == generation) => {}
-            Ok(_) => return not_found(),
-            Err(e) => return failed(e),
-        }
-        let chosen = match store.current() {
-            Ok(Some(current)) if current == generation => {
-                self.note(caller, "remove", Outcome::Denied, "chosen", &hex);
-                return conflict("the generation is the one the rules store chooses");
-            }
-            Ok(current) => current,
-            Err(e) => return failed(e),
-        };
-        // A rollback has a target only while the history ends at the chosen generation.
-        let lines = match self.lines() {
-            Ok(lines) => lines,
-            Err(answer) => return answer,
-        };
-        if chosen.is_some_and(|chosen| rollback_target(&lines, chosen) == Ok(generation)) {
-            self.note(caller, "remove", Outcome::Denied, "rollback target", &hex);
-            return conflict("the generation is the target of a rollback");
-        }
-        if self
-            .audit
-            .write(&caller.event("remove", Outcome::Ok).target(&hex))
-            .is_err()
-        {
-            return Answer::unavailable();
-        }
-        match store.remove(generation) {
-            Ok(()) => Answer::json(StatusCode::OK, json!({"removed": hex})),
-            Err(e) => {
-                self.note(caller, "remove", Outcome::Failed, "store", &hex);
-                refused(e)
-            }
-        }
     }
 }
 

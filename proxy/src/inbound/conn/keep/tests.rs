@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use tokio::time::{Instant, sleep};
-use tukuyomi_kernel::Verdict;
+use tukuyomi_kernel::{Engine, Verdict};
 
 use super::*;
 use crate::config::{ForwardConfig, Keep, Records, RouteConfig};
@@ -146,12 +146,26 @@ fn a_request_that_was_let_in_and_is_dropped_before_its_answer_has_a_record_whate
         ] {
             let rig = Rig::with(config(), Mode::Hold, &keeping(records)).await;
             let (log, lines) = (rig.ctx.shared.log.clone(), rig.lines.clone());
-            let free = rig.ctx.shared.inspect.available_permits();
+            let free = rig
+                .ctx
+                .shared
+                .gates
+                .of(Engine::Coraza)
+                .inspect
+                .available_permits();
             let (client, task) = rig.connect().await;
             put(&client, GET_OPEN).await;
             // The request is with the inspection, which does not answer; then the client goes away.
             let by = Instant::now() + Duration::from_secs(20);
-            while rig.ctx.shared.inspect.available_permits() == free {
+            while rig
+                .ctx
+                .shared
+                .gates
+                .of(Engine::Coraza)
+                .inspect
+                .available_permits()
+                == free
+            {
                 assert!(
                     Instant::now() < by,
                     "{records:?}: the request did not arrive"

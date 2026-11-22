@@ -20,7 +20,12 @@
 //! 4. The proxy, by its control socket: one that cannot be reached is 503 and has a line of the history
 //!    (`unreachable`), one that has no place for the question is 503, one whose configuration in force has no
 //!    `managed` 409; each audited as denied (`unreachable`, `busy`, `unmanaged`).
-//! 5. For `activate` and `rollback`, the version is in the store (else 404 and 409); `apply` saves it here.
+//! 5. For `activate` and `rollback`, the version is in the store (else 404 and 409), and the rules store has a
+//!    generation chosen for the engine of each of its groups, which the proxy requires of a version (else 409 with
+//!    `no generation is chosen for the engine of an upstream` and `at`, the place in the version
+//!    (`upstreams.<name>.engine`), audited as denied: `engine`; a rules store that cannot be
+//!    read is 500; a version that the check with the main file refuses is left to the proxy, which refuses it with its
+//!    own sentence); `apply` saves the version here, and checks the engines with the rest of the version.
 //! 6. The job starts, unless the time of the answer (30 s) is nearly over (5 s or less left), or the process began to
 //!    stop since step 1: then 503, audited as failed (`time`, `stopping`), and what was saved stays. A thread that
 //!    cannot be started is 503, audited as failed (`thread`).
@@ -45,13 +50,14 @@
 //! it, and the lock of the store goes with the process. The job is `{"kind", "actor", "from", "to", "started", "ended",
 //! "state", "result", "reason", "detail", "config_before", "config_after", "history"}`: `started` and `ended` are
 //! seconds since the epoch, `state` is `running` or `ended`, and while it runs `ended`, `result` and `history` are
-//! `null`. `result` is the end of the order (`applied`, `refused`, `busy`, `current changed`, `no version`, `unmanaged`,
-//! `store`, `audit`, `error`, `unreachable`, `failed`, `unconfirmed`, `not recorded`); `reason` its fixed word (the
-//! part of the proxy that refused, the reason of `busy` or `error`, `current changed` or `store` for `not recorded`);
-//! `detail` the sentence of the proxy that refused, or of the store; `config_before` and `config_after` the SHA-256 of
-//! the main file in force before and after the order, when they are known; and `history` whether the history took
-//! its line (`null` when the end has none). A job that panics ends as `unconfirmed`, and the process writes a line to
-//! its records. A job cannot be stopped, and a change of the role of its user does not stop it.
+//! `null`. `result` is the end of the order (`applied`, `refused`, `busy`, `current changed`, `no version`,
+//! `unmanaged`, `store`, `audit`, `error`, `unreachable`, `failed`, `unconfirmed`, `not recorded`); `reason` its fixed
+//! word (the part of the proxy that refused, the reason of `busy` or `error`, `current changed` or `store` for
+//! `not recorded`); `detail` the sentence of the proxy that refused, or of the store; `config_before` and
+//! `config_after` the SHA-256 of the main file in force before and after the order, when they are known; and `history`
+//! whether the history took its line (`null` when the end has none). A job that panics ends as `unconfirmed`, and the
+//! process writes a line to its records. A job cannot be stopped, and a change of the role of its user does not stop
+//! it.
 
 use std::cell::Cell;
 use std::net::IpAddr;
@@ -75,6 +81,7 @@ use crate::admin::waf::control::{Control, Seen};
 use crate::config::{Built, Routing};
 use crate::log::Log;
 use crate::managed::apply::{self, Unrecorded};
+use crate::managed::import::{self, Refused};
 use crate::managed::store::NOT_CURRENT;
 use crate::managed::{ManagedError, Store};
 use crate::rules::bundle::{Fingerprint, hex};
@@ -368,6 +375,23 @@ impl Managed {
             }
             Ok(_) => return not_found(),
             Err(e) => return failed(e),
+        }
+        // The rules store has what the version needs, as the proxy would find when it reads the configuration again.
+        let stored = match ready.store.version(to) {
+            Ok(bytes) => bytes,
+            Err(e) => return failed(e),
+        };
+        match import::stored_engines_chosen(&ready.built, &stored) {
+            Ok(()) => {}
+            Err(Refused::Input(objection)) => {
+                let event = caller.event(kind.action(), Outcome::Denied);
+                let _ = self.audit.write(&event.target(&hex(&to)).reason("engine"));
+                return Answer::json(
+                    StatusCode::CONFLICT,
+                    json!({"error": objection.why, "at": objection.at}),
+                );
+            }
+            Err(Refused::Rules(e)) => return failed(ManagedError(e.0)),
         }
         let order = Order {
             kind,

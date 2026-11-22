@@ -48,6 +48,24 @@ test('every key that a script asks for with t() or w() is in the dictionaries', 
   }
 });
 
+test('the sentences that the API gives for the engines have their words in both languages, spelled as the API gives them', () => {
+  const sentences = [
+    'the proxy does not report its engines',
+    'the current generation records of the engine disagree',
+    'the current generation record cannot be removed',
+    'an upstream engine is not coraza or modsecurity',
+    'kernel.engines has no inspector for the engine of an upstream',
+    'two upstreams with a server at the same address have different engines',
+    'no generation is chosen for the engine of an upstream',
+  ];
+  for (const text of sentences) {
+    setLanguage('ja');
+    assert.notEqual(sentence(text), text, text);
+    assert.equal(Object.hasOwn(dictionaries.en, text), true, text);
+  }
+  setLanguage('en');
+});
+
 test('the language is the saved one, else the first language of the browser that we have, else English', () => {
   assert.equal(pickLanguage('ja', ['en-US']), 'ja');
   assert.equal(pickLanguage(null, ['fr-FR', 'ja-JP']), 'ja');

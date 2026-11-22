@@ -69,6 +69,7 @@ fn slot_with_a_request(mode: Mode, done: Shutdown) -> (Slot<Stub>, oneshot::Rece
     let take = || permits.clone().try_acquire_owned().unwrap();
     let (reply, answer) = oneshot::channel();
     let ticket = Ticket {
+        engine: Engine::ModSecurity,
         req: InspectReq {
             client: "192.0.2.10:40000".parse().unwrap(),
             server: "192.0.2.1:8080".parse().unwrap(),

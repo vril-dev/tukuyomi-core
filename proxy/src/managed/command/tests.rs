@@ -5,6 +5,7 @@ use crate::managed::store::tests::Fixture;
 use crate::rules::bundle::sha256;
 use serde_json::{Value, json};
 use std::fs;
+use tukuyomi_kernel::Engine;
 
 const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -190,6 +191,45 @@ fn a_version_that_the_proxy_would_refuse_is_not_chosen() {
     // So is a version that is not in the store.
     assert_eq!(command(&["activate", main, HEX]).0, Exit::Failed);
     assert_eq!(fixture.store().current(), Ok(Some(digest(&good).unwrap())));
+}
+
+#[test]
+fn a_version_whose_group_has_an_engine_with_no_generation_chosen_is_not_chosen() {
+    let fixture = Fixture::new();
+    let main = fixture.main_file(|m| {
+        m["kernel"]["engines"] =
+            json!({"modsecurity": {"inspector": "/opt/tukuyomi/inspector-modsecurity"}});
+    });
+    let main = main.to_str().unwrap();
+    let group = |engine: Value| {
+        let mut group = json!({"servers": [{
+            "address": "127.0.0.1:9000", "weight": 1, "max_fails": 1, "fail_timeout_ms": 1000, "backup": false,
+        }]});
+        group["engine"] = engine;
+        let version = json!({"sites": [], "upstreams": {"app": group}, "routes": [], "default_upstream": "app"});
+        hex(&fixture.version(&version))
+    };
+    let (coraza, modsecurity) = (group(json!("coraza")), group(json!("modsecurity")));
+    // Only Coraza has a generation chosen: a version for it is chosen, and one for ModSecurity is refused before the
+    // store chooses it.
+    assert_eq!(command(&["activate", main, &coraza]).0, Exit::Done);
+    let (exit, out, lines) = command(&["activate", main, &modsecurity]);
+    assert_eq!((exit, out.as_str()), (Exit::Failed, ""));
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some(
+            "managed activate: rules store refused: no generation is chosen for the engine of an upstream (upstream app)"
+        )
+    );
+    assert_eq!(
+        fixture.store().current(),
+        Ok(Some(digest(&coraza).unwrap()))
+    );
+    // Once a generation is chosen for ModSecurity, the same version is chosen.
+    fixture.choose_rules(Engine::ModSecurity);
+    let (exit, out, lines) = command(&["activate", main, &modsecurity]);
+    assert_eq!(exit, Exit::Done, "{lines:?}");
+    assert_eq!(out, format!("{modsecurity} current\n"));
 }
 
 #[test]

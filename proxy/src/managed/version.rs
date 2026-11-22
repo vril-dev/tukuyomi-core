@@ -19,7 +19,9 @@
 //! has `acme` if a site has, that no site has the host of the way to the admin process (`admin.route`; a `*.` host may
 //! cover it, as the name comes first), that a main file with a TLS listener has some certificate for it (a site,
 //! with `acme` or not, or the way), then the groups, the routes and
-//! the default group with the addresses the proxy listens on and the `max_body` of the proxy, that no route has the
+//! the default group with the addresses the proxy listens on, the `max_body` of the proxy and its engines (the
+//! `engine` of a group has to be one that `kernel` has an inspector for; a group that names none has
+//! `kernel.default_engine`), that no route has the
 //! host of the way (with any port), that no server is at `admin.listen` (the way is the proxy's own; a name that comes
 //! to that address is refused when it is looked up), then the `records` of the routes with the `records` of the main
 //! file, then
@@ -413,6 +415,7 @@ impl<C: Certificate, T> Raw<C, T> {
             &self.default_upstream,
             &bound,
             main.proxy.max_body,
+            &main.kernel,
             split,
         )?;
         if let Some(at) = forward.routes.rules().position(|rule| {

@@ -1,15 +1,21 @@
-//! The status route, `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "crs"}`.
+//! The status route, `GET /api/status`: `{"current", "reachable", "proxy", "rollback_to", "default_engine", "engines",
+//! "crs"}`.
 //!
-//! `current` is the generation the rules store chooses (`null` when it chooses none), and `reachable` and `proxy` are
-//! what the control socket says of the proxy (see `control`): `proxy` is `{"generation", "mode", "engine", "phase",
-//! "switching", "reloading", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures",
-//! "config", "managed", "resolve_timeout_ms", "config_reloads"}`, the answer of the proxy as it is, and `null` when it
-//! could not be read. A proxy of an older version does not send the figures (`reloading` and the last nine), and each
-//! one it does not send is `null`, as `managed` is for a proxy whose configuration has no `managed`; the answer is not
-//! refused for that. `rollback_to` is the
-//! generation a rollback would go to if it were asked for now: the target of the history (`history::rollback_target`)
-//! when the rules store still has that generation, else `null`. A history that cannot be read makes the answer 503, as
-//! it does for the history route.
+//! `current` is the generation the rules store chooses for the default engine (`null` when it chooses none), and
+//! `reachable` and `proxy` are what the control socket says of the proxy (see `control`): `proxy` is `{"generation",
+//! "mode", "engine", "phase", "switching", "engines", "reloading", "ready", "uptime_ms", "requests", "blocked",
+//! "policy_refused", "upstream_failures", "config", "managed", "resolve_timeout_ms", "config_reloads"}`, the answer of
+//! the proxy as it is (`generation`, `mode`, `engine` and `phase` are those of its default engine, and `engines` has
+//! the same four for each engine it runs), and `null` when it could not be read. A proxy of an older version does not
+//! send `engines` and the figures (`reloading` and the last nine), and each one it does not send is `null`, as
+//! `managed` is for a proxy whose configuration has no `managed`; the answer is not refused for that. `rollback_to` is
+//! the generation a rollback of the default engine would go to if it were asked for now: the target of the history
+//! (`history::rollback_target`) when the rules store still has that generation, else `null`. `default_engine` is the
+//! default engine, `coraza` or `modsecurity`, as this process read `kernel.default_engine` when it started (`coraza`
+//! when the configuration leaves it out); `current` and `rollback_to` are those of it. It can differ from the `engine`
+//! of `proxy`, which the proxy read when it started, while only one of the two has been restarted after the
+//! configuration changed. `engines` has an entry for each engine, `{"engine", "current", "rollback_to"}`, the same two
+//! for that engine. A history that cannot be read makes the answer 503, as it does for the history route.
 //!
 //! `crs` is `{"available", "files"}`: `available` says whether the configuration names a directory of the CRS
 //! (`admin.crs_dir`), and `files` are the names of the `.conf` files in its `rules` directory, which an import may turn
@@ -28,6 +34,7 @@ use super::history::rollback_target;
 use super::{Waf, failed};
 use crate::admin::server::Answer;
 use crate::rules::bundle::{BundlePath, MAX_FILES};
+use crate::rules::store::ENGINES;
 
 /// The most entries of the directory that are read, as many as an import reads.
 const SCAN_MAX: usize = 1024;
@@ -65,26 +72,52 @@ impl Waf {
             Ok(store) => store,
             Err(answer) => return answer,
         };
-        let (current, list) = match (store.current(), store.list()) {
-            (Ok(current), Ok(list)) => (current, list),
-            (Err(e), _) | (_, Err(e)) => return failed(e),
+        let list = match store.list() {
+            Ok(list) => list,
+            Err(e) => return failed(e),
         };
         let lines = match self.lines() {
             Ok(lines) => lines,
             Err(answer) => return answer,
         };
-        let rollback_to = current
-            .and_then(|chosen| rollback_target(&lines, chosen).ok())
-            .filter(|target| list.iter().any(|g| g.fingerprint == *target));
+        // The generation chosen for each engine, and where a rollback of the engine would go.
+        let mut engines = Vec::new();
+        for engine in ENGINES {
+            let current = match store.current(engine) {
+                Ok(current) => current,
+                Err(e) => return failed(e),
+            };
+            let rollback_to = current
+                .and_then(|chosen| {
+                    rollback_target(&lines, chosen, engine, |g| store.engine(g).ok()).ok()
+                })
+                .filter(|target| list.iter().any(|g| g.fingerprint == *target));
+            engines.push((engine, current, rollback_to));
+        }
+        let default = engines
+            .iter()
+            .find(|(engine, ..)| *engine == self.default_engine)
+            .map_or((None, None), |&(_, current, rollback_to)| {
+                (current, rollback_to)
+            });
         let proxy = self.control.status();
         let crs = self.crs_dir.as_deref();
         Answer::json(
             StatusCode::OK,
             json!({
-                "current": current.map(|current| current.hex()),
+                "current": default.0.map(|current| current.hex()),
                 "reachable": proxy.reachable(),
                 "proxy": proxy.state().map(|status| status.json()),
-                "rollback_to": rollback_to.map(|target| target.hex()),
+                "rollback_to": default.1.map(|target| target.hex()),
+                "default_engine": self.default_engine.name(),
+                "engines": engines
+                    .iter()
+                    .map(|(engine, current, rollback_to)| json!({
+                        "engine": engine.name(),
+                        "current": current.map(|current| current.hex()),
+                        "rollback_to": rollback_to.map(|target| target.hex()),
+                    }))
+                    .collect::<Vec<_>>(),
                 "crs": {"available": crs.is_some(), "files": crs.map(crs_files).unwrap_or_default()},
             }),
         )

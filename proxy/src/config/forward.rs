@@ -3,7 +3,7 @@
 //! `resolve_timeout_ms` is the time the proxy may take to look up the names of the servers each time it reads the
 //! configuration: when it starts, at SIGHUP, and for a reload order of the control socket, whose answer is waited for
 //! that long and a margin (1 ms to 3600 s).
-//! `upstreams` is an object from the name of a group to `{"servers": [..], "tls"?}`. A name is 1 to 64
+//! `upstreams` is an object from the name of a group to `{"servers": [..], "tls"?, "engine"?}`. A name is 1 to 64
 //! letters, digits, `-` and `_`, and there are 1 to 64 groups. A group has 1 to 64 servers, each `{"address", "weight",
 //! "max_fails", "fail_timeout_ms", "backup"}` with every key present: the address is an IP literal and a port
 //! (`[..]:port` for IPv6) or a name and a port (`name:port`), the weight is 1 to 100, `max_fails` is 0 to 100 (0:
@@ -18,7 +18,12 @@
 //! over TLS, and its certificate is checked against the authorities in `ca_file` (see `forward::tls`). `ca_file` is
 //! an absolute clean path of at most 3840 bytes; the file is not read here. `server_name` is a name of the form of a
 //! server name, and TLS has to be able to use it; without it each server is checked for its own name (so every name
-//! of a server of such a group must be one TLS can use), or, written as an IP literal, for its address.
+//! of a server of such a group must be one TLS can use), or, written as an IP literal, for its address. `engine` of a
+//! group is `coraza` or `modsecurity`, the engine that inspects the requests that go to the group, and the
+//! configuration must have an inspector for it (`kernel`); left out, it is `kernel.default_engine`, which the check
+//! resolves, so that a group always has the engine it is inspected by. No two groups with a server at the same address
+//! have different engines: a request reaches that backend through whichever of the groups its `Host` chooses, and the
+//! weakest of their engines and modes would be the protection of the backend.
 //! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?,
 //! "records"?}`.
 //! The `host` and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access`
@@ -28,13 +33,14 @@
 //! `websocket` tells whether a WebSocket handshake is let through. `records` is `best_effort`, `required` or `security`
 //! and says how the records of the requests of the route are kept (see `records`); left out, `records.keep` holds.
 //! `max_body` is the most bytes a request body may have on the route
-//! (0: none); it is not above the `max_body` of the proxy, which the route can only lower. `default_upstream` is the group that serves a request no route
-//! holds for, or the empty string, and then such a request is answered with 404. The default group has no
-//! `access`, no `rewrite`, no `stream`, no `max_body` and no `records`. The `path` of a route that has an access list is in its canonical
-//! form (see `route`): its escapes are in uppercase and none stands for a byte that a path holds as it is, for a
-//! request is held to the list of the route that its path in canonical form meets, and would not meet this one. If
-//! any route has an access list, no route has a port in its `host`: the client writes the port, and a request that
-//! writes a port that a route names would meet that route and not the one with the list.
+//! (0: none); it is not above the `max_body` of the proxy, which the route can only lower. `default_upstream` is the
+//! group that serves a request no route holds for, or the empty string, and then such a request is answered with 404.
+//! The default group has no `access`, no `rewrite`, no `stream`, no `max_body` and no `records`. The `path` of a route
+//! that has an access list is in its canonical form (see `route`): its escapes are in uppercase and none stands for a
+//! byte that a path holds as it is, for a request is held to the list of the route that its path in canonical form
+//! meets, and would not meet this one. If any route has an access list, no route has a port in its `host`: the client
+//! writes the port, and a request that writes a port that a route names would meet that route and not the one with the
+//! list.
 //!
 //! In a file with `managed`, `forward` has `resolve_timeout_ms` alone: the groups, the routes and the default group
 //! are those of the managed version, checked by the same rules (`located`, which `managed::version` calls), but for
@@ -44,32 +50,27 @@
 //! the proxy take the sentence alone from the check of the version (`managed::version`, `Raw::check`).
 
 use std::collections::BTreeSet;
-use std::fmt;
-use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde::de::{DeserializeOwned, Deserializer, Error, MapAccess, Visitor};
-use serde_json::Value;
+use tukuyomi_kernel::Engine;
 
+use self::group::{MAX_GROUPS, engine, engines_apart, servers, tls};
 use super::records;
 use super::rewrite::{self, RawAccess, RawRewrite};
-use super::{
-    ConfigError, MAX_CONN_MS, MAX_STORE_DIR, Object, RouteKeep, clean_abs, ensure, millis, same,
-};
+use super::{ConfigError, KernelSettings, MAX_CONN_MS, Object, RouteKeep, ensure, millis};
 use crate::forward::client_ip::Access;
 use crate::forward::rewrite::Rewrite;
-use crate::forward::tls::{self, Authorities, Client, Settings};
-use crate::route::{Rule, Table, parse_port};
+use crate::forward::tls::{Authorities, Client, Settings};
+use crate::route::{Rule, Table};
 
-const MAX_GROUPS: usize = 64;
-/// The most servers a group has, as the file writes them and once the names are looked up.
-pub(crate) const MAX_SERVERS: usize = 64;
+mod group;
+
+pub(super) use self::group::host_ok;
+pub(crate) use self::group::{Groups, MAX_SERVERS, RawTls, StoredTls, name_ok};
+
 const MAX_ROUTES: usize = 1024;
-const MAX_NAME: usize = 64;
 
 /// The key of a route that each sentence of `Rule::forward` and of `Rewrite::new` is about: each is about one key.
 const ROUTE_KEYS: [(&str, &str); 11] = [
@@ -149,6 +150,9 @@ pub struct GroupConfig<A = SocketAddr, T = Client> {
     pub name: String,
     pub servers: Vec<ServerConfig<A>>,
     pub tls: Option<T>,
+    /// The engine that inspects the requests that go to the group: the one it names, or the default of the
+    /// configuration, which the check resolves (see `kernel`).
+    pub engine: Engine,
 }
 
 /// The times of a response on a route that may take long, and whether the route lets a WebSocket through.
@@ -216,12 +220,13 @@ pub struct ForwardConfig {
 }
 
 /// The way to the admin process that the proxy makes itself: a request whose `Host` is `host` goes to the one server
-/// at `server` (`admin.listen`), if `access` lets its client.
+/// at `server` (`admin.listen`), if `access` lets its client. `engine` inspects such a request: the default engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdminWay {
     pub host: String,
     pub access: Access,
     pub server: SocketAddr,
+    pub engine: Engine,
 }
 
 #[cfg(test)]
@@ -245,6 +250,7 @@ impl ForwardConfig {
                 name: "main".to_string(),
                 servers,
                 tls: None,
+                engine: Engine::Coraza,
             }],
             routes: Table::default(),
             default: Some(0),
@@ -283,57 +289,6 @@ impl RawForward {
     }
 }
 
-/// A group as it is written. `T` is its `tls`: `RawTls` in the main file and in the document of `managed import`,
-/// `StoredTls` in a managed version.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, bound(deserialize = "T: Deserialize<'de>"))]
-struct RawGroup<T> {
-    servers: Vec<Object<RawServer>>,
-    #[serde(default, deserialize_with = "super::present")]
-    tls: Option<Object<T>>,
-}
-
-/// The `tls` of a group that names the file of its authorities by its path.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RawTls {
-    ca_file: String,
-    #[serde(default, deserialize_with = "super::present")]
-    server_name: Option<String>,
-}
-
-impl RawTls {
-    /// The file of the authorities, an absolute clean path of at most 3840 bytes, and the name to check the servers
-    /// for, which `routing` checks.
-    pub(crate) fn split(self) -> Result<(Authorities, Option<String>), ConfigError> {
-        let ca_file = PathBuf::from(self.ca_file);
-        ensure(
-            clean_abs(&ca_file) && ca_file.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
-            "an upstream tls ca_file is not an absolute clean path of at most 3840 bytes",
-        )?;
-        Ok((Authorities::File(ca_file), self.server_name))
-    }
-}
-
-/// The `tls` of a group of a managed version: the file of the authorities by the SHA-256 of a file of the store.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StoredTls {
-    pub(crate) ca: String,
-    #[serde(default, deserialize_with = "super::present")]
-    pub(crate) server_name: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawServer {
-    address: String,
-    weight: u32,
-    max_fails: u32,
-    fail_timeout_ms: u64,
-    backup: bool,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawRoute {
@@ -362,114 +317,6 @@ struct RawStream {
     websocket: bool,
 }
 
-/// The groups in the order of the file. A name that is repeated is a repeated key, which a map would swallow. `T` is
-/// the `tls` of a group, as for `RawGroup`.
-pub(crate) struct Groups<T>(Vec<(String, Object<RawGroup<T>>)>);
-
-impl<T> Groups<T> {
-    /// The names of the groups, in order: what the place of a refusal names a group by (see `At`).
-    pub(crate) fn names(&self) -> Vec<String> {
-        self.0.iter().map(|(name, _)| name.clone()).collect()
-    }
-}
-
-impl Groups<StoredTls> {
-    /// The `ca` of each group of a version that has `tls`, as it is written: the files of the store that the groups
-    /// name, for the cleaning of the store (see `managed::version`).
-    pub(crate) fn authorities(&self) -> impl Iterator<Item = &str> {
-        self.0
-            .iter()
-            .filter_map(|(_, Object(group))| group.tls.as_ref())
-            .map(|Object(tls)| tls.ca.as_str())
-    }
-}
-
-impl<T: DeserializeOwned> Groups<T> {
-    /// Reads `value` as one group is read here, for the reading of a version item by item (see `managed::version`).
-    pub(crate) fn read_one(value: &Value) -> Result<(), ConfigError> {
-        Object::<RawGroup<T>>::deserialize(value)
-            .map(drop)
-            .map_err(|e| super::refusal(&e))
-    }
-}
-
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Groups<T> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_map(GroupsVisitor(PhantomData))
-    }
-}
-
-struct GroupsVisitor<T>(PhantomData<T>);
-
-impl<'de, T: Deserialize<'de>> Visitor<'de> for GroupsVisitor<T> {
-    type Value = Groups<T>;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("an object")
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Groups<T>, A::Error> {
-        let mut seen = BTreeSet::new();
-        let mut groups = Vec::new();
-        while let Some((name, group)) = map.next_entry::<String, Object<RawGroup<T>>>()? {
-            if !seen.insert(name.clone()) {
-                return Err(A::Error::duplicate_field("upstreams"));
-            }
-            groups.push((name, group));
-        }
-        Ok(Groups(groups))
-    }
-}
-
-/// A name is 1 to 64 bytes of letters, digits, `-` and `_`.
-pub(crate) fn name_ok(name: &str) -> bool {
-    (1..=MAX_NAME).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-/// A label of a server name: 1 to 63 bytes.
-fn host_label_ok(label: &str) -> bool {
-    (1..=63).contains(&label.len())
-}
-
-/// A server name: 1 to 253 bytes of lowercase letters, digits, `-`, `_` and `.` in labels of 1 to 63 bytes, the last
-/// of which starts with a letter.
-pub(super) fn host_ok(name: &str) -> bool {
-    name.len() <= 253
-        && name.split('.').all(host_label_ok)
-        && name
-            .bytes()
-            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
-        && name
-            .rsplit('.')
-            .next()
-            .is_some_and(|last| last.starts_with(|c: char| c.is_ascii_lowercase()))
-}
-
-/// The address of a server: an IP literal and a port, or a name and a port.
-fn server_address(text: &str) -> Result<Address, ConfigError> {
-    if let Ok(literal) = text.parse::<SocketAddr>() {
-        ensure(literal.port() != 0, "a server port is 0")?;
-        let ip = literal.ip().to_canonical();
-        ensure(
-            !ip.is_unspecified() && !ip.is_multicast(),
-            "a server address is unspecified or a multicast address",
-        )?;
-        return Ok(Address::Literal(literal));
-    }
-    let (name, port) = text.split_once(':').ok_or(ConfigError(
-        "a server address is not an IP address and port, or a name and port",
-    ))?;
-    ensure(host_ok(name), "a server name is malformed")?;
-    let port = parse_port(port.as_bytes()).ok_or(ConfigError("a server port is not 1 to 65535"))?;
-    Ok(Address::Name {
-        name: name.to_owned(),
-        port,
-    })
-}
-
 /// The `stream` of a route: both times from 1 ms to 24 h, and the idle time not above the total.
 fn stream(raw: Option<Object<RawStream>>) -> Result<Option<Stream>, ConfigError> {
     let Some(Object(raw)) = raw else {
@@ -490,95 +337,6 @@ fn stream(raw: Option<Object<RawStream>>) -> Result<Option<Stream>, ConfigError>
     }))
 }
 
-/// The servers of the group at `group`.
-fn servers(
-    group: usize,
-    raw: Vec<Object<RawServer>>,
-    listeners: &[SocketAddr],
-) -> Result<Vec<ServerConfig<Address>>, (ConfigError, At)> {
-    ensure(
-        (1..=MAX_SERVERS).contains(&raw.len()),
-        "an upstream has no server or more than 64 servers",
-    )
-    .map_err(|e| (e, At::Group(group, Some("servers"))))?;
-    raw.into_iter()
-        .enumerate()
-        .map(|(at, Object(server))| {
-            let key = |key: &'static str| move |e: ConfigError| (e, At::Server(group, at, key));
-            let address = server_address(&server.address).map_err(key("address"))?;
-            if let Address::Literal(literal) = address {
-                ensure(
-                    !listeners.iter().any(|listener| same(*listener, literal)),
-                    "a listener and a server are the same address",
-                )
-                .map_err(key("address"))?;
-            }
-            ensure(
-                (1..=100).contains(&server.weight),
-                "a server weight is out of range",
-            )
-            .map_err(key("weight"))?;
-            ensure(
-                server.max_fails <= 100,
-                "a server max_fails is out of range",
-            )
-            .map_err(key("max_fails"))?;
-            Ok(ServerConfig {
-                address,
-                weight: server.weight,
-                max_fails: server.max_fails,
-                fail_timeout: millis(
-                    server.fail_timeout_ms,
-                    "a server fail_timeout_ms is out of range",
-                )
-                .map_err(key("fail_timeout_ms"))?,
-                backup: server.backup,
-            })
-        })
-        .collect()
-}
-
-/// The `tls` of the group at `group`, whose servers are `servers`: `split` checks the file of the authorities as it is
-/// written, and every name that a server is checked for (the `server_name`, or else the name of each server written
-/// with a name) is one that TLS can use.
-fn tls<T>(
-    group: usize,
-    raw: Option<Object<T>>,
-    servers: &[ServerConfig<Address>],
-    split: &impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
-) -> Result<Option<Settings>, (ConfigError, At)> {
-    let Some(Object(raw)) = raw else {
-        return Ok(None);
-    };
-    let (authorities, server_name) =
-        split(raw).map_err(|e| (e, At::Group(group, Some("tls.ca"))))?;
-    match &server_name {
-        Some(name) => ensure(
-            host_ok(name) && tls::dns_name(name).is_some(),
-            "an upstream tls server_name is not a name that TLS can use",
-        )
-        .map_err(|e| (e, At::Group(group, Some("tls.server_name"))))?,
-        None => {
-            let unfit = servers.iter().position(|server| match &server.address {
-                Address::Name { name, .. } => tls::dns_name(name).is_none(),
-                Address::Literal(_) => false,
-            });
-            if let Some(at) = unfit {
-                return Err((
-                    ConfigError(
-                        "a server name of an upstream with tls is not a name that TLS can use",
-                    ),
-                    At::Server(group, at, "address"),
-                ));
-            }
-        }
-    }
-    Ok(Some(Settings {
-        authorities,
-        server_name,
-    }))
-}
-
 /// Checks the `forward` object of a file without `managed`. `listeners` are the addresses the proxy listens on, the
 /// status listener's included, and `max_body` is the limit on a request body that the proxy has: a route may lower it,
 /// not raise it.
@@ -586,6 +344,7 @@ pub(super) fn check(
     raw: RawForward,
     listeners: &[SocketAddr],
     max_body: usize,
+    kernel: &KernelSettings,
 ) -> Result<ForwardSettings, ConfigError> {
     let (Some(upstreams), Some(routes), Some(default_upstream)) =
         (raw.upstreams, raw.routes, raw.default_upstream)
@@ -601,6 +360,7 @@ pub(super) fn check(
         &default_upstream,
         listeners,
         max_body,
+        kernel,
         RawTls::split,
     )
 }
@@ -615,8 +375,10 @@ pub(super) fn timeout_only(raw: RawForward) -> Result<Duration, ConfigError> {
 }
 
 /// The upstream groups, the routes and the default group of the `forward` object of a file without `managed`, checked,
-/// with `resolve_timeout` taken as it is. `listeners` and `max_body` are as for `check`, and `split` checks the `tls`
-/// of a group as it is written. A refusal is the sentence of `located`.
+/// with `resolve_timeout` taken as it is. `listeners`, `max_body` and `kernel` are as for `check`, and `split` checks
+/// the `tls` of a group as it is written. A refusal is the sentence of `located`.
+// One argument for each part of what the configuration file gives; a struct of them would only repeat their names.
+#[allow(clippy::too_many_arguments)]
 fn routing<T>(
     resolve_timeout: Duration,
     upstreams: Groups<T>,
@@ -624,6 +386,7 @@ fn routing<T>(
     default_upstream: &str,
     listeners: &[SocketAddr],
     max_body: usize,
+    kernel: &KernelSettings,
     split: impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
 ) -> Result<ForwardSettings, ConfigError> {
     located(
@@ -633,6 +396,7 @@ fn routing<T>(
         default_upstream,
         listeners,
         max_body,
+        kernel,
         split,
     )
     .map_err(|(e, _)| e)
@@ -641,7 +405,10 @@ fn routing<T>(
 /// The upstream groups, the routes and the default group, checked: the routing of a managed version (see
 /// `managed::version`), and, through `routing`, that of a file without `managed`. A refusal also tells where in a
 /// managed version it is (see `At`): a refusal about two items is about the later one, and one about a rule that the
-/// routes break together is about the first route that breaks it.
+/// routes break together is about the first route that breaks it. The engine of a group is checked against `kernel`,
+/// whose default engine is the one of a group that names none.
+// One argument for each part of what the configuration file gives; a struct of them would only repeat their names.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn located<T>(
     resolve_timeout: Duration,
     upstreams: Groups<T>,
@@ -649,6 +416,7 @@ pub(crate) fn located<T>(
     default_upstream: &str,
     listeners: &[SocketAddr],
     max_body: usize,
+    kernel: &KernelSettings,
     split: impl Fn(T) -> Result<(Authorities, Option<String>), ConfigError>,
 ) -> Result<ForwardSettings, (ConfigError, Option<At>)> {
     let top = |key: &'static str| move |e: ConfigError| (e, Some(At::Top(key, None)));
@@ -668,8 +436,15 @@ pub(crate) fn located<T>(
         .map_err(top("upstreams"))?;
         let servers = servers(at, group.servers, listeners).map_err(placed)?;
         let tls = tls(at, group.tls, &servers, &split).map_err(placed)?;
-        groups.push(GroupConfig { name, servers, tls });
+        let engine = engine(at, group.engine, kernel).map_err(placed)?;
+        groups.push(GroupConfig {
+            name,
+            servers,
+            tls,
+            engine,
+        });
     }
+    engines_apart(&groups).map_err(placed)?;
     ensure(
         routes.len() <= MAX_ROUTES,
         "routes has more than 1024 entries",

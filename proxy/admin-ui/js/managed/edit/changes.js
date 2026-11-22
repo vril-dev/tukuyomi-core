@@ -1,7 +1,7 @@
-// What a saving changes, for the confirmation: the groups, the default group, the access list, the rate limit, the host
-// policies, the sites and the routes that are added, taken away or changed. A line names a group, a host policy or a
-// site, or the host and the path of a route, and none of its values, for a rewrite can hold a secret. Nothing runs when
-// the module is loaded.
+// What a saving changes, for the confirmation: the groups, the engines of the groups, the default group, the access
+// list, the rate limit, the host policies, the sites and the routes that are added, taken away or changed. A line names
+// a group, a host policy or a site, or the host and the path of a route, and none of its values, for a rewrite can hold
+// a secret. Nothing runs when the module is loaded.
 
 const plain = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -63,15 +63,41 @@ export function notReached(before, after, kind, changes = false) {
     .map((policy) => String(policy.name));
 }
 
+/** A group without its engine, which is told on its own (see `engineChanges`). */
+function withoutEngine(group) {
+  const rest = { ...group };
+  delete rest.engine;
+  return rest;
+}
+
+/**
+ * The groups of both versions whose engine is written differently: `engine` when the engine that inspects the group
+ * changes (the one it names, else `name`, the default engine), and `engine_key` when only the writing changes, for the
+ * default engine, or the same name, written in one and not in the other: that changes what the group does when the
+ * default engine is changed later. With no default engine known (`name` is null) every writing that changes is told as
+ * a change of the engine.
+ */
+function engineChanges(before, after, name, out) {
+  const engineOf = (group) => (typeof group.engine === 'string' ? group.engine : name);
+  for (const [key, group] of Object.entries(before.upstreams)) {
+    if (!Object.hasOwn(after.upstreams, key) || group.engine === after.upstreams[key].engine) continue;
+    const [was, now] = [engineOf(group), engineOf(after.upstreams[key])];
+    out.push({ area: was !== null && was === now ? 'engine_key' : 'engine', action: 'change', label: key });
+  }
+}
+
 /**
  * The lines of what changes from the version `before` to the version `after`: `{ area, action, label }` with `area`
- * one of `upstream`, `default`, `access`, `rate_limit`, `host_policy`, `site` and `route`, and `action` one of `add`,
- * `remove` and `change`. Groups, host policies and sites are matched by their names and routes by their hosts and
- * paths, so a renamed one is one taken away and one added.
+ * one of `upstream`, `engine`, `engine_key`, `default`, `access`, `rate_limit`, `host_policy`, `site` and `route`, and
+ * `action` one of `add`, `remove` and `change`. Groups, host policies and sites are matched by their names and routes
+ * by their hosts and paths, so a renamed one is one taken away and one added. The engine of a group is not part of the
+ * line of the group; `name` is the default engine (null when it is not known).
  */
-export function changesBetween(before, after) {
+export function changesBetween(before, after, name = null) {
   const out = [];
-  changed('upstream', new Map(Object.entries(before.upstreams)), new Map(Object.entries(after.upstreams)), (key) => key, out);
+  const groups = (version) => new Map(Object.entries(version.upstreams).map(([key, group]) => [key, withoutEngine(group)]));
+  changed('upstream', groups(before), groups(after), (key) => key, out);
+  engineChanges(before, after, name, out);
   if (before.default_upstream !== after.default_upstream) out.push({ area: 'default', action: 'change', label: '' });
   single('access', before.access, after.access, out);
   single('rate_limit', before.rate_limit, after.rate_limit, out);

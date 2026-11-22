@@ -10,15 +10,15 @@ use std::fmt::{Display, Write as _};
 
 use tukuyomi_kernel::Phase;
 
-use crate::inspect::driver::State;
+use crate::inspect::engines::States;
 use crate::log::counters::Counters;
 use crate::log::ship::Unshipped;
 
 /// Everything the page is made of.
 pub(super) struct Scrape<'a> {
     pub(super) counters: &'a Counters,
-    /// The kernel that serves.
-    pub(super) state: State,
+    /// The kernel that serves each engine that runs.
+    pub(super) states: States,
     /// The connections that are open.
     pub(super) connections_open: usize,
     /// How many times a connection had to wait for a permit.
@@ -99,7 +99,7 @@ impl Page {
 /// The page for `scrape`.
 pub(super) fn render(scrape: &Scrape<'_>) -> String {
     let counters = scrape.counters;
-    let state = &scrape.state;
+    let states = &scrape.states;
     let mut page = Page(String::new());
     page.labelled(
         "tukuyomi_requests_total",
@@ -176,30 +176,56 @@ pub(super) fn render(scrape: &Scrape<'_>) -> String {
     page.single(
         "tukuyomi_inspector_up",
         "gauge",
-        "1 if the kernel that serves is ready, otherwise 0.",
-        u8::from(state.phase == Phase::Ready),
+        "1 if the kernel of every engine that runs is ready, otherwise 0.",
+        u8::from(states.all_ready()),
     );
     page.single(
         "tukuyomi_inspector_restarts_total",
         "counter",
-        "Restarts of the inspector since the start.",
-        state.restarts,
+        "Restarts of the inspectors of all the engines since the start.",
+        states.restarts(),
     );
+    page.family(
+        "tukuyomi_inspector_engine_up",
+        "gauge",
+        "1 if the kernel of the engine is ready, otherwise 0; one sample for each engine that runs.",
+    );
+    for state in states.started() {
+        page.sample(
+            "tukuyomi_inspector_engine_up",
+            &[("engine", state.engine.name())],
+            u8::from(state.phase == Phase::Ready),
+        );
+    }
+    page.family(
+        "tukuyomi_inspector_engine_restarts_total",
+        "counter",
+        "Restarts of the inspector of the engine since the start; one sample for each engine that runs.",
+    );
+    for state in states.started() {
+        page.sample(
+            "tukuyomi_inspector_engine_restarts_total",
+            &[("engine", state.engine.name())],
+            state.restarts,
+        );
+    }
     page.family(
         "tukuyomi_rules_generation_info",
         "gauge",
-        "The generation of the rules that serves (first 16 digits), what its rules do and the engine that applies them; always 1.",
+        "The generation of the rules that serves (first 16 digits), what its rules do and the engine that applies them; always 1; one sample for each engine that runs.",
     );
-    let generation = state.generation.hex();
-    page.sample(
-        "tukuyomi_rules_generation_info",
-        &[
-            ("generation", generation.get(..16).unwrap_or(&generation)),
-            ("mode", state.mode.name()),
-            ("engine", state.engine.name()),
-        ],
-        1,
-    );
+    for state in states.started() {
+        let generation = state.generation.hex();
+        page.sample(
+            "tukuyomi_rules_generation_info",
+            &[
+                ("generation", generation.get(..16).unwrap_or(&generation)),
+                ("mode", state.mode.name()),
+                ("engine", state.engine.name()),
+            ],
+            1,
+        );
+    }
     page.labelled(
         "tukuyomi_rules_switches_total",
         "Switches to another generation of the rules, by how they ended.",

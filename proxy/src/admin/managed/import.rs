@@ -30,7 +30,9 @@
 //!    `expect`, and the proxy. Nothing is saved for a proxy that could not take the version.
 //! 4. The version with the main file and the files (see `managed::import`), as `managed import` checks a document but
 //!    for the country database, which the proxy reads when it takes the version: a refusal is 400, with the fixed
-//!    sentence (which names no site and no group) and its place. Not audited. The seat of the check is given back
+//!    sentence (which names no site and no group) and its place; a group whose engine has no generation chosen in
+//!    the rules store is refused so, about the key `engine` of the group, and a rules store that cannot be read is
+//!    500. Not audited. The seat of the check is given back
 //!    here.
 //! 5. The audit log takes the line `managed-import`, with the name of the version, before anything is saved: one that
 //!    it does not take is 503, and nothing is saved.
@@ -55,14 +57,14 @@ use zeroize::Zeroizing;
 
 use super::history::Kind;
 use super::job::{Caller, Order, Ready, Target, version_of};
-use super::routes::{Managed, conflict};
+use super::routes::{Managed, conflict, failed};
 use crate::admin::audit::Outcome;
 use crate::admin::auth::{Cx, Who};
 use crate::admin::password::Secret;
 use crate::admin::server::{Answer, Req, json_body};
-use crate::managed::import::{self, LARGE_FILE, MANY_FILES, MAX_FILES, Placing, Reading};
+use crate::managed::import::{self, LARGE_FILE, MANY_FILES, MAX_FILES, Placing, Reading, Refused};
 use crate::managed::store::MAX_BYTES;
-use crate::managed::{LoadError, Objection, Placed, sent};
+use crate::managed::{LoadError, ManagedError, Objection, Placed, sent};
 use crate::rules::bundle::{hex, sha256};
 
 /// The action of the audit log for the line that comes before anything is saved.
@@ -214,7 +216,8 @@ impl Managed {
         };
         let import = match import::from_request(&ready.built, &ready.store, version, files) {
             Ok(import) => import,
-            Err(objection) => return invalid(&objection),
+            Err(Refused::Input(objection)) => return invalid(&objection),
+            Err(Refused::Rules(e)) => return failed(ManagedError(e.0)),
         };
         drop(checking);
         let event = caller.event(IMPORT, Outcome::Ok).target(&name);

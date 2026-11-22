@@ -66,6 +66,28 @@ test('a draft with no change gives the version it was made from, with its empty 
   assert.deepEqual(carried, bare);
 });
 
+test('the engine of a group is built back as it was read, the default engine leaves the key out, and a word that is no engine stays for the check to refuse', () => {
+  const version = sampleVersion();
+  const server = { address: '127.0.0.1:9000', weight: 1, max_fails: 1, fail_timeout_ms: 10000, backup: false };
+  version.upstreams.app.engine = 'coraza';
+  version.upstreams.api.engine = 'modsecurity';
+  version.upstreams.odd = { servers: [server], engine: 'Coraza' };
+  version.upstreams.plain = { servers: [server] };
+  const draft = draftOf(version);
+  assert.deepEqual(draft.build().version, version);
+  assert.equal(draft.changed, false);
+  // The default engine is no key; an engine is written for a group that had no key, and what is written is a change.
+  draft.write(groupNamed(draft, 'app'), 'engine', '');
+  assert.equal(Object.hasOwn(draft.build().version.upstreams.app, 'engine'), false);
+  assert.equal(draft.groupChanged(groupNamed(draft, 'app')), true);
+  assert.equal(draft.changed, true);
+  draft.write(groupNamed(draft, 'plain'), 'engine', 'modsecurity');
+  assert.equal(draft.build().version.upstreams.plain.engine, 'modsecurity');
+  // A version whose engine is not a text is not edited.
+  assert.equal(readableVersion({ ...version, upstreams: { app: { ...version.upstreams.app, engine: 7 } } }), false);
+  forgetDraft();
+});
+
 test('a draft from a version and a new base leave the sites and the routes as the draft carried them', () => {
   const source = sampleVersion();
   source.routes.push({ path: '/other/', upstream: 'api' });
@@ -170,6 +192,7 @@ test('a place in a refusal is found in the request as it was sent', () => {
   const { map } = draft.build();
   assert.deepEqual(locate('upstreams.api.servers[1].address', map), { screen: 'upstreams', panel: api.cid, cid: api.servers[1].cid, field: 'address' });
   assert.deepEqual(locate('upstreams.app', map), { screen: 'upstreams', panel: app.cid, cid: app.cid, field: 'name' });
+  assert.deepEqual(locate('upstreams.app.engine', map), { screen: 'upstreams', panel: app.cid, cid: app.cid, field: 'engine' });
   assert.deepEqual(locate('rate_limit.keys', map), { screen: 'policy', panel: null, cid: 'rate', field: 'keys' });
   assert.deepEqual(locate('files[0]', map), { screen: 'upstreams', panel: app.cid, cid: app.cid, field: 'ca' });
   assert.equal(locate('files[1]', map), null);
@@ -183,6 +206,8 @@ test('a place in a refusal is found in the request as it was sent', () => {
   // The name of a group is looked for only among the names that were sent: what every object has is no group.
   assert.equal(locate('upstreams.__proto__.servers[0].address', map), null);
   assert.equal(locate('upstreams.constructor', map), null);
+  assert.equal(locate('upstreams.__proto__.engine', map), null);
+  assert.equal(locate('upstreams.nothing.engine', map), null);
   // A line that was taken away after the request does not shift what the answer means.
   const kept = api.servers[1].cid;
   draft.removeServer(api, api.servers[0].cid);
@@ -196,6 +221,9 @@ test('the answer of a check is put on no field when the draft has moved on since
   const refused = new ApiError('refused', 400, 'a server port is 0', { at: 'upstreams.app.servers[0].address' });
   assert.equal(checkFinding(draft, asked, { answer: { version: OTHER }, error: null }, describeError).kind, 'passed');
   assert.equal(checkFinding(draft, asked, { answer: { version: FP }, error: null }, describeError).kind, 'same');
+  // What a check says of the groups that a generation of detection inspects goes on to the confirmation, by name.
+  assert.deepEqual(checkFinding(draft, asked, { answer: { version: OTHER, detect: [{ upstream: 'app', engine: 'coraza' }] }, error: null }, describeError).detect, ['app']);
+  assert.deepEqual(checkFinding(draft, asked, { answer: { version: OTHER }, error: null }, describeError).detect, []);
   const finding = checkFinding(draft, asked, { answer: null, error: refused }, describeError);
   assert.equal(finding.kind, 'refused');
   assert.equal(finding.fault.field, 'address');
@@ -415,6 +443,31 @@ test('the lines of what a change does name the items and no value, and the order
     ['route', 'change', '* /'],
   ]);
   assert.doesNotMatch(JSON.stringify(lines), /SECRET/);
+});
+
+test('the engine of a group is a line of its own: the engine that inspects it changes, or only how it is written, and the group is not told twice', () => {
+  const before = sampleVersion();
+  const change = (edit, name = 'coraza') => {
+    const after = JSON.parse(JSON.stringify(before));
+    edit(after.upstreams);
+    return changesBetween(before, after, name).map((line) => [line.area, line.action, line.label]);
+  };
+  assert.deepEqual(change((groups) => (groups.app.engine = 'modsecurity')), [['engine', 'change', 'app']]);
+  // The engine that is written is the one that the default is: what changes is the writing, which matters when the default is changed.
+  assert.deepEqual(change((groups) => (groups.app.engine = 'coraza')), [['engine_key', 'change', 'app']]);
+  assert.deepEqual(change((groups) => (groups.app.engine = 'coraza'), 'modsecurity'), [['engine', 'change', 'app']]);
+  assert.deepEqual(change((groups) => (groups.app.engine = 'modsecurity'), 'modsecurity'), [['engine_key', 'change', 'app']]);
+  // When it is not known which engine is the default, every change of the writing is told as a change of the engine.
+  assert.deepEqual(change((groups) => (groups.app.engine = 'coraza'), null), [['engine', 'change', 'app']]);
+  // What else changes in the group is one line, and the engine another.
+  assert.deepEqual(
+    change((groups) => {
+      groups.app.engine = 'modsecurity';
+      groups.app.servers[0].weight = 2;
+    }),
+    [['upstream', 'change', 'app'], ['engine', 'change', 'app']],
+  );
+  assert.deepEqual(change(() => {}), []);
 });
 
 test('a reading that fails ends like any other, so that the buttons that wait for it come back', async () => {
@@ -749,14 +802,15 @@ test('a fault of a field in a closed part opens the part before the focus goes t
   assert.equal(focused, true);
 });
 
-test('what the configuration file says of ACME, the records and the host of the admin route is read when it can be', async () => {
+test('what the configuration file says of ACME, the records, the inspector of ModSecurity and the host of the admin route is read when it can be', async () => {
   const reading = (call) => Screen.prototype.readFile.call({ ctx: { api: { call } } });
-  const read = await reading(async () => ({ sha256: FP, acme: { directory: 'x' }, admin: { route: { host: 'admin.example' } } }));
-  assert.deepEqual([read.acme, read.records, read.adminHost], [true, false, 'admin.example']);
+  const read = await reading(async () => ({ sha256: FP, acme: { directory: 'x' }, admin: { route: { host: 'admin.example' } }, kernel: { engines: { modsecurity: { inspector: true } } } }));
+  assert.deepEqual([read.acme, read.records, read.adminHost, read.modsecurity], [true, false, 'admin.example', true]);
+  assert.equal((await reading(async () => ({ sha256: FP, kernel: { inspector: true } }))).modsecurity, false);
   const refused = await reading(async () => {
     throw new Error('gone');
   });
-  assert.deepEqual([refused.acme, refused.records, refused.adminHost], [null, null, null]);
+  assert.deepEqual([refused.acme, refused.records, refused.adminHost, refused.modsecurity], [null, null, null, null]);
 });
 
 test('a refusal about a site or a route is found at its field, at the note of its part, or at its panel', () => {

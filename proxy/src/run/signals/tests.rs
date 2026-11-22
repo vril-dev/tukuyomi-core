@@ -11,14 +11,14 @@ pub(in crate::run) fn runtime() -> Runtime {
 pub(in crate::run) struct Fixture {
     pub(in crate::run) waits: Waits,
     ready: oneshot::Sender<Result<(), Failure>>,
-    _failed: oneshot::Sender<Failure>,
+    _failed: mpsc::Sender<Failure>,
     pub(in crate::run) end: oneshot::Sender<End>,
 }
 
 /// Needs a runtime to be entered.
 pub(in crate::run) fn fixture() -> Fixture {
     let (ready, ready_rx) = oneshot::channel();
-    let (failed, failed_rx) = oneshot::channel();
+    let (failed, failed_rx) = mpsc::channel(2);
     let (end, end_rx) = oneshot::channel();
     Fixture {
         waits: Waits::new(Signals::install().unwrap(), ready_rx, failed_rx, end_rx),
@@ -65,16 +65,19 @@ fn a_wait_returns_the_answer_to_a_switch_once() {
     runtime().block_on(async {
         let mut f = fixture();
         let (reply, told) = oneshot::channel();
-        f.waits.switch = Some(told);
+        f.waits.switch = Some((Engine::ModSecurity, told));
         reply.send(Switched::Yes).unwrap();
         assert!(matches!(
             f.waits.wait(after(2000)).await,
-            Event::Switched(true)
+            Event::Switched {
+                engine: Engine::ModSecurity,
+                switched: true
+            }
         ));
         assert!(matches!(f.waits.wait(after(30)).await, Event::Late));
 
         let (reply, told) = oneshot::channel::<Switched>();
-        f.waits.switch = Some(told);
+        f.waits.switch = Some((Engine::Coraza, told));
         drop(reply);
         assert!(matches!(
             f.waits.wait(after(2000)).await,

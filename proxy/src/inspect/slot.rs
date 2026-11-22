@@ -85,6 +85,7 @@ pub(super) fn deliver(
         };
         // The request and the hold live to the end of this turn, after the send.
         let Ticket {
+            engine: _,
             req: _req,
             reply,
             hold: _hold,

@@ -196,7 +196,8 @@ pub(super) fn unmanaged() -> Answer {
     conflict(UNMANAGED)
 }
 
-/// The managed store cannot be opened or read.
+/// The managed store cannot be opened or read, or the rules store cannot be read where a version is checked for a
+/// generation chosen for the engine of each of its groups: 500 for both.
 pub(super) fn failed(e: ManagedError) -> Answer {
     Answer::error(StatusCode::INTERNAL_SERVER_ERROR, e.0)
 }

@@ -5,10 +5,12 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use http::HeaderMap;
 use http::header::{CONTENT_TYPE, HeaderValue};
+use serde_json::Value;
 use tukuyomi_kernel::Engine;
 
 use super::*;
@@ -16,11 +18,11 @@ use crate::acme::base64;
 use crate::admin::audit::Append;
 use crate::admin::file_store::FileAdminStore;
 use crate::admin::file_store::tests::{TestDir, scratch};
-use crate::admin::waf::history::Activation;
+use crate::admin::waf::history::{Activation, Ended, Kind};
 use crate::config::Keep;
 use crate::log;
 use crate::log::sink::RecordFile;
-use crate::rules::bundle::{Bundle, BundlePath, Mode};
+use crate::rules::bundle::{Bundle, BundlePath, Fingerprint, Mode};
 use crate::rules::file_store::FileStore;
 use crate::rules::routes::Routes;
 use crate::rules::store::{NOT_EXPECTED, Staged};
@@ -77,7 +79,15 @@ enum Behavior {
 type Hook = Box<dyn FnOnce() + Send>;
 
 struct Proxy {
+    /// The generation that serves Coraza, which the proxy runs from the start.
     serving: Arc<Mutex<Fingerprint>>,
+    /// The generation that serves ModSecurity, and whether the proxy runs that engine.
+    modsecurity: Arc<Mutex<Fingerprint>>,
+    runs_modsecurity: Arc<AtomicBool>,
+    /// The engine of each order, by the word of the order.
+    engines_asked: Arc<Mutex<Vec<String>>>,
+    /// A proxy of an older version: it does not send its engines.
+    old: Arc<AtomicBool>,
     behavior: Arc<Mutex<Behavior>>,
     orders: Arc<Mutex<Vec<Fingerprint>>>,
     /// The next connections, that many, are closed without a word, as the proxy does when its places are taken.
@@ -94,6 +104,10 @@ impl Proxy {
         listener.set_nonblocking(true).unwrap();
         let mut proxy = Proxy {
             serving: Arc::new(Mutex::new(Fingerprint::of(b"none"))),
+            modsecurity: Arc::new(Mutex::new(Fingerprint::of(b"none"))),
+            runs_modsecurity: Arc::new(AtomicBool::new(false)),
+            engines_asked: Arc::new(Mutex::new(Vec::new())),
+            old: Arc::new(AtomicBool::new(false)),
             behavior: Arc::new(Mutex::new(Behavior::Switch)),
             orders: Arc::new(Mutex::new(Vec::new())),
             closing: Arc::new(AtomicUsize::new(0)),
@@ -106,6 +120,12 @@ impl Proxy {
             proxy.behavior.clone(),
             proxy.orders.clone(),
             proxy.stop.clone(),
+        );
+        let (modsecurity, runs_modsecurity, engines_asked, old) = (
+            proxy.modsecurity.clone(),
+            proxy.runs_modsecurity.clone(),
+            proxy.engines_asked.clone(),
+            proxy.old.clone(),
         );
         let (closing, hook) = (proxy.closing.clone(), proxy.hook.clone());
         let pending = Arc::new(AtomicBool::new(false));
@@ -136,8 +156,23 @@ impl Proxy {
                     if let Some(hooked) = hooked {
                         hooked();
                     }
+                    let engines = if old.load(Ordering::SeqCst) {
+                        String::new()
+                    } else {
+                        let mut list = format!(
+                            r#"{{"engine":"coraza","generation":"{}","mode":"block","phase":"ready"}}"#,
+                            current.hex()
+                        );
+                        if runs_modsecurity.load(Ordering::SeqCst) {
+                            list.push_str(&format!(
+                                r#",{{"engine":"modsecurity","generation":"{}","mode":"block","phase":"ready"}}"#,
+                                modsecurity.lock().unwrap().hex()
+                            ));
+                        }
+                        format!(r#","engines":[{list}]"#)
+                    };
                     format!(
-                        r#"{{"generation":"{}","mode":"block","engine":"coraza","phase":"ready","switching":{},"ready":true}}"#,
+                        r#"{{"generation":"{}","mode":"block","engine":"coraza","phase":"ready","switching":{},"ready":true{engines}}}"#,
                         current.hex(),
                         pending.load(Ordering::SeqCst)
                     )
@@ -145,14 +180,25 @@ impl Proxy {
                     let expect =
                         Fingerprint::from_hex(ask["expect"].as_str().unwrap().as_bytes()).unwrap();
                     orders.lock().unwrap().push(expect);
+                    let engine = ask["engine"].as_str().unwrap().to_owned();
+                    engines_asked.lock().unwrap().push(engine.clone());
+                    // The engine that is ordered: its generation and whether it runs.
+                    let (slot, runs) = if engine == "modsecurity" {
+                        (modsecurity.clone(), runs_modsecurity.clone())
+                    } else {
+                        (serving.clone(), Arc::new(AtomicBool::new(true)))
+                    };
+                    let current = *slot.lock().unwrap();
+                    let running = runs.load(Ordering::SeqCst);
                     let behavior = *behavior.lock().unwrap();
                     let (result, now) = if behavior == Behavior::Refuse {
-                        ("refused", current)
-                    } else if expect == current {
-                        ("unchanged", current)
+                        ("refused", running.then_some(current))
+                    } else if running && expect == current {
+                        ("unchanged", Some(current))
                     } else if behavior == Behavior::Switch {
-                        *serving.lock().unwrap() = expect;
-                        ("switched", expect)
+                        *slot.lock().unwrap() = expect;
+                        runs.store(true, Ordering::SeqCst);
+                        ("switched", Some(expect))
                     } else {
                         gone = behavior == Behavior::Gone;
                         if matches!(behavior, Behavior::Busy | Behavior::BusyDeaf) {
@@ -160,16 +206,20 @@ impl Proxy {
                                 closing.store(2, Ordering::SeqCst);
                             }
                             pending.store(true, Ordering::SeqCst);
-                            let (serving, pending) = (serving.clone(), pending.clone());
+                            let (slot, runs, pending) =
+                                (slot.clone(), runs.clone(), pending.clone());
                             thread::spawn(move || {
                                 thread::sleep(Duration::from_millis(400));
-                                *serving.lock().unwrap() = expect;
+                                *slot.lock().unwrap() = expect;
+                                runs.store(true, Ordering::SeqCst);
                                 pending.store(false, Ordering::SeqCst);
                             });
                         }
-                        ("busy", current)
+                        ("busy", running.then_some(current))
                     };
-                    format!(r#"{{"result":"{result}","generation":"{}"}}"#, now.hex())
+                    let now =
+                        now.map_or_else(|| "null".to_owned(), |now| format!("\"{}\"", now.hex()));
+                    format!(r#"{{"result":"{result}","generation":{now}}}"#)
                 };
                 let _ = sock.write_all(format!("{answer}\n").as_bytes());
                 if gone {
@@ -196,14 +246,17 @@ impl Drop for Proxy {
 struct FakeTrial {
     fail: Arc<Mutex<Option<Failed>>>,
     runs: Arc<AtomicUsize>,
+    /// The configuration has an inspector for ModSecurity.
+    modsecurity: Arc<AtomicBool>,
 }
 
 impl Trial for FakeTrial {
     /// As the configuration is: Coraza has its inspector, `kernel.inspector`, and ModSecurity has none in
-    /// `kernel.engines`.
+    /// `kernel.engines` unless the test says so.
     fn usable(&self, engine: Engine) -> Result<(), &'static str> {
         match engine {
             Engine::Coraza => Ok(()),
+            Engine::ModSecurity if self.modsecurity.load(Ordering::SeqCst) => Ok(()),
             Engine::ModSecurity => {
                 Err("kernel.engines has no inspector for the engine of the generation")
             }
@@ -254,14 +307,15 @@ struct Rig {
     audit_fails: Arc<AtomicBool>,
     trial_fails: Arc<Mutex<Option<Failed>>>,
     runs: Arc<AtomicUsize>,
+    modsecurity: Arc<AtomicBool>,
     proxy: Option<Proxy>,
 }
 
 fn rig(with_proxy: bool) -> Rig {
-    rig_with(with_proxy, None)
+    rig_with(with_proxy, None, Engine::Coraza)
 }
 
-fn rig_with(with_proxy: bool, records: Option<Records>) -> Rig {
+fn rig_with(with_proxy: bool, records: Option<Records>, default_engine: Engine) -> Rig {
     let dir = scratch();
     fs::DirBuilder::new()
         .mode(0o700)
@@ -294,10 +348,13 @@ fn rig_with(with_proxy: bool, records: Option<Records>) -> Rig {
         crs_dir: None,
         records: records.as_ref(),
         waits: WAITS,
+        default_engine,
     };
+    let modsecurity = Arc::new(AtomicBool::new(false));
     let trial = FakeTrial {
         fail: trial_fails.clone(),
         runs: runs.clone(),
+        modsecurity: modsecurity.clone(),
     };
     let waf = Waf::new(config, admin.clone(), audit.clone(), Box::new(trial));
     Rig {
@@ -309,6 +366,7 @@ fn rig_with(with_proxy: bool, records: Option<Records>) -> Rig {
         audit_fails,
         trial_fails,
         runs,
+        modsecurity,
         proxy,
     }
 }
@@ -359,7 +417,7 @@ impl Rig {
     }
 
     fn current(&self) -> Option<Fingerprint> {
-        self.store().current().unwrap()
+        self.store().current(Engine::Coraza).unwrap()
     }
 
     fn serving(&self) -> Fingerprint {
@@ -416,8 +474,37 @@ impl Rig {
         self.post(Op::Activate, body)
     }
 
+    /// An activation of `to` for an engine that has no generation chosen.
+    fn activate_none(&self, to: Fingerprint) -> Answer {
+        self.post(
+            Op::Activate,
+            json!({"generation": to.hex(), "expect": null}),
+        )
+    }
+
     fn rollback(&self, expect: Fingerprint) -> Answer {
         self.post(Op::Rollback, json!({"expect": expect.hex()}))
+    }
+
+    fn rollback_of(&self, engine: Engine, expect: Fingerprint) -> Answer {
+        let body = json!({"engine": engine.name(), "expect": expect.hex()});
+        self.post(Op::Rollback, body)
+    }
+
+    /// The configuration has an inspector for ModSecurity.
+    fn allow_modsecurity(&self) {
+        self.modsecurity.store(true, Ordering::SeqCst);
+    }
+
+    /// The engine of each order that the proxy got, by its word.
+    fn engines_asked(&self) -> Vec<String> {
+        self.proxy
+            .as_ref()
+            .unwrap()
+            .engines_asked
+            .lock()
+            .unwrap()
+            .clone()
     }
 
     fn remove(&self, generation: Fingerprint) -> Answer {
@@ -433,6 +520,13 @@ impl Rig {
             "",
             &body.to_string(),
         )
+    }
+
+    /// The engine of the generation that the answer of an import says it made, as the rules store has it.
+    fn made_for(&self, made: &Answer) -> Engine {
+        let fingerprint = made.body["fingerprint"].as_str().unwrap();
+        let fingerprint = Fingerprint::from_hex(fingerprint.as_bytes()).unwrap();
+        self.store().engine(fingerprint).unwrap()
     }
 
     /// The lines of the audit log, the newest first.
@@ -1053,7 +1147,7 @@ fn the_records_route_reads_the_record_files_or_says_that_there_are_none() {
         sync_ms: None,
         ship: None,
     };
-    let rig = rig_with(false, Some(config));
+    let rig = rig_with(false, Some(config), Engine::Coraza);
     let found = rig.get(Op::Records, "/api/records", "id=0123456789abcdef-3");
     assert_eq!(found.status, StatusCode::OK);
     assert_eq!(found.body["records"], json!([record]));
@@ -1078,6 +1172,32 @@ fn the_records_route_reads_the_record_files_or_says_that_there_are_none() {
         open.body["error"],
         "the directory has group or other permission bits"
     );
+}
+
+#[test]
+fn the_records_route_filters_by_the_engine_that_judged_the_request() {
+    let dir = scratch();
+    let line = |id: &str, engine: &str| json!({"ts": "2026-10-25T08:00:00.000Z", "type": "request", "id": id, "engine": engine});
+    let (a, b) = (
+        line("0123456789abcdef-1", "coraza"),
+        line("0123456789abcdef-2", "modsecurity"),
+    );
+    fs::write(dir.path().join("records.log"), format!("{a}\n{b}\n")).unwrap();
+    let config = Records {
+        dir: dir.path().to_path_buf(),
+        file_bytes: 1 << 20,
+        files: 2,
+        keep: Keep::BestEffort,
+        sync_ms: None,
+        ship: None,
+    };
+    let rig = rig_with(false, Some(config), Engine::Coraza);
+    let of = |query: &str| rig.get(Op::Records, "/api/records", query);
+    assert_eq!(of("engine=modsecurity").body["records"], json!([b]));
+    assert_eq!(of("engine=coraza").body["records"], json!([a]));
+    // The name, exactly as a record has it; a name that is no engine is not taken.
+    assert_eq!(of("engine=ModSecurity").status, StatusCode::BAD_REQUEST);
+    assert_eq!(of("engine=other").status, StatusCode::BAD_REQUEST);
 }
 
 // ---- importing ----
@@ -1242,32 +1362,46 @@ fn the_table_gives_each_route_its_role_and_a_generation_in_a_path_is_a_star() {
 #[test]
 fn a_generation_of_an_engine_that_cannot_be_used_is_refused_at_import_activate_and_rollback() {
     let rig = rig(true);
-    let (g1, other) = (rig.make(1), rig.make_for(Engine::ModSecurity, 2));
+    let (g1, other, second) = (
+        rig.make(1),
+        rig.make_for(Engine::ModSecurity, 2),
+        rig.make_for(Engine::ModSecurity, 3),
+    );
     rig.start_on(g1);
     let sentence = "kernel.engines has no inspector for the engine of the generation";
     let lines = |rig: &Rig| fields(&rig.lines()[0], &["action", "result", "reason"]).join(" ");
 
-    // An activation: 409 with the sentence, audited as denied. The store, the proxy and the history are untouched.
-    let answer = rig.activate(other, g1);
+    // An activation: ModSecurity has none chosen, so the client expects none, and then the engine is what is refused:
+    // 409 with the sentence, audited as denied. The store, the proxy and the history are untouched.
+    let answer = rig.activate_none(other);
     assert_eq!(answer.status, StatusCode::CONFLICT);
     assert_eq!(answer.body["error"], sentence);
     assert_eq!(lines(&rig), "activate denied engine");
     assert_eq!(rig.current(), Some(g1));
+    assert_eq!(rig.store().current(Engine::ModSecurity), Ok(None));
     assert!(rig.orders().is_empty());
     assert!(rig.history().is_empty());
 
-    // A rollback to it: it is the target of a history that ends at the generation the store chooses.
-    rig.start_on(other);
-    rig.behave(Behavior::Switch);
-    assert_eq!(rig.activate(g1, other).status, StatusCode::OK);
-    assert_eq!((rig.current(), rig.history().len()), (Some(g1), 1));
-    let orders = rig.orders().len();
-    let answer = rig.rollback(g1);
+    // A rollback of that engine to a generation of it: the history of the engine goes from `other` to `second`, which
+    // the rules store chooses now.
+    let line = Activation::new(
+        SystemTime::now(),
+        "ola",
+        (other, second),
+        Kind::Activate,
+        Ended::Switched,
+    )
+    .of(Engine::ModSecurity);
+    rig.admin.record_activation(&line).unwrap();
+    rig.store().activate(second).unwrap();
+    assert_eq!(rig.history().len(), 1);
+    let answer = rig.rollback_of(Engine::ModSecurity, second);
     assert_eq!(answer.status, StatusCode::CONFLICT);
     assert_eq!(answer.body["error"], sentence);
     assert_eq!(lines(&rig), "rollback denied engine");
-    assert_eq!((rig.current(), rig.serving()), (Some(g1), g1));
-    assert_eq!((rig.orders().len(), rig.history().len()), (orders, 1));
+    assert_eq!(rig.store().current(Engine::ModSecurity), Ok(Some(second)));
+    assert!(rig.orders().is_empty());
+    assert_eq!(rig.history().len(), 1);
 
     // An import: 400 before anything is staged or tried, for a refused engine and for a name that is none.
     let rules = json!([{"name": "a.conf", "data": "YQo="}]);
@@ -1283,8 +1417,203 @@ fn a_generation_of_an_engine_that_cannot_be_used_is_refused_at_import_activate_a
         );
     }
     assert_eq!(rig.runs.load(Ordering::SeqCst), 0);
-    assert_eq!(rig.store().list().unwrap().len(), 2);
-    // Without the key the engine is Coraza, and the import goes on to its trial.
-    assert_eq!(rig.import(&json!({"rules": rules})).status, StatusCode::OK);
+    assert_eq!(rig.store().list().unwrap().len(), 3);
+    // Without the key the engine is the default engine, which is Coraza in this rig, and the import goes on to its
+    // trial.
+    let made = rig.import(&json!({"rules": rules}));
+    assert_eq!(made.status, StatusCode::OK);
     assert_eq!(rig.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.made_for(&made), Engine::Coraza);
+}
+
+#[test]
+fn an_import_is_for_the_default_engine_unless_the_body_names_an_engine() {
+    let rig = rig_with(false, None, Engine::ModSecurity);
+    // Both engines can be used here, so that the engine of the generation tells which one the import was for.
+    rig.modsecurity.store(true, Ordering::SeqCst);
+    let rules = json!([{"name": "a.conf", "data": "YQo="}]);
+    let made = rig.import(&json!({"rules": rules}));
+    assert_eq!(made.status, StatusCode::OK, "{:?}", made.body);
+    assert_eq!(rig.made_for(&made), Engine::ModSecurity);
+    let made = rig.import(&json!({"rules": rules, "engine": "coraza"}));
+    assert_eq!(made.status, StatusCode::OK, "{:?}", made.body);
+    assert_eq!(rig.made_for(&made), Engine::Coraza);
+}
+
+// ---- the engines ----
+
+#[test]
+fn an_engine_that_does_not_run_is_started_by_its_activation_and_a_rollback_goes_back_in_the_history_of_its_engine()
+ {
+    let rig = rig(true);
+    rig.allow_modsecurity();
+    let (c1, c2) = (rig.make(1), rig.make(2));
+    let (m1, m2) = (
+        rig.make_for(Engine::ModSecurity, 3),
+        rig.make_for(Engine::ModSecurity, 4),
+    );
+    rig.start_on(c1);
+
+    // ModSecurity does not run and has none chosen: the client expects none, and the activation starts the engine.
+    let answer = rig.activate_none(m1);
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["result"], "switched");
+    assert_eq!(answer.body["engine"], "modsecurity");
+    // There is no generation before it: `from` is the generation itself, which no rollback goes back to.
+    assert_eq!(answer.body["from"], m1.hex());
+    assert_eq!(answer.body["generation"], m1.hex());
+    assert_eq!(rig.store().current(Engine::ModSecurity), Ok(Some(m1)));
+    assert_eq!(rig.current(), Some(c1));
+    assert_eq!(rig.engines_asked(), ["modsecurity"]);
+    let kept = rig.admin.activations(10).unwrap();
+    assert_eq!(kept[0].engine, Some(Engine::ModSecurity));
+
+    // The next generation of ModSecurity, then a switch of Coraza, which is the newest line of the history.
+    assert_eq!(rig.activate(m2, m1).status, StatusCode::OK);
+    assert_eq!(rig.activate(c2, c1).status, StatusCode::OK);
+    assert_eq!(
+        rig.engines_asked(),
+        ["modsecurity", "modsecurity", "coraza"]
+    );
+
+    // A rollback of ModSecurity is not drawn to the line of Coraza, and goes to the generation before `m2`.
+    let answer = rig.rollback_of(Engine::ModSecurity, m2);
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["generation"], m1.hex());
+    assert_eq!(rig.store().current(Engine::ModSecurity), Ok(Some(m1)));
+    assert_eq!(rig.current(), Some(c2));
+    assert_eq!(
+        rig.engines_asked().last().map(String::as_str),
+        Some("modsecurity")
+    );
+    // A rollback that names no engine is one of the default engine.
+    let answer = rig.rollback(c2);
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["engine"], "coraza");
+    assert_eq!(rig.current(), Some(c1));
+    // A name that is no engine is not taken.
+    let answer = rig.post(
+        Op::Rollback,
+        json!({"engine": "Coraza", "expect": c1.hex()}),
+    );
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn what_the_client_expects_is_the_generation_chosen_for_the_engine_and_null_is_none() {
+    let rig = rig(true);
+    rig.allow_modsecurity();
+    let (c1, c2) = (rig.make(1), rig.make(2));
+    let m1 = rig.make_for(Engine::ModSecurity, 3);
+    rig.start_on(c1);
+    // Coraza has a generation chosen, so none is not what is expected; ModSecurity has none, so a generation is not.
+    for answer in [rig.activate_none(c2), rig.activate(m1, c1)] {
+        assert_eq!(answer.status, StatusCode::CONFLICT);
+        assert_eq!(answer.body["error"], NOT_EXPECTED.0);
+    }
+    assert_eq!(rig.current(), Some(c1));
+    assert_eq!(rig.store().current(Engine::ModSecurity), Ok(None));
+    assert!(rig.orders().is_empty() && rig.history().is_empty());
+    // The key is there in every request: one that leaves it out is not one that expects none.
+    let answer = rig.post(Op::Activate, json!({"generation": m1.hex()}));
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+    // The generation that is chosen is activated again: the engine that does not run is started by it.
+    rig.store().activate(m1).unwrap();
+    let answer = rig.activate(m1, m1);
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["result"], "switched");
+    let answer = rig.activate(m1, m1);
+    assert_eq!(answer.body["result"], "unchanged");
+}
+
+#[test]
+fn a_proxy_that_does_not_report_its_engines_is_not_switched() {
+    let rig = rig(true);
+    let (c1, c2, c3) = (rig.make(1), rig.make(2), rig.make(3));
+    rig.start_on(c1);
+    assert_eq!(rig.activate(c2, c1).status, StatusCode::OK);
+    let (orders, history) = (rig.orders().len(), rig.history().len());
+    rig.proxy
+        .as_ref()
+        .unwrap()
+        .old
+        .store(true, Ordering::SeqCst);
+    for answer in [rig.activate(c3, c2), rig.rollback(c2)] {
+        assert_eq!(answer.status, StatusCode::CONFLICT);
+        assert_eq!(
+            answer.body["error"],
+            "the proxy does not report its engines"
+        );
+    }
+    assert_eq!(
+        fields(&rig.lines()[0], &["action", "result", "reason"]),
+        ["rollback", "denied", "version"]
+    );
+    assert_eq!(rig.current(), Some(c2));
+    assert_eq!((rig.orders().len(), rig.history().len()), (orders, history));
+}
+
+#[test]
+fn the_status_and_the_generations_tell_each_engine_its_chosen_and_serving_generation() {
+    let rig = rig(true);
+    rig.allow_modsecurity();
+    let (c1, c2) = (rig.make(1), rig.make(2));
+    let m1 = rig.make_for(Engine::ModSecurity, 3);
+    rig.start_on(c1);
+    assert_eq!(rig.activate_none(m1).status, StatusCode::OK);
+    assert_eq!(rig.activate(c2, c1).status, StatusCode::OK);
+
+    let status = rig.get(Op::Status, "/api/status", "").body;
+    // The fields of an older version are those of the default engine, and `engines` has each engine.
+    assert_eq!(status["current"], c2.hex());
+    assert_eq!(status["rollback_to"], c1.hex());
+    assert_eq!(
+        status["engines"],
+        json!([
+            {"engine": "coraza", "current": c2.hex(), "rollback_to": c1.hex()},
+            {"engine": "modsecurity", "current": m1.hex(), "rollback_to": null},
+        ])
+    );
+    let running = &status["proxy"]["engines"];
+    assert_eq!(running[0]["engine"], "coraza");
+    assert_eq!(running[0]["generation"], c2.hex());
+    assert_eq!(running[1]["engine"], "modsecurity");
+    assert_eq!(running[1]["generation"], m1.hex());
+
+    // A generation is chosen and serving for its engine.
+    let generations = rig.get(Op::Generations, "/api/generations", "").body;
+    let flags = |fingerprint: Fingerprint| {
+        let item = generations["generations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["fingerprint"] == fingerprint.hex())
+            .unwrap();
+        (
+            item["current"].as_bool().unwrap(),
+            item["serving"].as_bool().unwrap(),
+        )
+    };
+    assert_eq!(flags(c1), (false, false));
+    assert_eq!(flags(c2), (true, true));
+    assert_eq!(flags(m1), (true, true));
+    // The generation that a rollback of its engine goes to is not removed, and the one of the other engine is.
+    let answer = rig.remove(c1);
+    assert_eq!(answer.status, StatusCode::CONFLICT);
+    assert_eq!(
+        answer.body["error"],
+        "the generation is the target of a rollback"
+    );
+}
+
+#[test]
+fn the_status_names_the_default_engine() {
+    for (engine, name) in [
+        (Engine::Coraza, "coraza"),
+        (Engine::ModSecurity, "modsecurity"),
+    ] {
+        let rig = rig_with(false, None, engine);
+        let status = rig.get(Op::Status, "/api/status", "").body;
+        assert_eq!(status["default_engine"], name);
+    }
 }

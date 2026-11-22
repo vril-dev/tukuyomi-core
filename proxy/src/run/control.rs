@@ -1,6 +1,6 @@
 //! The control socket: how another process of this user (the admin process) asks the proxy for its state, to switch
-//! to the generation of rules that the rules store chooses, and to read the configuration again with a managed
-//! version. The path is `admin.control` of the configuration.
+//! an engine to the generation of rules that the rules store chooses for it, and to read the configuration again with
+//! a managed version. The path is `admin.control` of the configuration.
 //!
 //! The socket is bound after `prepare` and before the driver starts, so a path that cannot be used ends the start
 //! before the inspector runs. Its directory must be a real directory owned by this user without group or other bits:
@@ -16,26 +16,31 @@
 //! line in time, or goes away, gets no answer. The ops are carried out by the main loop (`Order`), which owns the
 //! switcher and the reading of the configuration. `{"op":"status"}` is answered with
 //! `{"generation":..,"mode":..,"engine":..,"phase":..,"switching":..,"reloading":..,"ready":..}`: the 64 digits of the
-//! generation that serves, what its rules do (`block` or `detect`), the engine that applies them (`coraza` or
+//! generation that serves the default engine, what its rules do (`block` or `detect`), that engine (`coraza` or
 //! `modsecurity`), the phase of its kernel (`starting`, `ready`, `stopping`, `stopped` or `failed`), whether a switch
 //! is under way, whether a reading of the configuration file again is under way (of SIGHUP or of a reload order), and
-//! whether `/readyz` says `ready`. The same object holds the figures of the proxy: `uptime_ms` (the milliseconds since
-//! the proxy started), `requests` (the requests of every class of the records, `closed` included, which got no answer,
-//! and those of a route that writes no record for them), `blocked` (the requests a rule blocked), `policy_refused` (the
-//! requests the access list or the rate limit turned away), `upstream_failures` (the failures of the servers of every
-//! upstream group of the configuration in force; they start from 0 when a reading of the configuration file again
-//! replaces it, as they do in `/metrics`), `config` (the 64 digits of the SHA-256 of the configuration file in force),
-//! `managed` (the 64 digits of the name of the managed version in force, or `null` for a file without `managed`),
-//! `resolve_timeout_ms` (the `forward.resolve_timeout_ms` of the configuration in force) and `config_reloads`
-//! (`{"replaced":..,"refused":..}`, the readings of the configuration file again by how they ended). The counts are
-//! those that `/metrics` shows; an answer without the figures is the answer of an older proxy.
-//! `{"op":"switch","expect":"<64 digits>"}` reads the rules store, and if the generation it chooses is not `expect` it
-//! does nothing and answers `refused` (`current changed`). Otherwise it does what SIGUSR1 does and answers when the
-//! switch has ended, `{"result":..,"generation":..}` with the generation that serves then and, when the result is not
-//! `switched`, a `reason`: `unchanged` (`already serving`), `refused` (`current changed`, `store refused`), `failed`
-//! (`driver did not take the order`, `not switched`) or `busy` (`starting`, `switch under way`, `too many orders`,
-//! `stopping`). A switch is waited for as long as the kernel may take to be ready and a margin; a client that has
-//! waited that long gets `busy` and `switch under way`, and the switch goes on.
+//! whether `/readyz` says `ready`. The same object has `engines`, the state of every engine that runs, in the order of
+//! their names: `[{"engine":..,"generation":..,"mode":..,"phase":..}, ..]`, in the words of the fields above. An answer
+//! without `engines` is the answer of a proxy of an older version, which runs one engine for everything. The same
+//! object holds the figures of the proxy: `uptime_ms` (the milliseconds since the proxy started), `requests` (the
+//! requests of every class of the records, `closed` included, which got no answer, and those of a route that writes no
+//! record for them), `blocked` (the requests a rule blocked), `policy_refused` (the requests the access list or the
+//! rate limit turned away), `upstream_failures` (the failures of the servers of every upstream group of the
+//! configuration in force; they start from 0 when a reading of the configuration file again replaces it, as they do in
+//! `/metrics`), `config` (the 64 digits of the SHA-256 of the configuration file in force), `managed` (the 64 digits of
+//! the name of the managed version in force, or `null` for a file without `managed`), `resolve_timeout_ms` (the
+//! `forward.resolve_timeout_ms` of the configuration in force) and `config_reloads` (`{"replaced":..,"refused":..}`,
+//! the readings of the configuration file again by how they ended). The counts are those that `/metrics` shows; an
+//! answer without the figures is the answer of an older proxy.
+//! `{"op":"switch","engine"?:"<engine>","expect":"<64 digits>"}` reads the rules store for the engine (the default
+//! engine if the order names none), and if the generation it chooses is not `expect` it does nothing and answers
+//! `refused` (`current changed`). Otherwise it does what SIGUSR1 does for that engine, which starts the engine if it
+//! does not run, and answers when the switch has ended, `{"result":..,"generation":..}` with the generation that serves
+//! the engine then (`null` if the engine does not run) and, when the result is not `switched`, a `reason`: `unchanged`
+//! (`already serving`), `refused` (`current changed`, `store refused`), `failed` (`driver did not take the order`,
+//! `not switched`) or `busy` (`starting`, `switch under way`, `too many orders`, `stopping`). A switch is waited for as
+//! long as the kernel may take to be ready and a margin; a client that has waited that long gets `busy` and
+//! `switch under way`, and the switch goes on.
 //! `{"op":"reload","managed":"<64 digits>"}` reads the configuration file again as SIGHUP does (see `reload`), with the
 //! managed version of that name in the place of the one that the managed store chooses: its record `current` is not
 //! read. The version is read again also when it is the one in force. The order gives the user of the socket no power
@@ -51,11 +56,11 @@
 //! long as the names of the configuration in force may take to be looked up (`resolve_timeout`) and the margin; a
 //! client that has waited that long gets `busy` and `reload under way`, and the reading goes on.
 //! A line that is not a request gets `{"result":"error","reason":..}` with `line too long`, `malformed request`,
-//! `unknown op`, `bad expect` or `bad managed`, and a status that the main loop does not answer within 2 s gets `no
-//! answer`. Each answer to a switch order or a reload order is one line in the records (`control: switch ..`,
-//! `control: reload <64 digits>: <result> (<reason>)`), the busy answers of the connection itself included (the queue
-//! of orders is full, the wait is over, the order was dropped); an order that gets such an answer and then ends gets a
-//! second line when it ends.
+//! `unknown op`, `bad expect`, `bad engine` or `bad managed`, and a status that the main loop does not answer within
+//! 2 s gets `no answer`. Each answer to a switch order or a reload order is one line in the records
+//! (`control: switch ..`, `control: reload <64 digits>: <result> (<reason>)`), the busy answers of the connection
+//! itself included (the queue of orders is full, the wait is over, the order was dropped); an order that gets such an
+//! answer and then ends gets a second line when it ends.
 
 use std::fs;
 use std::future::poll_fn;
@@ -67,23 +72,30 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
-use tukuyomi_kernel::Phase;
+use tukuyomi_kernel::{Engine, Phase};
 
+use self::answer::{EngineLine, reload_line, switch_line};
+use self::order::{Ask, SwitchOrder, parse};
 use super::host;
 use super::start::Refusal;
 use super::status::Readiness;
 use crate::inbound::conn::{Setup, SharedSetup};
 use crate::inbound::session::send_and_close;
-use crate::inspect::driver::State;
+use crate::inspect::engines::States;
 use crate::log::Log;
-use crate::rules::bundle::{Fingerprint, hex};
+use crate::rules::bundle::Fingerprint;
+
+mod answer;
+mod order;
+
+pub(super) use self::answer::{Answer, Figures, Outcome, Reloaded};
+pub(super) use self::order::{Order, ReloadOrder};
 
 /// The most connections served at once; another one is accepted and closed.
 const SEATS: usize = 4;
@@ -97,327 +109,6 @@ const WRITE_WAIT: Duration = Duration::from_secs(2);
 pub(super) const SWITCH_MARGIN: Duration = Duration::from_secs(5);
 /// The pause after an accept failed.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
-
-/// How a switch order ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Outcome {
-    Switched,
-    Unchanged,
-    Refused,
-    Failed,
-    Busy,
-}
-
-impl Outcome {
-    fn word(self) -> &'static str {
-        match self {
-            Outcome::Switched => "switched",
-            Outcome::Unchanged => "unchanged",
-            Outcome::Refused => "refused",
-            Outcome::Failed => "failed",
-            Outcome::Busy => "busy",
-        }
-    }
-}
-
-/// How a reload order ended.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Reloaded {
-    /// The configuration was replaced: the main file and the version that the order named serve now.
-    Replaced,
-    /// Nothing was replaced, for the reason that the refusal gives.
-    Refused(Refusal),
-    /// No reading was started for the order, or its end was not waited for; the word says why.
-    Busy(&'static str),
-}
-
-impl Reloaded {
-    fn word(&self) -> &'static str {
-        match self {
-            Reloaded::Replaced => "replaced",
-            Reloaded::Refused(_) => "refused",
-            Reloaded::Busy(_) => "busy",
-        }
-    }
-
-    /// The reason of the answer and of its record line; `replaced` has none.
-    fn reason(&self) -> Option<&'static str> {
-        match self {
-            Reloaded::Replaced => None,
-            Reloaded::Refused(refusal) => Some(refusal.reason.word()),
-            Reloaded::Busy(why) => Some(why),
-        }
-    }
-}
-
-/// The figures of the proxy that a status answer holds besides its state: what `/metrics` shows of the same, taken
-/// when the answer is made.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Figures {
-    /// The milliseconds since the proxy started.
-    pub(super) uptime_ms: u64,
-    /// The requests of every class of the records, `closed` (no answer) included, and those of a route that writes no
-    /// record.
-    pub(super) requests: u64,
-    /// The requests that a rule blocked.
-    pub(super) blocked: u64,
-    /// The requests that the access list or the rate limit turned away.
-    pub(super) policy_refused: u64,
-    /// The failures of the servers of every upstream group of the configuration in force.
-    pub(super) upstream_failures: u64,
-    /// The SHA-256 of the configuration file in force.
-    pub(super) config: [u8; 32],
-    /// The name of the managed version in force, for a file with `managed`.
-    pub(super) managed: Option<[u8; 32]>,
-    /// The `forward.resolve_timeout_ms` of the configuration in force.
-    pub(super) resolve_timeout_ms: u64,
-    /// The readings of the configuration file again, by how they ended.
-    pub(super) config_replaced: u64,
-    pub(super) config_refused: u64,
-}
-
-/// The answer to a line, as the connection writes it.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Answer {
-    Status {
-        generation: Fingerprint,
-        mode: &'static str,
-        engine: &'static str,
-        phase: &'static str,
-        switching: bool,
-        reloading: bool,
-        ready: bool,
-        figures: Figures,
-    },
-    Switch {
-        outcome: Outcome,
-        reason: Option<&'static str>,
-        generation: Fingerprint,
-    },
-    /// The answer to a reload order, with the SHA-256 of the main file and the managed version in force when it is
-    /// given.
-    Reload {
-        reloaded: Reloaded,
-        config: [u8; 32],
-        managed: Option<[u8; 32]>,
-    },
-    Error(&'static str),
-}
-
-/// The answer to a reload order, written by the JSON writer with its keys in this order: `config` only for `replaced`,
-/// and `managed` always (`null` for none). The writer escapes the sentence of a refusal, which has names of the
-/// configuration in it.
-#[derive(Serialize)]
-struct ReloadLine<'a> {
-    result: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    config: Option<String>,
-    managed: Option<String>,
-}
-
-impl Answer {
-    /// The answer to a reload order that ended as `reloaded`, while `setup` is in force.
-    pub(super) fn reload(reloaded: Reloaded, setup: &Setup) -> Answer {
-        Answer::Reload {
-            reloaded,
-            config: setup.sha256,
-            managed: setup.managed,
-        }
-    }
-
-    /// The line of JSON with its line feed. Every value but the sentence of a refused reload order is a fixed word, a
-    /// boolean, a number or hexadecimal digits, so those lines are written as they are, with nothing to escape; the
-    /// answer to a reload order is written by the JSON writer.
-    fn line(&self) -> String {
-        match self {
-            Answer::Status {
-                generation,
-                mode,
-                engine,
-                phase,
-                switching,
-                reloading,
-                ready,
-                figures,
-            } => format!(
-                "{{\"generation\":\"{}\",\"mode\":\"{mode}\",\"engine\":\"{engine}\",\"phase\":\"{phase}\",\"switching\":{switching},\"reloading\":{reloading},\"ready\":{ready},\"uptime_ms\":{},\"requests\":{},\"blocked\":{},\"policy_refused\":{},\"upstream_failures\":{},\"config\":\"{}\",\"managed\":{},\"resolve_timeout_ms\":{},\"config_reloads\":{{\"replaced\":{},\"refused\":{}}}}}\n",
-                generation.hex(),
-                figures.uptime_ms,
-                figures.requests,
-                figures.blocked,
-                figures.policy_refused,
-                figures.upstream_failures,
-                hex(&figures.config),
-                figures
-                    .managed
-                    .map_or_else(|| "null".to_owned(), |name| format!("\"{}\"", hex(&name))),
-                figures.resolve_timeout_ms,
-                figures.config_replaced,
-                figures.config_refused
-            ),
-            Answer::Switch {
-                outcome,
-                reason: Some(reason),
-                generation,
-            } => format!(
-                "{{\"result\":\"{}\",\"reason\":\"{reason}\",\"generation\":\"{}\"}}\n",
-                outcome.word(),
-                generation.hex()
-            ),
-            Answer::Switch {
-                outcome,
-                reason: None,
-                generation,
-            } => format!(
-                "{{\"result\":\"{}\",\"generation\":\"{}\"}}\n",
-                outcome.word(),
-                generation.hex()
-            ),
-            Answer::Reload {
-                reloaded,
-                config,
-                managed,
-            } => {
-                let line = ReloadLine {
-                    result: reloaded.word(),
-                    reason: reloaded.reason(),
-                    detail: match reloaded {
-                        Reloaded::Refused(refusal) => Some(&refusal.detail),
-                        Reloaded::Replaced | Reloaded::Busy(_) => None,
-                    },
-                    config: matches!(reloaded, Reloaded::Replaced).then(|| hex(config)),
-                    managed: managed.map(|name| hex(&name)),
-                };
-                // The writer does not fail on these fields; an empty line would not be taken for an answer.
-                let mut text = serde_json::to_string(&line).unwrap_or_default();
-                text.push('\n');
-                text
-            }
-            Answer::Error(reason) => format!("{{\"result\":\"error\",\"reason\":\"{reason}\"}}\n"),
-        }
-    }
-}
-
-/// The record line of an answer to a switch order. `serving` is the generation that serves then.
-fn switch_line(
-    expect: Fingerprint,
-    outcome: Outcome,
-    reason: Option<&'static str>,
-    serving: Fingerprint,
-) -> String {
-    let why = reason.map_or_else(String::new, |reason| format!(" ({reason})"));
-    format!(
-        "control: switch expect {}: {}{why}, serving {}",
-        expect.hex(),
-        outcome.word(),
-        serving.hex()
-    )
-}
-
-/// A request to switch, and where its answer goes.
-pub(super) struct SwitchOrder {
-    expect: Fingerprint,
-    reply: oneshot::Sender<Answer>,
-}
-
-impl SwitchOrder {
-    /// The generation the client expects the store to choose.
-    pub(super) fn expect(&self) -> Fingerprint {
-        self.expect
-    }
-
-    /// Answers the client, and writes the record line of the order. `serving` is the generation that serves now.
-    pub(super) fn finish(
-        self,
-        outcome: Outcome,
-        reason: Option<&'static str>,
-        serving: Fingerprint,
-        log: &Log,
-    ) {
-        log.line(&switch_line(self.expect, outcome, reason, serving));
-        let _ = self.reply.send(Answer::Switch {
-            outcome,
-            reason,
-            generation: serving,
-        });
-    }
-}
-
-/// The record line of an answer to a reload order for the version `managed`.
-fn reload_line(managed: [u8; 32], reloaded: &Reloaded) -> String {
-    let why = reloaded
-        .reason()
-        .map_or_else(String::new, |reason| format!(" ({reason})"));
-    format!(
-        "control: reload {}: {}{why}",
-        hex(&managed),
-        reloaded.word()
-    )
-}
-
-/// A request to read the configuration again with a managed version, and where its answer goes.
-pub(super) struct ReloadOrder {
-    managed: [u8; 32],
-    reply: oneshot::Sender<Answer>,
-}
-
-impl ReloadOrder {
-    /// The name of the version the configuration is to be read with.
-    pub(super) fn managed(&self) -> [u8; 32] {
-        self.managed
-    }
-
-    /// Answers the client, and writes the record line of the order. `setup` is the setup in force now.
-    pub(super) fn finish(self, reloaded: Reloaded, setup: &Setup, log: &Log) {
-        log.line(&reload_line(self.managed, &reloaded));
-        let _ = self.reply.send(Answer::reload(reloaded, setup));
-    }
-}
-
-/// What a connection asks of the main loop.
-pub(super) enum Order {
-    Status(oneshot::Sender<Answer>),
-    Switch(SwitchOrder),
-    Reload(ReloadOrder),
-}
-
-/// What a line asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ask {
-    Status,
-    Switch(Fingerprint),
-    /// A reading of the configuration with the managed version of this name.
-    Reload([u8; 32]),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Raw {
-    op: String,
-    expect: Option<String>,
-    managed: Option<String>,
-}
-
-/// What the line asks for, or the word that says why it is not a request. A name is 64 lowercase hexadecimal digits.
-fn parse(line: &[u8]) -> Result<Ask, &'static str> {
-    const MALFORMED: &str = "malformed request";
-    let raw: Raw = serde_json::from_slice(line).map_err(|_| MALFORMED)?;
-    match (raw.op.as_str(), raw.expect, raw.managed) {
-        ("status", None, None) => Ok(Ask::Status),
-        ("switch", Some(expect), None) => Fingerprint::from_hex(expect.as_bytes())
-            .map(Ask::Switch)
-            .ok_or("bad expect"),
-        ("reload", None, Some(managed)) => Fingerprint::from_hex(managed.as_bytes())
-            .map(|name| Ask::Reload(name.bytes()))
-            .ok_or("bad managed"),
-        ("status" | "switch" | "reload", _, _) => Err(MALFORMED),
-        _ => Err("unknown op"),
-    }
-}
 
 /// The word for the phase of a kernel.
 fn phase_word(phase: Phase) -> &'static str {
@@ -497,7 +188,9 @@ pub(super) fn bind(path: &Path) -> Result<Bound, &'static str> {
 /// What the connections share.
 struct Shared {
     orders: mpsc::Sender<Order>,
-    state: watch::Receiver<State>,
+    state: watch::Receiver<States>,
+    /// The engine of a switch order that names none.
+    default_engine: Engine,
     /// How long a switch is waited for.
     switch_wait: Duration,
     /// The setup in force: how long a reading of the configuration is waited for, and the managed version that a busy
@@ -514,8 +207,12 @@ impl Shared {
         let (reply, told) = oneshot::channel();
         let (order, wait, late) = match ask {
             Ask::Status => (Order::Status(reply), READ_WAIT, "no answer"),
-            Ask::Switch(expect) => (
-                Order::Switch(SwitchOrder { expect, reply }),
+            Ask::Switch(engine, expect) => (
+                Order::Switch(SwitchOrder {
+                    engine: engine.unwrap_or(self.default_engine),
+                    expect,
+                    reply,
+                }),
                 self.switch_wait,
                 "switch under way",
             ),
@@ -546,8 +243,9 @@ impl Shared {
     fn busy(&self, reason: &'static str, ask: Ask) -> Answer {
         match ask {
             Ask::Status => Answer::Error("no answer"),
-            Ask::Switch(expect) => {
-                let generation = self.state.borrow().generation;
+            Ask::Switch(engine, expect) => {
+                let engine = engine.unwrap_or(self.default_engine);
+                let generation = self.state.borrow().of(engine).map(|state| state.generation);
                 self.log.line(&switch_line(
                     expect,
                     Outcome::Busy,
@@ -638,7 +336,9 @@ async fn accept(listener: UnixListener, shared: Arc<Shared>) {
 pub(super) struct Control {
     task: JoinHandle<()>,
     orders: mpsc::Receiver<Order>,
-    state: watch::Receiver<State>,
+    state: watch::Receiver<States>,
+    /// The engine whose state the fields of a status answer have besides `engines`.
+    default_engine: Engine,
     readiness: Arc<Readiness>,
     /// The switch order whose switch is under way.
     asked: Option<SwitchOrder>,
@@ -655,11 +355,12 @@ impl Drop for Control {
 }
 
 /// Starts to serve `bound`. A switch is waited for `switch_wait`, and a reading of the configuration as `setup`, the
-/// setup in force, says when it is asked for. `log` gets the lines of the busy answers of the connections. The runtime
-/// has to be entered.
+/// setup in force, says when it is asked for. `default_engine` is the engine of an order that names none. `log` gets
+/// the lines of the busy answers of the connections. The runtime has to be entered.
 pub(super) fn serve(
     bound: Bound,
-    state: watch::Receiver<State>,
+    state: watch::Receiver<States>,
+    default_engine: Engine,
     readiness: Arc<Readiness>,
     switch_wait: Duration,
     setup: SharedSetup,
@@ -670,6 +371,7 @@ pub(super) fn serve(
     let shared = Arc::new(Shared {
         orders,
         state: state.clone(),
+        default_engine,
         switch_wait,
         setup,
         log,
@@ -678,6 +380,7 @@ pub(super) fn serve(
         task: tokio::spawn(accept(listener, shared)),
         orders: taken,
         state,
+        default_engine,
         readiness,
         asked: None,
         reload: None,
@@ -694,16 +397,31 @@ impl Control {
     /// The answer to a status order. `switching`: a switch is under way; `reloading`: a reading of the configuration
     /// file again. `figures` are read by the caller.
     pub(super) fn status(&self, switching: bool, reloading: bool, figures: Figures) -> Answer {
-        let state = *self.state.borrow();
+        let states = *self.state.borrow();
+        let Some(lead) = states
+            .of(self.default_engine)
+            .or_else(|| states.started().next())
+        else {
+            return Answer::Error("no answer");
+        };
         Answer::Status {
-            generation: state.generation,
-            mode: state.mode.name(),
-            engine: state.engine.name(),
-            phase: phase_word(state.phase),
+            generation: lead.generation,
+            mode: lead.mode.name(),
+            engine: lead.engine.name(),
+            phase: phase_word(lead.phase),
             switching,
             reloading,
-            ready: self.readiness.check(state.phase).is_ok(),
+            ready: self.readiness.check(&states).is_ok(),
             figures,
+            engines: states
+                .started()
+                .map(|state| EngineLine {
+                    engine: state.engine.name(),
+                    generation: state.generation,
+                    mode: state.mode.name(),
+                    phase: phase_word(state.phase),
+                })
+                .collect(),
         }
     }
 
@@ -712,9 +430,22 @@ impl Control {
         self.asked = Some(order);
     }
 
-    /// The driver answered the switch that is under way: the order that asked for it, if there is one, gets its
-    /// answer. `serving` is the generation that serves now.
-    pub(super) fn switch_ended(&mut self, switched: bool, serving: Fingerprint, log: &Log) {
+    /// The driver answered the switch of `engine` that is under way: the order that asked for it, if there is one and
+    /// it is for that engine, gets its answer. `serving` is the generation that serves the engine now.
+    pub(super) fn switch_ended(
+        &mut self,
+        engine: Engine,
+        switched: bool,
+        serving: Option<Fingerprint>,
+        log: &Log,
+    ) {
+        if self
+            .asked
+            .as_ref()
+            .is_some_and(|order| order.engine() != engine)
+        {
+            return;
+        }
         if let Some(order) = self.asked.take() {
             if switched {
                 order.finish(Outcome::Switched, None, serving, log);

@@ -13,21 +13,25 @@
 //! runtime of the admin process, where a runtime can be driven and dropped, and a runtime that lived longer could be
 //! dropped on the thread of the other one, which tokio refuses.
 //!
-//! No socket, a socket that nobody answers at, a line that is not one of the proxy's, and no line in time are all
-//! the same to the caller: the proxy cannot be reached. For a reload order they are `None` instead, an end that is
-//! not known, for the order may have come to the proxy and its reading may go on. A connection that the proxy takes
-//! and closes before it says
-//! anything is another case: the proxy has no place for it (it serves 4 connections at once). A status question that
-//! meets it is asked once more after 250 ms, and then the answer is `Seen::Busy`; a switch order that meets it is
-//! `Reply::Busy`, which is also what the order of a switch that goes on is. A reload order that meets it has no answer
-//! (`None`), as when no line came in time: the reading may or may not go on. A line is taken only if it has the fields
-//! of an answer, 64 digits for the generation and one of the words of the proxy for the rest. The figures of a status
-//! (`reloading`, `uptime_ms`, `requests`, `blocked`, `policy_refused`, `upstream_failures`, `config`, `managed`,
-//! `resolve_timeout_ms` and `config_reloads`) are not needed for that: a proxy of an older version does not send them,
-//! and each one that is missing is `None`, as `managed` is when it is `null`. One that is there and is not what it
-//! should be (a boolean or a number; for `config` and `managed`, 64 lowercase digits; for `resolve_timeout_ms`, 1 ms
-//! to 3600 s, the range that the configuration allows) makes the line one that is not
-//! the proxy's. The answer to a reload order is taken only if its `result` is one of `replaced`, `refused`, `busy` and
+//! No socket, a socket that nobody answers at, a line that is not one of the proxy's, and no line in time are all the
+//! same to the caller: the proxy cannot be reached. For a reload order they are `None` instead, an end that is not
+//! known, for the order may have come to the proxy and its reading may go on. A connection that the proxy takes and
+//! closes before it says anything is another case: the proxy has no place for it (it serves 4 connections at once). A
+//! status question that meets it is asked once more after 250 ms, and then the answer is `Seen::Busy`; a switch order
+//! that meets it is `Reply::Busy`, which is also what the order of a switch that goes on is. A reload order that meets
+//! it has no answer (`None`), as when no line came in time: the reading may or may not go on. A line is taken only if
+//! it has the fields of an answer, 64 digits for the generation and one of the words of the proxy for the rest.
+//! `engines` of a status, the state of each engine that the proxy runs, is not needed either: a proxy of an older
+//! version, which runs one engine for everything, does not send it, and then it is `None` (the routes that switch
+//! refuse such a proxy, see `activate`); when it is there each of its entries has an engine (at most once), a
+//! generation, a mode and a phase in the words of the proxy, or the line is not the proxy's. The answer to a
+//! switch order always has its `generation`: 64 digits, or `null` for an engine that the proxy does not run. The
+//! figures of a status (`reloading`, `uptime_ms`, `requests`, `blocked`, `policy_refused`, `upstream_failures`,
+//! `config`, `managed`, `resolve_timeout_ms` and `config_reloads`) are not needed for that: a proxy of an older version
+//! does not send them, and each one that is missing is `None`, as `managed` is when it is `null`. One that is there and
+//! is not what it should be (a boolean or a number; for `config` and `managed`, 64 lowercase digits; for
+//! `resolve_timeout_ms`, 1 ms to 3600 s, the range that the configuration allows) makes the line one that is not the
+//! proxy's. The answer to a reload order is taken only if its `result` is one of `replaced`, `refused`, `busy` and
 //! `error`, its `reason` one of the words of that result (none for `replaced`), `config` 64 lowercase digits for
 //! `replaced` and nothing else, `managed` 64 lowercase digits or `null` (none for `error`), and `detail`, for `refused`
 //! only, 1 to 512 bytes from 0x20 to 0x7e. The answer of a proxy that does not know the order (`error`, `unknown op`)
@@ -47,6 +51,7 @@ use tukuyomi_kernel::Engine;
 
 use crate::managed::apply::{self, Answered, Look};
 use crate::rules::bundle::{Fingerprint, hex};
+use crate::rules::store::{ENGINES, index};
 
 /// The longest line of an answer in bytes, its line feed included.
 const LINE_MAX: usize = 4096;
@@ -86,19 +91,49 @@ pub(crate) const ERRORS: [&str; 5] = [
 /// The longest sentence of a refused reload order, in bytes.
 const DETAIL_MAX: usize = 512;
 
+/// The state of the kernel of one engine that the proxy runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EngineStatus {
+    /// The generation that serves the engine.
+    pub generation: Fingerprint,
+    pub mode: &'static str,
+    pub phase: &'static str,
+}
+
+/// The engines that the proxy runs, by engine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Engines([Option<EngineStatus>; ENGINES.len()]);
+
+impl Engines {
+    /// The state of `engine`, if the proxy runs it.
+    pub fn of(&self, engine: Engine) -> Option<&EngineStatus> {
+        self.0[index(engine)].as_ref()
+    }
+
+    /// The engines that run, in the order of their names, with their states.
+    pub fn running(&self) -> impl Iterator<Item = (Engine, &EngineStatus)> {
+        ENGINES
+            .into_iter()
+            .zip(&self.0)
+            .filter_map(|(engine, status)| Some((engine, status.as_ref()?)))
+    }
+}
+
 /// The state of the proxy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
-    /// The generation that serves.
+    /// The generation that serves the default engine.
     pub generation: Fingerprint,
     pub mode: &'static str,
-    /// The engine that applies the rules of the generation.
+    /// The default engine, which applies the rules of the generation.
     pub engine: &'static str,
     pub phase: &'static str,
     /// A switch is under way.
     pub switching: bool,
     pub ready: bool,
     // The figures that a proxy adds to its state; a figure that the proxy does not send is `None`.
+    /// The engines that the proxy runs; none for a proxy that does not send them.
+    pub engines: Option<Engines>,
     /// A reading of the configuration file again is under way.
     pub reloading: Option<bool>,
     /// The milliseconds since the proxy started.
@@ -138,6 +173,19 @@ impl Status {
             "switching": self.switching,
             "reloading": self.reloading,
             "ready": self.ready,
+            "engines": self.engines.map(|engines| {
+                engines
+                    .running()
+                    .map(|(engine, state)| {
+                        json!({
+                            "engine": engine.name(),
+                            "generation": state.generation.hex(),
+                            "mode": state.mode,
+                            "phase": state.phase,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            }),
             "uptime_ms": self.uptime_ms,
             "requests": self.requests,
             "blocked": self.blocked,
@@ -232,6 +280,7 @@ struct StatusLine {
     switching: bool,
     ready: bool,
     // The figures: a field that is missing is `None`.
+    engines: Option<Vec<EngineLine>>,
     reloading: Option<bool>,
     uptime_ms: Option<u64>,
     requests: Option<u64>,
@@ -244,10 +293,22 @@ struct StatusLine {
     config_reloads: Option<Reloads>,
 }
 
+/// The state of one engine in the line of a status.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EngineLine {
+    engine: String,
+    generation: String,
+    mode: String,
+    phase: String,
+}
+
 #[derive(Deserialize)]
 struct SwitchLine {
     result: String,
-    generation: String,
+    /// 64 digits, or `null` for an engine that the proxy does not run. The key is there in every answer.
+    #[serde(deserialize_with = "Option::deserialize")]
+    generation: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -280,10 +341,34 @@ fn hung_up(e: &io::Error) -> bool {
     )
 }
 
+/// The engines that the entries of a status say the proxy runs: each engine at most once, and every word one of the
+/// proxy's.
+fn engines_of(lines: Vec<EngineLine>) -> Option<Engines> {
+    let mut engines = Engines::default();
+    for line in lines {
+        let engine = Engine::parse(&line.engine)?;
+        let place = index(engine);
+        if engines.0[place].is_some() {
+            return None;
+        }
+        engines.0[place] = Some(EngineStatus {
+            generation: Fingerprint::from_hex(line.generation.as_bytes())?,
+            mode: word(&line.mode, &MODES)?,
+            phase: word(&line.phase, &PHASES)?,
+        });
+    }
+    Some(engines)
+}
+
 /// The state that `line` holds.
 fn status_of(line: &[u8]) -> Option<Status> {
     let line: StatusLine = serde_json::from_slice(line).ok()?;
+    let engines = match line.engines {
+        Some(lines) => Some(engines_of(lines)?),
+        None => None,
+    };
     Some(Status {
+        engines,
         generation: Fingerprint::from_hex(line.generation.as_bytes())?,
         mode: word(&line.mode, &MODES)?,
         engine: Engine::parse(&line.engine)?.name(),
@@ -354,7 +439,9 @@ fn reloaded_of(line: &[u8]) -> Option<Reloaded> {
 /// The answer to a switch order that `line` holds.
 fn reply_of(line: &[u8]) -> Option<Reply> {
     let line: SwitchLine = serde_json::from_slice(line).ok()?;
-    Fingerprint::from_hex(line.generation.as_bytes())?;
+    if let Some(generation) = &line.generation {
+        Fingerprint::from_hex(generation.as_bytes())?;
+    }
     match line.result.as_str() {
         "switched" => Some(Reply::Switched),
         "unchanged" => Some(Reply::Unchanged),
@@ -391,10 +478,14 @@ impl Control {
         }
     }
 
-    /// Orders the proxy to switch to the generation the rules store chooses, if that is `expect`. None: the proxy
-    /// cannot be reached.
-    pub fn switch(&self, expect: Fingerprint) -> Option<Reply> {
-        let request = format!("{{\"op\":\"switch\",\"expect\":\"{}\"}}\n", expect.hex());
+    /// Orders the proxy to switch `engine` to the generation the rules store chooses for it, if that is `expect`. None:
+    /// the proxy cannot be reached.
+    pub fn switch(&self, engine: Engine, expect: Fingerprint) -> Option<Reply> {
+        let request = format!(
+            "{{\"op\":\"switch\",\"engine\":\"{}\",\"expect\":\"{}\"}}\n",
+            engine.name(),
+            expect.hex()
+        );
         match self.ask(&request, self.switch_wait) {
             Heard::Line(line) => reply_of(&line),
             // The proxy has no place for the order, which it did not read.

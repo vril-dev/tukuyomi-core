@@ -9,11 +9,13 @@ import { ApiError } from '../api.js';
 import { append, badge, button, buttonClass, el, mount, notice, result, setText } from '../dom.js';
 import { lazy, w } from '../i18n.js';
 import {
+  ENGINE_IDS,
   Field,
   bytesText,
   checkbox,
   choice,
   confirmChange,
+  defaultEngine,
   engineName,
   fingerprintView,
   hashOf,
@@ -33,8 +35,6 @@ import {
 } from '../parts.js';
 import { Table } from '../table.js';
 
-/** The engines that an import can ask for, by the words the API takes. Coraza is first: it is the default. */
-export const ENGINES = ['coraza', 'modsecurity'];
 /** The limits of the API: files in all, bytes of a file, bytes of all the files, routes. */
 export const LIMITS = { files: 128, file: 2 * 1024 * 1024, total: 8 * 1024 * 1024, routes: 256 };
 /** The name of a file as a bundle holds it: one name, no path, letters, digits and `._-`, not starting with a dot. */
@@ -122,8 +122,9 @@ export function toBase64(bytes) {
 
 /** The body of the request to import. `rules` and `data` hold `{ name, data }` with the data in base64. */
 export function importBody({ engine, rules, data, crs, crsOff, routes, detectOnly, acceptBlock }) {
-  // A missing engine would be left out of the JSON, and the server would take Coraza for it.
-  if (!ENGINES.includes(engine)) throw new RangeError(`not an engine: ${engine}`);
+  // A missing engine would be left out of the JSON, and the server would take its default engine for it, whatever
+  // engine the screen shows.
+  if (!ENGINE_IDS.includes(engine)) throw new RangeError(`not an engine: ${engine}`);
   const body = { engine };
   if (rules.length > 0) body.rules = rules;
   if (data.length > 0) body.data = data;
@@ -280,9 +281,16 @@ class ImportScreen {
     this.engine = el(
       'select',
       { class: 'tc-select', name: 'engine' },
-      ENGINES.map((name) => el('option', { value: name, selected: name === ENGINES[0] }, lazy(() => engineName(name)))),
+      ENGINE_IDS.map((name) => el('option', { value: name, selected: name === ENGINE_IDS[0] }, lazy(() => engineName(name)))),
     );
-    this.engine.addEventListener('change', () => this.changed());
+    // The engine starts as the default one, once the status says which it is, unless the user chose one before. When the
+    // two processes have another default engine, none is the default one, and that is said.
+    this.engineChosen = false;
+    this.engineNote = el('div');
+    this.engine.addEventListener('change', () => {
+      this.engineChosen = true;
+      this.changed();
+    });
     this.rulesField = new Field(w('import.choose'), this.picker(this.rules), { hint: w('import.rules_hint'), asButton: true });
     this.dataField = new Field(w('import.choose'), this.picker(this.data), { hint: w('import.data_hint'), asButton: true });
     this.detect = checkbox((checked) => {
@@ -303,7 +311,7 @@ class ImportScreen {
           },
         },
       },
-      panelWith(w('import.engine'), [], new Field(w('import.engine_label'), this.engine, { hint: w('import.engine_hint') }).node).node,
+      panelWith(w('import.engine'), [], new Field(w('import.engine_label'), this.engine, { hint: w('import.engine_hint') }).node, this.engineNote).node,
       panelWith(w('import.rules'), [], this.rulesField.node, this.rulesBox).node,
       panelWith(w('import.data'), [], this.dataField.node, this.dataBox).node,
       panelWith(w('import.crs'), [], this.crsBox).node,
@@ -344,6 +352,9 @@ class ImportScreen {
       const crs = status.crs;
       this.crsAvailable = crs?.available === true;
       this.crsFiles = Array.isArray(crs?.files) ? crs.files.filter((name) => typeof name === 'string') : [];
+      const { name, differs } = defaultEngine(status);
+      if (name !== null && !this.engineChosen) this.engine.value = name;
+      mount(this.engineNote, differs ? notice('warn', w('engine.defaults_differ')) : null);
       this.drawCrs(null);
     } catch (error) {
       if (this.alive) this.drawCrs(error);

@@ -26,10 +26,11 @@
 //! file that was put in the store stays there if that last reading refuses. `activate` takes the lock
 //! of the store and chooses the version only if the steps of the start before the rules store pass with it (see
 //! `run`): the main file with the version, the lookup of the names of the upstream servers and the files of their
-//! authorities, and the certificates of the listeners. `remove` removes a version that `current` does not name and
-//! that nothing holds (a proxy that serves with it, or a command that reads it), and with it the files and the
-//! certificates of the sites with `acme` that no version names any more (see `remove`); it looks at no rollback.
-//! `list` shows the versions.
+//! authorities, and the certificates of the listeners; and only if the rules store has a generation chosen for the
+//! engine of each of its upstream groups (it reads the rules store for that, and chooses no generation). `remove`
+//! removes a version that `current` does not name and that nothing holds (a proxy that serves with it, or a command
+//! that reads it), and with it the files and the certificates of the sites with `acme` that no version names any more
+//! (see `remove`); it looks at no rollback. `list` shows the versions.
 //!
 //! The results go to the standard output, one line each, and the first word of a line is the name of a version:
 //! `import` says `created`, `existing` or `recreated` after it (`recreated`: the store had a broken copy, which was
@@ -61,6 +62,7 @@ use crate::config::{self, Built};
 use crate::inbound::transport::tls::{Fault, read_file};
 use crate::log::{Log, escaped};
 use crate::rules::bundle::{Fingerprint, hex};
+use crate::rules::store::UNCHOSEN;
 use crate::run::{EXIT_FAILED, host, read_parts};
 
 const USAGE: &str = "usage: tukuyomi-proxy managed import <config> <document>\n       tukuyomi-proxy managed activate <config> <version>\n       tukuyomi-proxy managed remove <config> <version>\n       tukuyomi-proxy managed list <config>";
@@ -259,13 +261,32 @@ fn activate(config: &Path, version: [u8; 32], out: &mut dyn Write, log: &Log) ->
         }
     };
     // The check comes before the store chooses: a version that the proxy would refuse is never the chosen one.
-    if let Err(refusal) = read_parts(config, &Choice::Named(version), NAME, log) {
-        return if refusal.exit() == EXIT_FAILED {
-            Exit::Failed
-        } else {
-            Exit::Usage
-        };
+    let parts = match read_parts(config, &Choice::Named(version), NAME, log) {
+        Ok(parts) => parts,
+        Err(refusal) => {
+            return if refusal.exit() == EXIT_FAILED {
+                Exit::Failed
+            } else {
+                Exit::Usage
+            };
+        }
+    };
+    // So is a version whose groups have an engine for which the rules store has no generation chosen.
+    match parts.unchosen() {
+        Ok(None) => {}
+        Ok(Some(group)) => {
+            log.line(&format!(
+                "{NAME}: rules store refused: {UNCHOSEN} (upstream {group})"
+            ));
+            return Exit::Failed;
+        }
+        Err(e) => {
+            log.line(&format!("{NAME}: rules store refused: {}", e.0));
+            return Exit::Failed;
+        }
     }
+    // The shared lock on the version is given back before the store chooses.
+    drop(parts);
     match store.choose(version) {
         Ok(()) => {
             result(out, &format!("{} current", hex(&version)));

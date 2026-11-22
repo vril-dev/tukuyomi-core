@@ -6,7 +6,8 @@
 //! SHA-256 of the bytes that were read. Every key must be present (a route may leave out its `host`, its `path`,
 //! its `access`, its `rewrite`, its `stream` and its `max_body`; `access` and `rewrite` have no key that must be
 //! present, see `rewrite`, and a `stream` has all three; an upstream group may leave out its
-//! `tls`, which may leave out its `server_name`; a listener may leave out its `tls` and its `redirect`, and the `tls`
+//! `tls`, which may leave out its `server_name`, and its `engine`; a listener may leave out its `tls` and its
+//! `redirect`, and the `tls`
 //! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
 //! may leave out `acme`, which it must have when a certificate has one, see `acme`, and `status`, which
 //! has the one key `listen`, see `status`, and `records`, `access`, `rate_limit`, `host_policies`, `geo` and `admin`,
@@ -15,15 +16,15 @@
 //! type, an array in place of an object and `null` for a key that may be left out included (such a key is either left
 //! out or has a value). A refusal is one fixed sentence per kind of fault and never carries a key or a value from the
 //! file. Then the values are checked in a fixed order and the first broken rule is returned: the `proxy` bounds, the
-//! `status` object against the listeners (before `forward`, for no server may be at its address), the `forward`
-//! values (see `forward`; the names of the servers are not looked up here, `forward::resolve` does that when the proxy
-//! starts), the `rules.store` values, the `records` object (and that the `records` of the routes suit it), the
-//! `access`, `rate_limit`, `host_policies` and `geo` objects (see `policy`) and that `geo` is there if a list of
-//! countries is, the
+//! `status` object against the listeners (before `forward`, for no server may be at its address), the `rules.store`
+//! values and the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's own check (before
+//! `forward`, for the engine of a group is checked against them), the `forward` values (see `forward`; the names of the
+//! servers are not looked up here, `forward::resolve` does that when the proxy starts), the `records` object (and that
+//! the `records` of the routes suit it), the `access`, `rate_limit`, `host_policies` and `geo` objects (see `policy`)
+//! and that `geo` is there if a list of countries is, the
 //! `admin` object against the listeners and the status listener, the `acme` object with the certificates that have
 //! `acme` (that of `admin.route` included), the directories, the control socket and the files of `acme` against each
-//! other (see `places`), the conversion of the `kernel` object into `tukuyomi_kernel::Config` with that type's
-//! own check, and last the relations between the `proxy` and `kernel` objects.
+//! other (see `places`), and last the relations between the `proxy` and `kernel` objects.
 //!
 //! `managed` may be left out. When it is there it is `{"dir"}`, the directory of the managed store (see `managed`),
 //! an absolute clean path of at most 3840 bytes, and the file does not write how the proxy routes: `forward` has
@@ -62,7 +63,8 @@
 //! only kind there is, and `dir` is an absolute clean path of at most 3840 bytes. The `kernel` object has no
 //! rules path and no rules fingerprint: the directory and the fingerprint of the chosen generation come from the
 //! rules store when the proxy starts (`KernelSettings::for_generation`). Its `inspector` is the one of the engine
-//! Coraza; the inspectors of the other engines are in its `engines` object, which may be left out (see `kernel`).
+//! Coraza; the inspectors of the other engines are in its `engines` object, which may be left out, and its
+//! `default_engine`, which may be left out too, is the engine of an upstream group that names none (see `kernel`).
 
 use std::fmt;
 use std::fs::{self, File};
@@ -642,15 +644,7 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Built, ConfigError> {
     // A server may not be at an address the proxy listens on, the one of the status listener included.
     let mut bound = addresses(&listeners);
     bound.extend(status.map(|status| status.listen));
-    // With `managed`, the routing is checked with the version (see `managed::version`).
-    let (forward, resolve_timeout) = if versioned {
-        (None, forward::timeout_only(f)?)
-    } else {
-        let forward = forward::check(f, &bound, p.max_body)?;
-        let timeout = forward.resolve_timeout;
-        (Some(forward), timeout)
-    };
-
+    // The kernel values are checked before the groups, whose engines are checked against them.
     ensure(s.kind == "file", "rules store kind is not supported")?;
     let dir = PathBuf::from(s.dir);
     ensure(
@@ -661,6 +655,15 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Built, ConfigError> {
         dir.as_os_str().as_bytes().len() <= MAX_STORE_DIR,
         "rules store dir is over 3840 bytes",
     )?;
+    let kernel = kernel::settings(k, &dir)?;
+    // With `managed`, the routing is checked with the version (see `managed::version`).
+    let (forward, resolve_timeout) = if versioned {
+        (None, forward::timeout_only(f)?)
+    } else {
+        let forward = forward::check(f, &bound, p.max_body, &kernel)?;
+        let timeout = forward.resolve_timeout;
+        (Some(forward), timeout)
+    };
     let managed = m.map(|Object(raw)| places::managed_dir(raw)).transpose()?;
 
     let records = records::check(rec)?;
@@ -702,7 +705,6 @@ fn build(file: RawFile, sha256: [u8; 32]) -> Result<Built, ConfigError> {
         admin_route.as_ref(),
     )?;
 
-    let kernel = kernel::settings(k, &dir)?;
     let proxy = ProxyConfig {
         listeners,
         max_conns: p.max_conns,

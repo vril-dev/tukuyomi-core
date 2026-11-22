@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
-use tukuyomi_kernel::Verdict;
+use tukuyomi_kernel::{Engine, Verdict};
 
 use super::*;
 use crate::config::{
@@ -1798,6 +1798,7 @@ fn a_redirect_listener_sends_the_host_of_the_way_to_the_admin_process_to_https_w
                 host: host.to_owned(),
                 access: Access::new(Vec::new(), vec![Cidr::parse("192.0.2.0/24").unwrap()]),
                 server: "127.0.0.1:9180".parse().unwrap(),
+                engine: Engine::Coraza,
             });
             let rig = over_tls(&pki, kept(), Mode::Answer(BLOCK), &forward, 443)
                 .await
