@@ -61,15 +61,15 @@
 
 | ファイル | 内容 |
 |---|---|
-| `tukuyomi-core_v0.1.0_linux_amd64.tar.gz` | ディレクトリ `tukuyomi-core_v0.1.0_linux_amd64/` の中に、4 つの実行ファイル（上の「構成要素」）、`README.md`、`LICENSE`、`NOTICE`、`THIRD-PARTY-LICENSES`、`docs/`、`scripts/fetch-crs.sh` |
-| `tukuyomi-core_v0.1.0_linux_amd64.tar.gz.sha256` | tarball の SHA-256 |
-| `tukuyomi-core_v0.1.0_SHA256SUMS` | 上と同じ行 |
+| `tukuyomi-core_v0.2.0_linux_amd64.tar.gz` | ディレクトリ `tukuyomi-core_v0.2.0_linux_amd64/` の中に、4 つの実行ファイル（上の「構成要素」）、`README.md`、`README.ja.md`、`LICENSE`、`NOTICE`、`THIRD-PARTY-LICENSES`、`docs/`、`scripts/fetch-crs.sh` |
+| `tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256` | tarball の SHA-256 |
+| `tukuyomi-core_v0.2.0_SHA256SUMS` | 上と同じ行 |
 
 - ダウンロードしたら、展開する前に SHA-256 を確認します。
 
   ```bash
-  sha256sum -c tukuyomi-core_v0.1.0_linux_amd64.tar.gz.sha256
-  tar -xzf tukuyomi-core_v0.1.0_linux_amd64.tar.gz
+  sha256sum -c tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256
+  tar -xzf tukuyomi-core_v0.2.0_linux_amd64.tar.gz
   ```
 
 - 実行ファイルは、Ubuntu 26.04.1 LTS（glibc 2.43、gcc 15.2.0）で、`rustc` 1.94.1 と Go 1.27.2 を使ってビルドしました。動作を確認したのは、ビルドしたホストだけです。

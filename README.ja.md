@@ -19,7 +19,7 @@ Coraza／ModSecurity 搭載の WAF リバースプロキシ
 
 実装済みの機能と未実装の機能は、[システム概要](docs/detailed-design/00_overview/system-overview.md) の「現在の状態」を参照してください。
 
-> 0.1.0 は最初のリリースです。製品全体のセキュリティ評価は、まだ行っていません。
+> 製品全体のセキュリティ評価は、まだ行っていません。
 
 ## インストール
 
@@ -33,8 +33,8 @@ Coraza／ModSecurity 搭載の WAF リバースプロキシ
 [GitHub のリリース](https://github.com/vril-dev/tukuyomi-core/releases) から tarball とチェックサムのファイルを取得し、チェックサムを確認してから展開します。
 
 ```bash
-sha256sum -c tukuyomi-core_v0.1.0_linux_amd64.tar.gz.sha256
-tar -xzf tukuyomi-core_v0.1.0_linux_amd64.tar.gz
+sha256sum -c tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256
+tar -xzf tukuyomi-core_v0.2.0_linux_amd64.tar.gz
 ```
 
 CRS は同梱していません。`scripts/fetch-crs.sh` で取得してください。
