@@ -242,7 +242,7 @@ This screen shares one draft of the managed configuration with the Sites, Upstre
 
 From the top, the screen has the following.
 
-1. The notice "The global settings and the per-host settings do not apply to the route to this admin screen."
+1. The notice "The global settings and the per-host settings do not apply to the admin route."
 2. The panel for the global access control and rate limits
 3. The list of host policies, with "Add a per-host setting"
 4. The panel for editing the host policy that is open
@@ -251,8 +251,8 @@ In the editing panel, write a name and the hosts (one per line). For access cont
 
 The screen shows the following.
 
-- **When you change the global settings**: in a draft that changes the global access control or rate limit, the panel of the global settings and the confirmation of "Save and apply" show "This change does not reach the {n} per-host setting(s) that do not inherit the global access control ({names})." (`{n}` is the number and `{names}` are the names; rate limits use the same form). This is because global changes (including an urgent denial) do not take effect for hosts with "Settings for this host" or "Not used".
-- **List of host policies**: the list shows "A per-host setting applies only to requests whose Host header is one of its hosts. When a request for another host reaches the same upstream through the default upstream, a route with no host or a route whose host starts with *., only the global settings apply to it. Write a route for each host, and set the default upstream to None."
+- **When you change the global settings**: in a draft that changes the global access control or rate limit, the panel of the global settings and the confirmation of "Save and apply" show "This change does not apply to the {n} per-host setting(s) that do not inherit the global access control ({names})." (`{n}` is the number and `{names}` are the names; rate limits use the same form). This is because global changes (including an urgent denial) do not take effect for hosts with "Settings for this host" or "Not used".
+- **List of host policies**: the list shows "A per-host setting applies only to requests whose Host header is one of its hosts. Only the global settings apply to requests for other hosts that reach the same upstream through the default upstream, a route whose host starts with *., or a route without a host. We recommend writing a route for each host and setting the default upstream to 'None'."
 - **Where check errors point**: if you write a country list while the configuration file has no `geo`, the `at` of the check points to the access control of that host policy. If you write the same host as the admin route, the `at` of the check points to that row.
 
 For the setting keys of a host policy, the rules for comparing hosts, and how the policies are layered, see "Host Policies (`host_policies`)" in Appendix A (Operator Reference). For the description of the screen, see "Admin Screens" in Appendix B (Admin Reference).

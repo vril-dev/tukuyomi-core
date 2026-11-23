@@ -143,7 +143,7 @@ The following example is for a configuration with `managed`, with the routes wri
 - **Routes in every generation**: bypass routes are part of a generation, so keep putting the same routes into every generation of the engine that inspects requests to the admin screens. If you choose a generation that lacks them, these requests are inspected from that generation on.
 - **First generation**: the routes take effect only after a generation that holds them is in use. Import the first generation that holds them with the command (`rules import ... --routes <file>`).
 - **`proxy.max_body`**: set it to 12 MiB (12582912) or more. The admin route has no `max_body`, so `proxy.max_body` is its limit.
-- **Message when blocked**: if a rule blocks a request to `check` or `apply` with 403 in a generation that has no bypass routes, the admin screens show "The proxy or the WAF refused the request. A body with PEM files or many routes can be blocked by the WAF. Check that /api/managed/check and /api/managed/apply are left out of the inspection."
+- **Message when blocked**: if a rule blocks a request to `check` or `apply` with 403 in a generation that has no bypass routes, the admin screens show "The proxy or the WAF refused the request. The WAF can block a request body that contains PEM files or many routes. Check that /api/managed/check and /api/managed/apply are excluded from inspection."
 
 If the admin host is inspected with the CRS, the PUT and DELETE methods and the password fields also need tuning. Without it, a new user cannot make the first password change and cannot finish logging in. See "CRS Tuning for the Admin Host" in Appendix B (Admin Reference).
 

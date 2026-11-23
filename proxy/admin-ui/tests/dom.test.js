@@ -308,15 +308,15 @@ test('the overview shows the numbers of the proxy, and a dash where the proxy ga
   };
   const full = shown({ phase: 'ready', mode: 'block', engine: 'coraza', switching: false, generation: FP, uptime_ms: 3_700_000, requests: 12408, blocked: 31, policy_refused: 6, upstream_failures: 0, config: OTHER, config_reloads: { replaced: 3, refused: 1 } });
   for (const text of ['12,408', 'Up for 1 h 1 min', 'Refused 1', `${OTHER.slice(0, 12)}…`]) assert.equal(full.includes(text), true, text);
-  assert.equal(full.includes('Not read'), false);
+  assert.equal(full.includes('Unavailable'), false);
   const times = (text, part) => text.split(part).length - 1;
   // An old proxy gives none of the numbers; a number that is 0 is a number and is not confused with a missing one.
   const old = shown({ phase: 'ready', mode: 'block', engine: 'coraza', switching: false, generation: FP, requests: null, blocked: 0 });
-  assert.equal(times(old, 'This proxy does not give the numbers of the overview that show —.'), 1);
+  assert.equal(times(old, 'This proxy does not report the overview numbers shown as —.'), 1);
   assert.equal(old.includes('—'), true);
   const away = shown(null);
   assert.equal(times(away, 'The proxy cannot be reached.'), 1);
-  assert.equal(times(away, 'Not read'), 6);
+  assert.equal(times(away, 'Unavailable'), 6);
 });
 
 test('the list of generations is a table, and the address of one generation opens its detail and closes it again', async () => {
@@ -339,7 +339,7 @@ test('the list of generations is a table, and the address of one generation open
   assert.equal(root.querySelectorAll('[data-row]').length, 2);
   // The other generation can be chosen and deleted; the chosen one only says why it cannot be deleted.
   assert.equal(root.textContent.includes('Switch to this generation'), true);
-  assert.equal(root.textContent.includes('It is chosen, so it cannot be removed.'), true);
+  assert.equal(root.textContent.includes('It is chosen, so it cannot be deleted.'), true);
 
   screen.show({ id: OTHER, query: {} });
   await wait();
@@ -414,7 +414,7 @@ test('a generation is chosen with the generation that is chosen for its engine, 
   for (const text of ['Start the engine?', 'No generation is chosen for ModSecurity yet', 'the whole proxy stops']) assert.equal(said.includes(text), true, text);
   assert.deepEqual(alone.sent, [['/api/activate', { generation: M2, expect: null }]]);
   assert.equal(JSON.stringify(alone.sent[0][1]).includes('"expect":null'), true);
-  assert.equal(alone.root.textContent.includes('The ModSecurity engine of the proxy now serves generation'), true);
+  assert.equal(alone.root.textContent.includes(`The proxy is now running generation ${M2.slice(0, 12)} for ModSecurity.`), true);
   alone.screen.stop();
 
   // Chosen and not run: the engine is started with the generation that is chosen, and the list says it does not run.
@@ -432,13 +432,13 @@ test('a refusal says what the proxy kept for the engine only as far as it was kn
   setLanguage('en');
   const refused = (running, again) => outcomeView({ word: 'refused', ids: { from: again ? FP : OTHER, to: FP }, engine: 'modsecurity', running, chosen: true, unwritten: false, error: null }, String).textContent;
   const kept = refused(true, false);
-  assert.equal(kept.includes('keeps serving its earlier generation for ModSecurity') && kept.includes('choose generation'), true);
+  assert.equal(kept.includes('for ModSecurity, the proxy keeps running the generation it was running before') && kept.includes('choose generation'), true);
   // An engine that did not run is still not run, and with the same generation before and after there is none to choose again.
   const fresh = refused(false, true);
   assert.equal(fresh.includes('refused to start ModSecurity') && fresh.includes('Check the state on the Overview screen.') && !fresh.includes('choose generation'), true);
   // What was not known before is not said.
   const unsure = refused(null, false);
-  assert.equal(unsure.includes('refused to switch ModSecurity') && !unsure.includes('earlier generation') && !unsure.includes('does not run'), true);
+  assert.equal(unsure.includes('refused to switch ModSecurity') && !unsure.includes('the generation it was running before') && !unsure.includes('is not running'), true);
   assert.equal(refused(true, true).includes('Check the state on the Overview screen.'), true);
 });
 
@@ -509,11 +509,11 @@ test('the overview shows each engine that has something chosen or that runs, the
   assert.equal(marks(one), 1);
   // The proxy does not report its engines: it is told once for the panel, and for each engine that what the proxy serves is not known.
   const old = shown(statusOf({ chosen: { coraza: FP }, running: null }));
-  for (const text of ['This proxy does not report the state of its engines.', 'The generation that the proxy serves for this engine could not be read.']) assert.equal(old.textContent.includes(text), true, text);
+  for (const text of ['This proxy does not report the state of its engines.', 'This engine\'s running generation could not be read from the proxy.']) assert.equal(old.textContent.includes(text), true, text);
   // ModSecurity has a generation chosen and the proxy does not run it: it is there, and the way to start it is said.
   const two = shown(statusOf({ chosen: { coraza: FP, modsecurity: OTHER }, running: { coraza: FP } }));
   assert.equal(two.textContent.includes('ModSecurity'), true);
-  assert.equal(two.textContent.includes('A generation is chosen for this engine, but the proxy does not run it.'), true);
+  assert.equal(two.textContent.includes('This engine has a chosen generation but is not running in the proxy.'), true);
   // The proxy runs another default engine than the admin process names: neither is marked, and it is said.
   const apart = shown(statusOf({ chosen: { coraza: FP }, running: { coraza: FP }, proxy: { engine: 'modsecurity' } }));
   assert.equal(marks(apart), 0);
@@ -586,14 +586,14 @@ test('the page opens the shell for the role of the user, follows the address, an
   globalThis.location.hash = '#/generations/not-a-fingerprint';
   hash.handlers.forEach((handler) => handler());
   assert.equal(globalThis.location.hash, '#/generations');
-  assert.equal(app.textContent.includes('Removed what was not valid in the address.'), true);
+  assert.equal(app.textContent.includes('Removed the invalid parts of the address.'), true);
   // The content of a version is not for a viewer: its name is dropped from the address and told, and it is not asked for.
   globalThis.location.hash = `#/managed/${FP}`;
   hash.handlers.forEach((handler) => handler());
   await wait();
   await wait();
   assert.equal(globalThis.location.hash, '#/managed');
-  assert.equal(app.textContent.includes('Removed what was not valid in the address.'), true);
+  assert.equal(app.textContent.includes('Removed the invalid parts of the address.'), true);
   assert.equal(asked.includes(`/api/managed/versions/${FP}`), false);
   globalThis.location.hash = '#/generations';
   hash.handlers.forEach((handler) => handler());
@@ -641,7 +641,7 @@ test('while a job runs, the screen of the versions holds its buttons and says no
   const remove = root.querySelectorAll('button').filter((item) => item.textContent === 'Remove this version');
   assert.equal(remove.length, 1);
   assert.equal(remove[0].disabled, true);
-  assert.equal(root.textContent.includes('The selected version and the version that the proxy runs differ.'), false);
+  assert.equal(root.textContent.includes('The selected version and the running version differ.'), false);
   screen.stop();
 });
 
@@ -669,7 +669,7 @@ test('a viewer is not asked about the file, gets no way to correct a difference 
   await wait();
   await wait();
   await wait();
-  assert.equal(root.textContent.includes('The selected version and the version that the proxy runs differ.'), true);
+  assert.equal(root.textContent.includes('The selected version and the running version differ.'), true);
   assert.equal(asked.includes('/api/config'), false);
   assert.deepEqual(root.querySelectorAll('button').filter((item) => ['Apply the selected version again', 'Select the running version', 'Apply this version'].includes(item.textContent)), []);
   assert.deepEqual(root.querySelectorAll('a').filter((link) => /^#\/managed\/[0-9a-f]{64}$/.test(link.getAttribute('href'))), []);
@@ -695,7 +695,7 @@ test('an admin process that runs without the managed configuration is told so, w
     await wait();
     await wait();
     assert.equal(root.textContent.includes('The admin process started without the managed configuration.'), true, id);
-    assert.equal(root.textContent.includes('Create the first version from that JSON file with the commands managed import and managed activate.'), true, id);
+    assert.equal(root.textContent.includes('Create the first version from that JSON file with the managed import and managed activate commands.'), true, id);
     assert.equal(root.querySelectorAll('a').some((link) => link.getAttribute('href') === '#/config'), true, id);
     screen.stop();
   }
@@ -732,10 +732,10 @@ test('once the content of a version is closed, nothing that the screen keeps rea
 test('the outcome of a job with a result that this page does not know is told as such, with the word as it came', () => {
   setLanguage('en');
   const box = jobResult({ state: 'ended', result: 'a new word', from: FP, to: OTHER });
-  assert.equal(box.textContent.includes('The result is not one that this page knows.'), true);
+  assert.equal(box.textContent.includes('The result is not recognized.'), true);
   assert.equal(box.textContent.includes('a new word'), true);
   // A word of an object's prototype is no result.
-  assert.equal(jobResult({ state: 'ended', result: 'constructor', from: FP, to: OTHER }).textContent.includes('The result is not one that this page knows.'), true);
+  assert.equal(jobResult({ state: 'ended', result: 'constructor', from: FP, to: OTHER }).textContent.includes('The result is not recognized.'), true);
 });
 
 test('a removal that did not clean up says so, and one with a 503 or with no answer that names the version is not known', () => {
@@ -972,7 +972,7 @@ test('the screen of the sites opens a site, and a refusal of a check names the l
   assert.equal(root.querySelector('[data-row]').textContent.includes('Has an error'), true);
   // What another screen is to correct is told in the band with the way there.
   heldDraft().putFaults([{ screen: 'routes', panel: null, cid: 'routes', field: 'notice', words: lazy(() => 'too many routes') }]);
-  assert.equal(root.textContent.includes('Correct it on the routes screen'), true);
+  assert.equal(root.textContent.includes('Fix it on the Routes screen'), true);
   screen.stop();
   assert.equal(forgetDraft(), true);
 });
@@ -1016,7 +1016,7 @@ test('the screen of the routes makes a form when it opens, and a refusal of a fi
   assert.equal(stream.textContent.includes('a stream idle_ms is above its total_ms'), true);
   // What another screen is to correct is told in the band with the way there.
   heldDraft().putFaults([{ screen: 'sites', panel: null, cid: 'sites', field: 'notice', words: lazy(() => 'too many sites') }]);
-  assert.equal(root.textContent.includes('Correct it on the sites screen'), true);
+  assert.equal(root.textContent.includes('Fix it on the Sites screen'), true);
   screen.stop();
   assert.equal(forgetDraft(), true);
 });
@@ -1030,7 +1030,7 @@ test('typing in a field of a route draws the list again only when a line of it w
     input.value = value;
     input.dispatch('input');
   };
-  const idle = control('Idle limit');
+  const idle = control('Idle timeout');
   // The first change of the route is a change that the list shows.
   const unchanged = line();
   type(idle, '50');
@@ -1199,7 +1199,7 @@ test('the screen of the upstream groups chooses the engine of a group, says what
   engine.dispatch('change');
   assert.equal(heldDraft().groups[0].engine, 'modsecurity');
   assert.equal(heldDraft().changed, true);
-  for (const text of ['No generation is chosen for ModSecurity.', 'The configuration file has no inspector for ModSecurity']) assert.equal(root.textContent.includes(text), true, text);
+  for (const text of ['No generation is chosen for ModSecurity.', 'The ModSecurity inspector process is not in kernel.engines']) assert.equal(root.textContent.includes(text), true, text);
   pressed('Close');
   pressed('Check');
   await wait();
@@ -1253,7 +1253,7 @@ test('the confirmation of a saving names the groups whose engine changes, counts
   const dialog = root.querySelector('dialog');
   assert.notEqual(dialog, null);
   const said = dialog.textContent;
-  for (const text of ['Change Upstream engine app', '1 upstream(s) (app) are inspected by an engine whose generation only detects.', 'ModSecurity upstreams', 'Coraza upstreams']) assert.equal(said.includes(text), true, text);
+  for (const text of ['Change Upstream engine app', '1 upstream(s) (app) are inspected by an engine whose generation is detect-only.', 'ModSecurity upstreams', 'Coraza upstreams']) assert.equal(said.includes(text), true, text);
   // The user does not confirm: nothing is sent but the check.
   press(dialog.querySelectorAll('button').find((item) => item.textContent === 'Cancel'));
   await wait();
@@ -1297,7 +1297,7 @@ test('a version that is applied by its name is counted by engine in the confirma
   const dialog = root.querySelector('dialog');
   // The groups are counted by the engine that inspects them (the default engine for the one that names none), and ModSecurity runs a generation of detection.
   const said = dialog.textContent;
-  for (const text of ['Coraza upstreams', 'ModSecurity upstreams', 'Detect only now']) assert.equal(said.includes(text), true, text);
+  for (const text of ['Coraza upstreams', 'ModSecurity upstreams', 'Currently detect-only']) assert.equal(said.includes(text), true, text);
   press(apply(dialog));
   await wait();
   await wait();
