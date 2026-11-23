@@ -14,10 +14,10 @@ Main features:
 - Request inspection with Coraza or ModSecurity v3 (rule set generations and a detect-only mode)
 - Access control by IP address and country, and rate limiting (global and per host)
 - Certificate issuance and renewal with ACME (HTTP-01)
-- Admin API and admin UI (editing managed configuration and applying it without stopping the proxy, rule set generations, log search, audit log)
+- Admin API and admin UI (editing the managed configuration and applying it without stopping the proxy, rule set generations, log search, audit log)
 - Log files, and log shipping to PostgreSQL / MySQL
 
-For what is and is not implemented, see "現在の状態" (current status) in the [system overview](docs/detailed-design/00_overview/system-overview.md) (Japanese).
+For what is and is not implemented, see "Current Status" in the [system overview](docs/detailed-design/00_overview/system-overview.md).
 
 > The product as a whole has not had a security review yet.
 
@@ -33,17 +33,17 @@ Requirements:
 Download the tarball and its checksum file from the [GitHub releases](https://github.com/vril-dev/tukuyomi-core/releases), verify the checksum, and extract the tarball.
 
 ```bash
-sha256sum -c tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256
-tar -xzf tukuyomi-core_v0.2.0_linux_amd64.tar.gz
+sha256sum -c tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256
+tar -xzf tukuyomi-core_v0.2.1_linux_amd64.tar.gz
 ```
 
 The CRS is not bundled. Fetch it with `scripts/fetch-crs.sh`.
 
-For placement, the first start, and building from source (Rust 1.94.1 and Go 1.27.2 are required), see [docs/build/binary-deployment.md](docs/build/binary-deployment.md).
+For deployment, the first start, and building from source (which requires Rust 1.94.1 and Go 1.27.2), see [docs/build/binary-deployment.md](docs/build/binary-deployment.md).
 
 ## Documentation
 
-The documentation is in Japanese only.
+The documentation is available in English and Japanese.
 
 - Documentation index: [docs/README.md](docs/README.md)
 - Build and deployment: [docs/build/binary-deployment.md](docs/build/binary-deployment.md)
@@ -55,4 +55,4 @@ The documentation is in Japanese only.
 
 tukuyomi-core is released under the BSD 2-Clause License. See [LICENSE](LICENSE).
 
-For the licenses and copyright notices of the third-party software included in the executables, see [NOTICE](NOTICE) and [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).
+The executables include third-party software. Its licenses and copyright notices are in [NOTICE](NOTICE) and [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).

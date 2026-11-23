@@ -1,49 +1,51 @@
-# 運用リファレンス
+[English](operator-reference.md) | [日本語](operator-reference.ja.md)
 
-この文書は、現在の実装のコマンド、シグナル、設定ファイルの設定キー、ルールセットの扱い、managed 設定、リクエストの処理、アクセス制御とレート制限、ログ、監視をまとめたリファレンスです。配置と systemd の例は [ビルドと配置](../build/binary-deployment.md) を参照してください。管理プロセス（`admin` コマンド）の設定と API は [管理リファレンス](admin-reference.md) を参照してください。この文書には、プロキシから見えるものだけを書きます。
+# Operator Reference
 
-この文書に出てくるパスと名前（`/etc/tukuyomi-core/config.json`、OS ユーザー `tukuyomi`、`example.com` など）は例です。
+This document is a reference for the commands, signals, configuration file setting keys, rule set handling, managed configuration, request handling, access control and rate limits, logs, and monitoring of the current implementation. For deployment and systemd examples, see the [build and deployment guide](../build/binary-deployment.md). For the settings and API of the admin process (the `admin` command), see the [admin reference](admin-reference.md). This document covers only what is visible from the proxy.
 
-## コマンド
+The paths and names used in this document (`/etc/tukuyomi-core/config.json`, the OS user `tukuyomi`, `example.com`, and so on) are examples.
 
-どのコマンドも、`tukuyomi-proxy` の 1 つの実行ファイルで実行します。設定ファイルは、絶対パスで渡します（`.`・`..`・空の要素・末尾の `/` を含むパスは受け付けません）。
+## Commands
 
-root では、どのコマンドも実行できません。プロセスの 4 つのユーザー ID（real、effective、saved、file system）のどれかが 0 なら、`host check refused` の行を出して拒否します（exit 1）。サービスの OS ユーザーで実行してください（例: `sudo -u tukuyomi ...`）。
+Every command is run with the single executable `tukuyomi-proxy`. Pass the configuration file as an absolute path (a path that contains `.`, `..`, an empty component, or a trailing `/` is rejected).
 
-### 起動
+No command can run as root. If any of the process's four user IDs (real, effective, saved, and file system) is 0, the command writes a `host check refused` line and refuses to run (exit 1). Run commands as the OS user of the service (for example, `sudo -u tukuyomi ...`).
+
+### Start
 
 ```text
 tukuyomi-proxy <config>
 ```
 
-- 起動は、次の順に進みます。
-  1. 起動前の検証（root でないこと、SIGCHLD、ファイルディスクリプター）
-  2. 設定ファイル（`managed` があれば、managed ストアの選択中のバージョンと、それが指すファイルも。`geo` があれば、国のデータベースの読み込みと検証も）
-  3. アップストリームのサーバーの名前解決と、アップストリームの CA のファイル
-  4. TLS のリスナーの証明書と鍵
-  5. ルールストアと、エンジンごとの選択中の世代
-  6. ログファイル（設定に `records` があるとき）を開く
-  7. 監視用のリスナー（設定に `status` があるとき）のバインド
-  8. 制御ソケット（設定に `admin` があるとき）のバインド
-  9. 検査カーネルの起動と、検査プロセスの準備（起動するエンジンごと）
-  10. リスナーのバインド
-- 起動するエンジンは、選択中の世代があり、検査プロセスが設定にあるエンジンのすべてです。デフォルトのエンジンが先で、ほかは名前の順です。
-  - デフォルトのエンジンと、アップストリームのエンジンには、選択中の世代が必要です。無ければ、`start: rules store refused: no generation is chosen` の行を出して停止します（exit 1）。
-  - デフォルトのエンジンに選択中の世代が無く、ほかのエンジンには選択中の世代があるときは、`start: rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` の行を出して停止します（exit 1）。`kernel.default_engine` を書くか、デフォルトのエンジンの世代を選択してください。
-  - どのアップストリームも使わないエンジンも、選択中の世代があれば起動します（下の「検査エンジンの選択」）。
-- ログファイルは、検査プロセスより前に開きます。開けなければ、`start: record file refused: ...` の行を出し、検査プロセスを起動せずに停止します（exit 1）。
-- 監視用のリスナーと制御ソケットは、検査プロセスより前にバインドします。バインドできなければ、検査プロセスを起動せずに停止します（exit 1）。制御ソケットは `start: control socket refused: ...` の行を出します。
-- リスナーは、起動するエンジンの検査カーネルがすべて準備できてから、すべてをバインドします。1 つでもバインドできなければ、どれも使わずに停止します。
-- シグナルの処理は 6 の後に有効になります。それより前（名前解決は最長 `resolve_timeout_ms` かかります）に届いたシグナルは、どれもプロキシをそのまま終了させます。
-- ログには、準備ができると `start: the kernel is ready`、リスナーが待ち受けを始めると `start: listening` の行が出ます（`line` のログ。下の「ログ」）。
-- 環境変数 `NOTIFY_SOCKET` があれば、すべてのリスナーをバインドした後に `READY=1` を送ります（下の「systemd への通知」）。
-- 終了コードは次のとおりです。
+- Startup proceeds in this order:
+  1. Checks before start (not root, SIGCHLD, file descriptors)
+  2. The configuration file (if `managed` is present, also the selected version in the managed store and the files it points to; if `geo` is present, also loading and checking the country database)
+  3. Upstream server name resolution, and the upstream CA files
+  4. The TLS listeners' certificates and keys
+  5. The rules store, and the chosen generation of each engine
+  6. Opening the log files (when the configuration has `records`)
+  7. Binding the monitoring listener (when the configuration has `status`)
+  8. Binding the control socket (when the configuration has `admin`)
+  9. Starting the inspection kernel and preparing the inspector process (for each engine that starts)
+  10. Binding the listeners
+- Every engine that has a chosen generation and an inspector process in the configuration starts. The default engine starts first, and the others follow in name order.
+  - The default engine and the upstream engines need a chosen generation. If one has none, the proxy writes a `start: rules store refused: no generation is chosen` line and stops (exit 1).
+  - If the default engine has no chosen generation but another engine has one, the proxy writes a `start: rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` line and stops (exit 1). Set `kernel.default_engine`, or choose a generation for the default engine.
+  - An engine that no upstream uses also starts if it has a chosen generation (see "Choosing the Inspection Engine" below).
+- The log files are opened before the inspector processes. If a log file cannot be opened, the proxy writes a `start: record file refused: ...` line and stops without starting the inspector processes (exit 1).
+- The monitoring listener and the control socket are bound before the inspector processes. If either cannot be bound, the proxy stops without starting the inspector processes (exit 1). For the control socket, it writes a `start: control socket refused: ...` line.
+- All listeners are bound only after the inspection kernels of every starting engine are ready. If even one cannot be bound, none is used and the proxy stops.
+- Signal handling becomes active after step 6. Any signal that arrives earlier (name resolution can take up to `resolve_timeout_ms`) simply ends the proxy.
+- The log gets a `start: the kernel is ready` line when the kernels are ready, and a `start: listening` line when the listeners begin to listen (`line` log; see "Logs" below).
+- If the environment variable `NOTIFY_SOCKET` is set, the proxy sends `READY=1` after binding all listeners (see "Notifications to systemd" below).
+- The exit codes are as follows.
 
-| 終了コード | 意味 |
+| Exit code | Meaning |
 |---|---|
-| 0 | シグナルで停止し、検査カーネルの停止（検査プロセスの終了と作業ディレクトリの削除）まで確認できたとき |
-| 1 | それ以外の終了です。root での起動、起動前の検証の失敗、名前解決できないアップストリームの名前、使えない CA のファイル、受け付けない証明書や鍵、受け付けないルールストアや世代、選択中の世代が無いデフォルトのエンジンやアップストリームのエンジン、受け付けない managed ストアやバージョン、開けないログファイル、バインドできない監視用のリスナーや制御ソケットを含みます（このときは何も起動していません） |
-| 2 | 引数のエラー、または設定ファイルを受け付けなかったとき |
+| 0 | Stopped by a signal, and the inspection kernels were confirmed to have stopped (the inspector processes ended and the work directories were removed) |
+| 1 | Any other exit. This includes starting as root, a failed check before start, an upstream name that cannot be resolved, an unusable CA file, a rejected certificate or key, a rejected rules store or generation, a default engine or upstream engine without a chosen generation, a rejected managed store or version, a log file that cannot be opened, and a monitoring listener or control socket that cannot be bound (nothing has started in these cases) |
+| 2 | An argument error, or a configuration file that was rejected |
 
 ### `config check`
 
@@ -51,27 +53,27 @@ tukuyomi-proxy <config>
 tukuyomi-proxy config check <config>
 ```
 
-- 起動と同じ検証を、選択中の世代と検査カーネルの設定まで実行します（上の 2〜5 と、検査カーネルの設定の値）。起動前の検証（上の 1）では、root でないことだけを検証します。
-  - 通れば、標準出力に `accepted` の 1 行が出て exit 0 になります。
-  - ほかの行は標準エラーに出て、`config check:` で始まります。引数のエラーのときだけ `config:` で始まり、使い方の行が続きます。
-  - 終了コードは起動と同じです。
-  - 選択中の世代があるエンジンごとに、検査カーネルの設定を検証します。検査カーネルの設定を作れない世代は、`config check: rules generation refused: <reason>` の行を出して exit 1 になります。このビルドが持つ検査エンジンは `coraza` と `modsecurity` です。`modsecurity` は、設定の `kernel.engines` に検査プロセスがあるときだけ使えます（下の「`kernel`」の `engines`）。
-  - 起動のときと同じ文で、選択中の世代が無いデフォルトのエンジンとアップストリームのエンジンを受け付けません（`config check: rules store refused: no generation is chosen`、`config check: rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine`。どちらも exit 1）。
-  - デフォルトのエンジンかアップストリームのエンジンが `modsecurity` で、設定に `kernel.engines` が無いときは、設定ファイルかバージョンを受け付けません。どのアップストリームも使わないエンジンは、設定に検査プロセスが無ければ、選択中の世代があっても検証せず、起動もしません。
-  - 検知のみの世代を選択しているエンジンへ向くアップストリームごとに、`config check: upstream <name>: engine <engine>, mode detect` の行を出します。
-- `managed` があれば、managed ストアの選択中のバージョン（`current`）を起動のときと同じように読み込んで検証し、`config check: managed version <version>` の行を出します。選択中のバージョンが無ければ、`config check: managed store refused: no managed version is chosen` の行を出して exit 1 になります（下の「managed 設定」）。読んでいる間は、そのバージョンの削除を拒否します。
-- `geo` があれば、国のデータベースも起動のときと同じように読み込んで検証します（「アクセス制御とレート制限」の `geo`）。
-- 検証しないもの:
-  - SIGCHLD とファイルディスクリプター（上の 1 のうち、root でないこと以外）
-  - 作業ディレクトリ（`kernel.tmp_root`）。検査プロセスを起動するときに検証します
-  - 検査プロセスの実行ファイルが起動できること、Landlock が使えること
-  - ルールが世代のエンジン（Coraza か ModSecurity）で組めること（起動のときに検証します。ルールは `rules import` が事前検証してから世代にします）
-  - ログファイルを開けること（上の 6）
-  - リスナーと監視用のリスナーのポート、制御ソケットをバインドできること
-  - systemd の設定
-  - 動作中のプロキシが設定のリロードで拒否する理由（動作中に変更できない設定キーの違い、アップストリームのエンジンが稼働していないこと、新しいリスナーのバインド。下の「SIGHUP（設定のリロード）」）
-- このコマンドが書くものは、目印だけです。起動のときと同じく、起動するエンジンごとの選択中の世代を使うことを示す目印を、ルールストアの `using/` に作ります（まだ無いとき）。コマンドが終了すると、目印のロックは解除されます。
-- サービスと同じ OS ユーザーで実行してください。別の OS ユーザーでは、ルールストアと managed ストアの所有者の検証や、鍵のファイルの読み込みで受け付けません。
+- This command runs the same checks as start, up to the chosen generations and the inspection kernel settings (steps 2 to 5 above, and the values of the inspection kernel settings). The only check before start (step 1 above) that it runs is that the process is not root.
+  - If everything passes, it writes a single `accepted` line to standard output and exits 0.
+  - Other lines go to standard error and begin with `config check:`. Only an argument error gives a line that begins with `config:`, followed by a usage line.
+  - The exit codes are the same as for start.
+  - It checks the inspection kernel settings for each engine that has a chosen generation. If the inspection kernel settings of a generation cannot be built, it writes a `config check: rules generation refused: <reason>` line and exits 1. The inspection engines in this build are `coraza` and `modsecurity`. `modsecurity` can be used only when `kernel.engines` in the configuration has an inspector process (see `engines` under "`kernel`" below).
+  - With the same messages as start, it rejects a default engine or an upstream engine that has no chosen generation (`config check: rules store refused: no generation is chosen`, `config check: rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine`; both exit 1).
+  - If the default engine or an upstream engine is `modsecurity` and the configuration has no `kernel.engines`, it rejects the configuration file or version. An engine that no upstream uses is neither checked nor started if the configuration has no inspector process for it, even when a generation is chosen.
+  - For each upstream that points to an engine whose chosen generation is detect-only, it writes a `config check: upstream <name>: engine <engine>, mode detect` line.
+- If `managed` is present, it loads and checks the selected version of the managed store (`current`) as start does, and writes a `config check: managed version <version>` line. If no version is selected, it writes a `config check: managed store refused: no managed version is chosen` line and exits 1 (see "Managed Configuration" below). While it is reading the version, that version cannot be deleted.
+- If `geo` is present, it also loads and checks the country database as start does (`geo` in "Access Control and Rate Limits").
+- What it does not check:
+  - SIGCHLD and file descriptors (the parts of step 1 above other than the root check)
+  - The work directory (`kernel.tmp_root`). It is checked when an inspector process starts
+  - That the inspector process executable can start, and that Landlock is available
+  - That the generation's engine (Coraza or ModSecurity) can build the rules. This is checked at start. `rules import` runs the trial on the rules before it makes them a generation
+  - That the log files can be opened (step 6 above)
+  - That the ports of the listeners and of the monitoring listener, and the control socket, can be bound
+  - systemd settings
+  - The reasons a running proxy refuses a configuration reload (a difference in a setting key that cannot change while running, an upstream engine that is not running, and binding a new listener; see "SIGHUP (Configuration Reload)" below)
+- The only thing this command writes is a marker. As at start, it creates a marker in the rules store's `using/` (if one is not there yet) to show that the chosen generation of each engine that would start is in use. The lock on the marker is released when the command exits.
+- Run the command as the same OS user as the service. Under a different OS user, the command rejects the configuration when it checks the owner of the rules store and the managed store, and when it reads the key files.
 
 ### `rules`
 
@@ -83,44 +85,44 @@ tukuyomi-proxy rules remove <config> <fingerprint>
 tukuyomi-proxy rules list <config>
 ```
 
-どれも短いコマンドで、動作中のプロキシとは別のプロセスです。動作中のプロキシは、コマンドが行った変更を検知しません。新しい世代を使わせるには、SIGUSR1 を送ります（下の「シグナル」）。管理プロセスの API は、世代を選択し、続けて動作中のプロキシに切り替えを依頼します（[管理リファレンス](admin-reference.md)。依頼は「制御ソケット」）。
+Each of these is a short-lived command that runs as a process separate from the running proxy. The running proxy does not notice the changes these commands make, so to have it use a new generation, send it SIGUSR1 (see "Signals" below). The API of the admin process chooses a generation and then asks the running proxy to switch (see the [admin reference](admin-reference.md); for the request, see "Control Socket").
 
-| コマンド | すること | 標準出力 |
+| Command | What it does | Standard output |
 |---|---|---|
-| `import` | 入力からルールセットを作ってルールストアに置き、事前検証に通れば世代にします。世代は選択しません | `<fingerprint> created`、`<fingerprint> already exists`、`<fingerprint> recreated, the stored copy was broken` |
-| `activate` | 世代を選択します。選択は、世代のエンジンごとに 1 つです（下の「エンジンごとの選択中の世代」）。後で起動するプロキシと、SIGUSR1 を受けたプロキシがそれを使います。世代のエンジンが使えないときは、選択せずに受け付けません（exit 2） | `<fingerprint> current` |
-| `deactivate` | エンジンの選択中の世代を解除します。次に起動するプロキシは、そのエンジンを起動しません。動作中のプロキシは、起動したエンジンを止めません。デフォルトのエンジンと、アップストリームのエンジンに使われているエンジンは、解除せずに受け付けません（exit 1。下の「エンジンごとの選択中の世代」） | `<fingerprint> deactivated`（解除した世代） |
-| `remove` | どのエンジンでも選択中でない世代で、どのプロキシも使っていないものを削除します | `<fingerprint> removed` |
-| `list` | 世代の一覧 | フィンガープリント、作成時刻（エポックからの秒数）、モード（`block`・`detect`、マニフェストが読めなければ `unknown`）、エンジン（`coraza`・`modsecurity`、マニフェストが読めなければ `unknown`）、検査除外のルート（bypass）があれば `routes` と数、エンジンごとの選択中の世代に `current`（2 つのエンジンの世代が選択中なら、2 行に付きます）。選択中の世代を決められないとき（ファイルを読めない、内容が正しくない、`current` と `current.<engine>` が食い違う）は、世代の行をすべて出した後、標準エラーに `rules list: <reason>` の行を出して exit 1 になります |
+| `import` | Builds a rule set from the input, puts it in the rules store, and makes it a generation if it passes the trial. It does not choose the generation | `<fingerprint> created`, `<fingerprint> already exists`, `<fingerprint> recreated, the stored copy was broken` |
+| `activate` | Chooses a generation. One generation can be chosen per engine (see "Chosen Generation per Engine" below). Proxies that start later, and proxies that receive SIGUSR1, use it. If the generation's engine cannot be used, the command refuses without choosing it (exit 2) | `<fingerprint> current` |
+| `deactivate` | Clears an engine's chosen generation. The next proxy to start does not start that engine. A running proxy does not stop an engine it has started. For the default engine and for an upstream engine, the command refuses without clearing the choice (exit 1; see "Chosen Generation per Engine" below) | `<fingerprint> deactivated` (the generation that is no longer chosen) |
+| `remove` | Deletes a generation that is not chosen for any engine and is not used by any proxy | `<fingerprint> removed` |
+| `list` | Lists the generations | The fingerprint, the creation time (seconds since the epoch), the mode (`block`, `detect`, or `unknown` if the manifest cannot be read), the engine (`coraza`, `modsecurity`, or `unknown` if the manifest cannot be read), `routes` and the count if the generation has bypass routes, and `current` on the chosen generation of each engine (if two engines have a chosen generation, two lines have it). When the chosen generation cannot be determined (the file cannot be read, the content is invalid, or `current` and `current.<engine>` disagree), it writes all the generation lines, then writes a `rules list: <reason>` line to standard error and exits 1 |
 
-`import` の入力は次のとおりです。オプションのパスは、カレントディレクトリからの相対パスでも書けます。
+`import` takes the following input. The paths in the options can also be relative to the current directory.
 
-| オプション | 内容 |
+| Option | Content |
 |---|---|
-| `--crs <dir>` | `scripts/fetch-crs.sh` で取得した CRS のディレクトリ。`crs-setup.conf`（と任意の `crs-setup.conf.example`）と `rules/` の `.conf`・`.data`・`.example` だけを持つこと。ほかのもの（隠しファイル、`plugins` などのディレクトリ、ほかの拡張子、シンボリックリンク）があれば受け付けません |
-| `--crs-off <name>` | `crs/rules/` の `.conf` のうち、読み込まないもの。何度でも書けます。`--crs` が必要です |
-| `--rules <file>` | 運用者のルールのファイル。何度でも書け、CRS の後に書いた順に読み込みます |
-| `--data <file>` | 運用者のルールが読むデータのファイル。ルールセットには入りますが、ルールとしては読み込みません |
-| `--routes <file>` | 検査除外のルート（bypass）のファイル（下の「検査除外のルート」） |
-| `--engine <name>` | 世代の検査エンジンの名前。`coraza` か `modsecurity`（小文字）。省けば、設定の `kernel.default_engine` のエンジン（`kernel.default_engine` を書かなければ `coraza`）。これ以外の名前と、設定の `kernel.engines` に検査プロセスが無い `modsecurity` は、何も置かずに受け付けません（exit 2） |
-| `--accept-block` | 事前検証のリクエストがブロックされても、事前検証を失敗にしません（一致したルールは出力されます） |
-| `--detect-only` | 検知のみの世代にします（下の「検知のみのモード」） |
+| `--crs <dir>` | The CRS directory fetched with `scripts/fetch-crs.sh`. It must contain only `crs-setup.conf` (and optionally `crs-setup.conf.example`) and the `.conf`, `.data`, and `.example` files in `rules/`. Anything else (hidden files, directories such as `plugins`, other extensions, symbolic links) is rejected |
+| `--crs-off <name>` | A `.conf` file in `crs/rules/` that is not loaded. It can be given any number of times. Requires `--crs` |
+| `--rules <file>` | An operator rule file. It can be given any number of times, and the files are loaded after the CRS, in the order given |
+| `--data <file>` | A data file that the operator rules read. It goes into the rule set but is not loaded as rules |
+| `--routes <file>` | The bypass route file (see "Bypass Routes" below) |
+| `--engine <name>` | The name of the generation's inspection engine: `coraza` or `modsecurity` (lowercase). If omitted, the engine of `kernel.default_engine` in the configuration (`coraza` if `kernel.default_engine` is not set). Any other name, and `modsecurity` when `kernel.engines` in the configuration has no inspector process, is rejected without storing anything (exit 2) |
+| `--accept-block` | Does not fail the trial even if a trial request is blocked (the matched rules are printed) |
+| `--detect-only` | Makes a detect-only generation (see "Detect-Only Mode" below) |
 
-- 読み込む順は、`crs/crs-setup.conf`、`crs/rules/` の `.conf`（名前のバイト順）、運用者のルールのファイル（書いた順）です。
-- `--rules` と `--data` のファイルは、ディレクトリを除いた名前で、ルールセットの `rules/<name>` に入ります。
-  - 名前は 1〜128 文字の英数字・`.`・`_`・`-` で、`.` で始まる名前は使えません。
-  - 同じ名前は、`--rules` と `--data` をまたいでも受け付けません。
-  - 入力のファイルがシンボリックリンクのときと、`--crs` のディレクトリがシンボリックリンクのときも受け付けません。
-- 1 つのファイルは 2 MiB まで、ルールセット全体は 128 ファイル・8 MiB までです。ディレクトリは 1024 項目まで見ます。マニフェストは 64 KiB までで、ファイルの一覧と検査除外のルートがそれを分け合います。
-- ルールが読めるファイル（`@pmFromFile` など）は、ルールセットの中のファイルだけです。ルールには、ルールセットの中のパス（`rules/<name>` など）で書きます。
-- 事前検証: 検査プロセスを 1 つ起動し、決まった 3 つのリクエスト（`GET /`、フォームのボディ `a=b` の `POST /`、JSON のボディ `{"a":"b"}` の `POST /`）を検査します。
-  - 検査プロセスが `ready_wait` 以内に準備でき、どのリクエストも `inspect_wait` 以内に許可され、検査プロセスが正常に終了すれば、事前検証に通ります。
-  - 遮断の世代では、事前検証のリクエストが 1 つでもブロックされると失敗にします（`--accept-block` を付けたときを除きます）。検知のみの世代では、ルールに一致しても失敗にしません。
-  - 事前検証で分かるのは、ルールセットが起動し、通常の形のリクエストを通すことだけで、ルールが正しいことは分かりません。
-- 事前検証の間に SIGINT（Ctrl-C）か SIGTERM を受けると、事前検証を停止し、検査プロセスと作業ディレクトリを片付けて、世代を作らずに終了します。事前検証の後は、この 2 つのシグナルでコマンドは停止しません。
-- `import` は検査プロセスを起動するので、起動前の検証（[ビルドと配置](../build/binary-deployment.md) の「起動前の検証」）も実行します。
+- The loading order is `crs/crs-setup.conf`, the `.conf` files in `crs/rules/` (in byte order of the names), and then the operator rule files (in the order given).
+- The `--rules` and `--data` files are stored in the rule set as `rules/<name>`, where the name is the file name without its directory.
+  - A name is 1 to 128 characters of letters and digits, `.`, `_`, and `-`, and cannot start with `.`.
+  - The same name is rejected, even across `--rules` and `--data`.
+  - An input file that is a symbolic link is rejected, and so is a `--crs` directory that is a symbolic link.
+- One file can be up to 2 MiB, and a whole rule set can have up to 128 files and 8 MiB. Up to 1024 directory entries are read. The manifest can be up to 64 KiB, and the file list and the bypass routes share that size.
+- The only files that rules can read (with `@pmFromFile` and the like) are files inside the rule set. In a rule, write them as paths inside the rule set (`rules/<name>` and so on).
+- The trial starts one inspector process and inspects three fixed requests (`GET /`, `POST /` with the form body `a=b`, and `POST /` with the JSON body `{"a":"b"}`).
+  - If the inspector process becomes ready within `ready_wait`, every request is allowed within `inspect_wait`, and the inspector process exits normally, the trial passes.
+  - For a generation in block mode, the trial fails if even one trial request is blocked (unless `--accept-block` is given). For a detect-only generation, a match with a rule does not fail the trial.
+  - The trial shows only that the rule set starts and lets ordinary requests through. It does not show that the rules are correct.
+- If SIGINT (Ctrl-C) or SIGTERM arrives during the trial, the command stops the trial, cleans up the inspector process and the work directory, and exits without making a generation. After the trial, these two signals do not stop the command.
+- `import` starts an inspector process, so it also runs the checks before start (see "Checks Before Start" in the [build and deployment guide](../build/binary-deployment.md)).
 
-終了コードは、0 が成功、1 がそれ以外の終了（受け付けないルールストアや入力、失敗した事前検証、使用中のルールストア、`list` でマニフェストが読めない世代や、選択中の世代を決められないルールストア、設定が使っているエンジンと選択中の世代が無いエンジンの `deactivate`、root での実行）、2 が引数のエラー、受け付けない設定ファイル（`deactivate` では、`managed` の選択中のバージョンも含みます）、または使えないエンジン（`import` と `activate`）です。選択中の世代が無いルールストアの `list` は、exit 0 です。
+The exit codes are as follows. 0 is success. 1 is any other exit (a rejected rules store or input, a failed trial, a rules store in use, a generation whose manifest cannot be read in `list` (the whole list is still written), a rules store whose chosen generation cannot be determined, `deactivate` for an engine that the configuration uses or an engine that has no chosen generation, and running as root). 2 is an argument error, a configuration file that was rejected (for `deactivate`, this includes the selected version of `managed`), or an engine that cannot be used (`import` and `activate`). `list` exits 0 for a rules store that has no chosen generation.
 
 ### `managed`
 
@@ -131,24 +133,24 @@ tukuyomi-proxy managed remove <config> <version>
 tukuyomi-proxy managed list <config>
 ```
 
-managed 設定のバージョン（下の「managed 設定」）を扱う短いコマンドで、動作中のプロキシとは別のプロセスです。コマンドはプロキシに依頼しないので、動作中のプロキシは、選択中のバージョンを次の SIGHUP（`systemctl reload`）か起動で読み込みます。管理プロセスの反映は、制御ソケットでプロキシに設定をリロードさせてから選択します（下の「managed 設定」の「反映」）。設定ファイルには `managed` が必要です。`<version>` は、バージョンの SHA-256（64 桁の小文字の 16 進数）です。
+These are short-lived commands that work with managed configuration versions (see "Managed Configuration" below), and each runs as a process separate from the running proxy. The commands do not ask the proxy to do anything, so the running proxy loads the selected version at the next SIGHUP (`systemctl reload`) or start. When the admin process applies a version, it asks the proxy over the control socket to reload the configuration and then selects the version (see "Applying" under "Managed Configuration" below). The configuration file must have `managed`. `<version>` is the SHA-256 of the version (64 lowercase hexadecimal digits).
 
-| コマンド | すること | 標準出力 |
+| Command | What it does | Standard output |
 |---|---|---|
-| `import` | 文書からバージョンを作って managed ストアに置きます。文書が指すファイルを読み、プロキシと同じように検証して、`files/` に置きます。バージョンは選択しません | `<version> created`、`<version> existing`、`<version> recreated, the stored copy was broken` |
-| `activate` | 起動のうちルールストアより前の段階（設定ファイルとバージョン、アップストリームの名前解決と CA のファイル、証明書）を実行し、バージョンのアップストリームが使うエンジンに、選択中の世代があることをルールストアで確認して、通ったときだけバージョンを選択します（`current` を変更します）。選択中の世代が無いエンジンを使うアップストリームがあれば、`managed activate: rules store refused: no generation is chosen for the engine of an upstream (upstream <name>)` の行を出し、選択せずに拒否します（exit 1）。`import` は、この確認をしません | `<version> current` |
-| `remove` | 選択中でなく、使用中でもないバージョンを削除し、どのバージョンも指さなくなったファイルと ACME のサイトの証明書を片付けます。ロールバックの先かどうかは調べません | `<version> removed` |
-| `list` | バージョンの一覧 | バージョン、ファイルの更新時刻（エポックからの秒数）、選択中のバージョンに `current` |
+| `import` | Builds a version from a document and puts it in the managed store. It reads the files that the document points to, checks them in the same way as the proxy, and puts them in `files/`. It does not select the version | `<version> created`, `<version> existing`, `<version> recreated, the stored copy was broken` |
+| `activate` | Runs the startup steps that come before the rules store (the configuration file and the version, upstream name resolution and the CA files, the certificates), confirms in the rules store that every engine the version's upstreams use has a chosen generation, and selects the version only if everything passes (it changes `current`). If an upstream uses an engine that has no chosen generation, it writes a `managed activate: rules store refused: no generation is chosen for the engine of an upstream (upstream <name>)` line and refuses without selecting (exit 1). `import` does not make this check | `<version> current` |
+| `remove` | Deletes a version that is neither selected nor in use, and cleans up the files that no version points to any longer and the ACME site certificates. It does not check whether the version is a rollback target | `<version> removed` |
+| `list` | Lists the versions | The version, the update time of the file (seconds since the epoch), and `current` for the selected version |
 
-- `import` の文書のパスは、カレントディレクトリからの相対パスでも書けます。文書の形は、下の「managed ストアとバージョン」を参照してください。
-- `import` と `activate` は、国のデータベースも読み込んで検証します。`remove` と `list` は、設定ファイルだけを読み込みます。
-- `import`・`activate`・`remove` は、managed ストアのロックを取ります。管理プロセスの反映の間など、ほかがロックを持っていれば、待たずに拒否します（`the managed store is in use by another command`）。
-- `activate` は、ACME のサイトの証明書がまだ無いとき、`managed activate: tls certificate not issued yet (site <name>)` の行を出します。拒否はしません。
-- `activate` で選択したバージョンは、動作中のプロキシには次の SIGHUP まで効きません。すぐに `systemctl reload` を実行し、`reload: configuration replaced <sha256> managed <version>` の行を確認してください（下の「managed 設定」の「反映」）。
-- `remove` で片付けをすべては終えられなかったときは、標準エラーに `managed remove: the files that no version names were not cleaned up` の行を出し、exit 0 で終了します（バージョンは削除済みです）。次の削除で、また片付けます。
-- 結果の行のほかは標準エラーに出て、コマンドの名前で始まります（`managed import: document refused: <reason>` など）。文書に書かれたパスは、0x20〜0x7e の外のバイトを `\xNN` にして出力します。
+- The document path for `import` can also be relative to the current directory. For the document format, see "Managed Store and Versions" below.
+- `import` and `activate` also load and check the country database. `remove` and `list` load only the configuration file.
+- `import`, `activate`, and `remove` take the managed store lock. If something else holds the lock, for example while the admin process is applying a version, they refuse without waiting (`the managed store is in use by another command`).
+- When the certificate of an ACME site is not yet there, `activate` writes a `managed activate: tls certificate not issued yet (site <name>)` line. It does not refuse.
+- A version selected with `activate` does not take effect in the running proxy until the next SIGHUP. Run `systemctl reload` right away and check for the `reload: configuration replaced <sha256> managed <version>` line (see "Applying" under "Managed Configuration" below).
+- If `remove` cannot finish the whole cleanup, it writes a `managed remove: the files that no version names were not cleaned up` line to standard error and exits 0 (the version has been deleted). The next removal cleans up again.
+- Lines other than the result line go to standard error and begin with the name of the command (`managed import: document refused: <reason>` and so on). In a path written in the document, bytes outside 0x20 to 0x7e are printed as `\xNN`.
 
-終了コードは、0 が成功、1 がそれ以外の終了（受け付けない managed ストア・文書・ファイル、使用中の managed ストア、`activate` で名前解決できない名前や使えないファイル、`activate` が受け付けないバージョン、`remove` が拒否したバージョン、`list` で `current` が読めないか、`current` が指すバージョンが無い managed ストア、root での実行）、2 が引数のエラーか、受け付けない設定ファイル（`managed` の無い設定ファイルを含みます）です。
+The exit codes are as follows. 0 is success. 1 is any other exit (a rejected managed store, document, or file, a managed store in use, a name that cannot be resolved or a file that cannot be used in `activate`, a version that `activate` rejects, a version that `remove` refused, a managed store in which `current` cannot be read or in which the version `current` points to does not exist in `list`, and running as root). 2 is an argument error, or a configuration file that was rejected (this includes a configuration file without `managed`).
 
 ### `acme renew`
 
@@ -156,31 +158,31 @@ managed 設定のバージョン（下の「managed 設定」）を扱う短い�
 tukuyomi-proxy acme renew <config>
 ```
 
-- `acme` を持つ証明書を、設定の順に調べます（`managed` のある設定では、管理画面のルート、バージョンのサイトの順。下の「ACME のサイト」）。次のどれかに当てはまる証明書は、更新が必要とみなして、新しい鍵で注文し直します。
-  - 証明書か鍵のファイルが読めない
-  - 鍵が証明書に合わない
-  - 証明書がすべてのホストを含まない
-  - 有効期間の終わりまでが `renew_before_days` 日より短い（ちょうどその日数は短くありません）
-- 更新が必要ない証明書は `valid` です。
-- 更新が必要な証明書が 1 つでもあれば、アカウントの鍵を読み込むか作成し、CA にアカウントを作成するか、既存のアカウントを見つけます。アカウントは、CA の利用規約に同意し、`contact_email` を連絡先にして作成します。
-- コマンド全体（CA の応答と待ち時間を含みます）は `timeout_ms` までです。時間が尽きたとき、まだ更新できていない証明書は、その後のものも含めて `failed` になります。更新が必要ない証明書は `valid` のままです。
-- 結果は、`acme` を持つ証明書ごとに標準出力に 1 行出ます。
-  - `managed` の無い設定では `<listener>.<certificate> renewed|valid|failed` の形です。どちらも 1 から数えます。リスナーの番号は `proxy.listeners` の並びの位置で、TLS でないリスナーも数えます。
-  - `managed` のある設定では `admin route renewed|valid|failed`、`site <name> renewed|valid|failed` の形です。
-  - `failed` の証明書は、ファイルを前のまま残します。
-- `managed` と `acme` のある設定で、`acme` を持つ証明書が 1 つも無いとき（管理画面のルートにも、バージョンのサイトにも無いとき）は、結果の行を出さず、標準エラーに 1 行出して exit 0 で終了します。
-- `managed` のある設定では、`current` のバージョンを読み込み、終了するまで、そのバージョンの削除を拒否します。managed ストアのロックは取りません。
-- CA から受け取ったものは、問題の文書の `type` だけを標準エラーに出します。
-- SIGINT と SIGTERM を受けると、チャレンジのファイルを削除してすぐ終了します。
-- 動作中のプロキシは、新しい証明書を検知しません。コマンドの後に SIGUSR2 を送ります（`systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`）。
-- 終了コードは次のとおりです。
-  - 0: すべてが `renewed` か `valid`（`managed` のある設定で、`acme` を持つ証明書が無いときも）
-  - 1: 1 つでも `failed` がある、停止された、実行できない、root で実行した
-  - 2: 引数のエラー、受け付けない設定ファイル（`managed` のある設定では、プロキシが起動しない managed ストア・`current`・バージョンも）、`acme` の無い設定ファイル
+- It checks the certificates that have `acme`, in configuration order (with `managed`, the admin route first and then the version's sites; see "ACME Sites" below). A certificate that meets any of the following needs renewal, and the command places a new order for it with a new key.
+  - The certificate or key file cannot be read
+  - The key does not match the certificate
+  - The certificate does not contain all the hosts
+  - The time until the end of the validity period is shorter than `renew_before_days` days (exactly that number of days is not shorter)
+- A certificate that needs no renewal is `valid`.
+- If any certificate needs renewal, the command loads or creates the account key, and then creates an account with the CA or finds the existing one. The account is created with agreement to the CA's terms of service, with `contact_email` as the contact.
+- The whole command (including the responses of the CA and the waiting time) takes at most `timeout_ms`. When the time runs out, the certificates that have not been renewed yet, including those after it, become `failed`. A certificate that needs no renewal stays `valid`.
+- The result is one line on standard output for each certificate that has `acme`.
+  - Without `managed`, the form is `<listener>.<certificate> renewed|valid|failed`. Both numbers count from 1. The listener number is the position in `proxy.listeners`, and listeners without TLS are counted too.
+  - With `managed`, the forms are `admin route renewed|valid|failed` and `site <name> renewed|valid|failed`.
+  - A `failed` certificate leaves its files as they were.
+- With `managed` and `acme`, if no certificate has `acme` (neither the admin route nor a site of the version), the command writes no result line, writes one line to standard error, and exits 0.
+- With `managed`, the command loads the `current` version, and that version cannot be deleted until the command exits. It does not take the managed store lock.
+- From what it receives from the CA, the only thing it writes to standard error is the `type` of a problem document.
+- When it receives SIGINT or SIGTERM, it deletes the challenge files and exits at once.
+- The running proxy does not notice new certificates, so after the command, send it SIGUSR2 (`systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`).
+- The exit codes are as follows.
+  - 0: every certificate is `renewed` or `valid` (also when, with `managed`, no certificate has `acme`)
+  - 1: at least one is `failed`, the command was stopped, it could not run, or it was run as root
+  - 2: an argument error, a configuration file that was rejected (with `managed`, this includes a managed store, `current`, or version with which the proxy would not start), or a configuration file without `acme`
 
-手順は、下の「ACME」を参照してください。
+For the procedure, see "ACME" below.
 
-### `admin`（管理プロセスのコマンド）
+### `admin` (Admin Process Commands)
 
 ```text
 tukuyomi-proxy admin <config>
@@ -188,143 +190,143 @@ tukuyomi-proxy admin bootstrap <config> <name>
 tukuyomi-proxy admin reset <config> <name>
 ```
 
-- 管理プロセスを動かすコマンド（`admin <config>`）と、その短いコマンド（`bootstrap`・`reset`）です。設定ファイルに `admin` が必要です。設定キー、API、コマンドの内容は [管理リファレンス](admin-reference.md) を参照してください。
-- 動作中のプロキシとは別のプロセスです。プロキシに依頼できるのは、状態の問い合わせと、世代の切り替えと、managed 設定のバージョンを指定した設定のリロードだけです（下の「制御ソケット」）。
-- 起動前の検証も、root で実行できないことも、プロキシと同じです（`host check refused`）。
-- 管理プロセスは、`admin <config>` の間、ログを JSON で標準エラーに出します（systemd ではジャーナル）。`bootstrap` と `reset` は、人が読むための文の行を出します。
-- 終了コードは、0 が成功、1 がそれ以外の終了、2 が引数のエラー、受け付けない設定ファイル、`admin` の無い設定ファイルです。
+- `admin <config>` runs the admin process, and `bootstrap` and `reset` are its short-lived commands. The configuration file must have `admin`. For the setting keys, the API, and what the commands do, see the [admin reference](admin-reference.md).
+- The admin process is a separate process from the running proxy. All it can ask the proxy for is a status query, a generation switch, and a configuration reload with a specified version of the managed configuration (see "Control Socket" below).
+- It runs the same checks before start as the proxy, and like the proxy it cannot run as root (`host check refused`).
+- While `admin <config>` runs, the admin process writes its log as JSON to standard error (the journal under systemd). `bootstrap` and `reset` write plain-text lines for people to read.
+- The exit codes are as follows. 0 is success, 1 is any other exit, and 2 is an argument error, a configuration file that was rejected, or a configuration file without `admin`.
 
-## シグナル
+## Signals
 
-シグナルはプロキシのメインプロセスだけに送ります。検査プロセスは、SIGUSR1・SIGUSR2 は無視しますが、SIGTERM・SIGINT・SIGHUP が届くと終了します。systemd では、`systemctl reload`（ユニットの `ExecReload` が `config check` の後にメインプロセスへ SIGHUP を送るとき）か `systemctl kill --kill-whom=main` を使います。
+Send signals only to the proxy's main process. The inspector processes ignore SIGUSR1 and SIGUSR2, but exit when SIGTERM, SIGINT, or SIGHUP arrives. Under systemd, use `systemctl reload` (if the unit's `ExecReload` runs `config check` and then sends SIGHUP to the main process) or `systemctl kill --kill-whom=main`.
 
-| シグナル | すること |
+| Signal | What it does |
 |---|---|
-| SIGTERM、SIGINT | 停止します（下の「停止」） |
-| SIGHUP | 設定ファイルをリロードし、停止せずに新しい設定に切り替えます |
-| SIGUSR1 | ルールストアでエンジンごとに選択中の世代へ、エンジンを 1 つずつ切り替えます。選択中の世代があり、稼働していないエンジンは、起動します |
-| SIGUSR2 | すべての TLS のリスナーの証明書と鍵のファイルを再読み込みします（`managed` のある設定では、`admin.route` の証明書と、managed ストアのサイトの証明書） |
+| SIGTERM, SIGINT | Stops the proxy (see "Stopping" below) |
+| SIGHUP | Reloads the configuration file and switches to the new configuration without stopping |
+| SIGUSR1 | Switches each engine to the generation chosen for it in the rules store, one engine at a time. An engine that has a chosen generation and is not running is started |
+| SIGUSR2 | Reloads the certificate and key files of all TLS listeners (with `managed`, the certificate of `admin.route` and the certificates of the sites in the managed store) |
 
-SIGHUP を受けると停止していた以前のバージョンから入れ替えるときは、新しい実行ファイルを入れてからユニットを変更します（[ビルドと配置](../build/binary-deployment.md) の「systemd」）。以前のバージョンは SIGHUP で停止します。
+Earlier versions stop when they receive SIGHUP. When upgrading from such a version, install the new executable first and then change the unit (see "systemd" in the [build and deployment guide](../build/binary-deployment.md)).
 
-### SIGHUP（設定のリロード）
+### SIGHUP (Configuration Reload)
 
-- 起動のときと同じパスの設定ファイルを、別のスレッドで読み込みます。`managed` があれば、そのときの選択中のバージョン（`current`）と一緒に読み込みます。起動の段階のうち、ルールストアより前の段階（設定ファイルとバージョン、アップストリームのサーバーの名前解決と `ca_file`、リスナーの証明書と鍵、ACME のチャレンジ、`geo` の国のデータベース）を同じ検証で実行し、行の頭は `reload:` になります。
-- 制御ソケットの `reload` の依頼も、同じ手順で設定をリロードします（`current` の代わりに、依頼で指定されたバージョンを読み込みます。下の「制御ソケット」）。リロードは一度に 1 つだけです。
-- すべてが通り、動作中に変更できない設定キー（下）がどれも起動のときと同じなら、新しい設定に一度に切り替えます。最後に `reload: configuration replaced <sha256>` の行を出します（`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`）。どのファイルとバージョンが効いているかは、この値で確認します。
-- どこかで拒否したら、何も変更せず、理由の行を出します（`reload: configuration refused: <reason>`、`reload: upstream refused: <reason>`、`reload: tls refused: <reason>`、`managed` のある設定では `reload: managed store refused: <reason>`・`reload: managed version refused: <reason>` など）。拒否の行には、ファイルの値を出しません。
-- 新しい設定のアップストリームのエンジンが、稼働していないか、準備ができていないときも、何も変更せずに拒否します（`reload: configuration refused: the engine of an upstream is not ready (upstream <name>)`。`<name>` はそのアップストリームの名前です）。リロードは検査プロセスを起動しないので、そのエンジンは、先に SIGUSR1 で起動します（下の「SIGUSR1（世代の切り替え）」と「エンジンごとの選択中の世代」）。制御ソケットの `reload` の依頼では、`reason` が `fixed` の拒否になります。
-- 切り替えても拒否しても、`tukuyomi_config_reloads_total` に数えます（`replaced`、`refused`）。制御ソケットの `reload` で始めたリロードも、同じように数えます。
-- 変更できるもの:
-  - `proxy` の設定キー（下の変更できない設定キーを除きます）、リスナー（追加、削除、並べ替え、TLS と証明書、`http2`、`redirect`）
-  - `forward`（アップストリームとルート）。アップストリームのサーバーの名前は、リロードのたびに名前解決をやり直します。アップストリームの `engine` は、変更後のエンジンが稼働していれば、変更できます。`managed` のある設定では、バージョンのサイト、アップストリーム、ルート、デフォルトのアップストリーム
-  - アップストリームの `ca_file`、リスナーの証明書と鍵、ACME のチャレンジ
-  - 全体の `access`・`rate_limit`、`host_policies`、`geo`（国のデータベースを読み込みます）
-  - 管理画面のルートの証明書と `access`
+- The proxy reads the configuration file from the same path as at start, in a separate thread. If `managed` is present, it also reads the version selected at that time (`current`). It runs the startup steps that come before the rules store (the configuration file and the version, upstream server name resolution and `ca_file`, the listeners' certificates and keys, the ACME challenges, and the `geo` country database) with the same checks as at start, and the log lines begin with `reload:`.
+- A `reload` request on the control socket reloads the configuration in the same way (it loads the version that the request specifies instead of `current`; see "Control Socket" below). Only one reload can run at a time.
+- If everything passes and every setting key that cannot change while running (below) is the same as at start, the proxy switches to the new configuration in a single step. At the end it writes a `reload: configuration replaced <sha256>` line (with `managed`, `reload: configuration replaced <sha256> managed <version>`). Use this value to check which file and version are in effect.
+- If anything is refused, the proxy changes nothing and writes a line with the reason (`reload: configuration refused: <reason>`, `reload: upstream refused: <reason>`, `reload: tls refused: <reason>`, and with `managed`, `reload: managed store refused: <reason>`, `reload: managed version refused: <reason>`, and so on). A refusal line does not contain values from the file.
+- The proxy also refuses, changing nothing, when an upstream engine in the new configuration is not running or not ready (`reload: configuration refused: the engine of an upstream is not ready (upstream <name>)`, where `<name>` is the name of that upstream). A reload does not start inspector processes, so start that engine first with SIGUSR1 (see "SIGUSR1 (Generation Switch)" and "Chosen Generation per Engine" below). For a `reload` request on the control socket, this refusal has `reason` `fixed`.
+- Both a switch and a refusal are counted in `tukuyomi_config_reloads_total` (`replaced`, `refused`). A reload started with `reload` on the control socket is counted in the same way.
+- What can change:
+  - The `proxy` setting keys (except those that cannot change, below), and the listeners (adding, removing, reordering, TLS and certificates, `http2`, `redirect`)
+  - `forward` (the upstreams and the routes). The names of the upstream servers are resolved again at every reload. An upstream's `engine` can change if the new engine is running. With `managed`, this means the version's sites, upstreams, routes, and default upstream
+  - An upstream's `ca_file`, the listeners' certificates and keys, and the ACME challenges
+  - The global `access` and `rate_limit`, `host_policies`, and `geo` (the country database is loaded)
+  - The admin route's certificate and `access`
   - `records.keep`
-- 動作中に変更できない設定キー: `proxy.max_conns`、`max_buffered_bytes`、`drive_slice_ms`、`ready_wait_ms`、`stop_inspect_ms`、`stop_wait_ms`、`records`（`keep` を除くすべてと、有無）、`status`、`admin`、`admin.route.host`、`rules.store`、`managed`（有無と `dir`）、`kernel`（`default_engine` を含むすべて）。どれかが起動のときと違う設定は、全体を拒否します（`reload: configuration refused: <key> cannot change while running`）。変更するときは再起動してください。
-  - `records`・`status`・`admin`・`rules.store`・`managed`・`kernel` は、管理プロセスとログ送信プロセスも同じファイルから起動のときに読み込むので、プロキシだけが変更すると値が一致しなくなります。`admin.route.host` は、管理プロセスが起動のときに読み込む `admin.origin` と合わせて使うので、変更できません。
-- 接続:
-  - 切り替えた後に受け付けた接続は、新しい設定を使います。開いている接続は、受け付けたときの設定を使い続け、次のように閉じます。リクエストは拒否しません。
-  - HTTP/1.1: 応答した後で次のリクエストを待っている接続は、すぐ閉じます。応答の途中の接続は、その応答に `Connection: close` を付けて閉じます。受け付けたばかりの接続と、次のリクエストのヘッダー部を受信している途中の接続は、そのリクエストに応答してから閉じます。
-  - HTTP/2: `GOAWAY` を送り、開いているストリームが終了してから閉じます。
-  - WebSocket のトンネルと、ルートの `stream` の応答は、前の設定のまま、それぞれのタイムアウトまで続きます。
-- リスナー:
-  - 新しい設定のアドレスのうち、今は待ち受けていないものを、切り替える前にすべてバインドします。1 つでもバインドできなければ、全体を拒否します（`reload: configuration refused: listener <number> cannot be bound`。番号は新しい設定の中の位置で、1 から数えます）。
-  - 今もあるアドレスは、同じソケットのまま新しい並びの位置へ移ります。そのアドレスへの接続は拒否しません。
-  - 無くなったアドレスは、切り替えた後に閉じます。そこでまだ始まっていない接続（システムのバックログにあるもの、接続のスロットを待っているもの）は切断されます。開いている接続は上のとおり続きます。
-  - 今待ち受けているアドレスと重なるアドレスはバインドできず、全体を拒否します。たとえば `0.0.0.0:8080` で待ち受けているときの `127.0.0.1:8080`（逆も同じ）、`127.0.0.1:8080` のときの `[::ffff:127.0.0.1]:8080` です。変更するときは、削除するリロードと追加するリロードに分けるか、再起動してください。
-  - ログの `listener` は、その接続を受け付けたときの設定における番号です。並びを変更した後は、同じ番号が別のリスナーを指すことがあります。
-- 持ち越すもの:
-  - レート制限のテーブルは、テーブルごとに持ち越します（下の「レート制限（`rate_limit`）」と「ホストごとの設定（`host_policies`）」）。全体のテーブルは、新旧の両方に全体の `rate_limit` があり、`keys`・`rate`・`burst` がどれも同じなら続きます（`exempt_cidrs` は新しい値を使います）。どれかが違うか、片方に無ければ、新しいテーブルで 0 から数え、`reload: rate limit table started anew` の行を出します。
-  - アップストリームのダウン判定と失敗の数、アップストリームへの待機中の接続、リスナーの TLS のセッションは作り直します。`tukuyomi_upstream_failures_total` は 0 から数え直します。
-  - ルールの世代には触れません。稼働中の世代はそのままで、ルールストアも読み込みません（世代を切り替えるのは SIGUSR1）。エンジンも起動せず、新しい設定のアップストリームのエンジンの準備ができていることだけを確認します（上の拒否）。
-- 同じ内容のファイルと同じバージョンでも、上のとおり作り直し、待っている接続を閉じます。
-- リロードの途中に受けた SIGHUP は、`reload: a configuration reload is in progress, ignored` の行を出すだけです。シグナルの処理が有効になってからリスナーをバインドするまでの間と、停止の間に受けた SIGHUP も、行を 1 つ出すだけです。リロードの途中に制御ソケットで受け付けた `reload` の依頼には、`busy`（`reload under way`）で応答します。
-- リロードの途中に受けた SIGUSR2 は、リロードが終わった後（切り替えたときも拒否したときも）に、今の設定の証明書を読み込みます。`reload: SIGUSR2` の行は、そのときに出ます。
-- リロードの途中に停止が始まったら、リロードは破棄します。
-- SIGHUP の処理が有効になる前（起動の 6 より前）に届いた SIGHUP は、ほかのシグナルと同じくプロキシを終了させます。
+- Setting keys that cannot change while running: `proxy.max_conns`, `max_buffered_bytes`, `drive_slice_ms`, `ready_wait_ms`, `stop_inspect_ms`, `stop_wait_ms`, `records` (everything except `keep`, and whether it is present), `status`, `admin`, `admin.route.host`, `rules.store`, `managed` (whether it is present, and `dir`), and `kernel` (everything, including `default_engine`). A configuration in which any of them differs from start is refused as a whole (`reload: configuration refused: <key> cannot change while running`). To change them, restart.
+  - The admin process and the records shipper also read `records`, `status`, `admin`, `rules.store`, `managed`, and `kernel` from the same file at start, so if only the proxy changed them, the values would no longer match. `admin.route.host` is used together with `admin.origin`, which the admin process reads at start, so it cannot change.
+- Connections:
+  - Connections accepted after the switch use the new configuration. Open connections keep using the configuration they were accepted with, and are closed as follows. Requests are not refused.
+  - HTTP/1.1: a connection that is waiting for the next request after a response is closed at once. A connection in the middle of a response is closed with `Connection: close` added to that response. A connection that has just been accepted, or that is in the middle of receiving the header section of the next request, gets a response to that request and is then closed.
+  - HTTP/2: the proxy sends `GOAWAY` and closes the connection after the open streams end.
+  - WebSocket tunnels and the responses of routes with `stream` continue under the previous configuration until their own timeouts.
+- Listeners:
+  - Before switching, the proxy binds every address in the new configuration that it is not listening on now. If even one cannot be bound, the whole configuration is refused (`reload: configuration refused: listener <number> cannot be bound`; the number is the position in the new configuration, counted from 1).
+  - An address that stays in the new configuration keeps its socket and moves to its new position in the order. Connections to that address are not refused.
+  - An address that no longer exists is closed after the switch. Connections that have not started there yet (those in the system backlog, and those waiting for a connection slot) are disconnected. Open connections continue as described above.
+  - An address that overlaps an address the proxy is listening on now cannot be bound, so the whole configuration is refused. For example, `127.0.0.1:8080` while `0.0.0.0:8080` is being listened on (and the reverse), or `[::ffff:127.0.0.1]:8080` while `127.0.0.1:8080` is being listened on. To make such a change, split it into one reload that removes the address and another that adds the new one, or restart.
+  - `listener` in the log is the listener's number in the configuration under which the connection was accepted. After the order changes, the same number can point to a different listener.
+- What is carried over:
+  - The rate limit tables are carried over table by table (see "Rate Limits (`rate_limit`)" and "Host Policies (`host_policies`)" below). The global table continues if both the old and the new configuration have a global `rate_limit` and `keys`, `rate`, and `burst` are all the same (`exempt_cidrs` uses the new value). If any of them differs, or only one side has it, the new table counts from 0 and the proxy writes a `reload: rate limit table started anew` line.
+  - The following are created anew: which upstream servers are marked as failed, the upstream failure counts, the idle connections waiting to be reused for the upstreams, and the listeners' TLS sessions. `tukuyomi_upstream_failures_total` counts from 0 again.
+  - The rule generations are not touched. The running generation stays as it is, and the rules store is not read (SIGUSR1 switches generations). The proxy does not start engines either; it only checks that the upstream engines of the new configuration are ready (the refusal above).
+- Even for a file with the same content and the same version, everything is created anew as above and the waiting connections are closed.
+- A SIGHUP received during a reload only writes a `reload: a configuration reload is in progress, ignored` line. A SIGHUP received after signal handling becomes active but before the listeners are bound, or during a stop, also only writes one line. A `reload` request accepted on the control socket during a reload gets the response `busy` (`reload under way`).
+- A SIGUSR2 received during a reload loads the certificates of the current configuration after the reload ends (whether it switched or was refused). The `reload: SIGUSR2` line is written at that time.
+- If a stop starts during a reload, the reload is discarded.
+- A SIGHUP that arrives before SIGHUP handling becomes active (before step 6 of the start) ends the proxy, like the other signals.
 
-### SIGUSR1（世代の切り替え）
+### SIGUSR1 (Generation Switch)
 
-- プロキシは、エンジンごとにルールストアを読み込み、選択中の世代が稼働中の世代と違うエンジンを切り替えます。デフォルトのエンジンが先で、ほかは名前の順に、1 つずつ切り替えます。1 つの切り替えが終わってから、次のエンジンを始めます。
-  - 切り替えでは、選択中の世代で新しい検査カーネルと検査プロセスを起動します。新しい方の準備ができたら、そのエンジンの新しいリクエストを、そちらへ振り向けます。
-  - 古い方は、持っているリクエストを `stop_inspect` まで検査してから停止します。
-  - 新しい方が起動に失敗するか、`ready_wait` 以内に準備できなければ、切り替えは失敗です（`reload: generation <fingerprint> failed to start: <reason>` の行を出します）。古い方がそのまま検査を続けます。
-  - 新しい検査プロセスは、そのエンジンの実行ファイル（Coraza は `kernel.inspector`、ModSecurity は `kernel.engines`）で起動します。
-  - 選択中の世代のエンジンが使えないときは、切り替えません。`reload: rules store refused: <reason>` の行を出し、古い方がそのまま検査を続けます。`rules activate` と管理プロセスは、そのような世代を選択しません。
-- 選択中の世代があり、稼働していないエンジンは、同じ切り替えで起動します。起動に失敗したときは、そのエンジンは稼働していないままです。
-  - 選択中の世代が稼働中の世代と同じエンジンは、`reload: generation <fingerprint> is already running` の行を出して、次のエンジンへ進みます。
-  - 稼働していないエンジンに選択中の世代が無いときは、何もしません（行も出しません）。
-  - 稼働しているエンジンに選択中の世代が無いとき（`rules deactivate` の後など）は、`reload: rules store refused: no generation is chosen` の行を出し、`tukuyomi_rules_switches_total` の `refused` に数えます。そのエンジンは稼働し続けます。
-- 準備の後に検査カーネルが失敗すると、プロキシ全体が停止します。SIGUSR1 で起動したエンジンも、どのアップストリームも使わないエンジンも同じです（下の「`kernel`」と「検査エンジンの選択」）。
-- 検査除外のルートのテーブルは、エンジンごとにあります。新しい世代がリクエストを受け付け始めるときに、そのエンジンのテーブルが一緒に入れ替わります。
-- 切り替えの間は、そのエンジンの検査プロセスが 1 つ増えます。切り替えは、プロキシ全体で同時に 1 つだけなので、増えるのは 1 つまでです。メモリの目安は、下の「検査エンジンの選択」を参照してください。
-- シグナルの処理が有効になってからリスナーをバインドするまでの間、切り替えの途中、停止の間に受けた SIGUSR1 は、ログに行を 1 つ出すだけで何もしません（切り替えの途中は `reload: a switch is in progress, ignored`）。先の SIGUSR1 で、まだ切り替えていないエンジンがあるときは、途中の切り替えが終わってから続けます。
-- 使っている間、プロキシは、エンジンごとに、稼働中の世代の目印（ルールストアの `using/<fingerprint>`）に共有ロックを持ちます。そのため `rules remove` は、使用中の世代を削除できません。
-- 管理プロセスは、制御ソケットでも、エンジンを指定して同じ切り替えを依頼できます（下の「制御ソケット」）。切り替えの手順と、`tukuyomi_rules_switches_total` の数え方は SIGUSR1 と同じです。
+- The proxy reads the rules store for each engine and switches the engines whose chosen generation differs from the running one. It switches them one at a time, the default engine first and then the others in name order, and starts on the next engine after the current switch has finished.
+  - To switch, it starts a new inspection kernel and inspector process with the chosen generation. When the new one is ready, it sends that engine's new requests to it.
+  - The old one inspects the requests it holds until `stop_inspect` and then stops.
+  - If the new one fails to start or is not ready within `ready_wait`, the switch fails (the proxy writes a `reload: generation <fingerprint> failed to start: <reason>` line). The old one keeps inspecting as before.
+  - The new inspector process starts with the executable of that engine (`kernel.inspector` for Coraza, `kernel.engines` for ModSecurity).
+  - If the engine of the chosen generation cannot be used, the proxy does not switch. It writes a `reload: rules store refused: <reason>` line, and the old one keeps inspecting as before. `rules activate` and the admin process do not choose such a generation.
+- An engine that has a chosen generation and is not running starts in the same switch. If the start fails, the engine stays not running.
+  - For an engine whose chosen generation is the same as the running generation, the proxy writes a `reload: generation <fingerprint> is already running` line and goes on to the next engine.
+  - If an engine that is not running has no chosen generation, nothing happens (not even a line).
+  - If an engine that is running has no chosen generation (after `rules deactivate`, for example), the proxy writes a `reload: rules store refused: no generation is chosen` line and counts it as `refused` in `tukuyomi_rules_switches_total`. The engine keeps running.
+- If an inspection kernel fails after it is ready, the whole proxy stops. This also applies to an engine started by SIGUSR1 and to an engine that no upstream uses (see "`kernel`" and "Choosing the Inspection Engine" below).
+- Each engine has its own bypass route table. When the new generation starts accepting requests, that engine's table is replaced along with it.
+- During a switch, there is one more inspector process for that engine. Only one switch can run at a time in the whole proxy, so at most one more is added. For memory estimates, see "Choosing the Inspection Engine" below.
+- A SIGUSR1 received after signal handling becomes active but before the listeners are bound, during a switch, or during a stop only writes one line to the log and does nothing else (during a switch, `reload: a switch is in progress, ignored`). If an engine is still waiting to be switched by an earlier SIGUSR1, the proxy continues with it after the switch in progress finishes.
+- While a generation is in use, the proxy holds a shared lock on each engine's marker for the running generation (`using/<fingerprint>` in the rules store), so `rules remove` cannot delete a generation that is in use.
+- The admin process can also ask for the same switch over the control socket, naming the engine (see "Control Socket" below). The switch procedure and the way `tukuyomi_rules_switches_total` is counted are the same as for SIGUSR1.
 
-### SIGUSR2（証明書の再読み込み）
+### SIGUSR2 (Certificate Reload)
 
-- 再読み込みしたすべての証明書と鍵が検証に通ったときだけ、まとめて入れ替えます（検証の内容は下の `proxy.listeners` の `cert_file`・`key_file`）。入れ替えた後に始まるハンドシェイクから、新しいものを使います。開いている接続は、今のものを使い続けます。
-- `managed` のある設定では、`admin.route` の `cert_file`・`key_file` と、managed ストアのサイトの証明書（ACME のサイトは `acme/` の今のファイル）を再読み込みします。リスナーには `certificates` がありません。
-- 1 つでも通らなければ、どれも入れ替えず、どれが通らなかったかの行をログに出します。
-- `acme` を持つ証明書でファイルが無いものは、入れ替えを拒否する理由になりません。行を出してハンドシェイクの対象から外し、ファイルができた後の SIGUSR2 で使い始めます。動作中にファイルを削除してから SIGUSR2 を送ると、その証明書もハンドシェイクの対象から外れ、そのホストへの接続は失敗します。
-- アップストリームの CA のファイルは、SIGUSR2 では再読み込みしません（SIGHUP でリロードします）。
-- 証明書と鍵だけを再読み込みさせたいとき（ACME の更新の後など）は、SIGHUP でなく SIGUSR2 を送ります。SIGHUP は設定ファイル全体を読み込むので、書きかけの設定を読み込んでしまうことがあります。
-- シグナルの処理が有効になってからリスナーをバインドするまでの間と、停止の間に受けた SIGUSR2 は、ログに行を 1 つ出すだけです。SIGUSR1 とは関係しません。
+- The proxy replaces the certificates and keys all at once, and only when every reloaded certificate and key passes the checks (for the checks, see `cert_file` and `key_file` under `proxy.listeners` below). Handshakes that start after the replacement use the new ones. Open connections keep using the current ones.
+- With `managed`, it reloads the `cert_file` and `key_file` of `admin.route` and the certificates of the sites in the managed store (for an ACME site, the current files under `acme/`). Listeners in such a configuration do not have `certificates`.
+- If even one fails, none is replaced, and the log lines show which ones failed.
+- If the files of a certificate that has `acme` do not exist, that is not a reason to refuse the replacement. The proxy writes a line, leaves the certificate out of the handshakes, and starts using it at the first SIGUSR2 after the files exist. If you delete the files while running and then send SIGUSR2, that certificate is also left out of the handshakes, and connections to that host fail.
+- SIGUSR2 does not reload the upstream CA files (SIGHUP does).
+- To reload only certificates and keys (after an ACME renewal, for example), send SIGUSR2, not SIGHUP. SIGHUP reads the whole configuration file, so it can read a configuration that is only half written.
+- A SIGUSR2 received after signal handling becomes active but before the listeners are bound, or during a stop, only writes one line to the log. It is independent of SIGUSR1.
 
-### リロードしないもの
+### What Is Not Reloaded
 
-次のものは起動のときに読み込み、プロキシを再起動するまでそのままです。
+The following are read at start and stay as they are until the proxy is restarted.
 
-- 上の「SIGHUP（設定のリロード）」の、動作中に変更できない設定キー（`records` の保存先とサイズ、`status`、`admin` の制御ソケットのパス、`admin.route.host`、`rules.store`、`managed`、`kernel` など）
-- 管理プロセスとログ送信プロセスは、設定をリロードしません（どちらも SIGHUP では停止します）。設定を変更したら、それらを再起動してください（[管理リファレンス](admin-reference.md)、下の「ログ送信プロセス」）。
+- The setting keys that cannot change while running, listed under "SIGHUP (Configuration Reload)" above (the location and size of `records`, `status`, the control socket path of `admin`, `admin.route.host`, `rules.store`, `managed`, `kernel`, and so on)
+- The admin process and the records shipper do not reload the configuration (both stop on SIGHUP). After you change the configuration, restart them (see the [admin reference](admin-reference.md) and "Records Shipper" below).
 
-## 停止
+## Stopping
 
-最初の停止の理由（シグナル、起動かドライバーの失敗）の時刻を t0 とします。
+Here, t0 is the time of the first reason to stop (a signal, or a failure at start or in the driver).
 
-1. リスナーを閉じ、新しいリクエストを拒否します。制御ソケットも閉じて、そのファイルを削除します（応答を待っていたクライアントは、応答を受け取りません）。次のリクエストを待っている接続は閉じます。`/readyz` は 503 `stopping` になり、`NOTIFY_SOCKET` があれば `STOPPING=1` を送ります。
-2. 検査は `t0 + stop_inspect` までに終えます。
-3. 接続は `t0 + stop_wait` まで待ち、残りは打ち切ります。WebSocket のトンネルは停止では終了せず、このときに打ち切られます。この後に監視用のリスナーを閉じます。
-4. 起動しているエンジンの検査カーネルが、すべて終了するのを `t0 + stop_wait + kill_grace` まで待ちます。
-5. ログを最長 200 ms 書き出して終了します。
+1. The proxy closes the listeners and refuses new requests. It also closes the control socket and deletes its file (a client that was waiting for a response does not receive it). It closes the connections that are waiting for the next request. `/readyz` becomes 503 `stopping`, and if `NOTIFY_SOCKET` is set, the proxy sends `STOPPING=1`.
+2. Inspection ends by `t0 + stop_inspect`.
+3. The proxy waits until `t0 + stop_wait` for connections to finish, and cuts off the rest. WebSocket tunnels do not end when a stop begins, so they are cut off at this point. After this, it closes the monitoring listener.
+4. It waits until `t0 + stop_wait + kill_grace` for the inspection kernels of all running engines to end.
+5. It flushes the logs for at most 200 ms and exits.
 
-最後に `stop: kernel ..., bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` の行が出ます。検査カーネルの終了が確認できなかったときは、代わりに `stop: the driver stopped: ...` か `stop: the driver gave no end` が出ます。
+At the end, a `stop: kernel ..., bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` line is written. If an inspection kernel could not be confirmed to have ended, a `stop: the driver stopped: ...` or `stop: the driver gave no end` line is written instead.
 
-- その前に、起動しているエンジンごとに `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` の行が出ます。
-- `stop: kernel` の行は 1 つです。`bye`・`exit_confirmed`・`dir_removed` などは、起動しているエンジンのうち、名前の順で最初のエンジンについての値です。ほかのエンジンと、切り替えで前に停止した検査カーネルの結果は、`retired_clean` にまとめて出ます。
-- `bye true` は、検査プロセスが終了の通知を送ってから終了したことを示します。
-- 終了コードが 0 になるのは、停止の理由が失敗でなく、停止した検査カーネル（ほかのエンジンのものと、切り替えで前に停止したものも含みます）のすべてで、検査プロセスの終了と作業ディレクトリの削除が確認できたときだけです。
+- Before that, a `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` line is written for each engine that is running.
+- There is one `stop: kernel` line. The values `bye`, `exit_confirmed`, `dir_removed`, and so on are those of the running engine that comes first in name order. The results of the other engines, and of the inspection kernels that stopped earlier in a switch, are combined in `retired_clean`.
+- `bye true` shows that the inspector process sent the end notice before it exited.
+- The exit code is 0 only if the reason to stop is not a failure and, for every stopped inspection kernel (including those of the other engines and those stopped earlier in a switch), the inspector process was confirmed to have ended and the work directory to have been removed.
 
-## 設定ファイル
+## Configuration File
 
-### 全体の構成
+### Overall Structure
 
 ```text
 {"proxy": {..}, "forward": {..}, "kernel": {..}, "rules": {"store": {..}}, "acme": {..}, "status": {..}, "records": {..}, "access": {..}, "rate_limit": {..}, "host_policies": [..], "geo": {..}, "admin": {..}, "managed": {..}}
 ```
 
-- `acme`、`status`、`records`、`access`、`rate_limit`、`host_policies`、`geo`、`admin`、`managed` は省けます（下のそれぞれの節）。
+- `acme`, `status`, `records`, `access`, `rate_limit`, `host_policies`, `geo`, `admin`, and `managed` can be omitted (see the sections below).
 
-- UTF-8 の JSON の 1 つのオブジェクトで、256 KiB までです。
-- 値にデフォルト値はありません。省けると書いた設定キーのほかは、すべて書きます。
-- 未知の設定キー、同じ設定キーの重複、型が違う値、オブジェクトの代わりの配列は受け付けません。省ける設定キーに `null` を書くことも受け付けません（省くか、値を書きます）。
-- 受け付けないときのメッセージは、エラーの種類ごとに決まった英語の 1 文で、ファイルの値を含みません。
-  - 形のエラー（JSON でない、設定キーが無い・未知・重複、型の違い）は、どの設定キーかを示しません。
-  - 範囲と関係のエラーは、違反した決まりの設定キーの名前を示します（例: `max_conns is out of range`）。
-  - 値は決まった順に検証し、最初に違反した決まりを返します。
-- 設定の中のパスは、どれも絶対パスで、`.`・`..`・空の要素・末尾の `/` を含まない形で書きます。
-- 時間は、名前が `_ms` で終わる設定キーに、ミリ秒の整数で書きます。
-- バイト数の設定キーの 1 KiB は 1024、1 MiB は 1048576 です。
-- `acme` は、`managed` の無い設定ファイルでは、`acme` を持つ証明書があるときだけ書き、そのときは必ず書きます。`managed` のある設定ファイルでは、`acme` を持つ管理画面のルートの証明書があれば必ず書き、無くても書けます（ACME のサイトはバージョンの中にあるため。下の「ACME のサイト」）。
-- `geo` は、国の指定（全体の `access`、`host_policies` の `access`、ルートの `access` の `deny_countries`・`allow_countries`）が 1 つでもあるときは、必ず書きます。`managed` のある設定では、バージョンの国の指定にも必要です。
-- `managed` のある設定ファイルでは、`forward` は `resolve_timeout_ms` だけになり、TLS のリスナーの `certificates`、全体の `access`・`rate_limit`、`host_policies` は書けません（書けば受け付けません）。これらはバージョンに書きます。`admin` があれば、`admin.route` が必要です（下の「managed 設定」）。
+- The file is one JSON object in UTF-8, up to 256 KiB.
+- No value has a default. Write every setting key except those described as optional.
+- The following are rejected: an unknown setting key, a duplicate of the same setting key, a value of the wrong type, and an array in place of an object. Writing `null` for a setting key that can be omitted is also rejected (omit it, or write a value).
+- A rejection message is one fixed English sentence for each kind of error, and does not contain values from the file.
+  - Format errors (not JSON, a missing, unknown, or duplicate setting key, a wrong type) do not name the setting key.
+  - Range errors and errors in the relation between values name the setting key of the rule that was violated (for example, `max_conns is out of range`).
+  - The values are checked in a fixed order, and the first rule that is violated is returned.
+- Every path in the configuration is written as an absolute path that does not contain `.`, `..`, an empty component, or a trailing `/`.
+- Times are written as integers in milliseconds, in setting keys whose names end in `_ms`.
+- For the setting keys that give a number of bytes, 1 KiB is 1024 and 1 MiB is 1048576.
+- Without `managed`, write `acme` only when a certificate has `acme`, and in that case it is required. With `managed`, `acme` is required if the admin route's certificate has `acme`, and can be written even if it does not, because the ACME sites are in the version (see "ACME Sites" below).
+- Write `geo` whenever there is any country list (`deny_countries` or `allow_countries` in the global `access`, the `access` of `host_policies`, or the `access` of a route). With `managed`, it is also needed for the country lists in the version.
+- With `managed`, `forward` has only `resolve_timeout_ms`, and the TLS listeners' `certificates`, the global `access` and `rate_limit`, and `host_policies` cannot be written (they are rejected if written). These go in the version. If `admin` is present, `admin.route` is needed (see "Managed Configuration" below).
 
-### 例
+### Example
 
-TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレクトのリスナー、1 つのアップストリーム、ログファイル、レート制限の例を示します。省ける設定キーのうち、この例に入れたのは `acme`、`records`、`rate_limit` だけです。ほかの設定キーは、下のそれぞれの節を参照してください。値は動かすときの目安で、受け付ける範囲は下の表に示します。
+This example shows a TLS listener (with HTTP/2 and an ACME certificate), a listener that redirects to https, one upstream, a log file, and a rate limit. Of the optional setting keys, the example includes only `acme`, `records`, and `rate_limit`. For the other setting keys, see the sections below. The values are a starting point for running the proxy; the accepted ranges are in the tables below.
 
 ```json
 {
@@ -444,111 +446,111 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 }
 ```
 
-### `proxy`: 接続とサイズ
+### `proxy`: Connections and Sizes
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `listeners` | 1〜8 個 | リスナー（下の `proxy.listeners`） |
-| `max_conns` | 1〜65536 | 同時に持つクライアントの接続の数。すべてのリスナーで合わせて数えます |
-| `max_head_bytes` | 1024〜32768 | リクエストのヘッダー部の上限（バイト数）。超えると 431（リクエストラインの終わりが現れないまま上限に達したときは 414） |
-| `max_body` | 1 KiB〜4 GiB | リクエストのボディの上限（伸長した後の長さ）。超えると 413。検査するルートの gzip のボディは、`inspect_body` までです（下の「リクエストボディの上限と検査する長さ」）。検査除外のルートの gzip のボディは伸長しないので、送られたままの長さで数えます |
-| `inspect_body` | 1 KiB〜1 MiB、かつ `max_body` 以下 | ボディの先頭から検査するバイト数。これより長いボディは、残りを検査せずに流します |
-| `max_body_wire` | `max_body` 〜 `2 × max_body + 4 MiB` | chunked のボディの、回線上のバイト数の上限（チャンクのサイズ行と区切りを含みます）。超えると 413 |
-| `max_buffered_bytes` | `2 × inspect_body + 24 KiB + 32 KiB` 〜 4 GiB | リクエストがバッファリングするバイトの予算の合計（下の「リクエストボディの上限と検査する長さ」）。尽きると 503 |
-| `upstream_max_headers` | 1〜1024 | アップストリームが返す応答のヘッダー部に含まれるフィールド数の上限 |
-| `upstream_max_head_bytes` | 8192〜1 MiB | アップストリームが返す応答のヘッダー部の上限（バイト数）。アップストリームとの接続で使う読み取りバッファーのサイズにもなります |
-| `upstream_head_wire` | `2 × upstream_max_head_bytes` 〜 4 MiB | アップストリームから最後の応答のヘッダー部まで（1xx を含みます）に読み込むバイト数の上限 |
-| `trusted_proxies` | 0〜256 個のネットワーク | `X-Forwarded-For` を信頼する相手（下の「クライアントのアドレス」）。空なら、相手がいつもクライアントです。ホスト部が 0 の `address/prefix` で書きます（`10.1.2.3/24` や、プレフィックスの無いアドレスは受け付けません） |
-| `upstream_keepalive` | 0〜1024 | アップストリームごとに、再利用を待つ接続の数（アップストリームのサーバーすべてで合わせて）。0 なら、応答の後に閉じます |
-| `upstream_keepalive_requests` | 1〜1000000 | アップストリームへの 1 本の接続で送るリクエストの数の上限 |
-| `keepalive_requests` | 1〜1000000 | クライアントの 1 本の接続で受け付けるリクエストの数の上限。最後のリクエストの応答で閉じます。HTTP/2 では目安です（下の `http2`） |
-| `lingering_bytes` | 1〜4 MiB | 接続を閉じる前に、読み込んで捨てるバイト数の上限 |
+| `listeners` | 1 to 8 | The listeners (see `proxy.listeners` below) |
+| `max_conns` | 1 to 65536 | The number of client connections held at the same time. All listeners are counted together |
+| `max_head_bytes` | 1024 to 32768 | The maximum size of the request header section (in bytes). Beyond it, 431 (414 if the limit is reached before the end of the request line appears) |
+| `max_body` | 1 KiB to 4 GiB | The maximum size of the request body (the length after decompression). Beyond it, 413. A gzip body on a route that is inspected can be up to `inspect_body` (see "Request Body Limits and Inspected Length" below). A gzip body on a bypass route is not decompressed, so it is counted at the length as sent |
+| `inspect_body` | 1 KiB to 1 MiB, and at most `max_body` | How many bytes from the start of the body are inspected. For a longer body, the rest is passed on without inspection |
+| `max_body_wire` | `max_body` to `2 × max_body + 4 MiB` | The maximum number of bytes on the wire for a chunked body (including the chunk size lines and delimiters). Beyond it, 413 |
+| `max_buffered_bytes` | `2 × inspect_body + 24 KiB + 32 KiB` to 4 GiB | The total budget of bytes that requests buffer (see "Request Body Limits and Inspected Length" below). When it runs out, 503 |
+| `upstream_max_headers` | 1 to 1024 | The maximum number of fields in the header section of a response from an upstream |
+| `upstream_max_head_bytes` | 8192 to 1 MiB | The maximum size of the header section of a response from an upstream (in bytes). It is also the size of the read buffer used on a connection to an upstream |
+| `upstream_head_wire` | `2 × upstream_max_head_bytes` to 4 MiB | The maximum number of bytes read from an upstream up to the final response header section (including 1xx) |
+| `trusted_proxies` | 0 to 256 networks | The peers whose `X-Forwarded-For` is trusted (see "Client Address" below). If empty, the peer is always the client. Write each as an `address/prefix` whose host part is 0 (`10.1.2.3/24`, and an address without a prefix, are rejected) |
+| `upstream_keepalive` | 0 to 1024 | The number of connections per upstream that wait to be reused (counted over all of the upstream's servers). If 0, connections are closed after the response |
+| `upstream_keepalive_requests` | 1 to 1000000 | The maximum number of requests sent on one connection to an upstream |
+| `keepalive_requests` | 1 to 1000000 | The maximum number of requests accepted on one client connection. The connection is closed with the response to the last request. With HTTP/2 it is approximate (see `http2` below) |
+| `lingering_bytes` | 1 to 4 MiB | The maximum number of bytes read and discarded before a connection is closed |
 
-### `proxy`: 時間
+### `proxy`: Times
 
-範囲は、どれも 1 ms〜3600 s です。ただし、`keepalive_timeout_ms` は 0 も指定でき、`conn_total_ms` は 24 時間まで指定できます。
+Every range is 1 ms to 3600 s, except that `keepalive_timeout_ms` can also be 0 and `conn_total_ms` can be up to 24 hours.
 
-| 設定キー | 意味 |
+| Setting key | Meaning |
 |---|---|
-| `drive_slice_ms` | 検査のドライバーが 1 回に、仕事のあるエンジンの検査カーネルを動かす時間。仕事の無いエンジンの検査カーネルは、最短のステップ（1 ms）で動かします。新しいリクエストは、動かす回と回の間に受け付けるので、ほかのリクエストがあるときに新しいリクエストが待つ最長の時間は、この時間に、仕事のあるエンジンの数を掛けた時間が目安です。推奨値は 1 |
-| `ready_wait_ms` | 検査カーネルの準備を待つ時間（起動、世代の切り替え、`rules import` の事前検証） |
-| `head_read_ms` | リクエストのヘッダー部を読み終える時間。最初のヘッダー部は `accept` から数え（TLS のハンドシェイクを含みます）、後のヘッダー部は最初のバイトから数えます。HTTP/2 のヘッダーブロックは、`HEADERS` フレームの最初のバイトから数えます |
-| `body_read_ms` | ボディの先頭（`inspect_body` まで、またはボディ全体）を、ヘッダー部の終わりから読み終える時間。それより長いボディの残りは、読み込みと読み込みの間がこの時間を超えると切断します |
-| `inspect_wait_ms` | リクエストが検査の結果を待つ時間 |
-| `upstream_connect_ms` | アップストリームへの接続を作る時間（TLS のハンドシェイクを含みます） |
-| `upstream_header_ms` | リクエストをアップストリームへ送り始めてから、応答のヘッダー部を受信するまでの時間。送信の時間を含みます。ボディを流すリクエストでは、最後の断片をアップストリームの接続へ渡したときから数えます |
-| `request_total_ms` | リクエストの始めから、応答のヘッダー部までにかかる時間の上限。ボディを受信する時間と検査の時間も含みます。応答のボディを流す時間は含みません。接続の最初のリクエストは `accept` から（TLS のハンドシェイクを含みます）、後のリクエストは、最初のバイトと前の応答のうち遅い方から数えます |
-| `response_idle_ms` | アップストリームへの接続で通信が無くてよい時間と、クライアントが受信しない時間の上限。応答のボディの間だけでなく、アップストリームの応答のヘッダー部を待つ間にも効きます（ボディを流すリクエストでは、応答のヘッダー部が来るまで効きません）。そのため、ボディをバッファリングするリクエストでは、`upstream_header_ms` をこれより長くしても効きません |
-| `conn_total_ms` | クライアントの 1 本の接続が続く時間の上限（`accept` から）。`stream` を持つルートの応答だけは、これを越えて続けることができます |
-| `stop_inspect_ms` | 停止で、検査を終えるまでの時間（下の「停止」） |
-| `stop_wait_ms` | 停止で、接続の終了を待つ時間 |
-| `keepalive_timeout_ms` | 応答の後に、次のリクエストを待つ時間。0 なら、応答のたびに閉じます |
-| `keepalive_time_ms` | 接続を再利用できる時間（`accept` から）。この時間を過ぎてから応答するリクエストでは、その応答で閉じます |
-| `lingering_time_ms` | 接続を閉じる前に、クライアントがまだ送るものを読み込んで捨てる時間の上限 |
-| `lingering_timeout_ms` | 同じく、次の読み込みを待つ時間の上限。HTTP/2 では、`GOAWAY` の後にクライアントを待つ時間と、ストリームの無い接続を残す時間にもなります |
-| `upstream_keepalive_timeout_ms` | アップストリームへの接続が、再利用を待つ時間 |
+| `drive_slice_ms` | The time the inspection driver spends in one turn running the inspection kernels of engines that have work. The inspection kernel of an engine that has no work runs at the shortest step (1 ms). New requests are accepted between turns, so when other requests are in progress, a new request waits at most roughly this time multiplied by the number of engines that have work. The recommended value is 1 |
+| `ready_wait_ms` | The time to wait for an inspection kernel to be ready (start, a generation switch, the `rules import` trial) |
+| `head_read_ms` | The time to finish reading the request header section. The first header section on a connection is counted from `accept` (including the TLS handshake), and later ones from their first byte. An HTTP/2 header block is counted from the first byte of the `HEADERS` frame |
+| `body_read_ms` | The time to finish reading the first part of the body (up to `inspect_body`, or the whole body), counted from the end of the header section. For the rest of a longer body, the connection is cut when the time between reads exceeds this time |
+| `inspect_wait_ms` | The time a request waits for the inspection result |
+| `upstream_connect_ms` | The time to connect to an upstream (including the TLS handshake) |
+| `upstream_header_ms` | The time from the start of sending the request to the upstream until the response header section is received. It includes the time to send. For a request whose body is streamed, it is counted from when the last piece is handed to the upstream connection |
+| `request_total_ms` | The maximum time from the start of a request to the response header section. It includes receiving the body and inspection. It does not include the time to stream the response body. For the first request on a connection it is counted from `accept` (including the TLS handshake), and for later requests from the later of the first byte and the previous response |
+| `response_idle_ms` | The maximum time a connection to an upstream can go without traffic, and the maximum time the client can go without receiving. It applies not only during the response body but also while waiting for the response header section from the upstream (for a request whose body is streamed, it does not apply until the response header section arrives). So for a request whose body is buffered, making `upstream_header_ms` longer than this has no effect |
+| `conn_total_ms` | The maximum time one client connection can last (from `accept`). Only the response of a route that has `stream` can continue beyond it |
+| `stop_inspect_ms` | At a stop, the time to finish inspection (see "Stopping" above) |
+| `stop_wait_ms` | At a stop, the time to wait for connections to end |
+| `keepalive_timeout_ms` | After a response, the time to wait for the next request. If 0, the connection is closed after every response |
+| `keepalive_time_ms` | The time during which a connection can be reused (from `accept`). For a request whose response is sent after this time has passed, the connection is closed with that response |
+| `lingering_time_ms` | The maximum time spent reading and discarding what the client is still sending before a connection is closed |
+| `lingering_timeout_ms` | Likewise, the maximum time to wait for the next read before a connection is closed. With HTTP/2, it is also the time to wait for the client after `GOAWAY` and the time to keep a connection that has no streams |
+| `upstream_keepalive_timeout_ms` | The time a connection to an upstream waits to be reused |
 
 ### `proxy.listeners`
 
-1 つのリスナーは `{"address", "tls"?, "redirect"?}` です。
+A listener is `{"address", "tls"?, "redirect"?}`.
 
-- `address`: IP リテラルとポート（IPv6 は `[..]:port`）。ポート 0 は受け付けません。
-- どちらも無いとき: 通常のリスナー。HTTP で受け付け、アップストリームへ転送します。
-- `tls` があるとき: TLS を終端してから同じことをします。
-- `redirect` があるとき: すべてのリクエストに https へのリダイレクト（308）か 404 で応答し、何も転送しません。全体の `access` や `rate_limit`、ホストごとの設定に拒否されたクライアントには、403 か 429 で応答します（下の「アクセス制御とレート制限」）。
-- `tls` と `redirect` は一緒に書けません。
-- リスナーの間の決まり:
-  - 通常のリスナーか `tls` のリスナーが、少なくとも 1 つ必要です。
-  - `redirect` のリスナーがあるなら、`tls` のリスナーも必要です。
-  - 2 つのリスナーで同じアドレスは書けません。片方が `0.0.0.0` や `::` で、もう片方と同じポートのものも書けません。
+- `address`: An IP literal and a port (`[..]:port` for IPv6). Port 0 is rejected.
+- Neither present: a normal listener. It accepts HTTP and forwards to the upstreams.
+- `tls` present: it terminates TLS and then does the same.
+- `redirect` present: it responds to every request with a redirect to https (308) or 404, and forwards nothing. A client refused by the global `access` or `rate_limit`, or by a host policy, gets 403 or 429 (see "Access Control and Rate Limits" below).
+- `tls` and `redirect` cannot be written together.
+- Rules between listeners:
+  - At least one normal listener or `tls` listener is needed.
+  - If there is a `redirect` listener, a `tls` listener is also needed.
+  - Two listeners cannot have the same address. Nor can two listeners have the same port when one of them has `0.0.0.0` or `::`.
 
-`tls` は `{"min_version", "certificates", "http2"?}` です。`managed` のある設定ファイルでは `{"min_version", "http2"?}` で、`certificates` を書くと受け付けません（`a tls listener has certificates while the configuration has managed`）。証明書は、managed 設定のバージョンのサイトと `admin.route` に書きます（下の「managed 設定」）。
+`tls` is `{"min_version", "certificates", "http2"?}`. With `managed`, it is `{"min_version", "http2"?}`, and writing `certificates` is rejected (`a tls listener has certificates while the configuration has managed`). In that case, write the certificates in the sites of the managed configuration version and in `admin.route` (see "Managed Configuration" below).
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `min_version` | `"1.2"`、`"1.3"` | 受け付ける TLS の最も古いバージョン。TLS 1.3 はいつも受け付けます |
-| `certificates` | 1〜16 個 | `{"cert_file", "key_file", "hosts", "acme"?}` |
-| `cert_file`、`key_file` | 絶対パス、3840 バイトまで | 証明書のチェーンと秘密鍵のファイル。起動のとき、SIGHUP と制御ソケットの `reload` によるリロード、SIGUSR2 による再読み込みで読み込みます |
-| `hosts` | 1〜64 個 | 証明書に含まれる名前（小文字の英字・数字・`-`・`.`）か、`*.` と名前。IP リテラルは書けません。1 つのリスナーの中で同じホストは 1 回だけ |
-| `acme` | `{"renew_before_days"}`（1〜60） | `acme renew` で発行・更新する証明書であることを示す設定。ホストに `*.` は書けません。ファイルは起動のときに無くてもかまいません |
-| `http2` | オブジェクト | HTTP/2 を受け付けます（下の `http2`）。無ければ HTTP/1.1 だけ |
+| `min_version` | `"1.2"`, `"1.3"` | The oldest TLS version accepted. TLS 1.3 is always accepted |
+| `certificates` | 1 to 16 | `{"cert_file", "key_file", "hosts", "acme"?}` |
+| `cert_file`, `key_file` | Absolute path, up to 3840 bytes | The files of the certificate chain and the private key. They are read at start, at a reload by SIGHUP or by `reload` on the control socket, and at a reload by SIGUSR2 |
+| `hosts` | 1 to 64 | Names contained in the certificate (lowercase letters, digits, `-`, `.`), or `*.` and a name. IP literals cannot be written. Within one listener, the same host can appear only once |
+| `acme` | `{"renew_before_days"}` (1 to 60) | Marks the certificate as one that `acme renew` issues and renews. `*.` cannot be written in the hosts. The files do not have to exist at start |
+| `http2` | Object | Accepts HTTP/2 (see `http2` below). If absent, HTTP/1.1 only |
 
-- `cert_file` と `key_file` は、起動のとき、SIGHUP と制御ソケットの `reload` によるリロード、SIGUSR2 による再読み込みで、次を検証します。
-  - どちらも 1 MiB までの通常のファイルです。
-  - 証明書のファイルは PEM の証明書を 1〜10 枚持ち、先頭がホストの証明書です。鍵のファイルは鍵をちょうど 1 つ持ちます。
-  - 鍵が先頭の証明書と対になり、先頭の証明書が `hosts` のすべてを含みます。
-  - 有効期間は検証しません。
-- ハンドシェイクでは、クライアントが送ったサーバー名で、`hosts` から証明書を選びます。名前が、ワイルドカードより先に一致します。サーバー名の無いハンドシェイクと、合うホストの無いハンドシェイクは失敗します。
-- `*.` と名前は、名前の前のちょうど 1 つのラベルに一致します（`*.a.example` は `www.a.example` に一致し、`a.example` と `x.y.a.example` には一致しません）。英字の大小は区別しません。
-- TLS の接続のリクエストは、`Host` がハンドシェイクで使った証明書のホストに入っていなければ 421 で応答します（全体の `access` と `rate_limit`、ホストごとの設定の後、ルートを選ぶ前）。
+- `cert_file` and `key_file` are checked as follows at start, at a reload by SIGHUP or by `reload` on the control socket, and at a reload by SIGUSR2.
+  - Both are regular files of up to 1 MiB.
+  - The certificate file has 1 to 10 PEM certificates, and the first is the host's certificate. The key file has exactly one key.
+  - The key pairs with the first certificate, and the first certificate contains all of `hosts`.
+  - The validity period is not checked.
+- In the handshake, the certificate is chosen from `hosts` by the server name that the client sent. An exact name matches before a wildcard. A handshake without a server name, and a handshake with no matching host, fail.
+- `*.` followed by a name matches exactly one label before the name (`*.a.example` matches `www.a.example`, and does not match `a.example` or `x.y.a.example`). Matching is case-insensitive.
+- A request on a TLS connection gets 421 if its `Host` is not among the hosts of the certificate used in the handshake (this check comes after the global `access` and `rate_limit` and the host policies, and before the route is chosen).
 
-`http2` の 5 つの設定キーは、すべて書きます。
+All five setting keys of `http2` must be written.
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `max_streams` | 1〜256 | クライアントが同時に開けるストリームの数 |
-| `stream_window` | 65535〜1 MiB | ストリームの受信ウィンドウ |
-| `connection_window` | 65535〜4 MiB | 接続の受信ウィンドウ |
-| `max_header_list` | 1 KiB〜`4 × max_head_bytes` | リクエストのヘッダーフィールドを展開した後のサイズ |
-| `send_buffer` | 1 KiB〜1 MiB | ストリームごとに、送信を待つ応答のバイト数 |
+| `max_streams` | 1 to 256 | The number of streams a client can open at the same time |
+| `stream_window` | 65535 to 1 MiB | The receive window of a stream |
+| `connection_window` | 65535 to 4 MiB | The receive window of a connection |
+| `max_header_list` | 1 KiB to `4 × max_head_bytes` | The size of the request header fields after expansion |
+| `send_buffer` | 1 KiB to 1 MiB | The number of response bytes per stream waiting to be sent |
 
-- 1 本の接続が保持できる量にも、上限があります。
-  - `connection_window + max_streams × (send_buffer + 32 KiB)` は 16 MiB までです。
-  - ストリームごとに `max_header_list` と `upstream_max_head_bytes` を足しても、16 MiB までです。
-- この量は `max_buffered_bytes` に入りません。接続ごとにこれだけ持てるので、全体では `max_conns` 倍になります。たとえば上の例の値では、1 本あたり約 12.3 MiB で、256 本なら約 3 GiB になる可能性があります。`max_conns` と合わせて決めます。
-- HTTP/2 では、`keepalive_requests` と `keepalive_time_ms` は目安です。
-  - 接続を閉じる通知（`GOAWAY`）の前にクライアントが同じ書き込みで送ったストリームは、受け付け済みになります。
-  - `GOAWAY` の後も、`lingering_timeout_ms` の間は新しいストリームを受け付けます。
-- HTTP/2 は、TLS のリスナーで、クライアントがハンドシェイクで `h2` を選んだときだけ扱います。平文の HTTP/2（h2c）は扱いません。
+- There is also a limit on how much one connection can hold.
+  - `connection_window + max_streams × (send_buffer + 32 KiB)` is at most 16 MiB.
+  - With `max_header_list` and `upstream_max_head_bytes` added for each stream, the total is still at most 16 MiB.
+- This amount is not included in `max_buffered_bytes`. Each connection can hold this much, so in total it is `max_conns` times as much. For example, with the values in the example above it is about 12.3 MiB per connection, and 256 connections could reach about 3 GiB. Decide these values together with `max_conns`.
+- With HTTP/2, `keepalive_requests` and `keepalive_time_ms` are approximate.
+  - A stream that the client sent in the same write, before the connection-closing notice (`GOAWAY`), counts as accepted.
+  - Even after `GOAWAY`, new streams are accepted for `lingering_timeout_ms`.
+- HTTP/2 is handled only on TLS listeners, when the client chooses `h2` in the handshake. Plaintext HTTP/2 (h2c) is not handled.
 
-`redirect` は `{"https_port"}`（1〜65535）です。
+`redirect` is `{"https_port"}` (1 to 65535).
 
-- リダイレクト先は `https://<host>:<https_port><target>` で、`<target>` は受信したままです。`https_port` が 443 なら、ポートは書きません。`Host` に書かれたポートは使いません。
-- リダイレクトするのは、`Host` がどれかの TLS のリスナーの証明書に含まれるホストに入り、かつルート（またはデフォルトのアップストリーム）がリクエストに一致するときだけです。
-- `Host` が IP リテラルのとき、読めないとき、上の条件に当てはまらないときは 404 になります。
-- ボディは読み込みません。
-- 全体の `access` と `rate_limit`、ホストごとの設定に拒否されたクライアントは、リダイレクトも 404 も受けず、403 か 429 を受けます（下の「アクセス制御とレート制限」）。この判定は、ACME のチャレンジの後、リダイレクトの前に行います。管理画面のルート（`admin.route`）のホストは、これらに適用せずにリダイレクトします。
-- ACME のチャレンジのリクエストには、リダイレクトより先に応答します（下の「ACME」）。
+- The redirect target is `https://<host>:<https_port><target>`, where `<target>` is as received. If `https_port` is 443, the port is not written. The port written in `Host` is not used.
+- The proxy redirects only when `Host` is among the hosts of a certificate on one of the TLS listeners and a route (or the default upstream) matches the request.
+- If `Host` is an IP literal, cannot be read, or does not meet the condition above, the response is 404.
+- The body is not read.
+- A client refused by the global `access` or `rate_limit`, or by a host policy, gets neither the redirect nor 404, but 403 or 429 (see "Access Control and Rate Limits" below). This decision is made after the ACME challenge and before the redirect. Requests for the admin route's host (`admin.route`) are redirected without these checks.
+- The proxy answers ACME challenge requests before redirecting (see "ACME" below).
 
 ### `forward`
 
@@ -556,603 +558,603 @@ TLS のリスナー（HTTP/2 と ACME の証明書）、https へのリダイレ
 {"resolve_timeout_ms", "upstreams": {"<name>": {..}}, "routes": [..], "default_upstream"}
 ```
 
-`managed` のある設定ファイルでは、`forward` は `{"resolve_timeout_ms"}` だけで、`upstreams`・`routes`・`default_upstream` を書くと受け付けません（`forward has upstreams, routes or default_upstream while the configuration has managed`）。アップストリーム、ルート、デフォルトのアップストリームは、managed 設定のバージョンに同じ形で書きます（下の「managed 設定」）。
+With `managed`, `forward` is only `{"resolve_timeout_ms"}`, and writing `upstreams`, `routes`, or `default_upstream` is rejected (`forward has upstreams, routes or default_upstream while the configuration has managed`). Write the upstreams, routes, and default upstream in the same form in the managed configuration version (see "Managed Configuration" below).
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `resolve_timeout_ms` | 1 ms〜3600 s | 起動のときと、SIGHUP と制御ソケットの `reload` によるリロードで、アップストリームのサーバーの名前解決を終える時間。制御ソケットの `reload` の依頼と、管理プロセスの反映が応答を待つ時間にも効きます（下の「制御ソケット」と「managed 設定」の「反映」） |
-| `upstreams` | 1〜64 個 | アップストリームの名前（1〜64 文字の英字・数字・`-`・`_`）から `{"servers", "tls"?, "engine"?}` への対応 |
-| `routes` | 0〜1024 個 | リクエストの `Host` とパスからアップストリームを選ぶルート |
-| `default_upstream` | アップストリームの名前か空の文字列 | どのルートにも一致しないリクエストのアップストリーム。空なら、そうしたリクエストは 404 |
+| `resolve_timeout_ms` | 1 ms to 3600 s | The time to finish resolving the upstream server names, at start and at a reload by SIGHUP or by `reload` on the control socket. It also affects how long a `reload` request on the control socket, and the admin process when it applies a version, wait for a response (see "Control Socket" and "Applying" under "Managed Configuration" below) |
+| `upstreams` | 1 to 64 | A map from the name of an upstream (1 to 64 characters of letters, digits, `-`, and `_`) to `{"servers", "tls"?, "engine"?}` |
+| `routes` | 0 to 1024 | The routes that choose an upstream from the `Host` and the path of a request |
+| `default_upstream` | The name of an upstream, or an empty string | The upstream for a request that matches no route. If empty, such a request gets 404 |
 
-サーバーは `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}` で、すべての設定キーを書きます。1 つのアップストリームに 1〜64 個書けます。
+A server is `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}`, and every setting key must be written. One upstream can have 1 to 64 servers.
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `address` | IP リテラルとポート、または名前とポート（`name:port`） | 名前は、小文字の英字・数字・`-`・`_`・`.` で 253 バイトまでです。各ラベルは 1〜63 バイトで、最後のラベルは英字で始まります。ポートは 1〜65535 で、先頭に 0 を付けません。IP リテラルには、未指定アドレス（`0.0.0.0`、`::`）、マルチキャストアドレス、リスナーのアドレス（リスナーが未指定アドレスなら、そのポートのループバック）は書けません。管理プロセスのリスナー（`admin.listen`）は書けます（プロキシのルートから管理プロセスへ到達できるようにするため）。`managed` のある設定のバージョンには書けません（管理画面へは `admin.route` で入ります） |
-| `weight` | 1〜100 | 重み |
-| `max_fails` | 0〜100 | `fail_timeout_ms` の間にこの回数失敗したら、サーバーを `fail_timeout_ms` の間除外します。0 なら数えません |
-| `fail_timeout_ms` | 1 ms〜3600 s | 上の失敗を数える時間と、除外する時間 |
-| `backup` | true、false | ほかのどのサーバーも使えないときだけ使います |
+| `address` | An IP literal and a port, or a name and a port (`name:port`) | A name is lowercase letters, digits, `-`, `_`, and `.`, up to 253 bytes. Each label is 1 to 63 bytes, and the last label starts with a letter. The port is 1 to 65535 and has no leading 0. The following cannot be written as an IP literal: the unspecified addresses (`0.0.0.0`, `::`), multicast addresses, and the address of a listener (if the listener has an unspecified address, the loopback address on its port). The admin process's listener (`admin.listen`) can be written, so that the admin process can be reached through a proxy route. It cannot be written in a managed configuration version (the admin screens are reached through `admin.route`) |
+| `weight` | 1 to 100 | The weight |
+| `max_fails` | 0 to 100 | If the server fails this many times within `fail_timeout_ms`, it is excluded for `fail_timeout_ms`. If 0, failures are not counted |
+| `fail_timeout_ms` | 1 ms to 3600 s | The period over which the failures above are counted, and how long the server is excluded |
+| `backup` | true, false | Used only when no other server is usable |
 
-- 名前は起動のときと、SIGHUP と制御ソケットの `reload` によるリロードのたびに名前解決し、その間は名前解決をやり直しません（SIGUSR1 でもやり直しません）。
-  - 名前のアドレスが変わったら（コンテナの名前など）、SIGHUP でリロードします。
-  - 名前を解決して得たアドレスは、どれも、書いたサーバーと同じ値を持つ、アップストリームのサーバーになります。名前解決の後で、アップストリームのサーバーは 64 個までです。
-  - 名前が解決できないとき、アドレスが無いとき、未指定・マルチキャスト・リスナーのアドレスを指すとき、時間内に名前解決を終えられないときは、起動しません。SIGHUP のリロードでは、その設定を拒否します。
-- サーバーは、使えるサーバーの中から、重みに合わせて順に選びます（smooth weighted round robin）。
-- アップストリームのサーバーが 1 つだけなら、除外しません。アップストリームのどのサーバーも使えないときは、何も試さずに 502 にします。
-- 次のときは、サーバーの失敗として数えます。
-  - 接続を拒否された・切断された、到達できない、`upstream_connect_ms` 以内に接続できない（TLS のハンドシェイクの失敗も含みます）
-  - リクエストを送信できない、`upstream_header_ms` 以内に応答のヘッダー部が来ない、ヘッダー部の途中で切断された
-- 読み取れない応答、大きすぎる応答、アップストリームが返したステータスコードは、サーバーの失敗にしません。
-- 再利用を待っていた接続でリクエストを送信できなかったときは、サーバーの失敗に数えません（サーバーが待っている間に閉じただけかもしれません）。2 回送っても問題の無いメソッドは、同じサーバーへの新しい接続で 1 回だけ送り直します。ほかのメソッドは送り直さず、502 にします。
-- 失敗の後に次のサーバーへ回すのは、次の 2 つのときだけです。
-  - 接続が作れなかった（何も送っていません）
-  - 2 回送っても問題の無いメソッド（GET、HEAD、OPTIONS、PUT、DELETE、TRACE）
-- ボディを流すリクエストは、接続が作れなかったときのほかは、送り直しません。
-- 次のときは、サーバーの失敗にせず、ほかのサーバーへも回しません。
-  - リクエストの時間（`request_total_ms`）が尽きて切断された段階。これは、遅いクライアントによってサーバーが除外されないようにするためです
-  - プロキシ自身が接続を作れないとき（ファイルディスクリプターやポートが尽きたなど）。503 で応答します
+- A name is resolved at start and at every reload by SIGHUP or by `reload` on the control socket, and is not resolved again in between (SIGUSR1 does not resolve it again either).
+  - If the address of a name changes (a container name, for example), reload with SIGHUP.
+  - Every address that a name resolves to becomes an upstream server, with the same values as the server entry that was written. After name resolution, an upstream can have at most 64 servers.
+  - If a name cannot be resolved, has no address, points to an unspecified, multicast, or listener address, or cannot be resolved within the time limit, the proxy does not start. A reload by SIGHUP refuses that configuration.
+- Servers are chosen in turn from the usable ones, according to their weights (smooth weighted round robin).
+- If an upstream has only one server, it is not excluded. If none of an upstream's servers is usable, the proxy responds with 502 without trying anything.
+- The following count as a server failure.
+  - The connection was refused or cut off, the server is unreachable, or the connection cannot be made within `upstream_connect_ms` (a failed TLS handshake is included)
+  - The request cannot be sent, the response header section does not arrive within `upstream_header_ms`, or the connection was cut off in the middle of the header section
+- An unreadable response, a response that is too large, and a status code that the upstream returned are not counted as a server failure.
+- When a request cannot be sent on a connection that was waiting to be reused, it is not counted as a server failure, because the server may simply have closed the connection while it waited. A request with an idempotent method is sent again once, on a new connection to the same server. Other methods are not sent again, and the proxy responds with 502.
+- After a failure, the request is passed on to the next server only in these two cases.
+  - The connection could not be made (nothing was sent)
+  - The method is idempotent (GET, HEAD, OPTIONS, PUT, DELETE, TRACE)
+- A request whose body is streamed is not sent again, except when the connection could not be made.
+- In the following cases, the request is not counted as a server failure and is not passed on to another server.
+  - The connection was cut because the request time (`request_total_ms`) ran out. This keeps a slow client from getting a server excluded
+  - The proxy itself cannot make a connection (file descriptors or ports ran out, for example). It responds with 503
 
-アップストリームの `tls` は `{"ca_file", "server_name"?}` です。
+An upstream's `tls` is `{"ca_file", "server_name"?}`.
 
-- アップストリームのすべてのサーバーへ、TLS で接続します。サーバーの証明書は必ず検証し、検証を外す設定はありません。
-- `ca_file` は、信頼するルート証明書を持つ PEM のファイルです。絶対パスで 3840 バイトまで、ファイルは 1 MiB までで、1〜100 枚を持ちます。起動のときと SIGHUP のリロードで読み込みます（SIGUSR2 では読み込みません）。
-- `server_name` は、小文字の名前で、TLS で使える形であることが必要です。あれば、サーバーをその名前で検証します。無ければ、書いた名前で検証します。IP リテラルで書いたサーバーは、そのアドレスで検証します。
-- アップストリームへは TLS 1.2 と 1.3 で、ALPN は `http/1.1` だけです（アップストリームへ HTTP/2 は使いません）。クライアント証明書は送りません。
+- The proxy uses TLS to connect to every server of the upstream. It always verifies the server certificate, and there is no setting to turn the verification off.
+- `ca_file` is a PEM file that holds the root certificates to trust. It is an absolute path of up to 3840 bytes, the file is up to 1 MiB, and it holds 1 to 100 certificates. It is read at start and at a SIGHUP reload (not by SIGUSR2).
+- `server_name` is a lowercase name and must be in a form that can be used in TLS. If present, the server is verified against that name; if absent, against the name written for the server. A server written as an IP literal is verified with that address.
+- Connections to the upstream use TLS 1.2 and 1.3, and the only ALPN is `http/1.1` (HTTP/2 is not used to the upstream). The proxy sends no client certificate.
 
-アップストリームの `engine` は、そのアップストリームへのリクエストを検査するエンジンの名前です。
+An upstream's `engine` is the name of the engine that inspects requests to that upstream.
 
-- `coraza` か `modsecurity`（小文字）です。省けば、`kernel.default_engine` のエンジンで検査します（`kernel.default_engine` を書かなければ `coraza`）。`null` は書けません。
-- これ以外の名前は、`an upstream engine is not coraza or modsecurity` で受け付けません。設定の `kernel.engines` に検査プロセスが無い `modsecurity` も、`kernel.engines has no inspector for the engine of an upstream` で受け付けません。
-- 同じアドレスのサーバーを持つアップストリームは、どれも同じエンジンにします（下の「値どうしの関係」と「検査エンジンの選択」）。
-- 変更後のエンジンが稼働していれば、設定のリロードで変更できます（上の「SIGHUP（設定のリロード）」）。
+- It is `coraza` or `modsecurity` (lowercase). If omitted, the engine of `kernel.default_engine` inspects the requests (`coraza` if `kernel.default_engine` is not set). `null` cannot be written.
+- Any other name is rejected with `an upstream engine is not coraza or modsecurity`. `modsecurity` is also rejected, with `kernel.engines has no inspector for the engine of an upstream`, when `kernel.engines` in the configuration has no inspector process.
+- Upstreams that have servers with the same address must all use the same engine (see "Relations Between Values" and "Choosing the Inspection Engine" below).
+- It can be changed by a configuration reload if the new engine is running (see "SIGHUP (Configuration Reload)" above).
 
-ルートは `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?, "records"?}` です。
+A route is `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?, "records"?}`.
 
-| 設定キー | 意味 |
+| Setting key | Meaning |
 |---|---|
-| `host` | 小文字の名前と、任意で `:port`（`*.` とポートを含めて 253 バイトまで）。ポートを書けばそのポートだけに、書かなければどのポートにも一致します。`*.` で始めると、名前の前の 1 つ以上のラベルに一致します |
-| `path` | `/` で始まる 1〜255 バイトのパス。`/` で終われば、それで始まるパスすべてに一致し、そうでなければそのパスだけに一致します。使えるバイトは英数字と `-._~!$&'()*+,=:@/%` で、`%` の後は 16 進数 2 桁です。読み方が複数ある形（下の「`access` を使うときの注意」）は書けません |
-| `upstream` | アップストリームの名前 |
-| `access` | `{"deny_cidrs"?, "allow_cidrs"?, "deny_countries"?, "allow_countries"?}`。ネットワークは一覧ごとに 256 個まで、国は一覧ごとに 256 個まで（下の「アクセス制御とレート制限」の `access`） |
-| `rewrite` | アップストリームへ送るリクエストと、返す応答の書き換え（下） |
-| `stream` | `{"idle_ms", "total_ms", "websocket"}`。3 つとも書きます（下の「ストリーミング応答と WebSocket」） |
-| `max_body` | そのルートのボディの上限。`proxy.max_body` 以下で、下げることしかできません。0 ならボディを受け付けません |
-| `records` | `best_effort`、`required`、`security` のどれか。そのルートのリクエストに対するログの残し方。省けば `records.keep` に従います（下の「ログ」の「ログの残し方」） |
+| `host` | A lowercase name, optionally with `:port` (up to 253 bytes including `*.` and the port). If a port is written, it matches only that port; if not, any port. If it starts with `*.`, it matches one or more labels before the name |
+| `path` | A path of 1 to 255 bytes that starts with `/`. If it ends with `/`, it matches every path that starts with it; otherwise it matches only that path. The allowed bytes are letters and digits, and `-._~!$&'()*+,=:@/%`, and `%` must be followed by two hexadecimal digits. A form that can be read in more than one way (see "Notes on using `access`" below) cannot be written |
+| `upstream` | The name of an upstream |
+| `access` | `{"deny_cidrs"?, "allow_cidrs"?, "deny_countries"?, "allow_countries"?}`. Up to 256 networks per list, and up to 256 countries per list (see `access` in "Access Control and Rate Limits" below) |
+| `rewrite` | Rewrites the request sent to the upstream and the response returned (see below) |
+| `stream` | `{"idle_ms", "total_ms", "websocket"}`. Write all three (see "Streaming Responses and WebSocket (`stream`)" below) |
+| `max_body` | The body limit for that route. It is at most `proxy.max_body`, so it can only lower the limit. If 0, no body is accepted |
+| `records` | How logs are kept for that route's requests: one of `best_effort`, `required`, and `security`. If omitted, it follows `records.keep` (see "What Logs Keep (`keep` and the `records` of a Route)" under "Logs" below) |
 
-- ルートは、リクエストの `Host` と、リクエストターゲットの最初の `?` までを、受信したバイトのまま比較します。
-  - デコードや整形はしません。パスの英字の大小は区別します。
-  - ホストの英字の大小は区別せず、名前の末尾の `.` は 1 つ削除します。
-- 同じ `host` と `path` のルートは、2 つ書けません。
-- 読み方が複数あるパスのリクエストターゲット（下の「`access` を使うときの注意」に挙げた形）は、`path` を持つルートには一致しません。ホストだけのルートか、デフォルトのアップストリームへ回ります。
-- 一致するルートのうち、最も具体的なものを使います。
-  - 先にホストで決めます。名前がワイルドカードより先、長いワイルドカードが短いものより先、ポートのあるルートが無いものより先、ホストのあるルートが無いものより先です。
-  - 次にパスで決めます。そのパスだけのルートがプレフィックスより先、長いプレフィックスが短いものより先、パスのあるルートが無いものより先です。
-- デフォルトのアップストリームには、`access`・`rewrite`・`stream`・`max_body`・`records` はありません。デフォルトのアップストリームへ回るリクエストのログは、`records.keep` に従います。
-- ルートを選ぶ前に、管理画面のルート、全体の `access`・`rate_limit` とホストごとの設定、TLS の接続の `Host` の検証があります（下の「アクセス制御とレート制限」の「リクエストの検証の順序」）。
-- ルートを選んだ後、ボディを読み込む前と検査の前に、次のように応答します。
-  - どのルートにも一致せずデフォルトのアップストリームも無い: 404
-  - `access` に拒否されたクライアント: 403
-  - `Content-Length` がルートの `max_body` を超える: 413
-- `access`: クライアントのアドレス（下の「クライアントのアドレス」）が `deny_cidrs` に入るか、その国が `deny_countries` に入れば拒否します。`allow_cidrs` が空でなく、クライアントがそこに入らなければ拒否し、`allow_countries` が空でなく、その国がそこに入らなくても拒否します。`allow_cidrs` と `allow_countries` を両方書けば、両方に入るクライアントだけが通ります。国は、全体の `geo` のデータベースで判定します。国の指定を書くには `geo` が必要です（下の「アクセス制御とレート制限」の `geo`）。
+- A route compares the request's `Host`, and the request target up to the first `?`, as the bytes received.
+  - Nothing is decoded or normalized. The path is case-sensitive.
+  - The host is case-insensitive, and one trailing `.` is removed from the name.
+- Two routes with the same `host` and `path` cannot be written.
+- A request target with a path that can be read in more than one way (the forms listed in "Notes on using `access`" below) does not match a route that has `path`. It goes to a host-only route or to the default upstream.
+- When several routes match, the most specific one is used.
+  - The host is compared first: a name before a wildcard, a longer wildcard before a shorter one, a route with a port before one without, and a route with a host before one without.
+  - Then the path: a route for exactly that path before a prefix, a longer prefix before a shorter one, and a route with a path before one without.
+- The default upstream has no `access`, `rewrite`, `stream`, `max_body`, or `records`. The log of a request that goes to the default upstream follows `records.keep`.
+- Before a route is chosen, the proxy handles the admin route, applies the global `access` and `rate_limit` and the host policies, and checks `Host` on TLS connections (see "Order of Request Checks" under "Access Control and Rate Limits" below).
+- After a route is chosen, and before reading the body or inspecting, the proxy responds as follows.
+  - No route matches and there is no default upstream: 404
+  - A client refused by `access`: 403
+  - `Content-Length` exceeds the route's `max_body`: 413
+- `access`: A client is refused if its address (see "Client Address" below) is in `deny_cidrs`, or if its country is in `deny_countries`. It is also refused if `allow_cidrs` is not empty and the client is not in it, or if `allow_countries` is not empty and its country is not in it. If both `allow_cidrs` and `allow_countries` are written, only a client that is in both passes. The country is looked up in the country database of the global `geo`, so a country list requires `geo` (see `geo` in "Access Control and Rate Limits" below).
 
-`access` を使うときの注意:
+Notes on using `access`:
 
-- ルートは受信したバイトで選びますが、アップストリームのアプリケーションは別の綴りを同じパスと読むことがあります（`/priv%61te/x` を `/private/x` と読むなど）。そのため、どれかのルートが `access` を持つ間は、リクエストは「そのリクエストと取り違えられうるルート」すべての `access` に通らなければなりません。国の指定だけを持つ `access` も、`access` として数えます。次の決まりも同じです。
-- どれかのルートが `access` を持つ間は、次のリクエストは、`Host` が一致するルート（ホストを持たないルートを含みます）のどれかの `access` の外のクライアントには 403 になります。
-  - パス（`?` より前）が複数の読み方を持つリクエストターゲット。`\`、`;`、`//`、`.` か `..` のセグメント、`%2e`・`%2f`・`%5c`・`%00`・`%25`（大小どちらも）を含むもの、エスケープを置き換えると別のエスケープになるもの（`%2%65` など）
-  - 読めない `Host`（すべてのルートが対象になります）
-- `access` を持つルートのパスは、エスケープを大文字で書き、そのまま書けるバイトをエスケープにしない形（正規の形）で書きます。
-- どれかのルートが `access` を持つなら、どのルートの `host` にもポートは書けません。
-- 取り違えられうるルートを調べるとき、リクエストのパスの末尾に `/` を足した形は調べますが、末尾の `/` を取った形は調べません。完全一致のルート `/admin` の制限は `/admin/` には効かないので、アップストリームが同じように扱うなら両方を書きます。
-- パスの英字の大小は区別します。大小を区別しないアップストリームでは、制限は書いた綴りにだけ効きます。
+- A route is chosen by the bytes received, but the application behind the upstream may read a different spelling as the same path (for example, reading `/priv%61te/x` as `/private/x`). So while any route has `access`, a request must pass the `access` of every route that the request could be mistaken for. An `access` that has only country lists also counts as `access`. The same holds for the following rules.
+- While any route has `access`, the following requests get 403 when the client is outside the `access` of any route whose `Host` matches (including routes that have no host).
+  - A request target whose path (before `?`) can be read in more than one way. This is a target that contains `\`, `;`, `//`, a segment of `.` or `..`, or `%2e`, `%2f`, `%5c`, `%00`, or `%25` (in either case), or a target in which replacing an escape produces another escape (such as `%2%65`)
+  - An unreadable `Host` (all routes are covered)
+- The path of a route that has `access` is written in the canonical form: escapes in uppercase, and bytes that can be written literally are not escaped.
+- If any route has `access`, no route can have a port in `host`.
+- When the proxy looks for the routes that a request could be mistaken for, it checks the request path with a trailing `/` added, but not with a trailing `/` removed. So a restriction on the exact-match route `/admin` does not apply to `/admin/`; if the upstream treats them the same, write both.
+- The path is case-sensitive, so for an upstream that ignores case, the restriction applies only to the spelling that was written.
 
-`rewrite` は `{"host"?, "path"?, "query"?, "request_headers"?, "response_headers"?}` です。
+`rewrite` is `{"host"?, "path"?, "query"?, "request_headers"?, "response_headers"?}`.
 
-- `host`: アップストリームへ送る `Host`。ルートの `host` と同じ形で、ワイルドカードは書けません。
-- `path`: ルートのパスの置き換え。`path` を持つルートにだけ書けます。ルートのパスが `/` で終わるなら、その後のリクエストターゲット（クエリを含みます）をそのまま新しいパスの後ろに付けます。新しいパスも `/` で終わります。そうでなければパスを置き換え、クエリは残します。
-- `query`: `{"remove"?, "remove_prefixes"?, "set"?, "add"?}`。名前の比較は ASCII の大小を区別しません。名前の後ろに `[` が続く項目（`debug[]` など）も同じ名前として扱います。
-- `request_headers`・`response_headers`: `{"remove"?, "set"?, "add"?}`。`remove` は名前の一覧、`set` と `add` は `{"name", "value"}` の一覧です。`set` は同じ名前のヘッダーをすべて削除して 1 つ入れ、`add` は後ろに追加します。
-- クエリ、リクエストヘッダー、レスポンスヘッダーは、それぞれ 32 項目まで書けます。
-- リクエストヘッダーでは、次のものは書けません。
-  - `_` を含む名前
-  - 接続ごとのヘッダー（`Connection`、`Keep-Alive`、`Transfer-Encoding`、`Upgrade` など）
-  - クライアントのアドレスを伝えるヘッダー（`X-Forwarded-For`、`X-Forwarded-Proto`、`X-Real-IP`、`Forwarded` など）
-  - `Host`、`X-Forwarded-Host`、`X-Request-ID`
-  - ボディの長さと型を伝えるヘッダー（`Content-Length`、`Content-Type`、`Content-Encoding`）
-- レスポンスヘッダーでは、接続ごとのヘッダー、`Set-Cookie`、`X-Request-ID`、ボディの長さと型と範囲を伝えるヘッダー（`Content-Length`、`Content-Type`、`Content-Encoding`、`Content-Range`）は書けません。プロキシが自分で作る応答は書き換えません。
-- 書き換えの順は、リクエストヘッダー、`Host`、リクエストターゲット（パス、次にクエリ）です。`X-Forwarded-Host` は、その前にクライアントが送った `Host` から作ります。
-- 書き換えは、ルートを選んで検査した後に 1 回だけ行います。そのため、WAF のルールと除外、検査除外のルート、`access` は、公開側（書き換えの前）のパスと `Host` で書きます。2 つの公開側のプレフィックスが同じ内部のパスに入るときも、片方の公開側のパスに向けたルールは、もう片方には効きません。
-- フォームのボディの引数は、`query` の書き換えの対象ではありません。
-- 書き換えられないリクエスト（新しいリクエストターゲットが長すぎるなど）は送りません。サーバーの失敗にもしません。
+- `host`: The `Host` sent to the upstream. It has the same form as the route's `host`, and a wildcard cannot be written.
+- `path`: Replaces the route's path. It can be written only for a route that has `path`. If the route's path ends with `/`, the rest of the request target after it (including the query) is appended unchanged to the new path. The new path also ends with `/`. Otherwise the path is replaced and the query is kept.
+- `query`: `{"remove"?, "remove_prefixes"?, "set"?, "add"?}`. Name comparison ignores ASCII case. An item whose name is followed by `[` (such as `debug[]`) is treated as the same name.
+- `request_headers`, `response_headers`: `{"remove"?, "set"?, "add"?}`. `remove` is a list of names, and `set` and `add` are lists of `{"name", "value"}`. `set` removes every header with that name and adds one, and `add` appends one after any existing ones.
+- The query, the request headers, and the response headers can each have up to 32 items.
+- The following cannot be written in request headers.
+  - A name that contains `_`
+  - Hop-by-hop headers (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`, and so on)
+  - Headers that carry the client address (`X-Forwarded-For`, `X-Forwarded-Proto`, `X-Real-IP`, `Forwarded`, and so on)
+  - `Host`, `X-Forwarded-Host`, `X-Request-ID`
+  - Headers that carry the length and type of the body (`Content-Length`, `Content-Type`, `Content-Encoding`)
+- In response headers, hop-by-hop headers, `Set-Cookie`, `X-Request-ID`, and headers that carry the length, type and range of the body (`Content-Length`, `Content-Type`, `Content-Encoding`, `Content-Range`) cannot be written. Responses that the proxy generates itself are not rewritten.
+- Rewriting goes in this order: the request headers, `Host`, and the request target (the path, then the query). `X-Forwarded-Host` is built before that, from the `Host` that the client sent.
+- Rewriting is done only once, after a route is chosen and the request is inspected. So write the WAF rules and exclusions, the bypass routes, and `access` against the public-side path and `Host` (before rewriting). Even when two public-side prefixes are rewritten to the same internal path, a rule aimed at one public-side path does not apply to the other.
+- `query` does not rewrite the parameters in a form body.
+- A request that cannot be rewritten (the new request target is too long, for example) is not sent to the upstream, and is not counted as a server failure either.
 
-#### ストリーミング応答と WebSocket（`stream`）
+#### Streaming Responses and WebSocket (`stream`)
 
-- `total_ms`（1 ms〜24 時間）: 応答のヘッダー部の後、接続を少なくともこの時間は続けます。WebSocket のトンネルは、101 から `total_ms` で必ず終了します。
-- `idle_ms`（1 ms〜`total_ms`）: アップストリームからの通信が無くてよい時間
-- `websocket`: WebSocket のハンドシェイクを通すかどうか
-- `stream` を持つルートの応答は、その接続の最後の応答になります。接続の終了は、もとの終了（`accept` から `conn_total_ms`）と、応答のヘッダー部から `total_ms` の後のうち、遅い方になります。`total_ms` が接続の残りの時間より短くても、応答はそこでは切断されません。
-- WebSocket のハンドシェイクの GET は、ほかのリクエストと同じく検査します（検査除外のルートなら検査しません）。101 の後の WebSocket のフレームは検査せず、中継するだけです。
-- ハンドシェイクの前に、トンネルの分の予算（16 KiB）を確保します。確保できなければ、何も送らずに 503 で応答します。
-- トンネルは次のときに終了します。
-  - 両方の向きが終了した
-  - アップストリームが `idle_ms` の間何も送らない、またはどちらかへの書き込みが `response_idle_ms` の間進まない（両方の向きが開いている間は、クライアントからの送信が無くてもかまいません）
-  - 片方の向きが終了してから `idle_ms` 以内に、もう片方が終了しない（その間にどれだけ動いていても終了します）
-  - 101 から `total_ms` が過ぎた
-  - 読み書きが失敗した、アップストリームの接続を引き継げない、101 をクライアントへ送れない
-  - 停止で接続が打ち切られた
-- WebSocket を通さないルートへの `Upgrade` のリクエスト（`Upgrade: h2c` も含みます）は、トンネルにしません。`Upgrade` を除いて通常のリクエストとして転送し、応答の後に閉じます。アップストリームが、求められていない 101 を返したら 502 にします。
-- `CONNECT` は 400 で拒否します。
+- `total_ms` (1 ms to 24 hours): After the response header section, the connection continues for at least this long. A WebSocket tunnel always ends `total_ms` after the 101.
+- `idle_ms` (1 ms to `total_ms`): How long the upstream may send nothing
+- `websocket`: Whether to let WebSocket handshakes through
+- The response of a route that has `stream` is the last response on that connection. The connection ends at the later of the original end (`conn_total_ms` from `accept`) and `total_ms` after the response header section. Even if `total_ms` is shorter than the connection's remaining time, the response is not cut off at that point.
+- The GET of a WebSocket handshake is inspected like other requests (it is not inspected on a bypass route). The WebSocket frames after the 101 are not inspected, only relayed.
+- Before the handshake, the proxy reserves the budget for the tunnel (16 KiB). If it cannot, it responds with 503 without sending anything.
+- A tunnel ends in these cases.
+  - Both directions have ended
+  - The upstream sends nothing for `idle_ms`, or a write to either side makes no progress for `response_idle_ms` (while both directions are open, the client may send nothing)
+  - The other direction does not end within `idle_ms` after one direction has ended (the tunnel ends however much traffic there is in the meantime)
+  - `total_ms` has passed since the 101
+  - A read or write failed, the upstream connection cannot be taken over, or the 101 cannot be sent to the client
+  - The connection was cut off by a stop
+- An `Upgrade` request to a route that does not let WebSocket through (this includes `Upgrade: h2c`) does not become a tunnel. The proxy forwards it as an ordinary request without `Upgrade`, and closes the connection after the response. If the upstream returns a 101 that was not asked for, the proxy responds with 502.
+- `CONNECT` is refused with 400.
 
-### クライアントのアドレス
+### Client Address
 
-- `trusted_proxies` に入る相手からのリクエストでは、その `X-Forwarded-For` の行を、1 つの一覧として右から左へ読みます。
-  - 信頼するプロキシのアドレスは飛ばし、最初の、信頼するプロキシでないアドレスをクライアントとします。
-  - すべてが信頼するプロキシなら、いちばん左をクライアントとします。
-  - IP リテラルでない項目があれば、そこで読むのをやめ、相手をクライアントとします。
-- 信頼しない相手からのリクエストでは、相手がクライアントです。その `X-Forwarded-For` などの申告は捨てます。
-- 信頼する相手でも、`X-Forwarded-For` の行が無いリクエストでは、その相手がクライアントです。
-- このクライアントのアドレスを、検査、全体の `access`、`rate_limit`、国の判定、ルートの `access`、ログに使います。
+- For a request from a peer that is in `trusted_proxies`, the proxy reads its `X-Forwarded-For` lines as one list, from right to left.
+  - It skips the addresses of trusted proxies and takes the first address that is not a trusted proxy as the client.
+  - If all are trusted proxies, the leftmost is the client.
+  - If there is an item that is not an IP literal, it stops reading there and takes the peer as the client.
+- For a request from a peer that is not trusted, the peer is the client. Claims such as its `X-Forwarded-For` are discarded.
+- Even for a trusted peer, if the request has no `X-Forwarded-For` line, the peer is the client.
+- This client address is used for inspection, the global `access`, `rate_limit`, the country lookup, route `access`, and logs.
 
-アップストリームへ送るリクエストには、次のヘッダーを付けます。
+The following headers are added to the request sent to the upstream.
 
-| ヘッダー | 内容 |
+| Header | Content |
 |---|---|
-| `X-Forwarded-For` | 信頼する相手からのリクエスト: 受信した行に相手のアドレスを足したもの。ほか: 相手のアドレスだけ |
-| `X-Forwarded-Proto` | 信頼する相手が `http` か `https` ちょうどを送ったときはそれ。ほか: リスナーのスキーム（TLS のリスナーは `https`、ほかは `http`） |
-| `X-Forwarded-Host` | クライアントが書いた `Host`（相手を問わず） |
-| `X-Request-ID` | リクエスト ID（下の「ログ」の `id`）。クライアントが送ったものは、相手を問わず捨てて置き換えます |
+| `X-Forwarded-For` | From a trusted peer: the received line with the peer's address added. Otherwise: only the peer's address |
+| `X-Forwarded-Proto` | If a trusted peer sent exactly `http` or `https`, that value. Otherwise: the listener's scheme (`https` for a TLS listener, `http` for the others) |
+| `X-Forwarded-Host` | The `Host` that the client wrote (whatever the peer) |
+| `X-Request-ID` | The request ID (`id` in "Logs" below). One that the client sent is discarded and replaced, whatever the peer |
 
 ### `kernel`
 
-検査カーネルと検査プロセスの設定です。時間は、どれも 1 ms〜3600 s の範囲で書きます。
+Settings for the inspection kernel and the inspector processes. Every time is in the range 1 ms to 3600 s.
 
-検査カーネルは、起動したエンジンごとに 1 つあります。`slots`・`wait_queue`・`records`・`restarts`・`restart_window_ms` は、エンジンごとの検査カーネルが、それぞれ同じ値で持ちます。たとえば `slots` は、1 つのエンジンが同時に検査するリクエストの数です。
+There is one inspection kernel for each engine that has started. `slots`, `wait_queue`, `records`, `restarts`, and `restart_window_ms` apply to each engine's inspection kernel separately, with the same value. For example, `slots` is the number of requests that one engine inspects at the same time.
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `inspector` | 絶対パス | Coraza の検査プロセスの実行ファイル。省けない設定キーで、ModSecurity の世代だけを使うホストでも書きます |
-| `engines` | 省けます。`{"modsecurity": {"inspector": <absolute-path>}}` の形で、どちらの階層の設定キーも必要です。パスは 4095 バイトまで | ModSecurity の検査プロセスの実行ファイル。この設定キーがあり、`modsecurity` の世代が選択中のときに起動します（アップストリームが使うかどうかは問いません）。省くと、`modsecurity` の世代は、インポートと選択で `kernel.engines has no inspector for the engine of the generation` で受け付けません。起動では、デフォルトのエンジンでもアップストリームのエンジンでもない `modsecurity` は、選択中の世代があっても起動せず、行も出しません。デフォルトのエンジンかアップストリームのエンジンを `modsecurity` にする設定は、省くと受け付けません（`kernel.engines has no inspector for kernel.default_engine`、`kernel.engines has no inspector for the engine of an upstream`） |
-| `default_engine` | 省けます。`coraza` か `modsecurity`（小文字）。省けば `coraza` | アップストリームの `engine` を省いたときのエンジン、`rules import` の `--engine` を省いたときのエンジン、`managed` のある設定で管理画面のルートを検査するエンジンです（下の「検査エンジンの選択」）。`modsecurity` にするには、`engines` が必要です。これ以外の名前は `kernel.default_engine is not coraza or modsecurity` で受け付けません。`null` は書けません。動作中は変更できません（上の「SIGHUP（設定のリロード）」） |
-| `tmp_root` | 絶対パス、3840 バイトまで | 起動ごとの作業ディレクトリを作る親ディレクトリ。シンボリックリンクでないディレクトリで、所有者がプロキシの OS ユーザー、グループとその他のユーザーの権限が無く、setgid が無いこと |
-| `gomaxprocs` | 1〜65535 | 検査プロセスの `GOMAXPROCS`。ModSecurity の検査プロセスは、1 つのスレッドで動くので使いません（受け取った値を最初のメッセージで返すだけ） |
-| `gomemlimit` | 1〜9223372036854775807（バイト） | 検査プロセスの `GOMEMLIMIT`。ModSecurity の検査プロセスは、使いません（受け取った値を最初のメッセージで返すだけで、メモリの上限にはなりません） |
-| `slots` | 1〜4 | 同時に検査するリクエストの数 |
-| `wait_queue` | 1 以上、`max_conns` 以下 | 検査のスロットを待つリクエストの数 |
-| `records` | `slots + wait_queue` 以上 | 同時に持つリクエストのレコードの数。最上位の `records`（ログファイル）とは別の設定キーです |
-| `discard_limit` | `u32` の最大値より小さい | 検査プロセスの 1 回の起動で捨ててよい応答の数。超えると接続のエラーとします |
-| `tick_ms` | 1 s まで、ほかのどの時間以下 | 1 ステップの待ち時間の最長 |
-| `hello_wait_ms` | | 検査プロセスの起動から、最初のメッセージ（HELLO）までの時間 |
-| `frame_io_ms` | | 1 つのフレームの書き込みと、最初のバイトを受信した後の読み込みにかかる時間 |
-| `verdict_wait_ms` | | 検査プロセスが判定を返すまでの時間 |
-| `wait_deadline_ms` | | リクエストが検査プロセスに渡るまでの時間 |
-| `closed_wait_ms` | | リクエストを閉じてから、閉じたことの通知までの時間 |
-| `stop_after_ms` | | 判定を待つのをやめた（`verdict_wait_ms` が過ぎた）とき、または検査の終了を検査プロセスに伝えたときから、検査のスロットが返らないままこの時間が過ぎると、検査プロセスを停止します |
-| `drain_wait_ms` | | 終了の指示から、検査プロセスの終了の通知（BYE）までの時間 |
-| `exit_wait_ms` | | 終了の通知の後に、検査プロセスが自分で終了するのを待つ時間 |
-| `kill_grace_ms` | | SIGKILL の後、終了が確認できるまでの時間 |
-| `restarts` | 0〜1000 | `restart_window_ms` の間に再起動してよい回数。0 なら再起動しません |
-| `restart_window_ms` | | 再起動の回数を数えるウィンドウ |
+| `inspector` | Absolute path | The executable of the Coraza inspector process. This setting key is required, even on a host that uses only ModSecurity generations |
+| `engines` | Optional. In the form `{"modsecurity": {"inspector": <absolute-path>}}`; the setting keys at both levels are required. The path is up to 4095 bytes | The executable of the ModSecurity inspector process. It starts when this setting key is present and a `modsecurity` generation is chosen (whether or not an upstream uses it). If omitted, a `modsecurity` generation is rejected at import and at choosing, with `kernel.engines has no inspector for the engine of the generation`. At start, `modsecurity` that is neither the default engine nor an upstream engine does not start even if a generation is chosen, and no line is written. A configuration that makes the default engine or an upstream engine `modsecurity` is rejected if this is omitted (`kernel.engines has no inspector for kernel.default_engine`, `kernel.engines has no inspector for the engine of an upstream`) |
+| `default_engine` | Optional. `coraza` or `modsecurity` (lowercase). If omitted, `coraza` | The engine used when an upstream's `engine` is omitted or when `rules import` is run without `--engine`, and the engine that inspects the admin route when `managed` is present (see "Choosing the Inspection Engine" below). Setting it to `modsecurity` requires `engines`. Any other name is rejected with `kernel.default_engine is not coraza or modsecurity`. `null` cannot be written. It cannot change while running (see "SIGHUP (Configuration Reload)" above) |
+| `tmp_root` | Absolute path, up to 3840 bytes | The parent directory in which a work directory is created at each start. It must be a directory that is not a symbolic link, owned by the proxy's OS user, with no permissions for the group and other users, and without setgid |
+| `gomaxprocs` | 1 to 65535 | The inspector process's `GOMAXPROCS`. The ModSecurity inspector process runs in one thread and does not use it (it only returns the received value in the first message) |
+| `gomemlimit` | 1 to 9223372036854775807 (bytes) | The inspector process's `GOMEMLIMIT`. The ModSecurity inspector process does not use it (it only returns the received value in the first message, and it is not a memory limit) |
+| `slots` | 1 to 4 | The number of requests inspected at the same time |
+| `wait_queue` | 1 or more, at most `max_conns` | The number of requests waiting for an inspection slot |
+| `records` | At least `slots + wait_queue` | The number of request records held at the same time. This is a different setting key from the top-level `records` (the log files) |
+| `discard_limit` | Less than the maximum value of `u32` | The number of responses that may be discarded in one run of an inspector process. Beyond it, it is treated as a connection error |
+| `tick_ms` | Up to 1 s, and at most any other time | The longest wait in one step |
+| `hello_wait_ms` | | The time from the start of the inspector process to the first message (HELLO) |
+| `frame_io_ms` | | The time to write one frame, and to read after the first byte is received |
+| `verdict_wait_ms` | | The time until the inspector process returns a verdict |
+| `wait_deadline_ms` | | The time until a request is handed to the inspector process |
+| `closed_wait_ms` | | The time from closing a request until the notice that it is closed |
+| `stop_after_ms` | | The inspector process is stopped if the inspection slot is still not returned this long after the proxy stopped waiting for the verdict (`verdict_wait_ms` passed) or told the inspector process that inspection ended |
+| `drain_wait_ms` | | The time from the instruction to end until the inspector process's end notice (BYE) |
+| `exit_wait_ms` | | After the end notice, the time to wait for the inspector process to exit by itself |
+| `kill_grace_ms` | | After SIGKILL, the time until the exit is confirmed |
+| `restarts` | 0 to 1000 | The number of restarts allowed within `restart_window_ms`. If 0, the inspector process is not restarted |
+| `restart_window_ms` | | The window in which the number of restarts is counted |
 
-- 検査プロセスの再起動には、ウィンドウ内の回数に上限があります。上限に達したらウィンドウの中の再起動の回数が上限を下回るまで再起動せず、その間に待つリクエストは 503 になります。
-- ルールのエラーなど、決まって失敗する理由では再起動しません。どのエンジンの検査カーネルでも、停止すると、プロキシも停止します。リクエストを渡していないエンジンの検査カーネルでも同じです（`stop: the kernel failed`）。
+- Inspector process restarts are limited in number within the window. When the limit is reached, no restart happens until the number of restarts in the window falls below the limit, and requests that wait in the meantime get 503.
+- A cause that would make every restart fail, such as an error in the rules, does not lead to a restart. If any engine's inspection kernel stops, the proxy stops too, even when that engine has been given no requests (`stop: the kernel failed`).
 
 ### `rules.store`
 
-- `{"kind": "file", "dir"}` と書きます。`kind` は今は `file` だけです。
-- `dir` は絶対パスで 3840 バイトまでです。シンボリックリンクでないディレクトリで、所有者がプロキシの OS ユーザーであり、グループとその他のユーザーの権限が無いことが必要です。
+- Write `{"kind": "file", "dir"}`. For now, `kind` can only be `file`.
+- `dir` is an absolute path of up to 3840 bytes. It must be a directory that is not a symbolic link, owned by the proxy's OS user, with no permissions for the group and other users.
 
 ### `acme`
 
-`managed` の無い設定ファイルでは、`acme` を持つ証明書があるときだけ書きます。`managed` のある設定ファイルでは、上の「全体の構成」のとおりです。書くときは、すべての設定キーを書きます。
+Without `managed`, write it only when a certificate has `acme`. With `managed`, see "Overall Structure" above. When you write it, include all the setting keys.
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `directory_url` | `https://` の URL、2048 バイトまで | CA の ACME ディレクトリ |
-| `contact_email` | 254 バイトまで | CA に届ける連絡先。形式だけを検証します |
-| `account_key_file` | 絶対パス | ACME のアカウントの鍵。無ければコマンドが作成します（0600） |
-| `challenge_dir` | 絶対パス | チャレンジのファイルを置くディレクトリ |
-| `ca_file` | 絶対パス | CA のサーバー証明書を検証するルート証明書（アップストリームの `ca_file` と同じ形。1〜100 枚） |
-| `timeout_ms` | 1 ms〜600 s | コマンド全体のタイムアウト |
+| `directory_url` | A URL that starts with `https://`, up to 2048 bytes | The ACME directory of the CA |
+| `contact_email` | Up to 254 bytes | The contact passed to the CA. Only the format is checked |
+| `account_key_file` | Absolute path | The ACME account key. If it does not exist, the command creates it (0600) |
+| `challenge_dir` | Absolute path | The directory in which the challenge files are placed |
+| `ca_file` | Absolute path | The root certificates for verifying the CA's server certificate (the same form as an upstream's `ca_file`; 1 to 100 certificates) |
+| `timeout_ms` | 1 ms to 600 s | The timeout of the whole command |
 
-- `account_key_file`、`ca_file`、`acme` を持つ証明書（管理画面のルートの証明書を含みます）の `cert_file`・`key_file` は、すべて別のファイルにします。`acme` を持たない証明書の `cert_file`・`key_file` も、これらのどれとも別のファイルにします。
-- `challenge_dir` の直下に、これらのファイルや、ほかの証明書の `cert_file`・`key_file` を置かないでください（下の「配置の注意」）。
-- `challenge_dir` は、ルールストア、`records.dir`、管理データの保存先（`admin.store.dir`）、制御ソケットのあるディレクトリ、managed ストアと同じにも、互いの中にも置けません。`managed` の無い設定でも同じです。重なりは書いたままのパスで比べるので、シンボリックリンクを使わないでください（下の「値どうしの関係」）。
-- `managed` のある設定では、`account_key_file` と `ca_file` を managed ストアの中に置けません。
-- 通常のリスナーかリダイレクトのリスナーが、少なくとも 1 つ必要です（CA は平文の HTTP でチャレンジを取りに来ます）。
+- `account_key_file`, `ca_file`, and the `cert_file` and `key_file` of every certificate that has `acme` (including the admin route's certificate) must all be different files. The `cert_file` and `key_file` of certificates without `acme` must also differ from all of these.
+- Do not place these files, or the `cert_file` and `key_file` of other certificates, directly under `challenge_dir` (see "Placement Notes" below).
+- `challenge_dir` and the rules store, `records.dir`, the admin store (`admin.store.dir`), the control socket's directory, and the managed store cannot be the same directory, and none of them can be inside another. This also applies without `managed`. Overlaps are compared by the path as written, so do not use symbolic links (see "Relations Between Values" below).
+- With `managed`, `account_key_file` and `ca_file` cannot be placed inside the managed store.
+- At least one normal listener or redirect listener is needed, because the CA fetches the challenge over plaintext HTTP.
 
 ### `status`
 
-監視用のリスナー（下の「監視」）を置くときだけ書きます。省けば、監視用のリスナーはありません。
+Write it only when you want a monitoring listener (see "Monitoring" below). If omitted, there is no monitoring listener.
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `listen` | ループバックの IP（`127.0.0.0/8` か `::1`）とポート（0 は不可） | 監視用のリスナーのアドレス |
+| `listen` | A loopback IP (`127.0.0.0/8` or `::1`) and a port (0 is not allowed) | The address of the monitoring listener |
 
-- 応答に認証が無いので、同じホストの監視プログラムから使います。`::ffff:127.0.0.1` の形はループバックと見なしません。
-- リスナー（`proxy.listeners`）と重ねられません（リスナーどうしと同じ決まり。`0.0.0.0`・`::` と同じポートも重なります）。
-- アップストリームのサーバー（書いたアドレスも、名前解決したアドレスも）は、このアドレスにできません。リスナーのアドレスと同じく受け付けません。
-- リスナーの数（1〜8）にも、「通常か TLS のリスナーが少なくとも 1 つ」にも数えません。
+- Its responses are not authenticated, so use it from a monitoring program on the same host. The form `::ffff:127.0.0.1` is not regarded as loopback.
+- It cannot overlap a listener (`proxy.listeners`) (the same rule as between listeners; `0.0.0.0` or `::` with the same port also overlaps).
+- An upstream server cannot have this address, whether as written or after name resolution. It is rejected, just as a listener's address is.
+- It is not counted in the number of listeners (1 to 8), nor in "at least one normal or TLS listener".
 
 ### `admin`
 
-管理プロセス（`tukuyomi-proxy admin`）の設定です。省けます。省けば、管理プロセスは無く、プロキシは制御ソケットを作りません。
+Settings for the admin process (`tukuyomi-proxy admin`). It is optional. If it is omitted, there is no admin process and the proxy does not create a control socket.
 
 ```text
 {"listen", "control", "store", "origin", "trusted_proxies", "mfa", "session_idle_ms", "session_total_ms", "crs_dir"?, "route"?}
 ```
 
-- プロキシと管理プロセスは、同じ設定ファイルを読み込みます。プロキシが使う設定キーは `listen`、`control`、`route` で、ほかの設定キーは値を検証するだけです。プロキシと管理プロセスが、同じファイルを同じように受け付けるか、受け付けないかにするためです。ほかの設定キーの意味と範囲は [管理リファレンス](admin-reference.md) を参照してください。
+- The proxy and the admin process read the same configuration file. The proxy uses `listen`, `control`, and `route`, and only checks the values of the other setting keys, so that the proxy and the admin process both accept, or both reject, the same file. For the meaning and ranges of the other setting keys, see the [admin reference](admin-reference.md).
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `listen` | ループバックの IP（`127.0.0.0/8` か `::1`）とポート（0 は不可） | 管理プロセスのリスナーのアドレス。`::ffff:127.0.0.1` の形はループバックと見なしません。リスナー（`proxy.listeners`）とも監視用のリスナーとも重ねられません（リスナーどうしと同じ決まり）。`managed` の無い設定では、アップストリームのサーバーをこのアドレスにできます。`managed` のある設定のバージョンでは、できません |
-| `control` | 絶対パス、107 バイトまで | 管理プロセスがプロキシに依頼を送る制御ソケットのパス（下） |
-| `route` | `{"host", "certificate", "access"}` | 管理画面のルート（下）。`managed` のある設定ファイルでは必ず書き、`managed` の無い設定ファイルには書けません |
+| `listen` | A loopback IP (`127.0.0.0/8` or `::1`) and a port (0 is not allowed) | The address of the admin process's listener. The form `::ffff:127.0.0.1` is not regarded as loopback. It cannot overlap a listener (`proxy.listeners`) or the monitoring listener (the same rule as between listeners). Without `managed`, an upstream server can have this address. In a managed configuration version, it cannot |
+| `control` | Absolute path, up to 107 bytes | The path of the control socket over which the admin process sends requests to the proxy (below) |
+| `route` | `{"host", "certificate", "access"}` | The admin route (below). Required in a configuration file with `managed`, and not allowed in one without `managed` |
 
-- `rules.store.dir`、`records.dir`、`admin.store.dir`、`admin.control` のあるディレクトリ、`managed.dir` の重なりは、受け付けません（下の「値どうしの関係」）。ログファイルのローテーションが、同じディレクトリにあるソケットを置き換えてしまうなど、一方が他方の内容を変更しないようにするためです。
+- Overlaps among `rules.store.dir`, `records.dir`, `admin.store.dir`, the directory of `admin.control`, and `managed.dir` are rejected (see "Relations Between Values" below), so that one cannot change the contents of another (for example, log file rotation replacing a socket in the same directory).
 
-`route` は、`managed` のある設定で、プロキシが管理プロセスへ転送するルートです。
+With `managed`, `route` is the route through which the proxy forwards requests to the admin process.
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `host` | 名前 1 つ（`*.` は書けません） | 管理画面のホスト名。`Host` がこの名前のリクエストは、バージョンのルートを選ばずに `admin.listen` へ転送します |
-| `certificate` | `{"cert_file", "key_file", "acme"?}` | 管理画面のルートの証明書。リスナーの証明書（`hosts` が `host` だけのもの）と同じように検証して読み込みます。`acme` を付けると `acme renew` が発行し、ファイルは起動のときに無くてもかまいません（そのときは設定ファイルに `acme` が必要です） |
-| `access` | ルートの `access` と同じ形。`allow_cidrs` は必ず書き、空にできません | 管理画面のルートに適用されるアクセス制御 |
+| `host` | One name (`*.` cannot be written) | The host name of the admin screens. A request whose `Host` is this name is forwarded to `admin.listen` without choosing a route from the version |
+| `certificate` | `{"cert_file", "key_file", "acme"?}` | The admin route's certificate. It is checked and loaded in the same way as a listener certificate whose `hosts` is only `host`. With `acme`, `acme renew` issues it, and the files do not have to exist at start (in that case the configuration file needs `acme`) |
+| `access` | The same form as a route's `access`. `allow_cidrs` must be written and cannot be empty | The access control that applies to the admin route |
 
-- 全体の設定（全体の `access`・`rate_limit`）もホストごとの設定も、管理画面のルートには適用されません。管理画面のルートに適用されるネットワークの制限は、`access` だけです（下の「リクエストの検証の順序」）。WAF の検査は、デフォルトのエンジンで受けます（下の「検査エンジンの選択」）。
-- TLS のリスナーは、管理画面のルートの証明書を、バージョンのサイトの証明書と一緒に SNI で選びます。管理画面のホストのリクエストを、ほかの証明書の接続で受信すると 421 で、リダイレクトでない平文のリスナーで受信すると 404 で応答し、転送しません。リダイレクトのリスナーは、https へリダイレクトします。
-- `host` は、バージョンのサイトの `hosts`、ルートの `host`、ホストごとの設定の `hosts` に書けません（`*.` のワイルドカードに含まれる場合はかまいません。管理画面のルートが先に一致します）。
-- 証明書と `access` は設定のリロードで変更できます。`host` は動作中に変更できないので、変更するときはプロキシと管理プロセスを再起動してください。
-- `managed` の無い設定では、`admin.listen` を指すアップストリームとルートで、管理画面へ転送します（[管理リファレンス](admin-reference.md) の「外部からの利用」）。そのルートには、全体の設定とホストごとの設定が適用されます。検査するエンジンは、そのアップストリームのエンジンです（`engine` を省けば、デフォルトのエンジン）。
+- The global settings (the global `access` and `rate_limit`) and the host policies do not apply to the admin route. The only network restriction that applies to the admin route is `access` (see "Order of Request Checks" below). The default engine does the WAF inspection (see "Choosing the Inspection Engine" below).
+- A TLS listener chooses the admin route's certificate by SNI, along with the certificates of the version's sites. A request for the admin host is not forwarded: it gets 421 if it arrives on a connection that uses another certificate, and 404 if it arrives on a plaintext listener that is not a redirect listener. A redirect listener redirects it to https.
+- The name in `host` cannot be written in the `hosts` of a version's site, a route's `host`, or a host policy's `hosts` (being covered by a `*.` wildcard is fine; the admin route matches first).
+- The certificate and `access` can be changed by a configuration reload. `host` cannot change while running, so to change it, restart the proxy and the admin process.
+- Without `managed`, an upstream and a route that point to `admin.listen` forward to the admin screens (see "Access from Outside" in the [admin reference](admin-reference.md)). The global settings and the host policies apply to that route. Requests are inspected by the upstream's engine (the default engine if `engine` is omitted).
 
-#### 制御ソケット
+#### Control Socket
 
-管理プロセスが、プロキシに状態を問い合わせ、世代の切り替えと、managed 設定のバージョンを指定した設定のリロードを依頼するための Unix ドメインソケットです。
+A Unix domain socket through which the admin process queries the proxy's status and asks it to switch generations or to reload the configuration with a specified managed configuration version.
 
-- 作り方:
-  - ソケットのあるディレクトリは、シンボリックリンクでないディレクトリで、所有者がプロキシの OS ユーザー、グループとその他のユーザーの権限が無いことが必要です（ルールストアと同じ検証）。ソケットは 0600 で作成します。
-  - 検査カーネルを起動する前にバインドします。パスに既にあるものが、プロキシの OS ユーザーのソケットで、待ち受けているプロセスが無い（接続が拒否される）ときだけ、削除して作り直します。待ち受けているプロセスがあるもの、ソケットでないもの、別の OS ユーザーのものは、`start: control socket refused: ...` の行を出して拒否します（exit 1）。
-  - 停止では、リスナーを閉じる段階で一緒に閉じて、ファイルを削除します。ファイルが、作ったものと同じときだけ削除します。
-- 利用できるプロセス: プロキシと同じ OS ユーザーで動くプロセスは、どれも使えます。ソケットの先に認証は無く、利用を制限するのは、ディレクトリの権限とソケットの 0600 だけです。管理プロセスは、プロキシと同じ OS ユーザーで動かします。
-- 1 つの接続は、2 秒以内に JSON の 1 行（4 KiB まで）を送り、1 行の応答を受け取って閉じます。同時に 4 接続まで応答し、それを超えた接続は、受け付けてすぐ閉じます。行が来ない接続と、切断された接続には、応答しません。
+- How it is made:
+  - The socket's directory must be a directory that is not a symbolic link, owned by the proxy's OS user, with no permissions for the group and other users (the same check as for the rules store). The socket is created with 0600.
+  - It is bound before the inspection kernels start. If something already exists at the path, it is deleted and recreated only if it is a socket owned by the proxy's OS user with no process listening (connections are refused). If a process is listening on it, if it is not a socket, or if it belongs to another OS user, the proxy writes a `start: control socket refused: ...` line and refuses it (exit 1).
+  - At a stop, it is closed together with the listeners, and the file is deleted. The file is deleted only if it is still the one the proxy created.
+- Any process that runs as the same OS user as the proxy can use it. There is no authentication beyond the socket, and the only restrictions on use are the directory's permissions and the socket's mode 0600. Run the admin process as the same OS user as the proxy.
+- Each connection sends one line of JSON (up to 4 KiB) within 2 seconds, receives a one-line response, and is closed. The proxy responds on up to 4 connections at the same time, and a connection beyond that is accepted and closed at once. A connection that sends no line, and a connection that was cut off, get no response.
 
-依頼と応答は次のとおりです。
+The requests and responses are as follows.
 
-| 依頼 | 応答 |
+| Request | Response |
 |---|---|
-| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "reloading", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures", "config", "managed", "resolve_timeout_ms", "config_reloads", "engines"}`。デフォルトのエンジンの、稼働中の世代のフィンガープリント（64 桁の 16 進数）、その世代のモード（`block`、`detect`）、エンジン（`coraza` か `modsecurity`）、検査カーネルの段階（`starting`、`ready`、`stopping`、`stopped`、`failed`）、切り替えの途中か、設定のリロード（SIGHUP か `reload` の依頼）の途中か、`/readyz` が `ready` と応答する状態か。続く 9 つは、プロキシの数と値です（下）。最後の `engines` は、起動しているエンジンごとの状態で、エンジンの名前の順に `[{"engine", "generation", "mode", "phase"}, ..]` の形で並びます |
-| `{"op":"switch","engine"?:"<engine>","expect":"<fingerprint>"}` | `engine`（`coraza` か `modsecurity`。省けばデフォルトのエンジン）のルールストアで選択中の世代が `expect` と同じときだけ、SIGUSR1 と同じ、そのエンジンの切り替えをします（稼働していないエンジンは起動します）。切り替えが終わってから、`{"result", "reason"?, "generation"}` で応答します。`generation` は、応答するときにそのエンジンで稼働中の世代です（稼働していなければ `null`） |
-| `{"op":"reload","managed":"<version>"}` | 設定ファイルと、指定されたバージョンで、SIGHUP と同じ設定のリロードをします。managed ストアの `current` は読み込みません。同じバージョンでもリロードします。リロードが終わってから応答します（下） |
-| ほかの行 | `{"result":"error","reason":..}`。`reason` は `line too long`、`malformed request`、`unknown op`、`bad expect`、`bad engine`、`bad managed` |
+| `{"op":"status"}` | `{"generation", "mode", "engine", "phase", "switching", "reloading", "ready", "uptime_ms", "requests", "blocked", "policy_refused", "upstream_failures", "config", "managed", "resolve_timeout_ms", "config_reloads", "engines"}`. In order: the fingerprint (64 hexadecimal digits) of the default engine's running generation, that generation's mode (`block`, `detect`), the engine (`coraza` or `modsecurity`), the inspection kernel's phase (`starting`, `ready`, `stopping`, `stopped`, `failed`), whether a switch is in progress, whether a configuration reload (SIGHUP or a `reload` request) is in progress, and whether `/readyz` responds with `ready`. The next nine are the proxy's counts and values (below). The last, `engines`, is the state of each engine that has started, listed in engine name order in the form `[{"engine", "generation", "mode", "phase"}, ..]` |
+| `{"op":"switch","engine"?:"<engine>","expect":"<fingerprint>"}` | Only if the generation chosen in the rules store for `engine` (`coraza` or `modsecurity`; if omitted, the default engine) is the same as `expect`, it switches that engine in the same way as SIGUSR1 (an engine that is not running is started). After the switch ends, it responds with `{"result", "reason"?, "generation"}`. `generation` is the generation running on that engine at the time of the response (`null` if it is not running) |
+| `{"op":"reload","managed":"<version>"}` | With the configuration file and the specified version, it reloads the configuration in the same way as SIGHUP. It does not read the managed store's `current`. It reloads even for the same version. It responds after the reload ends (below) |
+| Any other line | `{"result":"error","reason":..}`. `reason` is one of `line too long`, `malformed request`, `unknown op`, `bad expect`, `bad engine`, `bad managed` |
 
-`status` の数と値は、応答を作るときに読み取ります。`uptime_ms`、`config`、`managed`、`resolve_timeout_ms` のほかは、`/metrics` が出力する値と同じです（下の「メトリクス（`/metrics`）」）。
+The `status` counts and values are read when the response is built. Except for `uptime_ms`, `config`, `managed`, and `resolve_timeout_ms`, they are the same as the values that `/metrics` outputs (see "Metrics (`/metrics`)" below).
 
-| 項目 | 内容 |
+| Field | Content |
 |---|---|
-| `uptime_ms` | プロキシが起動してからのミリ秒 |
-| `requests` | リクエストの数。ログの 7 つの `class` のすべてを数えます（`tukuyomi_requests_total` の合計） |
-| `blocked` | ルールがブロックしたリクエストの数（`tukuyomi_waf_rule_hits_total` の `block`） |
-| `policy_refused` | アクセス制御とレート制限で拒否したリクエストの数。全体の設定とホストごとの設定の、アクセス制御の 403 とレート制限の 429 で、ルートの `access` と `admin.route.access` の 403 は数えません（`tukuyomi_policy_refusals_total` の合計） |
-| `upstream_failures` | 稼働中の設定にあるすべてのアップストリームのサーバーで起きた失敗の数（`tukuyomi_upstream_failures_total` の合計）。設定のリロードで設定が切り替わると、`/metrics` と同じく 0 から数え直します |
-| `config` | 稼働中の設定ファイル（起動のときか、最後に切り替えたリロードで読み込んだファイル）の SHA-256（64 桁の小文字の 16 進数）。リロードで切り替えた後は、その `reload: configuration replaced` の行に出た値と同じです |
-| `managed` | 稼働中の managed 設定のバージョン（64 桁の小文字の 16 進数）。`managed` の無い設定では `null` |
-| `resolve_timeout_ms` | 稼働中の設定の `forward.resolve_timeout_ms` |
-| `config_reloads` | `{"replaced", "refused"}`。SIGHUP と `reload` の依頼による設定のリロードの数を、切り替えたか拒否したかで分けたもの（`tukuyomi_config_reloads_total`） |
+| `uptime_ms` | Milliseconds since the proxy started |
+| `requests` | The number of requests. All seven `class` values of the log are counted (the total of `tukuyomi_requests_total`) |
+| `blocked` | The number of requests that rules blocked (`block` of `tukuyomi_waf_rule_hits_total`) |
+| `policy_refused` | The number of requests refused by access control and rate limits. These are the 403 responses from access control and the 429 responses from rate limits in the global settings and the host policies; 403 responses from a route's `access` and from `admin.route.access` are not counted (the total of `tukuyomi_policy_refusals_total`) |
+| `upstream_failures` | The number of failures that occurred on all the upstream servers in the running configuration (the total of `tukuyomi_upstream_failures_total`). When the configuration is switched by a reload, it counts from 0 again, as `/metrics` does |
+| `config` | The SHA-256 of the running configuration file (the file read at start or at the last reload that switched) (64 lowercase hexadecimal digits). After a switch by a reload, it is the same as the value in the `reload: configuration replaced` line |
+| `managed` | The version of the running managed configuration (64 lowercase hexadecimal digits). `null` for a configuration without `managed` |
+| `resolve_timeout_ms` | `forward.resolve_timeout_ms` of the running configuration |
+| `config_reloads` | `{"replaced", "refused"}`. The number of configuration reloads by SIGHUP and by `reload` requests, split by whether they switched or were refused (`tukuyomi_config_reloads_total`) |
 
-- これらの無い応答は、前のビルドのプロキシが返した応答です。管理プロセスは、無い値を `null` として扱います（[管理リファレンス](admin-reference.md) の「一覧と内容」）。`engines` の無い応答も、前のビルドのプロキシが返した応答です。前のビルドのプロキシは、エンジンごとの状態を返しません（[管理リファレンス](admin-reference.md) の「選択とロールバック」）。
+- A response without these values comes from a proxy of an earlier build. The admin process treats a missing value as `null` (see "Listing and Contents" in the [admin reference](admin-reference.md)). A response without `engines` also comes from a proxy of an earlier build, which does not return the state of each engine (see "Choosing and Rolling Back" in the [admin reference](admin-reference.md)).
 
-`switch` の `result` は次のとおりです。
+The `result` of `switch` is as follows.
 
-| `result` | `reason` | とき |
+| `result` | `reason` | When |
 |---|---|---|
-| `switched` | 無し | 切り替えが終わり、選択中の世代で稼働しています（稼働していなかったエンジンは、起動しています） |
-| `unchanged` | `already serving` | 選択中の世代を、もう使っています |
-| `refused` | `current changed` | ルールストアで選択中の世代が、`expect` と違います（そのエンジンに選択中の世代が無いときも）。何もしません |
-| `refused` | `store refused` | ルールストアか設定を受け付けませんでした |
-| `failed` | `driver did not take the order`、`not switched` | 切り替えを始められませんでした、または新しい世代が起動しませんでした |
-| `busy` | `starting`、`switch under way`、`too many orders`、`stopping` | 検査カーネルの準備ができる前、別の切り替えの途中、依頼が多すぎる、停止の間 |
+| `switched` | None | The switch ended and the engine is running the chosen generation (an engine that was not running has started) |
+| `unchanged` | `already serving` | The chosen generation is already in use |
+| `refused` | `current changed` | The chosen generation in the rules store differs from `expect` (also when the engine has no chosen generation). Nothing is done |
+| `refused` | `store refused` | The rules store or the configuration was rejected |
+| `failed` | `driver did not take the order`, `not switched` | The switch could not be started, or the new generation did not start |
+| `busy` | `starting`, `switch under way`, `too many orders`, `stopping` | The inspection kernel is not ready yet, another switch is in progress, there are too many requests, or the proxy is stopping |
 
-- 切り替えの結果は、SIGUSR1 と同じように `tukuyomi_rules_switches_total` に数えます。数えないのは、`unchanged`、`busy`、`current changed` の応答だけです。`store refused` は `refused` に、`driver did not take the order` と `not switched` は `failed` に数えます。
-- 切り替えの依頼は、`ready_wait_ms` に 5 秒を足した時間まで応答を待ちます。それを過ぎると `busy`（`switch under way`）で応答し、切り替えは続きます。
-- 状態の問い合わせに 2 秒以内に応答できないとき（依頼が多すぎるとき、停止の間を含みます）は、`{"result":"error","reason":"no answer"}` を返します。
-- 切り替えの依頼は、応答するたびに、ログに `control: switch expect <fingerprint>: <result> (<reason>), serving <fingerprint>` の行を 1 つ出します。`busy` の応答も含みます。`busy` で応答した切り替えが後で終了すると、終了したときにもう 1 つ出ます。この行は、エンジンを名指ししません。`serving` は、依頼のエンジンで稼働中の世代で、稼働していなければ `none` です。
+- The result of a switch is counted in `tukuyomi_rules_switches_total`, as with SIGUSR1. The only responses not counted are `unchanged`, `busy`, and `current changed`. `store refused` is counted in `refused`, and `driver did not take the order` and `not switched` in `failed`.
+- A switch request waits for the response for `ready_wait_ms` plus 5 seconds. After that it responds with `busy` (`switch under way`), and the switch continues.
+- When the proxy cannot respond to the status query within 2 seconds (including when there are too many requests and during a stop), it returns `{"result":"error","reason":"no answer"}`.
+- Every time the proxy responds to a switch request, one line `control: switch expect <fingerprint>: <result> (<reason>), serving <fingerprint>` is written to the log. This includes a `busy` response. When a switch that got the response `busy` ends later, one more is written at that time. This line does not name the engine. `serving` is the generation running on the engine of the request, or `none` if it is not running.
 
-`reload` の応答は、どれも、応答するときに稼働中のバージョンを `managed` に持ちます（`managed` の無い設定では `null`）。
+In every response to `reload`, `managed` is the version running at the time of the response (`null` for a configuration without `managed`).
 
-| `result` | 形 | とき |
+| `result` | Form | When |
 |---|---|---|
-| `replaced` | `{"result":"replaced","config":"<sha256>","managed":"<version>"}` | 切り替えました。2 つの値は、`reload: configuration replaced <sha256> managed <version>` の行と同じです |
-| `refused` | `{"result":"refused","reason":..,"detail":..,"managed":..}` | 何も変更していません。`reason` は拒否した箇所で、`configuration`（設定ファイルか国のデータベース）、`version`（バージョンの検証）、`store`（managed ストア、バージョンやファイルの名前と内容）、`upstream`（名前解決、アップストリームの CA）、`tls`（リスナーの証明書、サイト、管理画面のルート）、`fixed`（動作中に変更できない設定キー、稼働していないエンジンのアップストリーム）、`listener`（新しいリスナーをバインドできなかった）、`thread`（リロードのスレッドを始められなかった、スレッドが応答せずに終了した）のどれかです。`detail` は、ログの行の `refused: ` の後ろと同じ文です |
-| `refused` | `reason` が `unmanaged`、`detail` が `the configuration in force has no managed object` | 動作中の設定に `managed` がありません。リロードを始めずに拒否します |
-| `busy` | `{"result":"busy","reason":..,"managed":..}` | `starting`（リスナーをバインドする前）、`reload under way`（SIGHUP かほかの `reload` のリロードの途中、またはこの依頼のリロードが待つ時間以内に終了しなかったとき。そのときもリロードは続きます）、`too many orders`、`stopping` |
+| `replaced` | `{"result":"replaced","config":"<sha256>","managed":"<version>"}` | It switched. The two values are the same as in the `reload: configuration replaced <sha256> managed <version>` line |
+| `refused` | `{"result":"refused","reason":..,"detail":..,"managed":..}` | Nothing was changed. `reason` says where it was refused: one of `configuration` (the configuration file or the country database), `version` (the check of the version), `store` (the managed store, the names and contents of versions and files), `upstream` (name resolution, the CA of the upstreams), `tls` (the certificates of listeners, sites, the admin route), `fixed` (a setting key that cannot change while running, an upstream of an engine that is not running), `listener` (a new listener could not be bound), or `thread` (the reload thread could not be started, or the thread ended without responding). `detail` is the same text that follows `refused: ` in the log line |
+| `refused` | `reason` is `unmanaged`, `detail` is `the configuration in force has no managed object` | The running configuration has no `managed`. It is refused without starting a reload |
+| `busy` | `{"result":"busy","reason":..,"managed":..}` | `starting` (before the listeners are bound), `reload under way` (a reload by SIGHUP or by another `reload` is in progress, or this request's reload did not end within its waiting time; in that case too, the reload continues), `too many orders`, `stopping` |
 
-- `reload` の依頼は、稼働中の設定の `forward.resolve_timeout_ms` に 5 秒を足した時間まで応答を待ちます。
-- 依頼のバージョンは、64 桁の小文字の 16 進数だけを受け付け（ほかは `bad managed`）、managed ストアの外を指せません。この依頼でできることは、同じ OS ユーザーが `current` を書いて SIGHUP を送るのと同じです。
-- `reload` の依頼で始めたリロードは、SIGHUP と同じように `tukuyomi_config_reloads_total` に数えます。リロードを始めなかった依頼（`busy`、`unmanaged`、`error`）は数えません。
-- 依頼でリロードを始めるときに、ログに `reload: control reload <version>` の行を出し、応答ごとに `control: reload <version>: <result> (<reason>)` の行を 1 つ出します（`replaced` には `(<reason>)` がありません）。待つ時間が尽きて `busy` で応答した依頼は、リロードが終了したときにもう 1 つ出ます。
-- 管理プロセスがこの依頼で反映する手順は、下の「managed 設定」の「反映」を参照してください。
+- A `reload` request waits for the response for the running configuration's `forward.resolve_timeout_ms` plus 5 seconds.
+- The version in the request must be 64 lowercase hexadecimal digits (anything else is `bad managed`), and cannot point outside the managed store. What this request can do is the same as what the same OS user can do by writing `current` and sending SIGHUP.
+- A reload started by a `reload` request is counted in `tukuyomi_config_reloads_total`, as with SIGHUP. A request that did not start a reload (`busy`, `unmanaged`, `error`) is not counted.
+- When a request starts a reload, the log gets a `reload: control reload <version>` line, and one `control: reload <version>: <result> (<reason>)` line for each response (`replaced` has no `(<reason>)`). For a request that got the response `busy` because the waiting time ran out, one more line is written when the reload ends.
+- For how the admin process uses this request to apply a configuration, see "Applying" under "Managed Configuration" below.
 
-### 値どうしの関係
+### Relations Between Values
 
-起動と `config check` は、値の範囲のほかに、次の関係を検証します。
+Besides the range of each value, start and `config check` check the following relations.
 
-| 関係 | 理由 |
+| Relation | Reason |
 |---|---|
-| `inspect_body ≤ max_body` | 検査するのはボディの先頭 |
-| `max_body ≤ max_body_wire ≤ 2 × max_body + 4 MiB` | chunked のボディは、チャンクのサイズ行と区切りの分も回線に載ります |
-| `max_buffered_bytes ≥ 2 × inspect_body + 24 KiB + 32 KiB` | 1 つのリクエストがバッファリングする最大: 検査する先頭、検査カーネルの写し、ヘッダーフィールド、流している途中の断片 |
-| `routes[].max_body ≤ max_body` | ルートは下げるだけ |
-| `http2.max_header_list ≤ 4 × max_head_bytes` | 展開した後のヘッダーフィールドのサイズ |
-| `connection_window + max_streams × (send_buffer + 32 KiB) ≤ 16 MiB` | 1 本の HTTP/2 の接続が保持できる量 |
-| 上に `max_streams × (max_header_list + upstream_max_head_bytes)` を足しても 16 MiB 以下 | 同上（ストリームごとのヘッダーフィールドと、アップストリームから読み込む断片） |
-| `upstream_head_wire ≥ 2 × upstream_max_head_bytes` | アップストリームのヘッダー部の読み込み |
-| `drive_slice ≤ tick` | ドライバーの 1 回は、検査カーネルの 1 ステップより短い |
-| `ready_wait ≥ hello_wait` | 準備の待ち時間は、検査プロセスの最初のメッセージを待つ時間を含みます |
-| `head_read ≤ request_total`、`body_read ≤ request_total` | リクエストの時間内の段階 |
-| `inspect_wait ≥ wait_deadline + 2 × verdict_wait + 18 × (drive_slice + frame_io)` | 1 つの検査に必要な最短の時間 |
-| `inspect_wait ≤ request_total` | リクエストの時間内の段階 |
-| `upstream_connect + upstream_header < request_total` | アップストリームとのやり取りの 2 つの段階は、リクエストの時間の中で終了します。`upstream_header` は、`response_idle` より長くしても、ボディをバッファリングするリクエストでは効きません（上の `response_idle_ms`） |
-| `request_total ≤ conn_total`、`response_idle ≤ conn_total`、`keepalive_timeout ≤ conn_total` | 接続の時間内の段階 |
-| `upstream_keepalive_timeout ≤ response_idle` | 再利用を待つ接続にも、読み込みのアイドルの上限が適用されます |
-| `keepalive_time + request_total ≤ conn_total` | `keepalive_time` の前に始まったリクエストは、接続の時間内に応答のヘッダー部を受信します |
-| `lingering_timeout ≤ lingering_time` | 閉じる前の読み込み |
-| `stop_inspect < stop_wait`、`stop_inspect + kill_grace < stop_wait` | 停止の段階の順 |
-| `wait_queue ≤ max_conns` | 1 つの接続が持つ検査は 1 つ |
-| `kernel.records ≥ slots + wait_queue` | 検査カーネルのレコード |
-| `tick ≤ 1 s`、`tick` はほかの検査カーネルのどの時間以下 | 検査カーネルの 1 ステップ |
-| アップストリームの `engine` と `kernel.default_engine` は、検査プロセスが設定にあるエンジンだけ（`modsecurity` には `kernel.engines` が必要です） | 検査プロセスの無いエンジンでは、検査できません |
-| 同じアドレスのサーバーを持つアップストリームは、どれも同じエンジン | クライアントが `Host` を選ぶだけで、同じサーバーへ届くアップストリームのうち、最も弱いエンジンやモードのものを通れてしまうためです（下の「検査エンジンの選択」） |
-| 国の指定（全体の `access`、`host_policies` の `access`、ルートの `access` の `deny_countries`・`allow_countries`）があれば `geo` もあります | 国を判定するデータベースが必要です |
-| `rules.store.dir`、`records.dir`、`admin.store.dir`、`admin.control` のあるディレクトリは、互いに同じでなく、どれも他の中にありません。`admin.control` 自身は前の 3 つの中にありません | 一方のローテーションや書き換えが、他方の内容を置き換えないため |
-| `managed.dir` は、上の 4 つのディレクトリと同じでなく、どれの中にもなく、どれを含むこともありません | 同上 |
-| `acme.challenge_dir` は、上の 5 つ（`managed.dir` を含みます）と同じでなく、どれの中にもなく、どれを含むこともありません。`managed` の無い設定でも同じです | `acme renew` はチャレンジのファイルを置き換えて削除します。チャレンジの応答に、ほかのディレクトリの中のファイルを返さないため |
-| `managed` のある設定では、`acme.account_key_file`・`acme.ca_file`、`admin.route` の `cert_file`・`key_file` は `managed.dir` の中にありません | `acme renew` が managed ストアの中の名前を上書きしないため |
-| `admin.listen` は `proxy.listeners` と `status.listen` に重なりません | 同じポートを 2 つのリスナーでバインドできません |
-| ルートの `records` が `required` なら `records` があります | 残す先のファイルが必要です |
-| `records.ship` があり、`records.keep` かルートの `records` に `required` があれば `records.files ≥ 3` | ログ送信プロセスの遅れでリクエストを拒否するしきい値（ファイル `files − 2` 個分）が 0 にならないため |
+| `inspect_body ≤ max_body` | What is inspected is the first part of the body |
+| `max_body ≤ max_body_wire ≤ 2 × max_body + 4 MiB` | A chunked body also carries the chunk size lines and delimiters on the wire |
+| `max_buffered_bytes ≥ 2 × inspect_body + 24 KiB + 32 KiB` | The most that one request buffers: the first part to be inspected, the copy for the inspection kernel, the header fields, and the piece being streamed |
+| `routes[].max_body ≤ max_body` | A route can only lower it |
+| `http2.max_header_list ≤ 4 × max_head_bytes` | The size of the header fields after expansion |
+| `connection_window + max_streams × (send_buffer + 32 KiB) ≤ 16 MiB` | The amount that one HTTP/2 connection can hold |
+| The above plus `max_streams × (max_header_list + upstream_max_head_bytes)` is also at most 16 MiB | Same as above (the header fields of each stream, and the piece read from the upstream) |
+| `upstream_head_wire ≥ 2 × upstream_max_head_bytes` | Reading the header section from the upstream |
+| `drive_slice ≤ tick` | One turn of the driver is shorter than one step of the inspection kernel |
+| `ready_wait ≥ hello_wait` | The wait for readiness includes waiting for the inspector process's first message |
+| `head_read ≤ request_total`, `body_read ≤ request_total` | Stages within the request time |
+| `inspect_wait ≥ wait_deadline + 2 × verdict_wait + 18 × (drive_slice + frame_io)` | The shortest time that one inspection needs |
+| `inspect_wait ≤ request_total` | A stage within the request time |
+| `upstream_connect + upstream_header < request_total` | The two stages of the exchange with the upstream end within the request time. Making `upstream_header` longer than `response_idle` has no effect for a request whose body is buffered (see `response_idle_ms` above) |
+| `request_total ≤ conn_total`, `response_idle ≤ conn_total`, `keepalive_timeout ≤ conn_total` | Stages within the connection time |
+| `upstream_keepalive_timeout ≤ response_idle` | The read idle limit also applies to a connection that waits to be reused |
+| `keepalive_time + request_total ≤ conn_total` | A request that started before `keepalive_time` receives the response header section within the connection time |
+| `lingering_timeout ≤ lingering_time` | Reading before closing |
+| `stop_inspect < stop_wait`, `stop_inspect + kill_grace < stop_wait` | The order of the stop stages |
+| `wait_queue ≤ max_conns` | One connection holds one inspection |
+| `kernel.records ≥ slots + wait_queue` | The records of the inspection kernel |
+| `tick ≤ 1 s`, and `tick` is at most any other time of the inspection kernel | One step of the inspection kernel |
+| An upstream's `engine` and `kernel.default_engine` can only be engines for which the configuration has an inspector process (`modsecurity` needs `kernel.engines`) | An engine without an inspector process cannot inspect |
+| Upstreams that have servers with the same address all have the same engine | Otherwise, a client could reach the same server through the upstream with the weakest engine or mode just by choosing `Host` (see "Choosing the Inspection Engine" below) |
+| If there is a country list (`deny_countries` or `allow_countries` in the global `access`, in the `access` of `host_policies`, or in the `access` of a route), `geo` is also present | A database is needed to look up countries |
+| `rules.store.dir`, `records.dir`, `admin.store.dir`, and the directory of `admin.control` are not the same as one another, and none is inside another. `admin.control` itself is not inside any of the first three | Prevents rotating or rewriting one from replacing the contents of another |
+| `managed.dir` is not the same as any of the four directories above, is not inside any of them, and does not contain any of them | Same as above |
+| `acme.challenge_dir` is not the same as any of the five above (including `managed.dir`), is not inside any of them, and does not contain any of them. This also applies without `managed` | `acme renew` replaces and deletes the challenge files, and a challenge response must never return a file inside another directory |
+| With `managed`, `acme.account_key_file`, `acme.ca_file`, and the `cert_file` and `key_file` of `admin.route` are not inside `managed.dir` | Keeps `acme renew` from overwriting a name inside the managed store |
+| `admin.listen` does not overlap `proxy.listeners` and `status.listen` | The same port cannot be bound by two listeners |
+| If `records` of a route is `required`, `records` is present | A file to keep the logs in is needed |
+| If `records.ship` is present and `records.keep` or the `records` of a route has `required`, `records.files ≥ 3` | Keeps the threshold at which requests are refused because the records shipper lags (`files − 2` files) from becoming 0 |
 
-- 時間の関係は `_ms` を除いた名前で書きました。
+- In the time relations, the setting key names are written without `_ms`.
 
-## リクエストボディの上限と検査する長さ
+## Request Body Limits and Inspected Length
 
-- 推奨値は、`max_body` が 100 MiB、`inspect_body` が 16 KiB です。`inspect_body` は、検査の負荷を測定してから決め直す予定です。
-  - 1 vCPU のホストでは、1 MiB 近い JSON の検査に約 7 秒かかりました。
-  - 検査の時間が `verdict_wait_ms` を超えると、リクエストは 503 になります。検査プロセスは、503 を返した後も、その検査が終わるまで CPU を使います。
-  - さらに `stop_after_ms` を超えると、検査プロセスは停止され、再起動します。その間は、そのエンジンへのほかのリクエストも 503 になり、再起動の回数（`restarts`）も使います。
-- ボディが `inspect_body` で終わる場合は、全体をバッファリングして検査し、検査した形で転送します。
-- 長いボディは、先頭の `inspect_body` バイトだけを検査します。許可されたら、残りをクライアントが送るとおりにアップストリームへ流します（バッファリングしません）。
-  - 先頭より後ろは検査しません。
-  - 流すボディは、クライアントが使ったメッセージの区切り（framing、長さか chunked）のまま送ります。
-- 検査除外のルートのボディは、`inspect_body` で終わればバッファリングして転送し、長ければ同じく流します。
-- gzip のボディ:
-  - 検査するルート: 全体をバッファリングして伸長します。gzip のままの長さも、伸長した長さも、`inspect_body`（ルートの `max_body` がそれより小さければ、その値）までです。どちらかが超えれば 413 です。gzip として読めないボディ、gzip の後ろに続くバイト、空の gzip のボディは 400 です。伸長したボディを `Content-Encoding` なしで検査し、そのまま転送します。
-  - 検査除外のルート: 伸長しません。ほかのボディと同じに扱い、上限は gzip のままの長さで数えます。
-- chunked のボディを流している途中で `max_body` を超えたときは、413 を返せません（アップストリームへ送り始めているためです）。アップストリームへのリクエストを切り、クライアントの接続を閉じ、ログに理由を書きます。
-- 予算（`max_buffered_bytes`）:
-  - ボディを流す 1 つのリクエストが持つのは、検査の間は、先頭の `inspect_body`、検査カーネルの写し（先頭とヘッダーフィールド）、流すための小さなバッファー（32 KiB）です。判定が出た後は、先頭の `inspect_body` と 32 KiB のバッファーだけになります。ボディの長さでは増えません。検査除外のルートには、検査カーネルの写しはありません。
-  - 同時に進むリクエストの数だけ必要なので、予算は、同時に来ると見込む最大の数に合わせて決めます。
-  - 予算の外にも、アップストリームの接続の読み込みバッファー（`upstream_max_head_bytes` まで）に、流しているボディが入ります。ボディの長さでは増えませんが、同時に流すリクエストの数だけ増えます。
-  - HTTP/2 のウィンドウとバッファーも予算の外です（上の `http2`）。
-- 大きなリクエストの送信時間:
-  - `request_total_ms` は、ボディを受け終えて応答のヘッダー部が来るまでを含みます。たとえば 100 MiB を 60 秒（`request_total_ms` 60000）で受けるには、約 14 Mbit/s が必要です。大きなリクエストを受けるなら、回線の速さに合わせて大きくします。
-  - `upstream_header_ms` は、ボディの最後の断片をアップストリームへ渡してから数えます。アップストリームが大きなリクエストを長く処理するなら、大きくします。
-  - ボディを流している間、クライアントからの読み込みの間隔は `body_read_ms` までです。
+- The recommended values are 100 MiB for `max_body` and 16 KiB for `inspect_body`. We plan to review `inspect_body` after the inspection load has been measured.
+  - On a host with 1 vCPU, inspecting a JSON body of almost 1 MiB took about 7 seconds.
+  - If the inspection takes longer than `verdict_wait_ms`, the request gets 503. The inspector process keeps using CPU until that inspection finishes, even after the 503 has been returned.
+  - If the inspection also exceeds `stop_after_ms`, the inspector process is stopped and restarted. Until the restart is complete, other requests to that engine also get 503. The restart also counts toward the number of restarts (`restarts`).
+- If a body ends within `inspect_body`, the proxy buffers the whole body, inspects it, and forwards it in the inspected form.
+- For a longer body, only the first `inspect_body` bytes are inspected. If the request is allowed, the rest is passed to the upstream as the client sends it (without buffering).
+  - Nothing after the first part is inspected.
+  - A streamed body is sent with the message framing the client used (length or chunked).
+- The body of a bypass route is buffered and forwarded if it ends within `inspect_body`, and streamed in the same way if it is longer.
+- gzip bodies:
+  - Inspected routes: The proxy buffers and decompresses the whole body. Both the gzip length and the decompressed length can be at most `inspect_body` (or the route's `max_body`, if that is smaller). If either exceeds it, the response is 413. A body that cannot be read as gzip, bytes that follow the gzip data, and an empty gzip body get 400. The proxy inspects the decompressed body without `Content-Encoding` and forwards it as it is.
+  - Bypass routes: The proxy does not decompress the body. It is handled like other bodies, and the limit applies to the gzip length.
+- If `max_body` is exceeded while a chunked body is being streamed, the proxy cannot return 413 (it has already started sending to the upstream). It cuts the request to the upstream, closes the client connection, and writes the reason to the log.
+- Budget (`max_buffered_bytes`):
+  - A request that streams its body holds the following. During inspection: the first `inspect_body` bytes, the inspection kernel's copy (the first part and the header fields), and a small buffer for streaming (32 KiB). After the verdict: only the first `inspect_body` bytes and the 32 KiB buffer. This does not grow with the length of the body. A bypass route has no copy for the inspection kernel.
+  - This amount is needed for each request in progress at the same time, so size the budget for the largest number of simultaneous requests you expect.
+  - Outside the budget, the streamed body also occupies the upstream connection's read buffer (up to `upstream_max_head_bytes`). It does not grow with the length of the body, but it grows with the number of requests streamed at the same time.
+  - The HTTP/2 windows and buffers are also outside the budget (see `http2` above).
+- Time to send large requests:
+  - `request_total_ms` covers the time until the response header section arrives, including the time to receive the body. For example, receiving 100 MiB in 60 seconds (`request_total_ms` 60000) requires about 14 Mbit/s. If you accept large requests, set it larger to match the line speed.
+  - `upstream_header_ms` is counted from the moment the last piece of the body is handed to the upstream. Set it larger if the upstream takes a long time to process large requests.
+  - While the body is being streamed, the interval between reads from the client can be at most `body_read_ms`.
 
-## ルールセットと世代
+## Rule Sets and Generations
 
-- 世代は、`rules import` が作るルールセットの一式で、フィンガープリント（マニフェストの SHA-256）で呼びます。作った後は変えません。
-- 世代は、ルールを検査するエンジンも持ちます（`rules import --engine`。省けば、`kernel.default_engine` のエンジン。書かなければ `coraza`）。このビルドが持つエンジンは `coraza`（Coraza）と `modsecurity`（ModSecurity v3）です。同じファイルでも、エンジンが違えばマニフェストが変わり、別の世代（別のフィンガープリント）になります。`modsecurity` の世代は、設定の `kernel.engines` に検査プロセスがあるときだけ、インポート、選択、起動ができます。
-- 「検査プロセスが追加する設定とルール」は、Coraza の世代の決まりです。ModSecurity の世代の決まりは、「ModSecurity の世代」を参照してください。
-- ルールストアの内容:
-  - `generations/<fingerprint>/`: 世代
-  - `current.<engine>`（`current.coraza`、`current.modsecurity`）: エンジンごとに選択した世代。以前のバージョンが書いた `current` も読みます（下の「エンジンごとの選択中の世代」）
-  - `current.<engine>.new`: 選択の途中で止まったときの残り。次の同じエンジンの選択が片付けます
-  - `using/<fingerprint>`: 使用中の目印
-  - `staging/`: インポートの途中
-  - `lock`: コマンドのロック
-- コマンドと管理プロセスは、一度に 1 つだけがルールストアを変更できます。途中で止まったコマンドの残りは、次のコマンドが片付けます。
-- フィンガープリントが検出するのは、事故による破損と取り違え、動作中のプロキシが保持しているフィンガープリントと中身が違う起動です。同じ OS ユーザーのプロセス（検査プロセスも同じ OS ユーザー）がルールストアを書き換えることは防ぎません。再起動をまたいだ認証でもありません。
-- 起動の後に使っている世代のファイルが壊れると、検査プロセスの次の再起動が失敗します（ファイルがマニフェストと違えば exit 11、マニフェストが変わればフィンガープリントの不一致）。そのとき、検査カーネルは決定的な失敗として停止し、プロキシも停止します。
+- A generation is a complete rule set created by `rules import`. It is identified by its fingerprint (the SHA-256 of the manifest). It does not change after it is created.
+- A generation also records the engine that inspects requests with its rules (`rules import --engine`; if omitted, the engine of `kernel.default_engine`; if that is not set, `coraza`). The engines in this build are `coraza` (Coraza) and `modsecurity` (ModSecurity v3). The same files give a different manifest under a different engine, and so a different generation (a different fingerprint). A `modsecurity` generation can be imported, chosen, and started only when `kernel.engines` in the configuration has an inspector process.
+- "Settings and Rules Added by the Inspector" applies to Coraza generations. For ModSecurity generations, see "ModSecurity Generations".
+- Contents of the rules store:
+  - `generations/<fingerprint>/`: the generations
+  - `current.<engine>` (`current.coraza`, `current.modsecurity`): the generation chosen for each engine. A `current` written by an earlier version is also read (see "Chosen Generation per Engine" below)
+  - `current.<engine>.new`: what is left over when choosing a generation stopped halfway. The next choice for the same engine cleans it up
+  - `using/<fingerprint>`: the marker for a generation in use
+  - `staging/`: an import in progress
+  - `lock`: the lock for commands
+- Only one command or admin process at a time can change the rules store. The next command cleans up what a command that stopped halfway left behind.
+- The fingerprint detects accidental corruption and mix-ups, and a start whose contents differ from the fingerprint held by the running proxy. It does not prevent a process running as the same OS user (the inspector process runs as the same OS user) from rewriting the rules store. It is not authentication across restarts either.
+- If a file of a generation in use is corrupted after the start, the next restart of the inspector process fails (exit 11 if a file differs from the manifest, a fingerprint mismatch if the manifest has changed). The inspection kernel then stops, treating this as a failure that a restart cannot fix, and the proxy also stops.
 
-### 検知のみのモード
+### Detect-Only Mode
 
-- `rules import --detect-only` で作った世代は、ルールに一致したリクエストも通します。リクエストのログは `class` が `forwarded`、`reason` が `detected by a rule` で、`rule` には、一致したルールの ID が入ります。
-- 遮断の世代と同じルールのファイルで、ブロックするかどうかだけが違います。最初はこの形で動かし、誤検知を確認し、除外を追加してから、遮断の世代をインポートし直すことをおすすめします。
-- 検知のみの世代でも、下の「検査プロセスが追加する設定とルール」のルールはブロックします。
-- Coraza の検知のみの世代は、ルールの前と後に目印のルール（ID 4000010、4000011）を追加します。運用者のルールでこれを削除したりスキップしたりすると、そのリクエストは検査できないとして 503 になります。黙ってブロックや素通しにはなりません。ModSecurity の世代は、目印のルールを追加しません。
+- A generation created with `rules import --detect-only` also lets requests that match a rule through. In the request log, `class` is `forwarded`, `reason` is `detected by a rule`, and `rule` holds the ID of the matching rule.
+- It uses the same rule files as a generation in block mode; the only difference is whether it blocks. We recommend running in this form first, checking for false positives, adding exclusions, and then importing the generation in block mode again.
+- Even a detect-only generation blocks on the rules in "Settings and Rules Added by the Inspector" below.
+- A Coraza detect-only generation adds marker rules (IDs 4000010 and 4000011) before and after the rules. If an operator's rule removes or skips them, the request cannot be inspected and gets 503. It is never silently blocked or passed through. A ModSecurity generation does not add marker rules.
 
-### 検査プロセスが追加する設定とルール
+### Settings and Rules Added by the Inspector
 
-運用者のルールの後に、検査プロセスが次を追加します。運用者のルールで変更することはできません。
+The inspector process adds the following after the operator's rules. Operator rules cannot change them.
 
-- 検査エンジンは On です。ボディを読みます。ボディの上限を超えたら拒否します。JSON の入れ子は 64 段までです。
-- ルール ID 4000001〜4000003（順に、ボディの解析の失敗、引数の数の上限、URI の解析の失敗でブロックします）は、すべての世代で検査プロセスが使います。4000010・4000011 は、検知のみの世代で使います。運用者のルールで同じ ID を使うと、その世代のルールセットを組み立てられません。遮断の世代では 4000010・4000011 を使っても組み立てられますが、検知のみの世代にインポートし直せなくなるので、使わないでください。
-- 次のものを含むルールは受け付けません。判定は文字の並びだけで、大文字と小文字を区別せず、`msg` の中の語にも一致します。
-  - `Include`、`SecIgnoreRuleCompilationErrors`（引数が `Off` でも）
-  - 名前が `SecAuditLog`・`SecDebugLog`・`SecUpload` で始まるディレクティブ
-  - `ctl:ruleEngine`・`ctl:requestBodyAccess`・`ctl:requestBodyLimit`
-  - `@inspectFile`・`@rbl`・`setenv:`
-  - 変数の名前 `reserved_body_cut`
-- 運用者のルールがボディの処理（`ctl:requestBodyProcessor` など）を変更したり、上のルールを実行時に外したりして、検査が終わったと検証できないリクエストは、503 になります。ModSecurity の世代で、ほかに検査できないとするリクエストは、「ModSecurity の世代」を参照してください。
+- The inspection engine is On, it reads the body, and it refuses a body that exceeds the body limit. JSON nesting is limited to 64 levels.
+- The inspector process uses rule IDs 4000001 to 4000003 in all generations (in order, they block on a body parse failure, on reaching the limit on the number of arguments, and on a URI parse failure). 4000010 and 4000011 are used in detect-only generations. If an operator's rule uses the same ID, the rule set of that generation cannot be built. In a generation in block mode, a rule set that uses 4000010 or 4000011 can be built, but it can no longer be imported again as a detect-only generation, so do not use them.
+- A rule that contains any of the following is rejected. The check looks only at the character sequence, ignores case, and also matches words inside `msg`.
+  - `Include`, `SecIgnoreRuleCompilationErrors` (even if the argument is `Off`)
+  - Directives whose names start with `SecAuditLog`, `SecDebugLog`, or `SecUpload`
+  - `ctl:ruleEngine`, `ctl:requestBodyAccess`, `ctl:requestBodyLimit`
+  - `@inspectFile`, `@rbl`, `setenv:`
+  - The variable name `reserved_body_cut`
+- If an operator's rule changes body processing (for example with `ctl:requestBodyProcessor`) or removes one of the rules above at run time, so that the proxy cannot verify that inspection has finished, the request gets 503. For other requests that a ModSecurity generation treats as uninspectable, see "ModSecurity Generations".
 
-### 運用者の責任範囲
+### Operator Responsibilities
 
-- `ctl:ruleRemoveById`、`SecRuleRemoveById` などで、ブロックするルールを意図的に外すことは、運用者の判断に任せ、拒否しません。
-- ただし Coraza の世代では、`SecRuleRemoveByMsg` は、前に `SecMarker` があると Coraza が異常終了し、ルールセットを組み立てられません（exit 11）。CRS は `SecMarker` を多く使うので、CRS と一緒には使えません。
-- インポートと検査プロセスが検出するのは、マーカーの事故（存在しないマーカーや前にあるマーカーへの `skipAfter`、名前の打ち間違い）だけです。
-- Coraza の推奨設定にある、`REQBODY_ERROR`・`MULTIPART_STRICT_ERROR` を見るルール（200002、200003）を運用者が追加すると、先頭で切ったボディもブロックします。ボディの途中で切ると、解析が失敗することがあるためです。
-  - 検査プロセスのルール 4000001 は、切ったボディの解析の失敗ではブロックしません。
-  - CRS 4.23.0 には、これに該当するルールはありません。
-- CRS のデフォルトは、`application/<name>+json` のボディをブロックします。受け付ける場合は、インポートの前に `crs-setup.conf` で受け付ける型に追加します。
+- Intentionally removing blocking rules with `ctl:ruleRemoveById`, `SecRuleRemoveById`, and so on is left to the operator's judgment and is not refused.
+- However, in a Coraza generation, if a `SecMarker` comes before `SecRuleRemoveByMsg`, Coraza terminates abnormally and the rule set cannot be built (exit 11). CRS uses many `SecMarker`s, so `SecRuleRemoveByMsg` cannot be used together with CRS.
+- The import and the inspector process detect only `SecMarker` mistakes (a `skipAfter` to a `SecMarker` that does not exist or comes earlier, a mistyped name).
+- Parsing can fail when a body is cut in the middle. So if an operator adds the rules that look at `REQBODY_ERROR` and `MULTIPART_STRICT_ERROR` (200002, 200003) from Coraza's recommended configuration, those rules also block a body that was cut to its first part.
+  - Rule 4000001 of the inspector process does not block on a parse failure of a cut body.
+  - CRS 4.23.0 has no rule of this kind.
+- By default, the CRS blocks `application/<name>+json` bodies. To accept them, add the types to the accepted types in `crs-setup.conf` before the import.
 
-### ModSecurity の世代
+### ModSecurity Generations
 
-`rules import --engine modsecurity` で作る世代は、libmodsecurity（ModSecurity v3.0.17）でリクエストを検査します。検査プロセスは別の実行ファイル（`tukuyomi-inspector-modsecurity`）で、設定の `kernel.engines.modsecurity.inspector` に書きます（[ビルドと配置](../build/binary-deployment.md)）。インポートの手順、事前検証、`--detect-only`、検査除外のルート、CRS のインポートは、Coraza の世代と同じです。アップストリームごとにエンジンを選ぶ設定では、同じリクエストでも、エンジンによって結果が違うことがあります。違いはこの節の後半にまとめています（エンジンの選び方は、下の「検査エンジンの選択」を参照してください）。
+A generation created with `rules import --engine modsecurity` inspects requests with libmodsecurity (ModSecurity v3.0.17). The inspector process is a separate executable (`tukuyomi-inspector-modsecurity`), set in `kernel.engines.modsecurity.inspector` in the configuration (see the [build and deployment guide](../build/binary-deployment.md)). The import procedure, the trial, `--detect-only`, bypass routes, and the CRS import are the same as for Coraza generations. When the engine is chosen per upstream, the same request can give a different result depending on the engine. The differences are summarized in the second half of this section (for how to choose an engine, see "Choosing the Inspection Engine" below).
 
-検査プロセスが追加する設定とルール（運用者のルールで変更することはできません）:
+Settings and rules added by the inspector process (operator rules cannot change them):
 
-- 検査エンジンは On、ボディの読み込みは有効、JSON の入れ子は 64 段までです。この 3 つは、検査プロセスが運用者のルールより先に設定します。ModSecurity は最初に設定された値を使うので、ルールに `SecRuleEngine`・`SecRequestBodyAccess`・`SecRequestBodyJsonDepthLimit` を書いても効きません。
-- ボディと引数の上限は、ModSecurity には設定せず、検査プロセスが自分で数えます。引数の数は、クエリ、フォームのボディ、JSON のボディのそれぞれで 1000 までで、超えるとルール 4000002 でブロックします（JSON は、値の数と空でない配列の数を別々に数えます）。multipart のボディは数えません。
-- ルール ID 4000001〜4000011 は、検査プロセスのために空けてあります。運用者のルールが使うと、モードを問わず、その世代のルールセットを組み立てられません。ModSecurity の世代は、検知のみの世代でも目印のルール（4000010、4000011）を追加しません。
-- ルール ID 4000001（ボディの解析の失敗）、4000002（引数の数の上限）、4000003（URI の解析の失敗）でブロックします。検知のみの世代でもブロックします。4000001 は、検査する長さで切ったボディではブロックしません。
+- The inspection engine is On, body reading is enabled, and JSON nesting is limited to 64 levels. The inspector process sets these three before the operator's rules. ModSecurity uses the value that was set first, so writing `SecRuleEngine`, `SecRequestBodyAccess`, or `SecRequestBodyJsonDepthLimit` in a rule has no effect.
+- The limits on the body and the arguments are not set in ModSecurity. The inspector process counts them itself. The number of arguments is limited to 1000 each for the query, a form body, and a JSON body. Above that, rule 4000002 blocks (for JSON, the number of values and the number of non-empty arrays are counted separately). A multipart body is not counted.
+- Rule IDs 4000001 to 4000011 are reserved for the inspector process. If an operator's rule uses one of them, the rule set of that generation cannot be built, whatever the mode. A ModSecurity generation does not add the marker rules (4000010, 4000011), even in a detect-only generation.
+- Rules 4000001 (body parse failure), 4000002 (limit on the number of arguments), and 4000003 (URI parse failure) block, even in a detect-only generation. 4000001 does not block a body that was cut at the inspected length.
 
-インポートの事前検証で、検査プロセスは、ルールのファイルを読んで検証します。次のものがあると、検査プロセスは起動せず（exit 11）、インポートは失敗します。標準エラーの `rules import: the inspector said:` の行（管理 API では `trial` の `detail`）に、理由の文と、ルールのファイルの名前が出ます。ModSecurity が読める書き方でも、検証できる決まった書き方でなければ受け付けないので、害の無いルールを受け付けないことがあります。
+In the import trial, the inspector process reads and checks the rule files. If any of the following is present, the inspector process does not start (exit 11) and the import fails. A line that starts with `rules import: the inspector said:` on standard error (the `detail` of `trial` in the admin API) gives the reason and the name of the rule file. Even syntax that ModSecurity can read is rejected unless it is in the fixed form that can be checked, so a harmless rule may be rejected.
 
-- ファイル: 行の終わりに CR があるもの（CRLF の改行）、NUL を含むもの、最後が改行で終わらないもの
-- 書き方: 決まった書き方でないもの。たとえば、`phase:'request'` のようにフェーズを引用符で囲んだものです。
-- ディレクティブ: 使えるのは、`SecRule`、`SecAction`、`SecDefaultAction`、`SecMarker`、`SecRuleRemoveById`・`SecRuleRemoveByTag`・`SecRuleRemoveByMsg`、`SecRuleUpdateTargetById`・`SecRuleUpdateTargetByTag`・`SecRuleUpdateTargetByMsg`、`SecRuleEngine`・`SecRequestBodyAccess`・`SecRequestBodyJsonDepthLimit`（受け付けますが効きません）、`SecComponentSignature`、`SecAuditEngine Off`、レスポンスボディのディレクティブ（`SecResponseBodyAccess`・`SecResponseBodyLimit`・`SecResponseBodyLimitAction`・`SecResponseBodyMimeType`・`SecResponseBodyMimeTypesClear`）です。ほかは受け付けません。たとえば次のものです。
-  - `Include`、名前が `SecRemoteRules` で始まるディレクティブ、`SecIgnoreRuleCompilationErrors`
-  - 名前が `SecAuditLog`・`SecDebugLog`・`SecUpload` で始まるディレクティブ、`SecTmpSaveUploadedFiles`、`SecDataDir`、`SecTmpDir`
-  - ボディと引数の上限を決めるディレクティブ（`SecRequestBodyLimit`・`SecRequestBodyNoFilesLimit`・`SecRequestBodyLimitAction`・`SecRequestBodyInMemoryLimit`・`SecArgumentsLimit`）
-  - ModSecurity が知らないディレクティブ
-- アクション: 使えるのは、`accuracy`・`allow`・`auditlog`・`block`・`capture`・`chain`・`ctl`・`deny`・`drop`・`expirevar`・`id`・`initcol`・`log`・`logdata`・`maturity`・`msg`・`multiMatch`・`noauditlog`・`nolog`・`pass`・`phase`・`redirect`・`rev`・`setrsc`・`setsid`・`setuid`・`setvar`・`severity`・`skip`・`skipAfter`・`status`・`t`・`tag`・`ver`・`xmlns` です。`exec` と `setenv` を含め、ほかは受け付けません。
-  - `ctl` で使えるのは、`auditEngine`・`auditLogParts`・`forceRequestBodyVariable`・`parseXmlIntoArgs`・`requestBodyProcessor`・`ruleRemoveById`・`ruleRemoveByTag`・`ruleRemoveTargetById`・`ruleRemoveTargetByTag` です。`ruleEngine`・`requestBodyAccess`・`requestBodyLimit` を含め、ほかは受け付けません。
-  - リクエストをブロックするアクション（`deny`・`drop`・`redirect`・`block`）と `nolog`・`noauditlog` を、同じルールに書くと受け付けません。どのルールがブロックしたかが分からなくなるためです。`SecDefaultAction` に `nolog`・`noauditlog` や `skipAfter` を書くことも受け付けません。
-  - `skipAfter` が指す `SecMarker` が、その後ろ（同じファイルか、後に読み込むファイル）に無いときは受け付けません。
-- 演算子: `@inspectFile`・`@rbl`・`@validateDTD`・`@validateSchema`・`@fuzzyHash`・`@geoLookup`・`@gsbLookup`・`@rsub`・`@validateHash` は受け付けません。ファイルを読む演算子（`@pmFromFile`・`@pmf`・`@ipMatchFromFile`・`@ipMatchF`）は、ルールセットの中にあるファイルを、英数字・`.`・`_`・`-` だけのパスで書いたときだけ使えます。パスは、ルールセットの中のパス（`rules/<name>` など）か、そのルールファイルがあるディレクトリからのパスです。
-- 変数と長さ: 変数 `ENV` は受け付けません。1 つの変数の並びは 256 個まで、`chain` でつなぐルールは 64 個までです。
-- 文字の並び: 上の読み取りとは別に、ルールの文字から空白と引用符を除き、大文字と小文字を区別せずに、`ctl:ruleEngine`・`ctl:requestBodyAccess`・`ctl:requestBodyLimit`・`exec:`・`setenv:`・`@inspectFile`・`@rbl`・`@validateDTD`・`@validateSchema`・`@fuzzyHash` を探します。`msg` の中にあっても受け付けません。
-- 読み取りとの不一致: 検査プロセスは、ModSecurity が組み立てたルールを、読み取った内容と照合します。一致しないルールは受け付けません。
+- Files: a file with CR at the end of a line (CRLF line endings), a file that contains NUL, and a file that does not end with a newline
+- Syntax: anything not in the fixed form. For example, a phase in quotes such as `phase:'request'`.
+- Directives: the directives you can use are `SecRule`, `SecAction`, `SecDefaultAction`, `SecMarker`, `SecRuleRemoveById`, `SecRuleRemoveByTag`, `SecRuleRemoveByMsg`, `SecRuleUpdateTargetById`, `SecRuleUpdateTargetByTag`, `SecRuleUpdateTargetByMsg`, `SecRuleEngine`, `SecRequestBodyAccess`, `SecRequestBodyJsonDepthLimit` (accepted but without effect), `SecComponentSignature`, `SecAuditEngine Off`, and the response body directives (`SecResponseBodyAccess`, `SecResponseBodyLimit`, `SecResponseBodyLimitAction`, `SecResponseBodyMimeType`, `SecResponseBodyMimeTypesClear`). Others are rejected. For example:
+  - `Include`, directives whose names start with `SecRemoteRules`, `SecIgnoreRuleCompilationErrors`
+  - Directives whose names start with `SecAuditLog`, `SecDebugLog`, or `SecUpload`, `SecTmpSaveUploadedFiles`, `SecDataDir`, `SecTmpDir`
+  - Directives that set the limits on the body and the arguments (`SecRequestBodyLimit`, `SecRequestBodyNoFilesLimit`, `SecRequestBodyLimitAction`, `SecRequestBodyInMemoryLimit`, `SecArgumentsLimit`)
+  - Directives that ModSecurity does not know
+- Actions: the actions you can use are `accuracy`, `allow`, `auditlog`, `block`, `capture`, `chain`, `ctl`, `deny`, `drop`, `expirevar`, `id`, `initcol`, `log`, `logdata`, `maturity`, `msg`, `multiMatch`, `noauditlog`, `nolog`, `pass`, `phase`, `redirect`, `rev`, `setrsc`, `setsid`, `setuid`, `setvar`, `severity`, `skip`, `skipAfter`, `status`, `t`, `tag`, `ver`, and `xmlns`. Others are rejected, including `exec` and `setenv`.
+  - The `ctl` settings you can use are `auditEngine`, `auditLogParts`, `forceRequestBodyVariable`, `parseXmlIntoArgs`, `requestBodyProcessor`, `ruleRemoveById`, `ruleRemoveByTag`, `ruleRemoveTargetById`, and `ruleRemoveTargetByTag`. Others are rejected, including `ruleEngine`, `requestBodyAccess`, and `requestBodyLimit`.
+  - A rule that has both an action that blocks the request (`deny`, `drop`, `redirect`, `block`) and `nolog` or `noauditlog` is rejected, because it would no longer be clear which rule blocked. `nolog`, `noauditlog`, or `skipAfter` in `SecDefaultAction` is also rejected.
+  - A `skipAfter` whose `SecMarker` does not come after it (in the same file or in a file loaded later) is rejected.
+- Operators: `@inspectFile`, `@rbl`, `@validateDTD`, `@validateSchema`, `@fuzzyHash`, `@geoLookup`, `@gsbLookup`, `@rsub`, and `@validateHash` are rejected. The operators that read a file (`@pmFromFile`, `@pmf`, `@ipMatchFromFile`, `@ipMatchF`) can be used only for a file in the rule set, written with a path of only letters and digits, `.`, `_`, and `-`. The path is either a path in the rule set (such as `rules/<name>`) or a path relative to the directory of that rule file.
+- Variables and lengths: the variable `ENV` is rejected. A list of variables can have up to 256 entries, and rules joined with `chain` can have up to 64.
+- Character sequences: separately from the reading above, the inspector process removes whitespace and quotes from the text of a rule and searches it, ignoring case, for `ctl:ruleEngine`, `ctl:requestBodyAccess`, `ctl:requestBodyLimit`, `exec:`, `setenv:`, `@inspectFile`, `@rbl`, `@validateDTD`, `@validateSchema`, and `@fuzzyHash`. A rule is rejected even if the sequence is inside `msg`.
+- Mismatch with the reading: the inspector process compares the rules that ModSecurity built with what it read. A rule that does not match is rejected.
 
-`ctl:ruleRemoveById` や `SecRuleRemoveById` などでブロックするルールを意図的に外すことは、Coraza の世代と同じく、運用者の判断に任せ、拒否しません。
+Intentionally removing blocking rules with `ctl:ruleRemoveById`, `SecRuleRemoveById`, and so on is left to the operator's judgment and is not refused, as with Coraza generations.
 
-Coraza の世代と違うところは次のとおりです。同じルールとリクエストでも、結果が違うことがあります。
+The differences from Coraza generations are as follows. The same rules and requests can give different results.
 
-1. 検知のみの世代では、運用者のルールがリクエストをブロックすると判定した後、ModSecurity は、そのフェーズに残っているルールだけをスキップします。そのため、ログの `rules`（一致したルール）と `score` が、Coraza の世代より短く、小さくなることがあります。
-2. 検査する長さで切ったボディの解析が失敗したとき、ModSecurity は、解析が止まった所から後のボディを、ルールに渡しません。`Content-Type` のパラメーターのせいで解析が始まらないとき（たとえば `Boundary=` を大文字で書いたとき）は、ボディを何も渡しません。切っていないボディは、解析が失敗すれば 4000001 でブロックします。
-3. 入れ子が 62〜64 段の JSON のボディは、ModSecurity ではブロックされず、Coraza ではブロックされます。65 段からは、どちらもブロックされます（決まりの上限は 64 段です）。
-4. `multiMatch` を付けた、リクエストをブロックするルールと、`msg` の無い、リクエストをブロックする `SecAction` は、ModSecurity では、それがブロックしたリクエストがすべて検査不能として扱われます。503 になり、プロキシは通しません。
-5. `ARGS:/re/` のように、変数の選択に書いた正規表現が失敗しても、ModSecurity は失敗の目印を残しません。そのため、リクエストは検査不能として扱われません。
-6. `@verifyCC`・`@verifyCPF`・`@verifySSN` の失敗も、5 と同じで、失敗の目印を残しません（CRS は使いません）。`@rx` の失敗は、検査不能として扱います。
-7. JSON のボディの値は、`ARGS` にだけ入り、`ARGS_POST` には入りません（CRS は `ARGS` を読みます）。
-8. `REQUEST_URI` は、`%XX` をデコードした URL です（デコードする前の形は `REQUEST_URI_RAW`）。そのため、`REQUEST_URI` を見るルールは、パスの中にある `%XX` でエンコードした攻撃に、Coraza の世代では一致しなくても、ModSecurity の世代では一致することがあります。
-9. 終わりの境界が無い multipart のボディは、ModSecurity ではボディの解析の失敗として、4000001 でブロックします（切ったボディを除きます）。Coraza は通します。
+1. In a detect-only generation, after an operator's rule has decided that a request is to be blocked, ModSecurity skips only the rules that remain in that phase. As a result, `rules` (the matched rules) and `score` in the log can be shorter and smaller than in a Coraza generation.
+2. When parsing of a body cut at the inspected length fails, ModSecurity does not pass the part of the body after the point where parsing stopped to the rules. When parsing does not start because of a `Content-Type` parameter (for example, when `Boundary=` is written in capitals), ModSecurity passes no body at all. For a body that was not cut, a parse failure is blocked by 4000001.
+3. A JSON body nested 62 to 64 levels deep is not blocked by ModSecurity, but is blocked by Coraza. From 65 levels, both block (the specified limit is 64 levels).
+4. For a request-blocking rule with `multiMatch`, and for a request-blocking `SecAction` without `msg`, ModSecurity treats every request that they blocked as uninspectable. It gets 503, and the proxy does not let it through.
+5. If a regular expression written in a variable selection such as `ARGS:/re/` fails, ModSecurity leaves no failure marker, so the request is not treated as uninspectable.
+6. Failures of `@verifyCC`, `@verifyCPF`, and `@verifySSN` are the same as in 5: no failure marker is left (CRS does not use them). A failure of `@rx` is treated as uninspectable.
+7. The values of a JSON body go only into `ARGS`, not into `ARGS_POST` (CRS reads `ARGS`).
+8. `REQUEST_URI` is the URL with `%XX` decoded (the form before decoding is `REQUEST_URI_RAW`). So a rule that looks at `REQUEST_URI` can match an attack encoded with `%XX` in the path in a ModSecurity generation, even if it does not match in a Coraza generation.
+9. A multipart body without a closing boundary is blocked by 4000001 in ModSecurity as a body parse failure (except a cut body). Coraza lets it through.
 
-次のリクエストは、ModSecurity の世代では検査不能として扱われ、503 になります。Coraza の世代ではそうなりません。
+The following requests are treated as uninspectable in a ModSecurity generation and get 503. In a Coraza generation, they are not.
 
-- ルールの正規表現が失敗したか、マッチ回数の上限に達したリクエスト（5 と 6 のものを除く）
-- 境界が空の multipart のボディ（`boundary=` や `boundary=""`）。ModSecurity は、このボディを何も解析せず、そのことも通知しないためです。
-- `Content-Type` を 2 つ以上持つ空でないボディ。ただし、プロキシが先に 415 で拒否するので（「ボディの型」）、検査プロセスまでは届きません。
+- A request for which the regular expression of a rule failed or reached the match limit (except those in 5 and 6)
+- A multipart body with an empty boundary (`boundary=` or `boundary=""`). This is because ModSecurity parses nothing of this body and does not report it.
+- A non-empty body with two or more `Content-Type` headers. However, the proxy refuses it first with 415 (see "Body Types"), so it does not reach the inspector process.
 
-ボディの処理を変更するなどで、検査が終わったと検証できないリクエストが 503 になることは、Coraza の世代と同じです（「検査プロセスが追加する設定とルール」）。
+As with Coraza generations, a request for which the inspector cannot verify that inspection has finished, for example because body processing was changed, gets 503 (see "Settings and Rules Added by the Inspector").
 
-### 検査エンジンの選択
+### Choosing the Inspection Engine
 
-アップストリームごとに、リクエストを検査するエンジンを選べます。エンジンは `coraza` と `modsecurity` です。
+Each upstream can have its own engine for inspecting requests. The engines are `coraza` and `modsecurity`.
 
-- アップストリームの `engine` で選びます。省いたアップストリームは、デフォルトのエンジン（`kernel.default_engine`。書かなければ `coraza`）で検査します。`rules import` の `--engine` を省いたときのエンジンも、デフォルトのエンジンです。形と受け付けない値は、上の「`forward`」と「`kernel`」を参照してください。
-- リクエストは、行き先のアップストリームが使うエンジンで検査します。そのエンジンの検査カーネルだけを使い、別のエンジンへは回しません。その検査カーネルが使えないときは、503 で応答します。
-- エンジンによって、同じリクエストでも検知の結果が違うことがあります（「ModSecurity の世代」を参照してください）。
-- 選択中の世代が検知のみのモードになっているエンジンを使うアップストリームは、ルールに一致したリクエストもブロックしません。起動、リロード、`config check` のときに、そのアップストリームごとに `upstream <name>: engine <engine>, mode detect` の行（`start:`・`reload:`・`config check:` で始まります）を出します。
+- Choose it with the upstream's `engine`. Requests to an upstream that omits it are inspected by the default engine (`kernel.default_engine`; `coraza` if not set). The default engine is also used when `rules import` is run without `--engine`. For the form and the values that are rejected, see "`forward`" and "`kernel`" above.
+- A request is inspected by the engine of the upstream it goes to. Only the inspection kernel of that engine is used, and the request is never sent to another engine. If that inspection kernel is unavailable, the proxy responds with 503.
+- Depending on the engine, the same request can give a different detection result (see "ModSecurity Generations").
+- An upstream that uses an engine whose chosen generation is in detect-only mode does not block even a request that matches a rule. At start, reload, and `config check`, the proxy writes an `upstream <name>: engine <engine>, mode detect` line for each such upstream (it starts with `start:`, `reload:`, or `config check:`).
 
-管理画面のルート:
+Admin route:
 
-- `managed` のある設定では、管理画面のルート（`admin.route`）は、デフォルトのエンジンで検査します。
-- インポートのルートを検査除外のルートにした世代を、デフォルトのエンジンの世代として使います（理由と、デフォルトのエンジンを変更するときの扱いは、[管理リファレンス](admin-reference.md) の「インポートのルートを検査除外にする」を参照してください）。
-- `managed` の無い設定で、管理プロセスへ転送するアップストリームは、そのアップストリームのエンジンで検査します（上の「`admin`」）。
+- With `managed`, the admin route (`admin.route`) is inspected by the default engine.
+- For the default engine, use a generation in which the import route is a bypass route (for the reason, and for what to do when you change the default engine, see "Bypassing Inspection for the Import Route" in the [admin reference](admin-reference.md)).
+- Without `managed`, requests to an upstream that forwards to the admin process are inspected by that upstream's engine (see "`admin`" above).
 
-同じアドレスのサーバー:
+Servers at the same address:
 
-- 同じアドレスのサーバーを持つアップストリームで、エンジンが違う設定は、受け付けません（`two upstreams with a server at the same address have different engines`）。クライアントが `Host` を選ぶだけで、同じサーバーへ届くアップストリームのうち、最も弱いエンジンやモードのものを通れてしまうためです。
-- アドレスは、IP リテラルで書いたサーバーなら、IP アドレスの正規の形（IPv6 の形で書いた IPv4 アドレスは、IPv4 アドレスと同じ）とポートで比べます。名前で書いたサーバーは、名前とポートで比べます。同じ IP アドレスを指す別の名前は、同じアドレスと見分けられません。別の名前で同じサーバーへ届くアップストリームは、運用者が同じエンジンにそろえてください。
+- A configuration in which upstreams that have a server at the same address use different engines is rejected (`two upstreams with a server at the same address have different engines`). Otherwise, a client could reach the same server through the upstream with the weakest engine or mode, just by choosing `Host`.
+- For a server written as an IP literal, addresses are compared by the canonical form of the IP address (an IPv4 address written in IPv6 form is the same as the IPv4 address) and the port. For a server written as a name, they are compared by name and port. Different names that point to the same IP address are not recognized as the same address. The operator must give the same engine to upstreams that reach the same server under different names.
 
-起動するエンジン:
+Engines to start:
 
-- プロキシは、選択中の世代があり、検査プロセスが設定にあるエンジンのすべてを起動します。デフォルトのエンジンが先で、ほかは名前の順です。どのアップストリームも使わないエンジンも、起動します。
-- デフォルトのエンジンと、アップストリームのエンジンには、選択中の世代が必要です。無ければ、起動も `config check` も、`rules store refused: no generation is chosen` で受け付けません。
-- デフォルトのエンジンに選択中の世代が無く、ほかのエンジンには選択中の世代があるときは、`rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` で受け付けません。以前のバージョンで ModSecurity の世代を選択していたホストを更新したときなどに当たります。`kernel.default_engine` を書くか、デフォルトのエンジンの世代を選択します（下の「バージョンの更新」）。
-- 起動したエンジンは、プロキシが停止するまで止まりません。`rules deactivate` を実行しても、同じです。
+- The proxy starts every engine that has a chosen generation and has an inspector process in the configuration. The default engine goes first, and the others in name order. It also starts an engine that no upstream uses.
+- The default engine and the upstream engines need a chosen generation. If there is none, both start and `config check` reject the configuration with `rules store refused: no generation is chosen`.
+- When the default engine has no chosen generation and another engine has one, the configuration is rejected with `rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine`. This happens, for example, when you update a host on which a ModSecurity generation was chosen with an earlier version. Write `kernel.default_engine`, or choose a generation for the default engine (see "Version Updates" below).
+- An engine that has started keeps running until the proxy stops, even if you run `rules deactivate`.
 
-プロセスの数とメモリの目安:
+Number of processes and memory estimates:
 
-- 常時稼働するプロセスは、プロキシが 1 つと、起動したエンジンごとの検査プロセスが 1 つずつです。Coraza だけを起動しているときは、検査プロセスは 1 つです。
-- 検査プロセスは、次のときに増えます。
-  - 世代の切り替えの間は、そのエンジンの検査プロセスが 1 つ増えます。切り替えは、プロキシ全体で同時に 1 つだけなので、増えるのは 1 つまでです。そのため、プロキシの子プロセスの検査プロセスは、最大でも、起動したエンジンの数に 1 を足した数です。
-  - 事前検証（`rules import` と管理 API のインポート）は、検査プロセスを 1 つ起動します。
-- 管理プロセスとログ送信プロセスは、これとは別のプロセスです。
+- One proxy always runs, plus one inspector process for each engine that has started. When only Coraza is started, there is one inspector process.
+- The number of inspector processes increases in the following cases.
+  - During a generation switch, that engine has one more inspector process. Only one switch at a time can run in the whole proxy, so there is at most one extra. The inspector processes that are child processes of the proxy therefore number at most the number of started engines plus 1.
+  - A trial (`rules import` and an import through the admin API) starts one inspector process.
+- The admin process and the records shipper are separate from these.
 
-メモリの目安は、検査プロセスを 1 つずつ測った値、足し算の目安、2 つのエンジンを起動したときの測定値の 3 つに分けて書きます。単位は MiB です。値は、ホストとリクエストの内容によって変わります。
+The memory estimate has three parts: the values measured for each inspector process, an estimate made by adding them, and a measurement with two engines started. The unit is MiB. The values change with the host and the content of the requests.
 
-- 検査プロセスを 1 つずつ測った値です。このバージョンと同じ検査プロセスの実行ファイル、CRS 4.23.0、4 つの論理 CPU と 8 GiB のメモリを持つ Linux ホストで、エンジンを 1 つだけ起動して測りました。
+- The values measured for each inspector process. They were measured with the same inspector executables as this version and CRS 4.23.0, on a Linux host with 4 logical CPUs and 8 GiB of memory, with only one engine started.
 
-  | プロセス | 起動の直後 | 16 KiB までのリクエストの後 | 1 MiB のボディを流した後 |
+  | Process | Right after start | After requests up to 16 KiB | After streaming a 1 MiB body |
   |---|---|---|---|
-  | Coraza の検査プロセス | 約 57 | 約 69 | 約 110〜112（最大 約 125）。この後も下がりません |
-  | ModSecurity の検査プロセス | 約 43 | 約 43 | 約 43（最大 約 52） |
+  | Coraza inspector process | about 57 | about 69 | about 110 to 112 (maximum about 125). It does not go down after this |
+  | ModSecurity inspector process | about 43 | about 43 | about 43 (maximum about 52) |
 
-  1 MiB のボディの列は、`proxy.inspect_body` を 1 MiB にして、1 MiB のボディを流した値です。`inspect_body` が推奨値の 16 KiB のときは、16 KiB までの値が当てはまります。
-- 足し算の目安です。上の値と同じ条件の値を足したもので、測った合計ではありません。プロキシは含みません。
-  - 2 つのエンジンを起動しているときは、通常のリクエストで約 100〜112（Coraza の約 57〜69 と、ModSecurity の約 43 の合計）です。1 MiB のボディを流している間の最大は約 178 です。
-  - 世代の切り替え 1 回と事前検証 1 回が重なったときの最悪は、通常のリクエストで約 240、1 MiB のボディを流している間の最大で約 305 です。約 240 と約 305 は、事前検証を行うプロセスの本体を、プロキシの起動の直後と同じ約 9 と仮定した値を含みます（測っていません）。
-- 2 つのエンジンを起動したときの測定値です。Core Rule Set の世代を 2 つのエンジンに選択し、通常のリクエストと SQL インジェクションのリクエストを各数回流した後の常駐メモリ（VmRSS）は、プロキシが約 10、Coraza の検査プロセスが約 52、ModSecurity の検査プロセスが約 43 でした。1 つずつ測った値とは、測った条件（世代とリクエスト）が違うので、同じ値にはなりません。1 MiB のボディは流していません。世代の切り替えの間は、検査プロセスの数が 2 つから最大 3 つに増えました。
+  The 1 MiB column is the value with `proxy.inspect_body` set to 1 MiB and a 1 MiB body streamed. When `inspect_body` is the recommended 16 KiB, the values for up to 16 KiB apply.
+- The estimate made by adding. It adds up the values above that were taken under the same conditions, and is not a measured total. The proxy is not included.
+  - When two engines are started, about 100 to 112 for ordinary requests (the sum of about 57 to 69 for Coraza and about 43 for ModSecurity). The maximum while a 1 MiB body is streamed is about 178.
+  - The worst case, when one generation switch and one trial overlap, is about 240 for ordinary requests and about 305 at the maximum while a 1 MiB body is streamed. The figures of about 240 and about 305 include an assumption: the process that runs the trial is assumed to use about 9 itself, the same as the proxy right after start (not measured).
+- The measurement with two engines started. A Core Rule Set generation was chosen for both engines, and a few ordinary requests and a few SQL injection requests were sent. After that, the resident memory (VmRSS) was about 10 for the proxy, about 52 for the Coraza inspector process, and about 43 for the ModSecurity inspector process. The conditions (generation and requests) differ from those of the per-process measurements, so the values do not match. No 1 MiB body was streamed. During a generation switch, the number of inspector processes rose from 2 to at most 3.
 
-どのアップストリームも使わないエンジン:
+An engine that no upstream uses:
 
-- 試しに ModSecurity を起動するときなど、どのアップストリームも使わず、デフォルトのエンジンでもないエンジンでも、検査カーネルが失敗すると、プロキシ全体が停止します。停止のときは、`stop: the kernel failed: <reason>` の行を出して exit 1 になります（上の「`kernel`」）。たとえば `kernel.restarts` が 0 のとき、そのエンジンの検査プロセスを SIGKILL で止めると、`stop: the kernel failed: BudgetExhausted` の行を出して停止します。
-- 試した後は、`rules deactivate` でそのエンジンの選択を解除します。解除すると、次の再起動から、そのエンジンは起動しません。動作中のプロキシは、起動したエンジンを止めないので、止めるには再起動します（下の「エンジンごとの選択中の世代」）。
+- An engine may be running that no upstream uses and that is not the default engine, for example when you start ModSecurity to try it out. Even for such an engine, if its inspection kernel fails, the whole proxy stops, writes a `stop: the kernel failed: <reason>` line, and exits with 1 (see "`kernel`" above). For example, when `kernel.restarts` is 0 and you stop the inspector process of that engine with SIGKILL, the proxy writes a `stop: the kernel failed: BudgetExhausted` line and stops.
+- After trying it out, clear that engine's choice with `rules deactivate`. From the next restart, that engine does not start. The running proxy does not stop an engine that has started, so restart the proxy to stop it (see "Chosen Generation per Engine" below).
 
-デフォルトのエンジンを変更する手順:
+Steps to change the default engine:
 
-デフォルトのエンジンを変更すると、`engine` を省いたアップストリームの検査エンジンも変わります。変えたくないアップストリームには、先に、今のエンジンを `engine` に書きます。`kernel` は動作中に変更できないので、`kernel.default_engine` は、プロキシの再起動で変更します。次の例は、`managed` のある設定で、デフォルトのエンジンを `coraza` から `modsecurity` に変更する手順です。コマンドは、サービスと同じ OS ユーザーで実行します。
+Changing the default engine also changes the inspection engine of the upstreams that omit `engine`. For an upstream you do not want to change, first write its current engine in `engine`. `kernel` cannot change while running, so changing `kernel.default_engine` requires restarting the proxy. The following example shows the steps to change the default engine from `coraza` to `modsecurity` in a configuration with `managed`. Run the commands as the same OS user as the service.
 
 ```text
-tukuyomi-proxy rules import <config> --engine modsecurity --crs <crs-dir> --rules <rules-file> --routes <routes-file>   # 新しいデフォルトのエンジンの世代。まだ選択しない
-tukuyomi-proxy managed import <config> <document>         # 全部のアップストリームに、今のエンジンを engine に書いたバージョン
-tukuyomi-proxy managed activate <config> <version>        # 上で作ったバージョンを選択する
+tukuyomi-proxy rules import <config> --engine modsecurity --crs <crs-dir> --rules <rules-file> --routes <routes-file>   # the generation for the new default engine; do not choose it yet
+tukuyomi-proxy managed import <config> <document>         # a version that writes the current engine in engine for every upstream
+tukuyomi-proxy managed activate <config> <version>        # select the version made above
 kill -HUP <proxy-pid>
    reload: configuration replaced <sha256> managed <version>
-tukuyomi-proxy rules activate <config> <fingerprint>      # 新しいデフォルトのエンジンの世代。SIGUSR1 は送らない
-tukuyomi-proxy rules list <config>                        # current の印が 2 行（Coraza の世代と ModSecurity の世代）
-（設定ファイルの kernel に "default_engine": "modsecurity" を書く）
+tukuyomi-proxy rules activate <config> <fingerprint>      # the generation for the new default engine; do not send SIGUSR1
+tukuyomi-proxy rules list <config>                        # two lines have the current marker (the Coraza generation and the ModSecurity generation)
+(write "default_engine": "modsecurity" in kernel of the configuration file)
 tukuyomi-proxy config check <config>                      # accepted
-（プロキシと管理プロセスを再起動する）
+(restart the proxy and the admin process)
    start: rules engine modsecurity
    start: rules engine coraza
 ```
 
-- 新しいデフォルトのエンジンの世代は、先頭の `rules import` で作ります。管理画面の Host での CRS の調整（[管理リファレンス](admin-reference.md) の「管理画面の Host での CRS の調整」）と、インポートのルートの検査除外のルート（「インポートのルートを検査除外にする」）を、その世代にも入れます。
-- その世代は、`kernel.default_engine` を書く前に選択します。SIGUSR1 を送らない間は、そのエンジンは起動せず、プロキシは稼働を続けます。
-- 世代を選択する前に、`kernel.default_engine` を書いて `config check` を実行すると、`rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine`（exit 1）で受け付けません。起動も、同じ文で受け付けません。
-- 動作中のプロキシへの SIGHUP は、`config check` が `accepted` でも、`reload: configuration refused: kernel cannot change while running` で拒否します。変更するには、再起動します。
-- 再起動の後、`start: rules engine` の行は、デフォルトのエンジンが先に出ます。管理画面のルートのリクエストは新しいデフォルトのエンジンで、`engine` を書いたアップストリームのリクエストは、書いたエンジンで検査します（リクエストのログの `engine`）。
-- 管理プロセスも設定ファイルの `kernel.default_engine` を読むので、プロキシと一緒に再起動します（[管理リファレンス](admin-reference.md) の「管理画面」）。
+- Create the generation for the new default engine with the first `rules import`. Put the CRS tuning for the admin Host (see "CRS Tuning for the Admin Host" in the [admin reference](admin-reference.md)) and the bypass route for the import route (see "Bypassing Inspection for the Import Route" in the admin reference) into that generation as well.
+- Choose that generation before you write `kernel.default_engine`. As long as you do not send SIGUSR1, that engine does not start and the proxy keeps running.
+- If you write `kernel.default_engine` and run `config check` before you choose the generation, the configuration is rejected with `rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` (exit 1). Start also rejects it with the same message.
+- SIGHUP to the running proxy is refused with `reload: configuration refused: kernel cannot change while running`, even if `config check` says `accepted`. To make the change, restart.
+- After the restart, the `start: rules engine` lines appear with the default engine first. Requests to the admin route are inspected by the new default engine, and requests to an upstream that has `engine` are inspected by the engine written there (`engine` in the request log).
+- The admin process also reads `kernel.default_engine` from the configuration file, so restart it together with the proxy (see "Admin Screens" in the [admin reference](admin-reference.md)).
 
-### エンジンごとの選択中の世代
+### Chosen Generation per Engine
 
-ルールストアは、エンジンごとに、選択中の世代を 1 つ持ちます。
+The rules store holds one chosen generation for each engine.
 
-- ファイルは `current.coraza` と `current.modsecurity` です。内容は、世代のフィンガープリント（64 桁の小文字の 16 進数）と改行で、65 バイトです。
-- `rules activate <config> <fingerprint>` は、その世代のエンジンの `current.<engine>` を書きます。`current.<engine>.new` に書いて同期してから置き換えるので、途中で止まっても、中途半端な内容は読まれません。途中で止まったときに残る `current.<engine>.new` は、どこからも読まれません。次の同じエンジンの `rules activate` が消します。
-- `rules list` は、エンジンごとの選択中の世代に `current` の印を付けます。2 つのエンジンの世代を選択していれば、印は 2 行に付きます。
+- The files are `current.coraza` and `current.modsecurity`. The content is the fingerprint of the generation (64 lowercase hexadecimal digits) and a newline, 65 bytes in all.
+- `rules activate <config> <fingerprint>` writes `current.<engine>` for the engine of that generation. It writes to `current.<engine>.new`, syncs, and then replaces the file, so half-written content is never read even if the command stops halfway. A `current.<engine>.new` left behind by a command that stopped halfway is never read. The next `rules activate` for the same engine removes it.
+- `rules list` puts the `current` marker on the chosen generation of each engine. If generations are chosen for two engines, the marker is on two lines.
 
-以前のバージョンが書いた `current`:
+The `current` written by an earlier version:
 
-- このバージョンは、`current` を書きません。以前のバージョンが書いた `current` は、同じエンジンの選択中の世代として読みます。エンジンに `current.<engine>` が無いとき、`current` が指す世代がそのエンジンの世代なら、その世代が、そのエンジンの選択中の世代です。
-- `rules activate` は、`current.<engine>` を書いた後に、同じエンジンの世代を指す `current` を消します。そのため、このバージョンで選択した後は、以前のバージョンは、そのエンジンの選択中の世代を読めません（下の「バージョンの更新」）。
-- 同じエンジンについて、`current` と `current.<engine>` の両方があり、別の世代を指しているときは、どちらも選ばず、`the current generation records of the engine disagree` で受け付けません。`rules list`、`config check`、起動、SIGUSR1 のどれも同じです。以前のバージョンで選択し直したときなどに、この状態になります。`rules activate` で、そのエンジンの世代を選択し直すと、`current.<engine>` を書いて `current` を消すので、元に戻ります。
-- `current.<engine>` が別のエンジンの世代を指しているときと、ファイルの内容が正しくないときは `the current generation record is broken`、ファイルを読めないときは `the current generation record cannot be read` で受け付けません。
+- This version does not write `current`. A `current` written by an earlier version is read as the chosen generation of the same engine. If an engine has no `current.<engine>` and the generation that `current` points to belongs to that engine, that generation is the chosen generation of that engine.
+- After writing `current.<engine>`, `rules activate` removes the `current` that points to a generation of the same engine. So once you choose a generation with this version, the earlier version can no longer read that engine's chosen generation (see "Version Updates" below).
+- If both `current` and `current.<engine>` exist for the same engine and point to different generations, the proxy uses neither and rejects them with `the current generation records of the engine disagree`. `rules list`, `config check`, start, and SIGUSR1 all behave the same way. This state arises, for example, when you choose again with an earlier version. Choosing that engine's generation again with `rules activate` writes `current.<engine>` and removes `current`, which resolves it.
+- If `current.<engine>` points to a generation of another engine, or the content of the file is not valid, the proxy rejects it with `the current generation record is broken`. If the file cannot be read, it rejects it with `the current generation record cannot be read`.
 
 `rules deactivate <config> <engine>`:
 
-- そのエンジンの選択を解除します。`current.<engine>` と、同じエンジンの世代を指す `current` を消し、解除した世代を `<fingerprint> deactivated` の行に出します。次の再起動から、そのエンジンは起動しません。
-- 動作中のプロキシは、起動したエンジンの検査カーネルを止めません。そのエンジンは、プロキシを再起動するまで稼働します。再起動までの SIGUSR1 は、`reload: rules store refused: no generation is chosen` の行を出します（上の「SIGUSR1（世代の切り替え）」）。
-- 設定ファイルと、managed ストアの選択中のバージョンを読み、デフォルトのエンジンか、どれかのアップストリームのエンジンがそのエンジンなら、`rules deactivate: the configuration uses the engine` の行を出して受け付けません（exit 1）。エンジンに選択中の世代が無いときも、`rules deactivate: no generation is chosen` の行を出して受け付けません（exit 1）。
-- `managed` のある設定で、選択中のバージョンを読めないなど、設定を受け付けないときは、`rules deactivate: configuration refused: <reason>` の行を出します（exit 2）。`rules` のコマンドのうち、managed ストアを読むのは、このコマンドだけです。
+- It clears that engine's choice: it deletes `current.<engine>` and the `current` that points to a generation of the same engine, and writes the generation that is no longer chosen in a `<fingerprint> deactivated` line. From the next restart, that engine does not start.
+- The running proxy does not stop the inspection kernel of an engine that has started. That engine keeps running until you restart the proxy. A SIGUSR1 before the restart writes a `reload: rules store refused: no generation is chosen` line (see "SIGUSR1 (Generation Switch)" above).
+- It reads the configuration file and the selected version of the managed store. If the default engine or any upstream engine is that engine, it writes a `rules deactivate: the configuration uses the engine` line and refuses (exit 1). When the engine has no chosen generation, it also refuses, with a `rules deactivate: no generation is chosen` line (exit 1).
+- With `managed`, when the configuration is rejected, for example because the selected version cannot be read, it writes a `rules deactivate: configuration refused: <reason>` line (exit 2). Of the `rules` commands, only this one reads the managed store.
 
-稼働していないエンジンを使うアップストリームを書く順:
+Adding an upstream for an engine that is not running:
 
-選択中の世代があり、稼働していないエンジン（たとえば、起動のときに ModSecurity の世代を選択していなかったとき）を、アップストリームに書く順です。リロードは検査プロセスを起動せず、稼働していないエンジンのアップストリームを拒否するので、SIGUSR1 でそのエンジンを起動します。次の例は、Coraza だけを起動しているプロキシに、`managed` のある設定で、ModSecurity のアップストリーム `mod` を足します。
+Follow these steps to have an upstream use an engine that has a chosen generation but is not running (for example, when no ModSecurity generation was chosen at start). A reload does not start an inspector process and refuses an upstream whose engine is not running, so start that engine with SIGUSR1 first. The following example adds a ModSecurity upstream `mod` to a proxy that has only Coraza running, in a configuration with `managed`.
 
 ```text
-tukuyomi-proxy rules activate <config> <fingerprint-modsecurity>   # ModSecurity の世代を選択する。SIGUSR1 はまだ送らない
-tukuyomi-proxy managed activate <config> <version>                 # アップストリーム mod を書いたバージョン。ModSecurity の世代が選択中なので通る
+tukuyomi-proxy rules activate <config> <fingerprint-modsecurity>   # choose the ModSecurity generation; do not send SIGUSR1 yet
+tukuyomi-proxy managed activate <config> <version>                 # a version that has the upstream mod; accepted because a ModSecurity generation is chosen
 kill -HUP <proxy-pid>
    reload: SIGHUP
    reload: configuration accepted
    reload: configuration refused: the engine of an upstream is not ready (upstream mod)
-kill -USR1 <proxy-pid>                                             # ModSecurity が起動する
+kill -USR1 <proxy-pid>                                             # ModSecurity starts
    reload: SIGUSR1
    reload: generation <fingerprint-coraza> is already running
    reload: starting generation <fingerprint-modsecurity>
@@ -1166,13 +1168,13 @@ kill -HUP <proxy-pid>
    reload: configuration replaced <sha256> managed <version>
 ```
 
-- 最初の SIGHUP は、ModSecurity が稼働していないので拒否します。前の設定のまま稼働し続け、`tukuyomi_config_reloads_total` の `refused` が 1 増えます。
-- 先に SIGUSR1 で ModSecurity を起動してから SIGHUP を送れば、リロードは拒否されません。
-- `managed activate` は、バージョンのアップストリームが使うエンジンに、選択中の世代が無いと、選択せずに拒否します（上の「`managed`」）。そのため、`rules activate` を先に行います。
+- The first SIGHUP is refused because ModSecurity is not running. The proxy keeps running with the previous configuration, and the `refused` count of `tukuyomi_config_reloads_total` goes up by 1.
+- If you start ModSecurity with SIGUSR1 first and then send SIGHUP, the reload is not refused.
+- `managed activate` refuses without selecting the version if an engine used by the version's upstreams has no chosen generation (see "`managed`" above). So run `rules activate` first.
 
-### 検査除外のルート
+### Bypass Routes
 
-`rules import --routes <file>` のファイルは、次の形の JSON の配列です。
+The file for `rules import --routes <file>` is a JSON array of the following form:
 
 ```json
 [
@@ -1180,103 +1182,103 @@ kill -HUP <proxy-pid>
 ]
 ```
 
-- `host` は省けます。ほかの設定キーは受け付けません。`action` は `bypass` だけです。
-- ルートに一致するリクエストは検査せず、アップストリームへ転送します。
-  - プロキシが自分で行う検証（ヘッダー部、ボディのサイズの上限）は、その前に行います。ボディの型は検証しません（下の「ボディの型」）。
-  - アップストリームは、検査除外のルートではなく、`forward` のルートかデフォルトのアップストリームで選びます。そこで 404・403・421 になるリクエストと、全体の `access` と `rate_limit`、ホストごとの設定で拒否されるリクエスト（403・429）、管理画面のルート（`admin.route`）で拒否されるリクエスト（421・404・403）は、検査除外のルートに一致しても応答は変わりません。
-  - 検査のスロットを取らないので、検査が混んでいるときや、検査プロセスが止まっているときも通ります。
-- ルートは、エンジンの世代ごとに効きます。リクエストを検査するエンジン（リクエストのアップストリームのエンジン）の、稼働中の世代のルートだけが、そのリクエストに適用されます。ほかのエンジンの世代にあるルートは、そのリクエストを検査除外にしません。
-- `path` と `host` の形と一致の方法は、`forward` のルートと同じです。ほかに次の決まりがあります。
-  - `path` は `/` だけにはできません（すべてのリクエストの検査を外してしまうためです）。2〜255 バイトで書きます。
-  - `host` にワイルドカードは書けません。
-  - 1 つの世代で 256 個までです。`host` と `path` の同じ組み合わせは書けません。
-- `host` を持つ検査除外のルートは、末尾が `.` の `Host`（`app.example.com.`）には一致せず、検査します。アップストリームがそれを別のホストとして解釈するかもしれないためです。`host` を持たないルートは、末尾が `.` の `Host` にも一致します。
-- パスの読み方が複数あるリクエスト（「`access` を使うときの注意」に挙げた形）は、検査除外のルートに一致せず、検査します。
-- ルートは世代のマニフェストに入り、フィンガープリントの一部になります。動作中のプロキシは、そのエンジンの世代の切り替えで、そのエンジンのルートを切り替えます。
+- `host` is optional. Other setting keys are rejected. `action` can only be `bypass`.
+- A request that matches a route is not inspected and is forwarded to the upstream.
+  - The proxy does its own checks (the header section and the body size limit) before that. It does not check the body type (see "Body Types" below).
+  - The upstream is chosen by a `forward` route or the default upstream, not by the bypass route. Matching a bypass route does not change the response to a request that gets 404, 403, or 421 there, a request refused by the global `access` and `rate_limit` or by the host policies (403, 429), or a request refused by the admin route (`admin.route`) (421, 404, 403).
+  - A bypass request does not take an inspection slot, so it passes even when inspection is busy or the inspector process is stopped.
+- Routes belong to each engine's generation. A request is affected only by the routes of the running generation of the engine that inspects it (its upstream's engine). Routes in other engines' generations do not make that request a bypass.
+- The form and the matching of `path` and `host` are the same as for `forward` routes. In addition:
+  - `path` cannot be only `/` (it would remove inspection of all requests). Write it with 2 to 255 bytes.
+  - `host` cannot contain a wildcard.
+  - A generation can have up to 256 routes. The same combination of `host` and `path` cannot be written twice.
+- A bypass route with `host` does not match a `Host` with a trailing `.` (`app.example.com.`), and the request is inspected, because the upstream might interpret it as a different host. A route without `host` also matches a `Host` with a trailing `.`.
+- A request whose path can be read in more than one way (the forms listed in "Notes on using `access`") does not match a bypass route and is inspected.
+- Routes are part of the generation's manifest and of its fingerprint. When the running proxy switches an engine's generation, it switches that engine's routes too.
 
-## managed 設定
+## Managed Configuration
 
-managed 設定は、サイト（ホストと証明書）、アップストリーム、ルート、デフォルトのアップストリーム、全体のアクセス制御とレート制限、ホストごとの設定を、設定ファイルの外の managed ストアにバージョンとして保存する仕組みです。設定ファイルの `managed` で使い始めます。管理画面と管理 API から編集して、動作中のプロキシに反映できます（[管理リファレンス](admin-reference.md) の「managed 設定の操作」）。コマンドは上の「`managed`」を参照してください。`managed` の無い設定ファイルは、これまでと同じように読みます。
+The managed configuration is a mechanism that stores sites (hosts and certificates), upstreams, routes, the default upstream, the global access control and rate limits, and host policies as versions in the managed store, outside the configuration file. Write `managed` in the configuration file to use it. You can edit it from the admin screens and the admin API and apply it to the running proxy (see "Managed Configuration Operations" in the [admin reference](admin-reference.md)). For the commands, see "`managed`" above. A configuration file without `managed` is read as before.
 
-### managed 設定を使うかどうか
+### Whether to Use the Managed Configuration
 
-できること:
+What you can do:
 
-- 上に挙げた設定を、管理画面と管理 API で編集し、検証してから保存して、動作中のプロキシに反映できます。反映では、プロキシがそのバージョンで設定のリロードを通した後にだけ、選択中のバージョンを進めます。そのため、プロキシが拒否したバージョンが、次の起動で使われることはありません（下の「反映」）。
-- 保存したバージョンは残り、前のバージョンに戻せます（ロールバック、名前を指定した反映）。
-- 管理画面と管理 API からの反映は管理プロセスの変更履歴に、操作は監査ログに残ります（[管理リファレンス](admin-reference.md) の「設定の変更履歴」と「監査ログ」）。コマンドでの変更は、どちらにも残りません。
+- You can edit the settings listed above in the admin screens and the admin API, check them, save them, and apply them to the running proxy. Applying advances the selected version only after the proxy has reloaded its configuration with that version, so a version that the proxy refused is never used at the next start (see "Applying" below).
+- Saved versions remain, and you can go back to an earlier version (rollback, applying by name).
+- Applying from the admin screens and the admin API is recorded in the admin process's configuration history, and the operations in the audit log (see "Configuration History" and "Audit Log" in the [admin reference](admin-reference.md)). Changes made with commands are recorded in neither.
 
-代わりに必要なこと:
+What you need instead:
 
-- 設定ファイルに書けなくなる設定キーがあります。`forward` は `resolve_timeout_ms` だけになり、TLS のリスナーの `certificates`、全体の `access`・`rate_limit`、`host_policies` も書けません（書くと設定を受け付けません）。これらはバージョンに書きます。
-- 設定に `admin` があれば、管理画面のルート（`admin.route`）が必須です（上の「`admin`」）。管理画面のルートはプロキシが作り、全体の設定もホストごとの設定も適用されません。管理画面のルートに適用されるネットワークの制限は、`admin.route.access` の `allow_cidrs` だけです。
-- `managed` の有無と `managed.dir` は、動作中に変更できない設定キーです。`managed` を追加するときと外すときは、プロキシと管理プロセスを再起動します（設定のリロードは拒否します）。
-- 管理画面のルートのリクエストも、デフォルトのエンジンの WAF の検査を通ります。管理画面からの検証と保存のリクエストは、証明書と秘密鍵を含むことがあり、遮断の世代でブロックされうるので、その 2 つのパスを検査除外のルートにした世代を、デフォルトのエンジンの世代として使います（[管理リファレンス](admin-reference.md) の「managed 設定を使う場合の管理画面のルート」）。デフォルトのエンジンを変更するときは、新しいデフォルトのエンジンの世代にも、同じルートを入れます（上の「検査エンジンの選択」）。
-- ACME で発行するサイトの証明書チェーンと秘密鍵は、設定ファイルのパスではなく、managed ストアの `acme/` に置きます（下の「ACME のサイト」）。
-- ログ送信プロセスを使うなら、プロキシと同じビルドに入れ替えてから、設定ファイルに `managed` を書きます。ログ送信プロセスも設定ファイルを読み、`managed` を知らない前のビルドは、未知の設定キーのある設定ファイルを受け付けずに起動しません（下の「ログ送信プロセスの起動」）。`kernel.default_engine` と、アップストリームの `engine` も、前のビルドには未知の設定キーです。同じビルドに入れ替えてから書きます（下の「バージョンの更新」）。
+- Some setting keys can no longer be written in the configuration file. `forward` can have only `resolve_timeout_ms`, and the `certificates` of a TLS listener, the global `access` and `rate_limit`, and `host_policies` cannot be written either (the configuration is rejected if you write them). Write these in a version.
+- If the configuration has `admin`, the admin route (`admin.route`) is required (see "`admin`" above). The proxy creates the admin route, and neither the global settings nor the host policies apply to it. The only network restriction that applies to the admin route is `allow_cidrs` of `admin.route.access`.
+- `managed` (whether it is present) and `managed.dir` are setting keys that cannot change while running, so when you add or remove `managed`, restart the proxy and the admin process (a configuration reload is refused).
+- Requests to the admin route are also inspected by the WAF, with the default engine. Check and save requests from the admin screens can contain a certificate and a private key, so a generation in block mode can block them. For the default engine, use a generation that has those two paths as bypass routes (see "Admin Route with the Managed Configuration" in the [admin reference](admin-reference.md)). When you change the default engine, put the same routes into the new default engine's generation as well (see "Choosing the Inspection Engine" above).
+- For a site whose certificate is issued by ACME, the certificate chain and private key are kept in `acme/` in the managed store, not at a path in the configuration file (see "ACME Sites" below).
+- If you use the records shipper, replace it with the same build as the proxy first, and then write `managed` in the configuration file. The records shipper also reads the configuration file, and an earlier build that does not know `managed` does not start, because it rejects a configuration file with unknown setting keys (see "Starting the Records Shipper" below). `kernel.default_engine` and the `engine` of an upstream are also unknown setting keys to an earlier build. Replace it with the same build before you write them (see "Version Updates" below).
 
-設定をファイルだけで管理し、管理画面から変更しないなら、`managed` は必要ありません。
+If you manage the configuration with the file only and do not change it from the admin screens, you do not need `managed`.
 
-### managed ストアとバージョン
+### Managed Store and Versions
 
-設定キー `managed` は `{"dir"}` だけを持ちます。`dir` は managed ストアのディレクトリで、絶対パスで 3840 バイトまでです。
+The setting key `managed` has only `{"dir"}`. `dir` is the managed store directory, an absolute path of at most 3840 bytes.
 
-- ディレクトリの条件は、シンボリックリンクでないディレクトリであること、所有者がプロキシの OS ユーザーであること、グループとその他のユーザーの権限が無いこと（0700）です。プロキシもコマンドもこのディレクトリは作らないので、先に作ります。開くたびに検証し、違えば受け付けません。
-- ルールストア、`records.dir`、管理データの保存先（`admin.store.dir`）、制御ソケットのあるディレクトリ、`acme.challenge_dir` と同じディレクトリにも、互いの中にも置けません。`acme.account_key_file`・`acme.ca_file` と、管理画面のルートが使う証明書と秘密鍵のファイルは、managed ストアの中に置けません（上の「値どうしの関係」）。
+- The directory must not be a symbolic link, must be owned by the proxy's OS user, and must have no permissions for the group and other users (0700). Neither the proxy nor the commands create this directory, so create it first. It is checked every time it is opened, and a directory that does not meet the conditions is rejected.
+- It cannot be the same directory as the rules store, `records.dir`, the admin store directory (`admin.store.dir`), the directory for the control socket, or `acme.challenge_dir`, and none of them can be inside another. `acme.account_key_file`, `acme.ca_file`, and the certificate and private key files used by the admin route cannot be placed inside the managed store (see "Relations Between Values" above).
 
-managed ストアの内容:
+Contents of the managed store:
 
-| 名前 | 内容 |
+| Name | Content |
 |---|---|
-| `versions/<version>.json` | バージョン。1 MiB まで |
-| `files/<sha256>` | バージョンが指す証明書チェーン、秘密鍵、アップストリームの CA のファイル。1 MiB まで |
-| `acme/<hosts-sha256>/chain`、`acme/<hosts-sha256>/key` | ACME のサイトの証明書チェーンと秘密鍵（下の「ACME のサイト」） |
-| `current` | 選択中のバージョンの SHA-256（64 桁の 16 進数）と改行 |
-| `lock` | managed ストアを変更するコマンドと管理プロセスが持つロック |
+| `versions/<version>.json` | A version. Up to 1 MiB |
+| `files/<sha256>` | A certificate chain, private key, or upstream CA file that a version points to. Up to 1 MiB |
+| `acme/<hosts-sha256>/chain`, `acme/<hosts-sha256>/key` | The certificate chain and private key of an ACME site (see "ACME Sites" below) |
+| `current` | The SHA-256 of the selected version (64 hexadecimal digits) and a newline |
+| `lock` | The lock held by the commands and the admin process that change the managed store |
 
-- バージョンとファイルの名前は、内容の SHA-256（64 桁の小文字の 16 進数）です。作った後は変えません。読むたびに名前と内容を照合し、合わないものは使いません。
-- `versions/` と `files/` はインポートのときに、`acme/` は `acme renew` が、無ければ作ります（0700）。バージョン、ファイル、`current` は、`.new` の名前で書き込んで同期してから置き換えるので、途中で止まっても、読む側は前のものか新しいものを丸ごと読みます。
-- バージョンは、決まった書き方（空白の無い JSON で、オブジェクトの設定キーをバイト順に並べたもの）だけを受け付けます。同じ内容は、いつも同じ名前のバージョンになります。バージョンは手で書かず、`managed import` か管理画面で作ります。
-- `managed list` の時刻は、バージョンのファイルの更新時刻です。
+- Versions and files are named by the SHA-256 of their contents (64 lowercase hexadecimal digits) and do not change after they are created. Each time one is read, its name is checked against its contents, and one that does not match is not used.
+- If they do not exist, `versions/` and `files/` are created at import, and `acme/` by `acme renew` (0700). Versions, files, and `current` are written under a name ending in `.new`, synced, and then renamed over the old file, so even if a write stops halfway, a reader reads either the old one or the new one in full.
+- A version is accepted only in one canonical form (JSON without whitespace, with the setting keys of each object in byte order), so the same contents always give a version with the same name. Do not write a version by hand; create it with `managed import` or in the admin screens.
+- The times in `managed list` are the modification times of the version files.
 
-バージョンは次の形の JSON です。
+A version is JSON in the following form.
 
 ```text
 {"sites": [..], "upstreams": {..}, "routes": [..], "default_upstream": "..", "access"?: {..}, "rate_limit"?: {..}, "host_policies"?: [..]}
 ```
 
-- `upstreams`、`routes`、`default_upstream`、`access`、`rate_limit`、`host_policies` は、`managed` の無い設定ファイルの `forward`（上の「`forward`」）と、下の「アクセス制御とレート制限」と同じ形と決まりで書きます。受け付けないときの文も同じです。違うのは、アップストリームの `tls` が `{"ca", "server_name"?}` で、`ca` が managed ストアの `files/` のファイルの SHA-256 であることだけです。アップストリームの `engine` は、`forward` と同じ形で書けます。
-- `sites` はサイトの一覧で、0〜64 個です。サイトは `{"name", "hosts", "certificate"}` と書きます。
-  - `name` は、アップストリームの名前と同じ決まり（1〜64 文字の英数字・`-`・`_`）で、サイトどうしで同じ名前は書けません。
-  - `hosts` は 1〜64 個で、リスナーの証明書の `hosts` と同じように書きます（名前か、`*.` と名前）。同じホストを 2 つのサイトに書けません。
-  - `certificate` は、`{"chain", "key"}`（managed ストアの `files/` の証明書チェーンと秘密鍵の SHA-256）か、`{"acme": {"renew_before_days"}}`（下の「ACME のサイト」）のどちらかです。
-- バージョンにパスは書きません。
-- 設定ファイルと合わせて検証します。アップストリームの `engine` は、設定ファイルの `kernel`（`engines` と `default_engine`）と合わせて検証します（`engine` を省いたアップストリームは、`kernel.default_engine` のエンジンになります）。管理画面のルートのホスト（`admin.route.host`）は、サイトの `hosts` にも、ルートの `host` にも書けません（`*.` のサイトがそれを含んでもかまいません。管理画面のルートが先に一致します）。アップストリームのサーバーは、`admin.listen` のアドレスにできません（名前を解決したアドレスも同じです）。TLS のリスナーがあれば、サイトか管理画面のルートの証明書が 1 つ以上必要です。
-- TLS のリスナーは、どれも、管理画面のルートとすべてのサイトの証明書から、クライアントが SNI で指定したホストで証明書を選びます。名前が同じ証明書を、`*.` で含む証明書より先に選びます。
+- `upstreams`, `routes`, `default_upstream`, `access`, `rate_limit`, and `host_policies` are written in the same form and with the same rules as `forward` in a configuration file without `managed` (see "`forward`" above) and as in "Access Control and Rate Limits" below, and they are rejected with the same messages. The only difference is that the `tls` of an upstream is `{"ca", "server_name"?}`, and `ca` is the SHA-256 of a file in `files/` of the managed store. The `engine` of an upstream can be written in the same form as in `forward`.
+- `sites` is the list of sites, 0 to 64 of them. A site is written as `{"name", "hosts", "certificate"}`.
+  - `name` follows the same rule as the name of an upstream (1 to 64 characters of letters and digits, `-`, and `_`), and the same name cannot be used for two sites.
+  - `hosts` has 1 to 64 entries and is written like the `hosts` of a listener's certificate (a name, or `*.` and a name). The same host cannot be written in two sites.
+  - `certificate` is either `{"chain", "key"}` (the SHA-256 of the certificate chain and of the private key in `files/` of the managed store) or `{"acme": {"renew_before_days"}}` (see "ACME Sites" below).
+- Do not write paths in a version.
+- A version is checked together with the configuration file. The `engine` of an upstream is checked against `kernel` in the configuration file (`engines` and `default_engine`), and an upstream that omits `engine` uses the engine of `kernel.default_engine`. The host of the admin route (`admin.route.host`) cannot appear in the `hosts` of a site or in the `host` of a route (a `*.` site may contain it; the admin route matches first). An upstream server cannot use the address of `admin.listen` (this also applies to an address that a name resolves to). If there is a TLS listener, at least one certificate is required, from a site or from the admin route.
+- Each TLS listener chooses a certificate from those of the admin route and all the sites, by the host that the client sends in SNI. A certificate for exactly that name is chosen before one that covers the name through `*.`.
 
-`managed import` の文書は、バージョンと同じ形で、ファイルを SHA-256 ではなくパスで書きます。サイトの `certificate` は `{"chain_file", "key_file"}` か `{"acme": {..}}`、アップストリームの `tls` は `{"ca_file", "server_name"?}` です。パスは絶対パスで 3840 バイトまでです。文書は 1 MiB までで、空白などの書き方は自由です。
+The document for `managed import` has the same form as a version, but files are written as paths instead of SHA-256. The `certificate` of a site is `{"chain_file", "key_file"}` or `{"acme": {..}}`, and the `tls` of an upstream is `{"ca_file", "server_name"?}`. A path is absolute and at most 3840 bytes. The document can be up to 1 MiB, and its layout, such as whitespace, is up to you.
 
-- コマンドは、文書が指すファイルを 1 回ずつ読み（1 MiB までの通常のファイル）、プロキシと同じように検証します（証明書チェーンと秘密鍵が対応し、サイトのホストを含むこと。CA のファイルが使えること）。検証に通れば、ファイルを `files/` に置き、それを SHA-256 で指すバージョンを `versions/` に置きます。
-- インポートの後は、文書と、文書が指すサイトの証明書チェーン・秘密鍵・CA のファイルを使いません。managed ストアにコピーしてあるので、削除してかまいません。
+- The command reads each file that the document points to once (regular files up to 1 MiB) and checks them in the same way as the proxy (the certificate chain matches the private key and covers the hosts of the site; the CA file is usable). If the checks pass, it places the files in `files/`, and a version that points to them by SHA-256 in `versions/`.
+- After the import, the document and the certificate chain, private key, and CA files of the sites that the document points to are no longer used. They have been copied into the managed store, so you can delete them.
 
-管理画面と管理 API で変更したときの変更履歴は、管理プロセスが別に持ちます（[管理リファレンス](admin-reference.md) の「設定の変更履歴」）。
+The admin process keeps its own configuration history of changes made in the admin screens and the admin API (see "Configuration History" in the [admin reference](admin-reference.md)).
 
-### managed 設定での初回起動
+### First Start with the Managed Configuration
 
-`managed` のある設定で、初めてプロキシを起動する手順です。選択中のバージョンが無いと、起動も `config check` も拒否します（`config check: managed store refused: no managed version is chosen`、exit 1）。そのため、起動の前にバージョンをインポートして選択します。ほかの手順は [ビルドと配置](../build/binary-deployment.md) の「初回起動の手順」と同じです。
+This section shows how to start the proxy for the first time with a configuration that has `managed`. Without a selected version, both start and `config check` refuse (`config check: managed store refused: no managed version is chosen`, exit 1), so import and select a version before you start. The other steps are the same as in "First Start" in the [build and deployment guide](../build/binary-deployment.md).
 
-例は、リダイレクトのリスナーと TLS のリスナー、ファイルの証明書を持つサイト 1 つ、アップストリーム 1 つ、管理画面のルートを持つ形です。ACME のサイトは下の「ACME のサイト」を参照してください。
+The example has a redirect listener, a TLS listener, one site with a certificate in a file, one upstream, and the admin route. For an ACME site, see "ACME Sites" below.
 
-1. ディレクトリを作ります。[ビルドと配置](../build/binary-deployment.md) の「OS ユーザーとディレクトリ」の表のディレクトリに加えて、managed ストアのディレクトリを 0700 で作ります。
+1. Create the directories. In addition to the directories in the table in "OS User and Directories" in the [build and deployment guide](../build/binary-deployment.md), create the managed store directory with 0700.
 
    ```bash
    sudo install -d -m 0700 -o tukuyomi -g tukuyomi /var/lib/tukuyomi-core/managed
    ```
 
-2. 証明書のファイルを置きます。
-   - 管理画面のルートの証明書と秘密鍵（例: `/var/lib/tukuyomi-core/tls/admin.pem`・`admin.key`）。設定ファイルが、このパスで指します。
-   - サイトの証明書チェーンと秘密鍵（例: `/var/lib/tukuyomi-core/import/www.pem`・`www.key`）。インポートの入力になるので、サービスの OS ユーザーが読める場所に置きます。
-3. 設定ファイルを書きます。`managed` の無い設定ファイルとの違いは次のとおりです（ほかの設定キーは同じように書きます）。
+2. Place the certificate files.
+   - The certificate and private key of the admin route (for example, `/var/lib/tukuyomi-core/tls/admin.pem` and `admin.key`). The configuration file points to them by these paths.
+   - The certificate chain and private key of the site (for example, `/var/lib/tukuyomi-core/import/www.pem` and `www.key`). The import reads them, so place them where the OS user of the service can read them.
+3. Write the configuration file. It differs from a configuration file without `managed` as follows (write the other setting keys as usual).
 
    ```json
    "proxy": {
@@ -1307,10 +1309,10 @@ managed ストアの内容:
    }
    ```
 
-   - `proxy` は、`listeners` 以外の設定キーを省略して示しました。TLS のリスナーには `certificates` を書きません（`http2` は書けます）。
-   - `forward` には `resolve_timeout_ms` だけを書きます。全体の `access`・`rate_limit` と `host_policies` は、バージョンに書きます。
-   - `admin.route.access` の `allow_cidrs` には、管理画面を使う人のネットワークを書きます。
-4. バージョンの文書を書きます（例: `/etc/tukuyomi-core/managed-import.json`）。サービスの OS ユーザーが読めるように置きます。
+   - `proxy` shows only `listeners`; its other setting keys are left out here. Do not write `certificates` in a TLS listener (`http2` can be written).
+   - Write only `resolve_timeout_ms` in `forward`. Write the global `access` and `rate_limit` and `host_policies` in the version.
+   - In the `allow_cidrs` of `admin.route.access`, write the networks that the people who use the admin screens connect from.
+4. Write the version document (for example, `/etc/tukuyomi-core/managed-import.json`). Place it where the OS user of the service can read it.
 
    ```json
    {
@@ -1332,67 +1334,67 @@ managed ストアの内容:
    }
    ```
 
-5. ルールセットをインポートし、世代を選択します（[ビルドと配置](../build/binary-deployment.md) の「初回起動の手順」の 2〜4）。7 の `managed activate` は、バージョンのアップストリームが使うエンジンに、選択中の世代があることを確認するので、この手順は 7 より前に行います。`rules import` と `rules activate` は設定ファイルだけを読み、managed ストアを読まないので、`current` がまだ無くても通ります（6 の後に実行してもかまいません）。`rules deactivate` は、managed ストアの選択中のバージョンも読みます（上の「エンジンごとの選択中の世代」）。
-6. バージョンをインポートします。
+5. Import the rule set and choose a generation (steps 2 to 4 of "First Start" in the [build and deployment guide](../build/binary-deployment.md)). `managed activate` in step 7 checks that each engine that the upstreams of the version use has a chosen generation, so do this step before step 7. `rules import` and `rules activate` read only the configuration file, not the managed store, so they succeed even before `current` exists (you may also run them after step 6). `rules deactivate` also reads the selected version of the managed store (see "Chosen Generation per Engine" above).
+6. Import the version.
 
    ```bash
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy managed import /etc/tukuyomi-core/config.json /etc/tukuyomi-core/managed-import.json
    ```
 
-   - `<version> created` が出ます。バージョンを置くだけで、選択しません（`current` はまだ無い状態です）。
-   - この後、サイトの入力のファイル（`www.pem`・`www.key`）は使わないので、削除してかまいません。
-7. バージョンを選択します。
+   - A `<version> created` line is written. The command only places the version and does not select it (`current` does not exist yet).
+   - After this, the input files of the site (`www.pem` and `www.key`) are no longer used, so you can delete them.
+7. Select the version.
 
    ```bash
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy managed activate /etc/tukuyomi-core/config.json <version>
    ```
 
-   - 起動と同じ検証（設定ファイルとバージョン、アップストリームの名前解決と CA のファイル、証明書）を実行し、通ったときだけ選択します。`<version> current` が出ます。
-8. 設定を検証します。
+   - The command runs the same checks as start (the configuration file and the version, name resolution of the upstreams and their CA files, the certificates) and selects the version only if the checks pass. A `<version> current` line is written.
+8. Check the configuration.
 
    ```bash
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy config check /etc/tukuyomi-core/config.json
    ```
 
-   - 通れば、標準出力に `accepted` が出ます。標準エラーに `config check: managed version <version>` の行が出ます。
-9. サービスを起動します（[ビルドと配置](../build/binary-deployment.md) の「systemd」）。ログに `start: managed version <version>` の行が出ます。
-10. 管理プロセスを起動し、最初のユーザーを作ります（[ビルドと配置](../build/binary-deployment.md) の「初回起動の手順」の 7）。管理画面には、`admin.route.access` が許すネットワークから、`admin.route.host` のホスト名で入ります。この後の変更は、管理画面か管理 API で行います（下の「反映」）。
+   - If it passes, `accepted` is written to standard output. A `config check: managed version <version>` line is written to standard error.
+9. Start the service (see "systemd" in the [build and deployment guide](../build/binary-deployment.md)). A line `start: managed version <version>` appears in the log.
+10. Start the admin process and create the first user (step 7 of "First Start" in the [build and deployment guide](../build/binary-deployment.md)). Open the admin screens at the host name in `admin.route.host`, from a network that `admin.route.access` allows. After this, make changes in the admin screens or the admin API (see "Applying" below).
 
-### managed 設定への移行
+### Moving to the Managed Configuration
 
-`managed` の無い設定ファイルで動作しているプロキシと管理プロセスを、managed 設定に移行する手順です。移行すると、設定ファイルのルートなどはバージョンへ、管理画面のホストへのルートは `admin.route` へ移ります。変換のコマンドは無いので、設定ファイルとバージョンの文書は手で書きます。
+These steps move a proxy and an admin process from a configuration file without `managed` to the managed configuration. After the move, the routes and so on in the configuration file go into a version, and the route for the host of the admin screens goes into `admin.route`. There is no conversion command, so write the configuration file and the version document by hand.
 
-先に、ログ送信プロセスを使っているなら、プロキシと同じビルドの実行ファイルに入れ替えておきます（上の「managed 設定を使うかどうか」）。
+If you use the records shipper, first replace it with an executable of the same build as the proxy (see "Whether to Use the Managed Configuration" above).
 
-何がどこへ移るかは次のとおりです。
+The settings move as follows.
 
-| 現在の設定ファイル | 移行後 |
+| Current configuration file | After the move |
 |---|---|
-| TLS のリスナーの `certificates` のうち、管理画面のホストの証明書 | `admin.route.certificate`（`cert_file`・`key_file`・`acme` はそのまま） |
-| ほかの証明書 | バージョンのサイト。ファイルの証明書は文書の `chain_file`・`key_file`、ACME の証明書は `{"acme": {..}}`（パスは書きません） |
-| `forward.upstreams` のうち、`admin.listen` を指すアップストリーム | 外します（バージョンのサーバーには `admin.listen` を書けません） |
-| ほかのアップストリーム | バージョンの `upstreams` |
-| `forward.routes` のうち、管理画面のホストのルート | 外し、その `access` を `admin.route.access` にコピーします（`allow_cidrs` が必要です） |
-| ほかのルートと `default_upstream` | バージョンの `routes`・`default_upstream` |
-| 全体の `access`・`rate_limit`、`host_policies` | バージョンの同じ設定キー |
-| `forward.resolve_timeout_ms`、`acme`、`admin` のほかの設定キー（`origin` を含む） | 設定ファイルにそのまま残します |
+| The certificate for the host of the admin screens, among the `certificates` of a TLS listener | `admin.route.certificate` (`cert_file`, `key_file`, and `acme` as they are) |
+| Other certificates | Sites of the version. A certificate in a file goes into `chain_file` and `key_file` of the document, and an ACME certificate into `{"acme": {..}}` (do not write paths) |
+| The upstream that points to `admin.listen`, among `forward.upstreams` | Remove it (an upstream server in a version cannot use the address of `admin.listen`) |
+| Other upstreams | `upstreams` of the version |
+| The route for the host of the admin screens, among `forward.routes` | Remove it and copy its `access` to `admin.route.access` (`allow_cidrs` is required) |
+| Other routes and `default_upstream` | `routes` and `default_upstream` of the version |
+| Global `access` and `rate_limit`, and `host_policies` | The same setting keys of the version |
+| `forward.resolve_timeout_ms`, `acme`, and the other setting keys of `admin` (including `origin`) | Leave them as they are in the configuration file |
 
-- `admin.route.host` は、現在の管理画面のホスト（`admin.origin` のホスト）にします。
-- 管理画面のルートには全体の設定が適用されないので、現在のルートの `access` をコピーし損ねると、管理画面に到達できる相手が変わります。
+- Set `admin.route.host` to the current host of the admin screens (the host of `admin.origin`).
+- The global settings do not apply to the admin route, so if you forget to copy the `access` of the current route, who can reach the admin screens changes.
 
-手順:
+Steps:
 
-1. managed ストアのディレクトリを作ります（上の「managed 設定での初回起動」の 1）。
-2. 移行後の設定ファイルを別の名前（例: `/etc/tukuyomi-core/config.managed.json`）で書き、バージョンの文書（例: `/etc/tukuyomi-core/managed-import.json`）も書きます。
-3. 新しい設定ファイルで、インポートしてバージョンを選択します。
+1. Create the managed store directory (step 1 of "First Start with the Managed Configuration" above).
+2. Write the new configuration file under another name (for example, `/etc/tukuyomi-core/config.managed.json`), and also write the version document (for example, `/etc/tukuyomi-core/managed-import.json`).
+3. With the new configuration file, import the version and select it.
 
    ```bash
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy managed import /etc/tukuyomi-core/config.managed.json /etc/tukuyomi-core/managed-import.json
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy managed activate /etc/tukuyomi-core/config.managed.json <version>
    ```
 
-   - ACME のサイトの証明書がまだ managed ストアに無いので、`managed activate` は `managed activate: tls certificate not issued yet (site <name>)` の行を出します。拒否はしません。
-4. ACME のサイトごとに、現在の証明書チェーンと秘密鍵を `acme/<hosts-sha256>/` にコピーします（`<hosts-sha256>` の作り方は下の「ACME のサイト」）。コピーしないと、`acme renew` と SIGUSR2 の後まで、そのサイトのホストに TLS で接続できません。
+   - The certificate of the ACME site is not yet in the managed store, so `managed activate` writes a `managed activate: tls certificate not issued yet (site <name>)` line, but it does not refuse.
+4. For each ACME site, copy the current certificate chain and private key to `acme/<hosts-sha256>/` (for how to compute `<hosts-sha256>`, see "ACME Sites" below). If you do not copy them, TLS connections to the hosts of that site fail until you run `acme renew` and send SIGUSR2.
 
    ```bash
    sudo -u tukuyomi mkdir -m 0700 /var/lib/tukuyomi-core/managed/acme
@@ -1402,189 +1404,189 @@ managed ストアの内容:
    sudo -u tukuyomi install -m 0600 /var/lib/tukuyomi-core/tls/www.key "$d/key"
    ```
 
-5. 新しい設定ファイルで `config check` を実行し、`accepted` が出て、`not issued yet` の行が無いことを確認します。`acme renew` を実行すると、コピーした証明書は、有効期限までが `renew_before_days` 日より短くなければ `site <name> valid`、短ければ発行し直して `site <name> renewed` になります。
-6. 移行前の構成を残します（元の設定ファイルを `config.json.before-managed` などの名前で、元の実行ファイルとユニットも）。
-7. 新しい設定ファイルを元のパス（例: `/etc/tukuyomi-core/config.json`）に置きます。同じディレクトリにコピーしてから、リネームして置き換えます。
-8. 管理プロセス、プロキシ、ログ送信プロセスの順に再起動します（`systemctl restart`）。
-   - この手順は `admin.route` を追加するので、動作中に変更できない設定キー（`admin.route.host` と `managed`）が違い、`systemctl reload` は拒否します（`reload: configuration refused: admin.route.host cannot change while running`。比較する順序で、`admin.route.host` が先に出ます）。
-   - 管理プロセスを再起動してからプロキシを再起動するまでの間、管理画面には元のルートでアクセスでき、managed 設定の変更の依頼は 409 で拒否します（何も変更されません）。
-   - プロキシの再起動の間は、接続が切れます。
-9. 確認します。
-   - プロキシのログに `start: managed version <version>` の行が出ます。ログ送信プロセスのログに `records-ship: configuration accepted` の行が出ます。
-   - どのホストにも元と同じ証明書が返り、ルートと `access` が元と同じように効きます。
-   - 管理画面のルートで、管理画面に入れます。
+5. Run `config check` with the new configuration file and check that `accepted` is written and that there is no `not issued yet` line. When you run `acme renew`, a copied certificate shows as `site <name> valid` if it expires in `renew_before_days` days or more. Otherwise, the certificate is issued again and shows as `site <name> renewed`.
+6. Keep the configuration from before the move (the original configuration file under a name such as `config.json.before-managed`, and the original executables and units).
+7. Put the new configuration file at the original path (for example, `/etc/tukuyomi-core/config.json`). Copy it into the same directory, and then rename it over the original.
+8. Restart the admin process, the proxy, and the records shipper, in this order (`systemctl restart`).
+   - This procedure adds `admin.route`, so setting keys that cannot change while running (`admin.route.host` and `managed`) differ, and `systemctl reload` refuses (`reload: configuration refused: admin.route.host cannot change while running`; `admin.route.host` is compared first).
+   - Between restarting the admin process and restarting the proxy, you can reach the admin screens through the original route, and requests to change the managed configuration are refused with 409 (nothing is changed).
+   - While the proxy restarts, connections are cut.
+9. Check.
+   - A line `start: managed version <version>` appears in the proxy's log, and a line `records-ship: configuration accepted` in the records shipper's log.
+   - Every host returns the same certificate as before, and the routes and `access` work as before.
+   - You can enter the admin screens through the admin route.
 
-移行前の構成に戻すときは、上の 6 で残したものを使います。移行後に `acme renew` が更新したサイトの証明書は managed ストアにだけあり、元の設定ファイルが指すファイルは古いままです。
+To go back to the configuration from before the move, use what you kept in step 6 above. A site certificate that `acme renew` renewed after the move exists only in the managed store; the file that the original configuration file points to still holds the old certificate.
 
-### 反映
+### Applying
 
-動作中のプロキシに別のバージョンを使わせる方法は 2 つあります。
+There are two ways to make the running proxy use another version.
 
-1. 管理画面と管理 API の反映（保存して反映、名前を指定した反映、ロールバック）: 管理プロセスが、制御ソケットの `reload` の依頼で、プロキシにそのバージョンで設定をリロードさせます（上の「制御ソケット」）。プロキシの設定が切り替わった後にだけ、`current` をそのバージョンにします。プロキシが拒否したバージョンは `current` になりません。操作と応答は [管理リファレンス](admin-reference.md) の「managed 設定の操作」を参照してください。
-   - 反映の間、管理プロセスは managed ストアのロックを持ちます。その間の `managed import`・`managed activate`・`managed remove` は拒否します（`the managed store is in use by another command`）。
-   - プロキシは、動作中の設定の `forward.resolve_timeout_ms` に 5 秒を足した時間まで、リロードの終わりを待って応答します。`resolve_timeout_ms` を長くすると、反映も長くかかり、その間はコマンドも拒否されます。
-   - 管理プロセスが応答を待つ時間と、証明書の検証での拒否（`tls`。`acme renew` が証明書を置き換えている瞬間と重なったときなど）の扱いは、[管理リファレンス](admin-reference.md) の「制御ソケット」を参照してください。
-2. コマンドと SIGHUP: `managed activate` が、起動と同じ検証を実行して `current` を変更します。コマンドはプロキシに依頼しないので、動作中のプロキシは、次の SIGHUP（`systemctl reload`）か起動で `current` のバージョンを読みます（上の「SIGHUP（設定のリロード）」）。
-   - SIGHUP が拒否されると（動作中に変更できない設定キーの違い、アップストリームのエンジンが稼働していないこと、新しいリスナーのバインドなど）、`current` は、動作中のプロキシが拒否したバージョンのまま残り、次に起動するときは、そのバージョンが使われます。
-   - 動作中のプロキシのバージョンを変更するには、管理画面か管理 API を使います。コマンドで変更したときは、すぐに `systemctl reload` を実行し、`reload: configuration replaced <sha256> managed <version>` の行を確認します。
+1. Applying from the admin screens and the admin API (save and apply, applying by name, rollback): The admin process sends a `reload` request on the control socket (see "Control Socket" above), and the proxy reloads its configuration with that version. The admin process sets `current` to that version only after the proxy's configuration has switched, so a version that the proxy refused does not become `current`. For the operations and responses, see "Managed Configuration Operations" in the [admin reference](admin-reference.md).
+   - While applying, the admin process holds the managed store lock, so `managed import`, `managed activate`, and `managed remove` are refused (`the managed store is in use by another command`).
+   - The proxy responds when the reload ends, waiting up to the `forward.resolve_timeout_ms` of the running configuration plus 5 seconds. A longer `resolve_timeout_ms` makes applying take longer, and commands are also refused for that time.
+   - For how long the admin process waits for the response, and how it handles a refusal in the certificate check (`tls`; for example, when the check overlaps with `acme renew` replacing a certificate), see "Control Socket" in the [admin reference](admin-reference.md).
+2. Commands and SIGHUP: `managed activate` runs the same checks as start and changes `current`. The command does not send a request to the proxy, so the running proxy reads the `current` version at the next SIGHUP (`systemctl reload`) or start (see "SIGHUP (Configuration Reload)" above).
+   - If SIGHUP is refused (for example, because a setting key that cannot change while running differs, an upstream uses an engine that is not running, or a new listener cannot be bound), `current` stays at the version that the running proxy refused, and that version is used at the next start.
+   - To change the version of the running proxy, use the admin screens or the admin API. When you change it with a command, run `systemctl reload` immediately and check the line `reload: configuration replaced <sha256> managed <version>`.
 
-どちらの方法も、次のとおりです。
+Both ways work as follows.
 
-- リロードは、バージョンと一緒に設定ファイルも読み込みます。設定ファイルを書き換えて、まだ SIGHUP を送っていなければ、管理画面からの反映でその書き換えも効きます。設定ファイルにエラーがあれば、反映も拒否します（`configuration`）。
-- 同じバージョンでもリロードします。SIGHUP と同じく、待機中の keep-alive の接続を閉じ、HTTP/2 の接続には `GOAWAY` を送り、アップストリームのダウン判定と失敗の数を初期化します（上の「SIGHUP（設定のリロード）」）。
-- ログには、`reload: control reload <version>`（制御ソケットの依頼で始めたとき）、SIGHUP と同じ `reload:` の行、`control: reload <version>: <result> (<reason>)` が出ます（下の「ほかのログ」）。
+- A reload also reads the configuration file together with the version. If you have rewritten the configuration file and have not yet sent SIGHUP, applying from the admin screens also puts that rewrite into effect. If the configuration file has an error, applying is also refused (`configuration`).
+- The proxy reloads even for the same version. As with SIGHUP, it closes idle keep-alive connections, sends `GOAWAY` to HTTP/2 connections, and resets which upstream servers are marked as failed, along with the failure counts of the upstreams (see "SIGHUP (Configuration Reload)" above).
+- The log shows `reload: control reload <version>` (when the reload was started by a request on the control socket), the same `reload:` lines as for SIGHUP, and `control: reload <version>: <result> (<reason>)` (see "Other Log Lines" below).
 
-途中で止まったとき:
+If applying stops halfway:
 
-| 状態 | 起きる場合 | SIGHUP と再起動 | 直し方 |
+| State | When it happens | SIGHUP and restart | How to fix |
 |---|---|---|---|
-| 使われないバージョンが残る | 管理画面で保存した後、リロードを依頼する前に、管理プロセスが止まった場合 | `current`（前のバージョン）のまま | 害はありません。必要なければ削除します（下の「バージョンの削除」） |
-| 何も変更されない | リロードの途中でプロキシが止まった場合、またはリロードが拒否された場合 | `current`（前のバージョン）のまま | 止まったときは再起動し、もう一度反映します |
-| プロキシは新しいバージョン、`current` は前のバージョン | プロキシの設定が切り替わった後、`current` を変更する前に管理プロセスが止まった場合、`current` を書けなかった場合、または、結果が分からないまま終わった反映で後からプロキシの設定が切り替わった場合 | 前のバージョンに戻ります | 同じバージョンをもう一度反映します（前のバージョンを反映しても、両者は一致します） |
-| プロキシは前のバージョン、`current` は新しいバージョン | プロキシの設定が切り替わった後、`current` を変更するまでの間に、SIGHUP が来た場合、またはプロキシが止まって前のバージョンで再起動した場合 | 新しいバージョンに切り替わります | もう一度反映します |
+| An unused version remains | The admin process stopped after saving in the admin screens and before requesting the reload | Stays at `current` (the previous version) | It does no harm. Remove it if you do not need it (see "Removing Versions" below) |
+| Nothing is changed | The proxy stopped during the reload, or the reload was refused | Stays at `current` (the previous version) | If the proxy stopped, restart it and apply again |
+| The proxy is on the new version and `current` is the previous version | The admin process stopped after the proxy's configuration switched and before `current` was changed, `current` could not be written, or the proxy's configuration switched later, for an apply whose result was not known | It goes back to the previous version | Apply the same version again (applying the previous version also makes the two match) |
+| The proxy is on the previous version and `current` is the new version | A SIGHUP arrived after the proxy's configuration switched and before `current` changed, or the proxy stopped and restarted with the previous version | It switches to the new version | Apply again |
 
-- 稼働中のバージョンは制御ソケットの `status` の `managed`、選択中のバージョンは `managed list` の `current` で分かります。管理画面と管理 API での見え方は [管理リファレンス](admin-reference.md) の「managed 設定の操作」を参照してください。
-- プロキシと管理プロセスは、この不一致を自動では修正しません。どちらのバージョンが正しいかは、止まった理由によって違うためです。
+- `managed` in the control socket's `status` shows the running version, and `current` in `managed list` shows the selected version. For how they appear in the admin screens and the admin API, see "Managed Configuration Operations" in the [admin reference](admin-reference.md).
+- The proxy and the admin process do not resolve this mismatch automatically, because which version is correct depends on why it stopped.
 
-### 配置の注意
+### Placement Notes
 
-- `acme.challenge_dir` は、チャレンジのためだけのディレクトリにし、ほかのファイルを置かないでください。ログ送信プロセスの接続文字列のファイル、国のデータベース、アップストリームの CA のファイル、検査プロセスの実行ファイルなども置かないでください。
-- `acme.challenge_dir` と managed ストアには、シンボリックリンクを使わないでください。ディレクトリの重なりの検証は、書いたままのパスで比較します。
-- `acme.account_key_file` と、管理画面のルートが使う証明書と秘密鍵のファイルは、ルールストア、`records.dir`、管理データの保存先、managed ストアの中に置かないでください。`acme renew` は、これらのファイルを書き換えます。
+- Use `acme.challenge_dir` only for challenges, and do not put other files in it. Do not put the records shipper's connection string file, the country database, upstream CA files, or the inspector process executables there either.
+- Do not use symbolic links for `acme.challenge_dir` and the managed store. The check for overlapping directories compares the paths as written.
+- Do not put `acme.account_key_file` and the certificate and private key files used by the admin route inside the rules store, `records.dir`, the admin store directory, or the managed store. `acme renew` rewrites these files.
 
-### ACME のサイト
+### ACME Sites
 
-バージョンのサイトの `certificate` を `{"acme": {"renew_before_days": 30}}`（1〜60）にすると、`acme renew` がそのサイトの証明書を発行し、更新します。`managed import` の文書にも、同じ形で書きます（パスは書きません）。
+If you set the `certificate` of a site in a version to `{"acme": {"renew_before_days": 30}}` (1 to 60), `acme renew` issues and renews that site's certificate. Write it in the same form in the `managed import` document as well (do not write paths).
 
-- ACME のサイトの `hosts` は名前だけで、`*.` は書けません。設定ファイルに `acme` が必要です。
-- `managed` のある設定ファイルは、`acme` を持つ証明書が設定ファイルに無くても `acme` を書けます（ACME のサイトはバージョンの中にあるためです）。
-- 証明書チェーンと秘密鍵は、managed ストアの `acme/<hosts-sha256>/chain` と `key` にあります。`<hosts-sha256>` は、サイトの `hosts` をバイト順に並べ、1 つずつ後ろに改行を付けてつないだバイト列の SHA-256 です。サイトの名前は入らないので、同じホストの組み合わせなら、名前を変更しても、ほかのバージョンでも、同じディレクトリを使います。
+- The `hosts` of an ACME site are names only; `*.` cannot be written. The configuration file needs `acme`.
+- A configuration file with `managed` can have `acme` even if no certificate in the configuration file has `acme` (because ACME sites are in the version).
+- The certificate chain and the private key are in `acme/<hosts-sha256>/chain` and `key` in the managed store. `<hosts-sha256>` is the SHA-256 of the site's `hosts`, sorted in byte order and joined, each followed by a newline. The site name is not included, so the same set of hosts uses the same directory even if the name changes, and in other versions too.
 
   ```bash
   printf '%s\n' www.example.com app.example.com | LC_ALL=C sort | sha256sum | cut -d' ' -f1
   ```
 
-- `acme/` と、その中のディレクトリは、`acme renew` が無ければ作ります（0700）。シンボリックリンクなど、ディレクトリでないものがあると、そのサイトは CA に注文せずに `failed` になります。
-- `acme renew` は、`current` のバージョンを読みます。対象は、`acme` を持つ管理画面のルート、バージョンのサイトの順です。結果の行は `admin route renewed|valid|failed`、`site <name> renewed|valid|failed` になります。
-  - `acme` を持つ管理画面のルートも ACME のサイトも無いときは、結果の行を出さず、標準エラーに 1 行出して exit 0 で終わります（タイマーを失敗させないためです）。
-  - `current` かバージョンが読めないときは、設定を受け付けずに exit 2 で終わります。設定ファイルにある管理画面のルートの証明書も更新しません。
-- ファイルがまだ無いサイトは、まだ発行していない証明書です。起動、設定のリロード、`config check`、`managed activate` は拒否せず、`tls certificate not issued yet (site <name>)` の行を出して、そのサイトのホストに対するハンドシェイクを拒否します。ファイルができた後の SIGUSR2 で使い始めます。
-- ホストの組み合わせを変更したバージョン（サイトにホストを追加した、変更した、`{"chain", "key"}` から `acme` に変更した）に反映すると、新しいディレクトリにはまだ証明書がありません。そのサイトのすべてのホスト（以前から接続できたホストも）に、TLS で接続できなくなります。反映の後すぐに、`acme renew` と SIGUSR2 を実行します（[ビルドと配置](../build/binary-deployment.md) の「証明書の更新のタイマー」のサービスを `systemctl start tukuyomi-core-acme.service` で実行します）。タイマーに任せると、次のタイマーまで接続できません。
-- 前のバージョンに戻す（ロールバック、名前を指定した反映）と、そのホストの組み合わせのディレクトリに前の証明書が残っていれば、発行し直さずに使います。プロキシは証明書の有効期限を見ないので、有効期限の切れた証明書もそのまま使います。戻した後は `acme renew` を実行します（有効期限が近ければ発行し直します）。
-- チャレンジに応答するホストは、`acme` を持つ管理画面のルートのホストと、稼働中のバージョンの ACME のサイトのホストです。反映でバージョンが切り替わると、一緒に切り替わります。`admin.route.access` はチャレンジに適用されません（CA はどのアドレスからも来るためです）。
-  - コマンドで `managed activate` した後、SIGHUP の前に `acme renew` を実行すると、新しいバージョンだけにあるホストは、プロキシがチャレンジに応答しないので `failed` になります。`managed activate` の後は、すぐに設定をリロードします（上の「反映」）。
-- 管理画面のルートの証明書に `acme` を付けたときは、ファイルは設定ファイルの `cert_file`・`key_file` に書きます（起動のときに無くてもかまいません）。ファイルが無い間は、管理画面のルートのハンドシェイクを拒否します。初回の発行は、下の「ACME」の「初回の発行」と同じです。
-- バージョンを削除すると、残るどのバージョンのサイトでもないホストの組み合わせの `acme/` のディレクトリも削除されます（下の「バージョンの削除」）。
+- `acme/` and the directories in it are created by `acme renew` if they do not exist (0700). If something other than a directory, such as a symbolic link, is in its place, that site becomes `failed` without an order being placed with the CA.
+- `acme renew` reads the `current` version. It handles the admin route first, if the route has `acme`, and then the sites of the version. The result lines are `admin route renewed|valid|failed` and `site <name> renewed|valid|failed`.
+  - If there is neither an admin route that has `acme` nor an ACME site, it writes no result line, writes one line to standard error, and ends with exit 0 (so that the timer does not fail).
+  - If `current` or the version cannot be read, it rejects the configuration and ends with exit 2. It does not renew the certificate of the admin route in the configuration file either.
+- While the files of a site do not exist yet, its certificate counts as not issued. Start, a configuration reload, `config check`, and `managed activate` do not refuse; they write a `tls certificate not issued yet (site <name>)` line and refuse handshakes for the hosts of that site. The certificate is used from the first SIGUSR2 after the files exist.
+- When you apply a version that changes the hosts of an ACME site (a host was added to a site or changed, or `{"chain", "key"}` was changed to `acme`), the new directory has no certificate yet, so TLS connections to all the hosts of that site fail (including hosts that could connect before). Run `acme renew` and send SIGUSR2 right after applying (start the service from "Certificate Renewal Timer" in the [build and deployment guide](../build/binary-deployment.md) with `systemctl start tukuyomi-core-acme.service`). If you leave it to the timer, connections fail until the next timer run.
+- When you go back to an earlier version (rollback, applying by name), if the old certificate is still in the directory for that set of hosts, it is used without being issued again. The proxy does not check certificate expiry, so it uses an expired certificate too. Run `acme renew` after going back (it issues the certificate again if it is close to expiry).
+- The proxy responds to challenges for the host of the admin route, if it has `acme`, and for the hosts of the ACME sites in the running version. These hosts change together with the version when applying switches it. `admin.route.access` does not apply to challenges (because the CA can connect from any address).
+  - If you run `acme renew` after selecting a version with the `managed activate` command but before SIGHUP, the hosts that are only in the new version become `failed`, because the proxy does not respond to challenges for them. After `managed activate`, reload the configuration immediately (see "Applying" above).
+- When you put `acme` on the certificate of the admin route, write the file locations in `cert_file` and `key_file` in the configuration file (the files need not exist at start). While the files do not exist, handshakes for the admin route are refused. Issue the first certificate as in "First Issue" under "ACME" below.
+- When you remove a version, the `acme/` directories for sets of hosts that no remaining version has as a site are also removed (see "Removing Versions" below).
 
-### バージョンの削除
+### Removing Versions
 
-バージョンは、`managed remove`（上の「`managed`」）と管理 API（[管理リファレンス](admin-reference.md) の「managed 設定の操作」）で削除します。
+Remove a version with `managed remove` (see "`managed`" above) or the admin API (see "Managed Configuration Operations" in the [admin reference](admin-reference.md)).
 
-- 選択中のバージョン（`current`）と、使用中のバージョンは削除できません（`the managed version is the current one`、`the managed version is in use`）。使用中なのは、プロキシが稼働中のバージョンと、設定のリロードで読んでいるバージョン、`acme renew` が終わるまで読んでいるバージョン、`config check` と `managed activate` が読んでいる間のバージョンです。`acme renew` などが読んでいる間の拒否は、終わった後にもう一度実行すれば通ります。管理 API は、ロールバックの先のバージョンも削除しません。
-- 一緒に、どのバージョンも指さなくなったファイルを片付けます。`files/` の証明書チェーン、秘密鍵、CA のファイルと、`acme/` のディレクトリ（ACME のサイトの証明書と秘密鍵）も削除されます。後で同じホストの組み合わせの ACME のサイトを使うと、発行し直します（CA の発行の回数に数えます）。
-- プロキシのビルドを入れ替えたときは、プロキシを新しいビルドで再起動してから、バージョンを削除します。
-- managed ストアは、`flock` のロックが使えるファイルシステムに置きます。削除とプロキシの読み込みは、バージョンのファイルのロックで守ります。ロックが取れないと、インポート、削除、起動を拒否します。
+- The selected version (`current`) and versions in use cannot be removed (`the managed version is the current one`, `the managed version is in use`). A version is in use while the proxy is running it, while a configuration reload is reading it, from when `acme renew` reads it until the command ends, and while `config check` or `managed activate` is reading it. If removal is refused because `acme renew` or a similar command is reading the version, run it again after that command ends. The admin API also does not remove the version that is the rollback target.
+- Files that no version points to any more are cleaned up at the same time. The certificate chains, private keys, and CA files in `files/`, and the directories in `acme/` (the certificates and private keys of ACME sites), are also removed. If you later use an ACME site with the same set of hosts, the certificate is issued again (the CA counts this as another issuance).
+- When you replace the build of the proxy, restart the proxy with the new build first, and then remove versions.
+- Put the managed store on a file system that supports `flock` locks. Removal and reading by the proxy are protected by a lock on the version file, and if the lock cannot be taken, import, removal, and start are refused.
 
-## リクエストの処理
+## Request Handling
 
-### ヘッダー部の検証
+### Header Checks
 
-リクエストのヘッダー部は、HTTP の解析の前に次の順に検証し、最初に破った決まりで応答します。ただし、ヘッダーフィールドが 64 個を超えるヘッダー部は、1・2 より先に 431 になります。
+Before HTTP parsing, the header section of a request is checked in the following order, and the first rule that is broken decides the response. A header section with more than 64 header fields, however, gets 431 before checks 1 and 2.
 
-1. 行の終わりは CRLF だけです。ヘッダー部は空の行で始まりません。
-2. メソッドは 1〜32 バイトのトークンで、`CONNECT` ではありません。リクエストターゲットは `/` で始まり、1〜4096 バイトで、`#` を持ちません。パスに `<`・`>`・`` ` ``、クエリに `"`・`<`・`>` を持ちません。バージョンは `HTTP/1.1` か `HTTP/1.0` です。リクエストターゲットが長すぎれば 414 です。
-3. ヘッダーフィールドは 64 個までです。名前は 1〜256 バイト、値は 4096 バイトまで、名前と値の合計は 24 KiB までです。値に HTAB 以外の制御文字を持ちません。超えれば 431 です。
-4. 空でない `Host` がちょうど 1 つあります。
-5. `Transfer-Encoding` と `Content-Length` を一緒に持ちません。`Transfer-Encoding` は `chunked` ちょうどの 1 行で、`HTTP/1.0` のリクエストは持ちません。`Content-Length` は数字の 1 行で、ボディの上限を超えません（超えれば 413 です）。
-6. `Expect` は無いか、`100-continue` ちょうどの 1 行です。違えば 417 です。
-7. `Connection` はトークンの一覧で、`host`、`content-length`、`content-type`、`content-encoding` を挙げません。
-8. `Content-Encoding` は無いか、`gzip` ちょうどの 1 行です。違えば 415 です。`Content-Length` が 0 より大きいリクエストは、`Content-Type` を 2 つ以上持ちません。違えば 415 です。
+1. Line endings are CRLF only. The header section does not start with an empty line.
+2. The method is a token of 1 to 32 bytes and is not `CONNECT`. The request target starts with `/`, is 1 to 4096 bytes long, and has no `#`. The path has none of `<`, `>`, and `` ` ``, and the query has none of `"`, `<`, and `>`. The version is `HTTP/1.1` or `HTTP/1.0`. If the request target is too long, the response is 414.
+3. There are at most 64 header fields. A name is 1 to 256 bytes, a value is at most 4096 bytes, and the names and values of all the fields together are at most 24 KiB. A value has no control characters other than HTAB. If a limit is exceeded, the response is 431.
+4. There is exactly one non-empty `Host`.
+5. `Transfer-Encoding` and `Content-Length` are not both present. `Transfer-Encoding` is exactly one line with `chunked`, and an `HTTP/1.0` request does not have it. `Content-Length` is one line of digits and does not exceed the body limit (if it does, the response is 413).
+6. `Expect` is absent or is exactly one line with `100-continue`. Otherwise the response is 417.
+7. `Connection` is a list of tokens and does not name `host`, `content-length`, `content-type`, or `content-encoding`.
+8. `Content-Encoding` is absent or is exactly one line with `gzip`. Otherwise the response is 415. A request with a `Content-Length` greater than 0 does not have two or more `Content-Type` headers. Otherwise the response is 415.
 
-ほかの違反は 400 になります。拒否するときの応答にボディはありません。
+Other violations get 400. A response that refuses a request has no body.
 
-- HTTP/1.1 の接続の最初のリクエストでは、応答を返して接続を閉じます。
-- 2 つ目からのリクエストのヘッダー部を拒否するときは、応答を返しません。前の応答を送り終えてから接続を閉じ、ログは `class` が `closed`、`status` が 0 の接続のログになります。
-- HTTP/2 のストリームのヘッダーフィールドも、HTTP/1.1 のヘッダー部の形に書き直してから、同じ決まりで検証します。拒否するときは、そのストリームにだけ応答を返し、接続は続けます。
+- For the first request of an HTTP/1.1 connection, the proxy returns the response and closes the connection.
+- When the proxy refuses the header section of the second or a later request, it returns no response. It closes the connection after it has finished sending the previous response, and logs a connection log with `class` `closed` and `status` 0.
+- The header fields of an HTTP/2 stream are also converted into an HTTP/1.1 header section and then checked with the same rules. When the proxy refuses one, it returns a response only for that stream, and the connection continues.
 
-- 名前に `_` を含むヘッダーは、検査もせず転送もしません。アップストリームの多くのサーバーは `X_Forwarded_For` と `X-Forwarded-For` を同じ変数として読み込むので、クライアントがその名前でプロキシが付けるアドレスを装えないようにするためです。
-- `Expect: 100-continue` は受け付けますが、検査する形にも、アップストリームへ送るリクエストにも入れません。プロキシは、ボディを読み始めるときに 100 を返します。
-- リクエストのトレーラーは受け付けません（400）。
-- HTTP/1.1 の接続では、次に挙げるリクエストは、その接続の最後のリクエストになります。
-  - chunked のリクエスト、`Upgrade` を持つリクエスト
-  - HTTP/1.0 のリクエスト（応答も HTTP/1.0 で返します）
-  - `Connection: close` のリクエスト
-  - ボディを読み終えないまま応答したリクエスト（ボディを持ったまま 403・404・415・421・429 で拒否したリクエストなど）
-- リクエストとリクエストの間（前のリクエストの後、次のヘッダー部の前）にある空の行は、2 つまで捨てます。
+- A header whose name contains `_` is neither inspected nor forwarded. Many upstream servers read `X_Forwarded_For` and `X-Forwarded-For` as the same variable, so this keeps a client from using such a name to pose as the address that the proxy adds.
+- `Expect: 100-continue` is accepted, but it is left out of what is inspected and of the request sent to the upstream. The proxy returns 100 when it starts reading the body.
+- Request trailers are rejected (400).
+- On an HTTP/1.1 connection, the following requests are the last request of the connection.
+  - A chunked request, and a request with `Upgrade`
+  - An HTTP/1.0 request (the response is also returned as HTTP/1.0)
+  - A request with `Connection: close`
+  - A request whose response was sent before its body was read to the end (for example, a request with a body that was refused with 403, 404, 415, 421, or 429)
+- Up to 2 empty lines between requests (after the previous request and before the next header section) are discarded.
 
-### ボディの型
+### Body Types
 
-ボディの型は、ヘッダー部の検証の後、ルートを選んでから検証します（下の「リクエストの検証の順序」の 10）。検査するルートかどうかで、決まりが違います。
+The body type is checked after the header section checks, once the route has been chosen (check 10 in "Order of Request Checks" below). The rules differ depending on whether the route is inspected.
 
-- 検査するルートでは、空でないボディは `Content-Type` をちょうど 1 つ持ち、それは次のどれかです（`;` より前を、大文字と小文字を区別せずに比較します）。違えば 415 です。
+- On an inspected route, a non-empty body has exactly one `Content-Type`, which is one of the following (the part before `;` is compared ignoring case). Otherwise the response is 415.
   - `application/x-www-form-urlencoded`
   - `multipart/form-data`
   - `application/json`
-  - `application/<name>+json`（名前は 1〜122 バイトの英数字・`.`・`-`）
-- 検査除外のルートでは、型を検証しません。`Content-Type` の無いボディも、ほかの型のボディも、そのまま流します。ただし、`Content-Type` を 2 つ以上持つ空でないボディは、どのルートでも 415 です。読む側によって、どの行を型として解釈するかが違うためです。
-- `Content-Length` のあるボディは、ボディを読む前に検証します。chunked のボディは、空かどうかが読むまで分からないので、読んだ後に検証します（検査する長さより長いボディは、先頭のその長さを読んだ後）。空のボディは、型を問いません。
+  - `application/<name>+json` (the name is 1 to 122 bytes of letters and digits, `.`, and `-`)
+- On a bypass route, the type is not checked. A body without `Content-Type` and a body of another type are streamed as they are. However, a non-empty body with two or more `Content-Type` headers gets 415 on any route, because different readers interpret different lines as the type.
+- A body with `Content-Length` is checked before the body is read. For a chunked body, whether it is empty is not known until it is read, so it is checked after it is read (for a body longer than the inspected length, after its first part of that length is read). An empty body can have any type.
 
-### 転送の前に除くヘッダー
+### Headers Removed Before Forwarding
 
-接続ごとのヘッダー（`Connection` とそれが挙げるもの、`Keep-Alive`、`TE`、`Transfer-Encoding`、`Upgrade`、`Expect` など）と `Proxy-Authorization` は除きます。その後に上の「クライアントのアドレス」のヘッダーを付けるので、クライアントが名前を挙げて除かせることはできません。アップストリームの応答のトレーラーは、クライアントへ送りません。
+The proxy removes the per-connection headers (`Connection` and the headers it names, `Keep-Alive`, `TE`, `Transfer-Encoding`, `Upgrade`, `Expect`, and so on) and `Proxy-Authorization`. It adds the headers in "Client Address" above after this removal, so a client cannot make the proxy remove them by naming them. It does not send the trailers of an upstream response to the client.
 
-### 応答
+### Responses
 
-| ステータスコード | 場合 |
+| Status code | Case |
 |---|---|
-| ルールのステータスコード | ルールがブロックした場合（200〜599 の外なら 500） |
-| 400、408、413、414、415、417、431 | ヘッダー部かボディが拒否された場合 |
-| 403 | 全体の `access`、ホストごとの設定の `access`、ルートの `access`、管理画面のルートの `admin.route.access`（`denied by route access`）に拒否された場合 |
-| 404 | 一致するルートもデフォルトのアップストリームも無い場合、リダイレクトしない `Host` の場合、リダイレクトのリスナーではない平文のリスナーで受けた、管理画面のルートのホストの場合（`admin host over plain http`） |
-| 421 | `Host` が TLS の証明書に入っていない場合、管理画面のルートのホストを、その証明書ではない接続で受けた場合（`admin host on another certificate`） |
-| 429 | 全体の `rate_limit` かホストごとの設定の `rate_limit` に拒否された場合。応答は `Retry-After` を持ちます |
-| 502 | アップストリームに接続できない場合、アップストリームの応答が不正な場合、アップストリームがタイムアウトした場合、アップストリームのどのサーバーも使えない場合 |
-| 503 | 検査できない場合（検査プロセスが使えない、検査のスロットの待ちが満杯になった・タイムアウトした）、予算が尽きた場合、リクエストがタイムアウトした場合、プロキシ自身がアップストリームへの接続を作れない場合 |
-| 500 | プロキシの内部で不整合が起きた場合（ログに `internal fault` の行も出ます） |
+| The status code of the rule | A rule blocked the request (500 if the code is outside 200 to 599) |
+| 400, 408, 413, 414, 415, 417, 431 | The header section or the body was refused |
+| 403 | Refused by the global `access`, the `access` of a host policy, the `access` of a route, or the `admin.route.access` of the admin route (`denied by route access`) |
+| 404 | No route matches and there is no default upstream; a `Host` that is not redirected; or the host of the admin route received on a plain listener that is not a redirect listener (`admin host over plain http`) |
+| 421 | The `Host` is not in the TLS certificate; or the host of the admin route was received on a connection that does not use its certificate (`admin host on another certificate`) |
+| 429 | Refused by the global `rate_limit` or the `rate_limit` of a host policy. The response has `Retry-After` |
+| 502 | The proxy cannot connect to the upstream, the upstream's response is invalid, the upstream timed out, or no server of the upstream is usable |
+| 503 | The request cannot be inspected (the inspector process is unavailable, or the wait for an inspection slot is full or timed out), the budget ran out, the request timed out, or the proxy itself cannot make a connection to the upstream |
+| 500 | An inconsistency occurred inside the proxy (a line `internal fault` also appears in the log) |
 
-プロキシが自分で作る応答は、ボディが空で `Content-Length: 0` を持ちます（204・304 は `Content-Length` を持ちません。429 は `Retry-After` も持ちます）。ACME のチャレンジの 200 は、そのファイルをボディに持ちます。
+A response that the proxy creates itself has an empty body and `Content-Length: 0` (204 and 304 have no `Content-Length`, and 429 also has `Retry-After`). The 200 for an ACME challenge has that file as its body.
 
-プロキシが返すすべての応答（アップストリームの応答、ブロック、ヘッダー部の拒否、リダイレクトも含みます）は、リクエスト ID を `X-Request-ID` に 1 つ持ちます。アップストリームの応答に同じ名前のヘッダーがあれば置き換えます。リクエスト ID は、そのリクエストのログの `id` と同じなので、拒否された人が ID を伝えれば、ログを検索できます。
+Every response that the proxy returns (including upstream responses, blocks, refusals of the header section, and redirects) has exactly one `X-Request-ID` header that carries the request ID. If the upstream response has a header with the same name, the proxy replaces it. The request ID is the same as the `id` in the log of that request, so if someone whose request was refused tells you the ID, you can find the request in the log.
 
-## アクセス制御とレート制限
+## Access Control and Rate Limits
 
-設定ファイルの最上位の `access`、`rate_limit`、`host_policies`、`geo` は、ルートを探す前にリクエストを拒否するポリシーを決めます。`access` と `rate_limit` は全体の設定（全体のアクセス制御と全体のレート制限）で、`host_policies` は、ホストごとに全体の設定の代わりに適用するホストごとの設定です。どれも省けて、省いたポリシーは適用されません。`managed` のある設定では、`access`・`rate_limit`・`host_policies` は設定ファイルに書かず、バージョンに書きます（上の「managed ストアとバージョン」）。値は、起動のときと設定のリロードで読みます（上の「SIGHUP（設定のリロード）」）。管理画面のルート（`admin.route`）には、どのポリシーも適用されません。
+The top-level `access`, `rate_limit`, `host_policies`, and `geo` of the configuration file define the policies that refuse requests before a route is looked up. `access` and `rate_limit` are the global settings (the global access control and the global rate limit), and `host_policies` holds the host policies, which apply to each host instead of the global settings. All of them are optional, and a policy that is omitted is not applied. In a configuration with `managed`, `access`, `rate_limit`, and `host_policies` are written in the version, not in the configuration file (see "Managed Store and Versions" above). The values are read at start and at a configuration reload (see "SIGHUP (Configuration Reload)" above). No policy applies to the admin route (`admin.route`).
 
-### リクエストの検証の順序
+### Order of Request Checks
 
-リクエストは、次の順に検証します。最初に拒否した検証が、そのリクエストの応答になります。
+A request is checked in the following order. The first check that refuses it decides the response.
 
-| 順 | 検証 | 応答 | ログの `reason` |
+| Order | Check | Response | `reason` in the log |
 |---|---|---|---|
-| 1 | ヘッダー部の検証（上の「ヘッダー部の検証」） | 400、414、431 など | ヘッダー部の違反ごとに決まった語句 |
-| 2 | ACME のチャレンジ（`acme` を持つ証明書があるときの、通常のリスナーとリダイレクトのリスナー） | チャレンジのファイルをボディにした 200、または 404 | `acme challenge` |
-| 3 | 管理画面のルート（`managed` のある設定で、`Host` が `admin.route.host` のとき）。TLS の接続でハンドシェイクに管理画面のルートの証明書を使ったか、平文の接続でないか、`admin.route.access` が許すか | 421、404、403 | `admin host on another certificate`、`admin host over plain http`、`denied by route access` |
-| 4 | そのリクエストに適用されるアクセス制御（`Host` が一致するホストごとの設定の `access`、無ければ全体の `access`） | 403 | `denied by access` |
-| 5 | そのリクエストに適用されるレート制限（同じく、ホストごとの設定か全体の `rate_limit`） | 429（`Retry-After: 1`） | `too many requests` |
-| 6 | TLS の接続の `Host` が、ハンドシェイクで使った証明書のホストに入っているか | 421 | `host not covered by the certificate` |
-| 7 | ルート（無ければデフォルトのアップストリーム） | 404 | `no route matches` |
-| 8 | ルートの `access` | 403 | `denied by route access` |
-| 9 | `Content-Length` とルートの `max_body` | 413 | `body over the limit of the route` |
-| 10 | ボディの型（上の「ボディの型」） | 415 | `body type not supported` |
+| 1 | Header section checks (see "Header Checks" above) | 400, 414, 431, and so on | A fixed phrase for each kind of header section violation |
+| 2 | ACME challenge (on a normal listener and a redirect listener, when there is a certificate that has `acme`) | 200 with the challenge file as the body, or 404 | `acme challenge` |
+| 3 | Admin route (in a configuration with `managed`, when `Host` is `admin.route.host`). Whether a TLS connection used the certificate of the admin route in the handshake, whether the connection is not plain, and whether `admin.route.access` allows it | 421, 404, 403 | `admin host on another certificate`, `admin host over plain http`, `denied by route access` |
+| 4 | The access control that applies to the request (the `access` of the host policy whose hosts match the `Host`, or the global `access` if there is none) | 403 | `denied by access` |
+| 5 | The rate limit that applies to the request (likewise, the `rate_limit` of the host policy or the global one) | 429 (`Retry-After: 1`) | `too many requests` |
+| 6 | Whether the `Host` of a TLS connection is among the hosts of the certificate used in the handshake | 421 | `host not covered by the certificate` |
+| 7 | Route (the default upstream if there is none) | 404 | `no route matches` |
+| 8 | The `access` of the route | 403 | `denied by route access` |
+| 9 | `Content-Length` and the `max_body` of the route | 413 | `body over the limit of the route` |
+| 10 | Body type (see "Body Types" above) | 415 | `body type not supported` |
 
-10 は、`Content-Length` のあるボディではボディを読む前に、chunked のボディでは読んだ後に検証します。その後に、検査し、転送します。リダイレクトのリスナーは、5 の後にリダイレクトか 404 で応答し、ボディを読みません。
+Check 10 is done before the body is read for a body with `Content-Length`, and after the body is read for a chunked body. After that, the proxy inspects and forwards the request. The redirect listener responds with a redirect or 404 after check 5 and does not read the body.
 
-- 3 に該当するリクエストは、4 から 9 を通らず、管理プロセスへ転送します（WAF の検査は通ります。ボディの上限は `proxy.max_body`）。3 の 421 は、HTTP/2 のクライアントが、管理画面のホストのリクエストを、別のサイトの証明書（`*.example.com` など）の接続で送ったときです。クライアントは、正しい SNI で接続し直します。リダイレクトのリスナーは、管理画面のルートのホストを、ポリシーを適用せずに https へリダイレクトします。
-- 4 と 5 で適用される設定は、リクエストの `Host` で決まります（下の「ホストごとの設定（`host_policies`）」）。
-- 4 と 5 は、検査除外のルートに一致するリクエストにも、リダイレクトのリスナーにも、同じように効きます。検査プロセスが止まっていても、拒否する応答は変わりません。監視用のリスナーには適用されません。
-- 拒否するのは、ヘッダー部を読んだ後のリクエストです。接続の受け付けと TLS のハンドシェイクは、拒否するクライアントにも行い、その間は `max_conns` の枠を使います。
-- 1 で拒否したリクエストと、2 で応答したチャレンジは、アクセス制御にもレート制限にも数えません。
-- 3〜9 で拒否したリクエストは、ボディを読む前に応答します。HTTP/1.1 の接続では、ボディを持つリクエストを拒否すると、応答の後に接続を閉じます。ボディの無いリクエストなら、接続は続きます。HTTP/2 では、そのストリームだけが終わります。
-- 拒否したリクエストは、ログに出ます（`class` は `rejected`）。4 と 5 で拒否したリクエストは、全体の設定でもホストごとの設定でも、`/metrics` の `tukuyomi_policy_refusals_total` に数えます。
+- A request that check 3 applies to skips checks 4 to 9 and is forwarded to the admin process (it is still inspected by the WAF, and the body limit is `proxy.max_body`). The 421 in check 3 happens when an HTTP/2 client sends a request for the host of the admin screens on a connection made for another site's certificate (such as `*.example.com`). The client reconnects with the correct SNI. The redirect listener redirects the host of the admin route to https without applying policies.
+- The settings that apply in checks 4 and 5 are decided by the `Host` of the request (see "Host Policies (`host_policies`)" below).
+- Checks 4 and 5 work the same way for requests that match a bypass route and on the redirect listener, and they refuse with the same response even when the inspector process is stopped. They do not apply to the monitoring listener.
+- Requests are refused after their header section has been read. Connections from clients that will be refused are still accepted and go through the TLS handshake, and in the meantime they use a `max_conns` slot.
+- A request refused in check 1 and a challenge responded to in check 2 are not counted by either the access control or the rate limit.
+- A request refused in checks 3 to 9 gets its response before the body is read. On an HTTP/1.1 connection, when a request with a body is refused, the connection is closed after the response. If the request has no body, the connection continues. In HTTP/2, only that stream ends.
+- A refused request appears in the log (`class` is `rejected`). A request refused in check 4 or 5 is counted in `tukuyomi_policy_refusals_total` of `/metrics`, whether by the global settings or by a host policy.
 
-### クライアントと国
+### Client and Country
 
-- 全体の `access`、`rate_limit`、ホストごとの設定、ルートの `access`、`admin.route.access` は、どれも上の「クライアントのアドレス」で決めたアドレスを見ます。国も、そのアドレスから判定します。
-- `trusted_proxies` に入る相手でも、`X-Forwarded-For` の行を付けなければ、その相手がクライアントです。`trusted_proxies` に入れない相手も同じです。前に置いた中継がクライアントのアドレスを伝えないと、その後ろのクライアントは区別されず、国は中継のアドレスで決まり、レート制限は 1 つのクライアントとして数えます。
+- The global `access` and `rate_limit`, the host policies, the `access` of a route, and `admin.route.access` all look at the address decided in "Client Address" above. The country is also determined from that address.
+- Even a peer that is in `trusted_proxies` is the client if it does not add an `X-Forwarded-For` line. The same applies to a peer that is not in `trusted_proxies`. If an intermediary in front of the proxy does not pass on the client address, the clients behind it cannot be told apart, the country is taken from the intermediary's address, and the rate limit counts them as one client.
 
 ### `access`
 
@@ -1592,24 +1594,24 @@ managed ストアの内容:
 {"deny_cidrs"?, "allow_cidrs"?, "deny_countries"?, "allow_countries"?}
 ```
 
-全体のアクセス制御です。ルートの `access` と同じ形で、同じ決まりで拒否します。全体の `access` は、ヘッダー部の検証に通ったリクエスト（ACME のチャレンジと管理画面のルートを除く）に効きます。ただし、ホストごとの設定が自分の `access` を持つ場合、その設定のホストへのリクエストには、全体の `access` の代わりに、その `access` が効きます（下の「ホストごとの設定（`host_policies`）」）。
+This is the global access control. It has the same form as the `access` of a route and refuses requests by the same rules. The global `access` applies to requests that passed the header section checks (except ACME challenges and the admin route). However, if a host policy has its own `access`, that `access` applies to requests to the hosts of that policy instead of the global `access` (see "Host Policies (`host_policies`)" below).
 
-| 設定キー | 内容 |
+| Setting key | Content |
 |---|---|
-| `deny_cidrs`、`allow_cidrs` | ネットワークの一覧。256 個まで。書き方は `trusted_proxies` と同じ |
-| `deny_countries`、`allow_countries` | 国の指定。256 個まで。国は、ISO 3166-1 alpha-2 の英大文字 2 字（`JP` など）か、`UNKNOWN`。小文字や、2 字でないものは受け付けません。2 字が ISO 3166 の一覧にあるかは検証しません |
+| `deny_cidrs`, `allow_cidrs` | A list of networks. Up to 256. Written in the same way as `trusted_proxies` |
+| `deny_countries`, `allow_countries` | A country list. Up to 256. A country is an ISO 3166-1 alpha-2 code in two uppercase letters (such as `JP`), or `UNKNOWN`. Lowercase letters and anything that is not two letters are rejected. The proxy does not check whether the two letters are in the ISO 3166 list |
 
-- 4 つとも省けます。省いた設定キーは空の一覧で、4 つとも空なら、誰も拒否しません。
-- 次のクライアントを拒否します。
-  - `deny_cidrs` に入るもの
-  - 国が `deny_countries` に入るもの
-  - `allow_cidrs` が空でなく、そこに入らないもの
-  - `allow_countries` が空でなく、国がそこに入らないもの
-- `allow_cidrs` と `allow_countries` を両方書けば、両方に入るクライアントだけが通ります。ネットワークを国に関係なく通す書き方はありません。
-- 拒否するときの応答は、ボディが空の 403 で、`Retry-After` は付けません。
-- 国の指定を書くには、`geo` が必要です。
+- All four are optional. An omitted setting key means an empty list, and if all four are empty, nobody is refused.
+- The following clients are refused.
+  - Those in `deny_cidrs`
+  - Those whose country is in `deny_countries`
+  - If `allow_cidrs` is not empty, those that are not in it
+  - If `allow_countries` is not empty, those whose country is not in it
+- If you write both `allow_cidrs` and `allow_countries`, only the clients that are in both pass. There is no way to let a network through regardless of its country.
+- A refused request gets 403 with an empty body and no `Retry-After`.
+- A country list requires `geo`.
 
-例:
+Example:
 
 ```json
 "access": {
@@ -1618,85 +1620,85 @@ managed ストアの内容:
 }
 ```
 
-この例は、`198.51.100.0/24` のクライアントと、`JP` と `UNKNOWN` 以外の国のクライアントを拒否します。
+This example refuses clients in `198.51.100.0/24` and clients from countries other than `JP` and `UNKNOWN`.
 
-### レート制限（`rate_limit`）
+### Rate Limits (`rate_limit`)
 
 ```text
 {"rate", "burst", "keys", "exempt_cidrs"?}
 ```
 
-全体のレート制限です。ホストごとの設定が自分の `rate_limit` を持つ場合、その設定のホストへのリクエストは、全体のテーブルではなく、そのホストごとの設定のテーブルで数えます（下の「ホストごとの設定（`host_policies`）」）。
+This is the global rate limit. If a host policy has its own `rate_limit`, requests to the hosts of that policy are counted in that host policy's table instead of the global table (see "Host Policies (`host_policies`)" below).
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `rate` | 1〜100000 | 1 つのクライアントが続けてよい、1 秒あたりのリクエスト数 |
-| `burst` | 0〜100000 | 休んだ後に、間を空けずに通すリクエストの余裕（バースト）。続けて `burst + 1` 件まで通り、次の 1 件から拒否します |
-| `keys` | 1024〜1048576 | 追跡するクライアント数の上限（下の「テーブルのサイズ」） |
-| `exempt_cidrs` | 0〜256 個のネットワーク | 数えないクライアント（除外するネットワーク）。書き方は `trusted_proxies` と同じ。省けば空 |
+| `rate` | 1 to 100000 | The number of requests per second that one client may keep making |
+| `burst` | 0 to 100000 | The burst allowance: the number of requests let through back to back after an idle period. Up to `burst + 1` requests in a row pass, and refusal starts from the next one |
+| `keys` | 1024 to 1048576 | The maximum number of clients tracked (see "Table size" below) |
+| `exempt_cidrs` | 0 to 256 networks | Clients that are not counted (excluded networks). Written in the same way as `trusted_proxies`. Empty if omitted |
 
-- 数え方:
-  - リクエストを 1 件ずつ数えます（接続ではなく、HTTP/2 ではストリームごと）。
-  - 休んでいたクライアントは、間を空けずに `burst + 1` 件まで通ります。次の 1 件は拒否します。その後は、待った時間が 1/`rate` 秒になるごとに 1 件通ります。
-  - 1/`rate` 秒は、ナノ秒に切り上げます。そのため、クライアントが `rate` を超えて通ることはありません。
-  - 拒否したリクエストは、そのクライアントのカウントを変えません。
-  - 初めて来るクライアントのリクエストは、必ず通ります。
-- クライアントの単位:
-  - IPv4 はアドレスごと。IPv6 は上位 64 ビット（/64）ごとです。同じ /64 の中でアドレスを変えても、カウントは増えません。
-  - IPv4-mapped IPv6 アドレス（`::ffff:192.0.2.1`）は、IPv4 として数えます。ポートは見ません。
-  - 信頼する相手が `X-Forwarded-For` を付けないと、その相手がクライアントになります（上の「クライアントと国」）。そのとき `rate` と `burst` は、その相手を通るすべてのクライアントの合計に対する値になります。
-- 拒否するときの応答: ボディが空の 429 で、`Retry-After` を付けます。値は、次の 1 件が通るまでの時間を秒に切り上げたもので、最小は 1 です。`rate` は 1 以上で、次の 1 件までは 1 秒を超えないので、いつも `1` になります。
-- `exempt_cidrs` に入るクライアントは、数えません。ただし、アクセス制御には先に拒否されます。監視プログラムなどを入れます。
-- テーブルのサイズ:
-  - `keys` は、同時に数えるクライアントの数の上限です。1 クライアントは約 100 バイトで、`keys` が 1048576 なら約 100 MB になります。
-  - 全体の `keys` と、自分のテーブルを持つホストごとの設定の `keys` の合計は、1048576 までです。超えると設定を受け付けません（`the rate limits keep count of more than 1048576 clients in all`）。
-  - リクエストのたびに、テーブルの古い方から最大 4 クライアントを調べ、カウントが残っていないもの（待ち時間が過ぎたもの）を外します。カウントが残っていないクライアントは新しいクライアントと同じ扱いなので、外しても結果は変わりません。
-  - テーブルが満杯で、いちばん古いクライアントのカウントがまだ残っているときは、そのクライアントを外して、新しいクライアントの場所を作ります。外されたクライアントは、次に来たときに新しいクライアントとして始まり、また `burst + 1` 件まで通ります。つまり、そのクライアントの制限が一度ゆるみます。新しいクライアントが、場所が無いために拒否されることはありません。
-  - 外した数は `tukuyomi_rate_limit_evicted_total` に、数えているクライアントの数は `tukuyomi_rate_limit_keys` に出ます（どちらも、すべてのテーブルの合計）。多くのアドレスからリクエストが来ると、実際のクライアントがテーブルから外されて、制限がゆるみます。`keys` は、同時に来るクライアントの数より十分大きくします。
-  - テーブルはプロキシのメモリの中にあり、再起動すると空になります。設定のリロードでは、テーブルごとに持ち越します。全体のテーブルは、新旧の両方に全体の `rate_limit` があり、`keys`・`rate`・`burst` がどれも同じなら続きます（`exempt_cidrs` は新しい値を使います）。どれかが違うか、片方に無ければ、新しいテーブルで 0 から数え、`reload: rate limit table started anew` の行を出します。ホストごとの設定のテーブルは、下の「ホストごとの設定（`host_policies`）」を参照してください。
-- 拒否したリクエストは、`tukuyomi_policy_refusals_total` の `rate_limit` に数えます。ログの `reason` は `too many requests` です。
+- How counting works:
+  - Requests are counted one by one (not connections; in HTTP/2, per stream).
+  - A client that has been idle passes up to `burst + 1` requests without a gap. The next one is refused. After that, one more request passes for every 1/`rate` seconds of waiting.
+  - 1/`rate` seconds is rounded up to nanoseconds, so a client never exceeds `rate`.
+  - A refused request does not change the count of that client.
+  - The first request from a new client always passes.
+- The unit of a client:
+  - For IPv4, each address. For IPv6, each /64 (the upper 64 bits). Changing the address within the same /64 does not increase the count.
+  - An IPv4-mapped IPv6 address (`::ffff:192.0.2.1`) is counted as IPv4. The port is not looked at.
+  - If a trusted peer does not add `X-Forwarded-For`, that peer becomes the client (see "Client and Country" above). In that case, `rate` and `burst` apply to all the clients behind that peer together.
+- A refused request gets 429 with an empty body and `Retry-After`. The value is the time until the next request can pass, rounded up to whole seconds, with a minimum of 1. Because `rate` is at least 1, that time never exceeds 1 second, so the value is always `1`.
+- Clients in `exempt_cidrs` are not counted, but the access control still applies to them first and can refuse them. Put monitoring programs there, for example.
+- Table size:
+  - `keys` is the maximum number of clients counted at the same time. One client takes about 100 bytes, so a `keys` of 1048576 takes about 100 MB.
+  - The total of the global `keys` and the `keys` of the host policies that have their own table is at most 1048576. If it exceeds that, the configuration is rejected (`the rate limits keep count of more than 1048576 clients in all`).
+  - On every request, the proxy examines up to 4 clients from the older end of the table and removes those that have no count left (those whose waiting time has passed). A client with no count left is treated in the same way as a new client, so removing it does not change the result.
+  - When the table is full and the oldest client still has a count left, that client is removed to make room for a new client. A removed client starts as a new client the next time it comes and again passes up to `burst + 1` requests. In effect, the limit for that client is loosened once. A new client is never refused for lack of room.
+  - The number of removed clients appears in `tukuyomi_rate_limit_evicted_total`, and the number of clients being counted appears in `tukuyomi_rate_limit_keys` (both are totals over all tables). If requests come from many addresses, real clients are removed from the table and the limit is loosened. Set `keys` well above the number of clients that come at the same time.
+  - The tables are kept in the proxy's memory and start empty after a restart. At a configuration reload, the proxy decides for each table whether to carry it over. The global table continues if both the old and the new configuration have the global `rate_limit` and `keys`, `rate`, and `burst` are all the same (`exempt_cidrs` uses the new value). If any of them differs, or one of the two has no global `rate_limit`, counting starts from 0 in a new table, and the proxy writes a `reload: rate limit table started anew` line. For the tables of host policies, see "Host Policies (`host_policies`)" below.
+- A refused request is counted under `rate_limit` in `tukuyomi_policy_refusals_total`. The `reason` in the log is `too many requests`.
 
-### ホストごとの設定（`host_policies`）
+### Host Policies (`host_policies`)
 
 ```text
 [{"name", "hosts", "access"?, "rate_limit"?}, ..]
 ```
 
-ホストごとに、全体のアクセス制御とレート制限の代わりに適用する設定です。省けます。`managed` の無い設定ファイルでは最上位に書き、`managed` のある設定ではバージョンに書きます（設定ファイルに書くと受け付けません）。
+These are per-host settings that apply instead of the global access control and rate limit. They are optional. In a configuration file without `managed`, write them at the top level. In a configuration with `managed`, write them in the version (they are rejected if written in the configuration file).
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `name` | 1〜64 文字の英数字・`-`・`_` | 名前。項目どうしで同じ名前は書けません。レート制限のテーブルの持ち越しに使います（下） |
-| `hosts` | 1〜64 個 | 適用するホスト。ルートの `host` と同じ形で、ポートは書きません（英小文字の名前か、`*.` と名前） |
-| `access` | 全体の `access` と同じ形 | このホストのアクセス制御 |
-| `rate_limit` | `{}`、または `rate`・`burst`・`keys` を全部書いた全体の `rate_limit` と同じ形 | このホストのレート制限 |
+| `name` | 1 to 64 characters of letters and digits, `-`, and `_` | The name. Two entries cannot have the same name. It is used to carry over rate limit tables (below) |
+| `hosts` | 1 to 64 entries | The hosts that the entry applies to. The same form as the `host` of a route, without a port (a lowercase name, or `*.` and a name) |
+| `access` | The same form as the global `access` | The access control for these hosts |
+| `rate_limit` | `{}`, or the same form as the global `rate_limit` with all of `rate`, `burst`, and `keys` written | The rate limit for these hosts |
 
-- 項目は 64 個まで、すべての項目のホストは合わせて 1024 個までです。同じホストを 2 度書けません（別の項目でも）。管理画面のルートのホスト（`admin.route.host`）と同じホストは書けません（`*.` のホストがそれを含んでもかまいません。管理画面のルートが先に一致します）。
-- `access` も `rate_limit` も無い項目は、受け付けません。
-- 一致の方法: リクエストの `Host` で、ルートと同じ方法で項目を選びます。大文字と小文字を区別せず、末尾の `.` を 1 つ落とし、ポートは見ません。名前のホストが `*.` のホストより先に、長い `*.` のホストが短いものより先に一致します。どの項目にも一致しないリクエストには、全体の設定が適用されます。
-- 重ね方: アクセス制御とレート制限は、それぞれ次の 3 つのどれかになります（管理画面の語も示します）。
+- There are at most 64 entries, and at most 1024 hosts in all entries together. The same host cannot be written twice (not even in different entries). The host of the admin route (`admin.route.host`) cannot be written (a `*.` host may contain it; the admin route matches first).
+- An entry with neither `access` nor `rate_limit` is rejected.
+- How matching works: the proxy chooses an entry by the `Host` of the request, in the same way as for routes. Case is ignored, one trailing `.` is dropped, and the port is ignored. A named host matches before a `*.` host, and a longer `*.` host before a shorter one. The global settings apply to a request that matches no entry.
+- How they combine: access control and rate limiting each take one of the following three forms (the table also shows the wording of the admin screens).
 
-| 書き方 | 管理画面の語 | アクセス制御 | レート制限 |
+| How to write | Admin screen wording | Access control | Rate limit |
 |---|---|---|---|
-| 設定キーを書かない | 引き継ぐ | 全体の `access` を適用します | 全体のテーブルで数えます。同じクライアントのリクエストは、ほかのホストへのものと合わせて数えます |
-| 値を書く | このホストの設定 | 全体の代わりに、この `access` を適用します | 全体の代わりに、このホストごとの設定のテーブルで数えます |
-| `{}` | 使わない | 誰も拒否しません | 数えません |
+| Do not write the setting key | Inherit | The global `access` applies | Counted in the global table. Requests from the same client are counted together with those to other hosts |
+| Write a value | Settings for this host | This `access` applies instead of the global one | Counted in the table of this host policy instead of the global one |
+| `{}` | Not used | Nobody is refused | Not counted |
 
-- 「このホストの設定」と「使わない」では、全体の設定の拒否（急いで追加した `deny_cidrs` も）が、そのホストには効きません。全体の設定を変更するときは、それを引き継がないホストごとの設定も見直してください。
-- ホストごとの設定は、その `Host` で来たリクエストにだけ適用されます。デフォルトのアップストリーム、`host` の無いルート、`*.` のルートで同じアップストリームに届く、ほかの `Host`（IP アドレスの `Host`、どの項目にも無い名前）のリクエストには、全体の設定だけが適用されます。ホストごとにルートを書き、デフォルトのアップストリームを空にすれば、この形は無くなります。
-  - IPv6 アドレスの `Host`（`[2001:db8::1]` など）は、どの項目にも一致しません。国際化ドメイン名は、Punycode 形式（`xn--` で始まる名前）で書きます。
-- 読めない `Host`（ヘッダー部の検証は通るが、ポートが `0` で始まる `www.example.com:0443` など）は、どのホストへのリクエストにもなりうるものとして扱います。全体の `access` と、自分の `access` を持つすべての項目の `access` の全部に通らなければ拒否します。レート制限は、全体のテーブルと、自分のテーブルを持つすべての項目のテーブルで順に数え、最初に拒否したテーブルで止めます。
-- リダイレクトのリスナーも、同じ方法で、適用される設定を決めます。管理画面のルートには適用されません。
-- 国の指定を書くには、`geo` が必要です。
-- レート制限のテーブル:
-  - 全体の `keys` と、自分のテーブルを持つ項目の `keys` の合計は、1048576 までです（上の「レート制限（`rate_limit`）」）。
-  - テーブルは項目ごとに別なので、ホストをまたいだ合計の上限はありません。1 つのクライアントは、全体の `rate` と、各項目の `rate` を足した分まで通せます。
-  - 設定のリロードでは、同じ `name` の項目が前も後も自分のテーブルを持ち、`keys`・`rate`・`burst` がどれも同じなら、テーブルを持ち越します（`hosts` だけを変更したときも）。自分のテーブルを持つ項目のうち、`name` を変更したもの、「引き継ぐ」か「使わない」から「このホストの設定」に切り替えたもの、新しく追加したものは、空から数え、`reload: rate limit table of host policy <name> started anew` の行を出します。2 つの項目の `name` を入れ替えると、テーブルも名前に付いて移ります。
-  - `/metrics` の `tukuyomi_rate_limit_keys` と `tukuyomi_rate_limit_evicted_total` は、すべてのテーブルの合計です。引き継ぐホストは全体のテーブルで数えるので、2 度は数えません。
-- ホストごとの設定で拒否したリクエストも、ログの `reason`（`denied by access`、`too many requests`）と `/metrics` のラベルは、全体の設定のものと同じです。どのホストかは、ログの `host` で分かります。
-- `host_policies` を書いた設定ファイルやバージョンを、この設定キーを知らない前のビルドで読むと、未知の設定キーとして受け付けません。ビルドを前に戻すときは注意してください。ログ送信プロセスも設定ファイルを読むので、設定ファイルに `host_policies` を書く前に、ログ送信プロセスをプロキシと同じビルドにします（下の「ログ送信プロセスの起動」）。
+- With "Settings for this host" and "Not used", refusals by the global settings (including a `deny_cidrs` added in a hurry) do not apply to that host. When you change the global settings, also review the host policies that do not inherit them.
+- A host policy applies only to requests that arrive with that `Host`. Requests with another `Host` (a `Host` that is an IP address, or a name that is in no entry) that reach the same upstream through the default upstream, a route without `host`, or a `*.` route get only the global settings. If you write a route for each host and leave the default upstream empty, this cannot happen.
+  - A `Host` that is an IPv6 address (such as `[2001:db8::1]`) matches no entry. Write an internationalized domain name in Punycode form (a name that starts with `xn--`).
+- A request whose `Host` cannot be parsed (it passes the header section checks, but, for example, the port of `www.example.com:0443` starts with `0`) is treated as if it could be for any host. It is refused unless it passes both the global `access` and the `access` of every entry that has its own `access`. For the rate limit, it is counted in the global table and then in the tables of all the entries that have their own table, in order, and counting stops at the first table that refuses it.
+- The redirect listener also chooses the applicable settings in the same way. Host policies do not apply to the admin route.
+- A country list requires `geo`.
+- Rate limit tables:
+  - The total of the global `keys` and the `keys` of the entries that have their own table is at most 1048576 (see "Rate Limits (`rate_limit`)" above).
+  - Each entry has its own table, so the total across hosts has no maximum. One client can pass up to the global `rate` plus the `rate` of each entry.
+  - At a configuration reload, if an entry with the same `name` has its own table both before and after, and `keys`, `rate`, and `burst` are all the same, the table is carried over (also when only `hosts` is changed). Among the entries that have their own table, an entry that was renamed, switched from "Inherit" or "Not used" to "Settings for this host", or newly added starts counting from empty, and the proxy writes a `reload: rate limit table of host policy <name> started anew` line. If you swap the names of two entries, the tables move with the names.
+  - `tukuyomi_rate_limit_keys` and `tukuyomi_rate_limit_evicted_total` in `/metrics` are totals over all tables. Hosts that inherit are counted in the global table, so they are not counted twice.
+- Requests that a host policy refuses have the same `reason` in the log (`denied by access`, `too many requests`) and the same labels in `/metrics` as those refused by the global settings. You can tell which host they were for from the `host` in the log.
+- An earlier build that does not know the setting key `host_policies` rejects a configuration file or a version that contains it, as having an unknown setting key. Be careful when you go back to an earlier build. The records shipper also reads the configuration file, so before you write `host_policies` in the configuration file, replace the records shipper with the same build as the proxy (see "Starting the Records Shipper" below).
 
-例:
+Example:
 
 ```json
 "host_policies": [
@@ -1706,22 +1708,22 @@ managed ストアの内容:
 ]
 ```
 
-この例では、`app.example.com` は `203.0.113.0/24` のクライアントだけが使え（全体の `access` は適用されません）、レート制限は全体のテーブルで数えます。`api.example.com` と `*.api.example.com` には全体の `access` が適用され、レート制限はこの項目のテーブルで数えます。`status.example.com` には、アクセス制御もレート制限も適用されません。
+In this example, only clients in `203.0.113.0/24` can use `app.example.com` (the global `access` does not apply), and its rate limit is counted in the global table. The global `access` applies to `api.example.com` and `*.api.example.com`, and their rate limit is counted in this entry's table. Neither access control nor a rate limit applies to `status.example.com`.
 
-### 国のデータベース（`geo`）
+### Country Database (`geo`)
 
 ```text
 {"country_db", "sha256"}
 ```
 
-2 つとも書きます。国の指定（`deny_countries`・`allow_countries`）を使うときに、クライアントのアドレスの国をこのデータベースで判定します。
+Write both. When you use a country list (`deny_countries` and `allow_countries`), the proxy uses this database to find the country of the client address.
 
-| 設定キー | 内容 |
+| Setting key | Content |
 |---|---|
-| `country_db` | 国のデータベースファイルの絶対パス |
-| `sha256` | そのファイルの SHA-256。64 桁の小文字の 16 進数 |
+| `country_db` | The absolute path of the country database file |
+| `sha256` | The SHA-256 of that file. 64 lowercase hexadecimal digits |
 
-例（`sha256` の値は例です。ファイルに `sha256sum` を実行した値を書きます）:
+Example (the `sha256` value is an example; write the value that `sha256sum` prints for your file):
 
 ```json
 "geo": {
@@ -1730,234 +1732,234 @@ managed ストアの内容:
 }
 ```
 
-- ファイルは、MaxMind DB の形式（バージョン 2）です。プロキシはデータベースを同梱せず、取得もしません。運用者が用意して置きます。データベースの使用許諾は、提供元の条件に従って運用者が守ります。
-- 国の決め方:
-  - アドレスのレコードの `country.iso_code` で決めます。無ければ `registered_country.iso_code` で決めます。どちらも無いとき、英大文字 2 字でないときは `UNKNOWN` です。
-  - ループバック、プライベート（`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`fc00::/7`）、リンクローカル、未指定のアドレスは、データベースを検索せずに `UNKNOWN` にします。データベースが知らないアドレスも `UNKNOWN` です。
-  - IPv4-mapped IPv6 アドレスは、IPv4 として検索します。
-  - IPv4 のアドレスだけのデータベース（メタデータの `ip_version` が 4）では、IPv6 のクライアントはすべて `UNKNOWN` になります。
-- `UNKNOWN` に注意してください。`allow_countries` に `UNKNOWN` を書かないと、プライベートなアドレスのクライアント（同じネットワークの監視など）も、IPv4 だけのデータベースでの IPv6 のクライアントも、すべて拒否されます。`deny_countries` に `UNKNOWN` を書けば、それらを拒否します。
-- 読み込み:
-  - 設定の全体を読むコマンドは、`geo` のファイルを読んで検証します。プロキシの起動、`config check`、SIGHUP と制御ソケットの `reload` によるリロード、`acme renew`、`managed import`、`managed activate` です。どれも、サービスの OS ユーザーがファイルを読める必要があります。設定ファイルだけを読むコマンド（`rules` の各コマンド、`managed list`・`managed remove`、`admin` の各コマンドと管理プロセス、ログ送信プロセス）は、`geo` の値の形だけを検証し、ファイルは読みません。
-  - 次を検証します。
-    - 通常のファイルで、シンボリックリンクでなく、256 MiB までです。全体を読みます。
-    - SHA-256 が `sha256` と一致します。
-    - MaxMind DB として読めます。メタデータのバージョンが 2、レコードのサイズが 24・28・32 ビット、`ip_version` が 4 か 6、検索ツリーが壊れていません。ツリーが指すレコードをすべて検証し、読めないレコードがあれば受け付けません。
-    - 国のデータベースです。`database_type` に `Country` を含むか、ISO コードを持つレコードが 1 つ以上あります。
-  - 国の指定があれば、プロキシは、検証したファイルの全体をメモリに保持します。読むコマンドは、読むたびに全体を検証するので、大きいファイルでは時間とメモリを使います。
-  - 国の指定（全体の `access`、`host_policies` の `access`、ルートの `access`）がどこにも無ければ、読んで検証した後で使わずに捨てます。国の指定があって `geo` が無い設定は受け付けません（`access has a list of countries while geo is left out`）。
-  - プロキシは、起動のときと、SIGHUP と制御ソケットの `reload` によるリロードのたびに読みます。その間は再度読み込みません。リロードのたびに全体を検証するので、大きいファイルではリロードのたびに時間とメモリを使います。
-- 入れ替える手順: 新しいファイルを別の名前で置き、`country_db` と `sha256` を 1 回の置き換えで書き換え、`config check` で検証してから、プロキシにリロードさせます（SIGHUP、`systemctl reload`）。管理プロセスは、データベースを読みません。同じ名前のファイルだけを入れ替えて `sha256` が合わないと、その間に実行する、設定の全体を読むコマンドと、再起動したプロキシは設定を受け付けず、プロキシのリロードも拒否されます。
+- The file is in the MaxMind DB format (version 2). The proxy neither includes a database nor downloads one. The operator prepares and places it, and is responsible for following the license terms of the database's provider.
+- How the country is determined:
+  - The proxy uses `country.iso_code` of the address record, or `registered_country.iso_code` if that is missing. If neither exists, or if the code is not two uppercase letters, it is `UNKNOWN`.
+  - Loopback, private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), link-local, and unspecified addresses become `UNKNOWN` without a database lookup. An address that the database does not know is also `UNKNOWN`.
+  - An IPv4-mapped IPv6 address is looked up as IPv4.
+  - With a database that has only IPv4 addresses (`ip_version` 4 in the metadata), all IPv6 clients become `UNKNOWN`.
+- Watch out for `UNKNOWN`. If you do not write `UNKNOWN` in `allow_countries`, clients with private addresses (such as monitoring on the same network) and IPv6 clients with an IPv4-only database are all refused. If you write `UNKNOWN` in `deny_countries`, they are refused.
+- Loading:
+  - The commands that read the whole configuration read and check the `geo` file. They are the proxy start, `config check`, a reload by SIGHUP or by `reload` on the control socket, `acme renew`, `managed import`, and `managed activate`. For all of them, the OS user of the service must be able to read the file. The commands that read only the configuration file (the `rules` commands, `managed list` and `managed remove`, the `admin` commands and the admin process, and the records shipper) check only the form of the `geo` values and do not read the file.
+  - The proxy checks the following.
+    - It is a regular file, not a symbolic link, and at most 256 MiB. It is read in full.
+    - The SHA-256 matches `sha256`.
+    - It can be read as a MaxMind DB. The metadata version is 2, the record size is 24, 28, or 32 bits, `ip_version` is 4 or 6, and the search tree is not broken. All the records that the tree points to are checked, and the file is rejected if any of them cannot be read.
+    - It is a country database. `database_type` contains `Country`, or at least one record has an ISO code.
+  - If there is a country list, the proxy keeps the whole checked file in memory. The commands that read the file check all of it every time, so a large file costs time and memory.
+  - If there is no country list anywhere (the global `access`, the `access` of `host_policies`, the `access` of a route), the file is read and checked and then discarded without being used. A configuration that has a country list but no `geo` is rejected (`access has a list of countries while geo is left out`).
+  - The proxy reads the file at start and at every reload by SIGHUP or by `reload` on the control socket. It does not read it again in between. The whole file is checked at every reload, so a large file costs time and memory at every reload.
+- Replacing the database: place the new file under another name, change both `country_db` and `sha256` in one write of the configuration file, check with `config check`, and then reload the proxy (SIGHUP, `systemctl reload`). The admin process does not read the database. If you overwrite the file under the same name, `sha256` no longer matches, and until you fix it, the commands that read the whole configuration and a proxy that restarts reject the configuration, and a reload of the proxy is also refused.
 
-## ログ
+## Logs
 
-ログは、標準エラーに 1 行 1 件の JSON で出ます（systemd ではジャーナル）。設定に `records` があれば、同じ行をファイルにも書きます（下の「ログファイル」）。さらに `records.ship` があれば、別のプロセス（ログ送信プロセス）がファイルの行を PostgreSQL か MySQL へ送ります（下の「ログ送信プロセス」）。ログを残せないときにリクエストを通すか拒否するかは、ルートごとに選べます（下の「ログの残し方」）。短いコマンド（`config check`・`rules`・`managed`・`acme`・`admin bootstrap`・`admin reset`）の出力は、人が読む文の行のままです。
+Logs are written to standard error, one JSON object per line (to the journal under systemd). If the configuration has `records`, the same lines are also written to files (except some of the first lines at start; see "Log Files (`records`)" below). If `records.ship` is also present, another process (the records shipper) sends the lines in the files to PostgreSQL or MySQL (see "Records Shipper" below). For each route, you can choose whether to let requests through or refuse them when logs cannot be kept (see "What Logs Keep (`keep` and the `records` of a Route)" below). The short-lived commands (`config check`, `rules`, `managed`, `acme`, `admin bootstrap`, `admin reset`) still write plain text lines for people to read.
 
-どのログも、次の 2 つの項目で始まります。値の無い項目は書きません（`null` にしません）。
+Every log line starts with the following two fields. A field without a value is left out (it is not written as `null`).
 
-| 項目 | 内容 |
+| Field | Content |
 |---|---|
-| `ts` | 記録した時刻。UTC の RFC 3339 形式でミリ秒まで（例: `2026-10-27T03:53:27.123Z`） |
-| `type` | `request`、`connection`、`tunnel`、`line`、`audit`、`dropped` のどれか |
+| `ts` | The time the line was recorded. UTC in RFC 3339 format with milliseconds (example: `2026-10-27T03:53:27.123Z`) |
+| `type` | One of `request`, `connection`, `tunnel`, `line`, `audit`, and `dropped` |
 
-### リクエストのログ（`request`）
+### Request Log (`request`)
 
-クライアントへ応答を書いたリクエストごとに 1 件出ます。ヘッダー部の拒否、リダイレクト、ACME のチャレンジへの応答も含みます。応答を送り終えたとき（または切れたとき）に書くので、ストリーミング応答のログは応答の終わりに出ます。
+One line is written for each request whose response was written to the client. This includes header section refusals, redirects, and responses to ACME challenges. The line is written when the response has been sent (or cut off), so a streamed response is logged when it ends.
 
 ```text
 {"ts":"2026-10-27T03:53:27.123Z","type":"request","id":"0186af5443bddbd9-1","conn":1,"listener":0,"proto":"h1","tls":false,"client":"192.0.2.10","method":"GET","host":"example.com","path":"/q","class":"blocked","status":403,"reason":"blocked by a rule","ms":3,"mode":"block","engine":"coraza","generation":"2f3bda9b9ca7db60","rule":949110,"rules":[941100,941110],"severity":2,"score":10,"sent":0}
 ```
 
-| 項目 | 内容 |
+| Field | Content |
 |---|---|
-| `id` | リクエスト ID。応答の `X-Request-ID` と、アップストリームへ送る `X-Request-ID` と同じです。起動ごとの乱数 16 桁と、リクエストごとの通し番号を `-` でつないだものです。HTTP/2 ではストリームごとに 1 つです |
-| `conn` | 接続の番号 |
-| `listener` | 受けたリスナーの番号（設定の `listeners` の順で、0 から） |
-| `proto` | `h1` か `h2` |
-| `tls` | TLS のリスナーか |
-| `client` | 上の「クライアントのアドレス」で決めたアドレス。ヘッダー部を読む前の応答では、接続の相手のアドレス |
-| `method`、`host`、`path` | リクエストのメソッド、`Host`（HTTP/2 では `:authority`）、リクエストターゲットの `?` より前（受けたまま）。ヘッダー部の検証に通らなかったリクエストにはありません |
-| `cut` | 上限で切った項目の名前の一覧（例: `["path"]`） |
-| `class` | 下の表 |
-| `status` | 応答したステータスコード（何も応答しなかったときは 0） |
-| `reason` | 決まった英語の語句（例: `malformed request head`、`body over the limit`、`inspection queue full`、`upstream connection failed`、`denied by access`、`too many requests`） |
-| `ms` | かかった時間（ミリ秒） |
-| `upstream`、`server` | アップストリームの名前と、最後に接続を試みたサーバーのアドレス（試していなければ `server` はありません） |
-| `mode`、`engine`、`generation` | 判定したルールの世代のモード（`block` か `detect`）と、そのエンジン（`coraza` か `modsecurity`）と、世代のフィンガープリントの先頭 16 桁。検査しなかったリクエスト（検査除外のルートで通したリクエストを含みます）にはありません |
-| `rule` | ブロックしたルール、または検知のみのモードで一致したルールの ID |
-| `rules` | ほかに一致したルールの ID。評価の順に 16 個まで。ログに記録しないルール（`nolog`）と、検査プロセスが追加するルール（4000001〜4000011）は入りません |
-| `rules_more` | 16 個より多く一致したとき `true` |
-| `severity` | 一致したルールの重大度のうち、最も重大なもの（0 が最も重大です。ルールの `severity` の値） |
-| `score` | CRS のインバウンドの anomaly score（`tx.blocking_inbound_anomaly_score`）。0 のときと、CRS の無いルールセットでは、この項目はありません |
-| `body` | ボディの長さ。`Content-Length` があればそれ、無ければそれまでに読んだバイト数（gzip のボディは gzip のままの長さ）。ボディの無いリクエスト、ルートで拒否したリクエスト、ボディの先頭を読み終えられなかったリクエストにはありません |
-| `inspected` | 先頭だけを検査して残りを流したリクエストの、検査したバイト数。検査除外のルートで流したボディにはありません |
-| `sent` | クライアントへ送った応答のボディのバイト数 |
+| `id` | The request ID. The same as the `X-Request-ID` of the response and the `X-Request-ID` sent to the upstream. It is a 16-digit random number chosen at each start and a per-request serial number, joined with `-`. In HTTP/2, there is one for each stream |
+| `conn` | The connection number |
+| `listener` | The number of the listener that received the request (its position in `listeners` in the configuration, from 0) |
+| `proto` | `h1` or `h2` |
+| `tls` | Whether the listener is a TLS listener |
+| `client` | The address decided in "Client Address" above. For a response given before the header section was read, the address of the connection's peer |
+| `method`, `host`, `path` | The method of the request, `Host` (`:authority` in HTTP/2), and the request target before the `?` (as received). Not present for a request that did not pass the header section checks |
+| `cut` | The names of the fields that were cut at their limit (example: `["path"]`) |
+| `class` | See the table below |
+| `status` | The status code of the response (0 if nothing was returned) |
+| `reason` | A fixed English phrase (examples: `malformed request head`, `body over the limit`, `inspection queue full`, `upstream connection failed`, `denied by access`, `too many requests`) |
+| `ms` | The time taken (milliseconds) |
+| `upstream`, `server` | The upstream name and the address of the last server that the proxy tried to connect to (`server` is not present if it tried none) |
+| `mode`, `engine`, `generation` | The mode of the rule generation that made the decision (`block` or `detect`), its engine (`coraza` or `modsecurity`), and the first 16 digits of the generation's fingerprint. Not present for a request that was not inspected (including a request that a bypass route let through) |
+| `rule` | The ID of the rule that blocked the request, or that matched in detect-only mode |
+| `rules` | The IDs of the other rules that matched. Up to 16, in the order of evaluation. Rules that are not logged (`nolog`) and the rules added by the inspector process (4000001 to 4000011) are not included |
+| `rules_more` | `true` when more than 16 rules matched |
+| `severity` | The highest severity among the matched rules (the value of a rule's `severity`; 0 is the most severe) |
+| `score` | The CRS inbound anomaly score (`tx.blocking_inbound_anomaly_score`). Not present when it is 0 or when the rule set has no CRS |
+| `body` | The length of the body. `Content-Length` if there is one, otherwise the number of bytes read so far (for a gzip body, the gzip length). Not present for a request without a body, for a request refused by a route, and for a request whose body could not be read to the end of its first part |
+| `inspected` | When only the first part of the body was inspected and the rest was streamed, the number of bytes inspected. Not present for a body streamed on a bypass route |
+| `sent` | The number of response body bytes sent to the client |
 
-`class` は次のどれかです。
+`class` is one of the following.
 
-| `class` | 場合 |
+| `class` | Case |
 |---|---|
-| `forwarded` | アップストリームの応答を返した場合 |
-| `blocked` | ルールがブロックした場合 |
-| `rejected` | ヘッダー部かボディが拒否された場合。全体の `access`・`rate_limit` とホストごとの設定の 403・429、ルートで拒否した 403・404・421、管理画面のルートで拒否した 421・404・403、リダイレクトのリスナーの 404 も含みます |
-| `redirected` | https へリダイレクトした場合 |
-| `answered` | ACME のチャレンジに応答した場合 |
-| `failed` | こちらの理由で応答できなかった場合（混んでいる、検査できない、アップストリームの失敗） |
-| `closed` | 何も応答しなかった場合 |
+| `forwarded` | The response of the upstream was returned |
+| `blocked` | A rule blocked the request |
+| `rejected` | The header section or the body was refused. This also includes the 403 and 429 of the global `access` and `rate_limit` and of the host policies, the 403, 404, and 421 that a route refused, the 421, 404, and 403 that the admin route refused, and the 404 of a redirect listener |
+| `redirected` | The request was redirected to https |
+| `answered` | The proxy responded to an ACME challenge |
+| `failed` | The proxy could not respond for a reason on its own side (busy, unable to inspect, an upstream failure) |
+| `closed` | Nothing was returned |
 
-`forwarded` の `reason` は次のどれかになります。
+The `reason` of `forwarded` is one of the following.
 
-- `forwarded`: 検査で許可した場合
-- `detected by a rule`: 検知のみのモードでルールに一致した場合
-- `bypassed by a route`: 検査除外のルートの場合
-- `closed while the response was sent`: 応答を送り終える前に切れた場合
+- `forwarded`: allowed by the inspection
+- `detected by a rule`: matched a rule in detect-only mode
+- `bypassed by a route`: the request matched a bypass route
+- `closed while the response was sent`: the connection was cut before the response was completely sent
 
-リクエストから来る文字（`method`、`host`、`path`）は、0x21〜0x7e の外のバイトと `"`・`\` を `%XX`（大文字の 16 進数）にしてから、`method` は 32、`host` は 255、`path` は 1024 バイトで切ります。`%XX` の途中では切りません。受けた `%` はそのままなので、受けた `%80` とバイトの 0x80 は同じ `%80` になります。
+In the fields that come from the request (`method`, `host`, `path`), bytes outside 0x21 to 0x7e, `"`, and `\` are turned into `%XX` (uppercase hexadecimal), and the fields are then cut at 32 bytes for `method`, 255 for `host`, and 1024 for `path`. They are not cut in the middle of a `%XX`. A `%` that was received is kept as it is, so a received `%80` and the byte 0x80 both become `%80`.
 
-クエリ、ボディ、`Host` 以外のヘッダー（`User-Agent`、`Cookie` など）、ルールに一致した値と変数の名前、ルールの `msg` は記録しません。パスに秘密の値を入れる作りのサイトでは、その値がログに残ります。
+The query, the body, headers other than `Host` (`User-Agent`, `Cookie`, and so on), the values and variable names that matched a rule, and the `msg` of a rule are not recorded. On a site that puts a secret value in the path, that value ends up in the log.
 
-### ほかのログ
+### Other Log Lines
 
-| `type` | 項目 | 場合 |
+| `type` | Fields | Case |
 |---|---|---|
-| `connection` | `conn`、`listener`、`client`、`class`、`status`、`reason`、`ms`、`streams` | 応答を書かずに終わった接続（リクエストの前に閉じた、2 つ目からのヘッダー部を拒否した、TLS のハンドシェイクに失敗したなど）と、HTTP/2 の接続の終わり（`streams` は受けたストリームの数） |
-| `tunnel` | `id`（トンネルを開いたリクエストの ID）、`conn`、`client`、`upstream`、`server`、`end`、`ms`、`to_upstream`、`from_upstream` | WebSocket のトンネルが終わった場合（動く前に終わったときも出ます）。`end` は `closed`（両方の向きが終わった）、`idle`、`total`、`error`、`stop`（停止で打ち切った）のどれか。バイト数はハンドシェイクの後に各向きで読んだ量 |
-| `line` | `line` | 下の表の文。512 バイトまでで、長い文は切ります。制御文字は空白にします |
-| `audit` | （[管理リファレンス](admin-reference.md) を参照） | 管理プロセスの監査ログ。管理プロセスだけが出します。プロキシのログファイルには入りません |
-| `dropped` | `count` | 書けずに捨てたログの数（前の `dropped` のログの後に捨てた分） |
+| `connection` | `conn`, `listener`, `client`, `class`, `status`, `reason`, `ms`, `streams` | A connection that ended without a response being written (closed before a request, the header section of the second or a later request was refused, the TLS handshake failed, and so on), and the end of an HTTP/2 connection (`streams` is the number of streams received) |
+| `tunnel` | `id` (the ID of the request that opened the tunnel), `conn`, `client`, `upstream`, `server`, `end`, `ms`, `to_upstream`, `from_upstream` | A WebSocket tunnel ended (this is also written if it ended before it started to work). `end` is one of `closed` (both directions ended), `idle`, `total`, `error`, and `stop` (cut off when the proxy stopped). The byte counts are the amounts read in each direction after the handshake |
+| `line` | `line` | A message from the table below. Up to 512 bytes, and a longer message is cut. Control characters become spaces |
+| `audit` | (see the [admin reference](admin-reference.md)) | The audit log of the admin process. Only the admin process writes it. It does not go into the proxy's log file |
+| `dropped` | `count` | The number of logs that could not be written and were discarded (those discarded since the previous `dropped` log) |
 
-`line` の文は次のとおりです。
+The `line` messages are as follows.
 
-| 文 | 場合 |
+| Message | Case |
 |---|---|
-| `start: ...` | 起動の各段階（`start: managed version <version>`、起動するエンジンごとの `start: rules generation <fingerprint>`・`start: rules engine <name>`・`start: rules mode block`（か `detect`）・`start: rules routes <count>`（デフォルトのエンジンが先）、検知のみの世代を選択しているエンジンへ向くアップストリームごとの `start: upstream <name>: engine <engine>, mode detect`、`start: rules store refused: <reason>`、`start: rules generation refused: <reason>`、`start: tls certificate not issued yet (<place>)`、`start: the kernel is ready`、`start: listening`、`start: record file refused: <reason>`、`start: control socket refused: <reason>` など） |
-| `reload: ...` | SIGHUP・SIGUSR1・SIGUSR2 と、制御ソケットの `reload` の依頼を受けたこと（`reload: SIGHUP`、`reload: control reload <version>` など）。設定のリロードの各段階と結果（`reload: configuration replaced <sha256>`、`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`、`reload: configuration refused: <reason>`、`reload: tls certificate not issued yet (<place>)`、`reload: rate limit table started anew`、`reload: rate limit table of host policy <name> started anew`、検知のみの世代を選択しているエンジンへ向くアップストリームごとの `reload: upstream <name>: engine <engine>, mode detect` など。上の「SIGHUP（設定のリロード）」）。切り替え（SIGUSR1 と制御ソケット。エンジンごとに、始めるときに `reload: starting generation <fingerprint>`・`reload: rules engine <name>`・`reload: rules mode block`（か `detect`）・`reload: rules routes <count>`、準備ができたときに `reload: generation <fingerprint> is ready, switched`、前の世代を停止したときに `reload: generation <fingerprint> retired, clean true`（か `false`）、すでに稼働している世代のときに `reload: generation <fingerprint> is already running`、起動に失敗したときに `reload: generation <fingerprint> failed to start: <reason>`、切り替えの途中のときに `reload: a switch is in progress, ignored`、拒否したときに `reload: rules store refused: <reason>`）と、証明書の入れ替えの結果 |
-| `control: switch ...`、`control: reload ...` | 制御ソケットの切り替えとリロードの依頼への応答（`control: reload <version>: <result> (<reason>)` など。上の「制御ソケット」） |
-| `driver: inspector incarnation changed, inc <count>, restarts <count>` | 検査プロセスが再起動した場合 |
-| `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` | 停止の始めに、起動しているエンジンごとに 1 つ出ます（上の「停止」） |
-| `conn <number>: internal fault: <reason>` | プロキシの内部の不整合 |
-| `notify: <notice> not sent ...` | systemd への通知を送れなかった場合 |
-| `stop: ...` | 停止の理由と、最後の停止の結果 |
+| `start: ...` | The startup steps (`start: managed version <version>`; for each engine that starts, `start: rules generation <fingerprint>`, `start: rules engine <name>`, `start: rules mode block` (or `detect`), and `start: rules routes <count>` (the default engine first); for each upstream that points to an engine whose chosen generation is detect-only, `start: upstream <name>: engine <engine>, mode detect`; `start: rules store refused: <reason>`, `start: rules generation refused: <reason>`, `start: tls certificate not issued yet (<place>)`, `start: the kernel is ready`, `start: listening`, `start: record file refused: <reason>`, `start: control socket refused: <reason>`, and so on) |
+| `reload: ...` | Receipt of SIGHUP, SIGUSR1, SIGUSR2, and a `reload` request on the control socket (`reload: SIGHUP`, `reload: control reload <version>`, and so on). The stages and the result of a configuration reload (`reload: configuration replaced <sha256>`, `reload: configuration replaced <sha256> managed <version>` in a configuration with `managed`, `reload: configuration refused: <reason>`, `reload: tls certificate not issued yet (<place>)`, `reload: rate limit table started anew`, `reload: rate limit table of host policy <name> started anew`, `reload: upstream <name>: engine <engine>, mode detect` for each upstream that points to an engine whose chosen generation is detect-only, and so on; see "SIGHUP (Configuration Reload)" above). A switch (SIGUSR1 and the control socket; for each engine, `reload: starting generation <fingerprint>`, `reload: rules engine <name>`, `reload: rules mode block` (or `detect`), and `reload: rules routes <count>` when it starts, `reload: generation <fingerprint> is ready, switched` when it is ready, `reload: generation <fingerprint> retired, clean true` (or `false`) when the previous generation was stopped, `reload: generation <fingerprint> is already running` for a generation that is already running, `reload: generation <fingerprint> failed to start: <reason>` when it failed to start, `reload: a switch is in progress, ignored` when a switch is in progress, and `reload: rules store refused: <reason>` when it was refused), and the result of a certificate replacement |
+| `control: switch ...`, `control: reload ...` | The responses to the switch and reload requests on the control socket (`control: reload <version>: <result> (<reason>)` and so on; see "Control Socket" above) |
+| `driver: inspector incarnation changed, inc <count>, restarts <count>` | The inspector process restarted |
+| `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` | One line for each running engine, written when a stop begins (see "Stopping" above) |
+| `conn <number>: internal fault: <reason>` | An inconsistency inside the proxy |
+| `notify: <notice> not sent ...` | A notification to systemd could not be sent |
+| `stop: ...` | The reason for the stop and the result of the last stop |
 
-- `<sha256>` は設定ファイルの SHA-256、`<version>` は managed 設定のバージョン（どちらも 64 桁の 16 進数）、`<fingerprint>` はルールの世代のフィンガープリントです。`<place>` は、`managed` の無い設定では `listener <number>, certificate <number>`、`managed` のある設定では `admin route` か `site <name>` です。
+- `<sha256>` is the SHA-256 of the configuration file, `<version>` is a managed configuration version (both are 64 hexadecimal digits), and `<fingerprint>` is the fingerprint of a rule generation. `<place>` is `listener <number>, certificate <number>` in a configuration without `managed`, and `admin route` or `site <name>` in a configuration with `managed`.
 
-### ログを書けないとき
+### When Logs Cannot Be Written
 
-- ログは 1024 件の待ち行列に入れ、書くのは 1 つのスレッドだけです。リクエストの処理と停止は、書き込みを待ちません。
-- 待ち行列が満杯になったときは、そのログを捨てて数え、書けるようになってから `dropped` のログを 1 件出します。標準エラーを読む側が止まると、こうなります。
-- 書き込みの失敗（`/dev/full` など）は、そのログを失い、別に数えます。
-- どちらの数も、監視の `/metrics` で見られます（`tukuyomi_records_dropped_total`、`tukuyomi_record_write_errors_total`）。標準エラーが詰まっている間は、ログでは通知できません。
-- 1 件は 4 KiB 未満で、切りません（項目の上限からこの大きさを超えません）。
-- ログファイル（`records`）に書けないときは、その行がファイルに入らないだけで、標準エラーには出ます。件数は `tukuyomi_record_file_errors_total` で見られます（下の「ログファイル」）。
-- ここまでは、ログを残せなくてもリクエストを通すデフォルトの扱い（`best_effort`）です。ログを残せないときにリクエストを拒否するルートも選べます（下の「ログの残し方」）。
+- Logs are put in a queue of 1024 entries, and only one thread writes them. Request handling and stopping do not wait for writes.
+- When the queue is full, the log is discarded and counted, and when writing becomes possible again, one `dropped` log is written. This happens when whatever reads standard error stops reading.
+- A write failure (such as to `/dev/full`) loses that log and is counted separately.
+- Both counts appear in `/metrics` (`tukuyomi_records_dropped_total`, `tukuyomi_record_write_errors_total`). While standard error is blocked, they cannot be reported in logs.
+- One line is less than 4 KiB and is not cut (the field limits keep it under this size).
+- When the log file (`records`) cannot be written, only that line is missing from the file; it still appears on standard error. The count appears in `tukuyomi_record_file_errors_total` (see "Log Files (`records`)" below).
+- All of the above is the default handling (`best_effort`), which lets requests through even when logs cannot be kept. You can also set a route to refuse requests when logs cannot be kept (see "What Logs Keep (`keep` and the `records` of a Route)" below).
 
-### ログファイル（`records`）
+### Log Files (`records`)
 
-設定に `records` を書くと、標準エラーに出すログと同じ行を、ディレクトリのファイルにも書きます。省けば、ログは標準エラーだけに出ます。管理プロセスは、このファイルを読んでログを検索します。
+When you write `records` in the configuration, the lines written to standard error are also written to files in a directory. If it is omitted, logs go only to standard error. The first lines at start, before the log files are opened (such as the `start: configuration accepted` and `start: rules …` lines), go only to standard error. The admin process searches the logs by reading these files.
 
 ```text
 {"dir", "file_bytes", "files", "keep"?, "sync_ms"?, "ship"?}
 ```
 
-`dir`、`file_bytes`、`files` は必ず書きます。
+`dir`, `file_bytes`, and `files` are required.
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `dir` | 絶対パス、3840 バイトまで | ファイルを置くディレクトリ。プロキシは作らないので、先に作ります。条件は、シンボリックリンクでないディレクトリであること、所有者がプロキシの OS ユーザーであること、グループとその他のユーザーの権限が無いことです |
-| `file_bytes` | 1 MiB〜1 GiB | 1 つのファイルのサイズ。使用中のファイルがこれを超える行は、次のファイルから書きます |
-| `files` | 2〜64 | 残すファイルの数（使用中のものを含む）。`ship` があり、`keep` かルートの `records` に `required` があるときは 3 以上 |
-| `keep` | `best_effort`、`required` | 自分の `records` を持たないルートとデフォルトのアップストリームの、ログの残し方（下の「ログの残し方」）。省けば `best_effort` |
-| `sync_ms` | 1〜60000 | 書いた行をディスクへ同期する（`fsync`）間隔の上限。省けば同期せず、OS に任せます（下の「ファイルに入る行」） |
-| `ship` | `{"db_driver", "db_dsn_file", "batch", "interval_ms", "retention_days"}` | ログ送信プロセスの設定（下の「ログ送信プロセス」）。プロキシはログ送信プロセスを動かさず、ログ送信プロセスの遅れを見るだけです |
+| `dir` | An absolute path, up to 3840 bytes | The directory where the files are placed. The proxy does not create it, so create it first. It must be a directory, not a symbolic link, owned by the proxy's OS user, with no permissions for the group and other users |
+| `file_bytes` | 1 MiB to 1 GiB | The size of one file. A line that would make the file in use exceed this is written to the next file |
+| `files` | 2 to 64 | The number of files to keep (including the one in use). 3 or more when `ship` is present and `keep` or the `records` of a route has `required` |
+| `keep` | `best_effort`, `required` | How logs are kept for the routes that have no `records` of their own and for the default upstream (see "What Logs Keep (`keep` and the `records` of a Route)" below). `best_effort` if omitted |
+| `sync_ms` | 1 to 60000 | The longest time before written lines are synced to disk (`fsync`). If omitted, the proxy does not sync and leaves it to the OS (see "Lines that go into the file" below) |
+| `ship` | `{"db_driver", "db_dsn_file", "batch", "interval_ms", "retention_days"}` | The records shipper settings (see "Records Shipper" below). The proxy does not run the records shipper; it only watches how far it is behind |
 
-- 使うディスクは、多くても `file_bytes × files` です。1 件は 4 KiB 未満なので、1 つのファイルが `file_bytes` を超えることはありません。
-- 名前とローテーション:
-  - 使用中のファイルは `records.log` です。古いファイルは、`records.1.log`、`records.2.log` と続き、`records.<files - 1>.log` が最も古いファイルです。
-  - 行を追加すると `file_bytes` を超えるときは、先に次のファイルへローテーションします。`records.log` を `records.rotating` にリネームし、`records.N.log` を `records.N+1.log` にリネームし（N は `files - 2` から 1 まで）、`records.rotating` を `records.1.log` にして、新しい `records.log` を開きます。いちばん古いファイルは、置き換えられて無くなります。
-  - リネームの途中で失敗したら、`records.rotating` を戻します。ローテーションの途中で止まって `records.rotating` が残ったときは、次のローテーションで置き換わります。
-  - どのファイルも、行の途中では切れません。
-  - `files` を小さくして再起動すると、`records.<files>.log` 以降の古いファイルは、所有者がプロキシの OS ユーザーの通常のファイルなら、起動のときとローテーションのたびに削除します（`records.63.log` まで）。
-- 開き方:
-  - `records.log` は、無ければ 0600 で作り、追記で開きます。シンボリックリンク、FIFO、ディレクトリ、別の OS ユーザーのファイルは受け付けません。グループかその他のユーザーの権限があるファイルは、書く前に 0600 にします。
-  - 最後の行が改行で終わっていないファイル（書いている途中で落ちたときなど）には、先に改行を書きます。次の行が途中の行とつながらないようにするためです。
-  - 起動のときに開けなければ、`start: record file refused: <reason>` の文を出し、検査プロセスを起動せずに止まります（exit 1）。
-- ファイルに入る行:
-  - 標準エラーに出す行を、すべて同じ形で、1 行ごとに 1 回の `write` で書きます。標準エラーの後に書きます。
-  - ファイルを開く前に出た行（設定の検証からルールの世代までの `start:` の文）は入りません。
-  - `sync_ms` が無ければ、ディスクへの同期（`fsync`）はしません。電源が落ちると、OS がまだディスクに書いていない行は失われます。
-  - `sync_ms` があれば、同期していない行のうち最も古いものが `sync_ms` だけ待ったときに、ファイルを同期します。後に行が来なくても同期します。ローテーションの前にも、リネームするファイルを同期します。電源が落ちて失うのは、最後の同期より後の行です。同期の失敗は、書き込みの失敗と同じように扱います（下の「ファイルに書けないとき」）。
-- ファイルが外部から動かされたとき: `records.log` のパスは、1 秒に 1 回まで検証します（ローテーションの前にも検証します）。パスにファイルが無いとき、または開いているのと別のファイルのときは、開いているファイルを閉じます。その行はファイルに入らず、`tukuyomi_record_file_errors_total` に数えます。次の行が `records.log` を新しく作って開きます。
-- ファイルに書けないとき:
-  - 書き込み、`open`、リネームが失敗すると、その行はファイルに入らず、ファイルを閉じて、`tukuyomi_record_file_errors_total` に数えます。標準エラーには出ます。リクエストの処理は待ちません。
-  - 閉じている間に来た行も、ファイルに入らず、同じように数えます。失敗から 1 秒以上後に来た最初の行が、開き直します。ディスクが壊れたままでも、再試行は 1 秒に 1 回までです。
-  - 途中まで書けた行は、書く前のサイズまで切り戻します。
-  - 同期（`sync_ms`）が失敗したときも、ファイルを閉じて、同じ件数に数えます。
-  - ディレクトリは、開き直す前とローテーションの前に、起動のときと同じように検証します。
-- ログ送信プロセス（`ship`）があれば、ログ送信プロセスが同じディレクトリに `ship.state`（送った位置）を置き、書き換えの間だけ `ship.state.new` を置きます。プロキシは `ship.state` を読むだけで、どちらも削除しません。
+- The disk used is at most `file_bytes × files`. One line is less than 4 KiB, so one file never exceeds `file_bytes`.
+- Names and rotation:
+  - The file in use is `records.log`. Older files continue as `records.1.log`, `records.2.log`, and so on, and `records.<files - 1>.log` is the oldest file.
+  - When adding a line would exceed `file_bytes`, the proxy first rotates to the next file. It renames `records.log` to `records.rotating`, renames `records.N.log` to `records.N+1.log` (N from `files - 2` down to 1), makes `records.rotating` into `records.1.log`, and opens a new `records.log`. The oldest file is replaced and disappears.
+  - If a rename fails partway, `records.rotating` is restored. If the process stops during a rotation and `records.rotating` is left, it is replaced at the next rotation.
+  - No file is cut in the middle of a line.
+  - If you restart with a smaller `files`, the older files from `records.<files>.log` on are deleted at start and at every rotation (up to `records.63.log`), if they are regular files owned by the proxy's OS user.
+- How files are opened:
+  - `records.log` is created with 0600 if it does not exist, and opened for appending. A symbolic link, a FIFO, a directory, and a file owned by another OS user are rejected. A file with permissions for the group or other users is changed to 0600 before writing.
+  - If the last line of a file does not end with a newline (for example, after a crash during a write), a newline is written first, so that the next line does not join the partial line.
+  - If the file cannot be opened at start, the proxy writes a `start: record file refused: <reason>` line and stops without starting the inspector processes (exit 1).
+- Lines that go into the file:
+  - Each line is written in the same form as on standard error, with one `write` per line, after it is written to standard error.
+  - Lines that appeared before the file was opened (the `start:` messages from the configuration check through the rule generations) are not included.
+  - Without `sync_ms`, there is no sync to disk (`fsync`). If the power goes off, lines that the OS has not yet written to disk are lost.
+  - With `sync_ms`, the file is synced once the oldest unsynced line has waited `sync_ms`, even if no later line comes. Before a rotation, the file to be renamed is also synced. If the power goes off, the lines after the last sync are lost. A sync failure is handled in the same way as a write failure (see "When the file cannot be written" below).
+- When something else moves the file: the path of `records.log` is checked at most once per second (also before a rotation). If there is no file at the path, or if it is a different file from the one that is open, the open file is closed. That line does not go into the file and is counted in `tukuyomi_record_file_errors_total`. The next line creates and opens a new `records.log`.
+- When the file cannot be written:
+  - If a write, an `open`, or a rename fails, that line does not go into the file, the file is closed, and the failure is counted in `tukuyomi_record_file_errors_total`. The line still appears on standard error. Request handling does not wait.
+  - Lines that arrive while the file is closed also do not go into the file and are counted in the same way. The first line that arrives at least 1 second after the failure reopens the file. Even if the disk stays broken, the proxy retries at most once per second.
+  - A line that was partly written is cut back to the size before the write.
+  - When a sync (`sync_ms`) fails, the file is also closed and the failure is counted in the same counter.
+  - The directory is checked before it is reopened and before a rotation, in the same way as at start.
+- If there is a records shipper (`ship`), it places `ship.state` (how far it has sent) in the same directory, and `ship.state.new` only while it rewrites it. The proxy only reads `ship.state` and deletes neither.
 
-### ログの残し方（`keep` とルートの `records`）
+### What Logs Keep (`keep` and the `records` of a Route)
 
-ルートごとに、ログを残せないときの扱いと、残すログを選べます。ルートの `records` を書かなければ、全体の `records.keep` に従います。`records.keep` を書かなければ `best_effort` です。
+For each route, you can choose what to do when logs cannot be kept and which logs to write. If a route has no `records`, the global `records.keep` applies, and if there is no `records.keep`, the value is `best_effort`.
 
-| 値 | ログを残せないとき | 書くログ |
+| Value | When logs cannot be kept | Logs written |
 |---|---|---|
-| `best_effort` | ログを捨てて数え、リクエストは通します（上の「ログを書けないとき」） | すべて |
-| `required` | そのルートの新しいリクエストを 503 で拒否します | すべて |
-| `security` | `best_effort` と同じです | ルールが判定したリクエスト（ブロックと、検知のみのモードで一致したもの）、検査できなかったリクエスト（検査プロセスに依頼できなかった 503 を含みます）、全体の `access`・`rate_limit` とホストごとの設定で拒否したリクエスト、受け付けた後に応答の前に切れたリクエスト（下）だけ。通常どおり通したリクエストのログは書きません |
+| `best_effort` | Discards the log and counts it, and lets the request through (see "When Logs Cannot Be Written" above) | All |
+| `required` | Refuses new requests on that route with 503 | All |
+| `security` | The same as `best_effort` | Only requests that a rule decided (blocks, and requests that matched in detect-only mode), requests that could not be inspected (including a 503 for a request that could not be passed to the inspector process), requests refused by the global `access` and `rate_limit` and by host policies, and requests cut after being accepted and before the response (below). Requests that were let through normally are not logged |
 
-`required` のルートは、次の 3 つがそろうときだけリクエストを受け付けます。
+A route with `required` accepts a request only when all three of the following hold.
 
-1. ログファイルへの最後の書き込み（と同期）が通っていて、ログを書くスレッドが動いている状態です。
-2. ログ送信プロセス（`ship`）があるなら、ログ送信プロセスがまだ送っていないバイト数が、ファイル `files − 2` 個分（`file_bytes × (files − 2)`）より少ない状態です。送っていないログがローテーションで消える前に拒否するためです。ログ送信プロセスの遅れが分からないとき（`ship.state` が読めない、形式が違う、90 秒より前に書かれた、ログファイルのどれでもないファイルを指す）も拒否します。`files` が 3 より少ないときは、遅れでは拒否しません。
-3. ログの待ち行列に枠が空いている状態です。枠は、待ち行列の 1024 のうち 512 までです。`required` のルートのリクエストを同時に 512 より多く受け付けると、それを超えたリクエストは 503 になります。
+1. The last write to the log file (and the sync) succeeded, and the thread that writes logs is running.
+2. If there is a records shipper (`ship`), the number of bytes that the records shipper has not sent yet is less than the size of `files − 2` files (`file_bytes × (files − 2)`). This refuses requests before unsent logs are lost to rotation. The proxy also refuses requests when it cannot tell how far the records shipper is behind (`ship.state` cannot be read, has the wrong format, was written more than 90 seconds ago, or points to a file that is none of the log files). When `files` is less than 3, it does not refuse because of the delay.
+3. There is a free slot in the log queue. At most 512 of the queue's 1024 places serve as slots. If more than 512 requests on `required` routes are accepted at the same time, the requests beyond that get 503.
 
-- 拒否したリクエストには 503 で応答し、`tukuyomi_records_refused_total` に数えます。拒否したリクエストのログ（`reason` は `records cannot be kept`）は「できる限り」で書きます。ただし、ログ送信プロセスの遅れで拒否したときは、そのログは書かずに数えるだけにします。送っていないログがローテーションで消えるまでの余白を、拒否したリクエストのログで使わないためです。
-- 受け付けたリクエストは、ボディを読む前に枠を取り、ログを待ち行列に入れるまで持ちます。そのリクエストのログは、待ち行列が満杯でも捨てません。
-- 受け付けた後に書き込みが失敗したら、数えて、それより後の `required` のリクエストを拒否します。書き込みは失敗の 1 秒後から再試行し、通れば受け付けに戻ります。
-- ログ送信プロセスの遅れは、プロキシが `ship.state` を 1 秒に 1 回読み、その位置より後のバイト数（指すファイルの残りと、それより新しいファイル）に、読んだ後に書いたバイトを足して見積もります。閾値より少なくなれば、受け付けに戻ります。
-- ログは応答を送り終えた後に書きます。そのため `required` は、クライアントに応答する前にログがあることは約束しません。次の 2 つのログは抜けることがあります。
-  - 書き込みが失敗し始めたときに、受け付け済みだったリクエストのログ
-  - 電源が落ちたときの、最後の同期より後のログ（`sync_ms` が無ければ OS に任せます）
-- `required` を使うには `records` が必要です。`ship` と `required` を両方使うときは、`files` を 3 以上にします（上の「値どうしの関係」）。
+- A refused request gets 503 and is counted in `tukuyomi_records_refused_total`. The log of a refused request (`reason` is `records cannot be kept`) is written on a best-effort basis. When the request was refused because the records shipper is behind, however, that log is only counted, not written, so that logs of refused requests do not use up the margin left before unsent logs are lost to rotation.
+- An accepted request takes a slot before its body is read and holds it until its log is put in the queue. The log of that request is not discarded even if the queue is full.
+- If a write fails after a request has been accepted, the proxy counts the failure and refuses later `required` requests. It retries the write 1 second after the failure, and returns to accepting requests when the write succeeds.
+- The proxy estimates how far the records shipper is behind. It reads `ship.state` once per second, and adds the bytes written since that read to the number of bytes after that position (the rest of the file it points to and the newer files). When the estimate falls below the threshold, the proxy returns to accepting requests.
+- Logs are written after the response has been sent, so `required` does not guarantee that the log exists before the response reaches the client. The following two logs can be missing.
+  - The log of a request that had already been accepted when writes started to fail
+  - Logs after the last sync when the power goes off (without `sync_ms`, it is left to the OS)
+- `required` needs `records`. When you use both `ship` and `required`, make `files` 3 or more (see "Relations Between Values" above).
 
-ルートを決める前、またはボディを読まずに応答する次のリクエストは、ルートの値と `records.keep` にかかわらず、ログを「できる限り」で書きます。どれもアップストリームへ何も送らない応答です。
+The following requests are decided before the route is chosen, or responded to without reading the body. They are logged on a best-effort basis, regardless of the route's `records` and of `records.keep`. None of them sends anything to the upstream.
 
-- 全体の `access`・`rate_limit` とホストごとの設定の 403 と 429
-- TLS の接続で、証明書が `Host` を持たないリクエストの 421
-- どのルートにも一致せず、デフォルトのアップストリームも無いリクエストの 404
-- ヘッダー部の検証で拒否したリクエスト、https へのリダイレクト、ACME のチャレンジへの応答
-- ルートの `access` の 403 と、ルートの `max_body` の 413
-- 接続のログ（`connection`）とトンネルのログ（`tunnel`）
+- The 403 and 429 of the global `access` and `rate_limit` and of the host policies
+- The 421 for a request on a TLS connection whose certificate does not cover the `Host`
+- The 404 for a request that matches no route when there is no default upstream
+- Requests refused by the header section checks, redirects to https, and responses to ACME challenges
+- The 403 of the `access` of a route and the 413 of the `max_body` of a route
+- Connection logs (`connection`) and tunnel logs (`tunnel`)
 
-受け付けた後に応答の前に切れたリクエスト（HTTP/1.1 でクライアントが接続を閉じた、HTTP/2 でストリームをリセットした）と、ボディの途中でクライアントが切断したリクエストは、どのルートでもログを書きます。アップストリームに届いたかもしれないためです。
+A request that was cut after being accepted and before the response (on HTTP/1.1 the client closed the connection, on HTTP/2 the stream was reset) and a request whose client disconnected in the middle of the body are logged on every route, because they may have reached the upstream.
 
-### ログを読めるユーザー
+### Users Who Can Read the Logs
 
-ログには、クライアントのアドレスとパスが入ります。ジャーナルを読めるユーザー（root と、Ubuntu では `adm`・`systemd-journal` のグループのユーザー）は、それを読めます。グループに入れる OS ユーザーは最小限にしてください。保存の期間と容量は journald の設定で決めます（[ビルドと配置](../build/binary-deployment.md) の「systemd」）。ログファイル（`records`）は 0600 で、0700 のディレクトリにあります。読めるのは、プロキシの OS ユーザーと root です。管理プロセスは、同じ OS ユーザーとしてこのファイルを読み、管理プロセスのユーザーに見せます（[管理リファレンス](admin-reference.md)）。ログ送信プロセスを使うときは、DB のテーブルにも同じログが入ります。テーブルを読める DB のユーザーも最小限にしてください。
+The logs contain the client address and the path. Users who can read the journal (root, and on Ubuntu the users in the groups `adm` and `systemd-journal`) can read them. Keep the OS users in these groups to a minimum. The journald settings decide the retention period and the size limit (see "systemd" in the [build and deployment guide](../build/binary-deployment.md)). The log file (`records`) is 0600 in a 0700 directory, so only the proxy's OS user and root can read it. The admin process reads this file as the same OS user and shows it to the users of the admin process (see the [admin reference](admin-reference.md)). When you use the records shipper, the same logs also go into a DB table. Keep the DB users who can read that table to a minimum as well.
 
-## ログ送信プロセス
+## Records Shipper
 
-ログ送信プロセス（`tukuyomi-records-ship`）は、プロキシのログファイルを読み、行を PostgreSQL か MySQL のテーブルへ順に入れる、別のプロセスです。プロキシはログ送信プロセスを動かさず、DB にも接続しません。DB に接続するライブラリと DB のパスワードは、ログ送信プロセスの実行ファイルとプロセスにだけあります。ビルドとユニットは [ビルドと配置](../build/binary-deployment.md) を参照してください。動作を確認しているのは PostgreSQL 16・18 と MySQL 8.0 です。
+The records shipper (`tukuyomi-records-ship`) is a separate process that reads the proxy's log files and inserts the lines in order into a PostgreSQL or MySQL table. The proxy does not run the records shipper and does not connect to the DB. The DB client library and the DB password exist only in the records shipper's executable and process. For the build and the unit, see the [build and deployment guide](../build/binary-deployment.md). It has been tested with PostgreSQL 16 and 18 and MySQL 8.0.
 
-### ログ送信プロセスの起動
+### Starting the Records Shipper
 
 ```text
 tukuyomi-records-ship <config>
 ```
 
-- `<config>` はプロキシと同じ設定ファイルで、絶対パスで書きます。プロキシと同じ検証で読み、`records.ship` が必要です。無ければ `records-ship: configuration refused: there is no records.ship object` の行を出して終わります。
-- 読むのは設定ファイルだけで、managed ストアのバージョンと国のデータベースは読みません。未知の設定キーのある設定ファイルは受け付けないので、設定に新しい設定キー（`managed`、`host_policies`、`kernel.default_engine`、アップストリームの `engine` など）を書く前に、ログ送信プロセスをプロキシと同じビルドに入れ替えます（[ビルドと配置](../build/binary-deployment.md) の「ログ送信プロセスのユニット」）。
-- プロキシと同じ OS ユーザーで動かします。root では動きません（ユーザー ID の 4 つのどれかが 0 なら起動しません）。ログのディレクトリが、この OS ユーザーのシンボリックリンクでないディレクトリで、グループとその他のユーザーの権限が無いことも検証します。`ship.state` をそこに書くためです。
-- ログのディレクトリのファイルシステムは、ファイルの作成時刻（`statx` の btime）を返す必要があります。ログ送信プロセスは、ログファイルを inode と作成時刻の組み合わせで見分けます（ファイルシステムは、削除したファイルの inode の番号をすぐに使い回します）。返さないファイルシステムでは、ログ送信プロセスは起動せず、プロキシは遅れを「分からない」として `required` のリクエストを拒否します。
-- 起動の順は、設定、ログのディレクトリ、接続文字列のファイル（下）、シグナルの受け付け、`NOTIFY_SOCKET` があれば `READY=1` です。DB には 1 回目の処理で接続します。接続できない DB は、動作中に止まったときと同じように、待って再試行します。
+- `<config>` is the same configuration file as the proxy's, written as an absolute path. It is read with the same checks as the proxy, and `records.ship` is required. If it is missing, the records shipper writes a `records-ship: configuration refused: there is no records.ship object` line and exits.
+- It reads only the configuration file, not the versions in the managed store or the country database. It rejects a configuration file with unknown setting keys, so before you write a new setting key (`managed`, `host_policies`, `kernel.default_engine`, the `engine` of an upstream, and so on) in the configuration, replace the records shipper with the same build as the proxy (see "Records Shipper Unit" in the [build and deployment guide](../build/binary-deployment.md)).
+- Run it as the same OS user as the proxy. It does not run as root (it does not start if any of its four user IDs is 0). Because it writes `ship.state` in the log directory, it also checks that the directory belongs to this OS user, is not a symbolic link, and has no permissions for the group and other users.
+- The file system of the log directory must return the creation time of files (the btime of `statx`). The records shipper identifies log files by their inode and creation time together (a file system reuses the inode number of a deleted file right away). With a file system that does not return it, the records shipper does not start, and the proxy treats the delay as "unknown" and refuses `required` requests.
+- At start, it handles the configuration, the log directory, the connection string file (below), signal handling, and `READY=1` (if there is `NOTIFY_SOCKET`), in this order. It connects to the DB in its first round of work. If the DB cannot be reached, the records shipper waits and retries, just as when the DB stops while it is running.
 
-| exit | 場合 |
+| exit | Case |
 |---|---|
-| 0 | SIGTERM、SIGINT、SIGHUP で停止した場合。動作中の 1 回分を終えてから停止し、`STOPPING=1` を送ります |
-| 1 | 接続文字列が読めない、または受け付けられなかった場合。DB がログインを拒否した場合（下の「ログ送信プロセスのエラー」）。そのほかの失敗 |
-| 2 | 引数のエラー、設定が受け付けられなかった場合 |
+| 0 | Stopped by SIGTERM, SIGINT, or SIGHUP. It finishes the round in progress, then stops, and sends `STOPPING=1` |
+| 1 | The connection string cannot be read or was rejected. The DB refused the login (see "Records Shipper Errors" below). Any other failure |
+| 2 | An argument error, or the configuration was rejected |
 
-- 停止のシグナルは、DB を呼び出している間は処理が待たされます。1 回の呼び出しは 30 秒まで（接続は 10 秒まで）で、1 回分の中に呼び出しが数回あるので、停止するまでに長いと 1〜2 分かかります。SIGKILL で停止しても、次の起動は DB に残った位置から続けます。行と位置は、同じトランザクションで DB に入るためです。
+- A stop signal is handled only after the DB call in progress finishes. One call takes at most 30 seconds (the connection at most 10 seconds), and one round has several calls, so stopping can take up to 1 to 2 minutes. Even if it is stopped with SIGKILL, the next start continues from the position left in the DB, because the lines and the position go into the DB in the same transaction.
 
 ### `records.ship`
 
@@ -1965,15 +1967,15 @@ tukuyomi-records-ship <config>
 {"db_driver", "db_dsn_file", "batch", "interval_ms", "retention_days"}
 ```
 
-5 つとも書きます。
+Write all five.
 
-| 設定キー | 範囲 | 意味 |
+| Setting key | Range | Meaning |
 |---|---|---|
-| `db_driver` | `pgsql`、`mysql` | 送る DB の種類 |
-| `db_dsn_file` | 絶対パス、3840 バイトまで | 接続文字列のファイル（下）。プロキシはこのファイルを開きません |
-| `batch` | 1〜10000 | 1 つのトランザクションに入れる行の数の上限 |
-| `interval_ms` | 100〜60000 | 送る行が無かったときに、次の回まで待つ時間。失敗の後に待つ時間の初期値でもあります |
-| `retention_days` | 0〜3650 | DB に残す日数。0 なら削除しません |
+| `db_driver` | `pgsql`, `mysql` | The kind of DB to send to |
+| `db_dsn_file` | An absolute path, up to 3840 bytes | The connection string file (below). The proxy does not open this file |
+| `batch` | 1 to 10000 | The maximum number of lines in one transaction |
+| `interval_ms` | 100 to 60000 | The time to wait until the next round when there were no lines to send. It is also the initial wait after a failure |
+| `retention_days` | 0 to 3650 | The number of days to keep lines in the DB. 0 means never delete |
 
 ```json
 "records": {
@@ -1991,226 +1993,237 @@ tukuyomi-records-ship <config>
 }
 ```
 
-### 接続文字列（`db_dsn_file`）
+### Connection String (`db_dsn_file`)
 
-接続文字列はパスワードを含むので、設定ファイルには書かず、別のファイルに置きます。
+The connection string contains a password, so do not write it in the configuration file. Put it in a separate file.
 
-- 条件は、通常のファイルであること、所有者がログ送信プロセスの OS ユーザーであること、グループとその他のユーザーの権限が無いこと（0600）です。16 KiB まで、UTF-8 の文字です。受け付けないときの文には、ファイルの名前も内容も入りません。
-- PostgreSQL: `host=db.example.com port=5432 user=tukuyomi_ship password=<password> dbname=records` の形式か、`postgresql://` の URL（`tokio-postgres` の形式）です。テーブルは、接続の `search_path` の最初のスキーマに作ります。
-  - 同じホストの PostgreSQL には、Unix ドメインソケットと peer 認証（OS ユーザーの名前と同じ名前のロール）で接続すれば、パスワードは必要ありません。例: `host=/var/run/postgresql user=tukuyomi dbname=tukuyomi_records sslmode=disable`。
-- MySQL: `mysql://<user>:<password>@<host>:<port>/<db-name>` の URL（`mysql_async` 0.37 の形式）です。DB の名前が必要で、テーブルはその DB に作ります。URL の中で記号を使う値は、パーセントエンコーディングで書きます。
+- It must be a regular file, owned by the OS user of the records shipper, with no permissions for the group and other users (0600). It is at most 16 KiB of UTF-8 text. The rejection message contains neither the name nor the contents of the file.
+- PostgreSQL: the form `host=db.example.com port=5432 user=tukuyomi_ship password=<password> dbname=records`, or a `postgresql://` URL (as accepted by `tokio-postgres`). The tables are created in the first schema in the connection's `search_path`.
+  - For PostgreSQL on the same host, you can connect through a Unix domain socket with peer authentication (a role with the same name as the OS user), and no password is needed. Example: `host=/var/run/postgresql user=tukuyomi dbname=tukuyomi_records sslmode=disable`.
+- MySQL: a URL of the form `mysql://<user>:<password>@<host>:<port>/<db-name>` (as accepted by `mysql_async` 0.37). The DB name is required, and the tables are created in that DB. Percent-encode values in the URL that contain symbols.
 
-TLS は次のとおりです。
+TLS works as follows.
 
 | | PostgreSQL | MySQL |
 |---|---|---|
-| 書かないとき | TLS。証明書とホスト名を検証します | TLS。証明書とホスト名を検証します |
-| 受け付ける指定 | `sslmode=require`、`verify-ca`、`verify-full`。どれも証明書とホスト名を検証します（`require` でも検証します） | `require_ssl=true`、`verify_ca=true`、`verify_identity=true` |
-| 受け付けない指定 | `sslmode=prefer`、`allow`（相手が TLS を拒否すると平文にフォールバックします） | `verify_ca=false`、`verify_identity=false`（検証を外します） |
-| 平文 | `sslmode=disable` と書いたときだけ（ループバックや Unix ドメインソケット向け） | `require_ssl=false` と書いたときだけ。Unix ドメインソケット（`socket`）は、このときだけ使えます |
+| When not written | TLS. Verifies the certificate and the host name | TLS. Verifies the certificate and the host name |
+| Accepted settings | `sslmode=require`, `verify-ca`, `verify-full`. All of them verify the certificate and the host name (`require` too) | `require_ssl=true`, `verify_ca=true`, `verify_identity=true` |
+| Rejected settings | `sslmode=prefer`, `allow` (they fall back to plaintext if the peer refuses TLS) | `verify_ca=false`, `verify_identity=false` (they turn off verification) |
+| Plaintext | Only when you write `sslmode=disable` (for loopback and Unix domain sockets) | Only when you write `require_ssl=false`. A Unix domain socket (`socket`) can be used only in this case |
 
-- 証明書を検証する認証局は、システムのものです。環境の `SSL_CERT_FILE` が指すファイル、無ければ、ディストリビューションごとの保存先にあるバンドル（Debian・Ubuntu、Fedora・Red Hat、openSUSE）を読みます。接続文字列では、認証局のファイルを指定できません。自前の認証局の証明書は、`SSL_CERT_FILE` で渡します。
-- TLS を提供しないサーバーには、接続しません。
-- MySQL では、サーバーが名乗る Unix ドメインソケットへ移らず、接続文字列のアドレスのままで接続します。
+- Certificates are verified against the system's certificate authorities. The records shipper reads the file that the environment variable `SSL_CERT_FILE` points to or, if that is not set, the bundle at each distribution's usual location (Debian and Ubuntu, Fedora and Red Hat, openSUSE). You cannot specify a CA file in the connection string; pass your own CA's certificate with `SSL_CERT_FILE`.
+- The records shipper does not connect to a server that does not offer TLS.
+- With MySQL, the records shipper does not switch to the Unix domain socket that the server reports. It connects with the address in the connection string as it is.
 
-### ログのテーブル
+### Log Table
 
-ログ送信プロセスは、DB に接続したときにテーブルを探し、無いテーブルだけを作ります。
+When the records shipper connects to the DB, it looks for the tables and creates only those that do not exist.
 
-| テーブル | 内容 |
+| Table | Content |
 |---|---|
-| `tukuyomi_records` | ログの行ごとに 1 つ。`id`（通し番号）、`ts`、`type`、`request_id`、`client`、`method`、`host`、`path`、`class`、`status`、`reason`、`ms`、`upstream`、`mode`、`engine`、`generation`、`rule`、`rules`（文字列）、`score`、`body`、`sent`、`raw`（行そのもの）、`line_hash`（行の SHA-256。UNIQUE） |
-| `tukuyomi_records_state` | ログのディレクトリ（`source`、`records.dir` のパス）ごとの、送った位置（`inode`、`born`、`offset`、`lost_lines`、`updated`） |
-| `tukuyomi_records_schema` | スキーマのバージョン（現在は 1） |
+| `tukuyomi_records` | One row for each log line. `id` (serial number), `ts`, `type`, `request_id`, `client`, `method`, `host`, `path`, `class`, `status`, `reason`, `ms`, `upstream`, `mode`, `engine`, `generation`, `rule`, `rules` (a string), `score`, `body`, `sent`, `raw` (the line itself), `line_hash` (the SHA-256 of the line. UNIQUE) |
+| `tukuyomi_records_state` | How far each log directory has been sent (`source`, the path of `records.dir`) (`inode`, `born`, `offset`, `lost_lines`, `updated`) |
+| `tukuyomi_records_schema` | The schema version (currently 1) |
 
-- インデックスは、`ts`、`(type, ts)`、`request_id`、`rule` にあります。
-- テーブルがそろっていてバージョンの行があれば、何も作らないので、ログ送信プロセスの DB のユーザーにテーブルを作る権限は必要ありません。作る権限を渡したくないときは、作る権限のあるユーザーでログ送信プロセスを一度動かしてテーブルを作らせ、その後で、ログ送信プロセスのユーザーを変更します。テーブルを手で作るときは、ログ送信プロセスが作る形（`records-ship/src/store/pgsql.rs`、`records-ship/src/store/mysql.rs` の `CREATE TABLE`）のとおりに作り、バージョンのテーブルに 1 の行も入れます。バージョンの行が無いと、ログ送信プロセスはテーブルを作ろうとするので、作る権限が必要になります。
-- `tukuyomi_records_schema` に、このログ送信プロセスより新しいバージョンがあれば、ログ送信プロセスはその DB にログを送りません（`the schema of the database is newer than this program`）。
-- 1 つのログのディレクトリには、ログ送信プロセスを 1 つだけ動かします。位置は `records.dir` のパスで分けるので、別のホストのプロキシを同じテーブルへ送るときは、`records.dir` のパスを変えるか、別のスキーマや DB にします。
-- PostgreSQL: テーブルを作る間はアドバイザリーロックを取ります。
-- MySQL: テーブルは InnoDB、文字は `utf8mb4`、照合順序は `utf8mb4_bin`、行フォーマットは `DYNAMIC` で作り、時刻は UTC の `DATETIME(3)` です。接続ごとに `sql_mode` を厳格な設定（`STRICT_ALL_TABLES` を含む）にし、タイムゾーンを UTC にします。テーブルを作る間は `GET_LOCK` を取ります。サーバーの `max_allowed_packet` は 2 MiB 以上にします（1 つの `INSERT` に 100 行まで入ります）。`records.dir` のパスは 512 文字までにします。超えると、ログ送信プロセスは `a value does not fit the database` の行を出して止まります。
+- The indexes are on `ts`, `(type, ts)`, `request_id`, and `rule`.
+- If all the tables exist and the version table has a row, nothing is created, so the records shipper's DB user does not need the privilege to create tables. If you do not want to grant that privilege, run the records shipper once as a user that has it, let it create the tables, and then switch the records shipper to the other user. When you create the tables by hand, create them exactly as the records shipper does (the `CREATE TABLE` in `records-ship/src/store/pgsql.rs` and `records-ship/src/store/mysql.rs`), and also insert a row with 1 into the version table. Without a version row, the records shipper tries to create the tables and needs the privilege to do so.
+- If `tukuyomi_records_schema` has a version newer than this records shipper, the records shipper does not send logs to that DB (`the schema of the database is newer than this program`).
+- Run only one records shipper per log directory. The position is kept for each `records.dir` path, so when proxies on different hosts send to the same tables, give them different `records.dir` paths, or use a different schema or DB.
+- PostgreSQL: it takes an advisory lock while it creates the tables.
+- MySQL: the tables are created as InnoDB, with the `utf8mb4` character set, the `utf8mb4_bin` collation, and the `DYNAMIC` row format, and times are `DATETIME(3)` in UTC. For each connection, the records shipper sets `sql_mode` to a strict setting (including `STRICT_ALL_TABLES`) and the time zone to UTC. It takes `GET_LOCK` while it creates the tables. Set the server's `max_allowed_packet` to 2 MiB or more (one `INSERT` holds up to 100 rows). Keep the `records.dir` path to at most 512 characters. If it is longer, the records shipper writes the line `a value does not fit the database` and stops.
 
-### 送信の仕組み
+### How Shipping Works
 
-- 1 回の処理で、ログファイルの行を `batch` 個まで読み、1 つのトランザクションで、行を入れて位置のテーブルを進めます。コミットの後に `ship.state` を書きます。ログ送信プロセスが落ちても、次の回は DB の位置から続けます。
-- `batch` 個そろった回の後はすぐ次の回へ進み、送る行が無かった回の後は `interval_ms` 待ちます。失敗の後は、待つ時間を `interval_ms` から倍にして 1 分まで延ばし、うまくいった回の後に戻します。
-- DB に接続できない間と、送る行が無い間も、`ship.state` を 1 秒に 1 回は書き直します。プロキシは、これでログ送信プロセスが動作中であることを判断します。
-- ログファイルは、名前ではなく inode と作成時刻で追跡します。ローテーションでリネームされても、続きから読みます。使用中のファイルの最後の、改行の無い行は、プロキシが書いている途中かもしれないので、次の回に回します。
-- すべての `type` の行を送ります。`type` を知っている JSON のオブジェクトの行は、その項目を同じ名前の列に入れます（無い項目と、型の違う項目の列は空です）。ほかの行は `type` を `unknown` にして入れます。行そのものは、いつも `raw` に残ります。
-- 列の長さはプロキシが書く上限に合わせ、長い値は切ります（`method` 32、`host` 255、`path` 1024、`request_id` 128 バイト）。UTF-8 でない行は、`raw` では不正なバイトを U+FFFD にします（`line_hash` は元のバイトのハッシュです）。
-- `line_hash` が UNIQUE なので、二重に送った行は 1 つになります。同じバイト列の行も 1 つになります。
-- `retention_days` があれば、1 分に 1 回、それより古い行を 1000 行まで削除します（1000 行削除できたときは続けて削除します）。古さはログの `ts`（プロキシの時計）で決めます。
+- In one round, the records shipper reads up to `batch` lines from the log file and, in one transaction, inserts them and advances the position table. After the commit, it writes `ship.state`. Even if the records shipper crashes, the next round continues from the position in the DB.
+- After a round that filled `batch` lines, it starts the next round immediately, and after a round with no lines to send, it waits `interval_ms`. After a failure, it doubles the wait each time, starting from `interval_ms`, up to 1 minute, and resets it after a successful round.
+- While it cannot connect to the DB, and while there are no lines to send, it still rewrites `ship.state` at least once per second. The proxy uses this to tell that the records shipper is running.
+- It tracks the log files by inode and creation time, not by name. Even if a file is renamed by a rotation, it reads on from where it left off. If the last line of the file in use has no newline, the proxy may still be writing it, so it is left for the next round.
+- It sends the lines of every `type`. For a line that is a JSON object with a `type` it knows, it puts the fields into the columns with the same names (columns whose field is missing or has a different type are left empty). Other lines are inserted with `type` set to `unknown`. The line itself is always kept in `raw`.
+- The column lengths follow the limits of what the proxy writes, and long values are cut (`method` 32, `host` 255, `path` 1024, `request_id` 128 bytes). For a line that is not UTF-8, invalid bytes become U+FFFD in `raw` (`line_hash` is the hash of the original bytes).
+- `line_hash` is UNIQUE, so a line that was sent twice ends up as one row. Lines with identical bytes also end up as one row.
+- If `retention_days` is not 0, once per minute it deletes up to 1000 lines older than that (if it deleted 1000 lines, it keeps deleting). Age is based on the `ts` of the log (the proxy's clock).
 
-### 送れないログ
+### Logs That Cannot Be Shipped
 
-- ログ送信プロセスが読む前に、ローテーションで消えたログファイルの行は失われます。
-  - ログ送信プロセスが開いていたファイルなら、失われた行を数えて位置の `lost_lines` に足し、`records-ship: a record file was removed before it was shipped, <count> lines lost` の行を出します。
-  - ログ送信プロセスが開く前に消えたファイル（DB に長く接続できない間に、プロキシが `files` より多くローテーションしたときなど）の行は、数えられません。`lines may be lost` を含む行だけを出します。この行は、何も失われていないときにも出ることがあります。
-- プロキシの `required` のルートは、そうなる前にリクエストを拒否します（上の「ログの残し方」）。`best_effort` と `security` のルートは拒否しません。
-- ログファイルは切り詰めないでください（logrotate の `copytruncate` など）。ログ送信プロセスは、切り詰めたファイルを同じファイルと見て、その先頭の行を送らないことがあります。ローテーションはプロキシが自分で行います。
+- Lines in a log file that rotation removed before the records shipper read them are lost.
+  - If it was the file that the records shipper had open, the records shipper counts the lost lines, adds them to `lost_lines` in the position table, and writes the line `records-ship: a record file was removed before it was shipped, <count> lines lost`.
+  - Lines in a file that disappeared before the records shipper opened it (for example, when the proxy rotated more than `files` times while the DB was unreachable for a long time) cannot be counted. The records shipper writes only a line that contains `lines may be lost`. This line may also appear when nothing was lost.
+- A `required` route of the proxy refuses requests before this happens (see "What Logs Keep (`keep` and the `records` of a Route)" above). A `best_effort` or `security` route does not.
+- Do not truncate the log files (for example, with logrotate's `copytruncate`). The records shipper treats a truncated file as the same file and may not send its first lines. The proxy rotates the files itself.
 
-### ログ送信プロセスのエラー
+### Records Shipper Errors
 
-- ログ送信プロセスのログは、プロキシと同じ 1 行 1 件の JSON（`type` が `line`、文は `records-ship:` で始まる）で、標準エラーに出ます。文には、接続文字列、ログ、サーバーが返した文の値を入れません。DB のエラーは、決まった文と、サーバーが返した SQLSTATE です（例: `records-ship: the database refused or failed a request (SQLSTATE 42000)`）。
-- DB がログインを拒否したとき（PostgreSQL の SQLSTATE が 28 で始まるもの、MySQL の 1045）は、待っても直らないので、`records-ship: stop: the login is refused, which waiting does not mend` の行を出して終わります（exit 1）。
-- ほかの拒否は、上の待ち時間を置いて再試行し、そのたびに行を出します。DB が無い、DB への権限が無い、MySQL の、そのホストからの接続を許可しない（1130）・アカウントがロックされている（3118）なども、これに入ります。
+- The records shipper writes its log to standard error as JSON, one line per entry, like the proxy (`type` is `line`, and the message starts with `records-ship:`). The messages do not contain the connection string, logs, or text from the server's error messages. A DB error is reported as a fixed message with the SQLSTATE that the server returned (example: `records-ship: the database refused or failed a request (SQLSTATE 42000)`).
+- When the DB refuses the login (a PostgreSQL SQLSTATE that starts with 28, or MySQL 1045), waiting will not help, so the records shipper writes the line `records-ship: stop: the login is refused, which waiting does not mend` and exits (exit 1).
+- For other refusals, the records shipper retries after the wait described above and writes a line each time. These include a DB that does not exist, missing privileges on the DB, and, for MySQL, a host that is not allowed to connect (1130) and a locked account (3118).
 
-## 監視
+## Monitoring
 
-設定に `status` を書くと、そのループバックアドレスで次の 3 つに応答します。応答に認証はありません。
+When you write `status` in the configuration, the proxy responds to the following three requests on that loopback address. The responses are not authenticated.
 
-| リクエスト | 応答 |
+| Request | Response |
 |---|---|
-| `GET /healthz` | 200 `ok`。プロキシが応答できることだけを示します |
-| `GET /readyz` | 準備ができていれば 200 `ready`。でなければ 503 と理由の語: `starting`（リスナーをバインドする前）、`inspector down`（起動しているエンジンの、どれかの検査プロセスが稼働していない。再起動の間も含みます）、`stopping`（停止が始まった後） |
-| `GET /metrics` | 200 と、下の表のメトリクス（Prometheus のテキスト形式、`text/plain; version=0.0.4`） |
+| `GET /healthz` | 200 `ok`. It shows only that the proxy can respond |
+| `GET /readyz` | 200 `ready` if the proxy is ready. Otherwise 503 and a word for the reason: `starting` (before the listeners are bound), `inspector down` (the inspector process of a started engine is not running, including during a restart), `stopping` (after a stop has begun) |
+| `GET /metrics` | 200 and the metrics in the table below (Prometheus text format, `text/plain; version=0.0.4`) |
 
-- 準備ができているのは、起動しているすべてのエンジンの検査プロセスが稼働していて、リスナーをすべてバインドし、停止が始まっていないときです。世代の切り替えの間は、古い世代が応答するので準備ができたままです。
-- `HEAD` は、同じステータスコードでボディを返しません。ほかのメソッドは 405、ほかのリクエストターゲット（クエリの付いたものも）は 404、HTTP/1.1 でないリクエストと、4 KiB に収まらないヘッダー部は 400 で応答します。
-- 1 つの接続で 1 つのリクエストに応答し、応答したら閉じます。同時に応答する接続は 8 つまでで、転送の `max_conns` とは別に数えます。それを超えた接続は、受けてすぐ閉じます。ヘッダー部を待つのは 2 秒、応答を書くのは 2 秒までです。
-- 監視のリクエストは、検査も転送もせず、ログにも記録しません。全体の `access` と `rate_limit`、ホストごとの設定も適用されません。
-- 監視用のリスナーは、検査プロセスより前にバインドし、停止の 3 の後に閉じます。それまで `/healthz` は 200 を返します。
+- The proxy is ready when the inspector processes of all the engines that have started are running, all the listeners are bound, and a stop has not begun. During a generation switch, the old generation responds, so the proxy stays ready.
+- `HEAD` returns the same status code without a body. Other methods get 405, other request targets (including those with a query) get 404, and a request that is not HTTP/1.1 and a header section that does not fit in 4 KiB get 400.
+- It serves one request on each connection and closes the connection after responding. At most 8 connections are served at the same time, counted separately from the `max_conns` for forwarding. A connection beyond that is closed immediately after it is accepted. It waits at most 2 seconds for the header section and at most 2 seconds to write the response.
+- Monitoring requests are neither inspected nor forwarded, and are not recorded in the logs. The global `access` and `rate_limit` and the host policies do not apply to them either.
+- The monitoring listener is bound before the inspector processes and is closed after step 3 of the stop. Until then, `/healthz` returns 200.
 
-### メトリクス（`/metrics`）
+### Metrics (`/metrics`)
 
-メトリクスの値はプロキシのメモリの中にあり、再起動すると 0 から数えます。ラベルの値は、決まった語か、設定の名前だけです（リクエストから来る値はラベルにしません）。
+The metric values are kept in the proxy's memory and start again from 0 after a restart. Label values are only fixed words or names from the configuration (values that come from requests are not used as labels).
 
-| 名前 | 型 | ラベル | 内容 |
+| Name | Type | Labels | Content |
 |---|---|---|---|
-| `tukuyomi_requests_total` | `counter` | `class` | リクエストの数。ログを書かないリクエストも数えます（`class` はログと同じ 7 つ） |
-| `tukuyomi_waf_rule_hits_total` | `counter` | `decision`（`block`、`detect`） | ルールがブロックしたリクエストと、検知のみのモードでルールに一致したリクエスト |
-| `tukuyomi_uninspectable_total` | `counter` | `reason` | 検査できなかったリクエスト（`invalid`、`queue_full`、`unavailable`、`wait_deadline`、`verdict_deadline`、`inspector_lost`、`protocol`、`inspector_error`、`not_created`、`cancelled`） |
-| `tukuyomi_policy_refusals_total` | `counter` | `policy`（`access`、`rate_limit`） | アクセス制御とレート制限で拒否したリクエスト（全体の設定とホストごとの設定の、アクセス制御の 403 とレート制限の 429）。ルートの `access` と `admin.route.access` の 403 は数えません |
-| `tukuyomi_rate_limit_keys` | `gauge` | | レート制限が今数えているクライアントの数。全体とホストごとの設定のすべてのテーブルの合計（`keys` のうち使っている分）。レート制限が無ければ 0 |
-| `tukuyomi_rate_limit_evicted_total` | `counter` | | カウントが残っているのに、場所を空けるためにテーブルから外したクライアントの数。すべてのテーブルの合計で、設定のリロードでテーブルが切り替わっても減りません。レート制限が無ければ 0 |
-| `tukuyomi_connections_accepted_total` | `counter` | | 受け付けた接続 |
-| `tukuyomi_connections_open` | `gauge` | | 開いている接続 |
-| `tukuyomi_connection_permit_waits_total` | `counter` | | 接続を受け付けるときに接続の枠を待った回数（`max_conns` に達した回数の目安） |
-| `tukuyomi_tls_handshake_failures_total` | `counter` | | TLS のハンドシェイクの失敗とタイムアウト |
-| `tukuyomi_body_buffer_bytes` | `gauge` | | ボディなどのバッファリングに使っている予算のバイト数（`max_buffered_bytes` のうち使っている分） |
-| `tukuyomi_inspections_waiting` | `gauge` | | 検査のスロットを待っているリクエスト（エンジンごとの `wait_queue` のうち使っている分の、全エンジンの合計） |
-| `tukuyomi_inspector_up` | `gauge` | | 起動しているエンジンの検査カーネルが、すべて準備できていれば 1、でなければ 0 |
-| `tukuyomi_inspector_restarts_total` | `counter` | | 検査プロセスの再起動（全エンジンの合計） |
-| `tukuyomi_inspector_engine_up` | `gauge` | `engine`（`coraza`、`modsecurity`） | エンジンの検査カーネルの準備ができていれば 1、でなければ 0。起動しているエンジンごとに 1 つ |
-| `tukuyomi_inspector_engine_restarts_total` | `counter` | `engine`（`coraza`、`modsecurity`） | エンジンの検査プロセスの再起動。起動しているエンジンごとに 1 つ |
-| `tukuyomi_rules_generation_info` | `gauge` | `generation`（フィンガープリントの先頭 16 桁）、`mode`、`engine` | リクエストを受けている世代。値はいつも 1。起動しているエンジンごとに 1 つ |
-| `tukuyomi_rules_switches_total` | `counter` | `result`（`switched`、`refused`、`failed`） | SIGUSR1 と制御ソケットによる世代の切り替え |
-| `tukuyomi_certificate_reloads_total` | `counter` | `result`（`replaced`、`refused`） | SIGUSR2 による証明書の再読み込み |
-| `tukuyomi_config_reloads_total` | `counter` | `result`（`replaced`、`refused`） | SIGHUP と制御ソケットの `reload` による設定のリロード。リロードの途中に受けて無視した SIGHUP と、リロードを始めなかった `reload` の依頼（`busy`、`unmanaged`、`error` の応答）は数えません |
-| `tukuyomi_upstream_failures_total` | `counter` | `group` | アップストリームのサーバーの失敗。設定のリロードで、0 から数え直します |
-| `tukuyomi_records_dropped_total` | `counter` | | 捨てたログ（上の「ログを書けないとき」） |
-| `tukuyomi_record_write_errors_total` | `counter` | | 書き込みに失敗したログ |
-| `tukuyomi_record_file_errors_total` | `counter` | | ログファイルに書けなかったログと、失敗した同期（上の「ログファイル」） |
-| `tukuyomi_records_refused_total` | `counter` | | `required` のルートで、ログを残せないために 503 で拒否したリクエスト（上の「ログの残し方」） |
-| `tukuyomi_records_healthy` | `gauge` | | ログファイルへの最後の書き込みが通り、ログを書くスレッドが動いていれば 1、でなければ 0 |
-| `tukuyomi_records_admitting` | `gauge` | | `required` のルートのリクエストを今受け付けるなら 1、拒否するなら 0（上の「ログの残し方」の 3 つ）。`required` のルートが無くても出ます |
-| `tukuyomi_records_unshipped_bytes` | `gauge` | | ログ送信プロセスがまだ送っていない、ログファイルのバイト数。`records.ship` があるときだけ出ます。ログ送信プロセスの遅れが分からない間は、値がありません |
-| `tukuyomi_start_time_seconds` | `gauge` | | 起動した時刻（Unix 時間の秒） |
+| `tukuyomi_requests_total` | `counter` | `class` | The number of requests. Requests whose logs are not written are also counted (`class` has the same 7 values as in the log) |
+| `tukuyomi_waf_rule_hits_total` | `counter` | `decision` (`block`, `detect`) | Requests that a rule blocked, and requests that matched a rule in detect-only mode |
+| `tukuyomi_uninspectable_total` | `counter` | `reason` | Requests that could not be inspected (`invalid`, `queue_full`, `unavailable`, `wait_deadline`, `verdict_deadline`, `inspector_lost`, `protocol`, `inspector_error`, `not_created`, `cancelled`) |
+| `tukuyomi_policy_refusals_total` | `counter` | `policy` (`access`, `rate_limit`) | Requests refused by the access control and the rate limit (the 403 of the access control and the 429 of the rate limit, for the global settings and the host policies). A 403 from the `access` of a route or from `admin.route.access` is not counted |
+| `tukuyomi_rate_limit_keys` | `gauge` | | The number of clients that the rate limit is counting now. The total over the global table and all the tables of host policies (the part of `keys` that is in use). 0 if there is no rate limit |
+| `tukuyomi_rate_limit_evicted_total` | `counter` | | The number of clients that were removed from a table to make room although their count was still left. The total over all tables, and it does not decrease even when a configuration reload replaces the tables. 0 if there is no rate limit |
+| `tukuyomi_connections_accepted_total` | `counter` | | Accepted connections |
+| `tukuyomi_connections_open` | `gauge` | | Open connections |
+| `tukuyomi_connection_permit_waits_total` | `counter` | | The number of times a connection waited for a connection slot when it was accepted (a guide to how often `max_conns` was reached) |
+| `tukuyomi_tls_handshake_failures_total` | `counter` | | Failures and timeouts of the TLS handshake |
+| `tukuyomi_body_buffer_bytes` | `gauge` | | The bytes of the budget in use for buffering bodies and so on (the part of `max_buffered_bytes` that is in use) |
+| `tukuyomi_inspections_waiting` | `gauge` | | Requests waiting for an inspection slot (the part of the `wait_queue` of each engine that is in use, totaled over all engines) |
+| `tukuyomi_inspector_up` | `gauge` | | 1 if the inspection kernels of all the engines that have started are ready, 0 otherwise |
+| `tukuyomi_inspector_restarts_total` | `counter` | | Restarts of inspector processes (total over all engines) |
+| `tukuyomi_inspector_engine_up` | `gauge` | `engine` (`coraza`, `modsecurity`) | 1 if the inspection kernel of the engine is ready, 0 otherwise. One for each engine that has started |
+| `tukuyomi_inspector_engine_restarts_total` | `counter` | `engine` (`coraza`, `modsecurity`) | Restarts of the inspector process of the engine. One for each engine that has started |
+| `tukuyomi_rules_generation_info` | `gauge` | `generation` (the first 16 digits of the fingerprint), `mode`, `engine` | The generation that is receiving requests. The value is always 1. One for each engine that has started |
+| `tukuyomi_rules_switches_total` | `counter` | `result` (`switched`, `refused`, `failed`) | Generation switches by SIGUSR1 and by the control socket |
+| `tukuyomi_certificate_reloads_total` | `counter` | `result` (`replaced`, `refused`) | Certificate reloads by SIGUSR2 |
+| `tukuyomi_config_reloads_total` | `counter` | `result` (`replaced`, `refused`) | Configuration reloads by SIGHUP and by `reload` on the control socket. A SIGHUP that was received during a reload and ignored, and a `reload` request that did not start a reload (the responses `busy`, `unmanaged`, and `error`), are not counted |
+| `tukuyomi_upstream_failures_total` | `counter` | `group` | Failures of upstream servers. Reset to 0 at a configuration reload |
+| `tukuyomi_records_dropped_total` | `counter` | | Logs that were discarded (see "When Logs Cannot Be Written" above) |
+| `tukuyomi_record_write_errors_total` | `counter` | | Logs that failed to be written |
+| `tukuyomi_record_file_errors_total` | `counter` | | Logs that could not be written to the log file, and failed syncs (see "Log Files (`records`)" above) |
+| `tukuyomi_records_refused_total` | `counter` | | Requests that a `required` route refused with 503 because logs could not be kept (see "What Logs Keep (`keep` and the `records` of a Route)" above) |
+| `tukuyomi_records_healthy` | `gauge` | | 1 if the last write to the log file succeeded and the thread that writes logs is running, 0 otherwise |
+| `tukuyomi_records_admitting` | `gauge` | | 1 if requests to `required` routes are accepted now, 0 if they are refused (the three conditions in "What Logs Keep (`keep` and the `records` of a Route)" above). It is also exposed when there is no `required` route |
+| `tukuyomi_records_unshipped_bytes` | `gauge` | | The bytes of the log files that the records shipper has not sent yet. Exposed only when `records.ship` is present. While the proxy cannot tell how far the records shipper is behind, it has no value |
+| `tukuyomi_start_time_seconds` | `gauge` | | The start time (Unix time in seconds) |
 
-### systemd への通知
+### Notifications to systemd
 
-環境に `NOTIFY_SOCKET` があれば、リスナーをすべてバインドした後に `READY=1` を、停止が始まったときに `STOPPING=1` を、そのソケットへ 1 回ずつ送ります。
+If the environment has `NOTIFY_SOCKET`, the proxy sends `READY=1` to that socket once after all the listeners are bound, and `STOPPING=1` once when a stop begins.
 
-- `NOTIFY_SOCKET` は、絶対パスか、`@` で始まる名前（Linux の抽象名前空間の名前）です。ほかの値なら `start:` の文を 1 行出し、通知を送らずに動きます。
-- 送れなかったときは `notify:` の文を 1 行出すだけで、動作は変えません。待たずに送るので、受ける側が読まなくてもプロキシは止まりません。
-- 検査プロセスの環境は空なので、検査プロセスは通知を送りません。
-- ユニットを `Type=notify` にすると、`systemctl start` は検査カーネルの準備とリスナーのバインドまで待ちます（[ビルドと配置](../build/binary-deployment.md) の「systemd」）。
+- `NOTIFY_SOCKET` is an absolute path or a name that starts with `@` (a name in the Linux abstract namespace). For any other value, the proxy writes one `start:` line and runs without sending notifications.
+- When a notification cannot be sent, the proxy only writes one `notify:` line and otherwise behaves as usual. It sends without waiting, so the proxy does not get stuck even if the receiver does not read.
+- The environment of the inspector processes is empty, so the inspector processes do not send notifications.
+- If you make the unit `Type=notify`, `systemctl start` waits until the inspection kernels are ready and the listeners are bound (see "systemd" in the [build and deployment guide](../build/binary-deployment.md)).
 
 ## ACME
 
-`acme renew` は、HTTP-01 のチャレンジだけで、証明書を発行・更新します（RFC 8555）。
+`acme renew` issues and renews certificates only with HTTP-01 challenges (RFC 8555).
 
-### 必要なもの
+### Requirements
 
-- CA は、証明書のホストのポート 80 へ、平文の HTTP でチャレンジを取りに来ます。ポート 80 で、通常のリスナーかリダイレクトのリスナーを持つ必要があります。
-  - プロキシはポートの番号を検証しません。
-- 通常のリスナーとリダイレクトのリスナーは、次のリクエストに、管理画面のルート、ポリシー（全体の設定とホストごとの設定）、ルート、ルートの `access`、検査、転送、リダイレクトより先に応答します。TLS のリスナーは応答しません。
-  - メソッドが `GET` か `HEAD` です。
-  - リクエストターゲットが `/.well-known/acme-challenge/<token>` で、後ろに何もありません（クエリやエスケープもありません）。トークンは 1〜128 文字の英数字・`-`・`_` です。
-  - `Host` が、`acme` を持つ証明書のホスト（大文字と小文字を区別せず、ポートと末尾の `.` は見ません）です。`managed` のある設定では、`acme` を持つ管理画面のルートのホストと、稼働中のバージョンの ACME のサイトのホストです（上の「ACME のサイト」）。
-- 上の形でないリクエストはチャレンジとして扱わず、ほかのリクエストと同じようにルートと検査へ回ります。
-- 応答は、`challenge_dir` の `<token>` のファイル（1 KiB までの通常のファイル）をボディにした 200 か、404 です。シンボリックリンクはたどりません。
-- `admin.route.access` はチャレンジに適用されません（CA はどのアドレスからも来るためです）。
-- `ca_file` には、CA の API のサーバー証明書を発行したルート証明書だけを入れます。100 枚までなので、OS のルート証明書のバンドルをそのまま使うことはできません。
+- The CA fetches the challenge over plaintext HTTP from port 80 of the certificate's host, so you need a normal listener or a redirect listener on port 80.
+  - The proxy does not check port numbers.
+- A normal listener and a redirect listener respond to the following requests before the admin route, the policies (the global settings and the host policies), routes, the `access` of a route, inspection, forwarding, and redirects. A TLS listener does not respond to them.
+  - The method is `GET` or `HEAD`.
+  - The request target is `/.well-known/acme-challenge/<token>` with nothing after it (no query and no escapes). The token is 1 to 128 characters of letters and digits, `-`, and `_`.
+  - The `Host` is the host of a certificate that has `acme` (case, the port, and a trailing `.` are ignored). With `managed`, it is the host of the admin route that has `acme`, or a host of an ACME site of the running version (see "ACME Sites" above).
+- A request that is not in the form above is not treated as a challenge, and goes to routes and inspection like other requests.
+- The response is either 200 with the file `<token>` in `challenge_dir` as its body (a regular file of up to 1 KiB), or 404. Symbolic links are not followed.
+- `admin.route.access` does not apply to challenges (because the CA can connect from any address).
+- In `ca_file`, put only the root certificates that issued the server certificate of the CA's API. It can hold at most 100 certificates, so you cannot use the OS root certificate bundle as it is.
 
-### 初回の発行
+### First Issue
 
-1. 設定に `acme` と、`acme` を持つ証明書を書きます。証明書のファイルはまだ無くてかまいません。
-   - `managed` の無い設定では、リスナーの証明書に `acme` を付けます。`managed` のある設定では、管理画面のルートの証明書（`admin.route.certificate`）とバージョンのサイト（上の「ACME のサイト」）に付けます。
-   - プロキシは、行（`start: tls certificate not issued yet (<place>)`）を出して、その証明書をハンドシェイクから外したまま起動します。
-   - 試すときは、CA のテスト用の ACME ディレクトリ（Let's Encrypt ならステージング）を `directory_url` に書きます。
-2. プロキシを起動します。
-3. サービスの OS ユーザーで `acme renew` を実行します。
+1. In the configuration, write `acme` and a certificate that has `acme`. The certificate files need not exist yet.
+   - In a configuration without `managed`, put `acme` on a certificate of a listener. In a configuration with `managed`, put it on the certificate of the admin route (`admin.route.certificate`) and on a site of a version (see "ACME Sites" above).
+   - The proxy writes a `start: tls certificate not issued yet (<place>)` line and starts, leaving that certificate out of the handshake.
+   - To test first, set `directory_url` to the CA's test ACME directory (staging, for Let's Encrypt).
+2. Start the proxy.
+3. Run `acme renew` as the OS user of the service.
 
    ```bash
    sudo -u tukuyomi /opt/tukuyomi-core/bin/tukuyomi-proxy acme renew /etc/tukuyomi-core/config.json
    ```
 
-   `2.1 renewed` のような行が出ます（`managed` のある設定では `admin route renewed`、`site www renewed` のような行）。
-4. `systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`（SIGUSR2）で、プロキシが証明書を使い始めます。
-5. テスト用の CA で通ったら、本番の CA に切り替えます。
-   - テスト用の CA の証明書は、有効期限が来ていないので、そのままでは置き換わりません（`valid`）。その証明書のファイルを削除します。リスナーと管理画面のルートの証明書は `cert_file` と `key_file`、ACME のサイトは managed ストアの `acme/<hosts-sha256>/` の `chain` と `key` です。
-   - `directory_url` を本番の CA のものに変更します。CA の API のサーバー証明書のルート証明書が違うなら、`ca_file` も変更します。
-   - もう一度 `acme renew` を実行してから、SIGUSR2 を送ります。ファイルを削除してから `acme renew` が終わるまでの間に SIGUSR2 を送ると（証明書も読む設定のリロードも含みます）、その証明書はハンドシェイクから外れます。この順を守れば、その間もプロキシは読み込み済みの証明書を使い続けます。
-   - `directory_url`・`ca_file`・`contact_email` など、`acme` の多くの設定キーはコマンドだけが読むので、プロキシの再起動は必要ありません。`challenge_dir` と、`acme` を持つ証明書のホストはプロキシも読むので、変更したときはプロキシに設定をリロードさせます（SIGHUP、`systemctl reload`。ACME のサイトのホストは、バージョンの反映で切り替わります）。
-6. 毎日のタイマーを置きます（[ビルドと配置](../build/binary-deployment.md) の「証明書の更新のタイマー」）。
+   Lines like `2.1 renewed` are written (with `managed`, lines like `admin route renewed` and `site www renewed`).
+4. Send SIGUSR2 (`systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`), and the proxy starts to use the certificate.
+5. When it works with the test CA, switch to the production CA.
+   - The certificate from the test CA has not expired, so `acme renew` leaves it as it is (`valid`). Delete that certificate's files: `cert_file` and `key_file` for listeners and the admin route, and `chain` and `key` in `acme/<hosts-sha256>/` in the managed store for an ACME site.
+   - Change `directory_url` to that of the production CA. If the server certificate of the production CA's API comes from a different root certificate, also change `ca_file`.
+   - Run `acme renew` again, and then send SIGUSR2. If you send SIGUSR2 between deleting the files and the end of `acme renew` (the same applies to a configuration reload, which also reads certificates), that certificate drops out of the handshake. If you keep to this order, the proxy keeps using the certificate it has already loaded in the meantime.
+   - Most setting keys of `acme`, such as `directory_url`, `ca_file`, and `contact_email`, are read only by the command, so the proxy does not need a restart. `challenge_dir` and the hosts of a certificate that has `acme` are also read by the proxy, so when you change them, reload the proxy's configuration (SIGHUP, `systemctl reload`; the hosts of an ACME site switch when a version is applied).
+6. Install the daily timer (see "Certificate Renewal Timer" in the [build and deployment guide](../build/binary-deployment.md)).
 
-### 注意
+### Notes
 
-- 同じ設定で `acme renew` を 2 つ同時に実行しないでください。同時実行を防ぐ仕組みはありません。
-- コマンドの後に SIGUSR2 を送らないと、新しい証明書は使われません。
-- 鍵と証明書は別のファイルに書いて同期してから、鍵、証明書の順に置き換えます。
-  - 2 つの置き換えの間で止まると、鍵が証明書に対応しない組み合わせが残ります。動作中のプロキシは、SIGUSR2 でその組み合わせを拒否して現在のものを使い続け、次のコマンドが作り直します。ただし、その間にプロキシを起動すると、その組み合わせを拒否して起動しません（exit 1）。
-  - 2 つの置き換えの間と、設定のリロード（SIGHUP、制御ソケットの `reload`）、`managed activate`、`config check`、起動が重なると、証明書の検証で拒否されることがあります（`tls refused`）。そのときは、もう一度実行します。管理画面と管理 API の反映での扱いは、[管理リファレンス](admin-reference.md) の「制御ソケット」を参照してください。
-- `cert_file`・`key_file`・`challenge_dir` が置かれたディレクトリと、managed ストアに、サービスの OS ユーザーが書けることが必要です（[ビルドと配置](../build/binary-deployment.md) の「OS ユーザーとディレクトリ」）。
-  - 鍵は 0600、証明書は 0644 で書きます（umask の分は引かれます）。
-- ACME のサイトでホストの組み合わせを変更したバージョンに反映したときと、前のバージョンに戻したときは、すぐに `acme renew` を実行します（上の「ACME のサイト」）。
+- Do not run two `acme renew` commands at the same time with the same configuration. Nothing prevents concurrent runs.
+- Unless you send SIGUSR2 after the command, the new certificate is not used.
+- The key and the certificate are each written to a separate file and synced, and then they replace the old files, the key first and then the certificate.
+  - If the command stops between the two replacements, a key that does not match the certificate is left behind. The running proxy refuses that pair at SIGUSR2 and keeps using the current one, and the next run recreates them. If you start the proxy in the meantime, however, it refuses that pair and does not start (exit 1).
+  - If the time between the two replacements overlaps with a configuration reload (SIGHUP, `reload` on the control socket), `managed activate`, `config check`, or start, the certificate check can be refused (`tls refused`). In that case, run it again. For how applying from the admin screens and the admin API handles this, see "Control Socket" in the [admin reference](admin-reference.md).
+- The OS user of the service must be able to write to the directory where `cert_file`, `key_file`, and `challenge_dir` are placed, and to the managed store (see "OS User and Directories" in the [build and deployment guide](../build/binary-deployment.md)).
+  - The key is written with 0600 and the certificate with 0644 (minus the umask).
+- After you apply a version that changes the hosts of an ACME site, and after you go back to an earlier version, run `acme renew` immediately (see "ACME Sites" above).
 
-## バージョンの更新
+## Version Updates
 
-0.1.0 から更新する手順と、0.1.0 に戻す手順です。更新後のバージョンは、アップストリームごとに検査エンジンを選べます（上の「検査エンジンの選択」）。ユニットの書き方は、[ビルドと配置](../build/binary-deployment.md) の「systemd」を参照してください。
+Until 1.0, only updates from the previous release are supported. To skip releases in between, update one release at a time, in order. To go back to the previous version, restore the backup taken before the update (see "Going Back to the Previous Version" below). For how to write the unit, see "systemd" in the [build and deployment guide](../build/binary-deployment.md).
 
-### 0.1.0 からの更新
+### Backup Before an Update
 
-- 実行ファイルを入れ替えるだけで、0.1.0 の設定ファイル、ルールストア、managed ストアは、そのまま読めます（0.1.0 で ModSecurity の世代を選択していたときは、下のとおり、`kernel.default_engine` が必要です）。新しい設定キー（`kernel.default_engine`、アップストリームの `engine`）を書かなければ、0.1.0 と同じように、1 つのエンジンだけで稼働します。
-- 0.1.0 で Coraza の世代を選択していたときは、`kernel.default_engine` を書く必要はありません。0.1.0 が書いた `current` は、Coraza の選択中の世代として読まれます。`config check` は `accepted` で、起動すると `start: rules engine coraza` の行が 1 つだけ出ます。`current` は書き換わらず、`current.*` も増えません。
-- 0.1.0 で ModSecurity の世代を選択していたときは、`kernel.default_engine` に `modsecurity` を書きます。
-  - 書かないと、`config check` と起動は、`rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` の行を出して受け付けません（exit 1）。ルールストアは変わりません。
-  - `modsecurity` を書いた設定ファイルは `config check` を通り、起動すると `start: rules engine modsecurity` の行が 1 つだけ出ます。`current` は書き換わらず、`current.*` も増えません。ModSecurity の検査プロセスは、0.1.0 のときから、設定の `kernel.engines` に必要です。
-- 管理プロセス、プロキシ、ログ送信プロセスは、同じビルドにそろえます。
-  - 以前のバージョンのプロキシには、更新後の管理プロセスは世代の選択とロールバックを行いません（409）。詳しくは、[管理リファレンス](admin-reference.md) の「選択とロールバック」と「管理画面」を参照してください。
-  - ログ送信プロセスは、設定ファイルの未知の設定キーを受け付けません。`kernel.default_engine` やアップストリームの `engine` を書く前に、ログ送信プロセスを同じビルドに入れ替えます。0.1.0 のプロキシも、`kernel.default_engine` のある設定ファイルを、`configuration has an unknown key` で受け付けません（exit 2）。
-  - 実行ファイルを同じリリースのものにすべて入れ替えてから、管理プロセス、プロキシ、ログ送信プロセスの順に再起動します（「managed 設定への移行」の手順 8 と同じ順です）。管理プロセスを先に再起動すると、入れ替えの間は、更新後の管理プロセスが以前のプロキシへの世代の選択とロールバックを 409 で拒否するだけで、ルールストアと切り替えの履歴は変わりません。
+Before an update, back up the following:
 
-### 0.1.0 への切り戻し
+- The configuration file
+- The rules store (`rules.store.dir`)
+- The managed store (`managed.dir`, when you use the managed configuration)
+- The admin store (`admin.store.dir`, when you use the admin process)
 
-実行ファイルを 0.1.0 に戻す手順です。0.1.0 は `current` だけを読み、`kernel.default_engine` とアップストリームの `engine` を知りません。更新後の `rules activate` は、`current.<engine>` を書いて、同じエンジンの世代を指す `current` を消します。そのため、更新後の実行ファイルで何をしたかによって、0.1.0 の `config check` と起動の結果が変わります。
+While you take the backup, keep the admin process, the proxy, the records shipper, and the certificate renewal timer stopped. Keep the owners and permissions as they are (the rules store and the other stores are checked for them). The backup also holds the admin store's password hashes and API tokens, the managed store's private keys, and so on, so put it in a directory that only root can read. The following commands back up the example directories and units from the [build and deployment guide](../build/binary-deployment.md). Leave out of the command any directory that you do not use.
 
-| 更新後の実行ファイルでしたこと | 0.1.0 の `config check` と起動 |
-|---|---|
-| 起動しただけ（選択も、新しい設定キーを書くことも、していません） | ルールストアが変わらないので、そのまま起動します |
-| 0.1.0 が選択していた世代と別のエンジンの世代だけを選択した（`current` は残ります） | 起動します。その選択は、0.1.0 には見えません |
-| 0.1.0 が選択していた世代と同じエンジンの世代を選択した（`current` が消えて、`current.<engine>` ができます） | `rules store refused: no generation is chosen` の行を出して受け付けません（exit 1） |
-| 設定ファイルに `kernel.default_engine` を書いた | `configuration refused: configuration has an unknown key` の行を出して受け付けません（exit 2） |
+```bash
+sudo systemctl stop tukuyomi-core-admin.service tukuyomi-core.service tukuyomi-core-records-ship.service tukuyomi-core-acme.timer
+sudo install -d -m 0700 /var/backups/tukuyomi-core
+sudo tar -C / -cpf /var/backups/tukuyomi-core/before-update.tar etc/tukuyomi-core/config.json var/lib/tukuyomi-core/store var/lib/tukuyomi-core/managed var/lib/tukuyomi-core/admin
+```
 
-戻す手順は次のとおりです。2 と 3 は更新後の実行ファイル、5 と 7 は 0.1.0 の実行ファイルで実行します。1、4、6 は、実行ファイルを使いません。
+The log directory (`records.dir`), the certificates and keys, and the work directory (`kernel.tmp_root`) are not backed up.
 
-1. プロキシと管理プロセスを止めます。
-2. `rules list` で、選択中の世代を確認します。0.1.0 が選択できる世代は 1 つなので、どの世代で動かすかを決めます。
-3. `managed` のある設定では、`managed activate <version>` で、アップストリームに `engine` を書いていない managed 設定のバージョンを選択し直します。0.1.0 は、アップストリームの `engine` を知らないためです。5 の後は、`current` と `current.<engine>` が別の世代を指すことがあり、更新後の実行ファイルの `managed activate` は受け付けなくなるので、先に行います。
-4. 設定ファイルから、`kernel.default_engine` を外します。アップストリームの `engine` を書いていたときも、外します。
-5. 0.1.0 の実行ファイルで、`rules activate <config> <fingerprint>` を実行します。0.1.0 が `current` を書きます。
-6. `current.coraza` と `current.modsecurity`（`current.*`）を消します。`current` だけが残ります。
-7. 0.1.0 の実行ファイルで `config check` を実行し、起動します。
+### Updating from 0.1.0
 
-どの手順の後も、`current` か `current.*` のどれかがあります。6 の前に 5 を行うのは、そのためです。
+- Take the backup described in "Backup Before an Update" above, and then replace the executables.
+- Once the executables are replaced, the 0.1.0 configuration file, rules store, and managed store are read as they are (if you had chosen a ModSecurity generation in 0.1.0, `kernel.default_engine` is required, as described below). If you do not write the new setting keys (`kernel.default_engine`, the `engine` of an upstream), the proxy runs with only one engine, as in 0.1.0.
+- If you had chosen a Coraza generation in 0.1.0, you do not need to write `kernel.default_engine`. The `current` written by 0.1.0 is read as Coraza's chosen generation. `config check` writes `accepted`, and at start only one `start: rules engine coraza` line appears. `current` is not rewritten and no `current.*` is added.
+- If you had chosen a ModSecurity generation in 0.1.0, write `modsecurity` in `kernel.default_engine`.
+  - If you do not, `config check` and start write the line `rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` and reject the configuration (exit 1). The rules store does not change.
+  - With `modsecurity` written, the configuration file passes `config check`, and at start only one `start: rules engine modsecurity` line appears. `current` is not rewritten and no `current.*` is added. The ModSecurity inspector process has been required in `kernel.engines` of the configuration since 0.1.0.
+- Use the same build for the admin process, the proxy, and the records shipper.
+  - The updated admin process does not choose generations or roll back for a proxy of an earlier version (409). For details, see "Choosing and Rolling Back" and "Admin Screens" in the [admin reference](admin-reference.md).
+  - The records shipper rejects unknown setting keys in the configuration file. Before you write `kernel.default_engine` or the `engine` of an upstream, replace the records shipper with the same build. The 0.1.0 proxy also rejects a configuration file that has `kernel.default_engine`, with `configuration has an unknown key` (exit 2).
+  - Replace all the executables with those of the same release, and then restart the admin process, the proxy, and the records shipper in this order (the same order as step 8 of "Moving to the Managed Configuration"). If you restart the admin process first, then while the replacement is in progress, the updated admin process only refuses generation choices and rollbacks for the earlier proxy with 409, and the rules store and the switch history do not change.
 
-更新後の実行ファイルに戻して進め直すときは、上の「0.1.0 からの更新」と同じです。0.1.0 で ModSecurity の世代を選択していたときは、`kernel.default_engine` が必要です。起動すると、0.1.0 が書いた `current` は、同じエンジンの選択中の世代として読まれます。`rules list` の `current` の印は 1 行、`start: rules engine <engine>` の行は 1 つで、`current.*` は増えません。
+### Going Back to the Previous Version
 
-`current.*` を消し忘れたまま、更新後の実行ファイルに戻したときは、次のようになります。
+Restore the backup taken before the update, and start the executables of the previous version. The steps are the same for every version.
 
-- 同じエンジンの `current` と `current.<engine>` が別の世代を指しているときは、`rules list`、`config check`、起動のどれも、`the current generation records of the engine disagree` で受け付けません（exit 1）。`rules list` は、世代の行をすべて出してから、標準エラーにこの文を出し、`current` の印は、食い違うエンジンの世代に付きません。`rules activate` で選択し直すと、元に戻ります。
-- 別のエンジンの古い選択だけが残っているとき（たとえば、`current` が Coraza の世代を指し、`current.modsecurity` が残っていて、`current.coraza` が無いとき）は、受け付けられ、選択中の世代として読まれます。`rules list` の `current` の印は 2 行になり、`config check` は `accepted` で、起動すると `start: rules engine coraza` と `start: rules engine modsecurity` の 2 つのエンジンが起動します。
-- 同じエンジンの食い違いは、起動を止めるだけです。別のエンジンの古い選択は、断られずに読まれて、そのエンジンが起動します。ModSecurity を起動したくないときは、戻すときに `current.*` を消します。
+1. Stop the admin process, the proxy, the records shipper, and the certificate renewal timer.
+2. Move the current configuration file and the directories you backed up aside to other names (keep them; do not delete them).
+3. Restore the backup.
+4. Put back the executables of the previous version, and check that the previous version's `config check` writes `accepted`.
+5. Start the admin process, the proxy, and the records shipper in this order, and start the certificate renewal timer.
 
-0.1.0 の管理プロセスは、更新後の管理プロセスが書いた切り替えの履歴の行（`engine` の欄がある行）を読めず、読み飛ばします。そのため、戻した後のロールバック先（`GET /api/status` の `rollback_to`）は、0.1.0 が書いた古い行から決まります（[管理リファレンス](admin-reference.md) の「切り替えの履歴」）。
+For the backup in the example in "Backup Before an Update" above, steps 2 and 3 are as follows.
+
+```bash
+sudo mv /etc/tukuyomi-core/config.json /etc/tukuyomi-core/config.json.after-update
+sudo mv /var/lib/tukuyomi-core/store /var/lib/tukuyomi-core/store.after-update
+sudo mv /var/lib/tukuyomi-core/managed /var/lib/tukuyomi-core/managed.after-update
+sudo mv /var/lib/tukuyomi-core/admin /var/lib/tukuyomi-core/admin.after-update
+sudo tar -C / -xpf /var/backups/tukuyomi-core/before-update.tar
+```
+
+- What you changed after the update is lost: the generations you imported or chose, the managed configuration versions and applies, the users, API tokens, and sessions you made, and the audit log lines in the admin store. The audit log lines were also written to standard error (the journal).
+- The log directory is not restored. Logs written after the update remain.
+- The ACME site certificates in `acme/` in the managed store go back to those at the time of the backup. The next `acme renew` renews them depending on how much validity they have left (see "ACME" above).

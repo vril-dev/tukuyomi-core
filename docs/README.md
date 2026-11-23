@@ -1,100 +1,104 @@
-# ドキュメントの索引
+[English](README.md) | [日本語](README.ja.md)
 
-tukuyomi-core のドキュメントの一覧です。tukuyomi-core は、tukuyomi（tukuyomi WAF）から派生し、WAF の機能に特化した製品を目指しています。
+# Documentation Index
 
-現在実装している主な機能は、WAF によるリクエストの検査、HTTP／HTTPS の受信と転送、IP アドレスと国によるアクセス制御とレート制限、管理プロセス（管理 API と管理画面）、managed 設定、ログ送信プロセスです。ソースは次のディレクトリにあります。
+This page lists the tukuyomi-core documentation. tukuyomi-core is derived from tukuyomi (the tukuyomi WAF) and aims to be a product focused on the WAF.
 
-- [`kernel/`](../kernel/): 検査プロセスの起動と監視、検査の受け渡しを担う Rust のライブラリ
-- [`inspector/`](../inspector/): Coraza を使う Go の検査プロセス
-- [`inspector-modsecurity/`](../inspector-modsecurity/): ModSecurity v3 を使う検査プロセス
-- [`proxy/`](../proxy/): プロキシ（管理プロセスと、管理画面の [`proxy/admin-ui/`](../proxy/admin-ui/) を含む）
-- [`records-ship/`](../records-ship/): ログ送信プロセス
+The main features implemented so far are request inspection by the WAF, receiving and forwarding HTTP/HTTPS, access control and rate limits by IP address and country, the admin process (admin API and admin screens), the managed configuration, and the records shipper. The source is in the following directories:
 
-0.1.0 から、Linux x86_64 用の 4 つの実行ファイルを 1 つの tarball にまとめ、GitHub のリリースで配布しています（[ビルドと配置](build/binary-deployment.md) の「リリースの tarball」）。
+- [`kernel/`](../kernel/): a Rust library that starts and monitors the inspector processes and passes requests to them for inspection
+- [`inspector/`](../inspector/): the inspector process written in Go, which uses Coraza
+- [`inspector-modsecurity/`](../inspector-modsecurity/): the inspector process that uses ModSecurity v3
+- [`proxy/`](../proxy/): the proxy (including the admin process and the admin screens in [`proxy/admin-ui/`](../proxy/admin-ui/))
+- [`records-ship/`](../records-ship/): the records shipper
 
-`build/` と `operations/` の文書は、現在の実装の使い方を説明します。`detailed-design/` の文書は初期草案で、目標、前提、候補、未決事項を記録しています。実装済みの範囲は、[システム概要](detailed-design/00_overview/system-overview.md) の「現在の状態」を参照してください。
+Since 0.1.0, the four executables for Linux x86_64 have been bundled into one tarball and distributed through GitHub releases (see "Release Tarball" in the [build and deployment guide](build/binary-deployment.md)).
 
-## 文書の一覧
+The documents in `build/` and `operations/` explain how to use the current implementation. The documents in `detailed-design/` are initial drafts that record goals, assumptions, candidates, and open points. For what is implemented, see "Current Status" in the [system overview](detailed-design/00_overview/system-overview.md).
 
-| 文書 | 内容 |
+## Documents
+
+| Document | Content |
 |---|---|
-| [システム概要](detailed-design/00_overview/system-overview.md) | 製品の目的、現在の状態（実装済みの範囲と未実装の機能）、前提・候補・未決定の区別、検討の対象とする範囲、用語 |
-| [アーキテクチャ概要](detailed-design/00_overview/architecture.md) | 構成の候補、権限と資源の境界、障害の影響範囲、リクエスト処理の流れの例、設計上の義務、状態と操作の組み合わせ、採用の判断に必要な検証の候補 |
-| [設計方針・制約](detailed-design/00_overview/design-principles.md) | 設計原則とその適用、検査モードと技術的な障害の区別、fail-closed の適用範囲、ログと管理機能の扱い、移植と前例の扱い、依存・ルール・設定のバージョン、コードの構成 |
-| [ビルドと配置](build/binary-deployment.md) | 構成要素、必要な環境、リリースの tarball、ソースからのビルド、CRS の取得、OS ユーザーとディレクトリ、国のデータベース、初回起動の手順、systemd のユニットファイルの例（管理プロセス、ログ送信プロセス、証明書の更新のタイマーを含む）、Landlock などによる検査プロセスの権限の制限、起動前の検証 |
-| [運用リファレンス](operations/operator-reference.md) | コマンド、シグナル、停止、設定ファイルの設定キーと値の関係、リクエストボディの上限と検査する大きさ、ルールセットと世代（検査エンジンの選択、エンジンごとの選択中の世代）、managed 設定（使うかどうかの判断、managed ストアとバージョン、初回起動、設定ファイルからの移行、反映）、リクエストの処理、IP アドレスと国によるアクセス制御とレート制限（全体とホストごと）、ログの行とログファイル、ログ送信プロセス（PostgreSQL・MySQL）、監視、ACME、バージョンの更新 |
-| [管理リファレンス](operations/admin-reference.md) | 管理プロセスのコマンドとリスナー、設定キー `admin`、外部からの利用（managed 設定を使う場合の管理画面のルートを含む）、ユーザーとロール、ログインと二要素認証、ロックアウトと試行回数の制限、セッション、CSRF 対策と Origin の確認、API トークン、監査ログ、世代の操作、managed 設定の操作、切り替えの履歴、設定の変更履歴、ログの読み出し、管理画面、API のパスの一覧とレスポンスの形式 |
+| [System Overview](detailed-design/00_overview/system-overview.md) | The purpose of the product, the current status (the implemented scope and the features not implemented), the distinction between assumptions, candidates, and open points, the scope under study, and terms |
+| [Architecture Overview](detailed-design/00_overview/architecture.md) | The candidate structure, privilege and resource boundaries, failure scope, an example of the request flow, design obligations, combinations of states and operations, and the candidate checks needed for the decision |
+| [Design Principles and Constraints](detailed-design/00_overview/design-principles.md) | The design principles and how they apply, the distinction between inspection modes and technical failures, where fail-closed applies, how logs and management functions are handled, how porting and precedents are handled, versions of dependencies, rules, and configuration, and code structure |
+| [Build and Deployment](build/binary-deployment.md) | Components, requirements, the release tarball, building from source, fetching the CRS, the OS user and directories, the country database, the first start, example systemd unit files (including the admin process, the records shipper, and the certificate renewal timer), restricting the inspector processes with Landlock and other mechanisms, and checks before start |
+| [Operator Reference](operations/operator-reference.md) | Commands, signals, stopping, the setting keys of the configuration file and the relations between values, request body limits and the inspected length, rule sets and generations (choosing the inspection engine, the chosen generation per engine), the managed configuration (deciding whether to use it, the managed store and versions, the first start, moving from a configuration file, applying), request handling, access control and rate limits by IP address and country (global and per host), log lines and log files, the records shipper (PostgreSQL and MySQL), monitoring, ACME, and version updates |
+| [Admin Reference](operations/admin-reference.md) | The commands and listener of the admin process, the setting key `admin`, access from outside (including the admin route when the managed configuration is used), users and roles, login and two-factor authentication, lockout and attempt limits, sessions, CSRF protection and Origin checks, API tokens, the audit log, generation operations, managed configuration operations, the switch history, the configuration history, reading logs, the admin screens, and the list of API paths and the response format |
 
-未決事項は、設計文書の末尾の表にまとめ、文書をまたいで重複しない ID を付けています（システム概要は OV-、アーキテクチャ概要は AR-、設計方針・制約は DP-）。
+Open points are listed in a table at the end of each design document. Their IDs are unique across documents (OV- for the system overview, AR- for the architecture overview, DP- for the design principles and constraints).
 
-## 文書の構成（予定）
+Each document is available in English (`.md`) and Japanese (`.ja.md`).
 
-次のツリーは、予定している文書の構成です。作成済みの文書は上の表の 6 つだけで、ツリーのほかのファイルとディレクトリ（`detailed-design/README.md` を含む）は、まだ作成していません。内容を書く時点で作成します。
+## Planned Structure
+
+The following tree shows the planned structure of the documents. The only documents written so far are the six in the table above. The other files and directories in the tree (including `detailed-design/README.md`) do not exist yet and will be created when their content is written.
 
 ```text
 docs/
-├── build/                              # ビルドと配置
-│   └── binary-deployment.md            # ビルドと配置
+├── build/                              # Build and Deployment
+│   └── binary-deployment.md            # Build and Deployment
 │
-├── operations/                         # 運用
-│   ├── operator-reference.md           # 運用リファレンス
-│   └── admin-reference.md              # 管理リファレンス
+├── operations/                         # Operations
+│   ├── operator-reference.md           # Operator Reference
+│   └── admin-reference.md              # Admin Reference
 │
-└── detailed-design/                    # 詳細設計
-    ├── 00_overview/                    # 概要・全体方針
-    │   ├── system-overview.md          # システム概要
-    │   ├── architecture.md             # アーキテクチャ概要
-    │   └── design-principles.md        # 設計方針・制約
+└── detailed-design/                    # Detailed Design
+    ├── 00_overview/                    # Overview and General Policy
+    │   ├── system-overview.md          # System Overview
+    │   ├── architecture.md             # Architecture Overview
+    │   └── design-principles.md        # Design Principles and Constraints
     │
-    ├── 01_requirements/                # 要件とのトレーサビリティ
-    │   ├── functional-requirements.md  # 機能要件との対応
-    │   └── non-functional.md           # 非機能要件との対応
+    ├── 01_requirements/                # Traceability to Requirements
+    │   ├── functional-requirements.md  # Mapping to Functional Requirements
+    │   └── non-functional.md           # Mapping to Non-Functional Requirements
     │
-    ├── 02_architecture/                # アーキテクチャ設計
-    │   ├── high-level.md               # 全体構成
-    │   ├── component-diagram.md        # コンポーネント図
-    │   ├── sequence-diagrams/          # シーケンス図
-    │   ├── data-flow.md                # データフロー
-    │   └── deployment.md               # デプロイメント構成
+    ├── 02_architecture/                # Architecture Design
+    │   ├── high-level.md               # Overall Structure
+    │   ├── component-diagram.md        # Component Diagram
+    │   ├── sequence-diagrams/          # Sequence Diagrams
+    │   ├── data-flow.md                # Data Flow
+    │   └── deployment.md               # Deployment Structure
     │
-    ├── 03_modules/                     # モジュール／コンポーネント詳細
+    ├── 03_modules/                     # Module and Component Details
     │
-    ├── 04_data/                        # データ設計
-    │   ├── er-diagram.md               # ER 図
-    │   ├── table-definitions.md        # テーブル定義
-    │   ├── data-dictionary.md          # データ辞書
-    │   └── file-formats.md             # ファイル／外部データ形式
+    ├── 04_data/                        # Data Design
+    │   ├── er-diagram.md               # ER Diagram
+    │   ├── table-definitions.md        # Table Definitions
+    │   ├── data-dictionary.md          # Data Dictionary
+    │   └── file-formats.md             # File and External Data Formats
     │
-    ├── 05_api/                         # API 設計
-    │   ├── rest-api.md                 # REST API 仕様
-    │   ├── internal-api.md             # 内部 API
-    │   └── message-formats.md          # メッセージ／イベント形式
+    ├── 05_api/                         # API Design
+    │   ├── rest-api.md                 # REST API Specification
+    │   ├── internal-api.md             # Internal API
+    │   └── message-formats.md          # Message and Event Formats
     │
-    ├── 06_ui/                          # UI 設計（必要な場合）
-    │   ├── screen-list.md              # 画面一覧
-    │   ├── screen-transitions.md       # 画面遷移
-    │   └── components.md               # UI コンポーネント
+    ├── 06_ui/                          # UI Design (If Needed)
+    │   ├── screen-list.md              # Screen List
+    │   ├── screen-transitions.md       # Screen Transitions
+    │   └── components.md               # UI Components
     │
-    ├── 07_security/                    # セキュリティ設計
+    ├── 07_security/                    # Security Design
     │   ├── authentication.md
     │   ├── authorization.md
     │   └── data-protection.md
     │
-    ├── 08_error-handling/              # エラー処理・例外設計
+    ├── 08_error-handling/              # Error Handling and Exception Design
     │   └── error-codes.md
     │
-    ├── 09_performance/                 # 性能・スケーラビリティ
+    ├── 09_performance/                 # Performance and Scalability
     │   └── performance-design.md
     │
-    ├── 10_ops/                         # 運用・監視設計
+    ├── 10_ops/                         # Operations and Monitoring Design
     │   ├── logging.md
     │   ├── monitoring.md
     │   └── backup-recovery.md
     │
-    ├── appendices/                     # 付録
-    │   ├── glossary.md                 # 用語集
-    │   ├── references.md               # 参考資料
-    │   └── change-history.md           # 変更履歴
+    ├── appendices/                     # Appendices
+    │   ├── glossary.md                 # Glossary
+    │   ├── references.md               # References
+    │   └── change-history.md           # Change History
     │
-    └── README.md                       # このディレクトリの説明と読み方
+    └── README.md                       # Description and Reading Guide for This Directory
 ```

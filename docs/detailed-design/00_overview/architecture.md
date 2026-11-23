@@ -1,362 +1,364 @@
-# アーキテクチャ概要
+[English](architecture.md) | [日本語](architecture.ja.md)
 
-> **状態: 初期草案**
+# Architecture Overview
+
+> **Status: initial draft**
 >
-> この文書は全体構成の候補を示します。実装済みの範囲は [システム概要](system-overview.md) の「現在の状態」を参照してください。
-> 図の要素は論理的な責務を表します。OS 上の配置、通信方式、ライブラリ、データベース、ポート、バージョンを決めるものではありません。
+> This document describes candidates for the overall structure. For the implemented scope, see "Current Status" in the [system overview](system-overview.md).
+> The elements in the diagrams represent logical responsibilities. They do not settle the placement on the OS, the communication method, the libraries, the database, the ports, or the versions.
 
-## この文書の範囲
+## Scope of This Document
 
-この文書では、検査エンジンとの接続方式の候補、責務の分担、障害の影響範囲、リクエスト処理の流れの例、方式を問わず決める必要がある設計上の義務、状態 × 操作の表、採用の判断に必要な検証の候補を示します。
+This document covers the candidate ways to connect to the inspection engine, the division of responsibilities, the failure scope, an example request flow, the design obligations that must be decided whichever approach is chosen, the States × Operations tables, and the candidate checks needed before deciding on adoption.
 
-前提と用語は [システム概要](system-overview.md)、原則と検査モードの扱いは [設計方針・制約](design-principles.md) を参照してください。
+The assumptions and terms are in the [system overview](system-overview.md), and the principles and the handling of inspection modes are in [design principles and constraints](design-principles.md).
 
-## 構成の候補
+## Candidate Structure
 
-### 第一候補: Rust のプロキシと Go の検査プロセス
+### First Candidate: a Rust Proxy and a Go Inspector
 
-Rust のプロキシが HTTP の受信・解釈・転送、設定、ログの保存を担い、Coraza による検査を専用の小さな Go のプロセスに任せる案です。
+In this proposal, the Rust proxy handles receiving, interpreting, and forwarding HTTP, the configuration, and storing logs, and leaves inspection with Coraza to a small dedicated Go process.
 
-- 検査プロセスは Coraza の Go API を直接使い、libcoraza を挟まない案です。
-- 検査プロセスには、管理 API、設定・ルールの保存先への接続、アップストリームへの転送、クライアントとの直接の通信を持たせない案です。
-- この案を第一候補にする理由は、検査プロセスの異常終了に Rust のプロキシが巻き込まれることを避けられる可能性と、検査側の権限と資源を別に制限できる可能性があるためです。通信が途切れないことを保証するものではありません（「障害の影響範囲」を参照）。
-- 代わりに、プロセス間通信、スーパーバイザーによる起動・停止・再起動の管理、準備完了の伝達、資源の回収の責務が増えます（「共通の責務と、方式ごとに増える責務」を参照）。
-- プロセスを分けるだけでは権限分離になりません（「権限と資源の境界」を参照）。全体としての採用は検証の後に判断します（AR-01。検査カーネルの初期実装に限った採用は [システム概要](system-overview.md) の「現在の状態」）。
+- The proposal is for the inspector process to use the Coraza Go API directly, without libcoraza in between.
+- The proposal is to give the inspector process no admin API, no connection to the store for settings and rules, no forwarding to upstreams, and no direct communication with clients.
+- This proposal is the first candidate because the Rust proxy may avoid being brought down when the inspector process exits abnormally, and because it may be possible to restrict the privileges and resources of the inspection side separately. It does not guarantee that communication is never interrupted (see "Failure Scope").
+- In exchange, it adds responsibilities: inter-process communication, managing start, stop, and restart by the supervisor, conveying readiness, and reclaiming resources (see "Shared Responsibilities and Those Each Approach Adds").
+- Separate processes alone do not give privilege separation (see "Privilege and Resource Boundaries"). Whether to adopt this structure as a whole is decided after verification (AR-01; for its limited adoption in the initial implementation of the inspection kernel, see "Current Status" in the [system overview](system-overview.md)).
 
 ```mermaid
 flowchart LR
-    client["クライアント"]
-    upstream["アップストリームのアプリケーション"]
-    operator["運用者"]
-    subgraph candidate ["tukuyomi-core の候補構成"]
-        rust["Rust のプロキシ<br/>HTTP の受信・解釈・転送<br/>検査要否の判定・ログの保存"]
-        inspector["Go の検査プロセス<br/>Coraza によるルールの構築と検査"]
+    client["Client"]
+    upstream["Upstream application"]
+    operator["Operator"]
+    subgraph candidate ["Candidate structure of tukuyomi-core"]
+        rust["Rust proxy<br/>Receiving, interpreting, and forwarding HTTP<br/>Deciding whether inspection is needed, storing logs"]
+        inspector["Go inspector process<br/>Building rules and inspecting with Coraza"]
     end
-    subgraph undecided ["配置と方式が未決定の要素"]
-        store[("設定・ルール・ログの保存先<br/>OV-07")]
-        mgmt["管理機能・管理 UI<br/>OV-03、AR-05"]
+    subgraph undecided ["Elements whose placement and method are undecided"]
+        store[("Store of settings, rules, and logs<br/>OV-07")]
+        mgmt["Management functions and admin UI<br/>OV-03, AR-05"]
     end
-    client -->|"HTTP のリクエスト"| rust
-    rust -->|"許可されたリクエストの転送"| upstream
-    upstream -->|"応答"| rust
-    rust -->|"応答"| client
-    rust -->|"検査の依頼<br/>通信方式は AR-02<br/>ルールの受け渡し方は AR-11"| inspector
-    inspector -->|"判定とログ用の情報"| rust
+    client -->|"HTTP request"| rust
+    rust -->|"Forwarding of allowed requests"| upstream
+    upstream -->|"Response"| rust
+    rust -->|"Response"| client
+    rust -->|"Inspection request<br/>Communication method: AR-02<br/>How rules are passed: AR-11"| inspector
+    inspector -->|"Decision and information for logs"| rust
     rust -.-> store
     operator -.-> mgmt
     mgmt -.-> store
 ```
 
-実線は候補構成での主な流れを、点線は配置や方式が未決定の関係を表します。
+Solid lines show the main flows in the candidate structure, and dotted lines show relations whose placement or method is undecided.
 
-### 責務の分担（候補）
+### Division of Responsibilities (Candidate)
 
-| 担当 | 担う責務（案） | 持たせない責務（案） |
+| Owner | Responsibilities (proposal) | Responsibilities not given (proposal) |
 |---|---|---|
-| Rust のプロキシ | 接続の受け付け、TLS（終端を行うかは OV-06）、HTTP の解釈とフレーミングの検証、検査要否の判定、検査に渡す表現の作成、判定とログ用の情報の検証、判定の適用、アップストリームへの転送、設定の管理、ログの保存（検査ログをどちらが書くかは DP-10）、検査プロセスとの通信の管理 | Coraza のルールの評価 |
-| Go の検査プロセス | ルールの構築と世代の保持、トランザクションの生成からロギングフェーズ（phase 5）と Close まで、判定とログ用の情報の返却 | 管理 API、設定・ルールの保存先への接続（ルールの受け渡し方は AR-11）、アップストリームへの転送、クライアントとの直接の通信 |
-| スーパーバイザー（起動・停止・再起動） | どのプロセスが担うかは未決定です（AR-03） | — |
-| 管理機能・管理 UI | 範囲と配置は未決定です（OV-03、AR-05） | — |
+| Rust proxy | Accepting connections, TLS (whether to terminate TLS is covered by OV-06), interpreting HTTP and validating framing, deciding whether inspection is needed, building the form passed to inspection, validating the decision and the information for logs, applying the decision, forwarding to the upstream, managing the configuration, storing logs (which side writes inspection logs is covered by DP-10), and managing communication with the inspector process | Evaluating Coraza rules |
+| Go inspector process | Building rules and holding generations; transactions, from creation to the logging phase (phase 5) and Close; and returning the decision and the information for logs | The admin API, a connection to the store for settings and rules (how rules are passed is covered by AR-11), forwarding to the upstream, and direct communication with clients |
+| Supervisor (start, stop, restart) | Which process is responsible is undecided (AR-03) | — |
+| Management functions and admin UI | The scope and placement are undecided (OV-03, AR-05) | — |
 
-### 比較対象: Rust のプロキシから libcoraza を呼ぶ構成
+### Compared: Calling libcoraza from the Rust Proxy
 
-libcoraza（Coraza の C ライブラリ）を Rust のプロキシから呼び、同じプロセスで検査する案です。
+In this proposal, the Rust proxy calls libcoraza (Coraza's C library), and inspection runs in the same process.
 
-- 独自のプロセス間通信を持たずに検査できます。
-- C API の所有権・寿命・借用・コールバック・並行実行・初期化の失敗・エラーの変換を Rust 側へ安全につなぐ責務と、ネイティブライブラリのビルドと配布が必要です。この FFI の境界は、採用する API に即して、異常系を含めて受入確認します（「採用判断に必要な検証」）。Go のランタイムも同じプロセスに入ります。
-- 接続ライブラリのバージョンと、その中に含まれる Coraza のバージョンの両方を固定し、修正版との対応を確認する必要があります（DP-09）。
-- 検査処理で回復できない障害が起きると、Rust のプロキシを含むプロセス全体が止まる可能性があります。
-- 単一のプロセスが必須になった場合（OV-06）や、別プロセスの通信・運用の負担が許容できない場合は、この案を優先して再評価します。
+- Inspection needs no inter-process communication of its own.
+- It takes on the responsibility of bridging the ownership, lifetime, borrowing, callbacks, concurrent execution, initialization failures, and error conversion of the C API safely to the Rust side, and it requires building and distributing the native library. This FFI boundary is checked for acceptance against the API to be adopted, including failure cases (see "Checks Needed for the Decision (Candidates)"). The Go runtime is also loaded into the same process.
+- Both the version of the connection library and the version of Coraza included in it must be pinned, and they must be checked against the patched versions (DP-09).
+- An unrecoverable failure during inspection may stop the whole process, including the Rust proxy.
+- If a single process becomes mandatory (OV-06), or if the communication and operational burden of a separate process is unacceptable, this proposal is the first to be re-evaluated.
 
-### 共通の責務と、方式ごとに増える責務
+### Shared Responsibilities and Those Each Approach Adds
 
-方式を比べるときは、HTTP の処理を Rust に置くこと自体から生じる責務と、方式ごとに増える責務を分けて数えます。共通の責務があるということは、両方式で実装の量や故障の種類が同じという意味ではありません。
+When comparing the approaches, count two kinds of responsibility separately: those that come from putting HTTP processing in Rust at all, and those that each approach adds. A shared responsibility does not mean the same amount of implementation or the same kinds of failure in both approaches.
 
-| 責務 | 両方式に共通 | 別プロセス案で増える | libcoraza 案で増える |
+| Responsibility | Shared by both approaches | Added by the separate-process proposal | Added by the libcoraza proposal |
 |---|---|---|---|
-| HTTP の解釈と転送 | フレーミング、正規化、ボディ・トレーラー、検査する表現と転送する表現の関係 | 検査に渡す表現のメッセージ化と、Rust のプロキシと検査プロセスの間の契約 | 検査に渡す表現を C API の型へ変換する処理 |
-| トランザクション | フェーズの順序、寿命、ロギングフェーズと Close、ルールの世代 | 切断、メッセージの欠落・重複・取り違え、両側の状態の不一致、再起動の前後での判定の混入 | C API をまたぐ所有権・寿命・借用、コールバック、エラーの変換 |
-| ボディと資源 | メモリ・ディスク・同時実行の上限、部分検査の意味 | ボディのコピー、通信の流量制御、待ち行列、取り残されたリクエストの回収 | OS の資源制限がプロセス単位になるため、検査側だけを制限しにくくなります |
-| 起動と更新 | WAF インスタンスの準備完了、ルールの構築・切り替え・旧世代の寿命 | 検査プロセスの準備完了の伝達、通信相手の確認、スーパーバイザーによる停止と再起動の管理 | ネイティブライブラリの読み込みと初期化の失敗 |
-| ルールと権限 | DNS への問い合わせ、外部コマンド、ファイル・監査ログへの書き込みなどに必要な権限 | 検査プロセスに与える OS の権限と、その配布・運用 | 検査に必要な権限を Rust のプロキシも持ちます |
-| ビルドと配布 | Rust と Go の両方のツールチェーン | 2 つの実行ファイル、その起動の順序、バージョンと通信の契約の組み合わせの整合（AR-13） | ネイティブライブラリのビルド、リンク、配布 |
+| HTTP interpretation and forwarding | Framing, normalization, bodies and trailers, and the relation between the inspected form and the forwarded form | Turning the form passed to inspection into messages, and the contract between the Rust proxy and the inspector process | Converting the form passed to inspection into C API types |
+| Transactions | The order of phases, lifetime, the logging phase and Close, and rule generations | Disconnection; lost, duplicated, or mixed-up messages; state mismatches between the two sides; and decisions mixed across a restart | Ownership, lifetime, and borrowing across the C API, callbacks, and error conversion |
+| Bodies and resources | Limits on memory, disk, and concurrency, and the meaning of partial inspection | Copying bodies, communication flow control, queues, and reclaiming stranded requests | OS resource limits apply per process, so it is harder to restrict the inspection side alone |
+| Start and update | Readiness of the WAF instance, building and switching rules, and the lifetime of old generations | Conveying the inspector process's readiness, verifying the communication peer, and managing stop and restart by the supervisor | Failures in loading and initializing the native library |
+| Rules and privileges | The privileges needed for DNS queries, external commands, writing to files and audit logs, and so on | The OS privileges given to the inspector process, and distributing and operating them | The Rust proxy also holds the privileges needed for inspection |
+| Build and distribution | Both the Rust and Go toolchains | Two executables, their start order, and keeping the combination of versions consistent with the communication contract (AR-13) | Building, linking, and distributing the native library |
 
-どちらが速い、簡単、安全とは、比較の前に決めません。プロセス間通信が自動的に速くなる、簡単になる、安全になるわけではありません。同じ検査範囲・同じ負荷で比べます（「採用判断に必要な検証」を参照）。
+Which approach is faster, simpler, or safer is not decided before the comparison. Using inter-process communication does not by itself make anything faster, simpler, or safer. Compare them with the same inspection scope and the same load (see "Checks Needed for the Decision (Candidates)").
 
-## 権限と資源の境界
+## Privilege and Resource Boundaries
 
-プロセスを分けるだけでは、権限分離になりません。別プロセス案を採る場合は、少なくとも次を組で決めます（AR-03、AR-04）。
+Separate processes alone do not give privilege separation. If the separate-process proposal is adopted, decide at least the following together (AR-03, AR-04).
 
-- 検査プロセスを実行する OS ユーザーと、アクセスできるファイル。ルールが別のファイルを参照する場合は、その範囲も含めます。
-- 外部との通信の可否。ルールの機能によっては DNS への問い合わせ、外部コマンドの実行、ファイルへの書き込みが必要になるため、使える機能と組にして決めます（DP-07）。
-- メモリ、CPU、ディスク、同時実行の上限と、その掛け方
-- 起動、停止、再起動をどのプロセスが行い、どの条件で再起動するか
-- ボディを一時的にディスクへ退避する場合の退避先、その権限・容量・回収（AR-09、AR-15）
+- The OS user that runs the inspector process, and the files it can access. If rules refer to other files, include those files too.
+- Whether external communication is allowed. Depending on the rule features, DNS queries, running external commands, and writing to files may be needed, so decide this together with which features can be used (DP-07).
+- The limits on memory, CPU, disk, and concurrency, and how they are applied
+- Which process starts, stops, and restarts it, and under what conditions it is restarted
+- If bodies are temporarily spilled to disk: where they go, and the permissions, capacity, and reclaiming of that location (AR-09, AR-15)
 
-OS 上の具体的な分離の方法とデプロイ構成は、対応する環境（OV-06）とともに決めます。
+The concrete OS isolation method and the deployment structure are decided together with the supported environments (OV-06).
 
-## 障害の影響範囲
+## Failure Scope
 
-別プロセス案で、検査プロセスが異常終了した場合、または強制終了した場合は次のとおりです（計画停止・ドレインは AR-17 で別に扱います）。
+In the separate-process proposal, if an inspector process exits abnormally or is killed, the effects are as follows (planned stops and draining are handled separately, in AR-17).
 
-- そのプロセスが処理中のすべてのトランザクションを失います。リクエストごとにキャンセルする仕組みではありません。
-- Rust のプロキシが動き続けても、通信が途切れないとは限りません。そのプロセスでは、再起動され（担当は AR-03）準備完了になるまで検査できません。代わりの検査プロセスがなければ、検査を必要とする通信（DP-02）は検査不能になり、拒否する案です（DP-03）。
-- 強制終了では、トランザクションのロギングフェーズと Close が実行されません。検査ログの完全な復旧と一時ファイルの削除は保証できません。Rust のプロキシに残る情報で、そのリクエストが未完了であることや、ログの記録に失敗したことを区別して記録する案です（DP-10）。回収できない検査ログを、正常に完了したものとして扱いません。資源の回収の方法は AR-15 を参照してください。
-- 資源の上限を明示しないと、検査プロセスの CPU・メモリ・ディスクの消費が、ほかの検査プロセスや Rust のプロキシを含むホストの資源に影響する可能性があります。
-- すでにアップストリームへ送ったデータや、クライアントへ送り始めた応答は取り戻せません。検査の完了前に送ってよい範囲は AR-08 で扱います。
+- All transactions that the process was handling are lost. This is not a way of cancelling individual requests.
+- Even if the Rust proxy keeps running, communication is not necessarily uninterrupted. That process cannot inspect until it has been restarted (who restarts it is covered by AR-03) and is ready. If no other inspector process can take its place, traffic that requires inspection (DP-02) becomes uninspectable, and the proposal is to refuse it (DP-03).
+- When the process is killed, the logging phase and Close are not run for its transactions, so complete recovery of inspection logs and deletion of temporary files cannot be guaranteed. The proposal is to use the information left in the Rust proxy to record, as separate cases, that the request was incomplete and that recording the log failed (DP-10). Inspection logs that cannot be recovered are not treated as completed normally. For how resources are reclaimed, see AR-15.
+- If resource limits are not made explicit, an inspector process's use of CPU, memory, and disk may affect other inspector processes and the host's resources, including the Rust proxy.
+- Data already sent to the upstream, and a response that has already started going to the client, cannot be taken back. How much may be sent before inspection completes is handled in AR-08.
 
-libcoraza 案では、同じ種類の障害が Rust のプロキシを含むプロセス全体に及ぶ可能性があります。
+In the libcoraza proposal, the same kind of failure may spread to the whole process, including the Rust proxy.
 
-どちらの案でも、障害の影響を小さくすることは、修正版の依存を使うことの代わりになりません（DP-09）。
+In either proposal, limiting the effect of failures is no substitute for using patched versions of dependencies (DP-09).
 
-## リクエスト処理の流れ（例）
+## Request Flow (Example)
 
-検査を必要とする通信で、リクエストボディをすべて受け取ってから、リクエストボディの判定を待つ場合の例です。転送の開始と検査の完了の関係は未決定です（AR-08）。明示的なバイパスのルートを残す場合（DP-01）、そのルートでは検査プロセスを呼ばない案です。
+The diagram shows an example for traffic that requires inspection: the Rust proxy receives the whole request body and then waits for the decision on it. The relation between the start of forwarding and the completion of inspection is undecided (AR-08). If routes with an explicit bypass are kept (DP-01), the proposal is not to call the inspector process for those routes.
 
 ```mermaid
 sequenceDiagram
-    participant C as クライアント
-    participant R as Rust のプロキシ
-    participant I as 検査プロセス
-    participant U as アップストリームのアプリケーション
-    C->>R: HTTP のリクエスト
-    R->>R: 解釈とフレーミングの検証、検査要否の判定
-    R->>I: トランザクションの開始（接続情報、URI、ヘッダー）
-    I-->>R: リクエストヘッダーまでの判定
-    alt ブロックの判定、または判定を得られない（検査不能）
-        R-->>C: 拒否の応答
-    else 継続
-        R->>I: リクエストボディ（上限の範囲内）
-        I-->>R: リクエストボディまでの判定
-        alt ブロックの判定、または判定を得られない（検査不能）
-            R-->>C: 拒否の応答
-        else 許可
-            R->>U: リクエストの転送
-            U-->>R: 応答
-            Note over R,I: 応答を検査するかは未決定（OV-04）
-            R-->>C: 応答
+    participant C as Client
+    participant R as Rust proxy
+    participant I as Inspector process
+    participant U as Upstream application
+    C->>R: HTTP request
+    R->>R: Interpretation and framing validation, decision whether inspection is needed
+    R->>I: Start of the transaction (connection information, URI, headers)
+    I-->>R: Decision up to the request headers
+    alt Block decision, or no decision obtained (uninspectable)
+        R-->>C: Refusal response
+    else Continue
+        R->>I: Request body (within the limit)
+        I-->>R: Decision up to the request body
+        alt Block decision, or no decision obtained (uninspectable)
+            R-->>C: Refusal response
+        else Allow
+            R->>U: Forwarding of the request
+            U-->>R: Response
+            Note over R,I: Whether to inspect responses is undecided (OV-04)
+            R-->>C: Response
         end
     end
-    R->>I: ロギングフェーズと Close
-    Note over R,I: 検査プロセスが応答しない、または停止した場合、この依頼は届かない（AR-15）
+    R->>I: Logging phase and Close
+    Note over R,I: If the inspector process does not respond or has stopped, this request does not arrive (AR-15)
 ```
 
-## 設計上の義務
+## Design Obligations
 
-次の項目は、方式を問わず決める必要があります。具体的な値や形式は未決定で、この文書では定めません。「案」と書いたものは採用前の案です。
+The following items must be decided whichever approach is chosen. Concrete values and formats are undecided and are not defined in this document. Anything written as a "proposal" is a proposal that has not been adopted.
 
-### HTTP の解釈とフレーミング（AR-06）
+### HTTP Parsing and Framing (AR-06)
 
-- 曖昧なフレーミング（Content-Length と Transfer-Encoding の併用、矛盾する重複ヘッダー、行の折り返しなど）を、拒否するか、規格が許す範囲で正規化するかを決めます。拒否を基本とする案です。
-- リクエストスマグリング（request smuggling）を防ぐため、受け付けたリクエストを転送時に組み立て直すかを決めます。
-- 早い段階で拒否するとき、読み残したボディが同じ接続の次のリクエストとして解釈されないようにします。`Expect: 100-continue` と接続の再利用の扱いを含めます。
-- HTTP/2 と HTTP/3 では、Cookie の分割、`:authority` と Host の関係などで、検査エンジンに渡す表現が HTTP/1.1 と変わり、ルールの結果が変わる可能性があります（OV-05）。
-- Upgrade（WebSocket など）の後の通信、双方向のストリーム、逐次送信する応答は、全体を受け取ってから評価する方式と両立しないことがあります。扱いを決めます（OV-05）。
-- トレーラーはボディの後に届きます。検査エンジンへ渡せるか、検査せずに転送してよいかを決めます（AR-07）。
-- 圧縮されたボディは、伸長しないままでは平文のボディを検査できる保証がありません。伸長する、拒否する、検査の範囲外と明記する、のどれにするか、どの符号化を対象にするかを決めます。伸長する場合は、伸長後のサイズだけでなく、伸長に使う CPU・メモリ・ディスク・時間の上限と、上限を超えたときや伸長に失敗したときの扱い（AR-09、AR-14）、検査した伸長後の表現と転送する元の表現の対応（AR-07）を決めます。
-- これらは libcoraza 案でも Rust のプロキシに必要になります。
+- Decide whether to refuse ambiguous framing (both Content-Length and Transfer-Encoding, contradictory duplicate headers, line folding, and so on) or to normalize it as far as the standards allow. The proposal is to refuse it by default.
+- Decide whether to rebuild a received request when forwarding it, to prevent request smuggling.
+- When refusing early, make sure that an unread body is not interpreted as the next request on the same connection. This includes the handling of `Expect: 100-continue` and connection reuse.
+- In HTTP/2 and HTTP/3, cookie splitting, the relation between `:authority` and Host, and so on make the form passed to the inspection engine differ from HTTP/1.1, so rule results may change (OV-05).
+- Traffic after an Upgrade (WebSocket and so on), bidirectional streams, and incrementally sent responses may not fit an approach that receives everything before evaluating it. Decide how to handle them (OV-05).
+- Trailers arrive after the body, so decide whether they can be passed to the inspection engine or may be forwarded without inspection (AR-07).
+- Without decompression, there is no guarantee that the plaintext of a compressed body can be inspected. Decide whether to decompress it, refuse it, or state explicitly that it is outside the inspection scope, and which encodings are covered. If decompressing, decide not only the size after decompression but also the limits on the CPU, memory, disk, and time used for decompression, the handling when a limit is exceeded or decompression fails (AR-09, AR-14), and how the inspected decompressed form corresponds to the original form that is forwarded (AR-07).
+- The Rust proxy needs these in the libcoraza proposal as well.
 
-### 検査する表現と転送する表現（AR-07）
+### Inspected and Forwarded Forms (AR-07)
 
-- 検査の後でパス、クエリ、Host、ヘッダーを書き換える場合、書き換えの前と後のどちらを、どのルールで検査するかを明文化します。
-- ボディを伸長して検査する場合や、解析して検査する場合は、検査した表現と転送する元の表現が同じ内容を表すことを、どう保つかを決めます（AR-06、AR-09）。
-- バイパスやルートの判定、検査、転送の間で、デコードと正規化を何回、どの順で行うかをそろえます。判定と転送で解釈が違うと、判定をすり抜ける余地になります。
-- 検査の要否やルートを判定できないリクエスト（URI や Host を解釈できない、正規化の結果が食い違うなど）を、バイパスとして扱いません。扱いは DP-03 で決めます。
-- 意図したルーティングの書き換えもあるため、「すべての表現を同一にする」だけでは仕様になりません。
+- If the path, query, Host, or headers are rewritten after inspection, state explicitly which rules inspect the form before the rewrite and which inspect the form after it.
+- When a body is decompressed or parsed before inspection, decide how to make sure that the inspected form and the original form that is forwarded represent the same content (AR-06, AR-09).
+- Make decoding and normalization run the same number of times, in the same order, in the bypass and route decision, in inspection, and in forwarding. If the decision and forwarding interpret a request differently, requests may slip past the decision.
+- A request whose need for inspection or whose route cannot be determined (the URI or Host cannot be interpreted, normalization results disagree, and so on) is not treated as a bypass. How it is handled is covered by DP-03.
+- Some rewriting for routing is intentional, so "make all forms identical" is not enough as a specification.
 
-### ボディの解析・上限と部分検査（AR-09）
+### Body Parsing, Limits and Partial Inspection (AR-09)
 
-- ボディを検査エンジンへ渡しただけでは、ボディの中の引数などが解析・検査されたとは言えません。採用する範囲の Content-Type ごとのボディプロセッサー（ボディの解析方法）の選択、リクエストと応答（応答を検査する場合、OV-04）のそれぞれで何を検査対象にするか、未知・未対応・不正な Content-Type のボディの扱いを、仕様と受入条件にします。採用する形式と値は未決定です。
-- 検査するボディ全体の上限と、メモリに置く上限（超えた分をディスクへ退避する境界）を分けて決めます。退避先を指定できるかは、採用するバージョンで確認します。
-- 上限を超えた残りを未検査のまま流す部分検査は、検査を必要とする通信の fail-closed と両立しません。部分検査を許す範囲を決めます。
-- 引数の数などの上限によって、検査エンジンが入力の一部を検査せずに捨てることがあります。上限に達したことを検知して拒否する設定とルールを、ブロックするモードの受入条件にします。
-- ボディの解析エラー、URI の解析エラー、multipart の厳格な検証の失敗をどう扱うかを、エンジン・設定・ルールの組で確認します。
-- 検査エンジンの推奨設定は参考にしますが、そのまま製品の仕様にはしません。推奨設定の初期値には、ブロックしない動作や部分検査が含まれる可能性があります。
-- 同時実行と待ち行列の上限、満杯のときの応答（AR-16）を決めます。
-- WAF インスタンスの上限（検査エンジンへ渡すボディや引数など）と、Rust のプロキシが受信・転送するときの上限（接続、ヘッダー、ボディ、同時実行、待ち行列、タイムアウト）を分けて決めます。On、DetectionOnly、Off、明示的なバイパスのどれを採っても、Rust のプロキシが受信・転送するときには資源と時間の境界を持たせる案です。値と超過時の扱いは未決定です。
-- 検査プロセスへ割り当て済みのトランザクションと、割り当て前の待ち行列にいるリクエストを区別します。待機中の資源（保持しているボディ、接続）と同時実行の枠の所有者、割り当てのときの引き渡しを決めます。切断やタイムアウトで取り消したリクエストを、あとから割り当てません（「割り当て前の待機中のリクエスト」の表）。
+- Passing a body to the inspection engine does not by itself mean that the arguments and so on in it were parsed and inspected. Make the following part of the specification and the acceptance conditions: which body processor (the way the body is parsed) is selected for each Content-Type in the adopted scope, what is inspected in requests and in responses (when responses are inspected, OV-04), and how bodies with an unknown, unsupported, or invalid Content-Type are handled. The formats and values to adopt are undecided.
+- Decide the limit on the whole inspected body and the limit on what is held in memory (beyond which the excess spills to disk) separately. Whether the spill destination can be specified is checked against the version to be adopted.
+- Partial inspection, which lets the part beyond the limit through uninspected, is not compatible with fail-closed for traffic that requires inspection, so decide where partial inspection is allowed.
+- Limits such as the number of arguments may make the inspection engine drop part of the input without inspecting it. For blocking mode, make it an acceptance condition that settings and rules detect when a limit is reached and refuse the request.
+- Check how body parsing errors, URI parsing errors, and strict multipart validation failures are handled for each combination of engine, settings, and rules.
+- The inspection engine's recommended settings are used as a reference, not adopted as the product specification as they stand. Their initial values may include non-blocking behavior and partial inspection.
+- Decide the limits on concurrency and queues, and the response when they are full (AR-16).
+- Decide the limits of the WAF instance (such as the body and arguments passed to the inspection engine) separately from the limits when the Rust proxy receives and forwards (connections, headers, bodies, concurrency, queues, timeouts). Whichever of On, DetectionOnly, Off, and explicit bypass is adopted, the proposal is that the Rust proxy should have bounds on resources and time when it receives and forwards. The values, and the handling when they are exceeded, are undecided.
+- Distinguish a transaction already assigned to an inspector process from a request still waiting in the queue. Decide who owns the resources held while it waits (held bodies, connections) and the concurrency slot, and how they are handed over at assignment. A request cancelled by a disconnection or a timeout is not assigned afterwards (see the table "Requests Waiting for Assignment").
 
-### トランザクションのフェーズ・寿命・ログ・Close（AR-10）
+### Transaction Phases, Lifetime, Logging and Close (AR-10)
 
-- 採用した検査範囲とルートごとに、呼ぶフェーズとその順序を、Rust のプロキシと検査エンジン（別プロセス案では検査プロセス）の間の呼び出しの契約として定めます。契約に反する順序の違反、欠落、重複は、検査エンジンの警告だけに任せず、検査不能として扱う案です。
-- 早い段階のブロックの後に残りのフェーズを呼ばないこと、応答を検査しない場合（OV-04）に応答のフェーズを呼ばないこと、ルールのアクションによる意図した評価の打ち切り（その機能を採るかは DP-07）は、契約の中で区別し、不正な欠落と混同しません。
-- トランザクションをいつ始めるか（受け付けの時点か、検査プロセスへ割り当てる時点か）を決めます。待機中のリクエストの扱いは AR-09 を参照してください。
-- 接続情報（クライアントのアドレス、サーバー名など）を検査エンジンに渡します。何を渡すかと、その値の出どころ（DP-08）を決めます。
-- ブロックの判定は、ステータスだけでなく、アクションの種類（拒否、リダイレクト、切断など）と付随する情報を落とさずに Rust のプロキシへ返します。
-- ブロック、許可、検査不能、クライアントの切断、タイムアウト、アップストリームの障害のすべての場合に、ロギングフェーズと Close をどの要素がいつ行うかを決めます。Close しないと、ボディの一時ファイルやトランザクションの資源が残ります。
-- 検査ログ（監査ログ）を検査プロセスが直接書くか、ログ用の情報を Rust のプロキシへ返して Rust のプロキシが書くかは未決定です（DP-10、AR-04）。
-- 応答を検査する場合（OV-04）は、応答の判定までトランザクションを保持します。
+- For each adopted inspection scope and route, define which phases are called, and in what order, as a call contract between the Rust proxy and the inspection engine (the inspector process in the separate-process proposal). The proposal is to treat out-of-order, missing, and duplicate calls that break the contract as uninspectable, rather than relying only on the inspection engine's warnings.
+- In the contract, distinguish the following from an improper omission: not calling the remaining phases after an early block, not calling the response phases when responses are not inspected (OV-04), and a rule action that intentionally ends evaluation (whether to adopt that feature is covered by DP-07).
+- Decide when a transaction starts (when the request is accepted, or when it is assigned to the inspector process). For the handling of waiting requests, see AR-09.
+- Pass connection information (the client address, the server name, and so on) to the inspection engine. Decide what to pass and where the values come from (DP-08).
+- When returning a block decision to the Rust proxy, include not only the status but also the kind of action (deny, redirect, drop, and so on) and the information that comes with it.
+- Decide which element runs the logging phase and Close, and when, for every one of these cases: block, allow, uninspectable, client disconnection, timeout, and upstream failure. Without Close, temporary body files and transaction resources are left behind.
+- It is undecided whether the inspector process writes inspection logs (audit logs) directly, or returns the information for logs to the Rust proxy, which writes them (DP-10, AR-04).
+- When responses are inspected (OV-04), keep the transaction until the decision on the response.
 
-### ルールの世代の整合（AR-11）
+### Consistency of Rule Generations (AR-11)
 
-- 検査エンジンに、使用中のルールを差し替える機能があるとは前提にしません。新しい WAF インスタンスを構築してから参照を切り替える案です。この案ではルールの切り替えに検査プロセスの再起動は必要ありませんが、再起動で切り替える案と比べて決めます（AR-17）。
-- 1 つのトランザクションは、開始時の世代で最後まで検査します。新しい世代へ切り替える時点、旧い世代を解放する条件、更新の直列化を決めます。
-- 切り替える前に新しい世代の構築に失敗し、現行の WAF インスタンスが健全な場合は、現行の世代を使い続ける案です。失敗が記録されることと、失敗した構築の資源が回収されることを確認します。無効なルールを繰り返し検証したときの資源の上限も含めます。
-- 更新の途中で検査プロセスが異常終了した場合は、そのプロセスのトランザクションをすべて失います（「障害の影響範囲」）。切り替えは済んだが、結果の通知を失った場合や、タイムアウトした場合は、更新の失敗とも旧い世代の継続とも断定できません。実際に適用された世代を確認する方法、再試行、再起動の後の世代の整合を決めます（AR-13）。
-- 待ち行列にいるリクエストをどの世代で検査するか（受け付けの時点で固定するか、割り当ての時点で固定するか）を決めます。
-- 複数のルールセット（デフォルトとルートごとなど、残す場合）があるときは、それぞれの世代の整合と、選んだルールセットが使えないときの扱い（DP-04）を決めます。
-- ルールを検査プロセスへどう渡すか（Rust のプロキシから渡すか、検査プロセスが読み込むか）を、検査プロセスの権限（AR-04）とともに決めます。検査プロセスが読み込む場合は、保存先への接続を持たせない案との整合と、読めるファイルの範囲を決めます。
-- 別プロセス案では、どの世代で判定したかを Rust のプロキシが確認できるようにする案です。
+- Do not assume that the inspection engine can replace rules in use. The proposal is to build a new WAF instance and then switch the reference to it. This proposal needs no restart of the inspector process to switch rules, but compare it with the proposal to switch by restarting, and then decide (AR-17).
+- A transaction is inspected to the end with the generation in use when it started. Decide when to switch to a new generation, when the old generation can be released, and how updates are serialized.
+- If building the new generation fails before switching and the current WAF instance is healthy, the proposal is to keep using the current generation. Check that the failure is recorded and that the resources of the failed build are reclaimed. This includes the resource limit when invalid rules are validated repeatedly.
+- If the inspector process exits abnormally during an update, all of its transactions are lost (see "Failure Scope"). If the switch happened but the notification of the result was lost, or the update timed out, it is not possible to conclude either that the update failed or that the old generation is still in use. Decide how to confirm which generation was actually applied, how to retry, and how to keep generations consistent after a restart (AR-13).
+- Decide which generation is used to inspect requests in the queue (locked in when the request is accepted, or when it is assigned).
+- If multiple rule sets are kept (for example, a default and per-route ones), decide how the generations of each stay consistent and how to handle a chosen rule set that cannot be used (DP-04).
+- Decide how rules reach the inspector process (the Rust proxy passes them, or the inspector process reads them) together with its privileges (AR-04). If the inspector process reads them, decide how that fits with the proposal to give it no connection to the store, and which files it can read.
+- In the separate-process proposal, the proposal is that the Rust proxy should be able to confirm which generation a decision was made with.
 
-### 起動と準備完了（AR-12）
+### Start and Readiness (AR-12)
 
-- 別プロセスにすると、Rust のプロキシが受け付けを始めていても、検査プロセスのルールがまだ構築されていない時間が生まれる可能性があります。受け付けの開始と準備完了の関係を決めます。
-- 準備完了の伝え方と、再起動の後に準備完了を確認する方法を決めます。準備完了の通知にも起動ごとの識別子を含め、前の起動の通知と取り違えません（AR-13）。
-- 外部（ヘルスチェックや負荷分散など）から見た準備完了を、検査プロセスの状態とどう結び付けるかを決めます。
-- 初期のルールの構築に失敗したとき、起動を中止するか、検査を必要とする通信を拒否したまま待つかを決めます。
-- ルールの更新の失敗は AR-11 で扱います。
+- With a separate process, there may be a period when the Rust proxy has started accepting requests but the inspector process has not finished building its rules. Decide how the start of accepting relates to readiness.
+- Decide how readiness is conveyed and how to confirm readiness after a restart. Include a per-start identifier in the readiness notification too, so that it is not mistaken for a notification from a previous start (AR-13).
+- Decide how readiness as seen from outside (health checks, load balancing, and so on) is tied to the state of the inspector process.
+- If building the initial rules fails, decide whether to abort the start or to wait while refusing traffic that requires inspection.
+- Failures of rule updates are handled in AR-11.
 
-### プロセス間のメッセージ（AR-02、AR-13）
+### Messages Between Processes (AR-02, AR-13)
 
-- 攻撃者が送ったバイト列がメッセージに入る前提で設計します。メッセージの境界と長さを検証できる形式にし、種類ごとに上限を決め、上限を超えたら検査不能とする案です。
-- 内部のトランザクションの識別子は Rust のプロキシが採番する案です。クライアントが送ったリクエスト ID（`X-Request-ID` など）をそのまま使いません。外部の相関情報と内部の識別子を分けます。
-- 再起動の前後で判定が混ざらないよう、Rust のプロキシと検査プロセスのそれぞれの起動ごとの識別子をメッセージに含める案です。前の起動の識別子を持つ判定や、終了済み・取り消し済みのリクエストへの遅れた判定、重複した判定は捨て、それだけで現行のトランザクションを検査不能にはしない案です。
-- 相関できる個別のメッセージの異常（型・長さ・範囲の不正、そのトランザクションの順序違反）は、そのトランザクションだけを検査不能とする案です。共有する接続が切れた場合や、メッセージの境界が壊れて以降を信頼できない場合は、その接続で処理中のすべてのトランザクションが影響を受けます。
-- 準備完了と更新の結果の通知にも、起動ごとの識別子と更新の相関を含める案です（AR-11、AR-12）。
-- 検査プロセスから返る判定とログ用の情報も、Rust のプロキシで型・長さ・範囲を検証します（DP-10）。
-- 通信相手の確認方法は、双方向で決めます。検査プロセスも、意図しない接続元からの依頼を受け付けません。方法は通信方式とともに決めます。
-- 2 つの実行ファイルのバージョンの組み合わせと、通信の契約・能力が合わない場合に、それを検知して受け付けないか、適合する組み合わせとして配布するかなど、整合の取り方を決めます（OV-06、DP-09）。段階的な更新を採るか、必須にするかは決めていません。
-- 通信方式とメッセージ形式は未決定です（AR-02）。同一ホスト内の Unix ドメインソケットは候補の 1 つで、必須ではありません。
+- Design on the assumption that bytes sent by an attacker end up in messages. The proposal is to use a format whose boundaries and lengths can be validated, set a limit for each kind of message, and treat anything over the limit as uninspectable.
+- The proposal is that the Rust proxy should assign the internal transaction identifiers. A request ID sent by the client (`X-Request-ID` and so on) is not used as it is, and external correlation information is kept separate from the internal identifier.
+- The proposal is for messages to carry per-start identifiers of both the Rust proxy and the inspector process, so that decisions from before and after a restart do not mix. The proposal is to discard decisions that carry the identifier of a previous start, late decisions for requests that have ended or been cancelled, and duplicate decisions, without making the current transaction uninspectable for that reason alone.
+- For an anomaly in an individual message that can be correlated (an invalid type, length, or range, or an ordering violation in that transaction), the proposal is to make only that transaction uninspectable. If the shared connection is cut, or message boundaries are broken so that nothing after them can be trusted, all transactions in progress on that connection are affected.
+- The proposal is to include a per-start identifier and the update correlation in readiness notifications and update result notifications too (AR-11, AR-12).
+- The decisions and information for logs that the inspector process returns are also validated for type, length, and range in the Rust proxy (DP-10).
+- Decide how to verify the communication peer in both directions. The inspector process, too, rejects requests from an unexpected source. The method is decided together with the communication method.
+- Decide how to keep the versions of the two executables consistent with the communication contract and capabilities: for example, detect a combination that does not match and reject it, or distribute only combinations known to match (OV-06, DP-09). Whether to adopt staged updates, or to make them mandatory, is not decided.
+- The communication method and the message format are undecided (AR-02). A Unix domain socket on the same host is one candidate, not a requirement.
 
-### タイムアウトと実際のキャンセル（AR-14）
+### Timeouts and Actual Cancellation (AR-14)
 
-- タイムアウトの種類を分けて決めます。少なくとも、クライアントからの受信（遅い送信を含みます）、クライアントへの送信、使われていない接続の保持、待ち行列での待機、ボディの伸長、アップストリームへの接続と応答、検査の判定待ち、ドレインのタイムアウトがあります。値は未決定です。
-- Rust のプロキシがタイムアウトで待つのをやめても、検査プロセスの評価が止まるとは限りません。ルールの評価が途中で中断できる保証はありません。
-- リクエストごとのタイムアウトと、検査プロセスに実際に残る処理の量（同時実行の上限）を分けて決めます。同時実行の枠をいつ返すかを決めます。
-- タイムアウトした、検査を必要とする通信は、検査不能として拒否する案です。タイムアウトの後に届いた判定は捨てる案です（AR-13）。
-- 強制再起動は、リクエストごとのキャンセルの代わりになりません。同じプロセスのほかのトランザクションも失われます。応答しない検査プロセスを強制再起動する条件は AR-03 で決めます。
+- Decide each kind of timeout separately. There are at least these: receiving from the client (including slow sending), sending to the client, keeping idle connections open, waiting in the queue, decompressing bodies, connecting to and getting a response from the upstream, waiting for the inspection decision, and draining. The values are undecided.
+- Even if the Rust proxy stops waiting because of a timeout, the inspector process does not necessarily stop evaluating. There is no guarantee that rule evaluation can be interrupted partway through.
+- Decide the per-request timeout separately from the amount of work that actually remains in the inspector process (the concurrency limit), and decide when the concurrency slot is returned.
+- The proposal is to refuse traffic that requires inspection as uninspectable when it times out, and to discard decisions that arrive after the timeout (AR-13).
+- A forced restart is no substitute for cancelling individual requests, because the other transactions of the same process are lost too. The conditions for forcibly restarting an unresponsive inspector process are covered by AR-03.
 
-### 資源の回収（AR-15）
+### Reclaiming Resources (AR-15)
 
-- 通常の場合と、計画停止・ドレインのタイムアウトまでに終えたトランザクションでは、ロギングフェーズと Close によって資源を回収します。ドレインのタイムアウトを超えて止めたものは、異常終了と同じ扱いになる可能性があります（AR-17）。
-- 検査プロセスの強制終了では Close が実行されません。検査プロセスごとに専用の一時領域を持たせ、その起動の識別子と所有者を結び付け、所有者のプロセスが終了したことを確認してから回収する案です。生きているプロセスや別のトランザクションの資源を消しません。旧いプロセスがまだ生きている場合や、終了を確認できない場合の扱いは未決定です。
-- 回収できなかった検査ログの扱いは「障害の影響範囲」と DP-10 を参照してください。
-- Rust のプロキシが異常終了した場合は、通信相手を失ったことを検知した検査プロセスが、未完了のトランザクションを Close する案です。
-- Rust のプロキシの側でも、判定を待っている状態や同時実行の枠など、取り残された状態を回収します。
+- Normally, and for transactions that finish before the timeout during a planned stop or drain, the logging phase and Close reclaim the resources. Transactions stopped after the drain timeout may be handled the same way as an abnormal exit (AR-17).
+- Close is not run when an inspector process is killed. The proposal is to give each inspector process its own temporary area, tie it to the identifier of that start and to its owner, and reclaim it after confirming that the owner process has exited. Resources of a process that is still running, or of another transaction, are not deleted. What to do when the old process is still running, or its exit cannot be confirmed, is undecided.
+- For the handling of inspection logs that could not be reclaimed, see "Failure Scope" and DP-10.
+- If the Rust proxy exits abnormally, the proposal is that the inspector process should detect that it has lost its peer and close the incomplete transactions.
+- The Rust proxy also reclaims what is left stranded on its side, such as a pending wait for a decision or a concurrency slot.
 
-### 停止と設定のリロード（AR-17）
+### Stopping and Configuration Reload (AR-17)
 
-- 検査プロセスを計画して止める場合（検査プロセスの更新など。ルールの切り替えに再起動が必要かは AR-11）は、新しいトランザクションを割り当てず、進行中のものをタイムアウトまで待ってロギングフェーズと Close を行う案です。異常終了とは別に扱います。
-- Rust のプロキシが停止するときと設定をリロードするときの、進行中のリクエスト、待ち行列にいるリクエスト、検査プロセスへの通知、ログの扱いを決めます。検査の要否を判定した設定を、いつ固定して保持するか（受け付けの時点か、割り当ての時点か）を決めます。設定のリロードに失敗した場合は、現行の設定を使い続ける案です。
+- For a planned stop of an inspector process (to update it, and so on; whether switching rules needs a restart is covered by AR-11), the proposal is to assign it no new transactions, wait for those in progress up to the timeout, and then run the logging phase and Close. This is handled separately from an abnormal exit.
+- For when the Rust proxy stops and when it reloads the configuration, decide how to handle requests in progress, requests in the queue, notifying the inspector process, and logs. Also decide when the configuration used to decide whether inspection is needed is locked in and held (when the request is accepted, or when it is assigned). If a configuration reload fails, the proposal is to keep using the current configuration.
 
-### アップストリームの障害（AR-18）
+### Upstream Failures (AR-18)
 
-- アップストリームへの接続の失敗、タイムアウト、切断、不正な応答でも、トランザクションのロギングフェーズと Close を行います。
-- アップストリームの障害は、ブロックや検査不能とは別の理由として記録する案です。
-- クライアントへ返す応答は AR-16 で扱います。同じリクエストをアップストリームへ送り直すかは、検査の範囲とあわせて未決定です。
+- Run the transaction's logging phase and Close in these cases too: a failed connection to the upstream, a timeout, a disconnection, and an invalid response.
+- The proposal is to record an upstream failure as its own reason, separate from a block and from uninspectable.
+- The response returned to the client is handled in AR-16. Whether to resend the same request to the upstream is undecided, along with the inspection scope.
 
-## 状態 × 操作
+## States × Operations
 
-前提は、別プロセス案で、WAF インスタンスの動作が On の、検査を必要とする通信です。DetectionOnly、Off、明示的なバイパス、ルール選択の失敗の扱いは [設計方針・制約](design-principles.md) の表を参照してください。libcoraza 案では、検査プロセスの行は Rust のプロキシを含むプロセス全体の状態に置き換わります。
+The tables in this section assume the separate-process proposal and traffic that requires inspection, with the WAF instance in On mode. For DetectionOnly, Off, explicit bypass, and a failure of rule selection, see the table in [design principles and constraints](design-principles.md). In the libcoraza proposal, the inspector process rows are replaced by the state of the whole process, including the Rust proxy.
 
-表の読み方:
+How to read the tables:
 
-- 表のすべての記述は採用前の候補で、実装済みの挙動ではありません。検査カーネルの初期実装で実装済みの範囲は、この表とは別に、[システム概要](system-overview.md) の「現在の状態」を参照してください。
-- 「案」は特に代わりの案が考えられるもの、ID は未決定の詳細を指します。案も ID もない記述は、方式を問わず満たす必要がある性質（要件の候補）とします。
-- 「新規のリクエスト」はその状態の間に届くリクエスト、「進行中のトランザクション」は検査プロセスへ割り当て済みのものを指します。割り当て前に待ち行列にいるリクエストは「割り当て前の待機中のリクエスト」の表に分けます。
-- 「明示的なバイパスのリクエスト」の列は、バイパスを残す場合（DP-01）に限ります。
-- 「応答の返却」の列では、応答を送り始めた後はステータスを変えられず、打ち切るか途中で切るかしか残りません（AR-08）。
+- Every statement in the tables is a candidate that has not been adopted, not implemented behavior. What the initial implementation of the inspection kernel implements is described separately from these tables; see "Current Status" in the [system overview](system-overview.md).
+- "Proposal" marks the items where other options are especially plausible, and an ID points to a detail that is undecided. A statement with neither a proposal nor an ID is a property that must hold whichever approach is chosen (a candidate requirement).
+- "New requests" are requests that arrive during that state, and "transactions in progress" are those already assigned to an inspector process. Requests in the queue before assignment have their own table, "Requests Waiting for Assignment".
+- The column "Explicit bypass requests" applies only if bypass is kept (DP-01).
+- In the column "Returning the response", once the response has started, the status can no longer be changed, and the only options left are to abort it or cut it off partway through (AR-08).
 
-### 検査プロセスとプロセス間通信
+### Inspector Processes and Inter-Process Communication
 
-| 状態 | 検査を必要とする新規のリクエスト | 進行中のトランザクション | 明示的なバイパスのリクエスト（残す場合） | 応答の返却 | ルールの更新 |
+| State | New requests that require inspection | Transactions in progress | Explicit bypass requests (if kept) | Returning the response | Rule update |
 |---|---|---|---|---|---|
-| 起動中（準備完了の前） | 割り当てません。ほかに準備完了の検査プロセスがなければ、検査不能として拒否する案です。受け付けの開始との関係は AR-12 | なし | 検査プロセスの準備を待たずに通すかは DP-01、AR-12 | — | 初期のルールの構築に失敗したときの扱いは AR-12 |
-| 準備完了 | 開始時の世代で検査します。ブロックの判定と転送の開始の関係は AR-08 | 契約したフェーズを順に処理し、ロギングフェーズと Close まで責任を持ちます（AR-10） | 検査プロセスを呼ばない案です。検査しなかった理由を記録します（DP-01、DP-05） | 応答を検査するかは OV-04 | 検証して新しい世代を構築し、新規のトランザクションから切り替える案（AR-11） |
-| 計画停止・ドレイン | 停止するプロセスに割り当てません。代わりがなければ検査不能として拒否する案 | タイムアウトまで完了を待ち、ロギングフェーズと Close を行う案です。タイムアウトを超えた分は AR-17 | 影響を受けない案 | 送り始めた後は AR-08 | 停止中に更新を受け付けるかは AR-17 |
-| 異常終了・強制終了 | 再起動され（担当は AR-03）準備完了になるまで、そのプロセスでは検査できません。代わりがなければ検査不能として拒否する案です。返す応答は AR-16 | そのプロセスのトランザクションをすべて失います。未転送のリクエストは拒否する案です。転送済みのデータは取り戻せません。ロギングフェーズと Close は実行されず、未完了として記録する案（AR-15、DP-10） | 検査プロセスを使わないため直接の影響はない案です。ホストの資源への影響は別です（AR-04） | 応答を検査する場合、送り始める前なら止める案です。送り始めた後は AR-08 | 実行中の更新は結果を確認できません。再起動後に構築する世代は AR-11 |
-| 応答しない（停止はしていない状態） | 判定待ちがタイムアウトしたら検査不能として拒否する案です（AR-14）。新しいトランザクションを割り当て続けるかは AR-03 | 待つのをやめても、検査プロセスの処理は残る可能性があります。強制再起動の条件は AR-03、AR-14 | 影響を受けない案 | 送り始めた後は AR-08 | 更新のタイムアウトと、結果が不明なときの扱いは AR-11 |
-| 再起動中（準備完了の確認前） | 準備完了を確認するまで割り当てません。代わりがなければ拒否する案（AR-12） | 前の起動の識別子を持つ判定は捨てる案（AR-13） | 影響を受けない案 | — | 再起動時に構築する世代と、更新の再試行は AR-11 |
-| 相関できる個別のメッセージの異常（型・長さ・範囲の不正、そのトランザクションの順序違反） | 影響しません | そのトランザクションだけを検査不能とする案（AR-13） | — | 送り始めた後は AR-08 | 更新のメッセージの異常は、結果が不明な更新として扱う案（AR-11） |
-| 共有する接続の切断・メッセージの境界の破損・通信相手の確認の失敗 | 接続を作り直して準備完了を確認するまで割り当てません。代わりがなければ検査不能として拒否する案 | その接続で処理中のすべてのトランザクションを検査不能とする案（AR-02、AR-13） | — | 送り始めた後は AR-08 | 実行中の更新は結果が不明になります。適用された世代の確認は AR-11、AR-13 |
-| 古い判定（前の起動の識別子、終了済み・取り消し済みのリクエストへの遅れた判定、重複） | 影響しません | 捨てます。それだけで現行のトランザクションを検査不能にはしない案（AR-13） | — | — | 古い更新の結果の通知も捨てる案（AR-13） |
+| Starting (before ready) | Not assigned. If no other inspector process is ready, the proposal is to refuse the request as uninspectable. How this relates to the start of accepting is covered by AR-12 | None | Whether to let them through without waiting for the inspector process to be ready is covered by DP-01 and AR-12 | — | How a failure to build the initial rules is handled is covered by AR-12 |
+| Ready | Inspected with the generation in use when the transaction starts. How a block decision relates to the start of forwarding is covered by AR-08 | Processes the phases in the contract in order, and is responsible through the logging phase and Close (AR-10) | The proposal is not to call the inspector process. The reason inspection was skipped is recorded (DP-01, DP-05) | Whether to inspect responses is covered by OV-04 | The proposal is to validate and build a new generation, and to switch to it starting with new transactions (AR-11) |
+| Planned stop or drain | Not assigned to the process being stopped. If no other process can take over, the proposal is to refuse the request as uninspectable | The proposal is to wait for them to complete, up to the timeout, and to run the logging phase and Close. For those still running after the timeout, see AR-17 | The proposal is that they are not affected | After sending has started, see AR-08 | Whether to accept updates during the stop is covered by AR-17 |
+| Abnormal exit or forced exit | That process cannot inspect until it has been restarted (who restarts it is covered by AR-03) and is ready. If no other process can take over, the proposal is to refuse the request as uninspectable. The response to return is covered by AR-16 | All of that process's transactions are lost. The proposal is to refuse requests not yet forwarded. Data already forwarded cannot be taken back. The logging phase and Close are not run, and the proposal is to record the transactions as incomplete (AR-15, DP-10) | The proposal is that they see no direct effect, because the inspector process is not used. The effect on host resources is a separate matter (AR-04) | When responses are inspected, the proposal is to stop the response if sending has not started. After sending has started, see AR-08 | The result of an update in progress cannot be confirmed. Which generation to build after a restart is covered by AR-11 |
+| Not responding (not stopped) | If the wait for a decision times out, the proposal is to refuse the request as uninspectable (AR-14). Whether to keep assigning new transactions is covered by AR-03 | Even after the wait stops, work may remain in the inspector process. The condition for a forced restart is covered by AR-03 and AR-14 | The proposal is that they are not affected | After sending has started, see AR-08 | The update timeout, and the handling when the result is unknown, are covered by AR-11 |
+| Restarting (before readiness is confirmed) | Not assigned until readiness is confirmed. If no other process can take over, the proposal is to refuse the request (AR-12) | The proposal is to discard decisions that carry the identifier of a previous start (AR-13) | The proposal is that they are not affected | — | Which generation to build at restart, and how updates are retried, are covered by AR-11 |
+| Anomaly in an individual message that can be correlated (an invalid type, length, or range, or an ordering violation in that transaction) | No effect | The proposal is to make only that transaction uninspectable (AR-13) | — | After sending has started, see AR-08 | The proposal is to treat an anomaly in an update message as an update with an unknown result (AR-11) |
+| Shared connection cut, broken message boundaries, or failed peer verification | Not assigned until the connection is re-established and readiness is confirmed. If no other process can take over, the proposal is to refuse the request as uninspectable | The proposal is to make all transactions in progress on that connection uninspectable (AR-02, AR-13) | — | After sending has started, see AR-08 | The result of an update in progress becomes unknown. For how to confirm the applied generation, see AR-11 and AR-13 |
+| Stale decisions (an identifier of a previous start, late decisions for requests that have ended or been cancelled, duplicates) | No effect | Discarded. The proposal is not to make the current transaction uninspectable for that reason alone (AR-13) | — | — | The proposal is to discard the result notification of an old update too (AR-13) |
 
-### リクエスト・資源・アップストリーム・ログ
+### Requests, Resources, Upstreams and Logs
 
-| 状態 | 検査を必要とする新規のリクエスト | 進行中のトランザクション | 明示的なバイパスのリクエスト（残す場合） | 応答の返却 | ルールの更新 |
+| State | New requests that require inspection | Transactions in progress | Explicit bypass requests (if kept) | Returning the response | Rule update |
 |---|---|---|---|---|---|
-| タイムアウト（タイムアウトの種類は AR-14） | 検査不能として拒否する案 | 待つのをやめても、検査プロセスの評価は続く可能性があります。タイムアウトの後に届いた判定は捨てる案です（AR-13）。同時実行の枠を返す時点は AR-14 | 転送のタイムアウトは AR-14 | 送り始めた後は AR-08 | 更新のタイムアウトは AR-11 |
-| クライアントの切断（転送の開始前） | 転送しません。ロギングフェーズと Close を行います（AR-10） | 同じ | 転送しません | — | — |
-| クライアントの切断（転送の開始後） | — | アップストリームへの転送を打ち切るかは AR-08。ロギングフェーズと Close を行います（AR-10） | アップストリームへの転送を打ち切るかは AR-08 | 返却を打ち切り、資源を解放します（AR-10） | — |
-| ボディ・引数の上限超過 | 値と拒否の条件は AR-09。未検査の残りを転送する部分検査は、検査を必要とする通信の fail-closed と両立しません | 上限に達したトランザクションを検査不能とする案です。検査エンジンが捨てた入力を検知して拒否します（AR-09） | Rust のプロキシが受信・転送するときの上限は持つ案です。値と超過時の扱いは AR-09 | 応答ボディの上限は OV-04、AR-09 | — |
-| 同時実行・待ち行列の上限超過 | トランザクションを作らずに拒否する案です。上限の値は AR-09、返す応答は AR-16 | 影響を受けない案 | Rust のプロキシ側の同時実行の上限は持つ案です。値と超過時の扱いは AR-09 | — | ルールの構築に使う資源の上限は AR-11 |
-| ディスクの不足・退避先の異常 | 退避が必要なリクエストは検査不能として拒否する案（AR-09） | 退避中のトランザクションを検査不能とする案です。Rust のプロキシを含むほかの処理への影響は AR-04 | 影響の範囲は AR-04 | 送り始めた後は AR-08 | — |
-| アップストリームの障害（接続失敗、タイムアウト、切断、不正な応答） | 検査の後に起きます。返す応答は AR-16 | ロギングフェーズと Close を行います。ブロックや検査不能とは別の理由として記録する案（AR-18） | 同じ扱い（AR-18） | 送り始めた後は AR-08 | — |
-| ログの保存先の障害（満杯、使えない状態） | ログを記録できないときに転送を続けるかは DP-10 | 同じ | 同じ | — | 更新のログの記録も DP-10 |
+| Timeout (the kinds of timeout are covered by AR-14) | The proposal is to refuse the request as uninspectable | Even after the wait stops, the inspector process may go on evaluating. The proposal is to discard decisions that arrive after the timeout (AR-13). When the concurrency slot is returned is covered by AR-14 | Forwarding timeouts are covered by AR-14 | After sending has started, see AR-08 | Update timeouts are covered by AR-11 |
+| Client disconnection (before forwarding starts) | Not forwarded. The logging phase and Close are run (AR-10) | Same | Not forwarded | — | — |
+| Client disconnection (after forwarding starts) | — | Whether to abort forwarding to the upstream is covered by AR-08. The logging phase and Close are run (AR-10) | Whether to abort forwarding to the upstream is covered by AR-08 | Stop returning the response and release resources (AR-10) | — |
+| Body or argument limit exceeded | The values and the conditions for refusal are covered by AR-09. Partial inspection, which forwards the uninspected remainder, is not compatible with fail-closed for traffic that requires inspection | The proposal is to make a transaction that reached the limit uninspectable. Input that the inspection engine dropped is detected and refused (AR-09) | The proposal is that the Rust proxy should have limits when it receives and forwards. The values, and the handling when they are exceeded, are covered by AR-09 | Limits on response bodies are covered by OV-04 and AR-09 | — |
+| Concurrency or queue limit exceeded | The proposal is to refuse the request without creating a transaction. The limit values are covered by AR-09, and the response to return in AR-16 | The proposal is that they are not affected | The proposal is that the Rust proxy should have concurrency limits on its side. The values, and the handling when they are exceeded, are covered by AR-09 | — | Limits on the resources used to build rules are covered by AR-11 |
+| Out of disk space, or a problem with the spill destination | The proposal is to refuse a request that needs to spill as uninspectable (AR-09) | The proposal is to make a transaction that is spilling uninspectable. For the effect on other processing, including the Rust proxy, see AR-04 | For the scope of the effect, see AR-04 | After sending has started, see AR-08 | — |
+| Upstream failure (failed connection, timeout, disconnection, invalid response) | Occurs after inspection. The response to return is covered by AR-16 | The logging phase and Close are run. The proposal is to record it as a reason separate from a block or uninspectable (AR-18) | Handled the same way (AR-18) | After sending has started, see AR-08 | — |
+| Failure of the log store (full or unavailable) | Whether to keep forwarding when logs cannot be recorded is covered by DP-10 | Same | Same | — | How update logs are recorded is also covered by DP-10 |
 
-### 割り当て前の待機中のリクエスト
+### Requests Waiting for Assignment
 
-検査を必要とする通信で、受け付けた後、検査プロセスへ割り当てる前に待ち行列にいるリクエストの扱いです。待機中の資源と同時実行の枠の所有者、割り当てのときの引き渡しは AR-09 を参照してください。
+This table covers requests that require inspection while they wait in the queue, after being accepted and before being assigned to an inspector process. For who owns the resources held while waiting and the concurrency slot, and how they are handed over at assignment, see AR-09.
 
-| 状態 | 待機中のリクエストの扱い（候補） |
+| State | Handling of waiting requests (candidate) |
 |---|---|
-| クライアントの切断 | 待ち行列から外し、資源を解放します。あとから割り当てません |
-| 待機のタイムアウト（AR-14） | 待ち行列から外し、検査不能として拒否する案です（AR-16）。あとから割り当てません |
-| 割り当て先の候補の検査プロセスの計画停止・ドレイン | 停止するプロセスへ割り当てません。ほかの検査プロセスへ回すか、拒否するかは AR-17 |
-| 検査プロセスの異常終了・応答しない・共有する接続の切断 | 待機中のリクエストはまだ失われていません。ほかの検査プロセスへ回すか、待つか、拒否するかは AR-03、AR-14 |
-| ルールの更新 | どの世代で検査するか（受け付けの時点で固定するか、割り当ての時点で固定するか）は AR-11 |
-| Rust のプロキシが設定をリロードするとき | 検査の要否を判定した設定をいつ固定して保持するかは AR-17 |
-| Rust のプロキシの計画停止 | 待機中のリクエストを割り当てるか、拒否するかは AR-17 |
+| Client disconnection | Removed from the queue, and its resources are released. Not assigned afterwards |
+| Wait timeout (AR-14) | The proposal is to remove it from the queue and refuse it as uninspectable (AR-16). Not assigned afterwards |
+| Planned stop or drain of an inspector process that is a candidate for assignment | Not assigned to the process being stopped. Whether to send it to another inspector process or refuse it is covered by AR-17 |
+| Abnormal exit of the inspector process, no response from it, or a cut shared connection | Waiting requests are not lost yet. Whether to send them to another inspector process, keep them waiting, or refuse them is covered by AR-03 and AR-14 |
+| Rule update | Which generation inspects them (locked in when the request is accepted, or when it is assigned) is covered by AR-11 |
+| When the Rust proxy reloads the configuration | For when to lock in and hold the configuration used to decide whether inspection is needed, see AR-17 |
+| Planned stop of the Rust proxy | Whether to assign or refuse the waiting requests is covered by AR-17 |
 
-### ルールと Rust のプロキシ
+### Rules and the Rust Proxy
 
-| 状態 | 検査を必要とする新規のリクエスト | 進行中のトランザクション | 明示的なバイパスのリクエスト（残す場合） | 応答の返却 | ルールの更新 |
+| State | New requests that require inspection | Transactions in progress | Explicit bypass requests (if kept) | Returning the response | Rule update |
 |---|---|---|---|---|---|
-| ルールの更新中 | 旧か新のどちらか 1 つの世代で検査します。世代を混ぜません（AR-11） | 開始時の世代で最後まで検査します | — | 同じトランザクションは同じ世代を使います | 同時に来た更新の直列化は AR-11 |
-| ルールの更新の失敗（切り替え前の構築の失敗で、現行の WAF インスタンスが健全な場合） | 現行の世代を使い続ける案 | 影響を受けない案 | — | — | 失敗を記録し、失敗した構築の資源を回収します。運用者へ通知する手段は OV-03、AR-05 |
-| ルールの更新の結果が不明（切り替えの結果を伝える通知の喪失、タイムアウト） | 判定ごとに、どの世代で検査したかを確認する案（AR-11、AR-13） | 開始時の世代で最後まで検査します | — | — | 失敗とも旧い世代の継続とも断定しません。適用された世代の確認と再試行は AR-11、AR-13 |
-| Rust のプロキシの起動中 | 受け付けを始める条件と、外部から見た準備完了は AR-12 | なし | 検査プロセスの準備を待たずに通すかは DP-01、AR-12 | — | 起動時のルールの構築は AR-11、AR-12 |
-| Rust のプロキシの計画停止 | 受け付けを止める案 | 完了を待つタイムアウト、検査プロセスへの通知、ロギングフェーズと Close は AR-17 | 進行中の扱いは AR-17 | 送り始めた後は AR-08 | 停止中は更新を受け付けない案 |
-| Rust のプロキシの異常終了・再起動 | 再起動して準備完了になるまで受け付けられません（AR-12） | 転送中のリクエストは失われます。検査プロセスに残ったトランザクションは、通信相手の喪失を検知して Close する案です（AR-15）。前の Rust のプロキシからの依頼と取り違えません（AR-13） | 転送中のリクエストは失われます | 返却中の応答は途切れます | 実行中の更新は結果が不明になります。適用された世代は再起動の後に確認します（AR-11、AR-13） |
-| Rust のプロキシが設定をリロードするとき | リロードの前後どちらの設定で検査の要否を判定するかを、リクエストごとに 1 つに定めます（AR-17） | 開始時の設定で最後まで扱う案 | バイパスの設定の変更も同じ扱い（AR-17、DP-01） | 開始時の設定で扱う案 | 設定とルールの世代の整合は AR-11、AR-17 |
-| Rust のプロキシが設定のリロードに失敗したとき | 現行の設定を使い続ける案（AR-17） | 影響を受けない案 | 同じ | — | 失敗を記録します。運用者へ通知する手段は OV-03、AR-05 |
+| During a rule update | Inspected with exactly one generation, either the old or the new. Generations are not mixed (AR-11) | Inspected to the end with the generation in use when it started | — | A transaction uses the same generation throughout | How updates that arrive at the same time are serialized is covered by AR-11 |
+| Failure of a rule update (a build failure before switching, with the current WAF instance healthy) | The proposal is to keep using the current generation | The proposal is that they are not affected | — | — | The failure is recorded, and the resources of the failed build are reclaimed. How the operator is notified is covered by OV-03 and AR-05 |
+| Unknown result of a rule update (lost notification of the switch result, timeout) | The proposal is to confirm, for each decision, which generation it was inspected with (AR-11, AR-13) | Inspected to the end with the generation in use when it started | — | — | No conclusion is drawn that the update failed or that the old generation is still in use. Confirming the applied generation and retrying are covered by AR-11 and AR-13 |
+| While the Rust proxy is starting | The conditions for starting to accept requests, and readiness as seen from outside, are covered by AR-12 | None | Whether to let them through without waiting for the inspector process to be ready is covered by DP-01 and AR-12 | — | How rules are built at start is covered by AR-11 and AR-12 |
+| Planned stop of the Rust proxy | The proposal is to stop accepting requests | The timeout for waiting for completion, notifying the inspector process, and the logging phase and Close are covered by AR-17 | How those in progress are handled is covered by AR-17 | After sending has started, see AR-08 | The proposal is to reject updates during the stop |
+| Abnormal exit or restart of the Rust proxy | Requests cannot be accepted until it has restarted and is ready (AR-12) | Requests being forwarded are lost. The proposal is that the inspector process should detect that it has lost its peer and close the transactions left in it (AR-15). They are not mixed up with requests from the previous Rust proxy (AR-13) | Requests being forwarded are lost | A response being returned is cut off | The result of an update in progress becomes unknown. The applied generation is confirmed after the restart (AR-11, AR-13) |
+| When the Rust proxy reloads the configuration | For each request, whether inspection is needed is decided with exactly one configuration, either the one before the reload or the one after (AR-17) | The proposal is to handle them to the end with the configuration in use when they started | A change to the bypass settings is handled the same way (AR-17, DP-01) | The proposal is to handle it with the configuration in use when it started | Keeping the configuration consistent with the rule generations is covered by AR-11 and AR-17 |
+| When the Rust proxy fails to reload the configuration | The proposal is to keep using the current configuration (AR-17) | The proposal is that they are not affected | Same | — | The failure is recorded. How the operator is notified is covered by OV-03 and AR-05 |
 
-## 採用判断に必要な検証（候補）
+## Checks Needed for the Decision (Candidates)
 
-比較の条件と許容値は、検証の前に決めます。検証に使う依存とルールのバージョンは DP-09 に従って確認します。
+The conditions and tolerances for the comparison are decided before verification. The versions of the dependencies and rules used in verification are checked as described in DP-09.
 
-1. 正常なリクエストとボディをアップストリームへ正しく渡し、URI・ヘッダー・クエリ・ボディの代表的な検知が、Coraza の Go API を直接使った場合と一致します。リクエストヘッダーの段階でのブロックも確認します。この一致は、採用した検査範囲を満たす証明にはなりません。Content-Type とボディプロセッサーごとの検査対象（AR-09）を仕様とし、仕様に対しても確認します。
-2. 応答を検査する場合（OV-04）、応答でのブロックとトランザクションの寿命を確認します。
-3. 検査プロセスの停止、通信断、タイムアウト、クライアントの切断で、検査を必要とする通信が未検査のまま通らず、Rust のプロキシの側に待ち状態や同時実行の枠が取り残されません。
-4. フェーズの呼び出しの契約に反する順序違反・欠落・重複を検査不能として扱い、早い段階のブロックなど契約で認めた非実行を検査不能と誤りません。メッセージの相関できる個別の異常はそのトランザクションだけを、共有する接続の切断や境界の破損はその接続のトランザクションをすべて検査不能とし、古い判定は捨てて現行のトランザクションに影響させません。
-5. 複数のトランザクションの途中で検査プロセスを止めます。計画停止・ドレインでは、タイムアウトまでに終えたトランザクションのロギングフェーズと Close が完了します。異常終了・強制終了では、判定の取り違えがなく、Rust のプロキシに残る情報で未完了・ログの記録の失敗を区別して記録でき、資源と一時ファイルを、生きているプロセスのものを消さずに回収できます。完全なログの復旧は求めませんが、回収できないログを正常な完了として扱いません。
-6. 検査プロセスを故意に異常終了させる仕組みを使い、Rust のプロキシとほかのリクエストへの影響の範囲を確認します。
-7. ボディのサイズ、伸長、同時実行、待ち行列、遅い送信の境界で、メモリ、CPU、待ち行列、ディスクの使用が決めた上限に収まります。取り消した待機中のリクエストが、あとから割り当てられません。
-8. 引数の数の上限に達したリクエスト、解析できないボディ、厳格な検証に失敗した multipart、未知・未対応の Content-Type のボディが、ブロックするモードで決めたとおりに扱われます。
-9. ルールの更新中、切り替え前の構築の失敗、結果が不明な更新（通知の喪失、タイムアウト）で世代が混ざらず、適用された世代を確認でき、失敗した構築の資源が回収されます。
-10. ルール選択の失敗時のフォールバックと、明示的なバイパス・DetectionOnly・Off を分けた結果になります。
-11. 検査、バイパスの判定、転送の間で、表現の解釈が食い違いません。伸長・解析して検査した表現と、転送する表現の対応も含みます。
-12. 同じルール・ボディ・負荷で、遅延、処理量、メモリ、ビルド・配布・運用の負担を各案で比べます。Go API を直接使う側の Coraza のバージョンと、libcoraza に含まれる Coraza のバージョンを記録して比較の条件に含め、できればそろえます。そろわない場合は、接続方式だけの差とは結論しません（DP-09）。
-13. ログの出力が、機微なデータの漏えいや、ログを閲覧・解析する側への入力の注入の入口になりません（DP-10）。
-14. libcoraza 案では、採用する API に即して、所有権・寿命・借用・コールバック・並行実行・初期化の失敗・エラーの変換を、異常系を含めて確認します。同じプロセスでの障害の影響範囲だけで比較を終えません。
+1. Ordinary requests and bodies reach the upstream correctly, and representative detections in the URI, headers, query, and body match those of the Coraza Go API used directly. Blocking at the request header stage is also checked. This match does not prove that the adopted inspection scope is met, so treat the inspection targets for each Content-Type and body processor (AR-09) as the specification, and check against it too.
+2. When responses are inspected (OV-04), check blocking on responses and the lifetime of the transaction.
+3. When the inspector process stops, communication breaks, a timeout occurs, or a client disconnects, traffic that requires inspection does not pass uninspected, and no waiting state or concurrency slot is left stranded on the Rust proxy side.
+4. Out-of-order, missing, or duplicate phase calls that break the call contract are treated as uninspectable, and phases that the contract allows to be skipped, such as those after an early block, are not mistaken for uninspectable. An anomaly in an individual message that can be correlated makes only that transaction uninspectable, a cut shared connection or broken boundaries make all transactions on that connection uninspectable, and stale decisions are discarded without affecting the current transactions.
+5. Stop the inspector process while several transactions are in progress. In a planned stop or drain, the logging phase and Close complete for the transactions that finish before the timeout. In an abnormal or forced exit, decisions are not mixed up; the information left in the Rust proxy can be used to record, as separate cases, that a request was incomplete and that recording its log failed; and resources and temporary files can be reclaimed without deleting those of a process that is still running. Complete recovery of logs is not required, but logs that cannot be recovered are not treated as completed normally.
+6. Use a mechanism that deliberately makes the inspector process exit abnormally to check how far the Rust proxy and other requests are affected.
+7. At the boundaries of body size, decompression, concurrency, queues, and slow sending, the use of memory, CPU, queues, and disk stays within the decided limits. A waiting request that was cancelled is not assigned afterwards.
+8. A request that reached the limit on the number of arguments, a body that cannot be parsed, a multipart body that failed strict validation, and a body with an unknown or unsupported Content-Type are handled as decided in blocking mode.
+9. During a rule update, after a build failure before switching, and after an update with an unknown result (lost notification, timeout), generations are not mixed, the applied generation can be confirmed, and the resources of the failed build are reclaimed.
+10. The results distinguish the fallback after a rule selection failure from explicit bypass, DetectionOnly, and Off.
+11. Inspection, the bypass decision, and forwarding do not interpret the form differently. This includes how the form inspected after decompression and parsing corresponds to the forwarded form.
+12. Compare the latency, throughput, memory, and build, distribution, and operational burden of each proposal with the same rules, bodies, and load. Record both the Coraza version on the side that uses the Go API directly and the Coraza version included in libcoraza, make them part of the comparison conditions, and make them the same if possible. If they cannot be made the same, do not conclude that the difference comes only from the connection method (DP-09).
+13. Log output does not become a way to leak sensitive data, or a way to inject input into whatever views and analyzes the logs (DP-10).
+14. In the libcoraza proposal, check ownership, lifetime, borrowing, callbacks, concurrent execution, initialization failures, and error conversion against the API to be adopted, including failure cases. Do not limit the comparison to the failure scope within the same process.
 
-3、5、6 は、libcoraza 案では、同じ障害がプロセス全体に及ぶ範囲として確認します。
+In the libcoraza proposal, items 3, 5, and 6 are checked with the whole process as the range that the same failure reaches.
 
-## 未決事項
+## Open Points
 
-| ID | 事項 | 現在の扱い | 関連 |
+| ID | Item | Current handling | Related |
 |---|---|---|---|
-| AR-01 | 検査エンジンとの接続方式 | 第一候補は Go の検査プロセス、比較対象は libcoraza です。検査カーネルの初期実装に限って、Go の検査プロセスの構成を採りました（[システム概要](system-overview.md) の「現在の状態」）。全体としての採用は、libcoraza との比較を含む検証の後に判断します | OV-06、DP-09 |
-| AR-02 | プロセス間通信の方式とメッセージ形式（別プロセス案の場合） | 未決定。同一ホスト内の Unix ドメインソケットは候補の 1 つ | AR-13 |
-| AR-03 | 検査プロセスの数、スーパーバイザー（起動・停止・再起動の担当）、再起動の条件 | 未決定 | OV-06、AR-14、AR-17 |
-| AR-04 | 検査プロセスの権限と OS 上の資源の制限 | 未決定 | OV-06、DP-07 |
-| AR-05 | 管理機能の配置（どのプロセスが管理の入口を持つか）と、採る場合の認証、操作ごとの権限の分け方、変更の履歴と適用範囲 | 未決定 | OV-03、OV-07、DP-10 |
-| AR-06 | HTTP の解釈とフレーミングの不変条件、拒否または正規化する入力 | 未決定。拒否を基本とする案 | OV-05 |
-| AR-07 | 検査する表現と転送する表現の対応 | 未決定 | OV-01、DP-05 |
-| AR-08 | 転送の開始と検査の完了の関係（ボディをどこまで受け取ってから送るか）、応答を送り始めた後の扱い | 未決定 | OV-04、OV-05 |
-| AR-09 | ボディの解析と検査対象（Content-Type ごと）、ボディ・伸長・引数・同時実行・待ち行列・ディスク退避の上限と超えたときの扱い（WAF インスタンスの上限と Rust のプロキシの上限を分けます）、待機中のリクエストの資源と枠 | 未決定 | AR-16、DP-03、OV-04 |
-| AR-10 | トランザクションの開始の時点、ルートごとのフェーズの呼び出しの契約、寿命・ログの記録・Close の責任 | 未決定 | AR-15、DP-07、DP-08、DP-10、OV-04 |
-| AR-11 | ルールの世代の切り替え、旧世代の寿命、更新の直列化、失敗時と結果が不明なときの扱い（確認と再試行）、ルールの受け渡し、待機中のリクエストの世代 | 未決定 | OV-07、AR-04、AR-13、DP-04 |
-| AR-12 | 起動、準備完了、受け付けの開始の関係と、外部から見た準備完了 | 未決定 | AR-03 |
-| AR-13 | メッセージの境界・長さ・上限、相関、双方の起動ごとの識別子、個別の異常と接続全体の異常の区別、準備完了と更新結果の通知の相関、通信相手の確認、2 つの実行ファイルのバージョンと通信の契約の整合 | 未決定 | AR-02、AR-11、AR-12、OV-06、DP-09 |
-| AR-14 | タイムアウトの種類（伸長と待ち行列での待機を含みます）と値、タイムアウトした後の扱い | 未決定 | AR-03、AR-09 |
-| AR-15 | 異常終了の後の資源の回収（検査プロセス側と Rust のプロキシ側、回収対象の所有者と終了の確認） | 未決定 | AR-03、AR-10、DP-10 |
-| AR-16 | 拒否、検査不能、アップストリームの障害のときにクライアントへ返す応答 | 未決定 | DP-03、AR-18 |
-| AR-17 | 計画停止・ドレインと、Rust のプロキシの停止と設定のリロード（失敗を含みます）、待機中のリクエストの扱いと設定を固定する時点 | 未決定 | AR-03、AR-11、OV-06 |
-| AR-18 | アップストリームの障害（接続失敗、タイムアウト、切断、不正な応答）の扱いと記録 | 未決定 | AR-16、DP-10 |
+| AR-01 | How to connect to the inspection engine | The first candidate is the Go inspector process, compared against libcoraza. The Go inspector process structure was adopted only for the initial implementation of the inspection kernel (see "Current Status" in the [system overview](system-overview.md)). Adoption as a whole is decided after verification, including the comparison with libcoraza | OV-06, DP-09 |
+| AR-02 | Inter-process communication method and message format (in the separate-process proposal) | Undecided. A Unix domain socket on the same host is one candidate | AR-13 |
+| AR-03 | The number of inspector processes, the supervisor (who owns start, stop, and restart), and the restart conditions | Undecided | OV-06, AR-14, AR-17 |
+| AR-04 | The privileges of the inspector process and the limits on OS resources | Undecided | OV-06, DP-07 |
+| AR-05 | Where the management functions go (which process holds the entry point for administration) and, if they are adopted, authentication, how privileges are divided per operation, and the history and scope of changes | Undecided | OV-03, OV-07, DP-10 |
+| AR-06 | Invariants of HTTP interpretation and framing, and the input to refuse or normalize | Undecided. The proposal is to refuse by default | OV-05 |
+| AR-07 | Correspondence between the inspected form and the forwarded form | Undecided | OV-01, DP-05 |
+| AR-08 | The relation between the start of forwarding and the completion of inspection (how much of the body is received before sending), and the handling after the response has started | Undecided | OV-04, OV-05 |
+| AR-09 | Body parsing and inspection targets (for each Content-Type), the limits on body, decompression, arguments, concurrency, queues, and spilling to disk and the handling when they are exceeded (the WAF instance's limits and the Rust proxy's limits are kept separate), and the resources and slots of waiting requests | Undecided | AR-16, DP-03, OV-04 |
+| AR-10 | When a transaction starts, the phase call contract for each route, and responsibility for lifetime, log recording, and Close | Undecided | AR-15, DP-07, DP-08, DP-10, OV-04 |
+| AR-11 | Switching rule generations, the lifetime of old generations, serialization of updates, the handling on failure and when the result is unknown (confirmation and retries), how rules are passed, and which generation waiting requests use | Undecided | OV-07, AR-04, AR-13, DP-04 |
+| AR-12 | How start, readiness, and the start of accepting relate, and readiness as seen from outside | Undecided | AR-03 |
+| AR-13 | Message boundaries, lengths, and limits; correlation; per-start identifiers on both sides; distinguishing individual anomalies from anomalies of the whole connection; correlation of readiness and update result notifications; verification of the communication peer; and consistency between the versions of the two executables and the communication contract | Undecided | AR-02, AR-11, AR-12, OV-06, DP-09 |
+| AR-14 | The kinds of timeouts (including decompression and waiting in the queue) and their values, and the handling after a timeout | Undecided | AR-03, AR-09 |
+| AR-15 | Reclaiming resources after an abnormal exit (on both the inspector process side and the Rust proxy side; who owns what is reclaimed; confirming the exit) | Undecided | AR-03, AR-10, DP-10 |
+| AR-16 | The response returned to the client on a refusal, an uninspectable request, or an upstream failure | Undecided | DP-03, AR-18 |
+| AR-17 | Planned stop and drain, stopping the Rust proxy and reloading the configuration (including failures), the handling of waiting requests, and when the configuration is locked in | Undecided | AR-03, AR-11, OV-06 |
+| AR-18 | The handling and recording of upstream failures (failed connection, timeout, disconnection, invalid response) | Undecided | AR-16, DP-10 |
 
-## 関連文書
+## Related Documents
 
-- [システム概要](system-overview.md)
-- [設計方針・制約](design-principles.md)
-- [ドキュメントの索引](../../README.md)
+- [System Overview](system-overview.md)
+- [Design Principles and Constraints](design-principles.md)
+- [Documentation Index](../../README.md)

@@ -2,3 +2,5 @@
 /kernel/target/
 /proxy/target/
 /records-ship/target/
+/docs/guide/dist/
+/docs/guide/.tmp/

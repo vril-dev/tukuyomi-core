@@ -1,0 +1,311 @@
+/* The look of the tukuyomi-core operations guide (PDF). The page, the fonts, the sizes and the page breaks are set
+   for an A4 print made by Chrome headless. The colours are those of the EPUB (book.css): a deep red accent (#9b1c1c),
+   a soft red (#fbefef) for table heads and code, and a light red (#e3b8b8) for frames. */
+
+@page {
+  size: A4;
+  margin: 18mm 16mm 18mm;
+  @bottom-center {
+    content: counter(page);
+    font-family: "Noto Sans CJK JP", "IPAexGothic", sans-serif;
+    font-size: 8pt;
+    color: #888888;
+  }
+}
+
+@page :first {
+  margin: 0;
+  @bottom-center { content: none; }
+}
+
+html {
+  font-family: "Noto Sans CJK JP", "IPAexGothic", "Noto Sans", sans-serif;
+  font-size: 9pt;
+  line-height: 1.55;
+  color: #222222;
+  background: #ffffff;
+}
+
+body {
+  margin: 0 !important;
+  padding: 0 !important;
+  max-width: none !important;
+  width: 100% !important;
+  font-size: 9pt;
+  line-height: 1.55;
+  hyphens: none;
+  text-rendering: optimizeLegibility;
+}
+
+/* The cover: text only (title, edition, version and date). */
+.cover {
+  width: 210mm;
+  height: 297mm;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  page-break-after: always;
+  background: linear-gradient(160deg, #3a0b0b 0%, #6b1515 45%, #9b1c1c 100%);
+  color: #fbefef !important;
+  padding: 50mm 25mm;
+  box-sizing: border-box;
+  margin: 0;
+}
+
+.cover .eyebrow {
+  font-size: 10pt;
+  font-weight: 400;
+  letter-spacing: 0.5em;
+  color: #f1d6d6 !important;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  padding: 4pt 18pt 4pt 22pt;
+  margin-bottom: 5em;
+  text-transform: none;
+}
+
+.cover h1 {
+  font-size: 56pt;
+  margin: 0;
+  border: none !important;
+  padding: 0 !important;
+  page-break-before: avoid;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  color: #ffffff !important;
+  line-height: 1;
+}
+
+.cover .tagline {
+  font-size: 20pt;
+  font-weight: 500;
+  color: #ffffff !important;
+  margin: 0.5em 0 0;
+  letter-spacing: 0.08em;
+}
+
+.cover .meta {
+  font-size: 11pt;
+  color: #e3b8b8 !important;
+  line-height: 2;
+  margin-top: auto;
+  padding-top: 3em;
+}
+
+/* Headings */
+h1 {
+  font-size: 17pt;
+  font-weight: 800;
+  page-break-before: always;
+  border-bottom: 3px solid #9b1c1c;
+  padding-bottom: 0.25em;
+  margin: 0 0 0.8em;
+  line-height: 1.3;
+  color: #9b1c1c;
+}
+
+h1#title-block-header,
+h1.title {
+  page-break-before: avoid;
+}
+
+h2 {
+  font-size: 12pt;
+  font-weight: 700;
+  margin: 1.2em 0 0.4em;
+  padding-left: 0.5em;
+  border-left: 5px solid #9b1c1c;
+  color: #9b1c1c;
+  line-height: 1.35;
+}
+
+h3 {
+  font-size: 10.5pt;
+  font-weight: 700;
+  margin: 1em 0 0.35em;
+  color: #9b1c1c;
+}
+
+h4 {
+  font-size: 9.5pt;
+  font-weight: 700;
+  margin: 0.8em 0 0.3em;
+  color: #9b1c1c;
+}
+
+/* Paragraphs */
+p {
+  margin: 0.4em 0;
+  text-align: justify;
+  text-justify: inter-ideograph;
+}
+
+/* Lists */
+ul, ol {
+  margin: 0.3em 0 0.5em;
+  padding-left: 1.4em;
+}
+
+li {
+  margin: 0.1em 0;
+}
+
+li > p {
+  margin: 0.15em 0;
+}
+
+/* Code */
+code {
+  font-family: "IPAexGothic", "Noto Sans Mono CJK JP", "DejaVu Sans Mono", monospace;
+  font-size: 0.88em;
+  background: #fbefef;
+  padding: 0.05em 0.3em;
+  border-radius: 3px;
+  border: 1px solid #e3b8b8;
+}
+
+pre {
+  font-family: "IPAexGothic", "Noto Sans Mono CJK JP", "DejaVu Sans Mono", monospace;
+  font-size: 7.8pt;
+  line-height: 1.45;
+  background: #fbefef;
+  border: 1px solid #e3b8b8;
+  border-left: 4px solid #9b1c1c;
+  border-radius: 4px;
+  padding: 0.55em 0.7em;
+  margin: 0.6em 0;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-size: inherit;
+}
+
+/* Tables. Long code blocks and tables (the reference tables in the appendices run over a page) may break across
+   pages, so that no page is left almost empty before them; a table row is kept on one page, and the head row is
+   repeated on the next page. */
+table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 8.2pt;
+  line-height: 1.45;
+  width: 100%;
+}
+
+tr {
+  page-break-inside: avoid;
+}
+
+th, td {
+  border: 1px solid #e3b8b8;
+  padding: 3pt 6pt;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: #fbefef;
+  font-weight: 700;
+  color: #9b1c1c;
+}
+
+/* Block quotes */
+blockquote {
+  border-left: 3px solid #e3b8b8;
+  margin: 0.6em 0;
+  padding: 0.4em 0.8em;
+  color: #2a2a2a;
+}
+
+blockquote p { margin: 0.2em 0; }
+
+/* Rules */
+hr {
+  border: none;
+  border-top: 1px solid #e3b8b8;
+  margin: 1.4em 0;
+}
+
+/* Links */
+a {
+  color: #9b1c1c;
+  text-decoration: none;
+}
+
+/* Emphasis */
+strong {
+  font-weight: 700;
+  color: #9b1c1c;
+}
+
+/* Table of contents */
+nav#TOC {
+  page-break-before: always;
+  page-break-after: always;
+}
+
+nav#TOC h1,
+nav#TOC h2 {
+  page-break-before: avoid;
+  border: none;
+  font-size: 17pt;
+  margin-bottom: 0.8em;
+}
+
+nav#TOC ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0.2em 0;
+}
+
+nav#TOC ul ul {
+  padding-left: 1.2em;
+  font-size: 0.92em;
+}
+
+nav#TOC ul ul ul {
+  font-size: 0.88em;
+  color: #555555;
+}
+
+nav#TOC li {
+  margin: 0.1em 0;
+  line-height: 1.4;
+}
+
+nav#TOC a {
+  color: #222222;
+}
+
+/* The heading of the table of contents, in the language of the book. */
+nav#TOC::before {
+  content: "目次";
+  display: block;
+  font-size: 17pt;
+  font-weight: 800;
+  color: #9b1c1c;
+  border-bottom: 3px solid #9b1c1c;
+  padding-bottom: 0.25em;
+  margin-bottom: 0.8em;
+}
+
+html[lang="en"] nav#TOC::before {
+  content: "Contents";
+}
+
+/* Widows and orphans in print */
+p, li, td {
+  orphans: 3;
+  widows: 3;
+}
+
+h1, h2, h3, h4 {
+  page-break-after: avoid;
+  page-break-inside: avoid;
+}
