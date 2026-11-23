@@ -260,7 +260,7 @@ test('words follow the language where they stand, and what was typed stays', () 
   input.value = 'typed text';
   const box = el('div', {}, el('p', {}, w('table.prev')), input, el('p', {}, w('table.count', { n: 7 })));
   document.body.append(box);
-  assert.deepEqual([box.children[0].textContent, input.getAttribute('aria-label'), box.children[2].textContent], ['Previous', 'Filter this table', '7 rows']);
+  assert.deepEqual([box.children[0].textContent, input.getAttribute('aria-label'), box.children[2].textContent], ['Previous', 'Filter this table', 'Rows: 7']);
   setLanguage('ja');
   retranslate();
   assert.deepEqual([box.children[0].textContent, input.getAttribute('aria-label'), box.children[2].textContent], ['前へ', '表の中を絞り込む', '7 件']);
