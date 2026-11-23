@@ -20,7 +20,8 @@ build: "pandoc → EPUB 3、pandoc → HTML → Chrome → PDF"
 - **構成**: 各章は「概要 → 仕組み → 設定例 → 運用上の注意」の流れにそろえます。
 - **整合**: 設定キー、コマンド、ログの文、画面の語は、ドキュメントと一致させます。
   本書に書く事実は、ドキュメントと、公開したリリースノート（付録C）にあるものだけです。
-- **範囲**: 0.2.0 で実装している機能だけを扱い、実装していない機能や決まっていないことは、そうと分かるように書きます。
+- **範囲**: 0.2.0 で実装している機能だけを扱います。
+  実装していない機能や決まっていないことは、そうと分かるように書きます。
 
 ## 目次
 
@@ -43,20 +44,20 @@ build: "pandoc → EPUB 3、pandoc → HTML → Chrome → PDF"
   （source: docs/operations/operator-reference.ja.md の「ACME」「ACME のサイト」）
 - **第9章　運用** — 監視、設定のリロード、停止、バージョンの更新と切り戻し
   （source: docs/operations/operator-reference.ja.md の「シグナル」「停止」「監視」「バージョンの更新」）
-- **付録A　運用リファレンス** — docs/operations/operator-reference.ja.md を、本を作るときに取り込みます
-- **付録B　管理リファレンス** — docs/operations/admin-reference.ja.md を、本を作るときに取り込みます
+- **付録A　運用リファレンス** — 本を作るときに、docs/operations/operator-reference.ja.md を取り込みます
+- **付録B　管理リファレンス** — 本を作るときに、docs/operations/admin-reference.ja.md を取り込みます
 - **付録C　リリースノート** — 0.2.0 と 0.1.0
 
 ## ファイル配置
 
 ```
 docs/guide/
-├── build-epub.sh          … EPUB を作る台本
-├── build-pdf.sh           … PDF を作る台本
+├── build-epub.sh          … EPUB を作るスクリプト
+├── build-pdf.sh           … PDF を作るスクリプト
 ├── book.css               … EPUB の体裁
 ├── book-pdf.css           … PDF の体裁
 ├── cjk-line-breaks.lua    … 日本語の文の間の改行を消す pandoc のフィルター
-├── lib/guide_book.sh      … 2 つの台本が使う章の並び、題、付録の取り込み
+├── lib/guide_book.sh      … 2 つのスクリプトが使う章の並び、題、付録の取り込み
 └── ja/
     ├── index.md           … 本ファイル（方針・目次）
     ├── 00-preface.md      … はじめに
@@ -66,7 +67,8 @@ docs/guide/
     └── C-release-notes.md … 付録C
 ```
 
-付録A と付録B はファイルを置かずに、`build-epub.sh` と `build-pdf.sh` がドキュメントの運用リファレンスと管理リファレンスを取り込んで作ります。
+付録A と付録B のファイルはありません。
+`build-epub.sh` と `build-pdf.sh` が、ドキュメントの運用リファレンスと管理リファレンスを取り込んで作ります。
 
 ## 作り方（メモ）
 
@@ -74,8 +76,9 @@ docs/guide/
   目次、扉、章ごとの改ページを付けます。
 - PDF は、同じ章と付録を pandoc で 1 つの HTML にまとめ、Google Chrome（headless）で A4 の PDF にします。Chrome と、フォントの Noto Sans CJK JP が必要です。
 - 環境変数 `SOURCE_DATE_EPOCH`（1970-01-01 UTC からの秒数）を渡すと、本の日付はその日（UTC）になります。渡さないときは、作った日です。
-  EPUB は、同じファイルから作れば毎回まったく同じものになります。
-  PDF には Chrome が作った時刻を書き込むので、作るたびにその部分が変わります。
-- 付録A と付録B は、ドキュメントの文書の題を付録の題に替えて取り込み、リンクも書き替えます。
-  2 つの文書の間のリンクは本に収めた付録へのリンクにし、ほかのドキュメントへのリンクは、文書の名前とリポジトリの中のパス（例: ビルドと配置（`docs/build/binary-deployment.ja.md`））にします。
+  `SOURCE_DATE_EPOCH` を渡したときは、同じファイルから作った EPUB が毎回まったく同じものになります。
+  Chrome は PDF に作成の時刻と識別子を書き込むので、PDF は作るたびにその部分が変わります。
+- 付録A と付録B は、ドキュメントの文書の題を付録の題に替えて取り込み、リンクも書き換えます。
+  2 つの文書の間のリンクは、本に収めた付録へのリンクにします。
+  ほかのドキュメントへのリンクは、文書の名前とリポジトリの中のパスにします（例: ビルドと配置（`docs/build/binary-deployment.ja.md`））。
 - 表紙は文字だけ（題、副題、版）にします。

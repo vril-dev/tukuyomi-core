@@ -70,6 +70,6 @@ There are no files for Appendix A and Appendix B. `build-epub.sh` and `build-pdf
 
 - pandoc joins the chapter files, in the order of the contents, into an EPUB 3 with a table of contents, a title page, and a page break before each chapter.
 - The PDF has the same chapters and appendices: pandoc joins them into one HTML file, and Google Chrome (headless) prints it as an A4 PDF. It needs Chrome and the Noto Sans CJK JP font.
-- When the environment variable `SOURCE_DATE_EPOCH` (seconds since 1970-01-01 UTC) is set, the date of the book is that day (UTC), and the same files give exactly the same EPUB at every build. Without it, the date is the day of the build. Chrome writes the time of the build into the PDF, so that part of the PDF changes at every build.
+- When the environment variable `SOURCE_DATE_EPOCH` (seconds since 1970-01-01 UTC) is set, the date of the book is that day (UTC), and the same files give exactly the same EPUB at every build. Without it, the date is the day of the build. Chrome writes the time of the build and identifiers into the PDF, so those parts of the PDF change at every build.
 - Appendix A and Appendix B include the operator reference and the admin reference, with their titles replaced by the appendix titles. Links between the two documents become links to the appendices in the book, and links to other documents become the name of the document and its path in the repository (for example, Build and Deployment (`docs/build/binary-deployment.md`)).
 - The cover is text only (title, subtitle, and version).
