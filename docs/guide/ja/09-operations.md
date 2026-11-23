@@ -94,7 +94,7 @@ SIGHUP を受けると、プロキシは起動のときと同じパスの設定�
 
 | ログの行 | 意味 |
 |---|---|
-| `reload: configuration replaced <sha256>` | 切り替えました。`managed` のある設定では `reload: configuration replaced <sha256> managed <version>` になります。どのファイルとバージョンが効いているかは、この値で確認します |
+| `reload: configuration replaced <sha256>` | 切り替えました。`managed` のある設定では、`reload: configuration replaced <sha256> managed <version>` になります。どのファイルとバージョンが効いているかは、この値で確認します |
 | `reload: configuration refused: <reason>` | 拒否しました。拒否の行には、ほかに `reload: upstream refused: <reason>`、`reload: tls refused: <reason>` などがあります。拒否の行に、ファイルの値は出しません |
 
 管理プロセスが managed 設定のバージョンを反映するときは、制御ソケットへ `reload` を依頼します。

@@ -5,16 +5,16 @@
 tukuyomi-core のドキュメントの一覧です。
 tukuyomi-core は tukuyomi（tukuyomi WAF）から派生した製品で、WAF の機能に特化することを目指しています。
 
-現在実装している主な機能は、WAF によるリクエストの検査、HTTP／HTTPS の受信と転送、IP アドレスと国によるアクセス制御とレート制限、管理プロセス（管理 API と管理画面）、managed 設定、ログ送信プロセスです。
+現在実装している主な機能は、WAF によるリクエストの検査、HTTP/HTTPS の受信と転送、IP アドレスと国によるアクセス制御とレート制限、管理プロセス（管理 API と管理画面）、managed 設定、ログ送信プロセスです。
 ソースは次のディレクトリにあります。
 
-- [`kernel/`](../kernel/): 検査プロセスの起動と監視、検査の受け渡しを担う Rust のライブラリ
+- [`kernel/`](../kernel/): 検査プロセスの起動と監視、検査プロセスへのリクエストの受け渡しを担う Rust のライブラリ
 - [`inspector/`](../inspector/): Coraza を使う Go の検査プロセス
 - [`inspector-modsecurity/`](../inspector-modsecurity/): ModSecurity v3 を使う検査プロセス
 - [`proxy/`](../proxy/): プロキシ（管理プロセスと、管理画面の [`proxy/admin-ui/`](../proxy/admin-ui/) を含む）
 - [`records-ship/`](../records-ship/): ログ送信プロセス
 
-0.1.0 からは、Linux x86_64 用の 4 つの実行ファイルを 1 つの tarball にまとめて、GitHub のリリースで配布しています（[ビルドと配置](build/binary-deployment.ja.md) の「リリースの tarball」）。
+0.1.0 からは、Linux x86_64 用の 4 つの実行ファイルを 1 つの tarball にまとめ、GitHub のリリースで配布しています（[ビルドと配置](build/binary-deployment.ja.md) の「リリースの tarball」）。
 
 `build/` と `operations/` の文書では、現在の実装の使い方を説明します。
 `detailed-design/` の文書は初期草案で、目標、前提、候補、未決事項を記録しています。
@@ -38,7 +38,7 @@ ID は文書をまたいで重複しないように付けています（シス�
 
 ## 文書の構成（予定）
 
-次のツリーは、予定している文書の構成です。
+下のツリーは、予定している文書の構成です。
 作成済みの文書は上の表にある 6 つだけです。
 ツリーにあるほかのファイルとディレクトリ（`detailed-design/README.md` を含む）はまだ作成しておらず、内容を書く時点で作成します。
 
