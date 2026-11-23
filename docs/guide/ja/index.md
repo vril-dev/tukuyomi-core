@@ -3,7 +3,7 @@ title: "tukuyomi core"
 subtitle: "運用ガイド ── 日本語版"
 language: ja
 audience: "tukuyomi core を導入・運用するエンジニア（インフラ／SRE／プラットフォーム担当）"
-version: "0.2.0 ベース"
+version: "0.2.1 ベース"
 build: "pandoc → EPUB 3、pandoc → HTML → Chrome → PDF"
 ---
 
@@ -20,7 +20,7 @@ build: "pandoc → EPUB 3、pandoc → HTML → Chrome → PDF"
 - **構成**: 各章は「概要 → 仕組み → 設定例 → 運用上の注意」の流れにそろえます。
 - **整合**: 設定キー、コマンド、ログの文、画面の語は、ドキュメントと一致させます。
   本書に書く事実は、ドキュメントと、公開したリリースノート（付録C）にあるものだけです。
-- **範囲**: 0.2.0 で実装している機能だけを扱います。
+- **範囲**: 0.2.1 で実装している機能だけを扱います。
   実装していない機能や決まっていないことは、そうと分かるように書きます。
 
 ## 目次
@@ -46,7 +46,7 @@ build: "pandoc → EPUB 3、pandoc → HTML → Chrome → PDF"
   （source: docs/operations/operator-reference.ja.md の「シグナル」「停止」「監視」「バージョンの更新」）
 - **付録A　運用リファレンス** — 本を作るときに、docs/operations/operator-reference.ja.md を取り込みます
 - **付録B　管理リファレンス** — 本を作るときに、docs/operations/admin-reference.ja.md を取り込みます
-- **付録C　リリースノート** — 0.2.0 と 0.1.0
+- **付録C　リリースノート** — 0.2.1、0.2.0、0.1.0
 
 ## ファイル配置
 

@@ -38,8 +38,8 @@ Coraza/ModSecurity 搭載の WAF リバースプロキシ
 チェックサムを確認してから、展開してください。
 
 ```bash
-sha256sum -c tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256
-tar -xzf tukuyomi-core_v0.2.0_linux_amd64.tar.gz
+sha256sum -c tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256
+tar -xzf tukuyomi-core_v0.2.1_linux_amd64.tar.gz
 ```
 
 CRS は同梱していません。`scripts/fetch-crs.sh` でダウンロードしてください。

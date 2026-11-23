@@ -1,6 +1,6 @@
 # Chapter 1. Introduction to tukuyomi core
 
-This chapter explains what kind of product tukuyomi core is. It looks at the processes that make it up, what each of them is responsible for, and what each of them does not have. It also lists what 0.2.0 implements, what it does not implement, and what is not decided.
+This chapter explains what kind of product tukuyomi core is. It looks at the processes that make it up, what each of them is responsible for, and what each of them does not have. It also lists what 0.2.1 implements, what it does not implement, and what is not decided.
 
 Concrete settings and commands come from Chapter 2 on. The goal here is to get the overall picture and the main terms.
 
@@ -71,7 +71,7 @@ The records shipper reads the log files that the proxy writes and ships their li
 
 All the processes run as the same OS user as the proxy, and none of them runs as root. The start and every command are refused if any of the user IDs is 0.
 
-Running the inspector processes and the records shipper as different OS users or as different services is not implemented in 0.2.0, so the processes are separate but share one OS user. Where each process keeps its files, and with what permissions, is decided on this basis (see Chapter 3).
+Running the inspector processes and the records shipper as different OS users or as different services is not implemented in 0.2.1, so the processes are separate but share one OS user. Where each process keeps its files, and with what permissions, is decided on this basis (see Chapter 3).
 
 ## 1.3 How a Request Is Handled
 
@@ -87,7 +87,7 @@ Keep the following in mind when you run tukuyomi core:
 
 - **A request that cannot be inspected is not allowed**: when inspection fails for a technical reason, such as an unavailable inspector process or a full inspection queue, the proxy responds with 503 and does not forward the request. Not inspecting on purpose, as on a bypass route, is handled separately from failing to inspect.
 - **Only the start of the body is inspected**: the proxy inspects the body up to the configured number of bytes (at most 1 MiB), and after allowing the request, passes the rest to the upstream without inspection. The body types that can be inspected are also limited. For details, see "Request Body Limits and Inspected Length" and "Body Types" in Appendix A (Operator Reference).
-- **Responses are not inspected**: 0.2.0 has no feature that inspects what comes back from the upstream.
+- **Responses are not inspected**: 0.2.1 has no feature that inspects what comes back from the upstream.
 - **Upstream failures get 502**: for example, when the proxy cannot connect to the upstream, the response is invalid, or the upstream times out.
 
 ## 1.4 The Configuration File and the Processes
@@ -144,7 +144,7 @@ To find out whether a feature or setting of tukuyomi exists in tukuyomi core, ch
 
 ## 1.7 What Is Implemented and What Is Not
 
-This section summarizes what 0.2.0 implements, following the items of "Current Status" in System Overview. For each implemented part, the documentation notes that it "does not mean the WAF is complete".
+This section summarizes what 0.2.1 implements, following the items of "Current Status" in System Overview. For each implemented part, the documentation notes that it "does not mean the WAF is complete".
 
 ### Implemented
 
@@ -182,7 +182,7 @@ For the changes since 0.1.0, see Appendix C (Release Notes).
 
 ### Not Decided
 
-The documentation states that these are undecided, and the 0.2.0 implementation does not settle them.
+The documentation states that these are undecided, and the 0.2.1 implementation does not settle them.
 
 - The criteria for which features to keep and which to remove. The version of tukuyomi to port from
 - Whether to inspect responses, and if so, the scope

@@ -33,8 +33,8 @@ Requirements:
 Download the tarball and its checksum file from the [GitHub releases](https://github.com/vril-dev/tukuyomi-core/releases), verify the checksum, and extract the tarball.
 
 ```bash
-sha256sum -c tukuyomi-core_v0.2.0_linux_amd64.tar.gz.sha256
-tar -xzf tukuyomi-core_v0.2.0_linux_amd64.tar.gz
+sha256sum -c tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256
+tar -xzf tukuyomi-core_v0.2.1_linux_amd64.tar.gz
 ```
 
 The CRS is not bundled. Fetch it with `scripts/fetch-crs.sh`.

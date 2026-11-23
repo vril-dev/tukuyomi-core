@@ -3,7 +3,7 @@ title: "tukuyomi core"
 subtitle: "Operations Guide ── English Edition"
 language: en
 audience: "Engineers who deploy and operate tukuyomi core (infrastructure, SRE, platform teams)"
-version: "based on 0.2.0"
+version: "based on 0.2.1"
 build: "pandoc → EPUB 3; pandoc → HTML → Chrome → PDF"
 ---
 
@@ -17,7 +17,7 @@ This book rearranges the English documentation in the tukuyomi core repository (
 - **Terms**: the same terms as the documentation.
 - **Structure**: each chapter follows the order overview → how it works → configuration examples → operational notes.
 - **Consistency**: setting keys, commands, log lines, and screen terms match the documentation. Every fact in this book is in the documentation or in the published release notes (Appendix C).
-- **Scope**: only what 0.2.0 implements. What is not implemented or not decided is marked as such.
+- **Scope**: only what 0.2.1 implements. What is not implemented or not decided is marked as such.
 - **Languages**: the English edition has the same chapters and sections as the Japanese edition (`docs/guide/ja/`).
 
 ## Contents
@@ -43,7 +43,7 @@ This book rearranges the English documentation in the tukuyomi core repository (
   (source: "Signals", "Stopping", "Monitoring", and "Version Updates" in docs/operations/operator-reference.md)
 - **Appendix A. Operator Reference** — docs/operations/operator-reference.md, included when the book is built
 - **Appendix B. Admin Reference** — docs/operations/admin-reference.md, included when the book is built
-- **Appendix C. Release Notes** — 0.2.0 and 0.1.0
+- **Appendix C. Release Notes** — 0.2.1, 0.2.0, and 0.1.0
 
 ## Files
 
