@@ -1,12 +1,12 @@
 /* The look of the tukuyomi-core operations guide (EPUB 3). A deep red accent (#9b1c1c) on a plain page, with a soft red
    (#fbefef) for table heads and code and a light red (#e3b8b8) for frames. Readers set their own fonts and sizes, so only
    the colours, the spacing and the frames are fixed here. The colours are written as values, because some EPUB readers
-   do not read CSS custom properties. */
+   do not read CSS custom properties. The body text has no colour of its own, so that it stays readable when the reader
+   shows light text on a dark page; an element with a background colour sets its text colour as well. */
 
 body {
   line-height: 1.7;
   font-family: serif;
-  color: #222222;
 }
 
 h1, h2, h3, h4 {
@@ -54,8 +54,10 @@ strong {
 code {
   font-family: monospace;
   font-size: 0.9em;
-  /* break-word, not anywhere: a table column keeps the width of its longest word instead of one letter. */
-  overflow-wrap: break-word;
+  /* A long setting key or value breaks anywhere, so that a table fits a narrow screen. word-wrap is the older name,
+     for readers that do not know overflow-wrap. */
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
 }
 
 pre {
@@ -68,7 +70,14 @@ pre {
   background: #fbefef;
   border: 1px solid #e3b8b8;
   border-left: 4px solid #9b1c1c;
+  color: #222222;
   page-break-inside: avoid;
+}
+
+/* The syntax highlighting CSS of pandoc keeps the lines of a code block unbroken except in print. A reader shows the
+   book on a screen, so a long line wraps here instead of running past the right edge. */
+pre > code.sourceCode {
+  white-space: pre-wrap;
 }
 
 pre code {
@@ -76,12 +85,15 @@ pre code {
 }
 
 table {
+  width: 100%;
   border-collapse: collapse;
   margin: 1em 0;
   font-size: 0.9em;
 }
 
 th, td {
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
   border: 1px solid #e3b8b8;
   padding: 0.3em 0.5em;
   vertical-align: top;
@@ -120,4 +132,9 @@ section.titlepage p, section.titlepage div {
 .subtitle {
   font-family: sans-serif;
   color: #222222;
+}
+
+/* The table of contents has the colour of the body text, so that it stays readable on a dark page. */
+nav#toc a {
+  color: inherit;
 }

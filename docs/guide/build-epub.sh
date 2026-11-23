@@ -6,12 +6,12 @@
 #   docs/guide/build-epub.sh ja
 #   docs/guide/build-epub.sh en
 #
-# Pipeline: pandoc (Markdown -> EPUB 3). Appendix A and B are not kept in docs/guide: they are taken from
-# docs/operations/operator-reference(.ja).md and admin-reference(.ja).md when the book is built, so the reference
-# exists in one place only. Links between the two references go to the appendix in the book. A link to another
-# document of the repository becomes its name followed by its path in the repository, as the chapters write it, so
-# that the book has no link to a file that a release tag may not have. The Japanese sources put each sentence on
-# its own line; cjk-line-breaks.lua drops those line breaks so that no space appears in the Japanese text.
+# Pipeline: pandoc (Markdown -> EPUB 3). The chapter list, the titles and Appendix A and B come from
+# lib/guide_book.sh, which build-pdf.sh shares. The Japanese sources put each sentence on its own line;
+# cjk-line-breaks.lua drops those line breaks so that no space appears in the Japanese text.
+# When SOURCE_DATE_EPOCH (seconds since 1970-01-01 UTC) is set, the date of the book is that day in UTC, and pandoc
+# takes the modification time and the times in the archive from it, so that the same sources give the same EPUB byte
+# for byte. Without it, the date is the day of the build.
 
 set -euo pipefail
 
@@ -23,6 +23,9 @@ TMP_BASE="$SCRIPT_DIR/.tmp/build-epub"
 CSS="$SCRIPT_DIR/book.css"
 FILTER="$SCRIPT_DIR/cjk-line-breaks.lua"
 
+# shellcheck source=./lib/guide_book.sh
+source "$SCRIPT_DIR/lib/guide_book.sh"
+
 DOC_VERSION="${VERSION:-}"
 if [[ -z "$DOC_VERSION" ]]; then
   DOC_VERSION="$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' "$REPO_ROOT/proxy/Cargo.toml" | head -n 1)"
@@ -31,20 +34,15 @@ if [[ ! "$DOC_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "cannot read the version (set VERSION=x.y.z)" >&2
   exit 1
 fi
-TODAY="$(date +%Y-%m-%d)"
-
-CHAPTERS=(
-  "00-preface.md"
-  "01-introduction.md"
-  "02-quickstart.md"
-  "03-binary-deployment.md"
-  "04-rules-and-generations.md"
-  "05-managed-configuration.md"
-  "06-access-control.md"
-  "07-logs.md"
-  "08-acme.md"
-  "09-operations.md"
-)
+if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
+  if [[ ! "$SOURCE_DATE_EPOCH" =~ ^[0-9]{1,12}$ ]]; then
+    echo "SOURCE_DATE_EPOCH is not a number of seconds" >&2
+    exit 1
+  fi
+  TODAY="$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%d)"
+else
+  TODAY="$(date +%Y-%m-%d)"
+fi
 
 usage() {
   echo "usage: $0 all|ja|en" >&2
@@ -52,40 +50,24 @@ usage() {
 
 build_one() {
   local lang="$1"
-  local book title subtitle rights suffix appendix_a appendix_b out
-  case "$lang" in
-    ja)
-      book="$SCRIPT_DIR/ja"
-      title="tukuyomi core"
-      subtitle="運用ガイド ── 日本語版（${DOC_VERSION} ベース）"
-      suffix=".ja.md"
-      appendix_a="付録A　運用リファレンス"
-      appendix_b="付録B　管理リファレンス"
-      out="$DIST/tukuyomi-core-guide-ja.epub"
-      ;;
-    en)
-      book="$SCRIPT_DIR/en"
-      title="tukuyomi core"
-      subtitle="Operations Guide ── English Edition (based on ${DOC_VERSION})"
-      suffix=".md"
-      appendix_a="Appendix A. Operator Reference"
-      appendix_b="Appendix B. Admin Reference"
-      out="$DIST/tukuyomi-core-guide-en.epub"
-      ;;
-    *)
-      usage
-      exit 64
-      ;;
-  esac
+  local book rights out
+  if ! guide_book_load "$lang" "$DOC_VERSION"; then
+    usage
+    exit 64
+  fi
+  book="$GUIDE_BOOK_DIR"
+  out="$DIST/tukuyomi-core-guide-${lang}.epub"
   rights="BSD 2-Clause License"
 
   local tmp="$TMP_BASE-$lang"
   rm -rf "$tmp"
   mkdir -p "$tmp" "$DIST"
+  # Do not leave a previous build in place if this one fails.
+  rm -f "$out"
 
   local files=()
   local chapter
-  for chapter in "${CHAPTERS[@]}"; do
+  for chapter in "${GUIDE_BOOK_CHAPTERS[@]}"; do
     if [[ ! -f "$book/$chapter" ]]; then
       echo "missing: $book/$chapter" >&2
       exit 1
@@ -94,57 +76,7 @@ build_one() {
   done
 
   echo "[1/3][$lang] appendices: taking the references from docs/operations"
-  TMP_DIR="$tmp" REPO_ROOT="$REPO_ROOT" SUFFIX="$suffix" \
-  APPENDIX_A="$appendix_a" APPENDIX_B="$appendix_b" python3 -I - <<'PY'
-import os
-import pathlib
-import re
-
-tmp = pathlib.Path(os.environ["TMP_DIR"])
-repo = pathlib.Path(os.environ["REPO_ROOT"])
-suffix = os.environ["SUFFIX"]
-names = {"operator-reference": ("appendix-a", os.environ["APPENDIX_A"]),
-         "admin-reference": ("appendix-b", os.environ["APPENDIX_B"])}
-link = re.compile(r"(?<!!)\[([^\]\n]+)\]\(([^)\s]+)\)")
-
-for stem, (anchor, heading) in names.items():
-    src = repo / "docs" / "operations" / (stem + suffix)
-    lines = src.read_text(encoding="utf-8").splitlines()
-    # The language line and the blank line after it are not part of the book.
-    if lines and lines[0].startswith("[English]"):
-        lines = lines[2:] if len(lines) > 1 and lines[1] == "" else lines[1:]
-    if not lines or not lines[0].startswith("# "):
-        raise SystemExit(f"{src}: the first line is not the title")
-    lines[0] = f'<a id="{anchor}"></a>\n\n# {heading}'
-
-    def target(m):
-        label, t = m.group(1), m.group(2)
-        if t.startswith(("http://", "https://", "mailto:", "#")):
-            return m.group(0)
-        path, _, frag = t.partition("#")
-        name = pathlib.PurePosixPath(path).name
-        for other, (other_anchor, _) in names.items():
-            if name in (other + ".md", other + ".ja.md"):
-                return f"[{label}](#{other_anchor})"
-        resolved = (pathlib.PurePosixPath("docs/operations") / path)
-        parts = []
-        for p in resolved.parts:
-            if p == "..":
-                if not parts:
-                    raise SystemExit(f"{src}: the link {t} leaves the repository")
-                parts.pop()
-            elif p != ".":
-                parts.append(p)
-        if not (repo / pathlib.PurePosixPath(*parts)).exists():
-            raise SystemExit(f"{src}: the link {t} points to no file")
-        where = "/".join(parts)
-        return f"{label}（`{where}`）" if suffix == ".ja.md" else f"{label} (`{where}`)"
-
-    text = "\n".join(link.sub(target, line) for line in lines) + "\n"
-    out = tmp / f"{anchor}.md"
-    out.write_text(text, encoding="utf-8")
-    print(f"  {out.name}: {len(lines)} lines from {src.relative_to(repo)}")
-PY
+  guide_book_appendices "$tmp" "$REPO_ROOT"
 
   local extra=("$tmp/appendix-a.md" "$tmp/appendix-b.md")
   if [[ -f "$book/C-release-notes.md" ]]; then
@@ -163,13 +95,14 @@ PY
     --split-level=1 \
     --css="$CSS" \
     --lua-filter="$FILTER" \
-    --metadata "title=${title}" \
-    --metadata "subtitle=${subtitle}" \
+    --metadata "title=${GUIDE_BOOK_TITLE}" \
+    --metadata "subtitle=${GUIDE_BOOK_EDITION_SUBTITLE}" \
     --metadata "lang=${lang}" \
     --metadata "identifier=urn:tukuyomi-core:guide:${lang}:${DOC_VERSION}" \
     --metadata "creator=vril" \
     --metadata "rights=${rights}" \
     --metadata "date=${TODAY}" \
+    --metadata "toc-title=${GUIDE_BOOK_TOC_TITLE}" \
     -o "$out" \
     "${files[@]}" "${extra[@]}"
 

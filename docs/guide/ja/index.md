@@ -4,7 +4,7 @@ subtitle: "運用ガイド ── 日本語版"
 language: ja
 audience: "tukuyomi core を導入・運用するエンジニア（インフラ／SRE／プラットフォーム担当）"
 version: "0.2.0 ベース"
-build: "pandoc → EPUB 3"
+build: "pandoc → EPUB 3、pandoc → HTML → Chrome → PDF"
 ---
 
 # tukuyomi core 運用ガイド（日本語版）
@@ -52,7 +52,11 @@ build: "pandoc → EPUB 3"
 ```
 docs/guide/
 ├── build-epub.sh          … EPUB を作る台本
+├── build-pdf.sh           … PDF を作る台本
 ├── book.css               … EPUB の体裁
+├── book-pdf.css           … PDF の体裁
+├── cjk-line-breaks.lua    … 日本語の文の間の改行を消す pandoc のフィルター
+├── lib/guide_book.sh      … 2 つの台本が使う章の並び、題、付録の取り込み
 └── ja/
     ├── index.md           … 本ファイル（方針・目次）
     ├── 00-preface.md      … はじめに
@@ -62,12 +66,16 @@ docs/guide/
     └── C-release-notes.md … 付録C
 ```
 
-付録A と付録B はファイルを置かずに、`build-epub.sh` がドキュメントの運用リファレンスと管理リファレンスを取り込んで作ります。
+付録A と付録B はファイルを置かずに、`build-epub.sh` と `build-pdf.sh` がドキュメントの運用リファレンスと管理リファレンスを取り込んで作ります。
 
 ## 作り方（メモ）
 
 - 章のファイルを目次の順に pandoc でつなぎ、EPUB 3 を作ります。
   目次、扉、章ごとの改ページを付けます。
+- PDF は、同じ章と付録を pandoc で 1 つの HTML にまとめ、Google Chrome（headless）で A4 の PDF にします。Chrome と、フォントの Noto Sans CJK JP が必要です。
+- 環境変数 `SOURCE_DATE_EPOCH`（1970-01-01 UTC からの秒数）を渡すと、本の日付はその日（UTC）になります。渡さないときは、作った日です。
+  EPUB は、同じファイルから作れば毎回まったく同じものになります。
+  PDF には Chrome が作った時刻を書き込むので、作るたびにその部分が変わります。
 - 付録A と付録B は、ドキュメントの文書の題を付録の題に替えて取り込み、リンクも書き替えます。
   2 つの文書の間のリンクは本に収めた付録へのリンクにし、ほかのドキュメントへのリンクは、文書の名前とリポジトリの中のパス（例: ビルドと配置（`docs/build/binary-deployment.ja.md`））にします。
 - 表紙は文字だけ（題、副題、版）にします。

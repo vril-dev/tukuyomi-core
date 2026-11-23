@@ -4,7 +4,7 @@ subtitle: "Operations Guide ── English Edition"
 language: en
 audience: "Engineers who deploy and operate tukuyomi core (infrastructure, SRE, platform teams)"
 version: "based on 0.2.0"
-build: "pandoc → EPUB 3"
+build: "pandoc → EPUB 3; pandoc → HTML → Chrome → PDF"
 ---
 
 # tukuyomi core Operations Guide (English Edition)
@@ -50,7 +50,11 @@ This book rearranges the English documentation in the tukuyomi core repository (
 ```
 docs/guide/
 ├── build-epub.sh          … the script that builds the EPUB
+├── build-pdf.sh           … the script that builds the PDF
 ├── book.css               … the style of the EPUB
+├── book-pdf.css           … the style of the PDF
+├── cjk-line-breaks.lua    … the pandoc filter that drops the line breaks between Japanese sentences
+├── lib/guide_book.sh      … the chapter list, the titles, and the appendix step that both scripts use
 └── en/
     ├── index.md           … this file (policy and contents)
     ├── 00-preface.md      … Preface
@@ -60,10 +64,12 @@ docs/guide/
     └── C-release-notes.md … Appendix C
 ```
 
-There are no files for Appendix A and Appendix B. `build-epub.sh` builds them from the operator reference and the admin reference in the documentation.
+There are no files for Appendix A and Appendix B. `build-epub.sh` and `build-pdf.sh` build them from the operator reference and the admin reference in the documentation.
 
 ## How the Book Is Built (Notes)
 
 - pandoc joins the chapter files, in the order of the contents, into an EPUB 3 with a table of contents, a title page, and a page break before each chapter.
+- The PDF has the same chapters and appendices: pandoc joins them into one HTML file, and Google Chrome (headless) prints it as an A4 PDF. It needs Chrome and the Noto Sans CJK JP font.
+- When the environment variable `SOURCE_DATE_EPOCH` (seconds since 1970-01-01 UTC) is set, the date of the book is that day (UTC), and the same files give exactly the same EPUB at every build. Without it, the date is the day of the build. Chrome writes the time of the build into the PDF, so that part of the PDF changes at every build.
 - Appendix A and Appendix B include the operator reference and the admin reference, with their titles replaced by the appendix titles. Links between the two documents become links to the appendices in the book, and links to other documents become the name of the document and its path in the repository (for example, Build and Deployment (`docs/build/binary-deployment.md`)).
 - The cover is text only (title, subtitle, and version).
