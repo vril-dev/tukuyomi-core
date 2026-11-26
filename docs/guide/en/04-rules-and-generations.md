@@ -234,6 +234,8 @@ If you send SIGHUP before step 3, ModSecurity is not running, so the reload is r
 
 ## 4.10 Operational Notes
 
+To close the chapter, here are the points to watch when you manage rule sets and generations.
+
 - **A generation needs three operations before it is in use**: import, choice, and switch (SIGUSR1). The commands alone do not change the running proxy.
 - **Start with `--detect-only`**: check for false positives, then import a generation in block mode again. Even a detect-only generation blocks on rules 4000001 to 4000003.
 - **Passing the trial does not mean that the rules are correct**: the trial shows only that the rule set starts and lets ordinary requests through (see section 4.2).

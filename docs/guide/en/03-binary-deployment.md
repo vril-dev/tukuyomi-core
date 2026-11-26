@@ -362,7 +362,7 @@ The proxy is not subject to this restriction. The proxy reads the configuration,
 
 ## 3.9 Operational Notes
 
-The main points of this chapter are as follows.
+To close the chapter, here are the points to watch when you deploy and run the proxy.
 
 - **Run the service and the commands as a dedicated OS user**: they do not run as root. Create the directories in the table in section 3.4 before the start.
 - **Check a changed configuration with `config check` first**: a successful `systemctl reload` does not mean that the configuration was switched, so check the result in the log lines.

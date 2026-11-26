@@ -259,6 +259,8 @@ For the setting keys of a host policy, the rules for comparing hosts, and how th
 
 ## 6.9 Operational Notes
 
+To close the chapter, here are the points to watch when you manage access control and rate limits.
+
 - **Changing the global settings**: also review the host policies that do not inherit them ("Settings for this host" and "Not used"), because global refusals do not take effect for those hosts.
 - **`allow_countries` and `UNKNOWN`**: when you write `allow_countries`, consider whether `UNKNOWN` is needed. Without `UNKNOWN`, clients with private addresses (such as monitoring on the same network) are refused.
 - **Size of `keys`**: make `keys` of `rate_limit` sufficiently larger than the number of clients that come at the same time. If it is too small, real clients are removed from the table and the limit is loosened. The memory is about 100 bytes per client.

@@ -211,6 +211,8 @@ The log directory is not restored, so the logs written after the update remain. 
 
 ## 9.5 Operational Notes
 
+To close the chapter, here are the points to watch in day-to-day operation.
+
 - **Results of configuration changes**: even when `systemctl reload` reports success, check the result with the `reload: configuration replaced` or `reload: configuration refused` line in the log.
 - **Setting keys that cannot change while running**: change them by restarting with `systemctl restart`. When you change setting keys that the admin process and the records shipper read, restart those processes too.
 - **Rule generations**: a configuration reload does not switch them. Switch generations with SIGUSR1 or in the admin screens.

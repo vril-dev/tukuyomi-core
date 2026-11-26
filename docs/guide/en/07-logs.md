@@ -177,7 +177,7 @@ A refused request gets 503 and is counted in `tukuyomi_records_refused_total`. T
 - `required` needs `records`. When you use both `ship` and `required`, set `files` to 3 or more.
 - The logs of requests answered before the route is chosen and of requests answered without reading the body (the 403 and 429 of the global `access` and `rate_limit`, requests refused by the header section checks, connection logs, and so on) are written with `best_effort` handling (discarded and counted if they cannot be written), whatever the route's value.
 
-For the exact rules of the three conditions for accepting a request, and the list of requests logged with `best_effort` handling, see "What Logs Keep (`keep` and the `records` of a Route)" in Appendix A (Operator Reference).
+For the exact rules of the three conditions for accepting a request, and the list of requests logged with `best_effort` handling, see "How Logs Are Kept (`keep` and the `records` of a Route)" in Appendix A (Operator Reference).
 
 ## 7.5 Users Who Can Read the Logs
 

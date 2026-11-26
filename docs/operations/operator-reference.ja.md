@@ -257,7 +257,7 @@ tukuyomi-proxy acme renew <config>
 - CA から受け取ったもののうち、標準エラーに出すのは、エラーの文書（problem document）の `type` だけです。
 - SIGINT と SIGTERM を受けると、チャレンジのファイルを削除して、すぐに終了します。
 - 動作中のプロキシは新しい証明書を検知しません。
-  新しい証明書を使わせるには、コマンドの後にプロキシへ SIGUSR2 を送ります（`systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`）。
+  新しい証明書を使わせるには、コマンドの後にプロキシへ SIGUSR2 を送ります（`systemctl kill -s SIGUSR2 --kill-whom=main tukuyomi-core.service`）。
 - 終了コードは次のとおりです。
   - 0: すべてが `renewed` か `valid`（`managed` のある設定で、`acme` を持つ証明書が無いときも 0 です）
   - 1: 1 つでも `failed` がある、停止された、実行できない、root で実行した
@@ -3094,7 +3094,7 @@ DB に接続したとき、ログ送信プロセスはテーブルを探し、�
 
    `2.1 renewed` のような行が出ます。
    `managed` のある設定では、`admin route renewed`、`site www renewed` のような行です。
-4. `systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service` で SIGUSR2 を送ると、プロキシが証明書を使い始めます。
+4. `systemctl kill -s SIGUSR2 --kill-whom=main tukuyomi-core.service` で SIGUSR2 を送ると、プロキシが証明書を使い始めます。
 5. テスト用の CA で通ったら、本番の CA に切り替えます。
    - テスト用の CA の証明書は有効期限が来ていないため、そのままでは置き換わりません（`valid`）。
      その証明書のファイルを削除します。
