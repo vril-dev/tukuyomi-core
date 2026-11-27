@@ -174,7 +174,7 @@ tukuyomi-proxy acme renew <config>
 - With `managed`, the command loads the `current` version, and that version cannot be deleted until the command exits. It does not take the managed store lock.
 - From what it receives from the CA, the only thing it writes to standard error is the `type` of a problem document.
 - When it receives SIGINT or SIGTERM, it deletes the challenge files and exits at once.
-- The running proxy does not notice new certificates, so after the command, send it SIGUSR2 (`systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`).
+- The running proxy does not notice new certificates, so after the command, send it SIGUSR2 (`systemctl kill -s SIGUSR2 --kill-whom=main tukuyomi-core.service`).
 - The exit codes are as follows.
   - 0: every certificate is `renewed` or `valid` (also when, with `managed`, no certificate has `acme`)
   - 1: at least one is `failed`, the command was stopped, it could not run, or it was run as root
@@ -293,10 +293,10 @@ Here, t0 is the time of the first reason to stop (a signal, or a failure at star
 4. It waits until `t0 + stop_wait + kill_grace` for the inspection kernels of all running engines to end.
 5. It flushes the logs for at most 200 ms and exits.
 
-At the end, a `stop: kernel ..., bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` line is written. If an inspection kernel could not be confirmed to have ended, a `stop: the driver stopped: ...` or `stop: the driver gave no end` line is written instead.
+At the end, a `stop: kernel ..., engine <engine>, bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` line is written. If an inspection kernel could not be confirmed to have ended, a `stop: the driver stopped: ...` or `stop: the driver gave no end` line is written instead.
 
 - Before that, a `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` line is written for each engine that is running.
-- There is one `stop: kernel` line. The values `bye`, `exit_confirmed`, `dir_removed`, and so on are those of the running engine that comes first in name order. The results of the other engines, and of the inspection kernels that stopped earlier in a switch, are combined in `retired_clean`.
+- There is one `stop: kernel` line. The values `bye`, `exit_confirmed`, `dir_removed`, and so on are those of the running engine that comes first in name order, and `engine` shows its name. The results of the other engines, and of the inspection kernels that stopped earlier in a switch, are combined in `retired_clean`.
 - `bye true` shows that the inspector process sent the end notice before it exited.
 - The exit code is 0 only if the reason to stop is not a failure and, for every stopped inspection kernel (including those of the other engines and those stopped earlier in a switch), the inspector process was confirmed to have ended and the work directory to have been removed.
 
@@ -621,7 +621,7 @@ A route is `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "ma
 | `rewrite` | Rewrites the request sent to the upstream and the response returned (see below) |
 | `stream` | `{"idle_ms", "total_ms", "websocket"}`. Write all three (see "Streaming Responses and WebSocket (`stream`)" below) |
 | `max_body` | The body limit for that route. It is at most `proxy.max_body`, so it can only lower the limit. If 0, no body is accepted |
-| `records` | How logs are kept for that route's requests: one of `best_effort`, `required`, and `security`. If omitted, it follows `records.keep` (see "What Logs Keep (`keep` and the `records` of a Route)" under "Logs" below) |
+| `records` | How logs are kept for that route's requests: one of `best_effort`, `required`, and `security`. If omitted, it follows `records.keep` (see "How Logs Are Kept (`keep` and the `records` of a Route)" under "Logs" below) |
 
 - A route compares the request's `Host`, and the request target up to the first `?`, as the bytes received.
   - Nothing is decoded or normalized. The path is case-sensitive.
@@ -1092,7 +1092,7 @@ The memory estimate has three parts: the values measured for each inspector proc
 
 An engine that no upstream uses:
 
-- An engine may be running that no upstream uses and that is not the default engine, for example when you start ModSecurity to try it out. Even for such an engine, if its inspection kernel fails, the whole proxy stops, writes a `stop: the kernel failed: <reason>` line, and exits with 1 (see "`kernel`" above). For example, when `kernel.restarts` is 0 and you stop the inspector process of that engine with SIGKILL, the proxy writes a `stop: the kernel failed: BudgetExhausted` line and stops.
+- An engine may be running that no upstream uses and that is not the default engine, for example when you start ModSecurity to try it out. Even for such an engine, if its inspection kernel fails, the whole proxy stops, writes a `stop: the kernel failed, engine <engine>: <reason>` line, and exits with 1 (see "`kernel`" above). For example, when `kernel.restarts` is 0 and you stop the inspector process of that engine with SIGKILL, the proxy writes a `stop: the kernel failed, engine <engine>: BudgetExhausted` line and stops.
 - After trying it out, clear that engine's choice with `rules deactivate`. From the next restart, that engine does not start. The running proxy does not stop an engine that has started, so restart the proxy to stop it (see "Chosen Generation per Engine" below).
 
 Steps to change the default engine:
@@ -1753,7 +1753,7 @@ Example (the `sha256` value is an example; write the value that `sha256sum` prin
 
 ## Logs
 
-Logs are written to standard error, one JSON object per line (to the journal under systemd). If the configuration has `records`, the same lines are also written to files (except some of the first lines at start; see "Log Files (`records`)" below). If `records.ship` is also present, another process (the records shipper) sends the lines in the files to PostgreSQL or MySQL (see "Records Shipper" below). For each route, you can choose whether to let requests through or refuse them when logs cannot be kept (see "What Logs Keep (`keep` and the `records` of a Route)" below). The short-lived commands (`config check`, `rules`, `managed`, `acme`, `admin bootstrap`, `admin reset`) still write plain text lines for people to read.
+Logs are written to standard error, one JSON object per line (to the journal under systemd). If the configuration has `records`, the same lines are also written to files (except some of the first lines at start; see "Log Files (`records`)" below). If `records.ship` is also present, another process (the records shipper) sends the lines in the files to PostgreSQL or MySQL (see "Records Shipper" below). For each route, you can choose whether to let requests through or refuse them when logs cannot be kept (see "How Logs Are Kept (`keep` and the `records` of a Route)" below). The short-lived commands (`config check`, `rules`, `managed`, `acme`, `admin bootstrap`, `admin reset`) still write plain text lines for people to read.
 
 Every log line starts with the following two fields. A field without a value is left out (it is not written as `null`).
 
@@ -1833,9 +1833,9 @@ The `line` messages are as follows.
 | Message | Case |
 |---|---|
 | `start: ...` | The startup steps (`start: managed version <version>`; for each engine that starts, `start: rules generation <fingerprint>`, `start: rules engine <name>`, `start: rules mode block` (or `detect`), and `start: rules routes <count>` (the default engine first); for each upstream that points to an engine whose chosen generation is detect-only, `start: upstream <name>: engine <engine>, mode detect`; `start: rules store refused: <reason>`, `start: rules generation refused: <reason>`, `start: tls certificate not issued yet (<place>)`, `start: the kernel is ready`, `start: listening`, `start: record file refused: <reason>`, `start: control socket refused: <reason>`, and so on) |
-| `reload: ...` | Receipt of SIGHUP, SIGUSR1, SIGUSR2, and a `reload` request on the control socket (`reload: SIGHUP`, `reload: control reload <version>`, and so on). The stages and the result of a configuration reload (`reload: configuration replaced <sha256>`, `reload: configuration replaced <sha256> managed <version>` in a configuration with `managed`, `reload: configuration refused: <reason>`, `reload: tls certificate not issued yet (<place>)`, `reload: rate limit table started anew`, `reload: rate limit table of host policy <name> started anew`, `reload: upstream <name>: engine <engine>, mode detect` for each upstream that points to an engine whose chosen generation is detect-only, and so on; see "SIGHUP (Configuration Reload)" above). A switch (SIGUSR1 and the control socket; for each engine, `reload: starting generation <fingerprint>`, `reload: rules engine <name>`, `reload: rules mode block` (or `detect`), and `reload: rules routes <count>` when it starts, `reload: generation <fingerprint> is ready, switched` when it is ready, `reload: generation <fingerprint> retired, clean true` (or `false`) when the previous generation was stopped, `reload: generation <fingerprint> is already running` for a generation that is already running, `reload: generation <fingerprint> failed to start: <reason>` when it failed to start, `reload: a switch is in progress, ignored` when a switch is in progress, and `reload: rules store refused: <reason>` when it was refused), and the result of a certificate replacement |
+| `reload: ...` | Receipt of SIGHUP, SIGUSR1, SIGUSR2, and a `reload` request on the control socket (`reload: SIGHUP`, `reload: control reload <version>`, and so on). The stages and the result of a configuration reload (`reload: configuration replaced <sha256>`, `reload: configuration replaced <sha256> managed <version>` in a configuration with `managed`, `reload: configuration refused: <reason>`, `reload: tls certificate not issued yet (<place>)`, `reload: rate limit table started anew`, `reload: rate limit table of host policy <name> started anew`, `reload: upstream <name>: engine <engine>, mode detect` for each upstream that points to an engine whose chosen generation is detect-only, and so on; see "SIGHUP (Configuration Reload)" above). A switch (SIGUSR1 and the control socket; for each engine, `reload: starting generation <fingerprint>`, `reload: rules engine <name>`, `reload: rules mode block` (or `detect`), and `reload: rules routes <count>` when it starts, `reload: generation <fingerprint> is ready, switched` when it is ready, `reload: generation <fingerprint> retired, engine <engine>, clean true` (or `false`) when the previous generation was stopped, `reload: generation <fingerprint> is already running` for a generation that is already running, `reload: generation <fingerprint> failed to start: <reason>` when it failed to start, `reload: a switch is in progress, ignored` when a switch is in progress, and `reload: rules store refused: <reason>` when it was refused), and the result of a certificate replacement |
 | `control: switch ...`, `control: reload ...` | The responses to the switch and reload requests on the control socket (`control: reload <version>: <result> (<reason>)` and so on; see "Control Socket" above) |
-| `driver: inspector incarnation changed, inc <count>, restarts <count>` | The inspector process restarted |
+| `driver: inspector incarnation changed, engine <engine>, inc <count>, restarts <count>` | The inspector process restarted |
 | `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` | One line for each running engine, written when a stop begins (see "Stopping" above) |
 | `conn <number>: internal fault: <reason>` | An inconsistency inside the proxy |
 | `notify: <notice> not sent ...` | A notification to systemd could not be sent |
@@ -1851,7 +1851,7 @@ The `line` messages are as follows.
 - Both counts appear in `/metrics` (`tukuyomi_records_dropped_total`, `tukuyomi_record_write_errors_total`). While standard error is blocked, they cannot be reported in logs.
 - One line is less than 4 KiB and is not cut (the field limits keep it under this size).
 - When the log file (`records`) cannot be written, only that line is missing from the file; it still appears on standard error. The count appears in `tukuyomi_record_file_errors_total` (see "Log Files (`records`)" below).
-- All of the above is the default handling (`best_effort`), which lets requests through even when logs cannot be kept. You can also set a route to refuse requests when logs cannot be kept (see "What Logs Keep (`keep` and the `records` of a Route)" below).
+- All of the above is the default handling (`best_effort`), which lets requests through even when logs cannot be kept. You can also set a route to refuse requests when logs cannot be kept (see "How Logs Are Kept (`keep` and the `records` of a Route)" below).
 
 ### Log Files (`records`)
 
@@ -1868,7 +1868,7 @@ When you write `records` in the configuration, the lines written to standard err
 | `dir` | An absolute path, up to 3840 bytes | The directory where the files are placed. The proxy does not create it, so create it first. It must be a directory, not a symbolic link, owned by the proxy's OS user, with no permissions for the group and other users |
 | `file_bytes` | 1 MiB to 1 GiB | The size of one file. A line that would make the file in use exceed this is written to the next file |
 | `files` | 2 to 64 | The number of files to keep (including the one in use). 3 or more when `ship` is present and `keep` or the `records` of a route has `required` |
-| `keep` | `best_effort`, `required` | How logs are kept for the routes that have no `records` of their own and for the default upstream (see "What Logs Keep (`keep` and the `records` of a Route)" below). `best_effort` if omitted |
+| `keep` | `best_effort`, `required` | How logs are kept for the routes that have no `records` of their own and for the default upstream (see "How Logs Are Kept (`keep` and the `records` of a Route)" below). `best_effort` if omitted |
 | `sync_ms` | 1 to 60000 | The longest time before written lines are synced to disk (`fsync`). If omitted, the proxy does not sync and leaves it to the OS (see "Lines that go into the file" below) |
 | `ship` | `{"db_driver", "db_dsn_file", "batch", "interval_ms", "retention_days"}` | The records shipper settings (see "Records Shipper" below). The proxy does not run the records shipper; it only watches how far it is behind |
 
@@ -1897,7 +1897,7 @@ When you write `records` in the configuration, the lines written to standard err
   - The directory is checked before it is reopened and before a rotation, in the same way as at start.
 - If there is a records shipper (`ship`), it places `ship.state` (how far it has sent) in the same directory, and `ship.state.new` only while it rewrites it. The proxy only reads `ship.state` and deletes neither.
 
-### What Logs Keep (`keep` and the `records` of a Route)
+### How Logs Are Kept (`keep` and the `records` of a Route)
 
 For each route, you can choose what to do when logs cannot be kept and which logs to write. If a route has no `records`, the global `records.keep` applies, and if there is no `records.keep`, the value is `best_effort`.
 
@@ -2048,7 +2048,7 @@ When the records shipper connects to the DB, it looks for the tables and creates
 - Lines in a log file that rotation removed before the records shipper read them are lost.
   - If it was the file that the records shipper had open, the records shipper counts the lost lines, adds them to `lost_lines` in the position table, and writes the line `records-ship: a record file was removed before it was shipped, <count> lines lost`.
   - Lines in a file that disappeared before the records shipper opened it (for example, when the proxy rotated more than `files` times while the DB was unreachable for a long time) cannot be counted. The records shipper writes only a line that contains `lines may be lost`. This line may also appear when nothing was lost.
-- A `required` route of the proxy refuses requests before this happens (see "What Logs Keep (`keep` and the `records` of a Route)" above). A `best_effort` or `security` route does not.
+- A `required` route of the proxy refuses requests before this happens (see "How Logs Are Kept (`keep` and the `records` of a Route)" above). A `best_effort` or `security` route does not.
 - Do not truncate the log files (for example, with logrotate's `copytruncate`). The records shipper treats a truncated file as the same file and may not send its first lines. The proxy rotates the files itself.
 
 ### Records Shipper Errors
@@ -2103,9 +2103,9 @@ The metric values are kept in the proxy's memory and start again from 0 after a 
 | `tukuyomi_records_dropped_total` | `counter` | | Logs that were discarded (see "When Logs Cannot Be Written" above) |
 | `tukuyomi_record_write_errors_total` | `counter` | | Logs that failed to be written |
 | `tukuyomi_record_file_errors_total` | `counter` | | Logs that could not be written to the log file, and failed syncs (see "Log Files (`records`)" above) |
-| `tukuyomi_records_refused_total` | `counter` | | Requests that a `required` route refused with 503 because logs could not be kept (see "What Logs Keep (`keep` and the `records` of a Route)" above) |
+| `tukuyomi_records_refused_total` | `counter` | | Requests that a `required` route refused with 503 because logs could not be kept (see "How Logs Are Kept (`keep` and the `records` of a Route)" above) |
 | `tukuyomi_records_healthy` | `gauge` | | 1 if the last write to the log file succeeded and the thread that writes logs is running, 0 otherwise |
-| `tukuyomi_records_admitting` | `gauge` | | 1 if requests to `required` routes are accepted now, 0 if they are refused (the three conditions in "What Logs Keep (`keep` and the `records` of a Route)" above). It is also exposed when there is no `required` route |
+| `tukuyomi_records_admitting` | `gauge` | | 1 if requests to `required` routes are accepted now, 0 if they are refused (the three conditions in "How Logs Are Kept (`keep` and the `records` of a Route)" above). It is also exposed when there is no `required` route |
 | `tukuyomi_records_unshipped_bytes` | `gauge` | | The bytes of the log files that the records shipper has not sent yet. Exposed only when `records.ship` is present. While the proxy cannot tell how far the records shipper is behind, it has no value |
 | `tukuyomi_start_time_seconds` | `gauge` | | The start time (Unix time in seconds) |
 
@@ -2149,7 +2149,7 @@ If the environment has `NOTIFY_SOCKET`, the proxy sends `READY=1` to that socket
    ```
 
    Lines like `2.1 renewed` are written (with `managed`, lines like `admin route renewed` and `site www renewed`).
-4. Send SIGUSR2 (`systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`), and the proxy starts to use the certificate.
+4. Send SIGUSR2 (`systemctl kill -s SIGUSR2 --kill-whom=main tukuyomi-core.service`), and the proxy starts to use the certificate.
 5. When it works with the test CA, switch to the production CA.
    - The certificate from the test CA has not expired, so `acme renew` leaves it as it is (`valid`). Delete that certificate's files: `cert_file` and `key_file` for listeners and the admin route, and `chain` and `key` in `acme/<hosts-sha256>/` in the managed store for an ACME site.
    - Change `directory_url` to that of the production CA. If the server certificate of the production CA's API comes from a different root certificate, also change `ca_file`.

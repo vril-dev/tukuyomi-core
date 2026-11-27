@@ -64,7 +64,7 @@ impl Source {
 
 /// What ended one wait.
 pub(super) enum Event {
-    Ready(Result<(), Failure>),
+    Ready(Result<(), (Engine, Failure)>),
     Signal(&'static str),
     /// SIGHUP.
     Configuration,
@@ -85,7 +85,11 @@ pub(super) enum Event {
     ConfigurationLost,
     /// An order from the control socket.
     Control(Order),
-    Failed(Failure),
+    /// The kernel of `engine`, which served, failed.
+    Failed {
+        engine: Engine,
+        failure: Failure,
+    },
     Ended(End),
     Lost(Source),
     /// The deadline of the wait passed.
@@ -105,8 +109,8 @@ pub(super) struct Waits {
     hup: Signal,
     usr1: Signal,
     usr2: Signal,
-    ready: Option<oneshot::Receiver<Result<(), Failure>>>,
-    failed: Option<mpsc::Receiver<Failure>>,
+    ready: Option<oneshot::Receiver<Result<(), (Engine, Failure)>>>,
+    failed: Option<mpsc::Receiver<(Engine, Failure)>>,
     /// The engine and the answer of the switch that is under way, if there is one. There is one at a time.
     pub(super) switch: Option<(Engine, oneshot::Receiver<Switched>)>,
     /// The engines that SIGUSR1 has still to switch, after the one under way.
@@ -123,8 +127,8 @@ pub(super) struct Waits {
 impl Waits {
     pub(super) fn new(
         signals: Signals,
-        ready: oneshot::Receiver<Result<(), Failure>>,
-        failed: mpsc::Receiver<Failure>,
+        ready: oneshot::Receiver<Result<(), (Engine, Failure)>>,
+        failed: mpsc::Receiver<(Engine, Failure)>,
         end: oneshot::Receiver<End>,
     ) -> Waits {
         Waits {
@@ -184,7 +188,11 @@ impl Waits {
             if answer.is_none() {
                 self.failed = None;
             }
-            return Poll::Ready(answer.map_or(Event::Lost(Source::Failed), Event::Failed));
+            return Poll::Ready(
+                answer.map_or(Event::Lost(Source::Failed), |(engine, failure)| {
+                    Event::Failed { engine, failure }
+                }),
+            );
         }
         if let Some((engine, switch)) = self.switch.as_mut()
             && let Poll::Ready(answer) = Pin::new(switch).poll(cx)

@@ -11,9 +11,9 @@ import { ENGINE_FIELD } from './edit/locate.js';
 import { Watch, isJob, jobPanel, watchLimit } from './job.js';
 
 /**
- * What `GET /api/managed` says of the proxy: `unreachable`; `silent` (it can be reached but had no place to answer
- * about its state); `unmanaged` (it answered and serves no version: its configuration has no `managed`); `reloading`;
- * or `ok`.
+ * What `GET /api/managed` says of the proxy: `unreachable`; `silent` (it can be reached but did not report its state:
+ * it had no place to answer, or it is a proxy of an older version that does not say whether it is reloading);
+ * `unmanaged` (it answered and serves no version: its configuration has no `managed`); `reloading`; or `ok`.
  */
 export function proxyOf(state) {
   if (state.reachable !== true) return 'unreachable';

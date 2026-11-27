@@ -2,6 +2,60 @@
 
 The release notes as they were published, newest first.
 
+## 0.2.2
+
+### Summary
+
+- **Log lines about the inspection kernels now name the engine.**
+  - With two engines running, it was not clear which engine a line was about.
+  - Four lines changed: `driver: inspector incarnation changed, engine <engine>, inc <n>, restarts <n>`, `stop: the kernel failed, engine <engine>: <reason>`, `reload: generation <fingerprint> retired, engine <engine>, clean <bool>`, and `stop: kernel <phase>, engine <engine>, bye …`.
+  - The `retired` line appears at every switch of a generation, not only when the proxy stops.
+- **Confirmation dialogs on the admin screens now ask a question.**
+  - For example, the title is now "Apply this version?" instead of "Apply this version". The buttons did not change.
+- **The table on the "Rule generations" screen now fits the screen.**
+  - On screens narrower than 1280 px, each row is shown as a box, as in the other long tables.
+  - In a row of the list, the button for choosing a generation is now "Switch". In a generation's details, it is still "Switch to this generation".
+- **Other fixes on the admin screens.**
+  - English sentences with a count no longer use "(s)", so they read correctly for one item.
+  - The message shown when the proxy does not answer a question about its state now gives the real cause: its control socket was at its limit of connections, or the proxy is an earlier build than the admin process.
+  - When the proxy refuses to apply a managed configuration version, the detail is shown in the screen's language when the screens know that sentence.
+  - Long names without hyphens no longer push notices past the edge of a dialog or a panel.
+- **Documentation.**
+  - The admin reference now says that the admin API answers 500 when the record of an engine's chosen generation is broken or the two records disagree, and that `rules activate` fixes it.
+  - The operator reference heading "What Logs Keep" is now "How Logs Are Kept".
+
+### Upgrade notes
+
+- **Updates are supported from 0.2.1.** Until 1.0, only updates from the previous release are supported.
+  - Setting keys, commands, and the admin API are the same as in 0.2.1, so the 0.2.1 configuration file and stores are used as they are.
+  - Four log lines changed (see above). If you watch the logs for these lines, update the patterns.
+  - The text of the admin screens changed in English and Japanese. Check any runbook or script that relies on that text.
+- **Before you update from 0.2.1, take a backup.**
+  - The steps are in "Backup Before an Update" in the operator reference.
+  - After taking the backup, replace all the executables with those of this release. The admin process, the proxy, and the records shipper must be of the same release.
+  - Start the admin process, the proxy, and the records shipper in this order, and then start the certificate renewal timer.
+- **If you run 0.2.0 or earlier, update to 0.2.1 first.** Follow the upgrade notes of the 0.2.1 release.
+- **To go back to 0.2.1, restore the backup taken before the update.** The steps are in "Going Back to the Previous Version" in the operator reference. Changes made after the update, such as generations imported or chosen and users created, are lost.
+
+### Validation
+
+- The whole test suite passed on the release tree, built with `--offline --locked`:
+  - the inspection kernel;
+  - the proxy: 942 unit tests and 112 process tests;
+  - the ModSecurity inspector;
+  - the records shipper with its database tests;
+  - clippy and fmt.
+- The 156 admin UI tests also passed.
+- The admin screens were checked in a browser at 761, 1279, and 1280 px wide, in English and Japanese, with Coraza and ModSecurity generations.
+- Built the four executables and the tarball, and verified the checksums. Two builds of the tarball are byte-identical.
+  - The release ModSecurity inspector, with a Core Rule Set generation, passed an ordinary request and blocked SQL injection.
+  - The dependencies are the same as in 0.2.1.
+  - Requirements: Linux x86_64 with Landlock (5.13 or later), glibc 2.39 or later, and for the ModSecurity inspector, libstdc++ with `GLIBCXX_3.4.29` and `CXXABI_1.3.15`.
+- Built the EPUB and PDF books from the same commit as the tarball. Two builds of each EPUB are byte-identical.
+  - Two builds of a PDF differ, because Chrome writes the build time and identifiers into it. The SHA-256 values of the PDFs are in `tukuyomi-core_v0.2.2_SHA256SUMS`.
+
+**Full changelog:** https://github.com/vril-dev/tukuyomi-core/compare/v0.2.1...v0.2.2
+
 ## 0.2.1
 
 ### Summary

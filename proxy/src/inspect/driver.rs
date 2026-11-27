@@ -176,6 +176,8 @@ pub enum Switched {
 #[derive(Debug)]
 pub enum End {
     Done {
+        /// The engine of `kernel`: the first of the engines that were running, in the order of their names.
+        engine: Engine,
         /// The end of the kernel that served last.
         kernel: tukuyomi_kernel::Shutdown,
         /// Every kernel that was stopped before it stopped with its process gone and its directory removed.
@@ -270,10 +272,11 @@ pub struct State {
 /// The main thread's side of the driver.
 pub struct Driver {
     pub ingress: SyncSender<Msg>,
-    /// Every kernel that was started at the start is ready, or the failure of the first that failed before it was.
-    pub ready: oneshot::Receiver<Result<(), Failure>>,
-    /// A kernel that served failed; the receiver closes only when the driver is gone.
-    pub failed: mpsc::Receiver<Failure>,
+    /// Every kernel that was started at the start is ready, or the failure of the first that failed before it was,
+    /// with its engine.
+    pub ready: oneshot::Receiver<Result<(), (Engine, Failure)>>,
+    /// A kernel that served failed, with its engine; the receiver closes only when the driver is gone.
+    pub failed: mpsc::Receiver<(Engine, Failure)>,
     pub end: oneshot::Receiver<End>,
     pub state: watch::Receiver<States>,
 }

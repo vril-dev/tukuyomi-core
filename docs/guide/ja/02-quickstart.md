@@ -52,8 +52,8 @@ systemd を使った本番向けの配置は第3章で扱い、この章では�
 リリースの tarball は GitHub のリリース（<https://github.com/vril-dev/tukuyomi-core/releases>）で配布しています。
 ダウンロードするのは、次の 2 つのファイルです。
 
-- `tukuyomi-core_v0.2.1_linux_amd64.tar.gz`
-- `tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256`
+- `tukuyomi-core_v0.2.2_linux_amd64.tar.gz`
+- `tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256`
 
 まず、作業用のディレクトリを作ります。
 展開したスクリプトを後で `sudo -u tukuyomi` で実行するので、このディレクトリは OS ユーザー `tukuyomi` から読めなければなりません。
@@ -68,11 +68,11 @@ d=$(mktemp -d /tmp/tukuyomi-core.XXXXXX) && chmod 0755 "$d" && cd "$d"
 展開する前に、SHA-256 を確認してください。
 
 ```bash
-sha256sum -c tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256
-tar -xzf tukuyomi-core_v0.2.1_linux_amd64.tar.gz
+sha256sum -c tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256
+tar -xzf tukuyomi-core_v0.2.2_linux_amd64.tar.gz
 ```
 
-展開すると、`tukuyomi-core_v0.2.1_linux_amd64/` に 4 つの実行ファイルや `scripts/fetch-crs.sh` などができます。
+展開すると、`tukuyomi-core_v0.2.2_linux_amd64/` に 4 つの実行ファイルや `scripts/fetch-crs.sh` などができます。
 
 実行ファイルは所有者を root にして、サービスの OS ユーザーが書き換えられない場所に置きます。
 この章で使うのは、プロキシと Coraza の検査プロセスの 2 つだけです。
@@ -80,8 +80,8 @@ ModSecurity の検査プロセス（`tukuyomi-inspector-modsecurity`）とログ
 
 ```bash
 sudo install -d -m 0755 /opt/tukuyomi-core/bin
-sudo install -m 0755 tukuyomi-core_v0.2.1_linux_amd64/tukuyomi-proxy \
-  tukuyomi-core_v0.2.1_linux_amd64/tukuyomi-inspector /opt/tukuyomi-core/bin/
+sudo install -m 0755 tukuyomi-core_v0.2.2_linux_amd64/tukuyomi-proxy \
+  tukuyomi-core_v0.2.2_linux_amd64/tukuyomi-inspector /opt/tukuyomi-core/bin/
 ```
 
 ## 2.4　OS ユーザーとディレクトリを用意する
@@ -243,7 +243,7 @@ root で実行すると、できたファイルを `tukuyomi` で実行する `r
 2.3 で移動した作業用のディレクトリで、次のコマンドを実行します。
 
 ```bash
-sudo -u tukuyomi tukuyomi-core_v0.2.1_linux_amd64/scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
+sudo -u tukuyomi tukuyomi-core_v0.2.2_linux_amd64/scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
 ```
 
 このスクリプトについて、知っておくとよい点は次のとおりです。
@@ -387,7 +387,7 @@ sudo kill -TERM $(pgrep -u tukuyomi -x tukuyomi-proxy)
 | `config check` やプロキシの起動が、`rules store refused: no generation is chosen` で exit 1 になる | デフォルトのエンジンの世代を選択していません。2.7 の `rules activate` を実行してください |
 | `rules import` が CRS のディレクトリを読めない | `fetch-crs.sh` を root で実行すると、できたファイルは root しか読めません。そのディレクトリを削除し、`tukuyomi` でダウンロードし直してください |
 | `rules import` の事前検証が失敗する | Landlock を使えない Linux では検査プロセスが起動しないため、事前検証は失敗します。ブロックする世代では、事前検証のリクエストがブロックされた場合も失敗します。この場合は、ログを見て設定を直すか、`--accept-block` を付けてください |
-| プロキシが `stop: the kernel failed: Exit(14)` で止まる | Landlock を使えない Linux では、検査プロセスが起動しません。Linux 5.13 以上で、LSM の一覧に `landlock` があるかを確認してください |
+| プロキシが `stop: the kernel failed, engine <engine>: Exit(14)` で止まる | Landlock を使えない Linux では、検査プロセスが起動しません。Linux 5.13 以上で、LSM の一覧に `landlock` があるかを確認してください |
 | ディレクトリのエラーで、起動も `rules import` も失敗する | 2.4 の表のディレクトリは、プロキシもコマンドも自動では作りません。シンボリックリンクは使えません。これらのディレクトリは、所有者 `tukuyomi`、権限 0700 にしてください |
 | リスナーをバインドできず、起動が止まる | ほかのプロセスが同じアドレスとポートを使っています。1 つでもバインドできないリスナーがあると、プロキシはどのリスナーも使わずに停止します |
 | 通常のリクエストが 502 になる | アップストリームの `127.0.0.1:8080` に接続できていません。アップストリームを起動してください。このときのログは、`class` が `failed` になります |

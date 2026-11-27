@@ -534,7 +534,7 @@ fn sigusr1_switches_to_the_chosen_generation_and_a_generation_in_use_is_not_remo
 
     // The proxy lets go of the first generation when its inspector is stopped and the driver has said so, which
     // is a moment after the record of the stop.
-    let retired = format!("reload: generation {first} retired, clean true");
+    let retired = format!("reload: generation {first} retired, engine coraza, clean true");
     proxy
         .records
         .wait_lines("the old generation to retire", 1, |l| l == retired.as_str());

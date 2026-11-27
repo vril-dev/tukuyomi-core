@@ -257,7 +257,7 @@ tukuyomi-proxy acme renew <config>
 - CA から受け取ったもののうち、標準エラーに出すのは、エラーの文書（problem document）の `type` だけです。
 - SIGINT と SIGTERM を受けると、チャレンジのファイルを削除して、すぐに終了します。
 - 動作中のプロキシは新しい証明書を検知しません。
-  新しい証明書を使わせるには、コマンドの後にプロキシへ SIGUSR2 を送ります（`systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service`）。
+  新しい証明書を使わせるには、コマンドの後にプロキシへ SIGUSR2 を送ります（`systemctl kill -s SIGUSR2 --kill-whom=main tukuyomi-core.service`）。
 - 終了コードは次のとおりです。
   - 0: すべてが `renewed` か `valid`（`managed` のある設定で、`acme` を持つ証明書が無いときも 0 です）
   - 1: 1 つでも `failed` がある、停止された、実行できない、root で実行した
@@ -460,12 +460,13 @@ systemd では、`systemctl reload` か `systemctl kill --kill-whom=main` を使
 4. 起動しているエンジンの検査カーネルがすべて終了するのを `t0 + stop_wait + kill_grace` まで待ちます。
 5. ログを最長 200 ms 書き出して、終了します。
 
-最後に `stop: kernel ..., bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` の行が出ます。
+最後に `stop: kernel ..., engine <engine>, bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` の行が出ます。
 検査カーネルの終了が確認できなかったときは、代わりに `stop: the driver stopped: ...` か `stop: the driver gave no end` が出ます。
 
 - その前に、起動しているエンジンごとに、`driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` の行が出ます。
 - `stop: kernel` の行は 1 つだけです。
   `bye`・`exit_confirmed`・`dir_removed` などは、起動しているエンジンのうち、名前の順で最初のエンジンの値です。
+  `engine` には、そのエンジンの名前が出ます。
   ほかのエンジンと、切り替えで前に停止した検査カーネルの結果は、`retired_clean` にまとめて出ます。
 - `bye true` は、検査プロセスが終了の通知を送ってから終了したことを示します。
 - 終了コードが 0 になるのは、停止の理由が失敗でなく、停止したすべての検査カーネルで検査プロセスの終了と作業ディレクトリの削除が確認できたときだけです。
@@ -1538,8 +1539,8 @@ Coraza の世代と違い、ModSecurity の世代では次のリクエストが�
 どのアップストリームも使わないエンジン:
 
 - 試しに ModSecurity を起動するときなど、どのアップストリームも使わず、デフォルトのエンジンでもないエンジンがあります。
-  そうしたエンジンでも、検査カーネルが失敗するとプロキシ全体が停止し、`stop: the kernel failed: <reason>` の行を出して exit 1 になります（上の「`kernel`」）。
-  たとえば、`kernel.restarts` が 0 のときにそのエンジンの検査プロセスを SIGKILL で止めると、`stop: the kernel failed: BudgetExhausted` の行を出して停止します。
+  そうしたエンジンでも、検査カーネルが失敗するとプロキシ全体が停止し、`stop: the kernel failed, engine <engine>: <reason>` の行を出して exit 1 になります（上の「`kernel`」）。
+  たとえば、`kernel.restarts` が 0 のときにそのエンジンの検査プロセスを SIGKILL で止めると、`stop: the kernel failed, engine <engine>: BudgetExhausted` の行を出して停止します。
 - 試した後は、`rules deactivate` でそのエンジンの選択を解除します。
   解除すると、次の再起動から、そのエンジンは起動しません。
   動作中のプロキシは起動したエンジンを止めないので、止めるには再起動します（下の「エンジンごとの選択中の世代」）。
@@ -2629,9 +2630,9 @@ ACME のチャレンジと管理画面のルートには効きません。
 | 文 | 場合 |
 |---|---|
 | `start: ...` | 起動の各段階（`start: managed version <version>`、起動するエンジンごとの `start: rules generation <fingerprint>`・`start: rules engine <name>`・`start: rules mode block`（か `detect`）・`start: rules routes <count>`（デフォルトのエンジンが先）、検知のみの世代を選択しているエンジンへ向くアップストリームごとの `start: upstream <name>: engine <engine>, mode detect`、`start: rules store refused: <reason>`、`start: rules generation refused: <reason>`、`start: tls certificate not issued yet (<place>)`、`start: the kernel is ready`、`start: listening`、`start: record file refused: <reason>`、`start: control socket refused: <reason>` など） |
-| `reload: ...` | SIGHUP・SIGUSR1・SIGUSR2 と、制御ソケットの `reload` の依頼を受けたこと（`reload: SIGHUP`、`reload: control reload <version>` など）。設定のリロードの各段階と結果（`reload: configuration replaced <sha256>`、`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`、`reload: configuration refused: <reason>`、`reload: tls certificate not issued yet (<place>)`、`reload: rate limit table started anew`、`reload: rate limit table of host policy <name> started anew`、検知のみの世代を選択しているエンジンへ向くアップストリームごとの `reload: upstream <name>: engine <engine>, mode detect` など。上の「SIGHUP（設定のリロード）」）。切り替え（SIGUSR1 と制御ソケット。エンジンごとに、始めるときに `reload: starting generation <fingerprint>`・`reload: rules engine <name>`・`reload: rules mode block`（か `detect`）・`reload: rules routes <count>`、準備ができたときに `reload: generation <fingerprint> is ready, switched`、前の世代を停止したときに `reload: generation <fingerprint> retired, clean true`（か `false`）、すでに稼働している世代のときに `reload: generation <fingerprint> is already running`、起動に失敗したときに `reload: generation <fingerprint> failed to start: <reason>`、切り替えの途中のときに `reload: a switch is in progress, ignored`、拒否したときに `reload: rules store refused: <reason>`）と、証明書の入れ替えの結果 |
+| `reload: ...` | SIGHUP・SIGUSR1・SIGUSR2 と、制御ソケットの `reload` の依頼を受けたこと（`reload: SIGHUP`、`reload: control reload <version>` など）。設定のリロードの各段階と結果（`reload: configuration replaced <sha256>`、`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`、`reload: configuration refused: <reason>`、`reload: tls certificate not issued yet (<place>)`、`reload: rate limit table started anew`、`reload: rate limit table of host policy <name> started anew`、検知のみの世代を選択しているエンジンへ向くアップストリームごとの `reload: upstream <name>: engine <engine>, mode detect` など。上の「SIGHUP（設定のリロード）」）。切り替え（SIGUSR1 と制御ソケット。エンジンごとに、始めるときに `reload: starting generation <fingerprint>`・`reload: rules engine <name>`・`reload: rules mode block`（か `detect`）・`reload: rules routes <count>`、準備ができたときに `reload: generation <fingerprint> is ready, switched`、前の世代を停止したときに `reload: generation <fingerprint> retired, engine <engine>, clean true`（か `false`）、すでに稼働している世代のときに `reload: generation <fingerprint> is already running`、起動に失敗したときに `reload: generation <fingerprint> failed to start: <reason>`、切り替えの途中のときに `reload: a switch is in progress, ignored`、拒否したときに `reload: rules store refused: <reason>`）と、証明書の入れ替えの結果 |
 | `control: switch ...`、`control: reload ...` | 制御ソケットの切り替えとリロードの依頼への応答（`control: reload <version>: <result> (<reason>)` など。上の「制御ソケット」） |
-| `driver: inspector incarnation changed, inc <count>, restarts <count>` | 検査プロセスが再起動した場合 |
+| `driver: inspector incarnation changed, engine <engine>, inc <count>, restarts <count>` | 検査プロセスが再起動した場合 |
 | `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` | 停止の始めに、起動しているエンジンごとに 1 つ出ます（上の「停止」） |
 | `conn <number>: internal fault: <reason>` | プロキシの内部の不整合 |
 | `notify: <notice> not sent ...` | systemd への通知を送れなかった場合 |
@@ -3094,7 +3095,7 @@ DB に接続したとき、ログ送信プロセスはテーブルを探し、�
 
    `2.1 renewed` のような行が出ます。
    `managed` のある設定では、`admin route renewed`、`site www renewed` のような行です。
-4. `systemctl kill --kill-whom=main -s USR2 tukuyomi-core.service` で SIGUSR2 を送ると、プロキシが証明書を使い始めます。
+4. `systemctl kill -s SIGUSR2 --kill-whom=main tukuyomi-core.service` で SIGUSR2 を送ると、プロキシが証明書を使い始めます。
 5. テスト用の CA で通ったら、本番の CA に切り替えます。
    - テスト用の CA の証明書は有効期限が来ていないため、そのままでは置き換わりません（`valid`）。
      その証明書のファイルを削除します。

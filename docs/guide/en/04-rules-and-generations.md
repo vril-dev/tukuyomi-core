@@ -177,7 +177,7 @@ The proxy starts every engine that has a chosen generation and an inspector proc
 
 - The default engine and the engines that upstreams use need a chosen generation. Without one, both start and `config check` are refused with `rules store refused: no generation is chosen`.
 - If the default engine has no chosen generation but another engine has one, the configuration is refused with `rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` (exit 1). To start with ModSecurity only, set `kernel.default_engine` in the configuration to `modsecurity` and choose a ModSecurity generation.
-- An engine that has started does not stop until the proxy stops, even when you run `rules deactivate`. If its inspection kernel fails, the whole proxy stops, even for an engine that no upstream uses and that is not the default engine (`stop: the kernel failed: <reason>`, exit 1).
+- An engine that has started does not stop until the proxy stops, even when you run `rules deactivate`. If its inspection kernel fails, the whole proxy stops, even for an engine that no upstream uses and that is not the default engine (`stop: the kernel failed, engine <engine>: <reason>`, exit 1).
 - For a guide to memory use, see "Choosing the Inspection Engine" in Appendix A (Operator Reference).
 
 ### Steps to Change the Default Engine
@@ -233,6 +233,8 @@ The following example adds a ModSecurity upstream `mod` to a proxy that has only
 If you send SIGHUP before step 3, ModSecurity is not running, so the reload is refused with `reload: configuration refused: the engine of an upstream is not ready (upstream mod)`. The proxy keeps running with the previous configuration, and the `refused` count of `tukuyomi_config_reloads_total` goes up by 1.
 
 ## 4.10 Operational Notes
+
+To close the chapter, here are the points to watch when you manage rule sets and generations.
 
 - **A generation needs three operations before it is in use**: import, choice, and switch (SIGUSR1). The commands alone do not change the running proxy.
 - **Start with `--detect-only`**: check for false positives, then import a generation in block mode again. Even a detect-only generation blocks on rules 4000001 to 4000003.

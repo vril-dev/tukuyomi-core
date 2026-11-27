@@ -32,7 +32,7 @@ The inspector processes, the admin process, and the records shipper run as the s
 - Linux. It has been tested on x86_64 only.
 - Linux with Landlock enabled.
   - An inspector process restricts its own privileges with Landlock after it reads the rules (see "Restricting the Inspector Processes" below).
-  - On a Linux without Landlock, the inspector process does not start (exit 14). The proxy does not start either (the log shows `stop: the kernel failed: Exit(14)`). Both the `rules import` trial and the admin process's import trial fail. There is no setting to run without the restriction.
+  - On a Linux without Landlock, the inspector process does not start (exit 14). The proxy does not start either (the log shows `stop: the kernel failed, engine <engine>: Exit(14)`). Both the `rules import` trial and the admin process's import trial fail. There is no setting to run without the restriction.
   - You need Linux 5.13 or later, which includes Landlock, and `landlock` must be in the LSM list (you can check it in `/sys/kernel/security/lsm`). We have not checked which distributions enable Landlock by default.
   - What can be restricted depends on the Linux version. You cannot tell from the outside which ABI version was used for the restriction.
     - Restricting TCP bind and connect requires Linux 6.7 or later (Landlock ABI 4 or later). On earlier versions, only file access is restricted.
@@ -63,20 +63,20 @@ Since 0.1.0, a tarball of executables for Linux x86_64 has been distributed thro
 
 | File | Content |
 |---|---|
-| `tukuyomi-core_v0.2.1_linux_amd64.tar.gz` | In the directory `tukuyomi-core_v0.2.1_linux_amd64/`: the four executables (see "Components" above), `README.md`, `README.ja.md`, `LICENSE`, `NOTICE`, `THIRD-PARTY-LICENSES`, `docs/`, and `scripts/fetch-crs.sh` |
-| `tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256` | The SHA-256 of the tarball |
-| `tukuyomi-core_v0.2.1_guide_ja.epub`, `tukuyomi-core_v0.2.1_guide_ja.pdf` | The operations guide, Japanese edition (EPUB and PDF) |
-| `tukuyomi-core_v0.2.1_guide_en.epub`, `tukuyomi-core_v0.2.1_guide_en.pdf` | The operations guide, English edition (EPUB and PDF) |
-| `tukuyomi-core_v0.2.1_SHA256SUMS` | The SHA-256 of the tarball and of the four books |
+| `tukuyomi-core_v0.2.2_linux_amd64.tar.gz` | In the directory `tukuyomi-core_v0.2.2_linux_amd64/`: the four executables (see "Components" above), `README.md`, `README.ja.md`, `LICENSE`, `NOTICE`, `THIRD-PARTY-LICENSES`, `docs/`, and `scripts/fetch-crs.sh` |
+| `tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256` | The SHA-256 of the tarball |
+| `tukuyomi-core_v0.2.2_guide_ja.epub`, `tukuyomi-core_v0.2.2_guide_ja.pdf` | The operations guide, Japanese edition (EPUB and PDF) |
+| `tukuyomi-core_v0.2.2_guide_en.epub`, `tukuyomi-core_v0.2.2_guide_en.pdf` | The operations guide, English edition (EPUB and PDF) |
+| `tukuyomi-core_v0.2.2_SHA256SUMS` | The SHA-256 of the tarball and of the four books |
 
 - After downloading, check the SHA-256 before extracting.
 
   ```bash
-  sha256sum -c tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256
-  tar -xzf tukuyomi-core_v0.2.1_linux_amd64.tar.gz
+  sha256sum -c tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256
+  tar -xzf tukuyomi-core_v0.2.2_linux_amd64.tar.gz
   ```
 
-- The books are not in the tarball. To check a downloaded book, use its line in `tukuyomi-core_v0.2.1_SHA256SUMS` (for example, `sha256sum -c --ignore-missing tukuyomi-core_v0.2.1_SHA256SUMS` in the directory of the downloaded files).
+- The books are not in the tarball. To check a downloaded book, use its line in `tukuyomi-core_v0.2.2_SHA256SUMS` (for example, `sha256sum -c --ignore-missing tukuyomi-core_v0.2.2_SHA256SUMS` in the directory of the downloaded files).
 - The executables were built on Ubuntu 26.04.1 LTS (glibc 2.43, gcc 15.2.0) with `rustc` 1.94.1 and Go 1.27.2. They have been tested only on the host where they were built.
 - The host that runs them needs glibc 2.39 or later (`tukuyomi-proxy` uses `GLIBC_2.39` symbols). The ModSecurity inspector process also needs the libstdc++ symbols `GLIBCXX_3.4.29` and `CXXABI_1.3.15`. They do not run on an older Linux, so build from source there (see "Building from Source" below).
 - The inspector process (`tukuyomi-inspector`) is statically linked. The TLS library (aws-lc) is also statically linked into the executable.
@@ -101,7 +101,7 @@ cd inspector && CGO_ENABLED=0 go build -mod=readonly -o tukuyomi-inspector .
 Always specify `CGO_ENABLED=0`.
 
 - The inspector process uses Go's `syscall.AllThreadsSyscall` to apply Landlock and the other restrictions to all threads. In an executable that uses cgo, this call returns `ENOTSUP`, so the inspector process does not start (exit 14).
-- The reason it does not start (`the inspector is built with cgo and cannot restrict every thread`) does not appear on the standard output or standard error of the inspector process. It appears only in the `the inspector said:` line of `rules import`, and in the `reload: the inspector said:` line when a SIGUSR1 switch fails. At proxy start, only the line `stop: the kernel failed: Exit(14)` appears.
+- The reason it does not start (`the inspector is built with cgo and cannot restrict every thread`) does not appear on the standard output or standard error of the inspector process. It appears only in the `the inspector said:` line of `rules import`, and in the `reload: the inspector said:` line when a SIGUSR1 switch fails. At proxy start, only the line `stop: the kernel failed, engine <engine>: Exit(14)` appears.
 
 ### ModSecurity Inspector
 
@@ -140,7 +140,7 @@ In its first message at start (HELLO), the inspector process reports to the insp
 | The libmodsecurity version | `v3.0.17` |
 | The archive sha256 | `f283b33d…b671a50` above |
 
-If they do not match, the inspection kernel writes one of `hello toolchain differs`, `hello engine version differs`, and `hello engine source differs`, rejects the inspector process, and does not restart it. At proxy start, the line `stop: the kernel failed: Hello("<message>")` appears; with `rules import`, the line `rules import: the trial failed: the inspector could not be started (Hello("<message>"))` appears.
+If they do not match, the inspection kernel writes one of `hello toolchain differs`, `hello engine version differs`, and `hello engine source differs`, rejects the inspector process, and does not restart it. At proxy start, the line `stop: the kernel failed, engine <engine>: Hello("<message>")` appears; with `rules import`, the line `rules import: the trial failed: the inspector could not be started (Hello("<message>"))` appears.
 
 ### Records Shipper
 

@@ -251,13 +251,15 @@ In the editing panel, write a name and the hosts (one per line). For access cont
 
 The screen shows the following.
 
-- **When you change the global settings**: in a draft that changes the global access control or rate limit, the panel of the global settings and the confirmation of "Save and apply" show "This change does not apply to the {n} per-host setting(s) that do not inherit the global access control ({names})." (`{n}` is the number and `{names}` are the names; rate limits use the same form). This is because global changes (including an urgent denial) do not take effect for hosts with "Settings for this host" or "Not used".
+- **When you change the global settings**: in a draft that changes the global access control or rate limit, the panel of the global settings and the confirmation of "Save and apply" show "Per-host settings that do not inherit the global access control: {n} ({names}). This change does not apply to them." (`{n}` is the number and `{names}` are the names; rate limits use the same form). This is because global changes (including an urgent denial) do not take effect for hosts with "Settings for this host" or "Not used".
 - **List of host policies**: the list shows "A per-host setting applies only to requests whose Host header is one of its hosts. Only the global settings apply to requests for other hosts that reach the same upstream through the default upstream, a route whose host starts with *., or a route without a host. We recommend writing a route for each host and setting the default upstream to 'None'."
 - **Where check errors point**: if you write a country list while the configuration file has no `geo`, the `at` of the check points to the access control of that host policy. If you write the same host as the admin route, the `at` of the check points to that row.
 
 For the setting keys of a host policy, the rules for comparing hosts, and how the policies are layered, see "Host Policies (`host_policies`)" in Appendix A (Operator Reference). For the description of the screen, see "Admin Screens" in Appendix B (Admin Reference).
 
 ## 6.9 Operational Notes
+
+To close the chapter, here are the points to watch when you manage access control and rate limits.
 
 - **Changing the global settings**: also review the host policies that do not inherit them ("Settings for this host" and "Not used"), because global refusals do not take effect for those hosts.
 - **`allow_countries` and `UNKNOWN`**: when you write `allow_countries`, consider whether `UNKNOWN` is needed. Without `UNKNOWN`, clients with private addresses (such as monitoring on the same network) are refused.

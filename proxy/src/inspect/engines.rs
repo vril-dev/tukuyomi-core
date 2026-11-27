@@ -524,8 +524,9 @@ impl<K: Kernel> Lane<K> {
     /// switch to tell).
     pub(super) fn retired(&mut self, retired: &Retired, switched: Switched, log: &Log) {
         log.line(&format!(
-            "reload: generation {} retired, clean {}",
+            "reload: generation {} retired, engine {}, clean {}",
             retired.generation.hex(),
+            self.engine.name(),
             retired.clean
         ));
         self.retired_clean &= retired.clean;
@@ -551,20 +552,21 @@ impl<K: Kernel> Lane<K> {
 /// How the main thread is told what the lanes say: that every kernel that was started at the start is ready, the
 /// first failure of one that is not, and the failure of a kernel that served.
 pub(super) struct Told {
-    /// The answer to the start: ready when `waiting` kernels have said so, or the failure of the first that fails.
-    ready: Option<oneshot::Sender<Result<(), Failure>>>,
+    /// The answer to the start: ready when `waiting` kernels have said so, or the failure of the first that fails,
+    /// with its engine.
+    ready: Option<oneshot::Sender<Result<(), (Engine, Failure)>>>,
     waiting: usize,
-    /// A kernel that served and failed. At most one for each engine says so; the sender is kept for as long as the
-    /// driver runs, so that the main thread never sees the channel close without an answer.
-    failed: tokio::sync::mpsc::Sender<Failure>,
+    /// A kernel that served and failed, with its engine. At most one for each engine says so; the sender is kept for
+    /// as long as the driver runs, so that the main thread never sees the channel close without an answer.
+    failed: tokio::sync::mpsc::Sender<(Engine, Failure)>,
 }
 
 impl Told {
     /// The start is ready when each of `waiting` kernels has said so; with none, it is ready as it is.
     pub(super) fn new(
-        ready: oneshot::Sender<Result<(), Failure>>,
+        ready: oneshot::Sender<Result<(), (Engine, Failure)>>,
         waiting: usize,
-        failed: tokio::sync::mpsc::Sender<Failure>,
+        failed: tokio::sync::mpsc::Sender<(Engine, Failure)>,
     ) -> Told {
         let mut told = Told {
             ready: Some(ready),
@@ -583,8 +585,8 @@ impl Told {
         }
     }
 
-    /// Takes in what a lane said.
-    pub(super) fn said(&mut self, said: Said) {
+    /// Takes in what the lane of `engine` said.
+    pub(super) fn said(&mut self, engine: Engine, said: Said) {
         match said {
             Said::Ready => {
                 self.waiting = self.waiting.saturating_sub(1);
@@ -592,11 +594,11 @@ impl Told {
             }
             Said::Failed(why) => {
                 if let Some(ready) = self.ready.take() {
-                    let _ = ready.send(Err(why));
+                    let _ = ready.send(Err((engine, why)));
                 }
             }
             Said::Lost(why) => {
-                let _ = self.failed.try_send(why);
+                let _ = self.failed.try_send((engine, why));
             }
         }
     }

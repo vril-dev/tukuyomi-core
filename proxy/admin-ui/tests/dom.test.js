@@ -337,8 +337,9 @@ test('the list of generations is a table, and the address of one generation open
   const screen = generationScreens[0].mount(ctx, root, { id: null, query: {} });
   await wait();
   assert.equal(root.querySelectorAll('[data-row]').length, 2);
+  assert.equal(root.querySelector('table').className, 'tc-table tc-table--dense tc-table--fold');
   // The other generation can be chosen and deleted; the chosen one only says why it cannot be deleted.
-  assert.equal(root.textContent.includes('Switch to this generation'), true);
+  assert.equal(root.querySelectorAll('button').filter((item) => item.textContent === 'Switch').length, 1);
   assert.equal(root.textContent.includes('It is chosen, so it cannot be deleted.'), true);
 
   screen.show({ id: OTHER, query: {} });
@@ -400,7 +401,7 @@ test('a generation is chosen with the generation that is chosen for its engine, 
   const both = statusOf({ chosen: { coraza: C1, modsecurity: M1 }, running: { coraza: C1, modsecurity: M1 } });
   const { screen, root, sent, buttons, confirm } = await openGenerations(0, both, list);
   const row = (fingerprint) => root.querySelector(`[data-row="${fingerprint}"]`);
-  press(buttons('Switch to this generation', row(M2))[0]);
+  press(buttons('Switch', row(M2))[0]);
   await wait();
   assert.equal((await confirm('Switch')).includes('The rules store will choose the generation below'), true);
   assert.deepEqual(sent, [['/api/activate', { generation: M2, expect: M1 }]]);
@@ -408,7 +409,7 @@ test('a generation is chosen with the generation that is chosen for its engine, 
 
   // No generation is chosen for ModSecurity: the request says so with a null, which is in the JSON, and the engine is started.
   const alone = await openGenerations(0, statusOf({ chosen: { coraza: C1 }, running: { coraza: C1 } }), [list[0], generation(M2, 'modsecurity')]);
-  press(alone.buttons('Switch to this generation', alone.root.querySelector(`[data-row="${M2}"]`))[0]);
+  press(alone.buttons('Switch', alone.root.querySelector(`[data-row="${M2}"]`))[0]);
   await wait();
   const said = await alone.confirm('Start');
   for (const text of ['Start the engine?', 'No generation is chosen for ModSecurity yet', 'the whole proxy stops']) assert.equal(said.includes(text), true, text);
@@ -454,7 +455,7 @@ test('a proxy that cannot be reached is not said to leave the engine not running
     screen.stop();
     return said;
   };
-  const choose = await told(0, (root, buttons) => buttons('Switch to this generation', root.querySelector(`[data-row="${C1}"]`))[0]);
+  const choose = await told(0, (root, buttons) => buttons('Switch', root.querySelector(`[data-row="${C1}"]`))[0]);
   assert.equal(choose.includes('Switch to this generation?'), true);
   const back = await told(1, (root, buttons) => buttons('Roll back')[0]);
   assert.equal(back.includes('Roll back Coraza to the previous generation?'), true);
@@ -487,7 +488,7 @@ test('a proxy that does not report its engines is offered no change, and the scr
   const old = statusOf({ chosen: { coraza: C2 }, rollback: { coraza: C1 }, running: null });
   for (const index of [0, 1]) {
     const { screen, root, buttons } = await openGenerations(index, old, list);
-    for (const label of ['Switch to this generation', 'Apply to the proxy', 'Start the engine', 'Roll back']) assert.equal(buttons(label).length, 0, label);
+    for (const label of ['Switch to this generation', 'Switch', 'Apply to the proxy', 'Start the engine', 'Roll back']) assert.equal(buttons(label).length, 0, label);
     assert.equal(root.textContent.includes('This proxy does not report the state of its engines.'), true);
     screen.stop();
   }
@@ -736,6 +737,15 @@ test('the outcome of a job with a result that this page does not know is told as
   assert.equal(box.textContent.includes('a new word'), true);
   // A word of an object's prototype is no result.
   assert.equal(jobResult({ state: 'ended', result: 'constructor', from: FP, to: OTHER }).textContent.includes('The result is not recognized.'), true);
+});
+
+test('the detail of a job is told in words when the dictionaries have the sentence, and as it came when they do not', () => {
+  setLanguage('en');
+  const ended = (detail) => jobResult({ state: 'ended', result: 'refused', reason: 'thread', detail, from: FP, to: OTHER });
+  const codes = (box) => box.querySelectorAll('code').map((node) => node.textContent);
+  const known = ended('the reload thread cannot be started');
+  assert.deepEqual([codes(known), known.textContent.includes('The thread that reloads the configuration cannot be started.')], [['thread'], true]);
+  assert.deepEqual(codes(ended('a sentence that nobody has')), ['thread', 'a sentence that nobody has']);
 });
 
 test('a removal that did not clean up says so, and one with a 503 or with no answer that names the version is not known', () => {
@@ -1252,8 +1262,9 @@ test('the confirmation of a saving names the groups whose engine changes, counts
   assert.equal(sent[0], '/api/managed/check');
   const dialog = root.querySelector('dialog');
   assert.notEqual(dialog, null);
+  assert.equal(dialog.querySelector('h2').textContent, 'Save and apply?');
   const said = dialog.textContent;
-  for (const text of ['Change Upstream engine app', '1 upstream(s) (app) are inspected by an engine whose generation is detect-only.', 'ModSecurity upstreams', 'Coraza upstreams']) assert.equal(said.includes(text), true, text);
+  for (const text of ['Change Upstream engine app', 'Upstreams inspected by an engine whose generation is detect-only: 1 (app).', 'ModSecurity upstreams', 'Coraza upstreams']) assert.equal(said.includes(text), true, text);
   // The user does not confirm: nothing is sent but the check.
   press(dialog.querySelectorAll('button').find((item) => item.textContent === 'Cancel'));
   await wait();
@@ -1295,6 +1306,7 @@ test('a version that is applied by its name is counted by engine in the confirma
   await wait();
   await wait();
   const dialog = root.querySelector('dialog');
+  assert.equal(dialog.querySelector('h2').textContent, 'Apply this version?');
   // The groups are counted by the engine that inspects them (the default engine for the one that names none), and ModSecurity runs a generation of detection.
   const said = dialog.textContent;
   for (const text of ['Coraza upstreams', 'ModSecurity upstreams', 'Currently detect-only']) assert.equal(said.includes(text), true, text);
@@ -1354,7 +1366,7 @@ test('the groups that a generation of detection inspects are named, twenty of th
   const names = (n) => Array.from({ length: n }, (_, at) => `g${at}`);
   assert.equal(detectNotice([]), null);
   const twenty = detectNotice(names(20)).textContent;
-  assert.equal(twenty.includes('20 upstream(s)') && twenty.includes('g19') && !twenty.includes('more'), true);
+  assert.equal(twenty.includes('only: 20 (') && twenty.includes('g19') && !twenty.includes('more'), true);
   const more = detectNotice(names(21)).textContent;
   assert.equal(more.includes('g19') && !more.includes('g20') && more.includes('and 1 more'), true);
 });

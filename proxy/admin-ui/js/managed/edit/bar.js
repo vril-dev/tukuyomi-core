@@ -492,7 +492,7 @@ export class EditScreen extends Screen {
     const draft = heldDraft();
     if (draft === null || this.locked()) return;
     if (draft.changed) {
-      const yes = await confirmChange(this.layer, { title: w('edit.discard'), lines: [el('p', {}, w('edit.discard.what'))], confirm: w('edit.discard'), tone: 'danger' });
+      const yes = await confirmChange(this.layer, { title: w('edit.discard_ask'), lines: [el('p', {}, w('edit.discard.what'))], confirm: w('edit.discard'), tone: 'danger' });
       if (!yes || !this.alive || heldDraft() !== draft) return;
     }
     await this.discardAndRead();
@@ -523,7 +523,7 @@ export class EditScreen extends Screen {
     }
     if (!this.alive || heldDraft() !== draft || !isFingerprint(current) || version === null) return;
     const yes = await confirmChange(this.layer, {
-      title: w('edit.moved.rebase'),
+      title: w('edit.moved.rebase_ask'),
       lines: [el('p', {}, w('edit.rebase.what')), changesView(changesBetween(draft.baseVersion, version, this.defaultName())), el('p', {}, w('edit.rebase.warn'))],
       confirm: w('edit.moved.rebase'),
     });

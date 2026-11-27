@@ -178,7 +178,7 @@ SIGHUP を受けると、プロキシは起動のときと同じパスの設定�
 5. ログを最長 200 ms かけて書き出し、終了します。
 
 ログには、起動しているエンジンごとに `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` の行が出ます。
-最後に `stop: kernel ..., bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` の行が出ます。
+最後に `stop: kernel ..., engine <engine>, bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` の行が出ます。
 
 終了コードが 0 になるのは、次の両方を満たすときだけです。
 

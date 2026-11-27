@@ -63,9 +63,9 @@ const STATES = {
   rollback: { tone: 'muted', words: () => w('badge.rollback'), text: () => t('badge.rollback') },
   unstarted: { tone: 'warn', words: () => w('badge.unstarted'), text: () => t('badge.unstarted') },
 };
-/** The words of the button that changes the proxy for a generation, by what it does. */
+/** The words of the button that changes the proxy for a generation, by what it does; a row of the list has the short words for choosing, so that the table fits a wide screen. */
 const CHOOSE = {
-  choose: () => w('gen.choose'),
+  choose: (inDetail) => (inDetail ? w('gen.choose') : w('gen.choose_short')),
   apply: () => w('gen.apply'),
   start: () => w('gen.start'),
 };
@@ -272,6 +272,7 @@ class GenerationsScreen extends Screen {
         action: canChange(ctx.user.role) ? el('a', { class: buttonClass('small'), href: hashOf('import') }, w('nav.import')) : null,
       },
       dense: true,
+      fold: true,
       columns: [
         {
           key: 'fingerprint',
@@ -446,7 +447,7 @@ class GenerationsScreen extends Screen {
     const can = actionsOf(this.ctx.user.role, item, this.state());
     const busy = working.name !== null;
     const buttons = [
-      can.choose === null ? null : button(inDetail ? 'primary' : 'small', CHOOSE[can.choose](), () => this.choose(item, can.choose), { disabled: busy }),
+      can.choose === null ? null : button(inDetail ? 'primary' : 'small', CHOOSE[can.choose](inDetail), () => this.choose(item, can.choose), { disabled: busy }),
       can.remove ? el('span', { class: 'tc-actions--apart' }, button(inDetail ? 'danger' : 'small danger', w('gen.remove'), () => this.remove(item), { disabled: busy })) : null,
       can.kept === null ? null : el('span', { class: 'tc-muted tc-small' }, KEPT[can.kept]()),
     ];

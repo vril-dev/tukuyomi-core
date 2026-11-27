@@ -39,8 +39,8 @@ Before the commands, here is what you prepare and in what order.
 
 The release tarball is distributed through GitHub releases (<https://github.com/vril-dev/tukuyomi-core/releases>). Download the following two files:
 
-- `tukuyomi-core_v0.2.1_linux_amd64.tar.gz`
-- `tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256`
+- `tukuyomi-core_v0.2.2_linux_amd64.tar.gz`
+- `tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256`
 
 First, create a working directory. The extracted script is run later with `sudo -u tukuyomi`, so the OS user `tukuyomi` must be able to read this directory. `mktemp -d` picks the name, so that no other user can create a directory with that name first, and the permissions 0755 let `tukuyomi` read it.
 
@@ -51,18 +51,18 @@ d=$(mktemp -d /tmp/tukuyomi-core.XXXXXX) && chmod 0755 "$d" && cd "$d"
 Put the two downloaded files in this directory, and check the SHA-256 before extracting.
 
 ```bash
-sha256sum -c tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256
-tar -xzf tukuyomi-core_v0.2.1_linux_amd64.tar.gz
+sha256sum -c tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256
+tar -xzf tukuyomi-core_v0.2.2_linux_amd64.tar.gz
 ```
 
-Extracting creates `tukuyomi-core_v0.2.1_linux_amd64/`, which holds the four executables, `scripts/fetch-crs.sh`, and other files.
+Extracting creates `tukuyomi-core_v0.2.2_linux_amd64/`, which holds the four executables, `scripts/fetch-crs.sh`, and other files.
 
 Place the executables where the OS user of the service cannot modify them (owned by root). This chapter uses only two of them: the proxy and the Coraza inspector process. When you use the ModSecurity inspector process (`tukuyomi-inspector-modsecurity`) and the records shipper (`tukuyomi-records-ship`), place them in the same place (see Chapter 3).
 
 ```bash
 sudo install -d -m 0755 /opt/tukuyomi-core/bin
-sudo install -m 0755 tukuyomi-core_v0.2.1_linux_amd64/tukuyomi-proxy \
-  tukuyomi-core_v0.2.1_linux_amd64/tukuyomi-inspector /opt/tukuyomi-core/bin/
+sudo install -m 0755 tukuyomi-core_v0.2.2_linux_amd64/tukuyomi-proxy \
+  tukuyomi-core_v0.2.2_linux_amd64/tukuyomi-inspector /opt/tukuyomi-core/bin/
 ```
 
 ## 2.4 Preparing the OS User and Directories
@@ -204,7 +204,7 @@ The CRS (OWASP Core Rule Set) is not bundled, so fetch it with `scripts/fetch-cr
 **Always run it as the OS user of the service.** If you run it as root, `rules import`, which runs as `tukuyomi`, cannot read the files the script creates.
 
 ```bash
-sudo -u tukuyomi tukuyomi-core_v0.2.1_linux_amd64/scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
+sudo -u tukuyomi tukuyomi-core_v0.2.2_linux_amd64/scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
 ```
 
 Things to know about this script:
@@ -320,7 +320,7 @@ The proxy stops accepting new connections and requests, finishes the requests in
 | `config check` or the proxy start exits 1 with `rules store refused: no generation is chosen` | No generation is chosen for the default engine. Run `rules activate` as in section 2.7 |
 | `rules import` cannot read the CRS directory | If you run `fetch-crs.sh` as root, only root can read the files it creates. Delete that directory and fetch the CRS again as `tukuyomi` |
 | The `rules import` trial fails | On a Linux without Landlock, the inspector process does not start, so the trial fails. With a generation in block mode, the trial also fails when a trial request is blocked (`--accept-block`) |
-| The proxy stops with `stop: the kernel failed: Exit(14)` | On a Linux without Landlock, the inspector process does not start. Check that the Linux is 5.13 or later and that `landlock` is in the LSM list |
+| The proxy stops with `stop: the kernel failed, engine <engine>: Exit(14)` | On a Linux without Landlock, the inspector process does not start. Check that the Linux is 5.13 or later and that `landlock` is in the LSM list |
 | Both the start and `rules import` fail with a directory error | Make the directories in the table of section 2.4 owned by `tukuyomi`, with permissions 0700. Symbolic links cannot be used. Neither the proxy nor the commands create these directories |
 | The start stops because a listener cannot be bound | Another process is using the same address and port. If even one listener cannot be bound, the proxy uses none of them and stops |
 | An ordinary request gets 502 | The proxy cannot connect to the upstream `127.0.0.1:8080`. Start the upstream. The log of such a request has `class` `failed` |

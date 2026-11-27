@@ -1389,7 +1389,7 @@ impl Proxy {
         );
         assert!(
             lines.iter().any(|l| l.starts_with(
-                "stop: kernel Stopped, bye true, exit_confirmed true, dir_removed true, held_left 0, waiting_left 0"
+                "stop: kernel Stopped, engine coraza, bye true, exit_confirmed true, dir_removed true, held_left 0, waiting_left 0"
             )),
             "the kernel did not stop cleanly: {lines:#?}"
         );

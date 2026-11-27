@@ -188,7 +188,7 @@ When you apply a version that changes a site's set of hosts (a host was added to
 
 Right after applying, run `acme renew` and send SIGUSR2: start the renewal service from section 3.5 with `systemctl start tukuyomi-core-acme.service`. If you leave it to the timer, connections fail until the timer next runs.
 
-- When you press "Save and apply" in the admin screens and a site needs a new ACME certificate, the confirmation shows this message: "{n} site(s) need a new certificate. Their hosts cannot be reached over TLS until acme renew issues the certificate (at most a little over a day if you leave this to the renewal timer)." `{n}` is the number of those sites.
+- When you press "Save and apply" in the admin screens and a site needs a new ACME certificate, the confirmation shows this message: "Sites that need a new certificate: {n}. Their hosts cannot be reached over TLS until acme renew issues the certificate (at most a little over a day if you leave this to the renewal timer)." `{n}` is the number of those sites.
 - When you go back to an earlier version (rollback, or applying by name) and the previous certificate is still in the directory for that set of hosts, it is used without being issued again. The proxy does not check certificate expiry, so it uses even an expired certificate as it is. After going back, run `acme renew` (it issues the certificate again if expiry is near).
 - If you run the `managed activate` command and then run `acme renew` before sending SIGHUP, the hosts that are only in the new version are `failed`, because the proxy does not answer challenges for them. After `managed activate`, reload the configuration right away (see Chapter 5 and Chapter 9).
 

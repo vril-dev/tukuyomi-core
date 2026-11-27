@@ -311,8 +311,8 @@ struct Rig {
     /// The routes of the gate of Coraza, as the connections read them.
     routes: SharedRoutes,
     /// What the core tells the main thread: the start is ready, and a kernel that served has failed.
-    ready: oneshot::Receiver<Result<(), Failure>>,
-    failed: mpsc::Receiver<Failure>,
+    ready: oneshot::Receiver<Result<(), (Engine, Failure)>>,
+    failed: mpsc::Receiver<(Engine, Failure)>,
 }
 
 impl Rig {
@@ -838,13 +838,16 @@ fn the_restart_line_is_given_for_a_new_incarnation_and_not_for_the_same_one() {
     let starting = |inc, restarts| at(Phase::Starting, inc, restarts);
     // the incarnation the kernel starts with is not a restart; a round in the same one gives no line,
     // whatever else changed
-    assert_eq!(restart_line(1, &starting(1, 0)), None);
-    assert_eq!(restart_line(1, &at(Phase::Ready, 1, 0)), None);
-    assert_eq!(restart_line(4, &starting(4, 9)), None);
-    // the next number: one line of fixed text with the new number and the restarts made in all
+    assert_eq!(restart_line(Engine::Coraza, 1, &starting(1, 0)), None);
     assert_eq!(
-        restart_line(1, &starting(2, 1)).as_deref(),
-        Some("driver: inspector incarnation changed, inc 2, restarts 1")
+        restart_line(Engine::Coraza, 1, &at(Phase::Ready, 1, 0)),
+        None
+    );
+    assert_eq!(restart_line(Engine::Coraza, 4, &starting(4, 9)), None);
+    // the next number: one line of fixed text with the engine, the new number and the restarts made in all
+    assert_eq!(
+        restart_line(Engine::ModSecurity, 1, &starting(2, 1)).as_deref(),
+        Some("driver: inspector incarnation changed, engine modsecurity, inc 2, restarts 1")
     );
 }
 
@@ -905,7 +908,10 @@ fn the_start_is_ready_when_every_kernel_that_was_started_is_and_a_failure_before
     r.kernel_of(Engine::Coraza).kernel.phase = Phase::Ready;
     r.kernel_of(Engine::ModSecurity).kernel.phase = Phase::Failed(Failure::Exit(11));
     r.core.round().unwrap();
-    assert_eq!(r.ready.try_recv(), Ok(Err(Failure::Exit(11))));
+    assert_eq!(
+        r.ready.try_recv(),
+        Ok(Err((Engine::ModSecurity, Failure::Exit(11))))
+    );
 }
 
 #[test]
@@ -920,7 +926,11 @@ fn the_failure_of_a_kernel_that_serves_is_said_whichever_engine_it_is() {
         // The engine that nothing uses is the one that is not named by a group: its failure stops the proxy too.
         r.kernel_of(failing).kernel.phase = Phase::Failed(Failure::Exit(3));
         r.core.round().unwrap();
-        assert_eq!(r.failed.try_recv(), Ok(Failure::Exit(3)), "{failing:?}");
+        assert_eq!(
+            r.failed.try_recv(),
+            Ok((failing, Failure::Exit(3))),
+            "{failing:?}"
+        );
         r.core.round().unwrap();
         assert!(matches!(
             r.failed.try_recv(),
@@ -978,7 +988,8 @@ fn after_a_stop_tickets_are_still_submitted_and_shutdown_waits_for_the_ingress_t
 
     // the last sender goes: shutdown is called once, with the earliest deadline
     r.close();
-    let done = r.core.round().unwrap().expect("shutdown is due");
+    let (engine, done) = r.core.round().unwrap().expect("shutdown is due");
+    assert_eq!(engine, Engine::Coraza);
     assert_eq!(done.phase, Phase::Stopped);
     assert_eq!(r.active().kernel.shutdowns(), vec![earlier]);
     assert_eq!(r.core.mode, Mode::Down);
@@ -995,7 +1006,7 @@ fn at_the_stop_deadline_shutdown_is_called_and_a_late_ticket_is_unavailable() {
     r.active().kernel.at_shutdown = vec![(0, unavailable)];
     let by = Instant::now();
     r.send(Msg::Stop { inspect_by: by });
-    let done = r.core.round().unwrap().expect("the deadline is reached");
+    let (_, done) = r.core.round().unwrap().expect("the deadline is reached");
     // the result of shutdown is delivered like any other, and the main thread still sees it counted
     assert_eq!(outcome(&mut a.answer), Outcome::Verdict(unavailable));
     assert_eq!(done.results, vec![(0, unavailable, Matched::NONE)]);
@@ -1083,7 +1094,10 @@ fn a_kernel_that_cannot_start_says_so_once_through_ready_and_still_answers() {
     )
     .unwrap();
     let told = answer(&mut d.ready);
-    assert!(matches!(told, Err(Failure::TmpDir(_))), "{told:?}");
+    assert!(
+        matches!(told, Err((Engine::Coraza, Failure::TmpDir(_)))),
+        "{told:?}"
+    );
     assert!(matches!(
         d.failed.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
@@ -1111,9 +1125,11 @@ fn a_kernel_that_cannot_start_says_so_once_through_ready_and_still_answers() {
     drop(d.ingress);
     match answer(&mut d.end) {
         End::Done {
+            engine,
             kernel: done,
             retired_clean,
         } => {
+            assert_eq!(engine, Engine::Coraza);
             assert!(matches!(done.phase, Phase::Failed(Failure::TmpDir(_))));
             assert!(done.exit_confirmed && done.dir_removed && retired_clean);
         }
@@ -1340,7 +1356,7 @@ fn a_stop_during_a_switch_stops_the_new_kernel_at_once_and_lets_the_old_one_fini
     assert!(old_shut.lock().unwrap().is_empty());
     let by = Instant::now();
     r.send(Msg::Stop { inspect_by: by });
-    let done = loop {
+    let (_, done) = loop {
         if let Some(done) = r.core.round().unwrap() {
             break done;
         }
@@ -1454,7 +1470,10 @@ fn a_switch_for_an_engine_that_has_no_kernel_starts_it_and_the_state_has_both_en
     // From now on its failure is the failure of a kernel that serves.
     r.kernel_of(Engine::ModSecurity).kernel.phase = Phase::Failed(Failure::Exit(3));
     r.core.round().unwrap();
-    assert_eq!(r.failed.try_recv(), Ok(Failure::Exit(3)));
+    assert_eq!(
+        r.failed.try_recv(),
+        Ok((Engine::ModSecurity, Failure::Exit(3)))
+    );
 }
 
 #[test]
@@ -1604,11 +1623,13 @@ fn a_stop_stops_the_kernels_of_all_the_engines_by_the_deadline() {
     r.kernel_of(Engine::ModSecurity).kernel.at_shutdown = vec![(0, unavailable)];
     let by = Instant::now();
     r.send(Msg::Stop { inspect_by: by });
-    let done = loop {
+    let (engine, done) = loop {
         if let Some(done) = r.core.round().unwrap() {
             break done;
         }
     };
+    // The end that is told is the one of the first engine in the order of the names.
+    assert_eq!(engine, Engine::Coraza);
     assert_eq!(done.phase, Phase::Stopped);
     // Every kernel was stopped, once, with the deadline, one of them here and the other on a thread of its own.
     eventually("both kernels were stopped", || {

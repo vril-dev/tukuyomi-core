@@ -133,7 +133,7 @@ The proxy stops when it receives SIGTERM or SIGINT. Let t0 be the time when the 
 4. It waits until `t0 + stop_wait + kill_grace` for the inspection kernels of all the running engines to end.
 5. It spends at most 200 ms flushing the logs, and exits.
 
-The log has a `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` line for each running engine. At the end, a `stop: kernel ..., bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` line is written.
+The log has a `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` line for each running engine. At the end, a `stop: kernel ..., engine <engine>, bye ..., exit_confirmed ..., dir_removed ..., held_left ..., waiting_left ..., results ..., retired_clean ...` line is written.
 
 The exit code is 0 only when both of the following hold.
 
@@ -210,6 +210,8 @@ The following changes made after the update are lost.
 The log directory is not restored, so the logs written after the update remain. For other notes, see "Going Back to the Previous Version" in Appendix A (Operator Reference).
 
 ## 9.5 Operational Notes
+
+To close the chapter, here are the points to watch in day-to-day operation.
 
 - **Results of configuration changes**: even when `systemctl reload` reports success, check the result with the `reload: configuration replaced` or `reload: configuration refused` line in the log.
 - **Setting keys that cannot change while running**: change them by restarting with `systemctl restart`. When you change setting keys that the admin process and the records shipper read, restart those processes too.

@@ -34,7 +34,7 @@ function phaseBadge(phase) {
 
 const SECOND = 1000;
 
-/** The time since the proxy started in the two largest units that it has: `3 days 4 hours`, `4 hours 12 minutes`, `12 minutes 8 seconds`, `35 seconds`. */
+/** The time since the proxy started in the two largest units that it has, in English `3 d 4 h`, `4 h 12 min`, `12 min 8 s` and `35 s`. */
 export function uptimeText(ms) {
   const total = Math.floor(ms / SECOND);
   const [days, hours, minutes, seconds] = [Math.floor(total / 86400), Math.floor((total % 86400) / 3600), Math.floor((total % 3600) / 60), total % 60];

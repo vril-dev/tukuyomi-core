@@ -10,8 +10,8 @@ pub(in crate::run) fn runtime() -> Runtime {
 
 pub(in crate::run) struct Fixture {
     pub(in crate::run) waits: Waits,
-    ready: oneshot::Sender<Result<(), Failure>>,
-    _failed: mpsc::Sender<Failure>,
+    ready: oneshot::Sender<Result<(), (Engine, Failure)>>,
+    _failed: mpsc::Sender<(Engine, Failure)>,
     pub(in crate::run) end: oneshot::Sender<End>,
 }
 
@@ -45,10 +45,12 @@ fn a_wait_returns_what_the_driver_answered_once() {
         assert!(matches!(f.waits.wait(after(30)).await, Event::Late));
 
         let mut f = fixture();
-        f.ready.send(Err(Failure::BudgetExhausted)).unwrap();
+        f.ready
+            .send(Err((Engine::ModSecurity, Failure::BudgetExhausted)))
+            .unwrap();
         assert!(matches!(
             f.waits.wait(after(2000)).await,
-            Event::Ready(Err(Failure::BudgetExhausted))
+            Event::Ready(Err((Engine::ModSecurity, Failure::BudgetExhausted)))
         ));
 
         let mut f = fixture();

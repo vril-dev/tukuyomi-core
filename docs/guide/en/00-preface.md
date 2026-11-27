@@ -8,7 +8,7 @@ The book starts with getting a release and starting it for the first time, and g
 
 ## Scope of This Book
 
-This book covers only the features that tukuyomi core 0.2.1 implements. What is not implemented or not decided is marked as such, and is summarized in section 1.7 ("What Is Implemented and What Is Not").
+This book covers only the features that tukuyomi core 0.2.2 implements. What is not implemented or not decided is marked as such, and is summarized in section 1.7 ("What Is Implemented and What Is Not").
 
 As the repository's README notes, the product as a whole has not had a security review yet.
 
@@ -20,7 +20,7 @@ The book assumes that you know the basic concepts of Linux, HTTP/HTTPS, TLS, and
 
 ## Version Covered by This Book
 
-This book is written for **tukuyomi core 0.2.1**. The release file names in the procedures are those of `v0.2.1`.
+This book is written for **tukuyomi core 0.2.2**. The release file names in the procedures are those of `v0.2.2`.
 
 If a later release changes setting keys, commands, log lines, or the like, check the following first; they take precedence over this book:
 
@@ -31,12 +31,12 @@ If a later release changes setting keys, commands, log lines, or the like, check
 
 Read in order, the book takes you all the way from getting the release and starting it for the first time to a production deployment and day-to-day operations.
 
-- **Chapter 1** explains what tukuyomi core does and which processes it consists of. It also lists what 0.2.1 implements and what it does not.
+- **Chapter 1** explains what tukuyomi core does and which processes it consists of. It also lists what 0.2.2 implements and what it does not.
 - **Chapter 2** shows, step by step, how to start tukuyomi core by hand from the release tarball and confirm that an SQL injection request is blocked.
 - **Chapter 3** explains a production deployment with systemd.
 - **Chapters 4 to 9** cover rule sets and generations, the managed configuration and the admin screens, access control and rate limiting, logs and the records shipper, certificates with ACME, and day-to-day operations, one topic per chapter. If you already run tukuyomi core, you can go straight to the chapter you need from the table of contents.
 - **Appendix A. Operator Reference** and **Appendix B. Admin Reference** at the end of the book contain the text of the operator reference and the admin reference from the documentation in the repository. Only the heading levels and the links between documents are changed to fit the book.
-- **Appendix C. Release Notes** contains the release notes of 0.2.1, 0.2.0, and 0.1.0.
+- **Appendix C. Release Notes** contains the release notes of 0.2.2, 0.2.1, 0.2.0, and 0.1.0.
 
 Each chapter follows the same order: overview, how it works, configuration examples, and operational notes. Each one opens with what it covers, and can be read on its own.
 

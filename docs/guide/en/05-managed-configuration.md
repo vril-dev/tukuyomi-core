@@ -433,6 +433,8 @@ When the admin process was started without the managed configuration, the Config
 
 ## 5.15 Operational Notes
 
+To close the chapter, here are the points to watch when you run the admin process and managed configuration.
+
 - **Builds of the admin process and the proxy**: use the same build for both. If the proxy is an earlier build that does not return the state of each engine, the admin screens do not show the buttons for choosing a generation, applying to the proxy, starting an engine, and rolling back.
 - **Restarting the admin process**: a restart loses the sessions, the lockout states, two-factor authentication secrets that are still being set up, and the apply job, so everyone must log in again. API tokens, users, the audit log, and the histories stay in the store.
 - **Users who can read the logs**: the log files hold client addresses and paths. The admin API lets a viewer or above read the logs, so decide carefully who gets the viewer role.

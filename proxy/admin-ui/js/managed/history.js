@@ -110,7 +110,7 @@ class HistoryScreen extends Screen {
 
   rollback(state) {
     this.propose({
-      title: w('managed.rollback.title'),
+      title: w('managed.rollback.ask'),
       what: w('managed.rollback.what'),
       from: state.current,
       to: state.rollback_to,
