@@ -543,12 +543,12 @@ const BUSY = 'the proxy is busy';
 /**
  * What an answer to a request to switch (choose a generation, roll back) comes to, from the `{ body, error }` that
  * `perform` gave. The word is one of `switched`, `unchanged`, `refused`, `failed`, `unreachable` and `unconfirmed`
- * (the proxy's own, named in the body of the answer whatever the status is), or `busy` (the proxy had no room for
- * the switch), `lost` (no answer: the result is not known), `conflict` (the state moved under the request),
- * `unavailable`, `forbidden`, `limited`, or `other`. `ids` are the generation before and the one asked for, `engine`
- * is the engine that was switched (`engine` here is the one of the request, for an answer that did not name it),
- * `chosen` says whether the rules store chooses the latter now, and `unwritten` that the history has no line for the
- * request.
+ * (the proxy's own, named in the body of the answer whatever the status is), or `busy` (the proxy had no room to
+ * answer the question about its state, so the switch was not started), `lost` (no answer: the result is not known),
+ * `conflict` (the state moved under the request), `unavailable`, `forbidden`, `limited`, or `other`. `ids` are the
+ * generation before and the one asked for, `engine` is the engine that was switched (`engine` here is the one of the
+ * request, for an answer that did not name it), `chosen` says whether the rules store chooses the latter now, and
+ * `unwritten` that the history has no line for the request.
  */
 export function switchOutcome({ body, error }, engine = null) {
   const source = error === null ? body : error?.body;

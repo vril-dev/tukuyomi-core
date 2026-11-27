@@ -1,12 +1,13 @@
 // The job of a change of the managed configuration. A change is answered at once and its order runs on in the admin
 // process as a job, so the screen reads the job until it ends (`Watch`) and then tells how it ended: the name of the
 // result, what happened and what to do next (`RESULTS`, with `REFUSED` and `BUSY` for the words of the proxy). A word
-// that the tables do not hold is told as a result that is not known, with the word as it came. Nothing runs when the
-// module is loaded.
+// that the tables do not hold is told as a result that is not known, with the word as it came. The detail that a
+// result carries is told in the chosen language when the dictionaries have that sentence, and as it came otherwise.
+// Nothing runs when the module is loaded.
 
 import { ApiError } from '../api.js';
 import { badge, el, notice, result } from '../dom.js';
-import { lazy, t, w } from '../i18n.js';
+import { lazy, sentence, t, w } from '../i18n.js';
 import { fingerprintView, isFingerprint, kv, panel, row, timeView } from '../parts.js';
 
 // The next read comes this long after the answer to the one before.
@@ -199,7 +200,11 @@ function refusedNext(job) {
   return Object.hasOwn(REFUSED, job.reason) ? REFUSED[job.reason][1]() : null;
 }
 
-/** What the words of a job add to what happened: the word of its reason and the fixed sentence of its detail, as they came. */
+/**
+ * What the words of a job add to what happened: its reason, in the words of `REFUSED` or `BUSY` when they have it
+ * (a refusal also gives the word) and as it came otherwise, and its detail, the sentence that the proxy or the store
+ * gave: in words that follow the language when the dictionaries have that sentence, else as it came, in code.
+ */
 function reasonOf(job) {
   const mono = (text) => el('code', {}, String(text));
   const parts = [];
@@ -208,7 +213,7 @@ function reasonOf(job) {
     else if (job.result === 'busy' && Object.hasOwn(BUSY, job.reason)) parts.push(' ', BUSY[job.reason]());
     else parts.push(' ', mono(job.reason));
   }
-  if (typeof job.detail === 'string') parts.push(' ', mono(job.detail));
+  if (typeof job.detail === 'string') parts.push(' ', sentence(job.detail) === job.detail ? mono(job.detail) : lazy(() => sentence(job.detail)));
   return parts;
 }
 

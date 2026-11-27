@@ -442,7 +442,7 @@ class VersionsScreen extends Screen {
     }
     if (!this.alive) return;
     if (heldDraft()?.changed === true) {
-      const yes = await confirmChange(this.layer, { title: w('edit.from_version.replace_title'), lines: [el('p', {}, w('edit.from_version.replace_what'))], confirm: w('edit.from_version.replace_title'), tone: 'danger' });
+      const yes = await confirmChange(this.layer, { title: w('edit.from_version.replace_ask'), lines: [el('p', {}, w('edit.from_version.replace_what'))], confirm: w('edit.from_version.replace_title'), tone: 'danger' });
       if (!yes || !this.alive) return;
     }
     draftFromVersion(selected, contents[0], name, contents[1], () => this.ctx.api.call('GET', '/api/session'));
@@ -471,7 +471,7 @@ class VersionsScreen extends Screen {
     const { current, serving } = this.data.state;
     const version = mode === 'apply' ? current : serving;
     this.propose({
-      title: mode === 'apply' ? w('managed.repair.apply') : w('managed.repair.choose'),
+      title: mode === 'apply' ? w('managed.repair.apply_ask') : w('managed.repair.choose_ask'),
       what: w('managed.repair.what'),
       note: mode === 'apply' ? w('managed.repair.apply_note') : w('managed.repair.choose_note'),
       from: serving,

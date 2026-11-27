@@ -1864,9 +1864,13 @@ managed 設定の画面:
 | 415 | ボディを読み込む API に、`application/json` でない `Content-Type` | `unsupported media type` |
 | 422 | インポートの事前検証の失敗 | `the trial failed` |
 | 429 | クライアントの回数の超過 | `too many tries` |
-| 500 | 管理プロセスの中の不整合、ルールストアか managed ストアを読めない | `internal error`、ルールストアと managed ストアの文 |
+| 500 | 管理プロセスの中の不整合、ルールストアか managed ストアを読めない、選択中の世代の記録が壊れている・食い違っている | `internal error`、ルールストアと managed ストアの文（`the current generation record is broken` と `the current generation records of the engine disagree` を含む） |
 | 502 | プロキシが切り替えなかった | `the proxy did not switch` |
 | 503 | 保存先や監査ログの行を読み書きできない、時間切れ、プロキシに接続できない、managed 設定の検証が重なった | `unavailable`、`the proxy cannot be reached`、`the proxy is busy`、`the proxy did not say how the switch ended`、`a check of a managed version is under way` |
+
+`the current generation record is broken` または `the current generation records of the engine disagree` の 500 は、管理 API では直せません。
+`GET /api/generations` と `GET /api/status` も 500 になるため、管理画面では世代の一覧の表示も切り替えもできません。
+`rules activate` でそのエンジンの世代を選択し直してください（[運用リファレンス](operator-reference.ja.md) の「エンジンごとの選択中の世代」）。
 
 managed 設定の変更（「保存して反映」「名前で反映」「ロールバック」）は、受け付けると 202 で応答します。
 どう終わったかは、反映の処理（上の「managed 設定の操作」）で確認します。
