@@ -63,20 +63,20 @@ Since 0.1.0, a tarball of executables for Linux x86_64 has been distributed thro
 
 | File | Content |
 |---|---|
-| `tukuyomi-core_v0.2.1_linux_amd64.tar.gz` | In the directory `tukuyomi-core_v0.2.1_linux_amd64/`: the four executables (see "Components" above), `README.md`, `README.ja.md`, `LICENSE`, `NOTICE`, `THIRD-PARTY-LICENSES`, `docs/`, and `scripts/fetch-crs.sh` |
-| `tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256` | The SHA-256 of the tarball |
-| `tukuyomi-core_v0.2.1_guide_ja.epub`, `tukuyomi-core_v0.2.1_guide_ja.pdf` | The operations guide, Japanese edition (EPUB and PDF) |
-| `tukuyomi-core_v0.2.1_guide_en.epub`, `tukuyomi-core_v0.2.1_guide_en.pdf` | The operations guide, English edition (EPUB and PDF) |
-| `tukuyomi-core_v0.2.1_SHA256SUMS` | The SHA-256 of the tarball and of the four books |
+| `tukuyomi-core_v0.2.2_linux_amd64.tar.gz` | In the directory `tukuyomi-core_v0.2.2_linux_amd64/`: the four executables (see "Components" above), `README.md`, `README.ja.md`, `LICENSE`, `NOTICE`, `THIRD-PARTY-LICENSES`, `docs/`, and `scripts/fetch-crs.sh` |
+| `tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256` | The SHA-256 of the tarball |
+| `tukuyomi-core_v0.2.2_guide_ja.epub`, `tukuyomi-core_v0.2.2_guide_ja.pdf` | The operations guide, Japanese edition (EPUB and PDF) |
+| `tukuyomi-core_v0.2.2_guide_en.epub`, `tukuyomi-core_v0.2.2_guide_en.pdf` | The operations guide, English edition (EPUB and PDF) |
+| `tukuyomi-core_v0.2.2_SHA256SUMS` | The SHA-256 of the tarball and of the four books |
 
 - After downloading, check the SHA-256 before extracting.
 
   ```bash
-  sha256sum -c tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256
-  tar -xzf tukuyomi-core_v0.2.1_linux_amd64.tar.gz
+  sha256sum -c tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256
+  tar -xzf tukuyomi-core_v0.2.2_linux_amd64.tar.gz
   ```
 
-- The books are not in the tarball. To check a downloaded book, use its line in `tukuyomi-core_v0.2.1_SHA256SUMS` (for example, `sha256sum -c --ignore-missing tukuyomi-core_v0.2.1_SHA256SUMS` in the directory of the downloaded files).
+- The books are not in the tarball. To check a downloaded book, use its line in `tukuyomi-core_v0.2.2_SHA256SUMS` (for example, `sha256sum -c --ignore-missing tukuyomi-core_v0.2.2_SHA256SUMS` in the directory of the downloaded files).
 - The executables were built on Ubuntu 26.04.1 LTS (glibc 2.43, gcc 15.2.0) with `rustc` 1.94.1 and Go 1.27.2. They have been tested only on the host where they were built.
 - The host that runs them needs glibc 2.39 or later (`tukuyomi-proxy` uses `GLIBC_2.39` symbols). The ModSecurity inspector process also needs the libstdc++ symbols `GLIBCXX_3.4.29` and `CXXABI_1.3.15`. They do not run on an older Linux, so build from source there (see "Building from Source" below).
 - The inspector process (`tukuyomi-inspector`) is statically linked. The TLS library (aws-lc) is also statically linked into the executable.

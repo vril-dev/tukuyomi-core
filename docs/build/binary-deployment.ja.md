@@ -83,21 +83,21 @@
 
 | ファイル | 内容 |
 |---|---|
-| `tukuyomi-core_v0.2.1_linux_amd64.tar.gz` | ディレクトリ `tukuyomi-core_v0.2.1_linux_amd64/` の中に、4 つの実行ファイル（上の「構成要素」）、`README.md`、`README.ja.md`、`LICENSE`、`NOTICE`、`THIRD-PARTY-LICENSES`、`docs/`、`scripts/fetch-crs.sh` |
-| `tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256` | tarball の SHA-256 |
-| `tukuyomi-core_v0.2.1_guide_ja.epub`、`tukuyomi-core_v0.2.1_guide_ja.pdf` | 運用ガイドの日本語版（EPUB と PDF） |
-| `tukuyomi-core_v0.2.1_guide_en.epub`、`tukuyomi-core_v0.2.1_guide_en.pdf` | 運用ガイドの英語版（EPUB と PDF） |
-| `tukuyomi-core_v0.2.1_SHA256SUMS` | tarball と 4 つの本の SHA-256 |
+| `tukuyomi-core_v0.2.2_linux_amd64.tar.gz` | ディレクトリ `tukuyomi-core_v0.2.2_linux_amd64/` の中に、4 つの実行ファイル（上の「構成要素」）、`README.md`、`README.ja.md`、`LICENSE`、`NOTICE`、`THIRD-PARTY-LICENSES`、`docs/`、`scripts/fetch-crs.sh` |
+| `tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256` | tarball の SHA-256 |
+| `tukuyomi-core_v0.2.2_guide_ja.epub`、`tukuyomi-core_v0.2.2_guide_ja.pdf` | 運用ガイドの日本語版（EPUB と PDF） |
+| `tukuyomi-core_v0.2.2_guide_en.epub`、`tukuyomi-core_v0.2.2_guide_en.pdf` | 運用ガイドの英語版（EPUB と PDF） |
+| `tukuyomi-core_v0.2.2_SHA256SUMS` | tarball と 4 つの本の SHA-256 |
 
 - ダウンロードしたら、展開する前に SHA-256 を確認します。
 
   ```bash
-  sha256sum -c tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256
-  tar -xzf tukuyomi-core_v0.2.1_linux_amd64.tar.gz
+  sha256sum -c tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256
+  tar -xzf tukuyomi-core_v0.2.2_linux_amd64.tar.gz
   ```
 
 - 本は tarball に入っていません。
-  ダウンロードした本は、`tukuyomi-core_v0.2.1_SHA256SUMS` の行で確認できます（例: ダウンロードしたディレクトリで `sha256sum -c --ignore-missing tukuyomi-core_v0.2.1_SHA256SUMS`）。
+  ダウンロードした本は、`tukuyomi-core_v0.2.2_SHA256SUMS` の行で確認できます（例: ダウンロードしたディレクトリで `sha256sum -c --ignore-missing tukuyomi-core_v0.2.2_SHA256SUMS`）。
 - 実行ファイルは Ubuntu 26.04.1 LTS（glibc 2.43、gcc 15.2.0）上で、`rustc` 1.94.1 と Go 1.27.2 を使ってビルドしています。
   動作を確認したのはビルドしたホストだけです。
 - `tukuyomi-proxy` が `GLIBC_2.39` のシンボルを使うため、動かすホストには glibc 2.39 以上が必要です。

@@ -52,8 +52,8 @@ systemd を使った本番向けの配置は第3章で扱い、この章では�
 リリースの tarball は GitHub のリリース（<https://github.com/vril-dev/tukuyomi-core/releases>）で配布しています。
 ダウンロードするのは、次の 2 つのファイルです。
 
-- `tukuyomi-core_v0.2.1_linux_amd64.tar.gz`
-- `tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256`
+- `tukuyomi-core_v0.2.2_linux_amd64.tar.gz`
+- `tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256`
 
 まず、作業用のディレクトリを作ります。
 展開したスクリプトを後で `sudo -u tukuyomi` で実行するので、このディレクトリは OS ユーザー `tukuyomi` から読めなければなりません。
@@ -68,11 +68,11 @@ d=$(mktemp -d /tmp/tukuyomi-core.XXXXXX) && chmod 0755 "$d" && cd "$d"
 展開する前に、SHA-256 を確認してください。
 
 ```bash
-sha256sum -c tukuyomi-core_v0.2.1_linux_amd64.tar.gz.sha256
-tar -xzf tukuyomi-core_v0.2.1_linux_amd64.tar.gz
+sha256sum -c tukuyomi-core_v0.2.2_linux_amd64.tar.gz.sha256
+tar -xzf tukuyomi-core_v0.2.2_linux_amd64.tar.gz
 ```
 
-展開すると、`tukuyomi-core_v0.2.1_linux_amd64/` に 4 つの実行ファイルや `scripts/fetch-crs.sh` などができます。
+展開すると、`tukuyomi-core_v0.2.2_linux_amd64/` に 4 つの実行ファイルや `scripts/fetch-crs.sh` などができます。
 
 実行ファイルは所有者を root にして、サービスの OS ユーザーが書き換えられない場所に置きます。
 この章で使うのは、プロキシと Coraza の検査プロセスの 2 つだけです。
@@ -80,8 +80,8 @@ ModSecurity の検査プロセス（`tukuyomi-inspector-modsecurity`）とログ
 
 ```bash
 sudo install -d -m 0755 /opt/tukuyomi-core/bin
-sudo install -m 0755 tukuyomi-core_v0.2.1_linux_amd64/tukuyomi-proxy \
-  tukuyomi-core_v0.2.1_linux_amd64/tukuyomi-inspector /opt/tukuyomi-core/bin/
+sudo install -m 0755 tukuyomi-core_v0.2.2_linux_amd64/tukuyomi-proxy \
+  tukuyomi-core_v0.2.2_linux_amd64/tukuyomi-inspector /opt/tukuyomi-core/bin/
 ```
 
 ## 2.4　OS ユーザーとディレクトリを用意する
@@ -243,7 +243,7 @@ root で実行すると、できたファイルを `tukuyomi` で実行する `r
 2.3 で移動した作業用のディレクトリで、次のコマンドを実行します。
 
 ```bash
-sudo -u tukuyomi tukuyomi-core_v0.2.1_linux_amd64/scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
+sudo -u tukuyomi tukuyomi-core_v0.2.2_linux_amd64/scripts/fetch-crs.sh /var/lib/tukuyomi-core/crs-4.23.0
 ```
 
 このスクリプトについて、知っておくとよい点は次のとおりです。
