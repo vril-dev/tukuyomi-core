@@ -37,7 +37,7 @@
 - Landlock が有効な Linux。
   - 検査プロセスはルールを読んだ後に、Landlock で自身の権限を制限します（下の「検査プロセスの権限の制限」）。
   - Landlock が無い Linux では、検査プロセスは起動しません（exit 14）。
-    プロキシも起動しません（ログは `stop: the kernel failed: Exit(14)`）。
+    プロキシも起動しません（ログは `stop: the kernel failed, engine <engine>: Exit(14)`）。
     `rules import` の事前検証も、管理プロセスのインポートの事前検証も失敗します。
     制限をかけずに動かす設定はありません。
   - Landlock を含む Linux 5.13 以上で、LSM の一覧に `landlock` が入っている必要があります。一覧は `/sys/kernel/security/lsm` で確認できます。
@@ -130,7 +130,7 @@ cd inspector && CGO_ENABLED=0 go build -mod=readonly -o tukuyomi-inspector .
   cgo を使った実行ファイルではこの呼び出しが `ENOTSUP` を返すため、検査プロセスは起動しません（exit 14）。
 - 起動しない理由（`the inspector is built with cgo and cannot restrict every thread`）は、検査プロセスの標準出力・標準エラーには出ません。
   理由が出るのは、`rules import` の `the inspector said:` の行と、SIGUSR1 の切り替えが失敗したときの `reload: the inspector said:` の行だけです。
-  プロキシの起動では、`stop: the kernel failed: Exit(14)` の行だけが出ます。
+  プロキシの起動では、`stop: the kernel failed, engine <engine>: Exit(14)` の行だけが出ます。
 
 ### ModSecurity の検査プロセス
 
@@ -180,7 +180,7 @@ cd inspector-modsecurity && TUKUYOMI_MODSECURITY_PREFIX=<new-dir> cargo build --
 | アーカイブの sha256 | 上の `f283b33d…b671a50` |
 
 一致しない場合、検査カーネルは `hello toolchain differs`、`hello engine version differs`、`hello engine source differs` のどれかを出して、その検査プロセスを受け付けません。検査プロセスの再起動もしません。
-プロキシの起動では、`stop: the kernel failed: Hello("<message>")` の行が出ます。
+プロキシの起動では、`stop: the kernel failed, engine <engine>: Hello("<message>")` の行が出ます。
 `rules import` では、`rules import: the trial failed: the inspector could not be started (Hello("<message>"))` の行が出ます。
 
 ### ログ送信プロセス

@@ -33,7 +33,7 @@ The requirements are as follows.
 
 - **Linux**: tested on x86_64 only.
 - **Linux with Landlock enabled**: an inspector process restricts its own privileges with Landlock after it reads the rules (see section 3.8).
-  - On a Linux without Landlock, the inspector process does not start (exit 14). The proxy does not start either, and the log shows `stop: the kernel failed: Exit(14)`. Both the `rules import` trial and the admin process's import trial fail. No setting lets it run without the restriction.
+  - On a Linux without Landlock, the inspector process does not start (exit 14). The proxy does not start either, and the log shows `stop: the kernel failed, engine <engine>: Exit(14)`. Both the `rules import` trial and the admin process's import trial fail. No setting lets it run without the restriction.
   - You need Linux 5.13 or later, with `landlock` in the LSM list, which you can check in `/sys/kernel/security/lsm`. Which distributions enable Landlock by default has not been checked.
   - What can be restricted depends on the Linux version. Restricting TCP bind and connect requires Linux 6.7 or later (Landlock ABI 4 or later). On earlier versions, only files are restricted.
 - **glibc and libstdc++**: the release executables need glibc 2.39 or later. The ModSecurity inspector process also needs the libstdc++ symbols `GLIBCXX_3.4.29` and `CXXABI_1.3.15`. On an older Linux, build from source.

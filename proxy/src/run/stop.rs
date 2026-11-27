@@ -5,7 +5,7 @@ use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 
 use tokio::time::{Instant, timeout_at};
-use tukuyomi_kernel::{Failure, Phase};
+use tukuyomi_kernel::{Engine, Failure, Phase};
 
 use super::serve::note_joined;
 use super::signals::{Event, Source, Waits};
@@ -17,15 +17,18 @@ use crate::log::Log;
 /// The driver's end counts as clean only for a stopped kernel whose child exit and directory removal are
 /// confirmed, when every kernel that was stopped before it stopped cleanly too.
 fn clean_shutdown(end: &End) -> bool {
-    matches!(end, End::Done { kernel, retired_clean: true }
+    matches!(end, End::Done { kernel, retired_clean: true, .. }
         if kernel.phase == Phase::Stopped && kernel.exit_confirmed && kernel.dir_removed)
 }
 
 /// Why the process stops.
 pub(super) enum Cause {
     Signal(&'static str),
-    /// The kernel failed (before ready, or after).
-    Failed(Failure),
+    /// The kernel of `engine` failed (before ready, or after).
+    Failed {
+        engine: Engine,
+        failure: Failure,
+    },
     /// The driver ended without being told to.
     Ended(End),
     /// A channel closed without an answer.
@@ -40,7 +43,9 @@ impl Cause {
     pub(super) fn of(event: Event) -> Option<Cause> {
         match event {
             Event::Signal(name) => Some(Cause::Signal(name)),
-            Event::Ready(Err(failure)) | Event::Failed(failure) => Some(Cause::Failed(failure)),
+            Event::Ready(Err((engine, failure))) | Event::Failed { engine, failure } => {
+                Some(Cause::Failed { engine, failure })
+            }
             Event::Ended(end) => Some(Cause::Ended(end)),
             Event::Lost(source) => Some(Cause::Lost(source)),
             Event::Late => Some(Cause::Late),
@@ -79,7 +84,10 @@ impl Stop {
                 stop.fault = false;
                 log.line(&format!("stop: {name}"));
             }
-            Cause::Failed(failure) => log.line(&format!("stop: the kernel failed: {failure:?}")),
+            Cause::Failed { engine, failure } => log.line(&format!(
+                "stop: the kernel failed, engine {}: {failure:?}",
+                engine.name()
+            )),
             Cause::Ended(end) => {
                 log.line("stop: the driver ended before it was told to stop");
                 stop.ended = Some(end);
@@ -103,8 +111,11 @@ impl Stop {
             Event::Ended(end) => self.ended = Some(end),
             Event::Lost(Source::End) => self.end_lost = true,
             Event::Signal(name) => log.line(&format!("stop: {name} again")),
-            Event::Failed(failure) => {
-                log.line(&format!("stop: the kernel failed: {failure:?}"));
+            Event::Failed { engine, failure } => {
+                log.line(&format!(
+                    "stop: the kernel failed, engine {}: {failure:?}",
+                    engine.name()
+                ));
             }
             Event::Joined(done) => note_joined(done, log),
             Event::Configuration => log.line("reload: configuration ignored while stopping"),
@@ -189,11 +200,13 @@ pub(super) async fn stop(
 
     match &stop.ended {
         Some(End::Done {
+            engine,
             kernel: done,
             retired_clean,
         }) => log.line(&format!(
-            "stop: kernel {:?}, bye {}, exit_confirmed {}, dir_removed {}, held_left {}, waiting_left {}, results {}, retired_clean {}",
+            "stop: kernel {:?}, engine {}, bye {}, exit_confirmed {}, dir_removed {}, held_left {}, waiting_left {}, results {}, retired_clean {}",
             done.phase,
+            engine.name(),
             done.bye,
             done.exit_confirmed,
             done.dir_removed,

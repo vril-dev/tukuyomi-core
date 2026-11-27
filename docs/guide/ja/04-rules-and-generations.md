@@ -269,7 +269,7 @@ ModSecurity の世代を使わないホストでは、この設定キーは省�
 - デフォルトのエンジンに選択中の世代が無く、ほかのエンジンにはある場合は、`rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` で拒否されます（exit 1）。
   ModSecurity だけで使い始めるときは、設定の `kernel.default_engine` を `modsecurity` にしたうえで、ModSecurity の世代を選択してください。
 - 一度起動したエンジンは、`rules deactivate` を実行しても、プロキシが停止するまで止まりません。
-  どのアップストリームも使わず、デフォルトのエンジンでもないエンジンでも、検査カーネルが失敗するとプロキシ全体が停止します（`stop: the kernel failed: <reason>`、exit 1）。
+  どのアップストリームも使わず、デフォルトのエンジンでもないエンジンでも、検査カーネルが失敗するとプロキシ全体が停止します（`stop: the kernel failed, engine <engine>: <reason>`、exit 1）。
 - メモリの目安は、付録A 運用リファレンスの「検査エンジンの選択」を参照してください。
 
 ### デフォルトのエンジンを変更する手順

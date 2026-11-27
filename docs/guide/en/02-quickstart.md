@@ -320,7 +320,7 @@ The proxy stops accepting new connections and requests, finishes the requests in
 | `config check` or the proxy start exits 1 with `rules store refused: no generation is chosen` | No generation is chosen for the default engine. Run `rules activate` as in section 2.7 |
 | `rules import` cannot read the CRS directory | If you run `fetch-crs.sh` as root, only root can read the files it creates. Delete that directory and fetch the CRS again as `tukuyomi` |
 | The `rules import` trial fails | On a Linux without Landlock, the inspector process does not start, so the trial fails. With a generation in block mode, the trial also fails when a trial request is blocked (`--accept-block`) |
-| The proxy stops with `stop: the kernel failed: Exit(14)` | On a Linux without Landlock, the inspector process does not start. Check that the Linux is 5.13 or later and that `landlock` is in the LSM list |
+| The proxy stops with `stop: the kernel failed, engine <engine>: Exit(14)` | On a Linux without Landlock, the inspector process does not start. Check that the Linux is 5.13 or later and that `landlock` is in the LSM list |
 | Both the start and `rules import` fail with a directory error | Make the directories in the table of section 2.4 owned by `tukuyomi`, with permissions 0700. Symbolic links cannot be used. Neither the proxy nor the commands create these directories |
 | The start stops because a listener cannot be bound | Another process is using the same address and port. If even one listener cannot be bound, the proxy uses none of them and stops |
 | An ordinary request gets 502 | The proxy cannot connect to the upstream `127.0.0.1:8080`. Start the upstream. The log of such a request has `class` `failed` |

@@ -8,6 +8,7 @@ use tukuyomi_kernel::Shutdown;
 
 fn shutdown(phase: Phase, confirmed: bool, removed: bool) -> End {
     End::Done {
+        engine: Engine::Coraza,
         kernel: Shutdown {
             results: Vec::new(),
             phase,
@@ -36,10 +37,11 @@ fn only_a_stopped_confirmed_removed_kernel_is_a_clean_end() {
         "result for an unknown request"
     )));
     // A kernel that was stopped before, and did not stop cleanly, makes the end unclean too.
-    let End::Done { kernel, .. } = shutdown(Phase::Stopped, true, true) else {
+    let End::Done { engine, kernel, .. } = shutdown(Phase::Stopped, true, true) else {
         unreachable!()
     };
     assert!(!clean_shutdown(&End::Done {
+        engine,
         kernel,
         retired_clean: false
     }));
@@ -177,7 +179,11 @@ fn the_stop_exits_one_unless_the_end_is_clean_and_the_cause_is_not_a_failure() {
             driver.join().unwrap();
         }
         // A failure as the cause, although the driver ends cleanly.
-        for cause in [Cause::Failed(Failure::BudgetExhausted), Cause::Late] {
+        let failed = Cause::Failed {
+            engine: Engine::Coraza,
+            failure: Failure::BudgetExhausted,
+        };
+        for cause in [failed, Cause::Late] {
             let f = fixture();
             let (tx, driver) = driver_thread(Some(shutdown(Phase::Stopped, true, true)), f.end);
             let connections = connections(&tx);

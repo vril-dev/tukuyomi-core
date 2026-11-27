@@ -36,14 +36,16 @@ pub(super) struct Pending {
 
 /// The record line for a new incarnation of the inspector, or `None` while it is the one seen last. The kernel
 /// numbers the next incarnation when the one before it has ended, so the number can change before the next
-/// process has started, or with none to follow; the line says only that the number changed and how many
-/// restarts the kernel has made in all. The first incarnation is the number the kernel starts with and gets no
-/// line. Fixed text and numbers only.
-pub(super) fn restart_line(seen: u32, status: &Status) -> Option<String> {
+/// process has started, or with none to follow; the line says only which engine it is, that the number changed and
+/// how many restarts the kernel has made in all. The first incarnation is the number the kernel starts with and gets
+/// no line. Fixed text and numbers only.
+pub(super) fn restart_line(engine: Engine, seen: u32, status: &Status) -> Option<String> {
     (status.inc != seen).then(|| {
         format!(
-            "driver: inspector incarnation changed, inc {}, restarts {}",
-            status.inc, status.restarts
+            "driver: inspector incarnation changed, engine {}, inc {}, restarts {}",
+            engine.name(),
+            status.inc,
+            status.restarts
         )
     })
 }
@@ -219,7 +221,7 @@ impl<K: Kernel> Slot<K> {
     /// gives no line.
     pub(super) fn note_incarnation(&mut self) -> Option<String> {
         let status = self.kernel.status();
-        let line = restart_line(self.inc, &status)?;
+        let line = restart_line(self.engine, self.inc, &status)?;
         self.inc = status.inc;
         Some(line)
     }

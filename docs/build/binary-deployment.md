@@ -32,7 +32,7 @@ The inspector processes, the admin process, and the records shipper run as the s
 - Linux. It has been tested on x86_64 only.
 - Linux with Landlock enabled.
   - An inspector process restricts its own privileges with Landlock after it reads the rules (see "Restricting the Inspector Processes" below).
-  - On a Linux without Landlock, the inspector process does not start (exit 14). The proxy does not start either (the log shows `stop: the kernel failed: Exit(14)`). Both the `rules import` trial and the admin process's import trial fail. There is no setting to run without the restriction.
+  - On a Linux without Landlock, the inspector process does not start (exit 14). The proxy does not start either (the log shows `stop: the kernel failed, engine <engine>: Exit(14)`). Both the `rules import` trial and the admin process's import trial fail. There is no setting to run without the restriction.
   - You need Linux 5.13 or later, which includes Landlock, and `landlock` must be in the LSM list (you can check it in `/sys/kernel/security/lsm`). We have not checked which distributions enable Landlock by default.
   - What can be restricted depends on the Linux version. You cannot tell from the outside which ABI version was used for the restriction.
     - Restricting TCP bind and connect requires Linux 6.7 or later (Landlock ABI 4 or later). On earlier versions, only file access is restricted.
@@ -101,7 +101,7 @@ cd inspector && CGO_ENABLED=0 go build -mod=readonly -o tukuyomi-inspector .
 Always specify `CGO_ENABLED=0`.
 
 - The inspector process uses Go's `syscall.AllThreadsSyscall` to apply Landlock and the other restrictions to all threads. In an executable that uses cgo, this call returns `ENOTSUP`, so the inspector process does not start (exit 14).
-- The reason it does not start (`the inspector is built with cgo and cannot restrict every thread`) does not appear on the standard output or standard error of the inspector process. It appears only in the `the inspector said:` line of `rules import`, and in the `reload: the inspector said:` line when a SIGUSR1 switch fails. At proxy start, only the line `stop: the kernel failed: Exit(14)` appears.
+- The reason it does not start (`the inspector is built with cgo and cannot restrict every thread`) does not appear on the standard output or standard error of the inspector process. It appears only in the `the inspector said:` line of `rules import`, and in the `reload: the inspector said:` line when a SIGUSR1 switch fails. At proxy start, only the line `stop: the kernel failed, engine <engine>: Exit(14)` appears.
 
 ### ModSecurity Inspector
 
@@ -140,7 +140,7 @@ In its first message at start (HELLO), the inspector process reports to the insp
 | The libmodsecurity version | `v3.0.17` |
 | The archive sha256 | `f283b33d…b671a50` above |
 
-If they do not match, the inspection kernel writes one of `hello toolchain differs`, `hello engine version differs`, and `hello engine source differs`, rejects the inspector process, and does not restart it. At proxy start, the line `stop: the kernel failed: Hello("<message>")` appears; with `rules import`, the line `rules import: the trial failed: the inspector could not be started (Hello("<message>"))` appears.
+If they do not match, the inspection kernel writes one of `hello toolchain differs`, `hello engine version differs`, and `hello engine source differs`, rejects the inspector process, and does not restart it. At proxy start, the line `stop: the kernel failed, engine <engine>: Hello("<message>")` appears; with `rules import`, the line `rules import: the trial failed: the inspector could not be started (Hello("<message>"))` appears.
 
 ### Records Shipper
 

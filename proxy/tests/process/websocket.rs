@@ -169,7 +169,7 @@ fn a_tunnel_is_not_ended_by_the_stop_and_is_cut_when_the_time_to_finish_ends() {
     );
     assert!(
         lines.iter().any(|l| l.starts_with(
-            "stop: kernel Stopped, bye true, exit_confirmed true, dir_removed true, held_left 0, waiting_left 0"
+            "stop: kernel Stopped, engine coraza, bye true, exit_confirmed true, dir_removed true, held_left 0, waiting_left 0"
         )),
         "records: {lines:#?}"
     );

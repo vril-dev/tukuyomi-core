@@ -118,7 +118,7 @@ impl<K: Kernel> Core<K> {
     }
 
     pub(super) fn run(&mut self) -> End {
-        let done = loop {
+        let (engine, done) = loop {
             match self.round() {
                 Ok(None) => {}
                 Ok(Some(done)) => break done,
@@ -127,6 +127,7 @@ impl<K: Kernel> Core<K> {
         };
         match self.quiesce() {
             Ok(()) => End::Done {
+                engine,
                 kernel: done,
                 retired_clean: self.lanes.iter().all(|lane| lane.retired_clean),
             },
@@ -134,9 +135,9 @@ impl<K: Kernel> Core<K> {
         }
     }
 
-    /// One round. `Some` is the end of the `shutdown` that was called in this round (the other kernels are stopped on
-    /// threads of their own). `Err` is a fault that stops the driver.
-    pub(super) fn round(&mut self) -> Result<Option<Shutdown>, &'static str> {
+    /// One round. `Some` is the end of the `shutdown` that was called in this round, with the engine of its kernel (the
+    /// other kernels are stopped on threads of their own). `Err` is a fault that stops the driver.
+    pub(super) fn round(&mut self) -> Result<Option<(Engine, Shutdown)>, &'static str> {
         self.intake(None)?;
         for lane in &mut self.lanes {
             lane.scan();
@@ -159,7 +160,7 @@ impl<K: Kernel> Core<K> {
             if let Some(phase) = lane.active.as_ref().map(|active| active.status().phase)
                 && let Some(said) = lane.signals.note(phase)
             {
-                self.told.said(said);
+                self.told.said(lane.engine, said);
             }
             lane.note(&self.log);
         }
@@ -290,7 +291,7 @@ impl<K: Kernel> Core<K> {
     /// and waited for last. So every `shutdown` ends by `inspect_by` and the grace of the kernel, which `stop_wait`
     /// leaves room for. Every request is decided by then, so a ticket that is left in a table breaks the promise that
     /// every result comes out once.
-    fn finish_if_due(&mut self) -> Result<Option<Shutdown>, &'static str> {
+    fn finish_if_due(&mut self) -> Result<Option<(Engine, Shutdown)>, &'static str> {
         let Mode::Stopping { inspect_by } = self.mode else {
             return Ok(None);
         };
@@ -321,6 +322,7 @@ impl<K: Kernel> Core<K> {
         let Some(active) = here.and_then(|at| self.lanes[at].active.as_mut()) else {
             return Err("no kernel to stop");
         };
+        let engine = active.engine;
         let done = active.shutdown(inspect_by)?;
         self.mode = Mode::Down;
         for lane in &mut self.lanes {
@@ -330,7 +332,7 @@ impl<K: Kernel> Core<K> {
             let retired = retirement.wait()?;
             self.lanes[at].retired(&retired, Switched::Yes, &self.log);
         }
-        Ok(Some(done))
+        Ok(Some((engine, done)))
     }
 
     /// After `shutdown`: answers every ticket with `Outcome::Unavailable` until the last sender is gone. The

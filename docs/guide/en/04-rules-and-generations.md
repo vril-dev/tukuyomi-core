@@ -177,7 +177,7 @@ The proxy starts every engine that has a chosen generation and an inspector proc
 
 - The default engine and the engines that upstreams use need a chosen generation. Without one, both start and `config check` are refused with `rules store refused: no generation is chosen`.
 - If the default engine has no chosen generation but another engine has one, the configuration is refused with `rules store refused: no generation is chosen for kernel.default_engine, but one is chosen for another engine` (exit 1). To start with ModSecurity only, set `kernel.default_engine` in the configuration to `modsecurity` and choose a ModSecurity generation.
-- An engine that has started does not stop until the proxy stops, even when you run `rules deactivate`. If its inspection kernel fails, the whole proxy stops, even for an engine that no upstream uses and that is not the default engine (`stop: the kernel failed: <reason>`, exit 1).
+- An engine that has started does not stop until the proxy stops, even when you run `rules deactivate`. If its inspection kernel fails, the whole proxy stops, even for an engine that no upstream uses and that is not the default engine (`stop: the kernel failed, engine <engine>: <reason>`, exit 1).
 - For a guide to memory use, see "Choosing the Inspection Engine" in Appendix A (Operator Reference).
 
 ### Steps to Change the Default Engine

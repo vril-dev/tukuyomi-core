@@ -387,7 +387,7 @@ sudo kill -TERM $(pgrep -u tukuyomi -x tukuyomi-proxy)
 | `config check` やプロキシの起動が、`rules store refused: no generation is chosen` で exit 1 になる | デフォルトのエンジンの世代を選択していません。2.7 の `rules activate` を実行してください |
 | `rules import` が CRS のディレクトリを読めない | `fetch-crs.sh` を root で実行すると、できたファイルは root しか読めません。そのディレクトリを削除し、`tukuyomi` でダウンロードし直してください |
 | `rules import` の事前検証が失敗する | Landlock を使えない Linux では検査プロセスが起動しないため、事前検証は失敗します。ブロックする世代では、事前検証のリクエストがブロックされた場合も失敗します。この場合は、ログを見て設定を直すか、`--accept-block` を付けてください |
-| プロキシが `stop: the kernel failed: Exit(14)` で止まる | Landlock を使えない Linux では、検査プロセスが起動しません。Linux 5.13 以上で、LSM の一覧に `landlock` があるかを確認してください |
+| プロキシが `stop: the kernel failed, engine <engine>: Exit(14)` で止まる | Landlock を使えない Linux では、検査プロセスが起動しません。Linux 5.13 以上で、LSM の一覧に `landlock` があるかを確認してください |
 | ディレクトリのエラーで、起動も `rules import` も失敗する | 2.4 の表のディレクトリは、プロキシもコマンドも自動では作りません。シンボリックリンクは使えません。これらのディレクトリは、所有者 `tukuyomi`、権限 0700 にしてください |
 | リスナーをバインドできず、起動が止まる | ほかのプロセスが同じアドレスとポートを使っています。1 つでもバインドできないリスナーがあると、プロキシはどのリスナーも使わずに停止します |
 | 通常のリクエストが 502 になる | アップストリームの `127.0.0.1:8080` に接続できていません。アップストリームを起動してください。このときのログは、`class` が `failed` になります |

@@ -38,7 +38,7 @@ systemd では、プロキシ、管理プロセス、ログ送信プロセスを
 - **Linux**: 動作を確認しているのは x86_64 だけです。
 - **Landlock が有効な Linux**: 検査プロセスはルールを読んだ後に、Landlock で自身の権限を制限します（3.8 を参照してください）。
   - Landlock が無い Linux では、検査プロセスは起動しません（exit 14）。
-    プロキシも起動せず、ログには `stop: the kernel failed: Exit(14)` が出ます。
+    プロキシも起動せず、ログには `stop: the kernel failed, engine <engine>: Exit(14)` が出ます。
     `rules import` の事前検証も、管理プロセスのインポートの事前検証も失敗します。
     制限をかけずに動かす設定はありません。
   - Linux 5.13 以上で、LSM の一覧に `landlock` が入っている必要があります。一覧は `/sys/kernel/security/lsm` で確認できます。
