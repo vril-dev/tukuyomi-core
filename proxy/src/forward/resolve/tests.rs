@@ -6,6 +6,7 @@ use rustls::pki_types::ServerName;
 use tukuyomi_kernel::Engine;
 
 use super::*;
+use crate::config::Balance;
 use crate::forward::tls::Authorities;
 use crate::forward::tls::tests::Pki;
 use crate::route::Table;
@@ -43,6 +44,7 @@ fn settings(groups: &[(&str, Vec<Address>)], wait_ms: u64) -> ForwardSettings {
                 servers: servers.iter().cloned().map(terms).collect(),
                 tls: None,
                 engine: Engine::Coraza,
+                balance: Balance::RoundRobin,
             })
             .collect(),
         routes: Table::default(),

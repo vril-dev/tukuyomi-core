@@ -113,10 +113,35 @@ export function newServer() {
   return { cid: nextCid(), address: '', weight: '1', max_fails: '1', fail_timeout_ms: '10000', backup: false, raw: {} };
 }
 
-/** What a group holds as text, to tell whether it has changed since the draft was made. */
+/** Whether the kind of key `policy` of a hash is a header or a cookie, and so has the name of one. */
+export const keyHasName = (policy) => policy === 'header' || policy === 'cookie';
+
+/** The kind of key and the name of the hash of `group`, or null for a group that does not hash. */
+function hashOf(group) {
+  if (group.balance !== 'hash') return null;
+  return { policy: group.hash_policy, key: keyHasName(group.hash_policy) ? group.hash_key : '' };
+}
+
+/** What a group holds as text, to tell whether it has changed since the draft was made: of its hash, only what its method uses. */
 export function snapshot(group) {
   const servers = group.servers.map((server) => [server.address, server.weight, server.max_fails, server.fail_timeout_ms, server.backup]);
-  return JSON.stringify([group.name, group.tls, group.ca, group.server_name, group.engine, servers]);
+  return JSON.stringify([group.name, group.tls, group.ca, group.server_name, group.engine, group.balance, hashOf(group), servers]);
+}
+
+/**
+ * The `balance`, `hash_policy` and `hash_key` of `group` written over `built`. The weighted round robin is what a group
+ * does when it names no method, so it is not written unless the version did; a key that the method or the kind of key
+ * does not use is left out. A hash with no kind of key, and a header or a cookie with no name, are told in `faults`.
+ */
+export function withBalance(built, group, faults) {
+  if (group.balance === 'round_robin' && group.raw.balance !== 'round_robin') delete built.balance;
+  else built.balance = group.balance;
+  const hash = hashOf(group);
+  withText(built, 'hash_policy', hash === null ? '' : hash.policy);
+  withText(built, 'hash_key', hash === null ? '' : hash.key);
+  if (hash === null) return;
+  if (hash.policy === '') faults.push(fault('upstreams', group.cid, group.cid, 'hash_policy', w('edit.fault.hash_policy')));
+  else if (keyHasName(hash.policy) && hash.key.trim() === '') faults.push(fault('upstreams', group.cid, group.cid, 'hash_key', emptyField()));
 }
 
 export function groupOf(name, raw) {
@@ -131,6 +156,10 @@ export function groupOf(name, raw) {
     server_name: typeof tls.server_name === 'string' ? tls.server_name : '',
     // The empty text is no engine of its own: the default engine.
     engine: typeof raw.engine === 'string' ? raw.engine : '',
+    // A group that names no method has the weighted round robin. The kind of key and its name are held whatever the method is.
+    balance: typeof raw.balance === 'string' ? raw.balance : 'round_robin',
+    hash_policy: typeof raw.hash_policy === 'string' ? raw.hash_policy : '',
+    hash_key: typeof raw.hash_key === 'string' ? raw.hash_key : '',
     raw,
   };
   group.origin = snapshot(group);
@@ -138,7 +167,7 @@ export function groupOf(name, raw) {
 }
 
 export function newGroup() {
-  return { cid: nextCid(), fresh: true, name: '', servers: [newServer()], tls: false, ca: '', server_name: '', engine: '', raw: {} };
+  return { cid: nextCid(), fresh: true, name: '', servers: [newServer()], tls: false, ca: '', server_name: '', engine: '', balance: 'round_robin', hash_policy: '', hash_key: '', raw: {} };
 }
 
 export function builtServer(group, server, faults) {

@@ -35,6 +35,12 @@ pub(super) struct RawGroup<T> {
     pub(super) tls: Option<Object<T>>,
     #[serde(default, deserialize_with = "crate::config::present")]
     pub(super) engine: Option<String>,
+    #[serde(default, deserialize_with = "crate::config::present")]
+    pub(super) balance: Option<String>,
+    #[serde(default, deserialize_with = "crate::config::present")]
+    pub(super) hash_policy: Option<String>,
+    #[serde(default, deserialize_with = "crate::config::present")]
+    pub(super) hash_key: Option<String>,
 }
 
 /// The `tls` of a group that names the file of its authorities by its path.

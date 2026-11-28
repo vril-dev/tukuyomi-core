@@ -303,7 +303,8 @@ fn is_control(b: u8) -> bool {
     b <= 0x08 || (0x0a..=0x1f).contains(&b) || b == 0x7f
 }
 
-fn is_token(b: u8) -> bool {
+/// Whether `b` is a character of a token: a letter, a digit or one of `!#$%&'*+-.^_`|~`.
+pub(crate) fn is_token(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 

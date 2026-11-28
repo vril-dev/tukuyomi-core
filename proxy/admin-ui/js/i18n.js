@@ -2,8 +2,8 @@
 // API gives for a refusal are keys too, so that the page can show them in the chosen language; a sentence that is not
 // in the dictionaries is shown as the API gave it. Here are the words of the frame of the page and of its shared parts,
 // and the sentences that the frame or more than one folder of screens can show; a folder of screens keeps the words
-// that only it uses in its `words.js` (and the words of the path of a route in `route-words.js`), and `dictionaries` is
-// all of them together. Nothing runs when the module is loaded.
+// that only it uses in its `words.js` (and the words of how a request is sent on, in `route-words.js`), and
+// `dictionaries` is all of them together. Nothing runs when the module is loaded.
 
 import { en as accountEnglish, ja as accountJapanese } from './account/words.js';
 import { en as routeEnglish, ja as routeJapanese } from './managed/edit/route-words.js';

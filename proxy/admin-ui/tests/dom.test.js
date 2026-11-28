@@ -1277,6 +1277,61 @@ test('the screen of the upstream groups chooses the engine of a group, says what
   forgetDraft();
 });
 
+test('the screen of the upstream groups chooses how a server is chosen, asks for the key of a hash only for a hash, marks the group in the list, and tells a refusal at the field', async () => {
+  const version = { sites: [], upstreams: groupOfOne, routes: [], default_upstream: '' };
+  const { root, screen, sent, pressed, control, errorOf } = await editScreen('upstreams', version, () => ({ at: 'upstreams.app.hash_key', sentence: 'an upstream hash_key is not a name of 1 to 64 token characters' }));
+  const line = () => root.querySelector('[data-row]').textContent;
+  const type = (input, value) => {
+    input.value = value;
+    input.dispatch('input');
+  };
+  const choose = (input, value) => {
+    input.value = value;
+    input.dispatch('change');
+  };
+  const hidden = (input) => {
+    for (let node = input; node !== null; node = node.parent) if (node.hidden) return true;
+    return false;
+  };
+  // The weighted round robin is what a group has when it names no method, and the list does not mark it.
+  assert.equal(line().includes('round robin'), false);
+  pressed('Edit');
+  const balance = control('Load balancing method');
+  assert.deepEqual(balance.querySelectorAll('option').map((option) => option.textContent), ['Weighted round robin', 'Least connections', 'Hash']);
+  assert.deepEqual([hidden(control('Hash key')), hidden(control('Header or cookie name'))], [true, true]);
+  choose(balance, 'least_conn');
+  assert.equal(line().includes('Least connections'), true);
+  assert.equal(hidden(control('Hash key')), true);
+  // A hash asks for the kind of key, and for a name only when the kind is a header or a cookie.
+  choose(balance, 'hash');
+  assert.deepEqual([hidden(control('Hash key')), hidden(control('Header or cookie name'))], [false, true]);
+  assert.deepEqual(control('Hash key').querySelectorAll('option').map((option) => option.textContent), ['Choose one', 'Client IP address', 'Header', 'Cookie']);
+  choose(control('Hash key'), 'header');
+  assert.equal(hidden(control('Header or cookie name')), false);
+  type(control('Header or cookie name'), 'X-User');
+  for (const text of ['Hash', 'Header X-User']) assert.equal(line().includes(text), true, text);
+  choose(control('Hash key'), 'client_ip');
+  assert.equal(hidden(control('Header or cookie name')), true);
+  assert.deepEqual(heldDraft().build().version.upstreams.app, { ...groupOfOne.app, balance: 'hash', hash_policy: 'client_ip' });
+  choose(control('Hash key'), 'header');
+  pressed('Close');
+  pressed('Check');
+  await wait();
+  await wait();
+  assert.deepEqual(sent[1].version.upstreams.app, { ...groupOfOne.app, balance: 'hash', hash_policy: 'header', hash_key: 'X-User' });
+  // The refusal opens the group at the name of the key; a method that does not use the key takes it away, and the key is not written.
+  const refused = control('Header or cookie name');
+  assert.equal(refused.getAttribute('aria-invalid'), 'true');
+  assert.equal(errorOf(refused), 'an upstream hash_key is not a name of 1 to 64 token characters');
+  assert.equal(document.activeElement, refused);
+  choose(control('Load balancing method'), 'round_robin');
+  assert.equal(refused.getAttribute('aria-invalid'), null);
+  assert.deepEqual(heldDraft().build().version.upstreams.app, groupOfOne.app);
+  assert.equal(heldDraft().changed, false);
+  screen.stop();
+  forgetDraft();
+});
+
 test('the confirmation of a saving names the groups whose engine changes, counts the groups by engine, and says which are inspected by a generation that only detects', async () => {
   const version = { sites: [], upstreams: groupOfOne, routes: [], default_upstream: '' };
   const status = statusOf({ chosen: { coraza: FP, modsecurity: OTHER }, running: { coraza: FP, modsecurity: OTHER } });

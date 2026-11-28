@@ -1,17 +1,18 @@
-//! A server of a group, and what it counts of its failures to be left out.
+//! A server of a group, what it counts of its failures to be left out, and how many requests it has.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use super::lasting::{InUse, Lasting};
 use crate::config::ServerConfig;
 use crate::forward::pool::Pool;
 use crate::forward::tls::Secure;
 
 /// A server of a group: where it is, its weight, how it counts, its view of the pool of the group, how it is spoken
-/// to if the group has `tls`, and what has failed. What has failed is shared with the same server of the group that
-/// this one replaces, and of the group that replaces this one, if it counts and is spoken to as they are (see
-/// `follow`).
+/// to if the group has `tls`, what has failed, and how many requests it has. What has failed is shared with the same
+/// server of the group that this one replaces, and of the group that replaces this one, if it counts and is spoken to
+/// as they are; how many requests it has is shared with it whatever the two are like (see `follow`).
 pub struct Server {
     address: SocketAddr,
     weight: i64,
@@ -20,6 +21,7 @@ pub struct Server {
     pool: Pool,
     secure: Option<Secure>,
     passive: Arc<PassiveHealth>,
+    lasting: Arc<Lasting>,
 }
 
 /// What a server counts of its failures to be left out: the failures in the window, and the time until which the
@@ -45,15 +47,19 @@ impl Server {
             pool,
             secure,
             passive: Arc::default(),
+            lasting: Arc::default(),
         }
     }
 
-    /// Goes on counting the failures that `earlier` counts, if this server counts and is spoken to as it is: the
-    /// same `max_fails` and `fail_timeout`, and either neither has TLS or both check for the same name against
-    /// authorities that are the same bytes. The failures in the window and the time until which a server is left out
-    /// are counted with these, so with another `max_fails` or `fail_timeout` they would not mean what they meant, and
-    /// a failure of TLS may not be one with other authorities.
+    /// Goes on with what `earlier` keeps. The requests that it has are counted together whatever the two servers are
+    /// like, for a request is the same request whatever their `max_fails`, `fail_timeout` and TLS are. The failures
+    /// that it counts are counted together only if this server counts and is spoken to as it is: the same `max_fails`
+    /// and `fail_timeout`, and either neither has TLS or both check for the same name against authorities that are
+    /// the same bytes. The failures in the window and the time until which a server is left out are counted with
+    /// these, so with another `max_fails` or `fail_timeout` they would not mean what they meant, and a failure of TLS
+    /// may not be one with other authorities.
     pub(super) fn follow(&mut self, earlier: &Server) {
+        self.lasting = Arc::clone(&earlier.lasting);
         let spoken_alike = match (&self.secure, &earlier.secure) {
             (None, None) => true,
             (Some(secure), Some(earlier)) => secure.same_as(earlier),
@@ -83,6 +89,16 @@ impl Server {
 
     pub(in crate::forward) fn pool(&self) -> &Pool {
         &self.pool
+    }
+
+    /// The number of requests that the server has: those that were chosen for it and whose answers are not over.
+    pub(in crate::forward) fn in_use(&self) -> u64 {
+        self.lasting.in_use()
+    }
+
+    /// Counts a request against the server, until the value that is returned is dropped.
+    pub(in crate::forward) fn count_request(&self) -> InUse {
+        InUse::new(&self.lasting)
     }
 
     /// How to speak TLS to the server, if the group has `tls`; `None`: the connection is plain.

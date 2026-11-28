@@ -16,7 +16,7 @@ use tokio_rustls::TlsAcceptor;
 use tukuyomi_kernel::Engine;
 
 use super::*;
-use crate::config::{Address, ForwardConfig, GroupConfig};
+use crate::config::{Address, Balance, ForwardConfig, GroupConfig};
 use crate::forward::origin::tests::{bare, collect, config, ctx_of, far, run, send};
 use crate::forward::origin::{OriginBody, forward};
 use crate::forward::rewrite::Rewrite;
@@ -355,6 +355,7 @@ fn a_group_without_tls_speaks_plain_and_a_group_with_it_speaks_tls() {
             servers: ForwardConfig::of(&[plain]).groups.remove(0).servers,
             tls: None,
             engine: Engine::Coraza,
+            balance: Balance::RoundRobin,
         });
         let ctx = ctx_of(&forward, keeping());
         for group in [0, 1, 0, 1] {

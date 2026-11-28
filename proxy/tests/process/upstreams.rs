@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 
 use serde_json::{Value, json};
@@ -172,4 +173,60 @@ fn a_route_with_a_path_regex_and_a_route_with_a_priority_go_to_their_groups() {
         ["GET /files/v2/x HTTP/1.1"]
     );
     proxy.finish(1);
+}
+
+/// One group of three servers that the client address chooses among.
+fn hashed_by_client(addresses: &[SocketAddr]) -> Value {
+    json!({
+        "resolve_timeout_ms": RESOLVE_TIMEOUT_MS,
+        "upstreams": {"main": {
+            "servers": [server(addresses[0]), server(addresses[1]), server(addresses[2])],
+            "balance": "hash",
+            "hash_policy": "client_ip",
+        }},
+        "routes": [],
+        "default_upstream": "main",
+    })
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_group_with_balance_hash_sends_a_client_to_the_same_server_each_time() {
+    let knobs = Knobs {
+        upstreams: 3,
+        forward: hashed_by_client,
+        trusted_proxies: vec!["127.0.0.0/8".to_string()],
+        ..Knobs::quick()
+    };
+    let proxy = Proxy::start("balance_hash", knobs);
+    // The test peer is trusted, so the client is the address that its `X-Forwarded-For` names; the path says which of
+    // the requests it was. Each of 16 clients asks twice.
+    for round in 0..2 {
+        for client in 1..=16 {
+            let request = format!(
+                "GET /c{client}-{round} HTTP/1.1\r\nHost: example.test\r\nX-Forwarded-For: 198.51.100.{client}\r\n\r\n"
+            );
+            let reply = exchange(proxy.port, request.as_bytes());
+            assert_eq!(reply.status(), 200, "client {client}: {:?}", reply.text());
+        }
+    }
+    let seen: Vec<Vec<String>> = [&proxy.upstream, &proxy.others[0], &proxy.others[1]]
+        .iter()
+        .map(|up| first_lines(&up.requests()))
+        .collect();
+    let went = |client: usize, round: usize| {
+        let line = format!("GET /c{client}-{round} HTTP/1.1");
+        let at: Vec<usize> = (0..3).filter(|&s| seen[s].contains(&line)).collect();
+        assert_eq!(at.len(), 1, "{line}: {at:?}");
+        at[0]
+    };
+    let mut used = BTreeSet::new();
+    for client in 1..=16 {
+        let first = went(client, 0);
+        assert_eq!(went(client, 1), first, "client {client}");
+        used.insert(first);
+    }
+    // 16 clients are not all of one server's: the key is the client and not the test peer, which is always the same.
+    assert!(used.len() > 1, "every client went to one server");
+    proxy.finish(seen[0].len());
 }

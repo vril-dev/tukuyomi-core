@@ -11,7 +11,7 @@ import { w } from '../../i18n.js';
 import { emptyField } from '../../parts.js';
 import { isJob, sameJob } from '../job.js';
 import { notReached, same } from './changes.js';
-import { NAME, accessOf, builtAccess, builtHostPolicy, builtRate, builtServer, builtSite, builtTls, fault, groupOf, hostPolicyOf, hostPolicyText, linesOf, newGroup, newHostPolicy, newServer, newSite, plain, rateOf, readableHostPolicy, readableSite, siteOf, siteText, snapshot } from './items.js';
+import { NAME, accessOf, builtAccess, builtHostPolicy, builtRate, builtServer, builtSite, builtTls, fault, groupOf, hostPolicyOf, hostPolicyText, linesOf, newGroup, newHostPolicy, newServer, newSite, plain, rateOf, readableHostPolicy, readableSite, siteOf, siteText, snapshot, withBalance } from './items.js';
 import { builtRoute, makeForm, newRoute, readableRoute, routeChanged, routeLine, routeOf } from './route-items.js';
 
 // An edit of a draft with changes that comes this long after the last request keeps the session alive: an edit is use.
@@ -22,7 +22,8 @@ const TOUCH_MS = 30_000;
  * in this form is not edited.
  */
 export function readableVersion(version) {
-  const group = (raw) => plain(raw) && Array.isArray(raw.servers) && raw.servers.every(plain) && (!Object.hasOwn(raw, 'tls') || plain(raw.tls)) && (!Object.hasOwn(raw, 'engine') || typeof raw.engine === 'string');
+  const text = (raw, key) => !Object.hasOwn(raw, key) || typeof raw[key] === 'string';
+  const group = (raw) => plain(raw) && Array.isArray(raw.servers) && raw.servers.every(plain) && (!Object.hasOwn(raw, 'tls') || plain(raw.tls)) && ['engine', 'balance', 'hash_policy', 'hash_key'].every((key) => text(raw, key));
   const optional = (key) => !Object.hasOwn(version, key) || plain(version[key]);
   return (
     plain(version) &&
@@ -262,6 +263,18 @@ export class Draft {
     this.putFaults(this.faults.filter((one) => one.cid !== cid));
     this.clearFault(group.cid, 'servers');
     this.edited();
+  }
+
+  /** The group `group` chooses its servers by the method `balance` (the value of the choice of the form): what was told of the method and of the key that a hash uses is told no more. */
+  setBalance(group, balance) {
+    this.write(group, 'balance', balance);
+    for (const field of ['hash_policy', 'hash_key']) this.clearFault(group.cid, field);
+  }
+
+  /** The hash of `group` has the kind of key `policy` (the value of the choice of the form): what was told of the name of the key is told no more. */
+  setHashPolicy(group, policy) {
+    this.write(group, 'hash_policy', policy);
+    this.clearFault(group.cid, 'hash_key');
   }
 
   /** The default group is the group whose `cid` is `value` (the value of the choice of the form), or none. */
@@ -505,6 +518,7 @@ export class Draft {
       const built = { ...group.raw, servers: group.servers.map((server) => builtServer(group, server, faults)) };
       if (group.engine === '') delete built.engine;
       else built.engine = group.engine;
+      withBalance(built, group, faults);
       const tls = builtTls(group, faults);
       if (tls === undefined) {
         delete built.tls;

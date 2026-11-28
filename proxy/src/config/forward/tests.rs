@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use http::HeaderName;
 use serde_json::{Value, json};
 
 use tukuyomi_kernel::Engine;
@@ -437,4 +438,115 @@ fn a_route_with_a_path_regex_has_no_access_list_and_no_path_to_rewrite_and_at_mo
         refusal(load(regexes(33))),
         "routes has more than 32 entries with a path regex"
     );
+}
+
+/// The `forward` object with the group `g`, which has these keys besides `servers`.
+fn with_balance(keys: Value) -> Value {
+    let mut group = json!({"servers": [server("192.0.2.1:80")]});
+    for (key, value) in keys.as_object().unwrap() {
+        group[key] = value.clone();
+    }
+    forward(group)
+}
+
+#[test]
+fn a_group_has_the_balance_it_names_and_a_hash_has_a_key_of_a_kind_it_names() {
+    let balance_of = |keys: Value| load(with_balance(keys)).unwrap().groups[0].balance.clone();
+    assert_eq!(balance_of(json!({})), Balance::RoundRobin);
+    assert_eq!(
+        balance_of(json!({"balance": "round_robin"})),
+        Balance::RoundRobin
+    );
+    assert_eq!(
+        balance_of(json!({"balance": "least_conn"})),
+        Balance::LeastConn
+    );
+    let hash = |policy: &str, key: Option<&str>| {
+        let mut keys = json!({"balance": "hash", "hash_policy": policy});
+        if let Some(key) = key {
+            keys["hash_key"] = json!(key);
+        }
+        balance_of(keys)
+    };
+    assert_eq!(hash("client_ip", None), Balance::Hash(HashKey::ClientIp));
+    // The name of a header is not case sensitive, and the one of a cookie is.
+    assert_eq!(
+        hash("header", Some("X-User")),
+        Balance::Hash(HashKey::Header(HeaderName::from_static("x-user")))
+    );
+    assert_eq!(
+        hash("cookie", Some("Sid")),
+        Balance::Hash(HashKey::Cookie("Sid".to_owned()))
+    );
+}
+
+#[test]
+fn a_balance_and_the_keys_of_a_hash_are_refused_with_a_sentence_for_each_and_the_first_wrong_key_counts()
+ {
+    let refused = |keys: Value| refusal(load(with_balance(keys)));
+    let balance = "an upstream balance is not round_robin, least_conn or hash";
+    let stray_policy = "an upstream has a hash_policy without balance hash";
+    let bad_policy = "an upstream hash_policy is not client_ip, header or cookie";
+    let bad_key = "an upstream hash_key is not a name of 1 to 64 token characters";
+    assert_eq!(refused(json!({"balance": "Hash"})), balance);
+    assert_eq!(
+        refused(json!({"balance": "hash"})),
+        "an upstream with balance hash has no hash_policy"
+    );
+    assert_eq!(
+        refused(json!({"balance": "hash", "hash_policy": "jwt_sub"})),
+        bad_policy
+    );
+    assert_eq!(refused(json!({"hash_policy": "client_ip"})), stray_policy);
+    assert_eq!(
+        refused(json!({"balance": "least_conn", "hash_key": "x"})),
+        "an upstream has a hash_key without balance hash"
+    );
+    assert_eq!(
+        refused(json!({"balance": "hash", "hash_policy": "cookie"})),
+        "an upstream hash_policy header or cookie has no hash_key"
+    );
+    // A `hash_key` is refused for `client_ip` whatever it says.
+    assert_eq!(
+        refused(json!({"balance": "hash", "hash_policy": "client_ip", "hash_key": ""})),
+        "an upstream hash_policy client_ip has a hash_key"
+    );
+    // A name is 1 to 64 token characters, for a header and for a cookie.
+    let longest = "a".repeat(64);
+    for policy in ["header", "cookie"] {
+        let with = |key: &str| {
+            let keys = json!({"balance": "hash", "hash_policy": policy, "hash_key": key});
+            load(with_balance(keys))
+        };
+        assert!(with(&longest).is_ok(), "{policy}");
+        assert_eq!(refusal(with(&format!("{longest}a"))), bad_key, "{policy}");
+    }
+    for key in ["", "a b"] {
+        let keys = json!({"balance": "hash", "hash_policy": "header", "hash_key": key});
+        assert_eq!(refused(keys), bad_key, "{key:?}");
+    }
+    // The name of a header has no `_`, as the proxy drops such a header; the name of a cookie may have one.
+    let keys = json!({"balance": "hash", "hash_policy": "header", "hash_key": "X_User"});
+    assert_eq!(
+        refused(keys),
+        "an upstream hash_key header name has an underscore"
+    );
+    let keys = json!({"balance": "hash", "hash_policy": "header", "hash_key": "X-User"});
+    assert!(load(with_balance(keys)).is_ok());
+    let keys = json!({"balance": "hash", "hash_policy": "cookie", "hash_key": "my_sid"});
+    assert!(load(with_balance(keys)).is_ok());
+    // Two keys are wrong: the first in the order of `balance`, `hash_policy`, `hash_key` is the one that counts.
+    let keys = json!({"balance": "nope", "hash_policy": "client_ip", "hash_key": "x"});
+    assert_eq!(refused(keys), balance);
+    let keys = json!({"balance": "least_conn", "hash_policy": "client_ip", "hash_key": "x"});
+    assert_eq!(refused(keys), stray_policy);
+    let keys = json!({"balance": "hash", "hash_policy": "nope", "hash_key": ""});
+    assert_eq!(refused(keys), bad_policy);
+    // A value that is not text is the wrong type, and null is no value.
+    for value in [json!(1), json!(null)] {
+        assert_eq!(
+            refused(json!({"balance": value})),
+            "configuration has a value of the wrong type"
+        );
+    }
 }

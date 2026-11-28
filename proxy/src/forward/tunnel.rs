@@ -2,7 +2,8 @@
 //! copies.
 //!
 //! `origin` sends the handshake of a WebSocket and, when the upstream answers it with 101, hands over what it holds
-//! of the upstream connection (`Switch`). `conn` adds the share of the byte budget, the route's times and the words
+//! of the upstream connection (`Switch`), and with it the count of the request against its server, which is taken off
+//! when the tunnel is over or is given up. `conn` adds the share of the byte budget, the route's times and the words
 //! of the record (`Tunnel`), and the session runs it once the 101 has been written to the client. The client
 //! side of the copy is the stream of the client itself with the bytes that the gate had already read behind the
 //! handshake in front, so they reach the upstream first and in order; the upstream side is the connection that hyper
@@ -49,6 +50,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{Instant, Sleep, sleep, timeout, timeout_at};
 
 use crate::config::{ProxyConfig, Stream};
+use crate::forward::group::InUse;
 use crate::forward::pool::Lease;
 use crate::inbound::transport::io::{Gauge, Guarded};
 use crate::log::Log;
@@ -59,16 +61,27 @@ const BUFFER: usize = 8 * 1024;
 /// The share of the byte budget that a tunnel holds: its two buffers.
 pub const HOLD: usize = 2 * BUFFER;
 
-/// The upstream side of a connection whose handshake was answered with 101: the way to the upgraded connection, and
-/// the connection, which is kept until it has been taken over.
+/// The upstream side of a connection whose handshake was answered with 101: the way to the upgraded connection, the
+/// connection, which is kept until it has been taken over, and the request counted against its server, which is kept
+/// until the tunnel is over.
 pub struct Switch {
     on: OnUpgrade,
     lease: Lease,
+    in_use: Option<InUse>,
 }
 
 impl Switch {
     pub(super) fn new(on: OnUpgrade, lease: Lease) -> Switch {
-        Switch { on, lease }
+        Switch {
+            on,
+            lease,
+            in_use: None,
+        }
+    }
+
+    /// Keeps the request counted against its server for as long as the switch, and the tunnel that it becomes, lives.
+    pub(super) fn count(&mut self, in_use: InUse) {
+        self.in_use = Some(in_use);
     }
 }
 
@@ -192,7 +205,12 @@ impl Tunnel {
         C: AsyncRead + AsyncWrite + Unpin,
     {
         let Tunnel {
-            switch: Switch { on, lease },
+            switch:
+                Switch {
+                    on,
+                    lease,
+                    in_use: _in_use,
+                },
             stream,
             until,
             mut report,

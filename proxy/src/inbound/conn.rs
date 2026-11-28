@@ -398,6 +398,7 @@ impl Conn {
             body,
             upload,
             peer: self.peer,
+            client: self.client.ip(),
             https: matches!(self.scheme, Scheme::Https(_)),
             websocket: websocket.is_some(),
             id: self.request.clone(),

@@ -184,6 +184,7 @@ async fn exchange(
             pool: pool.clone(),
             reuse: false,
             switch: Some(Switch::new(on, lease)),
+            in_use: None,
         };
         return Ok(Response::from_parts(parts, body));
     }
@@ -196,6 +197,7 @@ async fn exchange(
         pool: pool.clone(),
         reuse,
         switch: None,
+        in_use: None,
     };
     // An answer without a body (to a HEAD request, a 204, a 304, a length of 0) is whole with its head.
     if body.is_end_stream() {

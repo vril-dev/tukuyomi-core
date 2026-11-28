@@ -244,6 +244,7 @@ Earlier versions stop when they receive SIGHUP. When upgrading from such a versi
     - A server that is the same as before is carried over if its `max_fails` and `fail_timeout_ms` are the same as before and its `tls` is the same: neither has `tls`, or both have it and the server is verified against the same name with a `ca_file` of the same content (the content is compared, not the path).
     - A server that was excluded and is carried over stays excluded for the time that remains (only a server with `max_fails` of 1 or more is excluded). This holds for a file with the same content and for the same version too. The server is used again after `fail_timeout_ms` has passed, or after the proxy is restarted.
     - Any other server counts from 0. For each upstream that has servers that were in the old configuration and count from 0 now, the proxy writes one `reload: upstream <name>: failure counts started anew, servers <number>` line, where `<number>` is how many such servers it has. An upstream that has no such server gets no line. A server that was not in the old configuration (an added server, or any server of an upstream that was added or renamed) counts from 0 and is not in `<number>`.
+  - The number of requests in progress on each server (see `balance` under "`forward`" below) is carried over for every server that is the same as before, whether or not its failure counts are. A request that began before the reload and ends after it is taken off the number in the new configuration.
   - The following are created anew: the failure total of each upstream (`tukuyomi_upstream_failures_total` counts from 0 again, also when a server stays excluded), the idle connections waiting to be reused for the upstreams, and the listeners' TLS sessions.
   - The rule generations are not touched. The running generation stays as it is, and the rules store is not read (SIGUSR1 switches generations). The proxy does not start engines either; it only checks that the upstream engines of the new configuration are ready (the refusal above).
 - Even for a file with the same content and the same version, the proxy carries over and creates anew as above, and closes the waiting connections.
@@ -568,7 +569,7 @@ With `managed`, `forward` is only `{"resolve_timeout_ms"}`, and writing `upstrea
 | Setting key | Range | Meaning |
 |---|---|---|
 | `resolve_timeout_ms` | 1 ms to 3600 s | The time to finish resolving the upstream server names, at start and at a reload by SIGHUP or by `reload` on the control socket. It also affects how long a `reload` request on the control socket, and the admin process when it applies a version, wait for a response (see "Control Socket" and "Applying" under "Managed Configuration" below) |
-| `upstreams` | 1 to 64 | A map from the name of an upstream (1 to 64 characters of letters, digits, `-`, and `_`) to `{"servers", "tls"?, "engine"?}` |
+| `upstreams` | 1 to 64 | A map from the name of an upstream (1 to 64 characters of letters, digits, `-`, and `_`) to `{"servers", "tls"?, "engine"?, "balance"?, "hash_policy"?, "hash_key"?}` |
 | `routes` | 0 to 1024 | The routes that choose an upstream from the `Host` and the path of a request |
 | `default_upstream` | The name of an upstream, or an empty string | The upstream for a request that matches no route. If empty, such a request gets 404 |
 
@@ -586,7 +587,7 @@ A server is `{"address", "weight", "max_fails", "fail_timeout_ms", "backup"}`, a
   - If the address of a name changes (a container name, for example), reload with SIGHUP.
   - Every address that a name resolves to becomes an upstream server, with the same values as the server entry that was written. After name resolution, an upstream can have at most 64 servers.
   - If a name cannot be resolved, has no address, points to an unspecified, multicast, or listener address, or cannot be resolved within the time limit, the proxy does not start. A reload by SIGHUP refuses that configuration.
-- Servers are chosen in turn from the usable ones, according to their weights (smooth weighted round robin).
+- The server for a request is chosen from the usable ones that the request has not tried yet, as the upstream's `balance` says (see below). Without a `balance`, servers are chosen in turn according to their weights (smooth weighted round robin).
 - If an upstream has only one server, it is not excluded. If none of an upstream's servers is usable, the proxy responds with 502 without trying anything.
 - The failures of an upstream's only server are counted too (if its `max_fails` is 1 or more), though it is not excluded. When a reload adds a second server, a failure that was counted before can exclude the first server at once. It is used again after `fail_timeout_ms`.
 - An excluded server stays excluded when the configuration is reloaded (SIGHUP, a `reload` request on the control socket, or applying a version, the same version included), if it is the same server with the same `max_fails`, `fail_timeout_ms`, and `tls`. It is used again after `fail_timeout_ms` has passed, or after the proxy is restarted. For the conditions, see "SIGHUP (Configuration Reload)" above.
@@ -616,6 +617,42 @@ An upstream's `engine` is the name of the engine that inspects requests to that 
 - Any other name is rejected with `an upstream engine is not coraza or modsecurity`. `modsecurity` is also rejected, with `kernel.engines has no inspector for the engine of an upstream`, when `kernel.engines` in the configuration has no inspector process.
 - Upstreams that have servers with the same address must all use the same engine (see "Relations Between Values" and "Choosing the Inspection Engine" below).
 - It can be changed by a configuration reload if the new engine is running (see "SIGHUP (Configuration Reload)" above).
+
+An upstream's `balance` is how the server for a request is chosen. `hash_policy` and `hash_key` say what the key of `hash` is made of.
+
+| Setting key | Meaning |
+|---|---|
+| `balance` | `round_robin`, `least_conn`, or `hash` (lowercase). If omitted, `round_robin`. `null` cannot be written |
+| `hash_policy` | `client_ip`, `header`, or `cookie`. It must be written when `balance` is `hash`, and cannot be written otherwise |
+| `hash_key` | The name of a header or of a cookie: 1 to 64 token characters of HTTP (letters, digits, and symbols such as `-`). A header name cannot contain `_`, and a cookie name can. It must be written when `hash_policy` is `header` or `cookie`, and cannot be written otherwise. A header name is not case-sensitive, and a cookie name is |
+
+- `round_robin` chooses servers in turn according to their weights, as described above.
+- `least_conn` chooses the server with the fewest requests in progress for its weight: the number of requests in progress on the server, divided by its weight.
+  - If several servers are equal in that, they are chosen in turn according to their weights. When no server has a request in progress, the servers are used in turn, and not the first one only.
+  - A request is in progress on a server from the moment the server is chosen until the end of the response body. A response without a body (to a `HEAD` request, or a 204, for example) ends with its header section. A request whose response is dropped before its end (the client went away, for example) stops counting then. A request that fails before the response header section arrives stops counting at once, and when it is passed on to the next server, it counts on that server. A WebSocket counts until its tunnel is over. A connection that is only waiting to be reused is not counted.
+  - The number is kept when the configuration is reloaded (see "SIGHUP (Configuration Reload)" above).
+- `hash` chooses the server by a key that is made from the request, so the same key goes to the same server.
+  - The key is made of the following.
+    - `client_ip`: the client address (see "Client Address" below). An IPv6 address is taken by its first 64 bits, so all the addresses of a /64 network have the same key.
+    - `header`: the value of the first field with that name, as the client sent it (before the edits of the route). The name cannot contain `_`, because a header whose name contains `_` is neither inspected nor forwarded (see "Header Checks" below).
+    - `cookie`: the value of the cookie with that name, read from all the `Cookie` fields of the request (every line of an HTTP/1.1 request, and every field of an HTTP/2 request), without the blanks around it. If the name is written more than once, the first is used.
+  - A request that has no key (no such field or cookie), an empty key, or a key of more than 1024 bytes is given a server by weight, as with `round_robin`.
+  - Each server gets a score from the key and from the server, and the server with the best score is chosen (rendezvous hashing). A server with a greater weight has a greater share of the keys. A server is told from the others by its address and port and its place among the servers at the same address, and not by the name of the upstream or its position in the file.
+  - When the server that a key goes to cannot be used (it is excluded, for example), the key goes to the server with the next best score. Only the keys that server had move, and they come back when it can be used again. A `backup` server is chosen only when no other server can be used.
+  - The score uses floating-point numbers. With one build, the same key goes to the same server, also after the proxy restarts. Another build or another CPU may round the last bit differently, and then a key whose two best scores are almost equal may go to the other server. The same key is not promised to go to the same server across builds.
+  - With `header` and `cookie`, a client can send its requests to a particular server by choosing the value of the key. The proxy puts no limit on this.
+- Only the first try of a request is chosen by `balance`. When a request is passed on to the next server after a failure (see above), that server is chosen by weight from those not yet tried, and not by the key or by the number of requests in progress.
+- A value that is not allowed is rejected with one of the following. When more than one setting key is wrong, the first of `balance`, `hash_policy`, and `hash_key` is reported.
+  - `an upstream balance is not round_robin, least_conn or hash`
+  - `an upstream with balance hash has no hash_policy`
+  - `an upstream hash_policy is not client_ip, header or cookie`
+  - `an upstream has a hash_policy without balance hash`
+  - `an upstream has a hash_key without balance hash`
+  - `an upstream hash_policy header or cookie has no hash_key`
+  - `an upstream hash_policy client_ip has a hash_key`
+  - `an upstream hash_key is not a name of 1 to 64 token characters`
+  - `an upstream hash_key header name has an underscore`
+- An earlier build that does not know `balance`, `hash_policy`, and `hash_key` rejects a configuration file or a version that has them, as having an unknown setting key. Be careful when you go back to an earlier build: remove them first. The records shipper also reads the configuration file, so before you write them in the configuration file, replace the records shipper with the same build as the proxy (see "Starting the Records Shipper" below).
 
 A route is `{"host"?, "path"?, "path_regex"?, "priority"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?, "records"?}`.
 
@@ -726,7 +763,7 @@ Notes on using `access`:
   - If there is an item that is not an IP literal, it stops reading there and takes the peer as the client.
 - For a request from a peer that is not trusted, the peer is the client. Claims such as its `X-Forwarded-For` are discarded.
 - Even for a trusted peer, if the request has no `X-Forwarded-For` line, the peer is the client.
-- This client address is used for inspection, the global `access`, `rate_limit`, the country lookup, route `access`, and logs.
+- This client address is used for inspection, the global `access`, `rate_limit`, the country lookup, route `access`, the key of an upstream whose `balance` is `hash` and `hash_policy` is `client_ip`, and logs.
 
 The following headers are added to the request sent to the upstream.
 

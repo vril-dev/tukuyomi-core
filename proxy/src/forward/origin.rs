@@ -21,7 +21,12 @@
 //! such field that the client sent is removed, and one with the number that the record of the request has is put in.
 //! The response to the client gets the same field with the same number in its place (see `session`).
 //!
-//! The server is chosen by the group (see `group`). The connection to it is the newest one that waits for that server
+//! The server is chosen by the group (see `group`); for a group with `balance` `hash` by a key that is made of the
+//! address that stands for the client (`Forward::client`), or of a field or a cookie of the request as it came, before
+//! the edits of the route are made, so that no edit changes which server a client goes to. The request is counted
+//! against the server from its choice on (`Server::count_request`), and the count goes with the answer: it is taken
+//! off when the body of the answer has ended or is dropped, when the try fails, and, for the 101 of a handshake, when
+//! the tunnel is over (`Switch`). The connection to it is the newest one that waits for that server
 //! in the pool of the group and is ready, or a new one (see `connect`; over TLS if the group has `tls`). It goes back
 //! to the pool when the body of the answer has been read to its end and nothing in the exchange ended it; a body that
 //! is dropped before its end ends the connection.
@@ -73,7 +78,7 @@
 //! end has already been reached does not start (see `Stage`). Informational responses are read over and not passed
 //! on; the bytes read from the upstream up to the final head, they included, are capped as a whole.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
@@ -89,7 +94,7 @@ use tokio::time::Instant;
 use self::attempt::{Payload, attempt, failure_of_server, idempotent, may_go_on};
 use self::fields::forwarded_fields;
 use crate::forward::client_ip;
-use crate::forward::group::{Group, Tried};
+use crate::forward::group::{Group, InUse, Tried};
 use crate::forward::pool::{Lease, Pool};
 use crate::forward::rewrite::Rewrite;
 use crate::forward::tunnel::Switch;
@@ -106,7 +111,8 @@ pub(super) use self::attempt::head_cap;
 pub(super) use self::fields::{CLIENT_CLAIMS, REQUEST_HOP, RESPONSE_HOP};
 
 /// An allowed request, as it is forwarded. `body` is the body, or its first bytes if it goes on in `upload`, which is
-/// read from the client as the upstream takes it. `peer` is the address of the connection the request came on. `https`
+/// read from the client as the upstream takes it. `peer` is the address of the connection the request came on, and
+/// `client` the address that stands for the client: the peer, or what a trusted peer says (see `client_ip`). `https`
 /// is true when the listener ended TLS. `websocket` is true for the handshake of a WebSocket that the route lets
 /// through. `id` is the number of the request, which the upstream gets in `X-Request-ID`.
 pub struct Forward {
@@ -116,6 +122,7 @@ pub struct Forward {
     pub body: Arc<BodyHold>,
     pub upload: Option<Upload>,
     pub peer: SocketAddr,
+    pub client: IpAddr,
     pub https: bool,
     pub websocket: bool,
     pub id: String,
@@ -132,6 +139,9 @@ pub struct OriginBody {
     /// Nothing in the answer ends the connection.
     reuse: bool,
     switch: Option<Switch>,
+    /// The request, counted against its server until the body has ended. The 101 of a handshake has none: the
+    /// `Switch` has it.
+    in_use: Option<InUse>,
 }
 
 impl OriginBody {
@@ -148,8 +158,21 @@ impl OriginBody {
         self.switch.take()
     }
 
-    /// The body has ended: the connection goes back to the pool, or is closed if the answer ended it.
+    /// Keeps the request counted against its server until the answer is over: until the body has ended or is dropped,
+    /// and, for the 101 of a handshake, until the tunnel is over. An answer that is over already (one without a body
+    /// ends with its head) leaves nothing to keep it for.
+    fn count(&mut self, in_use: InUse) {
+        if let Some(switch) = self.switch.as_mut() {
+            switch.count(in_use);
+        } else if self.lease.is_some() {
+            self.in_use = Some(in_use);
+        }
+    }
+
+    /// The body has ended: the request is no longer counted against its server, and the connection goes back to the
+    /// pool, or is closed if the answer ended it.
     fn end(&mut self) {
+        self.in_use = None;
         if let Some(lease) = self.lease.take()
             && self.reuse
         {
@@ -340,10 +363,13 @@ pub async fn forward(
         body,
         upload,
         peer,
+        client,
         https,
         websocket,
         id,
     } = f;
+    // The key comes from the fields as the client sent them: `forwarded_fields` and the edits of the route change them.
+    let key = group.key(client, &fields);
     let trusted = client_ip::trusts(&cfg.trusted_proxies, peer.ip());
     let made = forwarded_fields(
         fields,
@@ -394,15 +420,18 @@ pub async fn forward(
             error = OriginError::Late;
             break;
         }
-        let Some(index) = group.pick(tried, Instant::now()) else {
+        let Some(index) = group.pick(tried, Instant::now(), key.as_ref()) else {
             break;
         };
         tried.add(index);
         let chosen = group.server(index);
+        // Dropped with the iteration if the try fails; the answer takes it if there is one.
+        let in_use = chosen.count_request();
         server = Some(chosen.address());
         match attempt(chosen, cfg, &request, payload, head_request, websocket, by).await {
             Ok(mut response) => {
                 rewrite.respond(response.headers_mut());
+                response.body_mut().count(in_use);
                 return Dispatched {
                     server,
                     result: Ok(response),

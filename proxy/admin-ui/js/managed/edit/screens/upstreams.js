@@ -1,8 +1,8 @@
 // The screen of the upstream groups: the default group, the list of the groups, and one panel below the list that edits
-// the group that is open (its servers, the engine that inspects what goes to it, and TLS with the file of its
-// authorities). What is typed goes to the draft, and nothing is saved here: the band above the form checks and saves
-// it. The list is drawn again with every change and the panel is not, so that what is typed and the focus stay. Nothing
-// runs when the module is loaded.
+// the group that is open (its servers, how a server is chosen, the engine that inspects what goes to it, and TLS with
+// the file of its authorities). What is typed goes to the draft, and nothing is saved here: the band above the form
+// checks and saves it. The list is drawn again with every change and the panel is not, so that what is typed and the
+// focus stay. Nothing runs when the module is loaded.
 
 import { badge, button, el, mount, notice } from '../../../dom.js';
 import { lazy, t, w } from '../../../i18n.js';
@@ -12,6 +12,7 @@ import { mountScreen } from '../../screen.js';
 import { EditScreen } from '../bar.js';
 import { caKey } from '../draft.js';
 import { Rows, fileBox, numberBox, selectBox, textBox } from '../form.js';
+import { keyHasName } from '../items.js';
 import { pemProblem, pickPem } from '../pem.js';
 
 /** The marks of a group in the list: the tone of the badge, its words and the same words as text. */
@@ -21,6 +22,25 @@ const MARKS = {
   changed: { tone: 'warn', words: () => w('edit.mark.changed'), text: () => t('edit.mark.changed') },
   fault: { tone: 'bad', words: () => w('edit.mark.fault'), text: () => t('edit.mark.fault') },
 };
+
+/** The ways that a group chooses a server and the kinds of key of a hash: the word that a version holds, its words and the same words as text. */
+const BALANCES = [
+  { value: 'round_robin', words: () => w('edit.balance.round_robin'), text: () => t('edit.balance.round_robin') },
+  { value: 'least_conn', words: () => w('edit.balance.least_conn'), text: () => t('edit.balance.least_conn') },
+  { value: 'hash', words: () => w('edit.balance.hash'), text: () => t('edit.balance.hash') },
+];
+const HASH_POLICIES = [
+  { value: 'client_ip', words: () => w('edit.hash.client_ip'), text: () => t('edit.hash.client_ip') },
+  { value: 'header', words: () => w('edit.hash.header'), text: () => t('edit.hash.header') },
+  { value: 'cookie', words: () => w('edit.hash.cookie'), text: () => t('edit.hash.cookie') },
+];
+
+/** The options of a choice among `kinds`, after `before`; a word that a version holds and that is none of them stays, so that the choice does not read as another. */
+function choices(kinds, current, before = []) {
+  const options = [...before, ...kinds.map((kind) => ({ value: kind.value, label: kind.words() }))];
+  if (current !== '' && !kinds.some((kind) => kind.value === current)) options.push({ value: current, label: current });
+  return options;
+}
 
 /** The places that stay when the panel of a group is drawn again. */
 const OUTSIDE_PANEL = new Set(['default:default', 'groups:notice']);
@@ -60,7 +80,7 @@ class UpstreamsScreen extends EditScreen {
       empty: { title: w('edit.upstreams.empty') },
       fold: true,
       columns: [
-        { key: 'name', label: w('edit.col.name'), value: (group) => group.name.trim(), mono: true, long: true, cell: (group) => nameOf(group) },
+        { key: 'name', label: w('edit.col.name'), value: (group) => group.name.trim(), mono: true, long: true, text: (group) => this.nameText(group), cell: (group) => this.nameCell(group) },
         { key: 'servers', label: w('edit.col.servers'), value: (group) => group.servers.length, num: true, filter: false },
         { key: 'tls', label: w('edit.col.tls'), value: (group) => (group.tls ? 1 : 0), filter: false, cell: (group) => (group.tls ? w('edit.col.tls_on') : '—') },
         { key: 'engine', label: w('col.engine'), value: (group) => this.engineOf(group) ?? '', text: (group) => this.engineText(group), cell: (group) => this.engineCell(group) },
@@ -84,7 +104,7 @@ class UpstreamsScreen extends EditScreen {
     this.shown = draft;
     this.drawDefault(draft);
     // Only when a line would change: a drawing writes the count, which is read out, and takes the focus from a button of the list.
-    const key = JSON.stringify([defaultEngine(this.data?.status).name, draft.groups.map((group) => [group.cid, group.name, group.servers.length, group.tls, group.engine, draft.uses(group.cid).routes, this.marksOf(group)])]);
+    const key = JSON.stringify([defaultEngine(this.data?.status).name, draft.groups.map((group) => [group.cid, group.name, group.servers.length, group.tls, group.engine, group.balance, group.hash_policy, group.hash_key, draft.uses(group.cid).routes, this.marksOf(group)])]);
     if (key !== this.listKey) {
       this.listKey = key;
       this.table.update({ rows: draft.groups, loading: false });
@@ -123,6 +143,33 @@ class UpstreamsScreen extends EditScreen {
     else if (draft.groupChanged(group)) names.push('changed');
     if (draft.faults.some((one) => one.panel === group.cid)) names.push('fault');
     return names;
+  }
+
+  /** The method of `group` for the list, as text: nothing for the weighted round robin, which a group has when it names no method. */
+  balanceText(group) {
+    if (group.balance === 'round_robin') return '';
+    return BALANCES.find((one) => one.value === group.balance)?.text() ?? group.balance;
+  }
+
+  /** The key of the hash of `group` for the list, as text: the kind of key and, for a header or a cookie, its name; nothing for a group that does not hash or has no kind yet. */
+  keyText(group) {
+    if (group.balance !== 'hash') return '';
+    const kind = HASH_POLICIES.find((one) => one.value === group.hash_policy)?.text() ?? group.hash_policy;
+    return keyHasName(group.hash_policy) ? `${kind} ${group.hash_key.trim()}`.trim() : kind;
+  }
+
+  /** The text of the name of `group` in the list, which the filter looks in: the name and the words of its method. */
+  nameText(group) {
+    return [group.name.trim(), this.balanceText(group), this.keyText(group)].filter((part) => part !== '').join(' ');
+  }
+
+  /** The name of `group` in the list, with its method and the key of a hash behind it when it does not have the weighted round robin. */
+  nameCell(group) {
+    if (this.balanceText(group) === '') return nameOf(group);
+    const key = this.keyText(group);
+    const marks = [badge('muted', lazy(() => this.balanceText(group)))];
+    if (key !== '') marks.push(el('span', { class: 'tc-muted tc-small' }, lazy(() => this.keyText(group))));
+    return el('span', {}, nameOf(group), ' ', el('span', { class: 'tc-badges' }, marks));
   }
 
   /** The engine that inspects what goes to `group`: the one it names, else the default engine (null when that is not known). */
@@ -202,6 +249,7 @@ class UpstreamsScreen extends EditScreen {
         name.node,
         this.engineBox(draft, group).node,
         this.engineNote,
+        this.balancePart(draft, group),
         el('h3', {}, w('edit.group.servers')),
         serversNote,
         this.rows.node,
@@ -232,6 +280,35 @@ class UpstreamsScreen extends EditScreen {
     });
     this.placeField(group.cid, 'engine', box);
     return box;
+  }
+
+  /**
+   * The choice of how `group` chooses a server and, for a hash, the kind of its key and the name of the header or cookie
+   * that holds it. The two fields of the hash are hidden while they do not apply, and what they hold stays in the draft.
+   */
+  balancePart(draft, group) {
+    const key = textBox(w('edit.group.hash_key'), group.hash_key, { required: true, hint: w('edit.group.hash_key_hint'), onInput: (value) => draft.write(group, 'hash_key', value) });
+    key.node.hidden = !keyHasName(group.hash_policy);
+    const policy = selectBox(w('edit.group.hash_policy'), choices(HASH_POLICIES, group.hash_policy, [{ value: '', label: w('edit.group.hash_policy_unset') }]), group.hash_policy, {
+      hint: w('edit.group.hash_policy_hint'),
+      onChange: (value) => {
+        draft.setHashPolicy(group, value);
+        key.node.hidden = !keyHasName(value);
+      },
+    });
+    const hash = el('div', { class: 'tc-fields' }, policy.node, key.node);
+    hash.hidden = group.balance !== 'hash';
+    const balance = selectBox(w('edit.group.balance'), choices(BALANCES, group.balance), group.balance, {
+      hint: w('edit.group.balance_hint'),
+      onChange: (value) => {
+        draft.setBalance(group, value);
+        hash.hidden = value !== 'hash';
+      },
+    });
+    this.placeField(group.cid, 'balance', balance);
+    this.placeField(group.cid, 'hash_policy', policy);
+    this.placeField(group.cid, 'hash_key', key);
+    return el('div', { class: 'tc-stack' }, balance.node, hash);
   }
 
   /**

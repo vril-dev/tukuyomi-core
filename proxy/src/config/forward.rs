@@ -3,7 +3,8 @@
 //! `resolve_timeout_ms` is the time the proxy may take to look up the names of the servers each time it reads the
 //! configuration: when it starts, at SIGHUP, and for a reload order of the control socket, whose answer is waited for
 //! that long and a margin (1 ms to 3600 s).
-//! `upstreams` is an object from the name of a group to `{"servers": [..], "tls"?, "engine"?}`. A name is 1 to 64
+//! `upstreams` is an object from the name of a group to `{"servers": [..], "tls"?, "engine"?, "balance"?,
+//! "hash_policy"?, "hash_key"?}`. A name is 1 to 64
 //! letters, digits, `-` and `_`, and there are 1 to 64 groups. A group has 1 to 64 servers, each `{"address", "weight",
 //! "max_fails", "fail_timeout_ms", "backup"}` with every key present: the address is an IP literal and a port
 //! (`[..]:port` for IPv6) or a name and a port (`name:port`), the weight is 1 to 100, `max_fails` is 0 to 100 (0:
@@ -23,7 +24,16 @@
 //! configuration must have an inspector for it (`kernel`); left out, it is `kernel.default_engine`, which the check
 //! resolves, so that a group always has the engine it is inspected by. No two groups with a server at the same address
 //! have different engines: a request reaches that backend through whichever of the groups its `Host` chooses, and the
-//! weakest of their engines and modes would be the protection of the backend.
+//! weakest of their engines and modes would be the protection of the backend. `balance` of a group is `round_robin` (the
+//! weighted round robin, which a group without it has), `least_conn` (the server with the fewest requests in use for
+//! its weight, and the weighted round robin among servers that are equal in that) or `hash` (the server that the key of
+//! the request chooses, and for a key whose server cannot be used, the server with the next best score).
+//! `hash_policy` and `hash_key` are for `hash` alone, and it needs the first: `client_ip` (the address that stands for
+//! the client, its /64 network if it is IPv6; no `hash_key`), `header` or `cookie`, with `hash_key` the name of the
+//! header or of the cookie (1 to 64 token characters, and no `_` in the name of a header, which the proxy drops from
+//! every request). A request without a key, with an empty one or with one of more
+//! than 1024 bytes goes by the weighted round robin, and so does a request that goes on to another server after a
+//! failure.
 //! `routes` has at most 1024 entries `{"host"?, "path"?, "path_regex"?, "priority"?, "upstream", "access"?, "rewrite"?,
 //! "stream"?, "max_body"?, "records"?}`.
 //! The `host` and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access`
@@ -69,8 +79,10 @@ use crate::forward::rewrite::Rewrite;
 use crate::forward::tls::{Authorities, Client, Settings};
 use crate::route::{Rule, Table};
 
+mod balance;
 mod group;
 
+pub use self::balance::{Balance, HashKey};
 pub(super) use self::group::host_ok;
 pub(crate) use self::group::{Groups, MAX_SERVERS, RawTls, StoredTls, name_ok};
 
@@ -177,6 +189,8 @@ pub struct GroupConfig<A = SocketAddr, T = Client> {
     /// The engine that inspects the requests that go to the group: the one it names, or the default of the
     /// configuration, which the check resolves (see `kernel`).
     pub engine: Engine,
+    /// How the first server of a request is chosen from the servers.
+    pub balance: Balance,
 }
 
 /// The times of a response on a route that may take long, and whether the route lets a WebSocket through.
@@ -275,6 +289,7 @@ impl ForwardConfig {
                 servers,
                 tls: None,
                 engine: Engine::Coraza,
+                balance: Balance::RoundRobin,
             }],
             routes: Table::default(),
             default: Some(0),
@@ -465,11 +480,14 @@ pub(crate) fn located<T>(
         let servers = servers(at, group.servers, listeners).map_err(placed)?;
         let tls = tls(at, group.tls, &servers, &split).map_err(placed)?;
         let engine = engine(at, group.engine, kernel).map_err(placed)?;
+        let balance =
+            balance::check(at, group.balance, group.hash_policy, group.hash_key).map_err(placed)?;
         groups.push(GroupConfig {
             name,
             servers,
             tls,
             engine,
+            balance,
         });
     }
     engines_apart(&groups).map_err(placed)?;

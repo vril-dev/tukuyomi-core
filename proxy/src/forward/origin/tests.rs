@@ -169,6 +169,7 @@ pub(in crate::forward) fn request(
         body: hold(ctx, body),
         upload: None,
         peer: PEER.parse().unwrap(),
+        client: PEER.parse::<SocketAddr>().unwrap().ip(),
         https: false,
         websocket: false,
         id: ID.to_string(),
@@ -1100,7 +1101,7 @@ async fn stalled() -> (SocketAddr, (TcpListener, Vec<TcpStream>)) {
 /// The servers that the group gives over four choices, none tried.
 fn gives(group: &Group) -> Vec<usize> {
     (0..4)
-        .filter_map(|_| group.pick(Tried::default(), Instant::now()))
+        .filter_map(|_| group.pick(Tried::default(), Instant::now(), None))
         .collect()
 }
 
@@ -1443,5 +1444,145 @@ fn the_body_of_a_send_that_lost_the_rest_fails_and_does_not_end_as_if_it_were_wh
             "ab"
         );
         assert!(whole.frame().await.is_none());
+    });
+}
+
+// ---- the requests that a server has ----
+
+/// The requests that the first server of the first group of `ctx` has.
+fn has(ctx: &Ctx, server: usize) -> u64 {
+    ctx.setup.upstreams.group(0).server(server).in_use()
+}
+
+/// A GET that a server answers with `reply`: the context, the response and the server.
+async fn got(reply: &[u8], linger: bool) -> (Ctx, Response<OriginBody>, JoinHandle<bool>) {
+    let reply = reply.to_vec();
+    let (addr, up) = upstream(move |sock| answering(sock, reply, linger)).await;
+    let ctx = ctx(addr, config());
+    let response = send(bare(&ctx, "GET"), &ctx, far()).await.unwrap();
+    (ctx, response, up)
+}
+
+#[test]
+fn a_request_is_counted_against_its_server_until_the_body_has_ended_or_is_dropped() {
+    run(async {
+        // From the choice until the end of the body, not until the body is dropped.
+        let (ctx, response, up) =
+            got(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", false).await;
+        let mut body = response.into_body();
+        assert_eq!(has(&ctx, 0), 1);
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
+        assert_eq!(has(&ctx, 0), 0);
+        drop(body);
+        assert_eq!(has(&ctx, 0), 0);
+        up.await.unwrap();
+
+        // An answer without a body is over with its head.
+        let (ctx, response, up) = got(b"HTTP/1.1 204 No Content\r\n\r\n", false).await;
+        assert_eq!(has(&ctx, 0), 0);
+        drop(response);
+        up.await.unwrap();
+
+        // A body that is dropped before its end, as when the client goes away or the answer fails after its head.
+        let (ctx, response, up) =
+            got(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc", true).await;
+        assert_eq!(has(&ctx, 0), 1);
+        drop(response);
+        assert_eq!(has(&ctx, 0), 0);
+        assert!(up.await.unwrap());
+    });
+}
+
+#[test]
+fn a_try_that_fails_does_not_stay_counted_and_the_server_that_answers_is_counted_once() {
+    run(async {
+        let dead = nobody().await;
+        let ctx = ctx(dead, config());
+        assert_eq!(
+            refused(send(bare(&ctx, "GET"), &ctx, far()).await),
+            OriginError::Connect
+        );
+        assert_eq!(has(&ctx, 0), 0);
+
+        // The first server refuses the connection and the request goes on to the second.
+        let (live, up) = upstream(|sock| answering(sock, OK_REPLY.to_vec(), false)).await;
+        let ctx = ctx_of(&ForwardConfig::of(&[nobody().await, live]), config());
+        let body = send(bare(&ctx, "GET"), &ctx, far())
+            .await
+            .unwrap()
+            .into_body();
+        assert_eq!((has(&ctx, 0), has(&ctx, 1)), (0, 1));
+        collect(body).await;
+        assert_eq!((has(&ctx, 0), has(&ctx, 1)), (0, 0));
+        up.await.unwrap();
+    });
+}
+
+/// A handshake of a WebSocket that a server answers with 101 and then closes: the group and the switch of the answer,
+/// which has the request counted against the server.
+async fn switched() -> (Ctx, Switch) {
+    let reply =
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    let (addr, _) = upstream(|sock| answering(sock, reply.to_vec(), false)).await;
+    let ctx = ctx(addr, config());
+    let mut handshake = bare(&ctx, "GET");
+    handshake.websocket = true;
+    let mut response = send(handshake, &ctx, far()).await.unwrap();
+    assert_eq!(response.status(), 101);
+    let switch = response.body_mut().take_switch().unwrap();
+    // The body of the 101 went with the response and the count stays with the switch.
+    drop(response);
+    assert_eq!(has(&ctx, 0), 1);
+    (ctx, switch)
+}
+
+#[test]
+fn the_count_of_a_handshake_stays_until_the_tunnel_is_over_is_given_up_or_never_made() {
+    use crate::config::Stream;
+    use crate::forward::tunnel::{HOLD, Record, Tunnel};
+
+    let tunnel = |ctx: &Ctx, switch: Switch| {
+        let stream = Stream {
+            idle: Duration::from_secs(5),
+            total: Duration::from_secs(10),
+            websocket: true,
+        };
+        let hold = ctx
+            .shared
+            .budget
+            .clone()
+            .try_acquire_many_owned(u32::try_from(HOLD).unwrap())
+            .unwrap();
+        let record = Record {
+            log: ctx.shared.log.clone(),
+            id: ID.to_string(),
+            conn: 1,
+            client: "203.0.113.9".parse().unwrap(),
+            upstream: None,
+            server: None,
+        };
+        Tunnel::new(switch, stream, hold, record)
+    };
+    run(async {
+        // The switch is dropped and no tunnel is made.
+        let (ctx, switch) = switched().await;
+        drop(switch);
+        assert_eq!(has(&ctx, 0), 0);
+
+        // The tunnel is given up before it runs.
+        let (ctx, switch) = switched().await;
+        tunnel(&ctx, switch).failed();
+        assert_eq!(has(&ctx, 0), 0);
+
+        // The tunnel runs: the count stays while it copies, and goes when both sides have ended.
+        let (ctx, switch) = switched().await;
+        let tunnel = tunnel(&ctx, switch);
+        assert_eq!(has(&ctx, 0), 1);
+        let (mut client, far_end) = tokio::io::duplex(1024);
+        drop(far_end);
+        tunnel.run(&mut client, Bytes::new(), &ctx.setup.cfg).await;
+        assert_eq!(has(&ctx, 0), 0);
     });
 }

@@ -664,6 +664,16 @@ textarea.tc-input--lines { min-height: var(--size-control); font-family: var(--f
 .tc-rows__row--server { grid-template-columns: minmax(0, 2fr) repeat(3, minmax(0, 1fr)) auto auto; grid-template-rows: auto auto auto; row-gap: 2px; }
 .tc-rows__row--server > .tc-field { grid-row: 1 / span 3; grid-template-rows: subgrid; }
 .tc-rows__row--server > .tc-choice, .tc-rows__row--server > .tc-btn { grid-row: 2; align-self: center; margin-top: 0; }
+/* Beside the menu, from 761px up to 1279px (where a table with `fold` stands as boxes), the page is too narrow for the
+   six columns of a line: the fields stand as other fields do (`.tc-fields`), the backup mark and the button each take a
+   row, and a line is set off from the one above, as its fields now take more than one row. Up to 760px the rules of a
+   narrow screen (below) apply. */
+@media (min-width: 761px) and (max-width: 1279px) {
+  .tc-rows__row--server { grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); grid-template-rows: none; row-gap: var(--space-2); }
+  .tc-rows__row--server > .tc-field { grid-row: auto; grid-template-rows: none; }
+  .tc-rows__row--server > .tc-choice, .tc-rows__row--server > .tc-btn { grid-column: 1 / -1; grid-row: auto; justify-self: start; }
+  .tc-rows__row--server + .tc-rows__row--server { padding-top: var(--space-3); border-top: 1px solid var(--line-subtle); }
+}
 
 /* records */
 .tc-filters { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: var(--space-4); align-items: start; }

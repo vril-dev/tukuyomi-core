@@ -284,6 +284,7 @@ where
             servers,
             tls: config.map(|config| Client::new(config, names)),
             engine: group.engine,
+            balance: group.balance,
         });
     }
     Ok(Completed {

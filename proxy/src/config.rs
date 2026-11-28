@@ -6,7 +6,8 @@
 //! SHA-256 of the bytes that were read. Every key must be present (a route may leave out its `host`, its `path`,
 //! its `path_regex`, its `priority`, its `access`, its `rewrite`, its `stream` and its `max_body`; `access` and
 //! `rewrite` have no key that must be present, see `rewrite`, and a `stream` has all three; an upstream group may
-//! leave out its `tls`, which may leave out its `server_name`, and its `engine`; a listener may leave out its `tls`
+//! leave out its `tls` (which may leave out its `server_name`), its `engine`, its `balance`, and its `hash_policy` and
+//! `hash_key` (which it has only with a `balance` of `hash`); a listener may leave out its `tls`
 //! and its `redirect`, and the `tls`
 //! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
 //! may leave out `acme`, which it must have when a certificate has one, see `acme`, and `status`, which
@@ -99,8 +100,8 @@ mod status;
 pub use acme::AcmeConfig;
 pub use admin::{AdminConfig, AdminRoute, AdminStoreConfig, Mfa};
 pub use forward::{
-    Address, AdminWay, ForwardConfig, ForwardSettings, GroupConfig, RouteConfig, ServerConfig,
-    Stream,
+    Address, AdminWay, Balance, ForwardConfig, ForwardSettings, GroupConfig, HashKey, RouteConfig,
+    ServerConfig, Stream,
 };
 pub(crate) use forward::{At, Groups, MAX_SERVERS, RawRoute, RawTls, StoredTls, located, name_ok};
 pub use kernel::KernelSettings;

@@ -677,3 +677,66 @@ fn a_refusal_about_a_path_regex_or_a_priority_is_about_that_key_of_its_route() {
         )
     );
 }
+
+#[test]
+fn a_refusal_about_the_balance_of_a_group_is_about_that_key_of_its_group() {
+    let fixture = Fixture::new();
+    let built = with_admin(&fixture);
+    let base = fixture.plain_version(b"chain", b"key");
+    let refused = |keys: Value| {
+        let mut version = base.clone();
+        for (key, value) in keys.as_object().unwrap() {
+            version["upstreams"]["app"][key] = value.clone();
+        }
+        objection(&built, &version)
+    };
+    for (keys, sentence, place) in [
+        (
+            json!({"balance": "random"}),
+            "an upstream balance is not round_robin, least_conn or hash",
+            "upstreams.app.balance",
+        ),
+        (
+            json!({"balance": "hash"}),
+            "an upstream with balance hash has no hash_policy",
+            "upstreams.app.hash_policy",
+        ),
+        (
+            json!({"balance": "hash", "hash_policy": "jwt_sub"}),
+            "an upstream hash_policy is not client_ip, header or cookie",
+            "upstreams.app.hash_policy",
+        ),
+        (
+            json!({"hash_policy": "client_ip"}),
+            "an upstream has a hash_policy without balance hash",
+            "upstreams.app.hash_policy",
+        ),
+        (
+            json!({"balance": "least_conn", "hash_key": "x"}),
+            "an upstream has a hash_key without balance hash",
+            "upstreams.app.hash_key",
+        ),
+        (
+            json!({"balance": "hash", "hash_policy": "cookie"}),
+            "an upstream hash_policy header or cookie has no hash_key",
+            "upstreams.app.hash_key",
+        ),
+        (
+            json!({"balance": "hash", "hash_policy": "client_ip", "hash_key": "x"}),
+            "an upstream hash_policy client_ip has a hash_key",
+            "upstreams.app.hash_key",
+        ),
+        (
+            json!({"balance": "hash", "hash_policy": "header", "hash_key": "a b"}),
+            "an upstream hash_key is not a name of 1 to 64 token characters",
+            "upstreams.app.hash_key",
+        ),
+        (
+            json!({"balance": "hash", "hash_policy": "header", "hash_key": "X_User"}),
+            "an upstream hash_key header name has an underscore",
+            "upstreams.app.hash_key",
+        ),
+    ] {
+        assert_eq!(refused(keys), (sentence, at(place)), "{sentence}");
+    }
+}

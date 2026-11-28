@@ -397,7 +397,7 @@ fn a_failure_on_a_waiting_connection_that_is_not_sent_again_does_not_leave_the_s
         // One failure would leave the server out; this one was not counted.
         let group = ctx.setup.upstreams.group(0);
         let picked: Vec<usize> = (0..4)
-            .filter_map(|_| group.pick(Tried::default(), Instant::now()))
+            .filter_map(|_| group.pick(Tried::default(), Instant::now(), None))
             .collect();
         assert!(picked.contains(&0), "{picked:?}");
     });

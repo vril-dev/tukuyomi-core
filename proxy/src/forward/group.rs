@@ -11,14 +11,18 @@
 //! that they share, so the connections that wait are bounded for the group, not for each server. A group with `tls`
 //! is reached over TLS at every server, and a group without it never is (see `tls`); as a waiting connection is
 //! taken only for the server it is connected to, a plain connection is never used where TLS is wanted, nor the other
-//! way round. The server a request goes to is chosen by weight among the servers that can be used and that the
-//! request has not tried yet (see `select`).
+//! way round. The server a request goes to is chosen among the servers that can be used and that the request has not
+//! tried yet, as the `balance` of the group says for the first try (by weight, by the fewest requests in use for the
+//! weight, or by the key of the request), and by weight for the next ones (see `select`).
 //!
 //! A server counts the failures of its requests (`Group::fail`; what a failure is, is said at `origin`). When
 //! `max_fails` of them come within `fail_timeout`, counted from the first, the server is left out for
 //! `fail_timeout`; after that it is used again, and needs `max_fails` new failures to be left out again. A server
 //! with a `max_fails` of 0 is never left out, nor is the only server of a group. A group of which no server can be
 //! used has none to give (`Group::pick` is `None`).
+//!
+//! A server also counts the requests that it has (`Server::count_request`): from when it is chosen for a request until
+//! the answer to that request is over (see `origin`).
 //!
 //! A group also counts all the failures of its servers from the start of the proxy (`Group::failures`), also those of
 //! a server with a `max_fails` of 0, for `/metrics`.
@@ -31,7 +35,9 @@
 //! was (`Server::follow`). The group of the old configuration, which serves the requests that began before the new one
 //! was put in place, and the group of the new one then share what the server counts, so a failure counted by either
 //! counts for both and the server is left out for as long as it was. Any other server counts from nothing, and
-//! `Upstreams::anew` tells how many of the servers that were there before do. The failures of the group
+//! `Upstreams::anew` tells how many of the servers that were there before do. The requests that a server has are
+//! shared whatever else is the same or not, so a request that began under the old configuration is counted down in
+//! the new one when it ends. The failures of the group
 //! (`Group::failures`), the turn of the choice, the waiting connections and the way to the admin process begin again
 //! with each reading.
 //!
@@ -45,25 +51,29 @@
 //! that a client sees. The times are milliseconds from one start, that of the first groups of the proxy, which the
 //! groups of every later reading keep (`Upstreams::following`).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use http::HeaderMap;
 use tokio::time::Instant;
 use tukuyomi_kernel::Engine;
 
 use crate::config::{
-    AdminWay, ForwardConfig, GroupConfig, ProxyConfig, RouteConfig, RouteKeep, ServerConfig, Stream,
+    AdminWay, Balance, ForwardConfig, GroupConfig, ProxyConfig, RouteConfig, RouteKeep,
+    ServerConfig, Stream,
 };
 use crate::forward::client_ip::Access;
 use crate::forward::pool::Pool;
 use crate::forward::rewrite::Rewrite;
-use crate::forward::select::Turn;
+use crate::forward::select::{Key, Method, Turn};
 use crate::route::{RequestHost, Table};
 
+mod lasting;
 mod server;
 
+pub(in crate::forward) use self::lasting::InUse;
 pub use self::server::Server;
 
 /// The name of the group of the way to the admin process: not the name of a group of the configuration, which is made
@@ -112,8 +122,9 @@ impl Upstreams {
     }
 
     /// The groups of `cfg`, whose servers go on counting the failures of the servers of `earlier`, the groups that
-    /// they replace, as far as `Server::follow` allows (see the module documentation). The times are counted from
-    /// the start of `earlier`. `cfg` has been checked.
+    /// they replace, as far as `Server::follow` allows (see the module documentation). The requests that a server has
+    /// are shared whatever else is the same or not. The times are counted from the start of `earlier`. `cfg` has
+    /// been checked.
     pub fn following(cfg: &ForwardConfig, proxy: &ProxyConfig, earlier: &Upstreams) -> Upstreams {
         let mut upstreams = Upstreams::with(cfg, proxy, earlier.born);
         for group in &mut upstreams.groups {
@@ -223,7 +234,7 @@ impl Upstreams {
 
 /// `address` with an IPv4 address that is written as IPv6 as the IPv4 address, so that the two are told to be the same
 /// (as the check of the configuration tells the servers of two groups apart).
-fn canonical(address: SocketAddr) -> SocketAddr {
+pub(in crate::forward) fn canonical(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(address.ip().to_canonical(), address.port())
 }
 
@@ -241,6 +252,11 @@ fn counterpart<'a>(servers: &[Server], index: usize, earlier: &'a [Server]) -> O
 pub(super) struct Tried(u64);
 
 impl Tried {
+    /// Whether no server was tried: the request is at its first try.
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
     fn has(self, index: usize) -> bool {
         // An index past the last bit counts as tried, so that it is never chosen.
         u32::try_from(index)
@@ -266,6 +282,8 @@ pub struct Group {
     engine: Engine,
     servers: Vec<Server>,
     turn: Turn,
+    /// How the first server of a request is chosen.
+    method: Method,
     born: Instant,
     /// The failures of all the servers, counted since the start.
     failures: AtomicU64,
@@ -285,6 +303,7 @@ impl Admin {
             }],
             tls: None,
             engine: way.engine,
+            balance: Balance::RoundRobin,
         };
         Admin {
             host: way.host.clone(),
@@ -311,6 +330,7 @@ impl Group {
                 })
                 .collect(),
             turn: Turn::new(&cfg.servers),
+            method: Method::new(&cfg.balance, &cfg.servers),
             born,
             failures: AtomicU64::new(0),
         }
@@ -326,7 +346,7 @@ impl Group {
     }
 
     /// Makes the servers of this group go on counting the failures of the servers of `earlier` that they are the
-    /// same as, as far as `Server::follow` allows.
+    /// same as, as far as `Server::follow` allows. They share the requests that those servers have in any case.
     fn follow(&mut self, earlier: &Group) {
         for index in 0..self.servers.len() {
             if let Some(old) = counterpart(&self.servers, index, &earlier.servers) {
@@ -366,14 +386,25 @@ impl Group {
         self.servers.len() == 1 || self.servers[index].up(now)
     }
 
-    /// The server to try next: chosen by weight among those that can be used at `now` and are not in `tried`, the
-    /// `backup` servers only when no other can be chosen.
-    pub(super) fn pick(&self, tried: Tried, now: Instant) -> Option<usize> {
+    /// The key of a request from `client` with these `fields`, as the group takes it, if it is a `hash` group and the
+    /// request has one.
+    pub(super) fn key(&self, client: IpAddr, fields: &HeaderMap) -> Option<Key> {
+        self.method.key(client, fields)
+    }
+
+    /// The server to try next, among those that can be used at `now` and are not in `tried`, the `backup` servers only
+    /// when no other can be chosen. The first try is made as the `balance` of the group says, with `key` the key of
+    /// the request for a `hash` group; the later ones are chosen by weight.
+    pub(super) fn pick(&self, tried: Tried, now: Instant, key: Option<&Key>) -> Option<usize> {
         let now = self.since(now);
-        self.turn.pick(
-            |index| !tried.has(index) && self.usable(index, now),
-            |index| self.servers[index].weight(),
-        )
+        let may = |index: usize| !tried.has(index) && self.usable(index, now);
+        let weight = |index: usize| self.servers[index].weight();
+        if tried.is_empty() {
+            let in_use = |index: usize| self.servers[index].in_use();
+            self.method.first(&self.turn, may, weight, in_use, key)
+        } else {
+            self.turn.pick(may, weight)
+        }
     }
 
     /// Counts a failure of the server at `index`, at `now`.

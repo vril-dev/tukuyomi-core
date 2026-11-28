@@ -67,7 +67,9 @@
 //! `policy::Scopes`). A server of an upstream group goes on counting its failures, and so stays left out for as long
 //! as it was, when the old and the new configuration have it in the group of the same name, at the same address, with
 //! the same `max_fails`, `fail_timeout_ms` and TLS (see `forward::group`); otherwise it counts from nothing, and a line
-//! for the group says how many of the servers that were there before do.
+//! for the group says how many of the servers that were there before do. The number of requests that a server has
+//! (for `balance` `least_conn`) goes on whatever else changes, so a request that began under the old configuration is
+//! counted down in the new one when it ends.
 //! The listeners can be added, removed and put in another order. A listener whose address
 //! is still in the file keeps its socket, wherever it is now, so nobody is refused at it; the listener of a new address
 //! is bound before anything is replaced, all of them or none; the listener of an address that is gone is closed, which

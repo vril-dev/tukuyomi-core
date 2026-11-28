@@ -8,6 +8,7 @@ import { lazy, t } from '../../i18n.js';
 
 const SERVER_FIELD = /^upstreams\.([A-Za-z0-9_-]{1,64})\.servers\[([0-9]{1,3})\]\.(address|weight|max_fails|fail_timeout_ms)$/;
 const TLS_FIELD = /^upstreams\.([A-Za-z0-9_-]{1,64})\.tls\.(ca|server_name)$/;
+const BALANCE_FIELD = /^upstreams\.([A-Za-z0-9_-]{1,64})\.(balance|hash_policy|hash_key)$/;
 const SERVERS = /^upstreams\.([A-Za-z0-9_-]{1,64})\.servers$/;
 export const ENGINE_FIELD = /^upstreams\.([A-Za-z0-9_-]{1,64})\.engine$/;
 const GROUP = /^upstreams\.([A-Za-z0-9_-]{1,64})$/;
@@ -133,6 +134,8 @@ export function locate(at, map) {
     return server === undefined ? null : { screen: 'upstreams', panel: group.cid, cid: server, field: match[3] };
   }
   match = TLS_FIELD.exec(at);
+  if (match !== null) return placeOfGroup(map, match[1], match[2]);
+  match = BALANCE_FIELD.exec(at);
   if (match !== null) return placeOfGroup(map, match[1], match[2]);
   match = ENGINE_FIELD.exec(at);
   if (match !== null) return placeOfGroup(map, match[1], 'engine');

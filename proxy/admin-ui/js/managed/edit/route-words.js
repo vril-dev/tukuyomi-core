@@ -1,6 +1,7 @@
-// The words of the path of a route as a regular expression, and of its priority, in Japanese and in English, with the
-// sentences of the API that a check and a saving can give about them. `i18n.js` puts them in the dictionaries. This
-// file imports nothing.
+// The words of how a request is sent on, in Japanese and in English, with the sentences of the API that a check and a
+// saving can give about them: the path of a route as a regular expression and its priority, and how an upstream chooses
+// one of its servers (the method and, for a hash, its key). `i18n.js` puts them in the dictionaries. This file imports
+// nothing.
 
 export const ja = {
   'edit.col.regex': '正規表現',
@@ -9,6 +10,21 @@ export const ja = {
   'edit.route.path_regex_hint': '任意です。空欄のときは、すべてのパスに一致します。プロキシが受け取ったままのパス（URL デコードなし）の一部に一致すれば、このルートに一致します。パス全体に一致させるときは、^ と $ を書いてください。正規表現のルートには、アクセス制御と書き換え後のパスを設定できません。',
   'edit.route.priority': '優先度',
   'edit.route.priority_hint': '任意です。-1000〜1000 の整数を入力してください。空欄のときは 0 です。数が小さいルートが先に選ばれますが、比べるのは、ホストの一致の仕方が同じルートの間だけです。ホストを書いたルートは、数にかかわらず、ホストを書いていないルートより先に選ばれます。',
+
+  'edit.balance.round_robin': '重み付きラウンドロビン',
+  'edit.balance.least_conn': '最小接続数',
+  'edit.balance.hash': 'ハッシュ',
+  'edit.hash.client_ip': 'クライアントの IP アドレス',
+  'edit.hash.header': 'ヘッダー',
+  'edit.hash.cookie': 'クッキー',
+  'edit.group.balance': '負荷分散方式',
+  'edit.group.balance_hint': 'リクエストをどのサーバーに送るかの決め方です。重み付きラウンドロビンは、重みに応じてサーバーを順番に選びます。最小接続数は、処理中のリクエストの数を重みで割った値が最も小さいサーバーを選びます。ハッシュは、キーが同じリクエストを同じサーバーに送ります。',
+  'edit.group.hash_policy': 'ハッシュのキー',
+  'edit.group.hash_policy_unset': '選んでください',
+  'edit.group.hash_policy_hint': 'ハッシュの元にする値です。ヘッダーとクッキーの値はクライアントが決められるので、クライアントは自分のリクエストを特定のサーバーに送らせることができます。リクエストにその値が無いとき、値が空のとき、値が 1024 バイトを超えるときは、重み付きラウンドロビンでサーバーを選びます。',
+  'edit.fault.hash_policy': 'ハッシュのキーを選んでください。',
+  'edit.group.hash_key': 'ヘッダーかクッキーの名前',
+  'edit.group.hash_key_hint': 'キーにする値を持つヘッダーかクッキーの名前です。ヘッダーの名前として使える文字（英数字といくつかの記号）で、1〜64 文字で入力してください。ただし、ヘッダーの名前には _ を使えません。ヘッダーの名前は大文字と小文字を区別せず、クッキーの名前は区別します。',
 
   'a route has both a path and a path regex': 'ルートに、パスとパスの正規表現を同時に指定することはできません。',
   'a route path regex is not 1 to 255 bytes': 'パスの正規表現は 1〜255 バイトの範囲で入力してください。',
@@ -19,6 +35,15 @@ export const ja = {
   'a route with a path regex has an access list': 'パスが正規表現のルートには、アクセス制御を設定できません。このルートのアクセス制御を使わないか、パスを正規表現にしないでください。',
   'a rewrite path is set on a route with a path regex': 'パスが正規表現のルートには、書き換え後のパスを設定できません。書き換え後のパスを空にするか、パスを正規表現にしないでください。',
   'a route priority is not -1000 to 1000': '優先度は -1000〜1000 の整数で入力してください。',
+  'an upstream balance is not round_robin, least_conn or hash': '負荷分散方式は、重み付きラウンドロビン、最小接続数、ハッシュのいずれかを選んでください。',
+  'an upstream with balance hash has no hash_policy': 'ハッシュのキーを選んでください。ハッシュ方式にはキーが必要です。',
+  'an upstream hash_policy is not client_ip, header or cookie': 'ハッシュのキーは、クライアントの IP アドレス、ヘッダー、クッキーのいずれかを選んでください。',
+  'an upstream has a hash_policy without balance hash': 'ハッシュのキーを設定できるのは、負荷分散方式がハッシュのときだけです。方式をハッシュにするか、キーを設定しないでください。',
+  'an upstream has a hash_key without balance hash': 'ヘッダーかクッキーの名前を設定できるのは、負荷分散方式がハッシュのときだけです。方式をハッシュにするか、名前を設定しないでください。',
+  'an upstream hash_policy header or cookie has no hash_key': 'ハッシュのキーにするヘッダーかクッキーの名前を入力してください。',
+  'an upstream hash_policy client_ip has a hash_key': 'ハッシュのキーがクライアントの IP アドレスのときは、名前を設定できません。ヘッダーかクッキーを選ぶか、名前を設定しないでください。',
+  'an upstream hash_key is not a name of 1 to 64 token characters': '名前は、ヘッダーの名前として使える文字（英数字といくつかの記号）で、1〜64 文字で入力してください。',
+  'an upstream hash_key header name has an underscore': 'ヘッダーの名前には _ を使えません。名前に _ を含むヘッダーは、プロキシが捨てるためです。_ を使わない名前にするか、クッキーを選んでください。',
 };
 
 export const en = {
@@ -29,6 +54,21 @@ export const en = {
   'edit.route.priority': 'Priority',
   'edit.route.priority_hint': 'Optional. An integer from -1000 to 1000; if empty, 0. A route with a smaller number is chosen first, but only among routes whose host matches the request in the same way. A route that has a host always comes before one that has none.',
 
+  'edit.balance.round_robin': 'Weighted round robin',
+  'edit.balance.least_conn': 'Least connections',
+  'edit.balance.hash': 'Hash',
+  'edit.hash.client_ip': 'Client IP address',
+  'edit.hash.header': 'Header',
+  'edit.hash.cookie': 'Cookie',
+  'edit.group.balance': 'Load balancing method',
+  'edit.group.balance_hint': 'How a request chooses one of the servers. Weighted round robin takes the servers in turn, according to their weights. Least connections chooses the server with the fewest requests in progress relative to its weight. Hash sends requests with the same key to the same server.',
+  'edit.group.hash_policy': 'Hash key',
+  'edit.group.hash_policy_unset': 'Choose one',
+  'edit.group.hash_policy_hint': 'What the hash is made from. A client sets the value of a header or a cookie, so a client can make its requests go to a particular server. If a request has no such value, or the value is empty or longer than 1024 bytes, the server is chosen by weighted round robin.',
+  'edit.fault.hash_policy': 'Choose a hash key.',
+  'edit.group.hash_key': 'Header or cookie name',
+  'edit.group.hash_key_hint': 'The name of the header or the cookie that holds the key. Use 1 to 64 characters that a header name can have (letters, digits, and some symbols), but a header name cannot contain "_". A header name is not case-sensitive; a cookie name is.',
+
   'a route has both a path and a path regex': 'A route cannot have both a path and a regular expression for the path.',
   'a route path regex is not 1 to 255 bytes': 'The regular expression for the path must be 1 to 255 bytes.',
   'a route path regex has a character that is not allowed': 'The regular expression for the path contains a character that is not allowed. Use only ASCII characters in the range 0x21 to 0x7e (a space is not allowed).',
@@ -38,4 +78,13 @@ export const en = {
   'a route with a path regex has an access list': 'A route whose path is a regular expression cannot have access control. Turn off the route\'s access control, or use a path that is not a regular expression.',
   'a rewrite path is set on a route with a path regex': 'A route whose path is a regular expression cannot have a path to rewrite to. Clear the path to rewrite to, or use a path that is not a regular expression.',
   'a route priority is not -1000 to 1000': 'Priority must be an integer from -1000 to 1000.',
+  'an upstream balance is not round_robin, least_conn or hash': 'The load balancing method must be weighted round robin, least connections, or hash.',
+  'an upstream with balance hash has no hash_policy': 'Choose a hash key. The hash method needs one.',
+  'an upstream hash_policy is not client_ip, header or cookie': 'The hash key must be the client IP address, a header, or a cookie.',
+  'an upstream has a hash_policy without balance hash': 'A hash key can be set only when the load balancing method is hash. Choose hash, or leave the hash key out.',
+  'an upstream has a hash_key without balance hash': 'The name of a header or cookie can be set only when the load balancing method is hash. Choose hash, or leave the name out.',
+  'an upstream hash_policy header or cookie has no hash_key': 'Enter the name of the header or the cookie that the hash key is made from.',
+  'an upstream hash_policy client_ip has a hash_key': 'A name cannot be set when the hash key is the client IP address. Choose a header or a cookie, or leave the name out.',
+  'an upstream hash_key is not a name of 1 to 64 token characters': 'The name must be 1 to 64 characters that a header name can have (letters, digits, and some symbols).',
+  'an upstream hash_key header name has an underscore': 'A header name cannot contain "_". The proxy drops a header whose name contains "_". Use a name without "_", or choose a cookie.',
 };

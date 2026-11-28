@@ -3,6 +3,7 @@ use std::time::Duration;
 use tukuyomi_kernel::Engine;
 
 use super::*;
+use crate::config::HashKey;
 use crate::forward::origin::tests::config;
 
 const FAIL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,7 +30,7 @@ fn build(servers: Vec<ServerConfig>) -> (Upstreams, impl Fn(u64) -> Instant) {
 /// The servers that `pick` gives over `n` choices, none tried.
 fn chosen(group: &Group, now: Instant, n: usize) -> Vec<usize> {
     (0..n)
-        .filter_map(|_| group.pick(Tried::default(), now))
+        .filter_map(|_| group.pick(Tried::default(), now, None))
         .collect()
 }
 
@@ -95,7 +96,7 @@ fn a_server_that_was_tried_is_not_given_again_and_a_backup_serves_when_the_other
     let group = upstreams.group(0);
     let mut tried = Tried::default();
     let mut order = Vec::new();
-    while let Some(i) = group.pick(tried, at(1)) {
+    while let Some(i) = group.pick(tried, at(1), None) {
         tried.add(i);
         order.push(i);
     }
@@ -107,8 +108,8 @@ fn a_server_that_was_tried_is_not_given_again_and_a_backup_serves_when_the_other
     group.fail(1, at(2));
     assert_eq!(chosen(group, at(3), 3), [2, 2, 2]);
     group.fail(2, at(3));
-    assert_eq!(group.pick(Tried::default(), at(4)), None);
-    assert!(group.pick(Tried::default(), at(10_004)).is_some());
+    assert_eq!(group.pick(Tried::default(), at(4), None), None);
+    assert!(group.pick(Tried::default(), at(10_004), None).is_some());
 }
 
 use http::{HeaderMap, Uri};
@@ -371,4 +372,96 @@ fn a_server_is_the_same_by_its_address_and_its_place_among_those_at_that_address
     assert!(picked.contains(&0) && picked.contains(&2), "{picked:?}");
     assert!(!picked.contains(&1), "{picked:?}");
     assert_eq!(later.anew(&earlier).count(), 0);
+}
+
+/// The group of these servers with this `balance`, and the instant `ms` milliseconds after its start.
+fn balanced(servers: Vec<ServerConfig>, balance: Balance) -> (Upstreams, impl Fn(u64) -> Instant) {
+    let mut forward = ForwardConfig::of(&[]);
+    forward.groups[0].servers = servers;
+    forward.groups[0].balance = balance;
+    let upstreams = Upstreams::new(&forward, &config());
+    let start = Instant::now();
+    (upstreams, move |ms| start + Duration::from_millis(ms))
+}
+
+/// How many times each of the three servers is among `picked`.
+fn shares(picked: &[usize]) -> [usize; 3] {
+    [0, 1, 2].map(|server| picked.iter().filter(|&&p| p == server).count())
+}
+
+#[test]
+fn the_balance_chooses_the_first_server_of_a_request_and_the_next_ones_go_by_weight() {
+    let servers = || {
+        vec![
+            server(0, 1, false),
+            server(1, 1, false),
+            server(2, 1, false),
+        ]
+    };
+    // The fewest requests: server 2 has none, 0 has one and 1 has two. After it was tried, the others take turns
+    // although 0 has fewer requests than 1.
+    let (upstreams, at) = balanced(servers(), Balance::LeastConn);
+    let group = upstreams.group(0);
+    let _busy = [0, 1, 1].map(|server| group.server(server).count_request());
+    assert_eq!(group.pick(Tried::default(), at(1), None), Some(2));
+    let mut tried = Tried::default();
+    tried.add(2);
+    let next: Vec<usize> = (0..4)
+        .filter_map(|_| group.pick(tried, at(1), None))
+        .collect();
+    assert_eq!(shares(&next), [2, 2, 0]);
+
+    // The key chooses one server, always the same; the next one is not the next best of the key but the weighted
+    // order. A group that has no key for the request chooses by weight.
+    let (upstreams, at) = balanced(servers(), Balance::Hash(HashKey::ClientIp));
+    let group = upstreams.group(0);
+    let client = "203.0.113.9".parse().unwrap();
+    let key = group.key(client, &HeaderMap::new()).unwrap();
+    let home = group.pick(Tried::default(), at(1), Some(&key)).unwrap();
+    for _ in 0..4 {
+        assert_eq!(group.pick(Tried::default(), at(1), Some(&key)), Some(home));
+    }
+    let mut tried = Tried::default();
+    tried.add(home);
+    let next: Vec<usize> = (0..4)
+        .filter_map(|_| group.pick(tried, at(1), Some(&key)))
+        .collect();
+    assert_eq!(next.iter().filter(|&&server| server == home).count(), 0);
+    assert_eq!(next.iter().filter(|&&server| server == next[0]).count(), 2);
+    let none: Vec<usize> = (0..6)
+        .filter_map(|_| group.pick(Tried::default(), at(1), None))
+        .collect();
+    assert_eq!(shares(&none), [2, 2, 2]);
+
+    // The server of the key is left out: the key goes to another server, and back when it comes back.
+    group.fail(home, at(2));
+    let moved = group.pick(Tried::default(), at(3), Some(&key)).unwrap();
+    assert_ne!(moved, home);
+    assert_eq!(group.pick(Tried::default(), at(4), Some(&key)), Some(moved));
+    assert_eq!(
+        group.pick(Tried::default(), at(10_003), Some(&key)),
+        Some(home)
+    );
+}
+
+#[test]
+fn the_requests_that_a_server_has_are_counted_together_by_the_old_group_and_the_new_whatever_changed()
+ {
+    let (earlier, _) = build(vec![server(0, 1, false), server(1, 1, false)]);
+    let began = earlier.group(0).server(0).count_request();
+    // The limits of the server change, so its failures count from nothing, and its requests do not.
+    let later = reread(&earlier, vec![server(0, 2, false), server(1, 1, false)]);
+    assert_eq!(later.anew(&earlier).collect::<Vec<_>>(), [("main", 1)]);
+    let has = |upstreams: &Upstreams, server: usize| upstreams.group(0).server(server).in_use();
+    assert_eq!((has(&earlier, 0), has(&later, 0)), (1, 1));
+    let again = later.group(0).server(0).count_request();
+    assert_eq!((has(&earlier, 0), has(&later, 0)), (2, 2));
+    // A request that began under the old configuration ends: it is counted down for the new one.
+    drop(began);
+    assert_eq!((has(&earlier, 0), has(&later, 0)), (1, 1));
+    drop(again);
+    assert_eq!(
+        (has(&earlier, 0), has(&later, 0), has(&later, 1)),
+        (0, 0, 0)
+    );
 }

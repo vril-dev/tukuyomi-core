@@ -88,6 +88,62 @@ test('the engine of a group is built back as it was read, the default engine lea
   forgetDraft();
 });
 
+test('the method of a group is built back as it was read, and a key that the method or the kind of key does not use is not written', () => {
+  const version = sampleVersion();
+  const server = { address: '127.0.0.1:9000', weight: 1, max_fails: 1, fail_timeout_ms: 10000, backup: false };
+  version.upstreams.plain = { servers: [server] };
+  version.upstreams.turns = { servers: [server], balance: 'round_robin' };
+  version.upstreams.least = { servers: [server], balance: 'least_conn' };
+  version.upstreams.ip = { servers: [server], balance: 'hash', hash_policy: 'client_ip' };
+  version.upstreams.named = { servers: [server], balance: 'hash', hash_policy: 'header', hash_key: 'X-User' };
+  const draft = draftOf(version);
+  // A group that names no method has the weighted round robin and stays without the key; one that wrote it keeps it.
+  assert.deepEqual(draft.build().version, version);
+  assert.equal(draft.changed, false);
+  assert.equal(groupNamed(draft, 'plain').balance, 'round_robin');
+  const built = (name) => draft.build().version.upstreams[name];
+  const [plain, turns, named, ip] = ['plain', 'turns', 'named', 'ip'].map((name) => groupNamed(draft, name));
+  draft.setBalance(plain, 'round_robin');
+  assert.equal(Object.hasOwn(built('plain'), 'balance'), false);
+  draft.setBalance(turns, 'hash');
+  draft.setBalance(turns, 'round_robin');
+  assert.equal(built('turns').balance, 'round_robin');
+  // The name of the key is written for a header or a cookie only, and what was typed stays when the kind is changed back.
+  draft.setBalance(named, 'least_conn');
+  assert.deepEqual(built('named'), { servers: [server], balance: 'least_conn' });
+  assert.equal(draft.groupChanged(named), true);
+  draft.setBalance(named, 'hash');
+  assert.deepEqual(built('named'), version.upstreams.named);
+  assert.equal(draft.groupChanged(named), false);
+  draft.setHashPolicy(named, 'client_ip');
+  assert.deepEqual(built('named'), { servers: [server], balance: 'hash', hash_policy: 'client_ip' });
+  draft.setHashPolicy(named, 'cookie');
+  assert.deepEqual(built('named'), { servers: [server], balance: 'hash', hash_policy: 'cookie', hash_key: 'X-User' });
+  // A hash with no kind of key, and a header with no name, are told at their fields and nothing is built.
+  const toldAt = () => draft.build().faults.map((one) => [one.cid, one.field]);
+  draft.setHashPolicy(named, '');
+  assert.deepEqual(toldAt(), [[named.cid, 'hash_policy']]);
+  draft.setHashPolicy(named, 'header');
+  draft.write(named, 'hash_key', '  ');
+  assert.deepEqual(toldAt(), [[named.cid, 'hash_key']]);
+  draft.write(named, 'hash_key', 'X-Id');
+  draft.setBalance(ip, 'hash');
+  assert.equal(draft.groupChanged(ip), false);
+  // The group is one line of what a saving changes, and a method of another kind is not edited.
+  assert.deepEqual(changesBetween(version, draft.build().version).map((line) => [line.area, line.action, line.label]), [['upstream', 'change', 'named']]);
+  assert.equal(readableVersion({ ...version, upstreams: { plain: { servers: [server], balance: 7 } } }), false);
+  assert.equal(readableVersion({ ...version, upstreams: { ip: { servers: [server], hash_policy: 7 } } }), false);
+  // What was told of the kind and of the name goes when the method or the kind changes.
+  const told = (field) => ({ screen: 'upstreams', panel: named.cid, cid: named.cid, field, words: lazy(() => 'wrong') });
+  draft.putFaults([told('balance'), told('hash_policy'), told('hash_key')]);
+  draft.setHashPolicy(named, 'cookie');
+  assert.deepEqual(draft.faults.map((one) => one.field), ['balance']);
+  draft.putFaults([told('hash_policy'), told('hash_key')]);
+  draft.setBalance(named, 'least_conn');
+  assert.deepEqual(draft.faults, []);
+  forgetDraft();
+});
+
 test('a draft from a version and a new base leave the sites and the routes as the draft carried them', () => {
   const source = sampleVersion();
   source.routes.push({ path: '/other/', upstream: 'api' });
@@ -193,6 +249,7 @@ test('a place in a refusal is found in the request as it was sent', () => {
   assert.deepEqual(locate('upstreams.api.servers[1].address', map), { screen: 'upstreams', panel: api.cid, cid: api.servers[1].cid, field: 'address' });
   assert.deepEqual(locate('upstreams.app', map), { screen: 'upstreams', panel: app.cid, cid: app.cid, field: 'name' });
   assert.deepEqual(locate('upstreams.app.engine', map), { screen: 'upstreams', panel: app.cid, cid: app.cid, field: 'engine' });
+  for (const field of ['balance', 'hash_policy', 'hash_key']) assert.deepEqual(locate(`upstreams.api.${field}`, map), { screen: 'upstreams', panel: api.cid, cid: api.cid, field });
   assert.deepEqual(locate('rate_limit.keys', map), { screen: 'policy', panel: null, cid: 'rate', field: 'keys' });
   assert.deepEqual(locate('files[0]', map), { screen: 'upstreams', panel: app.cid, cid: app.cid, field: 'ca' });
   assert.equal(locate('files[1]', map), null);
@@ -207,6 +264,7 @@ test('a place in a refusal is found in the request as it was sent', () => {
   assert.equal(locate('upstreams.__proto__.servers[0].address', map), null);
   assert.equal(locate('upstreams.constructor', map), null);
   assert.equal(locate('upstreams.__proto__.engine', map), null);
+  assert.equal(locate('upstreams.__proto__.hash_key', map), null);
   assert.equal(locate('upstreams.nothing.engine', map), null);
   // A line that was taken away after the request does not shift what the answer means.
   const kept = api.servers[1].cid;
