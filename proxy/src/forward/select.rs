@@ -10,9 +10,8 @@ use std::sync::{Mutex, PoisonError};
 
 use crate::config::ServerConfig;
 
-/// The weights and the numbers of the servers of one group.
+/// The numbers and the `backup` marks of the servers of one group.
 pub(super) struct Turn {
-    weights: Vec<i64>,
     backup: Vec<bool>,
     /// The number of each server. Taken for a choice only, never across a wait.
     current: Mutex<Vec<i64>>,
@@ -21,24 +20,30 @@ pub(super) struct Turn {
 impl Turn {
     pub(super) fn new(servers: &[ServerConfig]) -> Turn {
         Turn {
-            weights: servers.iter().map(|s| i64::from(s.weight)).collect(),
             backup: servers.iter().map(|s| s.backup).collect(),
             current: Mutex::new(vec![0; servers.len()]),
         }
     }
 
-    /// The index of the server to use, among those that `may` accepts, or `None` if it accepts none.
-    pub(super) fn pick(&self, may: impl Fn(usize) -> bool) -> Option<usize> {
+    /// The index of the server to use, among those that `may` accepts, or `None` if it accepts none. `weight` gives the
+    /// weight of the server at an index. A choice reads it once for each server that `may` accepts, so that the number
+    /// of the server and the sum of the weights are made of the same value.
+    pub(super) fn pick(
+        &self,
+        may: impl Fn(usize) -> bool,
+        weight: impl Fn(usize) -> i64,
+    ) -> Option<usize> {
         let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
         for backup in [false, true] {
             let mut total = 0;
             let mut best: Option<usize> = None;
-            for i in 0..self.weights.len() {
+            for i in 0..self.backup.len() {
                 if self.backup[i] != backup || !may(i) {
                     continue;
                 }
-                current[i] += self.weights[i];
-                total += self.weights[i];
+                let w = weight(i);
+                current[i] += w;
+                total += w;
                 if best.is_none_or(|most| current[i] > current[most]) {
                     best = Some(i);
                 }

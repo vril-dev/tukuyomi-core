@@ -32,9 +32,8 @@
 //! instant may count as one; a count that is a little low or high changes how soon a server is left out, nothing
 //! that a client sees. The times are milliseconds from the start of the group.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -47,8 +46,11 @@ use crate::forward::client_ip::Access;
 use crate::forward::pool::Pool;
 use crate::forward::rewrite::Rewrite;
 use crate::forward::select::Turn;
-use crate::forward::tls::Secure;
 use crate::route::{RequestHost, Table};
+
+mod server;
+
+pub use self::server::Server;
 
 /// The name of the group of the way to the admin process: not the name of a group of the configuration, which is made
 /// of letters, digits, `-` and `_`.
@@ -193,74 +195,6 @@ impl Tried {
     }
 }
 
-/// A server of a group: where it is, how it counts, its view of the pool of the group, how it is spoken to if the
-/// group has `tls`, and what has failed.
-pub struct Server {
-    address: SocketAddr,
-    max_fails: u32,
-    fail_timeout_ms: u64,
-    pool: Pool,
-    secure: Option<Secure>,
-    /// Failures in the window that began at `window`.
-    fails: AtomicU32,
-    window: AtomicU64,
-    /// The server is left out until this time.
-    down_until: AtomicU64,
-}
-
-impl Server {
-    fn new(cfg: &ServerConfig, pool: Pool, secure: Option<Secure>) -> Server {
-        Server {
-            address: cfg.address,
-            max_fails: cfg.max_fails,
-            // The configuration bounds it to an hour, so this is exact.
-            fail_timeout_ms: u64::try_from(cfg.fail_timeout.as_millis()).unwrap_or(u64::MAX),
-            pool,
-            secure,
-            fails: AtomicU32::new(0),
-            window: AtomicU64::new(0),
-            down_until: AtomicU64::new(0),
-        }
-    }
-
-    pub fn address(&self) -> SocketAddr {
-        self.address
-    }
-
-    pub(super) fn pool(&self) -> &Pool {
-        &self.pool
-    }
-
-    /// How to speak TLS to the server, if the group has `tls`; `None`: the connection is plain.
-    pub(super) fn secure(&self) -> Option<&Secure> {
-        self.secure.as_ref()
-    }
-
-    /// Counts a failure that came `now` milliseconds after the start of the group.
-    fn fail(&self, now: u64) {
-        if self.max_fails == 0 {
-            return;
-        }
-        let expired =
-            now.saturating_sub(self.window.load(Ordering::Relaxed)) >= self.fail_timeout_ms;
-        let fails = if self.fails.load(Ordering::Relaxed) == 0 || expired {
-            self.window.store(now, Ordering::Relaxed);
-            1
-        } else {
-            self.fails.load(Ordering::Relaxed).saturating_add(1)
-        };
-        self.fails.store(fails, Ordering::Relaxed);
-        if fails >= self.max_fails {
-            self.down_until
-                .store(now.saturating_add(self.fail_timeout_ms), Ordering::Relaxed);
-        }
-    }
-
-    fn up(&self, now: u64) -> bool {
-        self.max_fails == 0 || now >= self.down_until.load(Ordering::Relaxed)
-    }
-}
-
 /// A group: its name, the engine that inspects the requests that go to it, its servers and the state of the choice
 /// among them.
 pub struct Group {
@@ -350,8 +284,10 @@ impl Group {
     /// `backup` servers only when no other can be chosen.
     pub(super) fn pick(&self, tried: Tried, now: Instant) -> Option<usize> {
         let now = self.since(now);
-        self.turn
-            .pick(|index| !tried.has(index) && self.usable(index, now))
+        self.turn.pick(
+            |index| !tried.has(index) && self.usable(index, now),
+            |index| self.servers[index].weight(),
+        )
     }
 
     /// Counts a failure of the server at `index`, at `now`.
