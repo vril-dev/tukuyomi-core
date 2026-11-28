@@ -29,17 +29,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustls::ClientConfig;
-
 use crate::config::{
     Address, ForwardConfig, ForwardSettings, GroupConfig, MAX_SERVERS, ServerConfig, same,
 };
-use crate::forward::tls::{self, Client, Fault, Settings};
+use crate::forward::tls::{self, Client, Fault, Settings, Trust};
 
 /// Why the groups were not made whole: a fixed sentence, and the group and the place of the server (from 1) it is
 /// about, if it is about a server.
@@ -208,7 +205,7 @@ pub fn complete_with<L, A>(
 ) -> Result<Completed, Refusal>
 where
     L: Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + 'static,
-    A: Fn(&Settings) -> Result<Arc<ClientConfig>, Fault>,
+    A: Fn(&Settings) -> Result<Trust, Fault>,
 {
     let ForwardSettings {
         resolve_timeout,

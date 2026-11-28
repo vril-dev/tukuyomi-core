@@ -370,12 +370,25 @@ systemd では、`systemctl reload` か `systemctl kill --kill-whom=main` を使
   - レート制限のテーブルは、テーブルごとに持ち越します（下の「レート制限（`rate_limit`）」と「ホストごとの設定（`host_policies`）」）。
     全体のテーブルが続くのは、新旧の両方に全体の `rate_limit` があり、`keys`・`rate`・`burst` がどれも同じときです。`exempt_cidrs` は新しい値を使います。
     どれかが違うか片方に無ければ、新しいテーブルで 0 から数え、`reload: rate limit table started anew` の行を出します。
-  - アップストリームのダウン判定と失敗の数、アップストリームへの待機中の接続、リスナーの TLS のセッションは作り直します。
-    `tukuyomi_upstream_failures_total` は 0 から数え直します。
+  - アップストリームのサーバーの失敗の数は、サーバーごとに持ち越します。サーバーを除外しているかどうかも、一緒に持ち越します（下の「`forward`」）。
+    - 前と同じサーバーとは、同じ名前のアップストリームにあり、アドレスが前と同じサーバーです。
+      同じアドレスを 2 回以上書いたときは、そのアドレスのサーバーの中での位置で見分けます。
+      IPv4 を IPv6 の形で書いたアドレスは、IPv4 のアドレスとみなします。
+      名前解決で並びが変わっても、同じアドレスのサーバーは失敗の数を引き継ぎます。
+    - 前と同じサーバーを持ち越すのは、`max_fails` と `fail_timeout_ms` が前と同じで、`tls` も同じときです。
+      `tls` が同じとは、どちらにも無いか、どちらにもあって、同じ名前で検証し、同じ内容の `ca_file` を使うことです（比べるのは中身で、パスではありません）。
+    - 除外していたサーバーを持ち越したときは、残りの時間だけ除外を続けます（除外するのは `max_fails` が 1 以上のサーバーだけです）。ファイルの内容とバージョンが前と同じでも同じです。
+      `fail_timeout_ms` が過ぎるか、プロキシを再起動すると、またそのサーバーを使います。
+    - それ以外のサーバーは、0 から数えます。
+      前の設定にもあって、今は 0 から数えるサーバーがあるアップストリームごとに、`reload: upstream <name>: failure counts started anew, servers <number>` の行を 1 つ出します。
+      `<number>` は、そのようなサーバーの数です。そのようなサーバーが無いアップストリームには、行を出しません。
+      前の設定に無かったサーバー（追加したサーバーと、追加した、または名前を変更したアップストリームのサーバー）は 0 から数え、`<number>` には入れません。
+  - アップストリームごとの失敗の合計、アップストリームへの待機中の接続、リスナーの TLS のセッションは作り直します。
+    `tukuyomi_upstream_failures_total` は、除外を続けるサーバーがあっても、0 から数え直します。
   - ルールの世代には触れません。
     稼働中の世代はそのままで、ルールストアも読み込みません。世代を切り替えるのは SIGUSR1 です。
     エンジンも起動せず、新しい設定のアップストリームが使うエンジンの準備ができていることだけを確認します（上の拒否）。
-- ファイルの内容とバージョンが前と同じでも、上のとおり作り直し、待っている接続を閉じます。
+- ファイルの内容とバージョンが前と同じでも、上のとおりに持ち越しと作り直しをして、待っている接続を閉じます。
 - リロードの途中に受けた SIGHUP は、`reload: a configuration reload is in progress, ignored` の行を出すだけです。
   シグナルの処理が有効になってからリスナーをバインドするまでの間と、停止の間に受けた SIGHUP も、行を 1 つ出すだけです。
   リロードの途中に制御ソケットで受け付けた `reload` の依頼には、`busy`（`reload under way`）で応答します。
@@ -792,6 +805,11 @@ systemd では、`systemctl reload` か `systemctl kill --kill-whom=main` を使
 - 使えるサーバーの中から、重みに合わせて順にサーバーを選びます（smooth weighted round robin）。
 - アップストリームのサーバーが 1 つだけなら、除外しません。
   アップストリームのどのサーバーも使えないときは、何も試さずに 502 で応答します。
+- アップストリームのサーバーが 1 つだけでも、`max_fails` が 1 以上なら失敗は数えます。
+  リロードで 2 つ目を追加すると、それまでに数えた失敗で、1 つ目がすぐに除外されることがあります。`fail_timeout_ms` が過ぎれば、また使います。
+- 設定をリロードしても（SIGHUP、制御ソケットの `reload`、バージョンの反映。同じバージョンでも）、除外しているサーバーは除外を続けます。
+  ただし、前と同じサーバーで、`max_fails`・`fail_timeout_ms`・`tls` が前と同じときです。
+  `fail_timeout_ms` が過ぎるか、プロキシを再起動すると、またそのサーバーを使います。条件は、上の「SIGHUP（設定のリロード）」を参照してください。
 - 次のときは、サーバーの失敗として数えます。
   - 接続を拒否された・切断された、到達できない、`upstream_connect_ms` 以内に接続できない（TLS のハンドシェイクの失敗も含みます）
   - リクエストを送信できない、`upstream_header_ms` 以内に応答のヘッダー部が来ない、ヘッダー部の途中で切断された
@@ -2096,7 +2114,7 @@ ACME のサイトについては、下の「ACME のサイト」を参照して�
   設定ファイルにエラーがあれば、反映も拒否されます（`configuration`）。
 - 同じバージョンでもリロードします。
   そのときも SIGHUP と同じく、待機中の keep-alive の接続を閉じ、HTTP/2 の接続には `GOAWAY` を送ります。
-  アップストリームのダウン判定と失敗の数も初期化します（上の「SIGHUP（設定のリロード）」）。
+  アップストリームのサーバーの除外と失敗の数は、SIGHUP と同じ条件で持ち越すので、除外しているサーバーは、同じバージョンを反映しても除外を続けます（上の「SIGHUP（設定のリロード）」）。
 - ログには、`reload: control reload <version>`、SIGHUP と同じ `reload:` の行、`control: reload <version>: <result> (<reason>)` が出ます（下の「ほかのログ」）。
   このうち `reload: control reload <version>` は、制御ソケットの依頼でリロードを始めたときに出ます。
 
@@ -2690,7 +2708,7 @@ ACME のチャレンジと管理画面のルートには効きません。
 | 文 | 場合 |
 |---|---|
 | `start: ...` | 起動の各段階（`start: managed version <version>`、起動するエンジンごとの `start: rules generation <fingerprint>`・`start: rules engine <name>`・`start: rules mode block`（か `detect`）・`start: rules routes <count>`（デフォルトのエンジンが先）、検知のみの世代を選択しているエンジンへ向くアップストリームごとの `start: upstream <name>: engine <engine>, mode detect`、`start: rules store refused: <reason>`、`start: rules generation refused: <reason>`、`start: tls certificate not issued yet (<place>)`、`start: the kernel is ready`、`start: listening`、`start: record file refused: <reason>`、`start: control socket refused: <reason>` など） |
-| `reload: ...` | SIGHUP・SIGUSR1・SIGUSR2 と、制御ソケットの `reload` の依頼を受けたこと（`reload: SIGHUP`、`reload: control reload <version>` など）。設定のリロードの各段階と結果（`reload: configuration replaced <sha256>`、`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`、`reload: configuration refused: <reason>`、`reload: tls certificate not issued yet (<place>)`、`reload: rate limit table started anew`、`reload: rate limit table of host policy <name> started anew`、検知のみの世代を選択しているエンジンへ向くアップストリームごとの `reload: upstream <name>: engine <engine>, mode detect` など。上の「SIGHUP（設定のリロード）」）。切り替え（SIGUSR1 と制御ソケット。エンジンごとに、始めるときに `reload: starting generation <fingerprint>`・`reload: rules engine <name>`・`reload: rules mode block`（か `detect`）・`reload: rules routes <count>`、準備ができたときに `reload: generation <fingerprint> is ready, switched`、前の世代を停止したときに `reload: generation <fingerprint> retired, engine <engine>, clean true`（か `false`）、すでに稼働している世代のときに `reload: generation <fingerprint> is already running`、起動に失敗したときに `reload: generation <fingerprint> failed to start: <reason>`、切り替えの途中のときに `reload: a switch is in progress, ignored`、拒否したときに `reload: rules store refused: <reason>`）と、証明書の入れ替えの結果 |
+| `reload: ...` | SIGHUP・SIGUSR1・SIGUSR2 と、制御ソケットの `reload` の依頼を受けたこと（`reload: SIGHUP`、`reload: control reload <version>` など）。設定のリロードの各段階と結果（`reload: configuration replaced <sha256>`、`managed` のある設定では `reload: configuration replaced <sha256> managed <version>`、`reload: configuration refused: <reason>`、`reload: tls certificate not issued yet (<place>)`、`reload: rate limit table started anew`、`reload: rate limit table of host policy <name> started anew`、0 から数え直すサーバーがあるアップストリームごとの `reload: upstream <name>: failure counts started anew, servers <number>`、検知のみの世代を選択しているエンジンへ向くアップストリームごとの `reload: upstream <name>: engine <engine>, mode detect` など。上の「SIGHUP（設定のリロード）」）。切り替え（SIGUSR1 と制御ソケット。エンジンごとに、始めるときに `reload: starting generation <fingerprint>`・`reload: rules engine <name>`・`reload: rules mode block`（か `detect`）・`reload: rules routes <count>`、準備ができたときに `reload: generation <fingerprint> is ready, switched`、前の世代を停止したときに `reload: generation <fingerprint> retired, engine <engine>, clean true`（か `false`）、すでに稼働している世代のときに `reload: generation <fingerprint> is already running`、起動に失敗したときに `reload: generation <fingerprint> failed to start: <reason>`、切り替えの途中のときに `reload: a switch is in progress, ignored`、拒否したときに `reload: rules store refused: <reason>`）と、証明書の入れ替えの結果 |
 | `control: switch ...`、`control: reload ...` | 制御ソケットの切り替えとリロードの依頼への応答（`control: reload <version>: <result> (<reason>)` など。上の「制御ソケット」） |
 | `driver: inspector incarnation changed, engine <engine>, inc <count>, restarts <count>` | 検査プロセスが再起動した場合 |
 | `driver: stop, engine <engine>, records <count>, held <count>, waiting <count>` | 停止の始めに、起動しているエンジンごとに 1 つ出ます（上の「停止」） |
@@ -3095,7 +3113,7 @@ DB に接続したとき、ログ送信プロセスはテーブルを探し、�
 | `tukuyomi_rules_switches_total` | `counter` | `result`（`switched`、`refused`、`failed`） | SIGUSR1 と制御ソケットによる世代の切り替え |
 | `tukuyomi_certificate_reloads_total` | `counter` | `result`（`replaced`、`refused`） | SIGUSR2 による証明書の再読み込み |
 | `tukuyomi_config_reloads_total` | `counter` | `result`（`replaced`、`refused`） | SIGHUP と制御ソケットの `reload` による設定のリロード。リロードの途中に受けて無視した SIGHUP と、リロードを始めなかった `reload` の依頼（`busy`、`unmanaged`、`error` の応答）は数えません |
-| `tukuyomi_upstream_failures_total` | `counter` | `group` | アップストリームのサーバーの失敗。設定のリロードで、0 から数え直します |
+| `tukuyomi_upstream_failures_total` | `counter` | `group` | アップストリームのサーバーの失敗。設定のリロードで、除外を続けるサーバーがあっても、0 から数え直します（「SIGHUP（設定のリロード）」） |
 | `tukuyomi_records_dropped_total` | `counter` | | 捨てたログ（上の「ログを書けないとき」） |
 | `tukuyomi_record_write_errors_total` | `counter` | | 書き込みに失敗したログ |
 | `tukuyomi_record_file_errors_total` | `counter` | | ログファイルに書けなかったログと、失敗した同期（上の「ログファイル」） |

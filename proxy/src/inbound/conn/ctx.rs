@@ -69,9 +69,11 @@ pub struct Setup {
 
 impl Setup {
     /// The setup of `cfg`, which is read from a file whose SHA-256 is `sha256`, with the upstream groups of `forward`,
-    /// and the country database and the scopes of `policy`. Each table of the rate limits goes on counting the
-    /// clients of the one it follows in `earlier`, the scopes of the setup that this one replaces, if there is one and
-    /// the two have the same `keys`, `rate` and `burst` (see `policy::Scopes`).
+    /// and the country database and the scopes of `policy`. `earlier` is the setup that this one replaces, if there is
+    /// one. Each table of the rate limits goes on counting the clients of the one it follows in the scopes of
+    /// `earlier`, if the two have the same `keys`, `rate` and `burst` (see `policy::Scopes`), and each server of the
+    /// upstream groups goes on counting the failures of the same server in the upstream groups of `earlier`, if it
+    /// counts and is spoken to as it was (see `forward::group`).
     // One argument for each part of what the configuration file gives; a struct of them would only repeat their names.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -82,10 +84,13 @@ impl Setup {
         challenge: Option<Challenge>,
         mut policy: PolicyConfig,
         keep: Keep,
-        earlier: Option<&Scopes>,
+        earlier: Option<&Setup>,
     ) -> Setup {
         Setup {
-            upstreams: Upstreams::new(forward, &cfg),
+            upstreams: match earlier {
+                Some(earlier) => Upstreams::following(forward, &cfg, &earlier.upstreams),
+                None => Upstreams::new(forward, &cfg),
+            },
             cfg,
             sha256,
             managed: None,
@@ -93,7 +98,7 @@ impl Setup {
             tls,
             challenge,
             country: policy.country.take(),
-            scopes: Scopes::new(policy, earlier),
+            scopes: Scopes::new(policy, earlier.map(|earlier| &earlier.scopes)),
             keep,
             retired: watch::channel(false).0,
         }

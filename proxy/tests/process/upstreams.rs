@@ -47,7 +47,7 @@ fn by_pattern(addresses: &[SocketAddr]) -> Value {
 }
 
 /// One group of two servers, the second the first upstream; the first is the one that the test stops.
-fn two_servers(addresses: &[SocketAddr]) -> Value {
+pub(crate) fn two_servers(addresses: &[SocketAddr]) -> Value {
     json!({
         "resolve_timeout_ms": RESOLVE_TIMEOUT_MS,
         "upstreams": {"main": {"servers": [server(addresses[1]), server(addresses[0])]}},

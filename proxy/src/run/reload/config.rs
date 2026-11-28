@@ -186,12 +186,12 @@ impl Reloader {
     }
 
     /// Binds the addresses of the listeners of `parts` that `acceptor` has not, builds the setup of `parts` and makes
-    /// it the current one, with the rate limit of the old setup going on if it can. The listeners of `acceptor` are
-    /// put in the order of the file in the same step, so a connection that is accepted from then on is numbered by the
-    /// listeners of the setup it takes. The listeners of the addresses that are gone are closed, and the old setup is
-    /// retired. The hold on the version of `parts` takes the place of the one of the old setup, which goes before the
-    /// line that says the configuration is replaced. A refusal drops `parts` with its hold before its line, and keeps
-    /// the old one.
+    /// it the current one, with the rate limit and the failure counts of the servers of the old setup going on if they
+    /// can. The listeners of `acceptor` are put in the order of the file in the same step, so a connection that is
+    /// accepted from then on is numbered by the listeners of the setup it takes. The listeners of the addresses that
+    /// are gone are closed, and the old setup is retired. The hold on the version of `parts` takes the place of the one
+    /// of the old setup, which goes before the line that says the configuration is replaced. A refusal drops `parts`
+    /// with its hold before its line, and keeps the old one.
     async fn replace(
         &mut self,
         parts: Parts,
@@ -248,7 +248,7 @@ impl Reloader {
             parts.challenge,
             parts.policy,
             keep,
-            Some(&earlier.scopes),
+            Some(&earlier),
         )
         .with_managed(parts.managed);
         // A line for each table of the rate limits that does not go on counting the clients of the one it follows.
@@ -259,6 +259,12 @@ impl Reloader {
                     "reload: rate limit table of host policy {name} started anew"
                 )),
             }
+        }
+        // A line for each group with servers that do not go on counting the failures of the servers they follow.
+        for (group, servers) in setup.upstreams.anew(&earlier.upstreams) {
+            shared.log.line(&format!(
+                "reload: upstream {group}: failure counts started anew, servers {servers}"
+            ));
         }
         acceptor.arrange(&listening, bound);
         shared.setup.replace(setup);

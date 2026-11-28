@@ -171,7 +171,7 @@ fn the_file_of_authorities_holds_1_to_100_certificates_and_is_at_most_1_mib() {
     let one = fs::read(pki.ca()).unwrap();
     for count in [1, 100] {
         let path = pki.file("many.pem", &one.repeat(count));
-        assert_eq!(roots(&path).unwrap().roots.len(), count);
+        assert_eq!(roots(&path).unwrap().0.roots.len(), count);
     }
     assert_eq!(
         refused(&pki.file("many.pem", &one.repeat(101))),
@@ -183,7 +183,7 @@ fn the_file_of_authorities_holds_1_to_100_certificates_and_is_at_most_1_mib() {
         bytes.resize(len, b'\n');
         pki.file("padded.pem", &bytes)
     };
-    assert_eq!(roots(&padded(1 << 20)).unwrap().roots.len(), 1);
+    assert_eq!(roots(&padded(1 << 20)).unwrap().0.roots.len(), 1);
     assert_eq!(refused(&padded((1 << 20) + 1)), Fault::TooLarge);
 }
 

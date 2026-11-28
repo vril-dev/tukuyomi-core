@@ -1,6 +1,7 @@
 //! A server of a group, and what it counts of its failures to be left out.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::config::ServerConfig;
@@ -8,7 +9,9 @@ use crate::forward::pool::Pool;
 use crate::forward::tls::Secure;
 
 /// A server of a group: where it is, its weight, how it counts, its view of the pool of the group, how it is spoken
-/// to if the group has `tls`, and what has failed.
+/// to if the group has `tls`, and what has failed. What has failed is shared with the same server of the group that
+/// this one replaces, and of the group that replaces this one, if it counts and is spoken to as they are (see
+/// `follow`).
 pub struct Server {
     address: SocketAddr,
     weight: i64,
@@ -16,11 +19,12 @@ pub struct Server {
     fail_timeout_ms: u64,
     pool: Pool,
     secure: Option<Secure>,
-    passive: PassiveHealth,
+    passive: Arc<PassiveHealth>,
 }
 
 /// What a server counts of its failures to be left out: the failures in the window, and the time until which the
-/// server is left out.
+/// server is left out. The times are milliseconds from the start that the groups of all the readings of the
+/// configuration count from (see `Group::since`).
 #[derive(Default)]
 struct PassiveHealth {
     /// Failures in the window that began at `window`.
@@ -40,8 +44,32 @@ impl Server {
             fail_timeout_ms: u64::try_from(cfg.fail_timeout.as_millis()).unwrap_or(u64::MAX),
             pool,
             secure,
-            passive: PassiveHealth::default(),
+            passive: Arc::default(),
         }
+    }
+
+    /// Goes on counting the failures that `earlier` counts, if this server counts and is spoken to as it is: the
+    /// same `max_fails` and `fail_timeout`, and either neither has TLS or both check for the same name against
+    /// authorities that are the same bytes. The failures in the window and the time until which a server is left out
+    /// are counted with these, so with another `max_fails` or `fail_timeout` they would not mean what they meant, and
+    /// a failure of TLS may not be one with other authorities.
+    pub(super) fn follow(&mut self, earlier: &Server) {
+        let spoken_alike = match (&self.secure, &earlier.secure) {
+            (None, None) => true,
+            (Some(secure), Some(earlier)) => secure.same_as(earlier),
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if spoken_alike
+            && self.max_fails == earlier.max_fails
+            && self.fail_timeout_ms == earlier.fail_timeout_ms
+        {
+            self.passive = Arc::clone(&earlier.passive);
+        }
+    }
+
+    /// Whether this server counts the failures of `earlier`: the two have what has failed in common.
+    pub(super) fn continues(&self, earlier: &Server) -> bool {
+        Arc::ptr_eq(&self.passive, &earlier.passive)
     }
 
     pub fn address(&self) -> SocketAddr {
@@ -62,7 +90,8 @@ impl Server {
         self.secure.as_ref()
     }
 
-    /// Counts a failure that came `now` milliseconds after the start of the group.
+    /// Counts a failure that came `now` milliseconds after the start that the times are counted from (see
+    /// `Group::since`).
     pub(super) fn fail(&self, now: u64) {
         if self.max_fails == 0 {
             return;

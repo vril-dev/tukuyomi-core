@@ -64,7 +64,11 @@
 //! until their own time. The clients that the rate limit counts go on being counted when the old and the new
 //! configuration both have a `rate_limit` with the same `keys`, `rate` and `burst`; otherwise the new limit counts from
 //! nothing, and a line says so. So it is for the table of a host policy with that of the policy of the same name (see
-//! `policy::Scopes`). The listeners can be added, removed and put in another order. A listener whose address
+//! `policy::Scopes`). A server of an upstream group goes on counting its failures, and so stays left out for as long
+//! as it was, when the old and the new configuration have it in the group of the same name, at the same address, with
+//! the same `max_fails`, `fail_timeout_ms` and TLS (see `forward::group`); otherwise it counts from nothing, and a line
+//! for the group says how many of the servers that were there before do.
+//! The listeners can be added, removed and put in another order. A listener whose address
 //! is still in the file keeps its socket, wherever it is now, so nobody is refused at it; the listener of a new address
 //! is bound before anything is replaced, all of them or none; the listener of an address that is gone is closed, which
 //! cuts the connections that have not started there (the ones still in the backlog of the system, and the one that

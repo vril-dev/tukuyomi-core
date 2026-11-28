@@ -23,6 +23,18 @@
 //! A group also counts all the failures of its servers from the start of the proxy (`Group::failures`), also those of
 //! a server with a `max_fails` of 0, for `/metrics`.
 //!
+//! When the configuration is read again, a server goes on counting its failures (`Upstreams::following`). A group of
+//! the new configuration is the group of the old one that has its name, and a server is the server of that group at
+//! the same address (an IPv4 address written as IPv6 is the IPv4 address) that has the same place among the servers of
+//! the group at that address: so the order in which a name is looked up does not matter, and a server that is written
+//! twice is told from itself. A server that is the same in both goes on counting if it counts and is spoken to as it
+//! was (`Server::follow`). The group of the old configuration, which serves the requests that began before the new one
+//! was put in place, and the group of the new one then share what the server counts, so a failure counted by either
+//! counts for both and the server is left out for as long as it was. Any other server counts from nothing, and
+//! `Upstreams::anew` tells how many of the servers that were there before do. The failures of the group
+//! (`Group::failures`), the turn of the choice, the waiting connections and the way to the admin process begin again
+//! with each reading.
+//!
 //! A configuration with `managed` and `admin` has the way to the admin process besides (`Upstreams::admin`): a route
 //! that the proxy makes itself, which a request takes by its `Host` alone, whatever the routes say, to a group of its
 //! own with the one server `admin.listen`. The group is not one of the groups of the configuration, so no route can
@@ -30,8 +42,10 @@
 //!
 //! The counts are atomic numbers that are read and written one at a time, so two failures that come in the same
 //! instant may count as one; a count that is a little low or high changes how soon a server is left out, nothing
-//! that a client sees. The times are milliseconds from the start of the group.
+//! that a client sees. The times are milliseconds from one start, that of the first groups of the proxy, which the
+//! groups of every later reading keep (`Upstreams::following`).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -65,6 +79,8 @@ pub struct Upstreams {
     /// Some route has an access list.
     guarded: bool,
     admin: Option<Admin>,
+    /// The start that the times of the servers are counted from: that of the first groups of the proxy.
+    born: Instant,
 }
 
 /// The way to the admin process: the name of its host, in lowercase, who may use it, and its group.
@@ -92,7 +108,23 @@ pub struct Route<'a> {
 impl Upstreams {
     /// The groups, with a pool for each group as `proxy` says. `cfg` has been checked.
     pub fn new(cfg: &ForwardConfig, proxy: &ProxyConfig) -> Upstreams {
-        let born = Instant::now();
+        Upstreams::with(cfg, proxy, Instant::now())
+    }
+
+    /// The groups of `cfg`, whose servers go on counting the failures of the servers of `earlier`, the groups that
+    /// they replace, as far as `Server::follow` allows (see the module documentation). The times are counted from
+    /// the start of `earlier`. `cfg` has been checked.
+    pub fn following(cfg: &ForwardConfig, proxy: &ProxyConfig, earlier: &Upstreams) -> Upstreams {
+        let mut upstreams = Upstreams::with(cfg, proxy, earlier.born);
+        for group in &mut upstreams.groups {
+            if let Some(old) = earlier.named(group.name()) {
+                group.follow(old);
+            }
+        }
+        upstreams
+    }
+
+    fn with(cfg: &ForwardConfig, proxy: &ProxyConfig, born: Instant) -> Upstreams {
         Upstreams {
             groups: cfg
                 .groups
@@ -103,7 +135,13 @@ impl Upstreams {
             default: cfg.default.map(RouteConfig::plain),
             guarded: cfg.routes.targets().any(|route| !route.access.is_empty()),
             admin: cfg.admin.as_ref().map(|way| Admin::new(way, proxy, born)),
+            born,
         }
+    }
+
+    /// The group called `name`.
+    fn named(&self, name: &str) -> Option<&Group> {
+        self.groups.iter().find(|group| **group.name() == *name)
     }
 
     /// The way to the admin process for a request with this `Host` value, if it has the name of the host of the way
@@ -165,11 +203,37 @@ impl Upstreams {
             .map(|group| (&**group.name(), group.failures()))
     }
 
+    /// The groups that have servers that do not go on counting the failures of the servers of `earlier`, the groups
+    /// that these replace, with how many such servers each has, in the order of the configuration. A server that has
+    /// no counterpart in `earlier` (one that is added, and each one of a group that is added or has another name)
+    /// counts from nothing in any case, and is not counted here.
+    pub fn anew<'a>(&'a self, earlier: &'a Upstreams) -> impl Iterator<Item = (&'a str, usize)> {
+        self.groups.iter().filter_map(move |group| {
+            let anew = group.anew(earlier.named(group.name())?);
+            (anew > 0).then_some((&**group.name(), anew))
+        })
+    }
+
     /// The group at `index`, for the tests.
     #[cfg(test)]
     pub(crate) fn group(&self, index: usize) -> &Group {
         &self.groups[index]
     }
+}
+
+/// `address` with an IPv4 address that is written as IPv6 as the IPv4 address, so that the two are told to be the same
+/// (as the check of the configuration tells the servers of two groups apart).
+fn canonical(address: SocketAddr) -> SocketAddr {
+    SocketAddr::new(address.ip().to_canonical(), address.port())
+}
+
+/// The server of `earlier` that the one at `index` of `servers` is the same as: the one at the same address that has
+/// the same place among the servers of its group at that address. `None` if there is none.
+fn counterpart<'a>(servers: &[Server], index: usize, earlier: &'a [Server]) -> Option<&'a Server> {
+    let address = canonical(servers.get(index)?.address());
+    let there = |server: &&Server| canonical(server.address()) == address;
+    let place = servers.iter().take(index).filter(there).count();
+    earlier.iter().filter(there).nth(place)
 }
 
 /// The servers of a request that were tried already. A group has at most 64.
@@ -261,6 +325,28 @@ impl Group {
         self.engine
     }
 
+    /// Makes the servers of this group go on counting the failures of the servers of `earlier` that they are the
+    /// same as, as far as `Server::follow` allows.
+    fn follow(&mut self, earlier: &Group) {
+        for index in 0..self.servers.len() {
+            if let Some(old) = counterpart(&self.servers, index, &earlier.servers) {
+                self.servers[index].follow(old);
+            }
+        }
+    }
+
+    /// How many servers of this group are the same as one of `earlier` and do not go on counting its failures.
+    fn anew(&self, earlier: &Group) -> usize {
+        self.servers
+            .iter()
+            .enumerate()
+            .filter(|&(index, server)| {
+                counterpart(&self.servers, index, &earlier.servers)
+                    .is_some_and(|old| !server.continues(old))
+            })
+            .count()
+    }
+
     /// The number of servers: a request tries each of them once at most.
     pub(super) fn len(&self) -> usize {
         self.servers.len()
@@ -270,7 +356,7 @@ impl Group {
         &self.servers[index]
     }
 
-    /// Milliseconds from the start of the group to `at`.
+    /// Milliseconds from the start that the times of the servers are counted from (`Upstreams::following`) to `at`.
     fn since(&self, at: Instant) -> u64 {
         u64::try_from(at.saturating_duration_since(self.born).as_millis()).unwrap_or(u64::MAX)
     }

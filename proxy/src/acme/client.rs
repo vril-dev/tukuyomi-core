@@ -183,7 +183,8 @@ impl Client {
             authorities: Authorities::File(ca_file.to_path_buf()),
             server_name: None,
         })
-        .map_err(|_| Failure::Text("the acme ca_file cannot be used for the CA"))?;
+        .map_err(|_| Failure::Text("the acme ca_file cannot be used for the CA"))?
+        .config;
         Ok(Client {
             connector: TlsConnector::from(config),
             deadline,

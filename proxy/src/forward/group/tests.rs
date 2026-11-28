@@ -218,3 +218,157 @@ fn the_way_to_the_admin_process_is_taken_by_the_name_of_its_host_alone() {
     let plain = Upstreams::new(&ForwardConfig::of(&[]), &config());
     assert!(plain.admin(Some(b"admin.example")).is_none());
 }
+
+/// The group `main` of these servers, made from the groups `earlier` when the configuration is read again.
+fn reread(earlier: &Upstreams, servers: Vec<ServerConfig>) -> Upstreams {
+    let mut forward = ForwardConfig::of(&[]);
+    forward.groups[0].servers = servers;
+    Upstreams::following(&forward, &config(), earlier)
+}
+
+#[test]
+fn a_server_that_is_left_out_stays_left_out_when_the_configuration_is_read_again() {
+    let servers = || vec![server(0, 1, false), server(1, 1, false)];
+    let (earlier, at) = build(servers());
+    earlier.group(0).fail(0, at(1000));
+    let later = reread(&earlier, servers());
+    let group = later.group(0);
+    // Left out until 1000 ms plus the fail timeout, as it was.
+    assert_eq!(chosen(group, at(1001), 4), [1, 1, 1, 1]);
+    assert_eq!(chosen(group, at(10_999), 4), [1, 1, 1, 1]);
+    assert!(chosen(group, at(11_000), 4).contains(&0));
+    assert_eq!(later.anew(&earlier).count(), 0);
+
+    // The failures of the only server of a group are counted too: with a second server added, it is left out.
+    let (earlier, at) = build(vec![server(0, 1, false)]);
+    earlier.group(0).fail(0, at(1000));
+    let later = reread(&earlier, servers());
+    assert_eq!(chosen(later.group(0), at(1001), 4), [1, 1, 1, 1]);
+}
+
+#[test]
+fn a_failure_counted_for_the_group_it_replaces_counts_for_the_new_group_and_the_other_way_round() {
+    let servers = || vec![server(0, 2, false), server(1, 2, false)];
+    let (earlier, at) = build(servers());
+    let later = reread(&earlier, servers());
+    // One failure for each group makes the 2 that leave the server out, for both.
+    earlier.group(0).fail(0, at(0));
+    assert!(chosen(later.group(0), at(1), 4).contains(&0));
+    later.group(0).fail(0, at(1));
+    assert_eq!(chosen(earlier.group(0), at(2), 4), [1, 1, 1, 1]);
+    assert_eq!(chosen(later.group(0), at(2), 4), [1, 1, 1, 1]);
+    // The failures of a group are its own, and start from 0 with the new group.
+    assert_eq!(earlier.group(0).failures(), 1);
+    assert_eq!(later.group(0).failures(), 1);
+}
+
+#[test]
+fn a_server_counts_from_nothing_when_its_limits_change_or_it_is_in_a_group_with_another_name() {
+    let (earlier, at) = build(vec![server(0, 1, false), server(1, 1, false)]);
+    earlier.group(0).fail(0, at(0));
+    let more_fails = |server: &mut ServerConfig| server.max_fails = 2;
+    let longer_timeout = |server: &mut ServerConfig| server.fail_timeout = Duration::from_secs(11);
+    let edits: [&dyn Fn(&mut ServerConfig); 2] = [&more_fails, &longer_timeout];
+    for edit in edits {
+        // A third server is added; it has nothing before it, so it is not counted among those that start anew.
+        let mut servers = vec![
+            server(0, 1, false),
+            server(1, 1, false),
+            server(2, 1, false),
+        ];
+        edit(&mut servers[0]);
+        let later = reread(&earlier, servers);
+        assert!(chosen(later.group(0), at(1), 6).contains(&0));
+        assert_eq!(later.anew(&earlier).collect::<Vec<_>>(), [("main", 1)]);
+    }
+
+    let mut renamed = ForwardConfig::of(&[]);
+    renamed.groups[0].name = "other".to_owned();
+    renamed.groups[0].servers = vec![server(0, 1, false), server(1, 1, false)];
+    let later = Upstreams::following(&renamed, &config(), &earlier);
+    assert!(chosen(later.group(0), at(1), 4).contains(&0));
+    assert_eq!(later.anew(&earlier).count(), 0);
+}
+
+#[test]
+fn a_server_counts_from_nothing_when_it_is_spoken_to_in_another_way() {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use crate::config::Address;
+    use crate::forward::tls::tests::Pki;
+    use crate::forward::tls::{self, Authorities, Client, Settings};
+
+    let pki = Pki::new();
+    let bytes = fs::read(pki.ca()).unwrap();
+    let copy = pki.file("copy.pem", &bytes);
+    // The same authorities in other bytes: a line feed more.
+    let longer = pki.file("longer.pem", &[bytes.as_slice(), b"\n"].concat());
+    let by = |path: PathBuf, name: &str| Settings {
+        authorities: Authorities::File(path),
+        server_name: Some(name.to_owned()),
+    };
+    // The group of two servers, spoken to as `settings` say (plainly for `None`), made from `earlier` if there is one.
+    let group = |settings: Option<Settings>, earlier: Option<&Upstreams>| {
+        let mut forward = ForwardConfig::of(&[]);
+        forward.groups[0].servers = vec![server(0, 1, false), server(1, 1, false)];
+        if let Some(settings) = &settings {
+            let names = forward.groups[0]
+                .servers
+                .iter()
+                .map(|server| tls::name_of(settings, &Address::Literal(server.address)).unwrap())
+                .collect();
+            forward.groups[0].tls = Some(Client::new(tls::config(settings).unwrap(), names));
+        }
+        match earlier {
+            Some(earlier) => Upstreams::following(&forward, &config(), earlier),
+            None => Upstreams::new(&forward, &config()),
+        }
+    };
+
+    let earlier = group(Some(by(pki.ca(), "app.test")), None);
+    earlier.group(0).fail(0, Instant::now());
+    assert!(earlier.group(0).left_out(0));
+    for (what, settings, same) in [
+        ("the same file", Some(by(pki.ca(), "app.test")), true),
+        ("a copy of the file", Some(by(copy, "app.test")), true),
+        ("another name", Some(by(pki.ca(), "other.test")), false),
+        ("other bytes", Some(by(longer, "app.test")), false),
+        ("no TLS", None, false),
+    ] {
+        let later = group(settings, Some(&earlier));
+        assert_eq!(later.group(0).left_out(0), same, "{what}");
+        assert_eq!(later.anew(&earlier).count(), usize::from(!same), "{what}");
+    }
+
+    // A server that was plain is spoken to over TLS: it counts from nothing too.
+    let plain = group(None, None);
+    plain.group(0).fail(0, Instant::now());
+    assert!(plain.group(0).left_out(0));
+    let later = group(Some(by(pki.ca(), "app.test")), Some(&plain));
+    assert!(!later.group(0).left_out(0));
+}
+
+#[test]
+fn a_server_is_the_same_by_its_address_and_its_place_among_those_at_that_address_not_by_its_index()
+{
+    // The first address is written twice, and it is the second of the two that fails.
+    let (earlier, at) = build(vec![
+        server(0, 1, false),
+        server(1, 1, false),
+        server(0, 1, false),
+    ]);
+    earlier.group(0).fail(2, at(0));
+    // Read again with another order, and the first of the two as an IPv4 address written as IPv6.
+    let mut servers = vec![
+        server(0, 1, false),
+        server(0, 1, false),
+        server(1, 1, false),
+    ];
+    servers[0].address = "[::ffff:127.0.0.1]:9000".parse().unwrap();
+    let later = reread(&earlier, servers);
+    let picked = chosen(later.group(0), at(1), 6);
+    assert!(picked.contains(&0) && picked.contains(&2), "{picked:?}");
+    assert!(!picked.contains(&1), "{picked:?}");
+    assert_eq!(later.anew(&earlier).count(), 0);
+}

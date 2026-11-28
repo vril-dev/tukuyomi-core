@@ -13,9 +13,11 @@
 //! 1.3 are spoken, `http/1.1` is the only protocol of ALPN, no certificate is sent, and the resuming of sessions is
 //! what rustls does by default: the servers of a group share one configuration and so their sessions.
 //!
-//! The settings are made into a `Client` when the names of the servers are looked up: the configuration of TLS, and
-//! the name of each server in the order of the group. The handshake belongs to the server (`Secure`); the caller
-//! bounds its time.
+//! The settings are made into a `Client` when the names of the servers are looked up: the configuration of TLS, the
+//! SHA-256 of the bytes of the file of authorities that it was made from (the name of the file, for one of the
+//! managed store), and the name of each server in the order of the group. The handshake belongs to the server
+//! (`Secure`), which also knows the name and the SHA-256, so that a later reading of the configuration can tell
+//! whether a server is spoken to as it was (see `Secure::same_as`); the caller bounds its time.
 
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -31,6 +33,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{Connect, TlsConnector};
 
 use crate::config::Address;
+use crate::rules::bundle::sha256;
 use crate::rules::file_store::{O_NOCTTY, O_NONBLOCK};
 
 /// The longest file of authorities in bytes.
@@ -122,9 +125,10 @@ fn read(path: &Path) -> Result<Vec<u8>, Fault> {
     Ok(bytes)
 }
 
-/// The authorities of the file at `path`.
-fn roots(path: &Path) -> Result<RootCertStore, Fault> {
-    roots_of(&read(path)?)
+/// The authorities of the file at `path`, and the SHA-256 of the bytes that they are read from.
+fn roots(path: &Path) -> Result<(RootCertStore, [u8; 32]), Fault> {
+    let bytes = read(path)?;
+    Ok((roots_of(&bytes)?, sha256(&bytes)))
 }
 
 /// The authorities in `bytes`, the content of a file of authorities.
@@ -143,12 +147,26 @@ fn roots_of(bytes: &[u8]) -> Result<RootCertStore, Fault> {
     Ok(roots)
 }
 
+/// The configuration of TLS that the servers of a group share, and the SHA-256 of the file of authorities that it was
+/// made from.
+#[derive(Clone, Debug)]
+pub struct Trust {
+    pub config: Arc<ClientConfig>,
+    pub sha256: [u8; 32],
+}
+
 /// The configuration of TLS that the servers of a group share: the authorities of `settings`, versions 1.3 and 1.2,
-/// ALPN `http/1.1`, no certificate of our own. Reads the file of the operator; a file of the managed store is not
-/// read here (see `config_of`).
-pub fn config(settings: &Settings) -> Result<Arc<ClientConfig>, Fault> {
+/// ALPN `http/1.1`, no certificate of our own. Reads the file of the operator once, and the SHA-256 is that of the
+/// bytes that the authorities are made from; a file of the managed store is not read here (see `config_of`).
+pub fn config(settings: &Settings) -> Result<Trust, Fault> {
     match &settings.authorities {
-        Authorities::File(path) => built(roots(path)?),
+        Authorities::File(path) => {
+            let (roots, sha256) = roots(path)?;
+            Ok(Trust {
+                config: built(roots)?,
+                sha256,
+            })
+        }
         Authorities::Stored(_) => Err(Fault::Unreadable),
     }
 }
@@ -188,18 +206,23 @@ pub fn name_of(settings: &Settings, address: &Address) -> Option<ServerName<'sta
     }
 }
 
-/// The TLS of a group once its names are looked up: the configuration its servers share, and the name each of them
-/// is checked for, one for each server and in the order of the group.
+/// The TLS of a group once its names are looked up: the configuration its servers share, the SHA-256 of the file of
+/// authorities, and the name each of them is checked for, one for each server and in the order of the group.
 #[derive(Clone, Debug)]
 pub struct Client {
     config: Arc<ClientConfig>,
+    authorities: [u8; 32],
     names: Vec<ServerName<'static>>,
 }
 
 impl Client {
     /// `names` has one entry for each server of the group.
-    pub fn new(config: Arc<ClientConfig>, names: Vec<ServerName<'static>>) -> Client {
-        Client { config, names }
+    pub fn new(trust: Trust, names: Vec<ServerName<'static>>) -> Client {
+        Client {
+            config: trust.config,
+            authorities: trust.sha256,
+            names,
+        }
     }
 
     /// The name each server is checked for.
@@ -213,18 +236,26 @@ impl Client {
         Secure {
             connector: TlsConnector::from(self.config.clone()),
             name: self.names[index].clone(),
+            authorities: self.authorities,
         }
     }
 }
 
-/// How to speak TLS to one server: the handshake, which checks the certificate of the server for its name.
+/// How to speak TLS to one server: the handshake, which checks the certificate of the server for its name against the
+/// authorities of a file, whose SHA-256 it knows.
 #[derive(Clone)]
 pub(super) struct Secure {
     connector: TlsConnector,
     name: ServerName<'static>,
+    authorities: [u8; 32],
 }
 
 impl Secure {
+    /// Whether `other` checks a server as this does: for the same name, against authorities that are the same bytes.
+    pub(super) fn same_as(&self, other: &Secure) -> bool {
+        self.name == other.name && self.authorities == other.authorities
+    }
+
     /// The handshake on `stream`.
     pub(super) fn handshake(&self, stream: TcpStream) -> Connect<TcpStream> {
         self.connector.connect(self.name.clone(), stream)

@@ -22,7 +22,7 @@ use crate::config::{
     Records, StatusConfig, StoreConfig, addresses,
 };
 use crate::forward::resolve;
-use crate::forward::tls::{self, Authorities, Fault};
+use crate::forward::tls::{self, Authorities, Fault, Trust};
 use crate::inbound::challenge::Challenge;
 use crate::inbound::session::RequestIds;
 use crate::inbound::transport::tls::{Files, Tls};
@@ -339,7 +339,7 @@ pub(crate) fn read_parts(
     listening.extend(loaded.status.map(|status| status.listen));
     // The file of the authorities of a group of a managed version is a file of its store, named by its SHA-256
     // (`Authorities::Stored`): it is read here through the store, which refuses a link and a file that is not what its
-    // name says, and `tls::config` refuses it.
+    // name says, and `tls::config` refuses it. The name is the SHA-256 that the TLS of the group keeps (`tls::Trust`).
     let completed = match &loaded.version {
         None => resolve::complete(loaded.forward, &listening, resolve::system),
         Some(version) => {
@@ -348,7 +348,10 @@ pub(crate) fn read_parts(
                     return Err(Fault::Unreadable);
                 };
                 let bytes = version.store.file(name).map_err(|_| Fault::Unreadable)?;
-                tls::config_of(&bytes)
+                Ok(Trust {
+                    config: tls::config_of(&bytes)?,
+                    sha256: name,
+                })
             })
         }
     };

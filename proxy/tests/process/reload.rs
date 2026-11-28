@@ -27,6 +27,7 @@ use crate::keepalive::read_response;
 use crate::rules::rules;
 use crate::support::*;
 use crate::tls::Pki;
+use crate::upstreams::two_servers;
 
 /// Knobs for a proxy with a second upstream, whose connections are kept after a response.
 fn kept() -> Knobs {
@@ -68,6 +69,17 @@ fn reloads(port: u16, result: &str) -> String {
         .1
         .lines()
         .find_map(|have| have.strip_prefix(&line))
+        .unwrap_or_else(|| panic!("no {line} in the page"))
+        .to_string()
+}
+
+/// The failures of the servers of the group `main` since the last reading of the file, from `/metrics`.
+fn failures(port: u16) -> String {
+    let line = "tukuyomi_upstream_failures_total{group=\"main\"} ";
+    page(port, "/metrics")
+        .1
+        .lines()
+        .find_map(|have| have.strip_prefix(line))
         .unwrap_or_else(|| panic!("no {line} in the page"))
         .to_string()
 }
@@ -219,6 +231,62 @@ fn a_file_with_another_value_that_cannot_change_is_refused_by_its_key_and_the_ol
     assert!(proxy.others[0].requests().is_empty());
     drop(sock);
     proxy.finish(1);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_server_that_is_left_out_stays_left_out_when_the_file_is_read_again_until_its_fail_timeout_changes()
+ {
+    let knobs = Knobs {
+        upstreams: 2,
+        forward: two_servers,
+        ..Knobs::quick()
+    };
+    let (mut proxy, status) = start("reload_left_out", knobs);
+    // The first server of the group refuses connections: the first request finds it, leaves it out and goes on to the
+    // other, and so does each request after that.
+    proxy.others[0].stop();
+    for path in ["/one", "/two"] {
+        assert_eq!(exchange(proxy.port, &get(path)).status(), 200, "{path}");
+    }
+    assert_eq!(failures(status), "1");
+
+    // The file is read again as it is. A group that began now would try the first server first, so a request that
+    // finds no failure shows that the server is still left out.
+    let file = fs::read(proxy.root().join("config.json")).expect("read the configuration");
+    proxy.signal("HUP");
+    let digest = hex(&sha256(&file));
+    proxy.records.wait_lines("the replacement", 1, |l| {
+        l == format!("reload: configuration replaced {digest}")
+    });
+    for path in ["/three", "/four"] {
+        assert_eq!(exchange(proxy.port, &get(path)).status(), 200, "{path}");
+    }
+    assert_eq!(failures(status), "0");
+    let lines = proxy.records.lines();
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("reload: upstream main:")),
+        "{lines:#?}"
+    );
+
+    // Another fail timeout for that server: it counts from nothing, a line says so, and it is tried again.
+    rewrite(proxy.root(), |config| {
+        config["forward"]["upstreams"]["main"]["servers"][0]["fail_timeout_ms"] = json!(60_000);
+    });
+    let file = fs::read(proxy.root().join("config.json")).expect("read the configuration");
+    proxy.signal("HUP");
+    let digest = hex(&sha256(&file));
+    proxy.records.wait_lines("the second replacement", 1, |l| {
+        l == format!("reload: configuration replaced {digest}")
+    });
+    let lines = proxy.records.lines();
+    let anew = "reload: upstream main: failure counts started anew, servers 1";
+    assert!(lines.iter().any(|l| l == anew), "{lines:#?}");
+    assert_eq!(exchange(proxy.port, &get("/five")).status(), 200);
+    assert_eq!(failures(status), "1");
+    proxy.finish(5);
 }
 
 #[test]
