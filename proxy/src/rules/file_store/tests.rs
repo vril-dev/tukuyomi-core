@@ -480,6 +480,30 @@ fn one_command_at_a_time_changes_the_store() {
 }
 
 #[test]
+fn a_dropped_lock_is_free_while_a_copy_of_its_file_is_still_open() {
+    // A copy of the descriptor shares the open file description, as a child process that is being started does.
+    let root = scratch();
+    let path = root.path().join("lock");
+    let open = || open_lock_file(&path, StoreError("open"), StoreError("regular")).unwrap();
+    let held = LockedFile::try_lock(open()).unwrap();
+    let _copy = held.try_clone().unwrap();
+    assert!(matches!(
+        LockedFile::try_lock(open()),
+        Err(TryLockError::WouldBlock)
+    ));
+    assert!(matches!(
+        LockedFile::try_lock_shared(open()),
+        Err(TryLockError::WouldBlock)
+    ));
+    drop(held);
+    drop(LockedFile::try_lock(open()).unwrap());
+    let shared = LockedFile::try_lock_shared(open()).unwrap();
+    let _shared_copy = shared.try_clone().unwrap();
+    drop(shared);
+    assert!(LockedFile::try_lock(open()).is_ok());
+}
+
+#[test]
 fn activate_verifies_the_generation_before_it_replaces_the_record() {
     let root = scratch();
     let mut store = opened(root.path());

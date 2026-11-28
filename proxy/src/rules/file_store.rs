@@ -23,6 +23,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
+use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -64,9 +65,9 @@ const CURRENT: &str = "current";
 const LOCK: &str = "lock";
 const USING: &str = "using";
 
-/// A bundle between `stage` and `commit` or `discard`. The lock lives as long as the descriptor does.
+/// A bundle between `stage` and `commit` or `discard`. The lock is held until this is dropped.
 struct Import {
-    _lock: File,
+    _lock: LockedFile,
     dir: PathBuf,
     fingerprint: Fingerprint,
 }
@@ -120,14 +121,14 @@ impl FileStore {
 
     /// Takes the lock without waiting; the file is made when it is not there. It is opened like every file that is
     /// read, so a link or a FIFO in its place is refused.
-    fn lock(&self) -> Result<File, StoreError> {
+    fn lock(&self) -> Result<LockedFile, StoreError> {
         let file = open_lock_file(
             &self.dir.join(LOCK),
             StoreError("the lock of the rules store cannot be opened"),
             StoreError("the lock of the rules store is not a regular file"),
         )?;
-        match file.try_lock() {
-            Ok(()) => Ok(file),
+        match LockedFile::try_lock(file) {
+            Ok(locked) => Ok(locked),
             Err(TryLockError::WouldBlock) => {
                 Err(StoreError("the rules store is in use by another command"))
             }
@@ -366,8 +367,8 @@ impl RuleStore for FileStore {
 
     fn hold(&self, generation: Fingerprint) -> Result<Hold, StoreError> {
         let file = self.using_file(generation)?;
-        match file.try_lock_shared() {
-            Ok(()) => Ok(Hold::new(file)),
+        match LockedFile::try_lock_shared(file) {
+            Ok(locked) => Ok(Hold::new(locked)),
             Err(TryLockError::WouldBlock) => Err(StoreError("the generation is being removed")),
             Err(TryLockError::Error(_)) => Err(StoreError(
                 "the usage lock of the generation cannot be taken",
@@ -388,8 +389,8 @@ impl RuleStore for FileStore {
         }
         let dir = self.generation_dir(generation)?;
         let using = self.using_file(generation)?;
-        match using.try_lock() {
-            Ok(()) => {}
+        let _using = match LockedFile::try_lock(using) {
+            Ok(locked) => locked,
             Err(TryLockError::WouldBlock) => {
                 return Err(StoreError("the generation is used by a running proxy"));
             }
@@ -398,7 +399,7 @@ impl RuleStore for FileStore {
                     "the usage lock of the generation cannot be taken",
                 ));
             }
-        }
+        };
         let away = self.ensure_dir(STAGING)?.join(random_name()?);
         fs::rename(&dir, &away).map_err(|_| CANNOT)?;
         sync_dir(&self.dir.join(GENERATIONS)).map_err(|_| CANNOT)?;
@@ -444,6 +445,43 @@ pub(crate) fn open_lock_file(
         return Err(not_regular);
     }
     Ok(file)
+}
+
+/// A file with a lock taken on it without waiting, exclusive (`try_lock`) or shared (`try_lock_shared`). The lock is
+/// released when this is dropped, with `File::unlock` before the file is closed. Closing alone is not enough: the lock
+/// belongs to the open file description, which a child process that another thread is starting shares until it runs
+/// its program, so the lock would stay held for that moment after the drop, and a command right after it would be
+/// refused as if another held the lock.
+#[derive(Debug)]
+pub struct LockedFile(File);
+
+impl LockedFile {
+    /// Takes the exclusive lock on `file` without waiting.
+    pub(crate) fn try_lock(file: File) -> Result<LockedFile, TryLockError> {
+        file.try_lock()?;
+        Ok(LockedFile(file))
+    }
+
+    /// Takes a shared lock on `file` without waiting.
+    pub(crate) fn try_lock_shared(file: File) -> Result<LockedFile, TryLockError> {
+        file.try_lock_shared()?;
+        Ok(LockedFile(file))
+    }
+}
+
+impl Deref for LockedFile {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        // If this fails, closing the file still releases the lock, once no child process shares it any more.
+        let _ = self.0.unlock();
+    }
 }
 
 /// Removes the bundles an earlier command left: the entries of `staging` whose name is 32 lowercase hexadecimal

@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 use crate::config;
 use crate::rules::bundle::{Fingerprint, hex, sha256};
 use crate::rules::file_store::{
-    open_lock_file, open_read, read_opened, read_regular, sync_dir, write_new,
+    LockedFile, open_lock_file, open_read, read_opened, read_regular, sync_dir, write_new,
 };
 use crate::rules::store::StoreError;
 use crate::run::host;
@@ -90,7 +90,7 @@ const NO_VERSION_LOCK: ManagedError =
 /// version back.
 #[derive(Debug)]
 pub struct Hold {
-    _file: File,
+    _file: LockedFile,
 }
 
 /// What a write found at its name.
@@ -159,16 +159,16 @@ impl Store {
     }
 
     /// Takes the lock without waiting; the file is made when it is not there. It is opened like every file that is
-    /// read, so a link or a FIFO in its place is refused. The lock lasts as long as the file that is returned.
-    pub fn lock(&self) -> Result<File, ManagedError> {
+    /// read, so a link or a FIFO in its place is refused. The lock lasts until what is returned is dropped.
+    pub fn lock(&self) -> Result<LockedFile, ManagedError> {
         let file = open_lock_file(
             &self.dir.join(LOCK),
             StoreError("the lock of the managed store cannot be opened"),
             StoreError("the lock of the managed store is not a regular file"),
         )
         .map_err(|e| ManagedError(e.0))?;
-        match file.try_lock() {
-            Ok(()) => Ok(file),
+        match LockedFile::try_lock(file) {
+            Ok(locked) => Ok(locked),
             Err(TryLockError::WouldBlock) => Err(IN_USE),
             Err(TryLockError::Error(_)) => Err(ManagedError(
                 "the lock of the managed store cannot be taken",
@@ -226,15 +226,15 @@ impl Store {
 
     /// The rest of `hold`, for the file of the version `name` that `open_version` opened.
     fn hold_opened(&self, name: [u8; 32], file: File) -> Result<(Vec<u8>, Hold), ManagedError> {
-        match file.try_lock_shared() {
-            Ok(()) => {}
+        let file = match LockedFile::try_lock_shared(file) {
+            Ok(locked) => locked,
             Err(TryLockError::WouldBlock) => {
                 return Err(ManagedError(
                     "the managed version is being removed or replaced",
                 ));
             }
             Err(TryLockError::Error(_)) => return Err(NO_VERSION_LOCK),
-        }
+        };
         let bytes = read_opened(&file, MAX_BYTES, None).map_err(version_fault)?;
         if sha256(&bytes) != name {
             return Err(ManagedError("the managed version does not match its name"));
@@ -248,11 +248,11 @@ impl Store {
         }
     }
 
-    /// The exclusive lock on the file of the version `name`, taken without waiting, which lasts as long as the file
-    /// that is returned: what `remove` holds while it removes the version, and `put` while it replaces a broken one. A
+    /// The exclusive lock on the file of the version `name`, taken without waiting, which lasts until what is returned
+    /// is dropped: what `remove` holds while it removes the version, and `put` while it replaces a broken one. A
     /// version that is not there is refused, and so is one that is not a regular file, which is not read (a link is
     /// not followed); one whose file another holds the lock of (see `Hold`) is in use.
-    pub(super) fn claim(&self, name: [u8; 32]) -> Result<File, ManagedError> {
+    pub(super) fn claim(&self, name: [u8; 32]) -> Result<LockedFile, ManagedError> {
         self.real_dir(Kind::Version)?;
         let path = self.path(Kind::Version, name);
         match fs::symlink_metadata(&path) {
@@ -261,8 +261,8 @@ impl Store {
             Err(e) => return Err(version_fault(e)),
         }
         let file = open_read(&path).map_err(|_| NO_VERSION_LOCK)?;
-        match file.try_lock() {
-            Ok(()) => Ok(file),
+        match LockedFile::try_lock(file) {
+            Ok(locked) => Ok(locked),
             Err(TryLockError::WouldBlock) => Err(VERSION_IN_USE),
             Err(TryLockError::Error(_)) => Err(NO_VERSION_LOCK),
         }

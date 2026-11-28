@@ -23,7 +23,7 @@
 //! opened without following a link and without waiting for a writer. The files are made 0600 and the directories
 //! 0700.
 
-use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
+use std::fs::{self, DirBuilder, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
@@ -39,7 +39,7 @@ use super::users::{Role, User};
 use super::waf::history::Activation;
 use crate::config;
 use crate::rules::file_store::{
-    O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, open_lock_file, read_regular, sync_dir, write_new,
+    LockedFile, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, open_lock_file, read_regular, sync_dir, write_new,
 };
 use crate::rules::store::StoreError;
 use crate::run::host;
@@ -66,7 +66,7 @@ pub struct FileAdminStore {
     writing: Mutex<()>,
     /// The open file that holds the lock of the admin process; none when the store was not opened for it. The lock
     /// ends when the store is dropped.
-    _process: Option<File>,
+    _process: Option<LockedFile>,
 }
 
 impl FileAdminStore {
@@ -118,21 +118,21 @@ impl FileAdminStore {
     }
 
     /// Takes the lock of a write without waiting; the file is made when it is not there.
-    fn lock(&self) -> Result<File, AdminError> {
+    fn lock(&self) -> Result<LockedFile, AdminError> {
         self.lock_file(LOCK, BUSY)
     }
 
     /// Takes the lock on the file `name` of the store directory without waiting, and the file is made when it is not
     /// there. `held` is the answer when another process holds the lock.
-    fn lock_file(&self, name: &str, held: AdminError) -> Result<File, AdminError> {
+    fn lock_file(&self, name: &str, held: AdminError) -> Result<LockedFile, AdminError> {
         let file = open_lock_file(
             &self.dir.join(name),
             StoreError("the lock of the admin store cannot be opened"),
             StoreError("the lock of the admin store is not a regular file"),
         )
         .map_err(|e| AdminError(e.0))?;
-        match file.try_lock() {
-            Ok(()) => Ok(file),
+        match LockedFile::try_lock(file) {
+            Ok(locked) => Ok(locked),
             Err(TryLockError::WouldBlock) => Err(held),
             Err(TryLockError::Error(_)) => {
                 Err(AdminError("the lock of the admin store cannot be taken"))
