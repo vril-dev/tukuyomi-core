@@ -134,8 +134,8 @@ potential_utf          0.1.6     Unicode-3.0            R      47
 rand                   0.10.3    MIT                    R      60, 61
 rand_core              0.10.1    MIT                    R      62, 63
 regex                  1.13.1    MIT                    R      8
-regex-automata         0.4.18    MIT                    R      8
-regex-syntax           0.8.11    MIT, Unicode-DFS-2016  R      8, 64
+regex-automata         0.4.18    MIT                    P R    8
+regex-syntax           0.8.11    MIT, Unicode-DFS-2016  P R    8, 64
 rustls                 0.23.46   MIT                    P R    65
 rustls-pki-types       1.15.1    MIT                    P R    66
 rustls-webpki          0.103.16  ISC                    P R    67
@@ -262,7 +262,9 @@ in its LICENSE file (text 6).
 
 regex-syntax 0.8.11 is used under MIT (text 8). The Unicode tables in the
 crate (src/unicode_tables) are under the Unicode data files license,
-Unicode-DFS-2016 (text 64).
+Unicode-DFS-2016 (text 64). tukuyomi-proxy builds regex-automata and
+regex-syntax without their Unicode features, so it contains none of the tables;
+tukuyomi-records-ship builds them with the tables.
 
 keyed_priority_queue 0.4.2: the crate package contains no license file. Its
 Cargo.toml gives the license as "MIT" and the author as AngelicosPhosphoros.

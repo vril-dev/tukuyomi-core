@@ -364,6 +364,12 @@ export class Draft {
     this.edited();
   }
 
+  /** The path of `route` is a regular expression, or no longer is (the value of the choice of the form): what was told of the path, and of the parts that a regular expression cannot have, is told no more. */
+  setRouteRegex(route, regex) {
+    this.writeRoute(route, route.form, 'regex', regex);
+    for (const [cid, field] of [[route.cid, 'path'], [route.form.access.cid, 'notice'], [route.cid, 'rewrite_path']]) this.clearFault(cid, field);
+  }
+
   /** The form of `route`, made the first time its panel is opened. Making it is no edit: nothing is told of it, and the draft does not change. */
   routeForm(route) {
     if (route.form === null) makeForm(route);

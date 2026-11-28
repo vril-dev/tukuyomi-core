@@ -15,7 +15,7 @@ const RATE_FIELD = /^rate_limit\.(rate|burst|keys|exempt_cidrs)$/;
 const FILE = /^files\[([0-9]{1,3})\]$/;
 const SITE = /^sites\[([0-9]{1,4})\](?:\.(name|hosts|certificate|certificate\.chain|certificate\.key|certificate\.acme))?$/;
 const SITE_HOST = /^sites\[([0-9]{1,4})\]\.hosts\[([0-9]{1,4})\]$/;
-const ROUTE = /^routes\[([0-9]{1,4})\](?:\.(host|path|upstream|max_body|records|access|stream|rewrite\.host|rewrite\.path|rewrite\.query|rewrite\.request_headers|rewrite\.response_headers))?$/;
+const ROUTE = /^routes\[([0-9]{1,4})\](?:\.(host|path|path_regex|priority|upstream|max_body|records|access|stream|rewrite\.host|rewrite\.path|rewrite\.query|rewrite\.request_headers|rewrite\.response_headers))?$/;
 const HOST_POLICY = /^host_policies\[([0-9]{1,4})\](?:\.(name|hosts|access|rate_limit|rate_limit\.rate|rate_limit\.burst|rate_limit\.keys|rate_limit\.exempt_cidrs))?$/;
 const HOST_POLICY_HOST = /^host_policies\[([0-9]{1,4})\]\.hosts\[([0-9]{1,4})\]$/;
 
@@ -44,6 +44,9 @@ const SITE_FIELDS = new Map([
 const ROUTE_FIELDS = new Map([
   ['host', 'host'],
   ['path', 'path'],
+  // The path and the regular expression are typed in one field.
+  ['path_regex', 'path'],
+  ['priority', 'priority'],
   ['upstream', 'upstream'],
   ['max_body', 'max_body'],
   ['records', 'records'],

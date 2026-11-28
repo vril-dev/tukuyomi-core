@@ -1580,6 +1580,8 @@ dependencies = [
  "httparse",
  "hyper",
  "hyper-util",
+ "regex-automata",
+ "regex-syntax",
  "rustls",
  "serde",
  "serde_json",

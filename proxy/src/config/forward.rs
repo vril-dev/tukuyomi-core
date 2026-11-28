@@ -24,10 +24,14 @@
 //! resolves, so that a group always has the engine it is inspected by. No two groups with a server at the same address
 //! have different engines: a request reaches that backend through whichever of the groups its `Host` chooses, and the
 //! weakest of their engines and modes would be the protection of the backend.
-//! `routes` has at most 1024 entries `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?,
-//! "records"?}`.
+//! `routes` has at most 1024 entries `{"host"?, "path"?, "path_regex"?, "priority"?, "upstream", "access"?, "rewrite"?,
+//! "stream"?, "max_body"?, "records"?}`.
 //! The `host` and the `path` follow the rules of `route` for a forwarding rule, `upstream` names a group, and `access`
 //! and `rewrite` are the networks and countries that may use the route and the edits it makes (see `rewrite`).
+//! `path_regex` is written in place of `path`, not with it, and is a regular expression that the path of a request
+//! meets (see `route`); at most 32 routes have one. `priority` is a whole number from -1000 to 1000, 0 if it is left
+//! out, and of the routes that hold for a request the one with the smaller number is chosen, after the host and
+//! before the path. A route with a `path_regex` has neither an access list nor a `rewrite` of the path.
 //! `stream` is `{"idle_ms", "total_ms", "websocket"}`, all three present: a response on the route may last `total_ms`
 //! from its head at the most (1 ms to 24 h) while the upstream may be silent for `idle_ms` (1 ms up to `total_ms`) and
 //! `websocket` tells whether a WebSocket handshake is let through. `records` is `best_effort`, `required` or `security`
@@ -72,8 +76,12 @@ pub(crate) use self::group::{Groups, MAX_SERVERS, RawTls, StoredTls, name_ok};
 
 const MAX_ROUTES: usize = 1024;
 
-/// The key of a route that each sentence of `Rule::forward` and of `Rewrite::new` is about: each is about one key.
-const ROUTE_KEYS: [(&str, &str); 11] = [
+/// The most routes that have a `path_regex`.
+const MAX_PATTERN_ROUTES: usize = 32;
+
+/// The key of a route that each sentence of `Rule::forward_with` and of `Rewrite::new` is about: each is about one
+/// key.
+const ROUTE_KEYS: [(&str, &str); 18] = [
     ("a route host is not 1 to 253 bytes", "host"),
     ("a route host is malformed", "host"),
     ("a route path is not 1 to 255 bytes", "path"),
@@ -84,9 +92,25 @@ const ROUTE_KEYS: [(&str, &str); 11] = [
         "path",
     ),
     ("a route path can be read in more than one way", "path"),
+    ("a route has both a path and a path regex", "path_regex"),
+    ("a route path regex is not 1 to 255 bytes", "path_regex"),
+    (
+        "a route path regex has a character that is not allowed",
+        "path_regex",
+    ),
+    (
+        "a route path regex is not a valid regular expression",
+        "path_regex",
+    ),
+    ("a route path regex is too large", "path_regex"),
+    ("a route priority is not -1000 to 1000", "priority"),
     ("a rewrite host is malformed", "rewrite.host"),
     (
         "a rewrite path is set on a route that has no path",
+        "rewrite.path",
+    ),
+    (
+        "a rewrite path is set on a route with a path regex",
         "rewrite.path",
     ),
     ("a rewrite path is malformed", "rewrite.path"),
@@ -296,6 +320,10 @@ pub(crate) struct RawRoute {
     host: Option<String>,
     #[serde(default, deserialize_with = "super::present")]
     path: Option<String>,
+    #[serde(default, deserialize_with = "super::present")]
+    path_regex: Option<String>,
+    #[serde(default, deserialize_with = "super::present")]
+    priority: Option<i64>,
     upstream: String,
     #[serde(default, deserialize_with = "super::present")]
     access: Option<Object<RawAccess>>,
@@ -457,15 +485,31 @@ pub(crate) fn located<T>(
             .ok_or(ConfigError(undefined))
     };
     let mut entries = Vec::with_capacity(routes.len());
+    let mut patterns = 0;
     for (at, Object(route)) in routes.into_iter().enumerate() {
         let key = |key: &'static str| move |e: ConfigError| (e, Some(At::Route(at, Some(key))));
-        // The host and the path of a rule, and of an edit, are told apart by the sentence.
+        // The host, the path and the priority of a rule, and the host and the path of an edit, are told apart by the
+        // sentence.
         let by_sentence = |e: ConfigError| {
             let key = ROUTE_KEYS.iter().find(|(text, _)| *text == e.0);
             (e, Some(At::Route(at, key.map(|(_, key)| *key))))
         };
-        let rule = Rule::forward(route.host.as_deref(), route.path.as_deref())
-            .map_err(|e| by_sentence(ConfigError(e.0)))?;
+        // The count comes before the expression is compiled, so that no more than the limit are.
+        if route.path_regex.is_some() {
+            patterns += 1;
+            ensure(
+                patterns <= MAX_PATTERN_ROUTES,
+                "routes has more than 32 entries with a path regex",
+            )
+            .map_err(key("path_regex"))?;
+        }
+        let rule = Rule::forward_with(
+            route.host.as_deref(),
+            route.path.as_deref(),
+            route.path_regex.as_deref(),
+            route.priority.unwrap_or(0),
+        )
+        .map_err(|e| by_sentence(ConfigError(e.0)))?;
         let group = index(
             &route.upstream,
             "a route names an upstream that is not defined",
@@ -478,16 +522,24 @@ pub(crate) fn located<T>(
         .map_err(key("max_body"))?;
         let access = rewrite::access(route.access).map_err(key("access"))?;
         ensure(
+            access.is_empty() || route.path_regex.is_none(),
+            "a route with a path regex has an access list",
+        )
+        .map_err(key("access"))?;
+        ensure(
             access.is_empty() || rule.canonical(),
             "a route with an access list has an escape in its path that is lowercase or is for a byte that needs no escape",
         )
         .map_err(key("path"))?;
-        let rewrite = rewrite::rewrite(route.path.as_deref(), route.rewrite).map_err(
-            |(e, part)| match part {
-                Some(part) => (e, Some(At::Route(at, Some(part)))),
-                None => by_sentence(e),
-            },
-        )?;
+        let rewrite = rewrite::rewrite(
+            route.path.as_deref(),
+            route.path_regex.is_some(),
+            route.rewrite,
+        )
+        .map_err(|(e, part)| match part {
+            Some(part) => (e, Some(At::Route(at, Some(part)))),
+            None => by_sentence(e),
+        })?;
         let stream = stream(route.stream).map_err(key("stream"))?;
         let records = route
             .records
@@ -515,12 +567,13 @@ pub(crate) fn located<T>(
             Some(At::Route(at, Some("host"))),
         ));
     }
-    // The later of two routes with the same host and path, which `Table::new` refuses: its refusal is about that route.
+    // The later of two routes with the same host and path (or path regex), which `Table::new` refuses: its refusal is
+    // about that route.
     let twice = {
         let mut seen = BTreeSet::new();
         entries
             .iter()
-            .position(|(rule, _)| !seen.insert((rule.host(), rule.path())))
+            .position(|(rule, _)| !seen.insert(rule.place()))
     };
     let routes = Table::new(entries);
     if let (Err(e), Some(at)) = (&routes, twice) {

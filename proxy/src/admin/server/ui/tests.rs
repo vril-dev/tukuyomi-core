@@ -58,6 +58,7 @@ fn each_file_answers_with_its_type_and_the_fields_of_the_page_and_needs_no_sessi
         ),
         (format!("/ui/{version}/managed/edit/screens/policy.js"), js),
         (format!("/ui/{version}/managed/edit/words.js"), js),
+        (format!("/ui/{version}/managed/edit/route-words.js"), js),
         (format!("/ui/{version}/account/account.js"), js),
         (format!("/ui/{version}/account/users.js"), js),
         (format!("/ui/{version}/account/qr.js"), js),

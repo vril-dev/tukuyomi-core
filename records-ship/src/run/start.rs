@@ -161,3 +161,6 @@ async fn serve<S: Store>(settings: Settings, database: S::Settings, log: &Log) -
     notify.stopping(log);
     EXIT_OK
 }
+
+#[cfg(test)]
+mod tests;

@@ -339,3 +339,102 @@ fn two_groups_with_a_server_at_the_same_address_have_the_same_engine() {
     assert_eq!(refusal(by_default("coraza")), apart);
     assert!(by_default("modsecurity").is_ok());
 }
+
+/// The `forward` object with the group `g` and these routes.
+fn with_routes(routes: Value) -> Value {
+    let mut object = forward(json!({"servers": [server("192.0.2.1:80")]}));
+    object["routes"] = routes;
+    object
+}
+
+/// The `forward` object with the group `g` and one route to it that has these keys besides `upstream`.
+fn with_route(keys: Value) -> Value {
+    let mut route = json!({"upstream": "g"});
+    for (key, value) in keys.as_object().unwrap() {
+        route[key] = value.clone();
+    }
+    with_routes(json!([route]))
+}
+
+#[test]
+fn a_route_may_have_a_path_regex_in_place_of_its_path_and_a_priority() {
+    let loaded = load(with_routes(json!([
+        {"path_regex": "^/api/v[0-9]+/", "upstream": "g"},
+        {"path": "/api/", "priority": -5, "upstream": "g"},
+        {"path": "/", "priority": 1000, "upstream": "g"},
+    ])))
+    .unwrap();
+    let rules: Vec<_> = loaded
+        .routes
+        .rules()
+        .map(|rule| (rule.path(), rule.path_regex(), rule.priority()))
+        .collect();
+    assert_eq!(
+        rules,
+        [
+            (None, Some("^/api/v[0-9]+/"), 0),
+            (Some("/api/"), None, -5),
+            (Some("/"), None, 1000)
+        ]
+    );
+    // Both of them is a refusal, and so is a value that is not text or not a whole number, `null` included.
+    let both = json!({"path": "/a", "path_regex": "^/a"});
+    assert_eq!(
+        refusal(load(with_route(both))),
+        "a route has both a path and a path regex"
+    );
+    let wrong = "configuration has a value of the wrong type";
+    for bad in [
+        json!({"path_regex": 5}),
+        json!({"path_regex": null}),
+        json!({"priority": 1.5}),
+        json!({"priority": "1"}),
+        json!({"priority": null}),
+    ] {
+        assert_eq!(refusal(load(with_route(bad.clone()))), wrong, "{bad}");
+    }
+}
+
+#[test]
+fn a_route_with_a_path_regex_has_no_access_list_and_no_path_to_rewrite_and_at_most_32_have_one() {
+    let list = json!({"deny_cidrs": ["10.0.0.0/8"]});
+    let regex = json!({"path_regex": "^/a"});
+    let with = |key: &str, value: Value| {
+        let mut keys = regex.clone();
+        keys[key] = value;
+        load(with_route(keys))
+    };
+    assert_eq!(
+        refusal(with("access", list.clone())),
+        "a route with a path regex has an access list"
+    );
+    // A list that turns nobody away is no list, as for the rule on the port of a host.
+    assert!(with("access", json!({"allow_cidrs": []})).is_ok());
+    assert_eq!(
+        refusal(with("rewrite", json!({"path": "/v2/"}))),
+        "a rewrite path is set on a route with a path regex"
+    );
+    assert!(with("rewrite", json!({"host": "inner.test"})).is_ok());
+    // The port of a host is refused when a route has an access list, in a route with a path regex too.
+    let ported = with_routes(json!([
+        {"host": "h.test:8080", "path_regex": "^/a", "upstream": "g"},
+        {"path": "/p/", "upstream": "g", "access": list},
+    ]));
+    assert_eq!(
+        refusal(load(ported)),
+        "a route host has a port while a route has an access list"
+    );
+    // At most 32 routes have a path regex; the routes with a path are not counted.
+    let regexes = |n: usize| {
+        let mut routes: Vec<Value> = (0..n)
+            .map(|i| json!({"path_regex": format!("^/r{i}$"), "upstream": "g"}))
+            .collect();
+        routes.push(json!({"path": "/p/", "upstream": "g"}));
+        with_routes(Value::Array(routes))
+    };
+    assert!(load(regexes(32)).is_ok());
+    assert_eq!(
+        refusal(load(regexes(33))),
+        "routes has more than 32 entries with a path regex"
+    );
+}

@@ -21,6 +21,24 @@ fn find(table: &Table<usize>, host: &str, target: &str) -> Option<usize> {
         .copied()
 }
 
+/// A rule with a path (or none) and a priority.
+fn by_path(host: Option<&str>, path: Option<&str>, priority: i64) -> Rule {
+    Rule::forward_with(host, path, None, priority)
+        .unwrap_or_else(|e| panic!("{host:?} {path:?} {priority}: {}", e.0))
+}
+
+/// A rule with a path regex and a priority.
+fn by_regex(host: Option<&str>, regex: &str, priority: i64) -> Rule {
+    Rule::forward_with(host, None, Some(regex), priority)
+        .unwrap_or_else(|e| panic!("{host:?} {regex:?} {priority}: {}", e.0))
+}
+
+/// A table of these rules, whose targets are their positions.
+fn table_of(rules: Vec<Rule>) -> Table<usize> {
+    let entries = rules.into_iter().enumerate().map(|(i, r)| (r, i));
+    Table::new(entries.collect()).unwrap()
+}
+
 #[test]
 fn a_path_is_exact_or_a_prefix_that_ends_in_a_slash_and_the_longest_prefix_wins() {
     let t = table(&[
@@ -382,4 +400,230 @@ fn a_request_that_cannot_be_told_by_its_path_could_be_taken_for_every_rule_its_h
             );
         }
     }
+}
+
+#[test]
+fn a_path_regex_is_matched_anywhere_in_the_path_as_received_and_not_in_the_query() {
+    let t = table_of(vec![
+        by_regex(None, "^/api/v[0-9]+/", 0),
+        by_regex(None, r"/files/.*\.pdf$", 0),
+        by_regex(None, "(?i)^/Doc/", 0),
+        by_path(None, Some("/"), 0),
+    ]);
+    assert_eq!(find(&t, "h", "/api/v2/x"), Some(0));
+    assert_eq!(find(&t, "h", "/api/vx/x"), Some(3));
+    // An expression that is not anchored holds in the middle of the path, one that is anchored does not.
+    assert_eq!(find(&t, "h", "/a/files/b/c.pdf"), Some(1));
+    assert_eq!(find(&t, "h", "/x/api/v2/"), Some(3));
+    // The query is not looked at, and `$` is the end of the path: a path with a `/` after it is another one.
+    assert_eq!(find(&t, "h", "/files/c.pdf?x=1"), Some(1));
+    assert_eq!(find(&t, "h", "/files/c?x=.pdf"), Some(3));
+    assert_eq!(find(&t, "h", "/files/c.pdf/"), Some(3));
+    // The case of letters counts, unless the expression says it does not.
+    assert_eq!(find(&t, "h", "/API/v2/x"), Some(3));
+    assert_eq!(find(&t, "h", "/doc/x"), Some(2));
+}
+
+#[test]
+fn a_path_regex_holds_for_no_target_that_can_be_read_in_more_than_one_way() {
+    let t = table_of(vec![
+        by_regex(None, "admin", 0),
+        by_path(Some("h.test"), None, 0),
+    ]);
+    assert_eq!(find(&t, "g.test", "/admin/x"), Some(0));
+    for target in [
+        "/admin/../x",
+        "/a/%2e%2e/admin",
+        "//admin",
+        "/admin;x",
+        "/admin%2Fx",
+        "/admin\\x",
+        "/%252e/admin",
+    ] {
+        assert_eq!(find(&t, "g.test", target), None, "{target}");
+        assert_eq!(find(&t, "h.test", target), Some(1), "{target}");
+    }
+    // Only the part before the `?` counts.
+    assert_eq!(find(&t, "g.test", "/admin?x=..%2f;\\//"), Some(0));
+}
+
+#[test]
+fn the_host_decides_first_then_the_smaller_priority_then_the_kind_of_path() {
+    // A rule with a host holds before one without, whatever their priorities.
+    let t = table_of(vec![
+        by_path(None, Some("/"), -1000),
+        by_path(Some("a.test"), Some("/"), 1000),
+    ]);
+    assert_eq!(find(&t, "a.test", "/x"), Some(1));
+    assert_eq!(find(&t, "b.test", "/x"), Some(0));
+    // In a host the smaller priority is first, whatever the path: also for a rule that has no path.
+    let t = table_of(vec![
+        by_path(None, Some("/x"), 0),
+        by_path(None, Some("/"), -1),
+    ]);
+    assert_eq!(find(&t, "h", "/x"), Some(1));
+    let t = table_of(vec![
+        by_path(None, Some("/x"), 1),
+        by_path(None, Some("/"), 2),
+    ]);
+    assert_eq!(find(&t, "h", "/x"), Some(0));
+    let t = table_of(vec![
+        by_path(Some("h"), None, -1),
+        by_path(Some("h"), Some("/x"), 0),
+    ]);
+    assert_eq!(find(&t, "h", "/x"), Some(0));
+    // With the same priority: the path itself, then a path regex, then a prefix (whatever its length).
+    let t = table_of(vec![
+        by_path(None, Some("/a/b/"), 0),
+        by_regex(None, "^/a/b", 0),
+        by_path(None, Some("/a/bc"), 0),
+    ]);
+    assert_eq!(find(&t, "h", "/a/bc"), Some(2));
+    assert_eq!(find(&t, "h", "/a/bd"), Some(1));
+    assert_eq!(find(&t, "h", "/a/b/c"), Some(1));
+    // A priority above that of a prefix puts the path regex after it.
+    let t = table_of(vec![
+        by_path(None, Some("/a/"), 0),
+        by_regex(None, "^/a", 1),
+    ]);
+    assert_eq!(find(&t, "h", "/a/x"), Some(0));
+    // Of two path regexes with the same host and priority, the one that was given first.
+    for (first, second) in [("^/a", "^/a/b"), ("^/a/b", "^/a")] {
+        let t = table_of(vec![by_regex(None, first, 0), by_regex(None, second, 0)]);
+        assert_eq!(find(&t, "h", "/a/b"), Some(0), "{first} {second}");
+    }
+}
+
+#[test]
+fn two_rules_with_the_same_host_and_path_or_path_regex_are_refused_whatever_their_priority() {
+    let same = "two routes have the same host and path";
+    let refused = |rules: Vec<Rule>| {
+        let entries = rules.into_iter().enumerate().map(|(i, r)| (r, i));
+        Table::new(entries.collect()).unwrap_err().0
+    };
+    let twice = vec![by_regex(Some("h"), "^/a", 0), by_regex(Some("h"), "^/a", 5)];
+    assert_eq!(refused(twice), same);
+    let twice = vec![
+        by_path(None, Some("/a/"), 0),
+        by_path(None, Some("/a/"), -3),
+    ];
+    assert_eq!(refused(twice), same);
+    // A path and a path regex of the same text, a path regex of another text, and the same one at another host.
+    let apart = vec![
+        by_path(None, Some("/a/"), 0),
+        by_regex(None, "/a/", 0),
+        by_regex(None, "/a", 0),
+        by_regex(Some("h"), "/a/", 0),
+    ];
+    assert!(Table::new(apart.into_iter().map(|r| (r, 0)).collect()).is_ok());
+}
+
+#[test]
+fn a_path_regex_has_1_to_255_visible_ascii_bytes_and_is_made_into_a_dfa_within_limits() {
+    let refused = |regex: &str| {
+        Rule::forward_with(None, None, Some(regex), 0)
+            .unwrap_err()
+            .0
+    };
+    let length = "a route path regex is not 1 to 255 bytes";
+    assert_eq!(refused(""), length);
+    assert!(Rule::forward_with(None, None, Some(&"a".repeat(255)), 0).is_ok());
+    assert_eq!(refused(&"a".repeat(256)), length);
+    let chars = "a route path regex has a character that is not allowed";
+    for bad in ["a b", "a\u{7f}"] {
+        assert_eq!(refused(bad), chars, "{bad:?}");
+    }
+    // The syntax stage: an error of syntax, a construct that is not in the syntax (look-around), the class `\p`, and
+    // Unicode switched on by its flag, in each kind of place that a flag may be (`(?-u)` and `(?i-u)` switch it off,
+    // and are taken).
+    let invalid = "a route path regex is not a valid regular expression";
+    for bad in ["(", "(?=a)", r"\pL", r"(?u)\w", r"(?iu)a", r"a(?u:b)"] {
+        assert_eq!(refused(bad), invalid, "{bad}");
+    }
+    for good in [r"(?-u)\w", r"(?i-u)a", r"(?-u:\w)"] {
+        assert!(
+            Rule::forward_with(None, None, Some(good), 0).is_ok(),
+            "{good}"
+        );
+    }
+    // The stages that make the NFA and the DFA: a short text whose NFA is over its limit, and one whose DFA is (the
+    // last 13 bytes of a path that are told apart, 2^13 states).
+    let large = "a route path regex is too large";
+    for bad in ["(a{100}){100}", "[ab]*a[ab]{13}c", r"[^/]{1,255}\.php"] {
+        assert_eq!(refused(bad), large, "{bad}");
+    }
+    // What an operator writes is within the limits: anchored, with counted repetitions, and `(?i)`.
+    for good in [
+        "^/servicea/(users|orders)/[0-9]+$",
+        "^/api/v[0-9]+/(users|orders|items)/[0-9]{1,12}(/[a-z_]{1,32})?$",
+        "(?i)^/api/v[0-9]+/",
+    ] {
+        assert!(
+            Rule::forward_with(None, None, Some(good), 0).is_ok(),
+            "{good}"
+        );
+    }
+}
+
+#[test]
+fn a_priority_is_from_minus_1000_to_1000_and_a_rule_has_a_path_or_a_path_regex_not_both() {
+    for good in [-1000, 0, 1000] {
+        assert_eq!(
+            by_path(None, Some("/a"), good).priority(),
+            i16::try_from(good).unwrap()
+        );
+    }
+    for bad in [-1001, 1001, i64::from(i16::MAX) + 1, i64::MIN, i64::MAX] {
+        let refused = Rule::forward_with(None, Some("/a"), None, bad)
+            .unwrap_err()
+            .0;
+        assert_eq!(refused, "a route priority is not -1000 to 1000", "{bad}");
+    }
+    assert_eq!(
+        Rule::forward_with(None, Some("/a"), Some("a"), 0)
+            .unwrap_err()
+            .0,
+        "a route has both a path and a path regex"
+    );
+    // A rule that lets a request through without inspection has neither, as it is written.
+    let bypass = Rule::bypass(Some("a.test"), "/a/").unwrap();
+    assert_eq!((bypass.path_regex(), bypass.priority()), (None, 0));
+}
+
+#[test]
+fn the_rules_a_request_could_be_taken_for_are_those_of_the_ranks_and_those_of_the_paths_alone() {
+    // A path regex is before a prefix, though the path alone chooses the prefix: the lists of both are asked.
+    let t = table_of(vec![
+        by_path(None, Some("/admin/"), 0),
+        by_regex(None, "^/admin", 0),
+    ]);
+    assert_eq!(could_hold(&t, Some("h"), "/admin/x"), [0, 1]);
+    // So is a smaller priority, on a rule for a whole host.
+    let t = table_of(vec![
+        by_path(None, Some("/admin/"), 0),
+        by_path(None, Some("/"), -1),
+    ]);
+    assert_eq!(could_hold(&t, Some("h"), "/admin/x"), [0, 1]);
+    assert_eq!(could_hold(&t, Some("h"), "/pub/x"), [1]);
+    // Another spelling of the path meets the same two, for each of its forms.
+    let t = table_of(vec![
+        by_path(None, Some("/private/"), 0),
+        by_path(None, Some("/"), -1),
+    ]);
+    assert_eq!(could_hold(&t, Some("h"), "/priv%61te/x"), [0, 1]);
+    assert_eq!(could_hold(&t, Some("h"), "/private"), [0, 1]);
+    // The path with a `/` after it is left out for each way on its own: where the path alone chooses the path itself,
+    // the ranks may choose a path regex, and then the prefix that it finds with the `/` is asked too.
+    let t = table_of(vec![
+        by_path(None, Some("/admin"), 0),
+        by_regex(None, "^/admin$", -1),
+        by_path(None, Some("/admin/"), 0),
+    ]);
+    assert_eq!(could_hold(&t, Some("h"), "/admin"), [0, 1, 2]);
+    // A table with neither a path regex nor a priority gives what the paths alone give.
+    let t = table_of(vec![
+        by_path(None, Some("/admin"), 0),
+        by_path(None, Some("/admin/"), 0),
+    ]);
+    assert_eq!(could_hold(&t, Some("h"), "/admin"), [0]);
 }

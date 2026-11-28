@@ -598,3 +598,82 @@ fn the_proxy_takes_the_sentence_of_a_refusal_without_its_place() {
         Some(LoadError::Version(ConfigError(why)))
     );
 }
+
+#[test]
+fn a_refusal_about_a_path_regex_or_a_priority_is_about_that_key_of_its_route() {
+    let fixture = Fixture::new();
+    let built = with_admin(&fixture);
+    let base = fixture.plain_version(b"chain", b"key");
+    let refused = |routes: Vec<Value>| {
+        let mut version = base.clone();
+        version["routes"].as_array_mut().unwrap().extend(routes);
+        objection(&built, &version)
+    };
+    let route = |keys: Value| {
+        let mut route = json!({"upstream": "app"});
+        for (key, value) in keys.as_object().unwrap() {
+            route[key] = value.clone();
+        }
+        route
+    };
+    let list = json!({"deny_cidrs": ["10.0.0.0/8"]});
+    for (keys, sentence, place) in [
+        (
+            json!({"path": "/a", "path_regex": "a"}),
+            "a route has both a path and a path regex",
+            "routes[0].path_regex",
+        ),
+        (
+            json!({"path_regex": ""}),
+            "a route path regex is not 1 to 255 bytes",
+            "routes[0].path_regex",
+        ),
+        (
+            json!({"path_regex": "a b"}),
+            "a route path regex has a character that is not allowed",
+            "routes[0].path_regex",
+        ),
+        (
+            json!({"path_regex": "("}),
+            "a route path regex is not a valid regular expression",
+            "routes[0].path_regex",
+        ),
+        (
+            json!({"path_regex": "(a{100}){100}"}),
+            "a route path regex is too large",
+            "routes[0].path_regex",
+        ),
+        (
+            json!({"priority": 1001}),
+            "a route priority is not -1000 to 1000",
+            "routes[0].priority",
+        ),
+        (
+            json!({"path_regex": "a", "access": list}),
+            "a route with a path regex has an access list",
+            "routes[0].access",
+        ),
+        (
+            json!({"path_regex": "a", "rewrite": {"path": "/v2/"}}),
+            "a rewrite path is set on a route with a path regex",
+            "routes[0].rewrite.path",
+        ),
+    ] {
+        assert_eq!(
+            refused(vec![route(keys)]),
+            (sentence, at(place)),
+            "{sentence}"
+        );
+    }
+    // The 33rd route that has a path regex is the one that is refused.
+    let many = (0..33)
+        .map(|i| route(json!({"path_regex": format!("^/r{i}$")})))
+        .collect();
+    assert_eq!(
+        refused(many),
+        (
+            "routes has more than 32 entries with a path regex",
+            at("routes[32].path_regex")
+        )
+    );
+}

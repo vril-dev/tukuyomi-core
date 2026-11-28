@@ -610,12 +610,14 @@ An upstream's `engine` is the name of the engine that inspects requests to that 
 - Upstreams that have servers with the same address must all use the same engine (see "Relations Between Values" and "Choosing the Inspection Engine" below).
 - It can be changed by a configuration reload if the new engine is running (see "SIGHUP (Configuration Reload)" above).
 
-A route is `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?, "records"?}`.
+A route is `{"host"?, "path"?, "path_regex"?, "priority"?, "upstream", "access"?, "rewrite"?, "stream"?, "max_body"?, "records"?}`.
 
 | Setting key | Meaning |
 |---|---|
 | `host` | A lowercase name, optionally with `:port` (up to 253 bytes including `*.` and the port). If a port is written, it matches only that port; if not, any port. If it starts with `*.`, it matches one or more labels before the name |
 | `path` | A path of 1 to 255 bytes that starts with `/`. If it ends with `/`, it matches every path that starts with it; otherwise it matches only that path. The allowed bytes are letters and digits, and `-._~!$&'()*+,=:@/%`, and `%` must be followed by two hexadecimal digits. A form that can be read in more than one way (see "Notes on using `access`" below) cannot be written |
+| `path_regex` | A regular expression for the path, written in place of `path` (a route cannot have both). It is 1 to 255 bytes of ASCII characters other than spaces and control characters (`0x21` to `0x7e`), and at most 32 routes can have one (see "Path Regular Expressions and `priority`" below) |
+| `priority` | A whole number from -1000 to 1000. If omitted, 0. Of the routes that match, the one with the smaller number is chosen, after the host and before the path (see "Path Regular Expressions and `priority`" below) |
 | `upstream` | The name of an upstream |
 | `access` | `{"deny_cidrs"?, "allow_cidrs"?, "deny_countries"?, "allow_countries"?}`. Up to 256 networks per list, and up to 256 countries per list (see `access` in "Access Control and Rate Limits" below) |
 | `rewrite` | Rewrites the request sent to the upstream and the response returned (see below) |
@@ -626,11 +628,13 @@ A route is `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "ma
 - A route compares the request's `Host`, and the request target up to the first `?`, as the bytes received.
   - Nothing is decoded or normalized. The path is case-sensitive.
   - The host is case-insensitive, and one trailing `.` is removed from the name.
-- Two routes with the same `host` and `path` cannot be written.
-- A request target with a path that can be read in more than one way (the forms listed in "Notes on using `access`" below) does not match a route that has `path`. It goes to a host-only route or to the default upstream.
+- Two routes with the same `host` and `path` (or the same `host` and `path_regex`) cannot be written, whatever their `priority`. A `path` and a `path_regex` with the same text are different routes.
+- A request target with a path that can be read in more than one way (the forms listed in "Notes on using `access`" below) does not match a route that has `path` or `path_regex`. It goes to a host-only route or to the default upstream.
 - When several routes match, the most specific one is used.
   - The host is compared first: a name before a wildcard, a longer wildcard before a shorter one, a route with a port before one without, and a route with a host before one without.
-  - Then the path: a route for exactly that path before a prefix, a longer prefix before a shorter one, and a route with a path before one without.
+  - Then `priority`: the smaller number first.
+  - Then the path: a route for exactly that path before a route with a `path_regex`, a route with a `path_regex` before a prefix, a longer prefix before a shorter one, and a route with a path before one without.
+  - Of two routes with a `path_regex` that are equal in all of these, the one written first is used.
 - The default upstream has no `access`, `rewrite`, `stream`, `max_body`, or `records`. The log of a request that goes to the default upstream follows `records.keep`.
 - Before a route is chosen, the proxy handles the admin route, applies the global `access` and `rate_limit` and the host policies, and checks `Host` on TLS connections (see "Order of Request Checks" under "Access Control and Rate Limits" below).
 - After a route is chosen, and before reading the body or inspecting, the proxy responds as follows.
@@ -638,6 +642,22 @@ A route is `{"host"?, "path"?, "upstream", "access"?, "rewrite"?, "stream"?, "ma
   - A client refused by `access`: 403
   - `Content-Length` exceeds the route's `max_body`: 413
 - `access`: A client is refused if its address (see "Client Address" below) is in `deny_cidrs`, or if its country is in `deny_countries`. It is also refused if `allow_cidrs` is not empty and the client is not in it, or if `allow_countries` is not empty and its country is not in it. If both `allow_cidrs` and `allow_countries` are written, only a client that is in both passes. The country is looked up in the country database of the global `geo`, so a country list requires `geo` (see `geo` in "Access Control and Rate Limits" below).
+
+Path Regular Expressions and `priority`:
+
+- `path_regex` is a regular expression in the syntax of the Rust `regex` crate. It is matched against the request target up to the first `?`, as the bytes received. Nothing is decoded or normalized, as for `path`.
+- When the configuration is read, the expression is built into a complete DFA (a table that is looked up once for each byte). An expression whose DFA would grow too large is rejected then (the limits are given below). So matching takes time in proportion to the length of the path, whatever the expression is, and no expression or path can make it slow.
+- It matches if it matches anywhere in the path. Write `^` and `$` where you mean the start and the end of the path. `$` ties the end of the expression to the end of the path: `^/api$` matches `/api` but not `/api/`. To match both, write `^/api/?$`.
+- It is case-sensitive. `(?i)` at the start of the expression makes it ignore the case of ASCII letters, and the other flags of the crate can be written.
+- Unicode is turned off, and a path is matched as bytes. `\w`, `\d`, `\s`, and `\b` match ASCII only. The flag that turns Unicode on (`(?u)`, in any form) and the classes of Unicode (`\p{L}`, `\P{L}`) are rejected, by the proxy and by the records shipper alike. To match a space, a control character, or a byte that is not ASCII, write it as `\xNN`.
+- The syntax of the crate differs in details from other regular expression syntaxes, such as Go's RE2. Look-around and backreferences cannot be written. For the syntax, see the documentation of the `regex` crate.
+- A route whose `path_regex` is not 1 to 255 bytes, has a character that is not allowed, or is not a valid regular expression is rejected, with `a route path regex is not 1 to 255 bytes`, `a route path regex has a character that is not allowed`, or `a route path regex is not a valid regular expression`.
+- An expression is rejected with `a route path regex is too large` if its NFA is over 64 KiB, or if its DFA, or the work to build it, is over 256 KiB. These forms tend to grow and may be rejected: large counted repetitions (`[^/]{1,255}\.php` is rejected), nested repetitions, and an expression that tells the last several bytes of the path apart after an unbounded loop (`[ab]*a[ab]{13}c`). Expressions that are anchored with `^` and have small repetition counts, such as `^/api/v[0-9]+/(users|orders|items)/[0-9]{1,12}(/[a-z_]{1,32})?$`, are far within the limits. If an expression is rejected, anchor it with `^` and make the repetition counts smaller.
+- At most 32 routes can have a `path_regex` (`routes has more than 32 entries with a path regex`). Each request is matched against every route that has a `path_regex` and whose `host` matches, so the time to choose the route grows with the number of those routes and the length of the path. Building the DFAs takes time when the configuration is read (at start, at a reload, and when the admin process checks or applies a version): up to about a second for 32 expressions that are near the limits or are rejected.
+- A route with a `path_regex` cannot have `access` (`a route with a path regex has an access list`; an `access` that turns nobody away is the same as none, and can be written) or a `rewrite.path` (`a rewrite path is set on a route with a path regex`). The rest of `rewrite` can be written.
+- A route with both `path` and `path_regex` is rejected (`a route has both a path and a path regex`). A `priority` outside -1000 to 1000 is rejected (`a route priority is not -1000 to 1000`).
+- `priority` is compared after the host. A route without a `host` does not take a request away from a route with a `host`, whatever the priority.
+- An earlier build that does not know `path_regex` and `priority` rejects a configuration file or a version that has them, as having an unknown setting key. Be careful when you go back to an earlier build: remove them first. The records shipper also reads the configuration file, so before you write them in the configuration file, replace the records shipper with the same build as the proxy (see "Starting the Records Shipper" below).
 
 Notes on using `access`:
 
@@ -649,6 +669,10 @@ Notes on using `access`:
 - If any route has `access`, no route can have a port in `host`.
 - When the proxy looks for the routes that a request could be mistaken for, it checks the request path with a trailing `/` added, but not with a trailing `/` removed. So a restriction on the exact-match route `/admin` does not apply to `/admin/`; if the upstream treats them the same, write both.
 - The path is case-sensitive, so for an upstream that ignores case, the restriction applies only to the spelling that was written.
+- The routes that the request could be mistaken for are those that would be chosen by the ranks above, and those that would be chosen by the host and the path alone, as if no route had a `path_regex` or a `priority`. The consequences are as follows.
+  - A request that goes to a route with a `path_regex` must also pass the `access` of the route that would have been chosen without `path_regex` and `priority`. So a `path_regex` cannot make a route that anyone may use inside a prefix that has `access`. For example, with `{"path": "/admin/", "access": {"allow_cidrs": ["192.0.2.0/24"], ...}}` and `{"path_regex": "^/admin/status$", ...}`, a request for `/admin/status` is sent to the second route, but a client outside `192.0.2.0/24` is still refused. To let anyone use it, give it a path outside `/admin/`.
+  - If a broad route (such as `/`) has `access` and a smaller `priority` than a route inside it (such as `/public/`), a request for `/public/x` is sent to the broad route, because it is chosen first. The `access` of both routes applies to the request.
+  - The path with a `/` added is not looked up when the route chosen for the path as received is for exactly that path (see above). When another route is chosen by its `priority` or its `path_regex`, the exception does not apply. For example, if `/admin` (exact) and `/admin/` (prefix, with `access`) are written together with a `path_regex` route that has a smaller `priority` and matches `/admin` but not `/admin/` (such as `^/admin$`), a request for `/admin` must also pass the `access` of `/admin/`. Whether it does depends on the expression: `^/admin` matches `/admin/` too, and then the `access` of `/admin/` is not asked for `/admin`. Because the exception does not apply, more requests may be refused, but never fewer.
 
 `rewrite` is `{"host"?, "path"?, "query"?, "request_headers"?, "response_headers"?}`.
 
@@ -1191,6 +1215,7 @@ The file for `rules import --routes <file>` is a JSON array of the following for
 - The form and the matching of `path` and `host` are the same as for `forward` routes. In addition:
   - `path` cannot be only `/` (it would remove inspection of all requests). Write it with 2 to 255 bytes.
   - `host` cannot contain a wildcard.
+  - `path_regex` and `priority` cannot be written. A mistake in either could skip the inspection of a request that has to be inspected.
   - A generation can have up to 256 routes. The same combination of `host` and `path` cannot be written twice.
 - A bypass route with `host` does not match a `Host` with a trailing `.` (`app.example.com.`), and the request is inspected, because the upstream might interpret it as a different host. A route without `host` also matches a `Host` with a trailing `.`.
 - A request whose path can be read in more than one way (the forms listed in "Notes on using `access`") does not match a bypass route and is inspected.

@@ -1,7 +1,7 @@
 // What a saving changes, for the confirmation: the groups, the engines of the groups, the default group, the access
 // list, the rate limit, the host policies, the sites and the routes that are added, taken away or changed. A line names
-// a group, a host policy or a site, or the host and the path of a route, and none of its values, for a rewrite can hold
-// a secret. Nothing runs when the module is loaded.
+// a group, a host policy or a site, or the host and the path (or regular expression) of a route, and none of its values,
+// for a rewrite can hold a secret. Nothing runs when the module is loaded.
 
 const plain = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -32,8 +32,10 @@ function single(area, a, b, out) {
   else if (!same(a, b)) out.push({ area, action: 'change', label: '' });
 }
 
-const routeKey = (route) => JSON.stringify([route.host ?? null, route.path ?? null]);
-const routeLabel = (route) => `${route.host ?? '*'} ${route.path ?? '*'}`;
+const routeKey = (route) => JSON.stringify([route.host ?? null, route.path ?? null, route.path_regex ?? null]);
+// A regular expression is told with `~` before it (as nginx writes it), so that it is not read as the path of the same text.
+const routePath = (route) => (route.path_regex === undefined ? (route.path ?? '*') : `~ ${route.path_regex}`);
+const routeLabel = (route) => `${route.host ?? '*'} ${routePath(route)}`;
 
 const isAcme = (site) => plain(site.certificate) && Object.hasOwn(site.certificate, 'acme');
 export const hostsKey = (site) => JSON.stringify([...site.hosts].sort());
@@ -90,8 +92,9 @@ function engineChanges(before, after, name, out) {
  * The lines of what changes from the version `before` to the version `after`: `{ area, action, label }` with `area`
  * one of `upstream`, `engine`, `engine_key`, `default`, `access`, `rate_limit`, `host_policy`, `site` and `route`, and
  * `action` one of `add`, `remove` and `change`. Groups, host policies and sites are matched by their names and routes
- * by their hosts and paths, so a renamed one is one taken away and one added. The engine of a group is not part of the
- * line of the group; `name` is the default engine (null when it is not known).
+ * by their hosts and paths or regular expressions (a path and a regular expression of the same text are two routes),
+ * so a renamed one is one taken away and one added. The engine of a group is not part of the line of the group; `name`
+ * is the default engine (null when it is not known).
  */
 export function changesBetween(before, after, name = null) {
   const out = [];

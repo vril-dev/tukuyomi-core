@@ -27,6 +27,25 @@ fn three_groups(addresses: &[SocketAddr]) -> Value {
     })
 }
 
+/// Three groups with a server each: `web` for the paths below `/`, `api` for those that have a version (`/v2/`) in
+/// them, and `files` for the paths below `/files/`, which comes first by its priority. There is no default group.
+fn by_pattern(addresses: &[SocketAddr]) -> Value {
+    json!({
+        "resolve_timeout_ms": RESOLVE_TIMEOUT_MS,
+        "upstreams": {
+            "web": {"servers": [server(addresses[0])]},
+            "api": {"servers": [server(addresses[1])]},
+            "files": {"servers": [server(addresses[2])]},
+        },
+        "routes": [
+            {"path_regex": "/v[0-9]+/", "upstream": "api"},
+            {"path": "/files/", "priority": -1, "upstream": "files"},
+            {"path": "/", "upstream": "web"},
+        ],
+        "default_upstream": "",
+    })
+}
+
 /// One group of two servers, the second the first upstream; the first is the one that the test stops.
 fn two_servers(addresses: &[SocketAddr]) -> Value {
     json!({
@@ -123,4 +142,34 @@ fn with_one_server_of_a_group_stopped_the_requests_go_to_the_other() {
             && l["server"] == server.as_str()
     });
     proxy.finish(4);
+}
+
+#[test]
+#[ignore = "needs a built inspector"]
+fn a_route_with_a_path_regex_and_a_route_with_a_priority_go_to_their_groups() {
+    let knobs = Knobs {
+        upstreams: 3,
+        forward: by_pattern,
+        ..Knobs::quick()
+    };
+    let proxy = Proxy::start("route_pattern", knobs);
+    // The path regex is before the prefix `/`, the priority before the path regex, and the prefix holds for the rest.
+    for path in ["/api/v2/x", "/files/v2/x", "/other"] {
+        let reply = exchange(proxy.port, &get(path));
+        assert_eq!(reply.status(), 200, "{path}: {:?}", reply.text());
+        assert_eq!(reply.message().body, UPSTREAM_BODY.as_bytes());
+    }
+    assert_eq!(
+        first_lines(&proxy.upstream.requests()),
+        ["GET /other HTTP/1.1"]
+    );
+    assert_eq!(
+        first_lines(&proxy.others[0].requests()),
+        ["GET /api/v2/x HTTP/1.1"]
+    );
+    assert_eq!(
+        first_lines(&proxy.others[1].requests()),
+        ["GET /files/v2/x HTTP/1.1"]
+    );
+    proxy.finish(1);
 }

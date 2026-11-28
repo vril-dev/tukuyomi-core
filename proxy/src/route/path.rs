@@ -156,6 +156,11 @@ impl<'a> Target<'a> {
     pub(super) fn path_is(&self, other: &[u8]) -> bool {
         self.path == other
     }
+
+    /// The path, unless it is ambiguous.
+    pub(super) fn unambiguous(&self) -> Option<&'a [u8]> {
+        (!self.ambiguous).then_some(self.path)
+    }
 }
 
 /// How well the path of a rule holds for a target. The variants are in the order of their strength, and a prefix
@@ -165,6 +170,8 @@ pub(super) enum PathRank {
     /// The rule has no path, so it holds for every path.
     Any,
     Prefix(usize),
+    /// The rule has a path regex that matches the path.
+    Pattern,
     Exact,
 }
 

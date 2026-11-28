@@ -1031,6 +1031,38 @@ test('the screen of the routes makes a form when it opens, and a refusal of a fi
   assert.equal(forgetDraft(), true);
 });
 
+test('the screen of the routes writes the path as a regular expression when it is chosen, marks it in the list with its priority, and tells a refusal at the field of the path', async () => {
+  const version = { sites: [], upstreams: groupOfOne, routes: [{ path: '/', upstream: 'app' }], default_upstream: '' };
+  const { root, screen, sent, pressed, control, errorOf } = await editScreen('routes', version, () => ({ at: 'routes[0].path_regex', sentence: 'a route path regex is not a valid regular expression' }));
+  pressed('Edit');
+  const type = (input, value) => {
+    input.value = value;
+    input.dispatch('input');
+  };
+  const hintOf = (input) => root.querySelector(`[id="${input.getAttribute('aria-describedby')}"]`).textContent;
+  const path = control('Path');
+  assert.equal(hintOf(path).includes('matches every path below it'), true);
+  type(path, '^/api/');
+  // The choice is the checkbox in the label of its name; the help of the path follows it.
+  const regex = root.querySelectorAll('label').find((item) => item.textContent.startsWith('Treat the path')).children[0];
+  regex.checked = true;
+  regex.dispatch('change');
+  assert.equal(hintOf(path).includes('as the proxy received it'), true);
+  type(control('Priority'), '7');
+  const line = root.querySelector('[data-row]').textContent;
+  assert.deepEqual(['^/api/', 'Regex', 'Priority 7'].filter((word) => !line.includes(word)), []);
+  pressed('Close');
+  pressed('Check');
+  await wait();
+  await wait();
+  assert.deepEqual(sent[1].version.routes, [{ path_regex: '^/api/', priority: 7, upstream: 'app' }]);
+  const refused = control('Path');
+  assert.equal(refused.getAttribute('aria-invalid'), 'true');
+  assert.equal(errorOf(refused), 'a route path regex is not a valid regular expression');
+  screen.stop();
+  assert.equal(forgetDraft(), true);
+});
+
 test('typing in a field of a route draws the list again only when a line of it would change', async () => {
   const version = { sites: [], upstreams: groupOfOne, routes: [{ path: '/', upstream: 'app', stream: { idle_ms: 5, total_ms: 9, websocket: false } }], default_upstream: '' };
   const { root, screen, pressed, control } = await editScreen('routes', version, () => ({ at: null, sentence: 'refused' }));

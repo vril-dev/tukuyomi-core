@@ -149,11 +149,13 @@ fn headers(raw: Option<Object<RawHeaders>>, make: Make) -> Result<Headers, Confi
     make(raw.remove, pairs(raw.set), pairs(raw.add)).map_err(refused)
 }
 
-/// The edits of a route whose path is `route_path`. A refusal of the query or of the fields comes with its key in the
-/// route (`rewrite.query`, `rewrite.request_headers`, `rewrite.response_headers`), and one of the host or of the path
-/// with none: their sentences tell them apart (see `forward`).
+/// The edits of a route whose path is `route_path`; `pattern` tells that the route has a path regex instead, which has
+/// no path to edit. A refusal of the query or of the fields comes with its key in the route (`rewrite.query`,
+/// `rewrite.request_headers`, `rewrite.response_headers`), and one of the host or of the path with none: their
+/// sentences tell them apart (see `forward`).
 pub(super) fn rewrite(
     route_path: Option<&str>,
+    pattern: bool,
     raw: Option<Object<RawRewrite>>,
 ) -> Result<Rewrite, (ConfigError, Option<&'static str>)> {
     let Some(Object(raw)) = raw else {
@@ -164,6 +166,12 @@ pub(super) fn rewrite(
         .map_err(|e| (e, Some("rewrite.request_headers")))?;
     let response = headers(raw.response_headers, Headers::response)
         .map_err(|e| (e, Some("rewrite.response_headers")))?;
+    if pattern && raw.path.is_some() {
+        return Err((
+            ConfigError("a rewrite path is set on a route with a path regex"),
+            None,
+        ));
+    }
     Rewrite::new(
         route_path,
         raw.host.as_deref(),

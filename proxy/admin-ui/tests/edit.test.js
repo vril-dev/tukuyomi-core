@@ -445,6 +445,19 @@ test('the lines of what a change does name the items and no value, and the order
   assert.doesNotMatch(JSON.stringify(lines), /SECRET/);
 });
 
+test('a path and a regular expression of the same text are two routes, and a regular expression is told with ~', () => {
+  const before = sampleVersion();
+  before.routes = [{ host: 'a.example', path: '/a', upstream: 'app' }, { path_regex: '^/b', upstream: 'app' }];
+  const after = JSON.parse(JSON.stringify(before));
+  after.routes[0] = { host: 'a.example', path_regex: '/a', upstream: 'app' };
+  after.routes[1].priority = 3;
+  assert.deepEqual(changesBetween(before, after).map((line) => [line.area, line.action, line.label]), [
+    ['route', 'remove', 'a.example /a'],
+    ['route', 'change', '* ~ ^/b'],
+    ['route', 'add', 'a.example ~ /a'],
+  ]);
+});
+
 test('the engine of a group is a line of its own: the engine that inspects it changes, or only how it is written, and the group is not told twice', () => {
   const before = sampleVersion();
   const change = (edit, name = 'coraza') => {
@@ -703,6 +716,42 @@ test('a part of a route takes away what was told about the part as a whole when 
   }
 });
 
+test('the path of a route is written as a path or as a regular expression by its choice, and a priority left empty is not written', () => {
+  const version = sampleVersion();
+  version.routes = [
+    { path_regex: '^/api/[0-9]+$', priority: -5, upstream: 'app' },
+    { path: '/static/', upstream: 'api' },
+  ];
+  const draft = draftOf(version);
+  assert.deepEqual(draft.build().version, version);
+  const [first, second] = draft.routes;
+  // The regular expression is in the one field of the path, and the choice is on.
+  const form = draft.routeForm(first);
+  assert.deepEqual([form.path, form.regex, form.priority], ['^/api/[0-9]+$', true, '-5']);
+  assert.deepEqual(draft.build().version, version);
+  // Turned off, the same text is written as `path` and `path_regex` is left out; turned on, it goes back.
+  draft.setRouteRegex(first, false);
+  assert.deepEqual(draft.build().version.routes[0], { path: '^/api/[0-9]+$', priority: -5, upstream: 'app' });
+  draft.setRouteRegex(first, true);
+  assert.deepEqual(draft.build().version.routes[0], version.routes[0]);
+  const other = draft.routeForm(second);
+  assert.deepEqual([other.path, other.regex, other.priority], ['/static/', false, '']);
+  draft.setRouteRegex(second, true);
+  assert.deepEqual(draft.build().version.routes[1], { path_regex: '/static/', upstream: 'api' });
+  // An empty priority leaves the key out, 0 is written when it is typed, and what is no whole number is told at its field.
+  draft.write(form, 'priority', ' ');
+  assert.equal(Object.hasOwn(draft.build().version.routes[0], 'priority'), false);
+  draft.write(form, 'priority', '0');
+  assert.equal(draft.build().version.routes[0].priority, 0);
+  draft.write(form, 'priority', '1.5');
+  assert.deepEqual(draft.build().faults.map((one) => [one.cid, one.field]), [[first.cid, 'priority']]);
+  // A change of the choice takes away what was told of the path and of the parts that a regular expression cannot have.
+  const told = (cid, field) => ({ screen: 'routes', panel: first.cid, cid, field, words: lazy(() => 'wrong') });
+  draft.putFaults([told(first.cid, 'path'), told(form.access.cid, 'notice'), told(first.cid, 'rewrite_path'), told(first.cid, 'host')]);
+  draft.setRouteRegex(first, false);
+  assert.deepEqual(draft.faults.map((one) => one.field), ['host']);
+});
+
 test('the first fault of a screen opens the panel of that screen alone', () => {
   const draft = draftOf(routedVersion());
   const words = lazy(() => 'wrong');
@@ -774,6 +823,9 @@ test('a version whose sites and routes are not in their forms is not edited', ()
   assert.equal(readableVersion(route({ upstream: 1 })), false);
   assert.equal(readableVersion(route({ host: 7 })), false);
   assert.equal(readableVersion(route({ max_body: '7' })), false);
+  assert.equal(readableVersion(route({ path_regex: '^/a', priority: -3 })), true);
+  assert.equal(readableVersion(route({ path_regex: 7 })), false);
+  assert.equal(readableVersion(route({ priority: '1' })), false);
   assert.equal(readableVersion(route({ access: { deny_cidrs: 'x' } })), false);
   assert.equal(readableVersion(route({ stream: { idle_ms: 1, total_ms: '2', websocket: true } })), false);
   assert.equal(readableVersion(route({ rewrite: { query: { set: ['a=b'] } } })), false);
@@ -834,6 +886,9 @@ test('a refusal about a site or a route is found at its field, at the note of it
   assert.deepEqual(locate('routes[0]', map), { screen: 'routes', panel: route.cid, cid: route.cid, field: 'notice' });
   assert.deepEqual(locate('routes[0].host', map), { screen: 'routes', panel: route.cid, cid: route.cid, field: 'host' });
   assert.deepEqual(locate('routes[0].rewrite.path', map), { screen: 'routes', panel: route.cid, cid: route.cid, field: 'rewrite_path' });
+  // The regular expression is typed in the field of the path.
+  assert.deepEqual(locate('routes[0].path_regex', map), { screen: 'routes', panel: route.cid, cid: route.cid, field: 'path' });
+  assert.deepEqual(locate('routes[0].priority', map), { screen: 'routes', panel: route.cid, cid: route.cid, field: 'priority' });
   assert.deepEqual(locate('routes[0].rewrite.query', map), { screen: 'routes', panel: route.cid, cid: `${route.cid}.query`, field: 'notice' });
   assert.deepEqual(locate('routes[0].access', map), { screen: 'routes', panel: route.cid, cid: `${route.cid}.access`, field: 'notice' });
   assert.deepEqual(locate('routes[0].stream', map), { screen: 'routes', panel: route.cid, cid: `${route.cid}.stream`, field: 'notice' });

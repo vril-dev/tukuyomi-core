@@ -4,10 +4,10 @@
 //!
 //! The file is read whole (at most 256 KiB, UTF-8) and deserialized into plain structs; the result keeps the
 //! SHA-256 of the bytes that were read. Every key must be present (a route may leave out its `host`, its `path`,
-//! its `access`, its `rewrite`, its `stream` and its `max_body`; `access` and `rewrite` have no key that must be
-//! present, see `rewrite`, and a `stream` has all three; an upstream group may leave out its
-//! `tls`, which may leave out its `server_name`, and its `engine`; a listener may leave out its `tls` and its
-//! `redirect`, and the `tls`
+//! its `path_regex`, its `priority`, its `access`, its `rewrite`, its `stream` and its `max_body`; `access` and
+//! `rewrite` have no key that must be present, see `rewrite`, and a `stream` has all three; an upstream group may
+//! leave out its `tls`, which may leave out its `server_name`, and its `engine`; a listener may leave out its `tls`
+//! and its `redirect`, and the `tls`
 //! of a listener may leave out its `http2`, and a certificate of a listener may leave out its `acme`; the file
 //! may leave out `acme`, which it must have when a certificate has one, see `acme`, and `status`, which
 //! has the one key `listen`, see `status`, and `records`, `access`, `rate_limit`, `host_policies`, `geo` and `admin`,

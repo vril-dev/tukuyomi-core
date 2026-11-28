@@ -1,10 +1,11 @@
 // The screen of the routes: the list of the routes, and one panel below the list that edits the route that is open (the
-// host, the path and the group, and the access control, the long responses and the rewrite in parts that fold). What is
-// typed goes to the draft, and nothing is saved here: the band above the form checks and saves it. The form of a route is
-// made the first time its panel opens, and opening it is no edit. Up to 1024 routes are read, so the list is drawn again
-// only when a route changes in a way that it shows. Nothing runs when the module is loaded.
+// host, the path or a regular expression for it, the priority and the group, and the access control, the long responses
+// and the rewrite in parts that fold). What is typed goes to the draft, and nothing is saved here: the band above the
+// form checks and saves it. The form of a route is made the first time its panel opens, and opening it is no edit. Up to
+// 1024 routes are read, so the list is drawn again only when a route changes in a way that it shows. Nothing runs when
+// the module is loaded.
 
-import { badge, button, el, mount } from '../../../dom.js';
+import { badge, button, el, mount, setText } from '../../../dom.js';
 import { lazy, t, w } from '../../../i18n.js';
 import { bytesText, checkbox, choice, panelWith } from '../../../parts.js';
 import { Table } from '../../../table.js';
@@ -31,6 +32,9 @@ const TAGS = {
 };
 
 const RECORDS = ['best_effort', 'required', 'security'];
+
+/** What a route matches the path with, as the version writes it: its regular expression, or its path. */
+const pathOf = (shape) => shape.path_regex ?? shape.path;
 
 /** Whether a part of a rewrite holds a line in any of its lists. */
 const holdsText = (item) => Object.entries(item).some(([key, value]) => key !== 'cid' && key !== 'raw' && value !== '');
@@ -61,7 +65,7 @@ class RoutesScreen extends EditScreen {
       fold: true,
       columns: [
         { key: 'host', label: w('edit.col.host'), value: (route) => this.shapeOf(route).host ?? '', mono: true, long: true, cell: (route) => this.shapeOf(route).host ?? w('edit.col.any') },
-        { key: 'path', label: w('edit.col.path'), value: (route) => this.shapeOf(route).path ?? '', mono: true, long: true, cell: (route) => this.shapeOf(route).path ?? w('edit.col.any') },
+        { key: 'path', label: w('edit.col.path'), value: (route) => pathOf(this.shapeOf(route)) ?? '', text: (route) => this.pathText(route), mono: true, long: true, cell: (route) => this.pathCell(route) },
         { key: 'upstream', label: w('edit.col.upstream'), value: (route) => this.shown.nameOf(route.ref), mono: true, long: true },
         { key: 'tags', label: w('edit.col.tags'), value: (route) => routeTags(this.shapeOf(route)).join(' '), filter: false, cell: (route) => this.tagsCell(route) },
         { key: 'marks', label: w('col.state'), value: (route) => this.marksOf(route).map((name) => MARKS[name].text()).join(' '), filter: false, cell: (route) => this.marksCell(route) },
@@ -99,6 +103,22 @@ class RoutesScreen extends EditScreen {
       this.shapes.set(route, shape);
     }
     return shape;
+  }
+
+  /** The text of the path of a route in the list, which the filter looks in: the path or regular expression, and the words of its marks. */
+  pathText(route) {
+    const shape = this.shapeOf(route);
+    return [pathOf(shape) ?? '', shape.path_regex === undefined ? '' : t('edit.col.regex'), shape.priority === undefined ? '' : t('edit.col.priority', { n: shape.priority })].filter((part) => part !== '').join(' ');
+  }
+
+  /** The path of a route in the list, with a mark when it is a regular expression and another for its priority when it has one. */
+  pathCell(route) {
+    const shape = this.shapeOf(route);
+    const path = pathOf(shape) ?? w('edit.col.any');
+    const marks = [];
+    if (shape.path_regex !== undefined) marks.push(badge('muted', w('edit.col.regex')));
+    if (shape.priority !== undefined) marks.push(badge('muted', w('edit.col.priority', { n: shape.priority })));
+    return marks.length === 0 ? path : el('span', {}, path, ' ', el('span', { class: 'tc-badges' }, marks));
   }
 
   tagsCell(route) {
@@ -206,11 +226,24 @@ class RoutesScreen extends EditScreen {
       onChange: (value) => draft.writeRoute(route, form, 'records', value),
     });
     this.placeField(route.cid, 'records', records);
+    // The path is one field: what it says is written as the path, or as a regular expression, as the choice below it says. Its help follows the choice.
+    const pathHint = (regex) => (regex ? w('edit.route.path_regex_hint') : w('edit.route.path_hint'));
+    const path = textBox(w('edit.route.path'), form.path, { hint: pathHint(form.regex), onInput: (value) => draft.writeRoute(route, form, 'path', value) });
+    this.placeField(route.cid, 'path', path);
+    const regex = checkbox((checked) => {
+      draft.setRouteRegex(route, checked);
+      setText(path.hint, pathHint(checked));
+    });
+    regex.checked = form.regex;
+    const priority = numberBox(w('edit.route.priority'), form.priority, { required: false, hint: w('edit.route.priority_hint'), onInput: (value) => draft.writeRoute(route, form, 'priority', value) });
+    this.placeField(route.cid, 'priority', priority);
     return el(
       'div',
       { class: 'tc-fields' },
       this.textField(draft, route, form, 'host', w('edit.route.host'), hostHint),
-      this.textField(draft, route, form, 'path', w('edit.route.path'), w('edit.route.path_hint')),
+      path.node,
+      choice(w('edit.route.path_regex'), regex),
+      priority.node,
       upstream.node,
       maxBody.node,
       records.node,

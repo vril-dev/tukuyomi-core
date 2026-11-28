@@ -7,7 +7,7 @@ import { dictionaries, pickLanguage, sentence, setLanguage, t } from '../js/i18n
 
 const scripts = new URL('../js/', import.meta.url);
 const scriptNames = readdirSync(scripts, { recursive: true }).filter((name) => name.endsWith('.js'));
-const isWords = (name) => name.endsWith('/words.js');
+const isWords = (name) => /[/-]words\.js$/.test(name);
 
 test('the two dictionaries have the same keys, and every text is filled', () => {
   assert.deepEqual(Object.keys(dictionaries.ja).sort(), Object.keys(dictionaries.en).sort());

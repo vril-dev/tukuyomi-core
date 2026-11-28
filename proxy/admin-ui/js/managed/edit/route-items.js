@@ -1,8 +1,9 @@
 // The routes of a draft of the managed configuration and how each goes to and from a version. A route that has not been
 // opened holds what the version says and is sent as it is; its form is made the first time its panel is opened. The
 // parts of a form have numbers of their own, made from the number of the route, so a refusal that names a part alone
-// goes when the part is written to. The lists of a rewrite are typed one item to a line, as `name=value` for a query
-// and as `Name: value` for a field of a header. Nothing runs when the module is loaded.
+// goes when the part is written to. The path is typed in one field: it is written as `path_regex` when the route's path
+// is a regular expression (`regex`), and as `path` when it is not. The lists of a rewrite are typed one item to a line,
+// as `name=value` for a query and as `Name: value` for a field of a header. Nothing runs when the module is loaded.
 
 import { w } from '../../i18n.js';
 import { WIDE, accessOf, builtAccess, fault, linesOf, linesText, nextCid, numberOf, plain, texts, withList, withText } from './items.js';
@@ -11,6 +12,8 @@ const STREAM_NUMBERS = [
   ['idle_ms', WIDE, 15],
   ['total_ms', WIDE, 15],
 ];
+// A priority is a whole number that may be below 0; the range is for the check of the API, as for the other numbers.
+const PRIORITY = /^-?[0-9]{1,4}$/;
 
 const textOf = (value) => (typeof value === 'string' ? value : '');
 
@@ -77,10 +80,14 @@ function formText(route) {
 export function makeForm(route) {
   const { cid, raw } = route;
   const rewrite = raw.rewrite ?? {};
+  const regex = typeof raw.path_regex === 'string';
   route.form = {
     cid,
     host: textOf(raw.host),
-    path: textOf(raw.path),
+    // The one field of the path holds the regular expression when the version has one.
+    path: regex ? raw.path_regex : textOf(raw.path),
+    regex,
+    priority: raw.priority === undefined ? '' : String(raw.priority),
     max_body: raw.max_body === undefined ? '' : String(raw.max_body),
     records: textOf(raw.records),
     access: accessOf(raw.access, `${cid}.access`),
@@ -125,8 +132,9 @@ function readableAccess(raw) {
 
 /** Whether the route `raw` of a version has the form that its form is made from. */
 export function readableRoute(raw) {
-  if (!plain(raw) || typeof raw.upstream !== 'string' || !textOrAbsent(raw.host) || !textOrAbsent(raw.path) || !textOrAbsent(raw.records)) return false;
+  if (!plain(raw) || typeof raw.upstream !== 'string' || !textOrAbsent(raw.host) || !textOrAbsent(raw.path) || !textOrAbsent(raw.path_regex) || !textOrAbsent(raw.records)) return false;
   if (raw.max_body !== undefined && typeof raw.max_body !== 'number') return false;
+  if (raw.priority !== undefined && typeof raw.priority !== 'number') return false;
   return readableAccess(raw.access) && readableStream(raw.stream) && readableRewrite(raw.rewrite);
 }
 
@@ -183,7 +191,7 @@ export function routeTags(shape) {
 /** What the list of the routes shows of `route` besides its group, as one text: it changes only when a line of the list would. */
 export function routeLine(route) {
   const shape = builtRoute(route, '', []);
-  return JSON.stringify([shape.host ?? null, shape.path ?? null, routeTags(shape), routeChanged(route)]);
+  return JSON.stringify([shape.host ?? null, shape.path ?? null, shape.path_regex ?? null, shape.priority ?? null, routeTags(shape), routeChanged(route)]);
 }
 
 /**
@@ -198,7 +206,11 @@ export function builtRoute(route, upstream, faults) {
   if (route.ref.cid === undefined && route.ref.text === '') report('upstream')(w('edit.fault.upstream'));
   const built = { ...route.raw, upstream };
   withText(built, 'host', form.host);
-  withText(built, 'path', form.path);
+  // The field of the path is written as the key that its choice names, and the other key is left out.
+  withText(built, form.regex ? 'path_regex' : 'path', form.path);
+  delete built[form.regex ? 'path' : 'path_regex'];
+  if (form.priority.trim() === '') delete built.priority;
+  else built.priority = numberOf(form.priority, PRIORITY, 4, report('priority'));
   if (form.max_body.trim() === '') delete built.max_body;
   else built.max_body = numberOf(form.max_body, WIDE, 15, report('max_body'));
   if (form.records === '') delete built.records;

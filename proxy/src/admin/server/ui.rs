@@ -74,7 +74,7 @@ static INDEX: File = File {
 };
 
 /// The other files, below `/ui/<version>/`.
-static FILES: [File; 36] = [
+static FILES: [File; 37] = [
     File {
         name: "app.css",
         kind: CSS,
@@ -234,6 +234,11 @@ static FILES: [File; 36] = [
         name: "managed/edit/words.js",
         kind: JAVASCRIPT,
         bytes: include_bytes!("../../../admin-ui/js/managed/edit/words.js"),
+    },
+    File {
+        name: "managed/edit/route-words.js",
+        kind: JAVASCRIPT,
+        bytes: include_bytes!("../../../admin-ui/js/managed/edit/route-words.js"),
     },
     File {
         name: "account/account.js",

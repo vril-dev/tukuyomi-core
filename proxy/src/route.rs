@@ -1,13 +1,20 @@
 //! Matching a request to a rule by its `Host` and its path.
 //!
-//! A rule has a host, a path, both or neither, and a table of rules gives each of them a target. The table of the
-//! routes that skip the inspection and the table of the routes that choose an upstream are made of the same parts
-//! and match in the same way; they differ in the target and in what a rule may hold (see `Rule::forward` and
-//! `Rule::bypass`).
+//! A rule has a host, a path or a path regex, any of them or none, and a priority, and a table of rules gives each of
+//! them a target. The table of the routes that skip the inspection and the table of the routes that choose an
+//! upstream are made of the same parts and match in the same way; they differ in the target and in what a rule may
+//! hold (see `Rule::forward`, `Rule::forward_with` and `Rule::bypass`).
 //!
 //! The path of a rule starts with `/`. It holds for that path only, or, if it ends in `/`, for every path that
 //! starts with it. Its bytes are `A-Z a-z 0-9 - . _ ~ ! $ & ' ( ) * + , = : @ / %`, and every `%` is followed by two
 //! hexadecimal digits. A path that can be read in more than one way is refused (see `ambiguous`).
+//!
+//! The path regex of a rule, in place of its path, is a regular expression, in the syntax of the `regex` crate, that
+//! holds for every path it matches somewhere in it, so `^` and `$` are written where they are meant. It is matched
+//! against the bytes of the path as received, with Unicode off, as a path is. It is made into a complete DFA when
+//! the rule is made, and an expression that is too large for that is refused (see `pattern`).
+//!
+//! The priority of a rule is a whole number from -1000 to 1000, 0 if it is not given.
 //!
 //! The host of a rule is 1 to 253 bytes: lowercase ASCII letters, digits, `-` and `.`, not ending in `.`, and then,
 //! if wanted, `:` and a port from 1 to 65535 without a leading zero. A rule without a port holds for every port of
@@ -22,7 +29,7 @@
 //! take `app.test.` for another host than `app.test`, so the request is inspected. A `Host` value that cannot be
 //! read as a name and an optional port, or whose name has an empty label (`app..test`, `.app.test`, `app.test..`),
 //! holds for no rule that has a host. A target that is ambiguous in the sense of the path holds for no rule that has
-//! a path, so that it is inspected, and it is not routed by a path.
+//! a path or a path regex, so that it is inspected, and it is not routed by a path.
 //!
 //! A rule is matched on the bytes received, so a request that is another way to write a request for a rule is not
 //! taken for it: an application behind the proxy may read `/priv%61te/x` or `/private/./x` as `/private/x`, which a
@@ -31,8 +38,11 @@
 //! the rules that a request could be taken for. If its `Host` can be read and the path of its target has a canonical
 //! form, they are the rules that are the most exact for the path as received, for its canonical form, and for its
 //! canonical form with a `/` added at the end (unless it ends in one, or the rule for the path as received is for that
-//! path itself: the operator wrote a rule for it, and the path with a `/` after it is another one). Otherwise they
-//! are every rule whose host holds for the request, whatever its path, and every rule if the `Host` cannot be read.
+//! path itself: the operator wrote a rule for it, and the path with a `/` after it is another one), each chosen by the
+//! ranks of the table and by the host and the path alone. A rule with a path regex has no access list, and the second
+//! way keeps a rule that is earlier by its priority, or by a path regex, from hiding the rule with the list that its
+//! path alone would have chosen. Otherwise they are every rule whose host holds for the request, whatever its path,
+//! and every rule if the `Host` cannot be read.
 //!
 //! The canonical form of a path is the path with each escape written one way: an escape of a byte that the path of
 //! a rule holds as it is becomes that byte (`%61` is `a`), and any other escape has uppercase digits (`%e3` is
@@ -45,11 +55,14 @@
 //!
 //! Of the rules that hold, the table gives the target of the one that is the most exact: the host decides first (a
 //! name before a wildcard, the longer wildcard before the shorter, a rule with a port before one without, a rule with
-//! a host before one without), and then the path (the path itself before a prefix, the longer prefix before the
-//! shorter, a rule with a path before one without).
+//! a host before one without), then the priority (the smaller number first), and then the path (the path itself
+//! before a path regex, a path regex before a prefix, the longer prefix before the shorter, a rule with a path before
+//! one without). Of two rules with the same host, priority and kind of path, which can only be two path regexes, the
+//! one that was given first is the more exact.
 
 mod host;
 mod path;
+mod pattern;
 mod rule;
 mod table;
 
